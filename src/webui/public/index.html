@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord Bot Manager</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      min-height: 100vh;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #16213e, #0f3460);
+      padding: 20px 30px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #0f3460;
+    }
+
+    .header h1 {
+      font-size: 1.5rem;
+      color: #e94560;
+    }
+
+    .header .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.9rem;
+      color: #888;
+    }
+
+    .header .status .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #3ba55d;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 30px;
+    }
+
+    .toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 25px;
+    }
+
+    .toolbar h2 {
+      font-size: 1.3rem;
+      color: #fff;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #e94560, #c73659);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(233, 69, 96, 0.3);
+    }
+
+    .btn-secondary {
+      background: #2a2a4a;
+      color: #fff;
+    }
+
+    .btn-secondary:hover {
+      background: #3a3a5a;
+    }
+
+    .btn-success {
+      background: #3ba55d;
+      color: white;
+    }
+
+    .btn-danger {
+      background: #ed4245;
+      color: white;
+    }
+
+    .btn-small {
+      padding: 6px 12px;
+      font-size: 0.8rem;
+    }
+
+    .bot-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+      gap: 20px;
+    }
+
+    .bot-card {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 20px;
+      border: 1px solid #0f3460;
+      transition: all 0.2s;
+    }
+
+    .bot-card:hover {
+      border-color: #e94560;
+      transform: translateY(-2px);
+    }
+
+    .bot-card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 15px;
+    }
+
+    .bot-card h3 {
+      font-size: 1.1rem;
+      color: #fff;
+      margin-bottom: 5px;
+    }
+
+    .bot-card .repo-url {
+      font-size: 0.8rem;
+      color: #666;
+      word-break: break-all;
+    }
+
+    .status-badge {
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .status-running { background: #3ba55d20; color: #3ba55d; }
+    .status-stopped { background: #ed424520; color: #ed4245; }
+    .status-building { background: #f5af1920; color: #f5af19; }
+    .status-error { background: #ed424520; color: #ed4245; }
+
+    .bot-card-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 15px;
+      padding-top: 15px;
+      border-top: 1px solid #0f3460;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      background: #16213e;
+      border-radius: 12px;
+      border: 2px dashed #0f3460;
+    }
+
+    .empty-state h3 {
+      margin-bottom: 10px;
+      color: #888;
+    }
+
+    .empty-state p {
+      color: #666;
+      margin-bottom: 20px;
+    }
+
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 25px;
+      width: 100%;
+      max-width: 500px;
+      border: 1px solid #0f3460;
+    }
+
+    .modal h3 {
+      margin-bottom: 20px;
+      color: #fff;
+    }
+
+    .form-group {
+      margin-bottom: 15px;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 5px;
+      color: #aaa;
+      font-size: 0.9rem;
+    }
+
+    .form-group input {
+      width: 100%;
+      padding: 10px 12px;
+      background: #1a1a2e;
+      border: 1px solid #0f3460;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 0.95rem;
+    }
+
+    .form-group input:focus {
+      outline: none;
+      border-color: #e94560;
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+
+    .logs-container {
+      background: #0d1117;
+      border-radius: 8px;
+      padding: 15px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+
+    .logs-container .log-line {
+      color: #8b949e;
+    }
+
+    .logs-container .log-line.error {
+      color: #f85149;
+    }
+
+    .hidden { display: none !important; }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #888;
+    }
+
+    .error-message {
+      background: #ed424520;
+      border: 1px solid #ed4245;
+      color: #ed4245;
+      padding: 10px 15px;
+      border-radius: 6px;
+      margin-bottom: 20px;
+    }
+
+    .success-message {
+      background: #3ba55d20;
+      border: 1px solid #3ba55d;
+      color: #3ba55d;
+      padding: 10px 15px;
+      border-radius: 6px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Discord Bot Manager</h1>
+    <div class="status">
+      <div class="dot"></div>
+      <span>Docker Connected</span>
+    </div>
+  </div>
+
+  <div class="container">
+    <div id="message"></div>
+
+    <div class="toolbar">
+      <h2>Your Bots</h2>
+      <button class="btn btn-primary" onclick="showAddBotModal()">+ Add Bot</button>
+    </div>
+
+    <div id="bots-container">
+      <div class="loading">Loading bots...</div>
+    </div>
+  </div>
+
+  <!-- Add Bot Modal -->
+  <div id="add-modal" class="modal-overlay hidden">
+    <div class="modal">
+      <h3>Add New Bot</h3>
+      <div class="form-group">
+        <label>Bot Name *</label>
+        <input type="text" id="bot-name" placeholder="My Discord Bot">
+      </div>
+      <div class="form-group">
+        <label>Git URL * (include token for private repos)</label>
+        <input type="text" id="bot-url" placeholder="https://TOKEN@github.com/user/repo.git">
+      </div>
+      <div class="form-group">
+        <label>Branch</label>
+        <input type="text" id="bot-branch" placeholder="main" value="main">
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideAddBotModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="addBot()">Add Bot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Logs Modal -->
+  <div id="logs-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 700px;">
+      <h3>Bot Logs: <span id="logs-bot-name"></span></h3>
+      <div id="logs-container" class="logs-container">
+        <div class="loading">Loading logs...</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideLogsModal()">Close</button>
+        <button class="btn btn-primary" onclick="refreshLogs()">Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let bots = [];
+    let currentLogsBotId = null;
+
+    // WebSocket for real-time updates
+    let ws = null;
+    function connectWebSocket() {
+      ws = new WebSocket(`ws://${window.location.host}/ws`);
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type.startsWith('bot:')) {
+          loadBots();
+        }
+      };
+      ws.onclose = () => setTimeout(connectWebSocket, 3000);
+    }
+    connectWebSocket();
+
+    // API helper
+    async function api(method, endpoint, data = null) {
+      const options = {
+        method,
+        headers: { 'Content-Type': 'application/json' }
+      };
+      if (data) options.body = JSON.stringify(data);
+
+      const res = await fetch(`/api${endpoint}`, options);
+      return res.json();
+    }
+
+    // Show message
+    function showMessage(type, text) {
+      const el = document.getElementById('message');
+      el.className = type === 'error' ? 'error-message' : 'success-message';
+      el.textContent = text;
+      setTimeout(() => el.textContent = '', 5000);
+    }
+
+    // Load bots
+    async function loadBots() {
+      try {
+        const res = await api('GET', '/bots');
+        if (res.success) {
+          bots = res.bots;
+          renderBots();
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to load bots');
+      }
+    }
+
+    // Render bots
+    function renderBots() {
+      const container = document.getElementById('bots-container');
+
+      if (bots.length === 0) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <h3>No Bots Yet</h3>
+            <p>Add your first Discord bot from a GitHub repository.</p>
+            <button class="btn btn-primary" onclick="showAddBotModal()">+ Add Bot</button>
+          </div>
+        `;
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="bot-grid">
+          ${bots.map(bot => `
+            <div class="bot-card">
+              <div class="bot-card-header">
+                <div>
+                  <h3>${escapeHtml(bot.name)}</h3>
+                  <div class="repo-url">${escapeHtml(getDisplayUrl(bot.url || bot.imageRef || ''))}</div>
+                </div>
+                <span class="status-badge status-${bot.status}">${bot.status}</span>
+              </div>
+              <div class="bot-card-actions">
+                ${bot.status === 'running' ? `
+                  <button class="btn btn-danger btn-small" onclick="stopBot('${bot.id}')">Stop</button>
+                  <button class="btn btn-secondary btn-small" onclick="restartBot('${bot.id}')">Restart</button>
+                ` : `
+                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
+                `}
+                <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                <button class="btn btn-secondary btn-small" onclick="pullBot('${bot.id}')">Pull</button>
+                <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
+    // Escape HTML
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Bot actions
+    async function startBot(id) {
+      const res = await api('POST', `/bots/${id}/start`);
+      if (res.success) {
+        showMessage('success', 'Bot starting...');
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to start bot');
+      }
+    }
+
+    async function stopBot(id) {
+      const res = await api('POST', `/bots/${id}/stop`);
+      if (res.success) {
+        showMessage('success', 'Bot stopped');
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to stop bot');
+      }
+    }
+
+    async function restartBot(id) {
+      const res = await api('POST', `/bots/${id}/restart`);
+      if (res.success) {
+        showMessage('success', 'Bot restarting...');
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to restart bot');
+      }
+    }
+
+    async function pullBot(id) {
+      showMessage('success', 'Pulling latest code...');
+      const res = await api('POST', `/bots/${id}/pull`);
+      if (res.success) {
+        showMessage('success', 'Code updated and rebuilt');
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to pull');
+      }
+    }
+
+    async function deleteBot(id) {
+      if (!confirm('Delete this bot? This will remove all files and stop the container.')) return;
+      const res = await api('DELETE', `/bots/${id}`);
+      if (res.success) {
+        showMessage('success', 'Bot deleted');
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to delete bot');
+      }
+    }
+
+    // Add bot modal
+    function showAddBotModal() {
+      document.getElementById('add-modal').classList.remove('hidden');
+    }
+
+    // Hide token in URL for display
+    function getDisplayUrl(url) {
+      if (!url) return '';
+      return url.replace(/\/\/([^@]+)@/, '//***@');
+    }
+
+    function hideAddBotModal() {
+      document.getElementById('add-modal').classList.add('hidden');
+      document.getElementById('bot-name').value = '';
+      document.getElementById('bot-url').value = '';
+      document.getElementById('bot-branch').value = 'main';
+    }
+
+    async function addBot() {
+      const name = document.getElementById('bot-name').value.trim();
+      const url = document.getElementById('bot-url').value.trim();
+      const branch = document.getElementById('bot-branch').value.trim() || 'main';
+
+      if (!name || !url) {
+        showMessage('error', 'Name and URL are required');
+        return;
+      }
+
+      const res = await api('POST', '/bots', { name, url, branch });
+      if (res.success) {
+        showMessage('success', 'Bot added successfully');
+        hideAddBotModal();
+        loadBots();
+      } else {
+        showMessage('error', res.error || 'Failed to add bot');
+      }
+    }
+
+    // Logs modal
+    function showLogs(botId, botName) {
+      currentLogsBotId = botId;
+      document.getElementById('logs-bot-name').textContent = botName;
+      document.getElementById('logs-modal').classList.remove('hidden');
+      refreshLogs();
+    }
+
+    function hideLogsModal() {
+      document.getElementById('logs-modal').classList.add('hidden');
+      currentLogsBotId = null;
+    }
+
+    async function refreshLogs() {
+      if (!currentLogsBotId) return;
+
+      const container = document.getElementById('logs-container');
+      container.innerHTML = '<div class="loading">Loading logs...</div>';
+
+      const res = await api('GET', `/bots/${currentLogsBotId}/logs?tail=100`);
+      if (res.success && res.logs) {
+        container.innerHTML = res.logs.map(log =>
+          `<div class="log-line">${escapeHtml(log)}</div>`
+        ).join('') || '<div class="log-line">No logs available</div>';
+        container.scrollTop = container.scrollHeight;
+      } else {
+        container.innerHTML = `<div class="log-line error">${res.error || 'Failed to load logs'}</div>`;
+      }
+    }
+
+    // Initialize
+    loadBots();
+  </script>
+</body>
+</html>

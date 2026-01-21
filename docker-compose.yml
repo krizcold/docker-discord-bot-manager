@@ -1,0 +1,75 @@
+name: discordbotmanager
+
+services:
+  discordbotmanager:
+    image: ghcr.io/yundera/nginx-hash-lock:latest
+    restart: unless-stopped
+    user: "root"
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+    expose:
+      - "80"
+    environment:
+      AUTH_HASH: $AUTH_HASH
+      BACKEND_HOST: "discordbotmanagerapp"
+      BACKEND_PORT: "8080"
+      LISTEN_PORT: "80"
+      ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
+    depends_on:
+      - discordbotmanagerapp
+    networks:
+      - pcs
+
+  discordbotmanagerapp:
+    image: ghcr.io/krizcold/discord-bot-manager:latest
+    container_name: discordbotmanagerapp
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data
+      PORT: 8080
+      API_HASH: $API_HASH
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: $DATA_ROOT/AppData/discordbotmanager/data
+        target: /data
+    networks:
+      - pcs
+    expose:
+      - 8080
+    x-casaos:
+      volumes:
+        - container: /var/run/docker.sock
+          description:
+            en_us: Docker socket for container management.
+        - container: /data
+          description:
+            en_us: Persistent data directory for bot configurations and registry.
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: discordbotmanager
+  author: kriz_cold
+  developer: kriz_cold
+  icon: https://cdn.statically.io/gh/krizcold/AppStore/main/Apps/Discord-Bot-Manager/icon.png
+  tagline:
+    en_us: "Manage multiple Discord bots from GitHub repositories"
+  category: Utilities
+  description:
+    en_us: "A Docker-based platform for managing Discord bots. Import bots from GitHub, configure environment variables, and manage deployments with automatic updates."
+  title:
+    en_us: "Discord Bot Manager"
+  port_map: "80"
+  index: /?hash=$AUTH_HASH
+  webui_port: 80
+
+networks:
+  pcs:
+    external: true

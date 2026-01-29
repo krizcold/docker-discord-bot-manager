@@ -23,7 +23,7 @@ services:
       - pcs
 
   discordbotmanagerapp:
-    image: ghcr.io/krizcold/discord-bot-manager:latest
+    image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped
     environment:

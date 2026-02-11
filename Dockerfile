@@ -20,6 +20,9 @@ COPY . .
 # Build TypeScript
 RUN npm run build
 
+# Copy static assets (HTML, CSS, JS) that tsc doesn't handle
+RUN cp -r src/webui/public dist/webui/public
+
 # Create data directory
 RUN mkdir -p /data/data/bots
 

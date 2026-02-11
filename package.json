@@ -5,7 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "tsc && cp -r src/webui/public dist/webui/public",
     "start": "node dist/index.js",
     "docker:build": "docker build -t discord-bot-manager .",
     "docker:run": "docker-compose up -d"

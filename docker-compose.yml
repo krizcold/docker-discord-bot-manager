@@ -4,28 +4,30 @@ services:
   discordbotmanager:
     image: ghcr.io/yundera/nginx-hash-lock:latest
     restart: unless-stopped
-    user: "root"
-    privileged: true
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
     expose:
       - "80"
+    user: "root"
     environment:
       AUTH_HASH: $AUTH_HASH
       BACKEND_HOST: "discordbotmanagerapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
       ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
+      ALLOWED_PATHS: "api"
     depends_on:
       - discordbotmanagerapp
     networks:
       - pcs
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
 
   discordbotmanagerapp:
     image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped
+    user: "root"
     environment:
       NODE_ENV: production
       DATA_DIR: /data
@@ -36,12 +38,24 @@ services:
         source: /var/run/docker.sock
         target: /var/run/docker.sock
       - type: bind
-        source: $DATA_ROOT/AppData/discordbotmanager/data
+        source: /DATA/AppData/discordbotmanager/data
         target: /data
     networks:
       - pcs
     expose:
       - 8080
+
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+
+    cpu_shares: 50
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
     x-casaos:
       volumes:
         - container: /var/run/docker.sock
@@ -50,6 +64,10 @@ services:
         - container: /data
           description:
             en_us: Persistent data directory for bot configurations and registry.
+
+networks:
+  pcs:
+    external: true
 
 x-casaos:
   architectures:
@@ -66,10 +84,8 @@ x-casaos:
     en_us: "A Docker-based platform for managing Discord bots. Import bots from GitHub, configure environment variables, and manage deployments with automatic updates."
   title:
     en_us: "Discord Bot Manager"
-  port_map: "80"
+  store_app_id: discordbotmanager
+  is_uncontrolled: false
   index: /?hash=$AUTH_HASH
+  port_map: "80"
   webui_port: 80
-
-networks:
-  pcs:
-    external: true

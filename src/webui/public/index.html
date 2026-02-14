@@ -269,6 +269,17 @@
       color: #f85149;
     }
 
+    .wizard-steps { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; }
+    .wizard-step { padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; background: #2a2a4a; color: #666; }
+    .wizard-step.active { background: #e94560; color: white; }
+    .wizard-step.completed { background: #3ba55d40; color: #3ba55d; }
+    .wizard-separator { color: #444; font-size: 0.8rem; }
+    .env-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+    .env-row input { flex: 1; padding: 8px 10px; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 6px; color: #fff; font-size: 0.85rem; }
+    .env-row .btn-remove { padding: 8px; background: none; border: none; color: #ed4245; cursor: pointer; font-size: 1rem; }
+    .detection-info { background: #0f3460; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 0.9rem; color: #aaa; }
+    .detection-info strong { color: #fff; }
+
     .hidden { display: none !important; }
 
     .loading {
@@ -318,26 +329,10 @@
     </div>
   </div>
 
-  <!-- Add Bot Modal -->
+  <!-- Add Bot Wizard Modal -->
   <div id="add-modal" class="modal-overlay hidden">
     <div class="modal">
-      <h3>Add New Bot</h3>
-      <div class="form-group">
-        <label>Bot Name *</label>
-        <input type="text" id="bot-name" placeholder="My Discord Bot">
-      </div>
-      <div class="form-group">
-        <label>Git URL * (include token for private repos)</label>
-        <input type="text" id="bot-url" placeholder="https://TOKEN@github.com/user/repo.git">
-      </div>
-      <div class="form-group">
-        <label>Branch</label>
-        <input type="text" id="bot-branch" placeholder="main" value="main">
-      </div>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" onclick="hideAddBotModal()">Cancel</button>
-        <button class="btn btn-primary" onclick="addBot()">Add Bot</button>
-      </div>
+      <div id="wizard-content"></div>
     </div>
   </div>
 
@@ -524,25 +519,118 @@
       }
     }
 
-    // Add bot modal
-    function showAddBotModal() {
-      document.getElementById('add-modal').classList.remove('hidden');
-    }
-
     // Hide token in URL for display
     function getDisplayUrl(url) {
       if (!url) return '';
       return url.replace(/\/\/([^@]+)@/, '//***@');
     }
 
-    function hideAddBotModal() {
-      document.getElementById('add-modal').classList.add('hidden');
-      document.getElementById('bot-name').value = '';
-      document.getElementById('bot-url').value = '';
-      document.getElementById('bot-branch').value = 'main';
+    // Wizard state
+    let wizardStep = 1;
+    let wizardBotId = null;
+    let wizardBotData = null;
+
+    function showAddBotModal() {
+      wizardStep = 1;
+      wizardBotId = null;
+      wizardBotData = null;
+      document.getElementById('add-modal').classList.remove('hidden');
+      renderWizard();
     }
 
-    async function addBot() {
+    function hideAddBotModal() {
+      document.getElementById('add-modal').classList.add('hidden');
+      wizardStep = 1;
+      wizardBotId = null;
+      wizardBotData = null;
+      loadBots();
+    }
+
+    function renderWizardSteps() {
+      const steps = ['Clone', 'Configure', 'Build'];
+      return `<div class="wizard-steps">
+        ${steps.map((s, i) => {
+          const num = i + 1;
+          let cls = 'wizard-step';
+          if (num === wizardStep) cls += ' active';
+          else if (num < wizardStep) cls += ' completed';
+          return `<span class="${cls}">${num}. ${s}</span>${num < 3 ? '<span class="wizard-separator">&rarr;</span>' : ''}`;
+        }).join('')}
+      </div>`;
+    }
+
+    function renderWizard() {
+      const el = document.getElementById('wizard-content');
+      if (wizardStep === 1) {
+        el.innerHTML = `
+          ${renderWizardSteps()}
+          <h3>Clone Repository</h3>
+          <div class="form-group">
+            <label>Bot Name *</label>
+            <input type="text" id="bot-name" placeholder="My Discord Bot">
+          </div>
+          <div class="form-group">
+            <label>Git URL * (include token for private repos)</label>
+            <input type="text" id="bot-url" placeholder="https://TOKEN@github.com/user/repo.git">
+          </div>
+          <div class="form-group">
+            <label>Branch</label>
+            <input type="text" id="bot-branch" placeholder="main" value="main">
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="hideAddBotModal()">Cancel</button>
+            <button class="btn btn-primary" onclick="wizardClone()">Clone</button>
+          </div>
+        `;
+      } else if (wizardStep === 2) {
+        const botType = wizardBotData?.botType || 'unknown';
+        const hasDb = wizardBotData?.hasDatabase;
+        el.innerHTML = `
+          ${renderWizardSteps()}
+          <h3>Configure Environment</h3>
+          <div class="detection-info">
+            Detected: <strong>${escapeHtml(botType)} bot</strong>${hasDb ? ' with database' : ''}
+          </div>
+          <div id="env-rows">
+            <div class="env-row">
+              <input type="text" placeholder="Key" value="DISCORD_TOKEN" class="env-key">
+              <input type="text" placeholder="Value" class="env-value">
+              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-small" onclick="addEnvRow()" style="margin-bottom: 10px;">+ Add Variable</button>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="wizardSkipEnv()">Skip</button>
+            <button class="btn btn-primary" onclick="wizardSaveEnv()">Save &amp; Continue</button>
+          </div>
+        `;
+      } else if (wizardStep === 3) {
+        el.innerHTML = `
+          ${renderWizardSteps()}
+          <h3>Build Image</h3>
+          <p style="color: #aaa; margin-bottom: 20px;">Ready to build Docker image for your bot. You can also skip this step — the image will be built automatically when you start the bot.</p>
+          <div id="build-status"></div>
+          <div class="modal-actions" id="build-actions">
+            <button class="btn btn-secondary" onclick="hideAddBotModal()">Close</button>
+            <button class="btn btn-primary" onclick="wizardBuild()">Build</button>
+          </div>
+        `;
+      }
+    }
+
+    function lockWizard() {
+      const modal = document.getElementById('add-modal');
+      modal.querySelectorAll('.btn').forEach(b => b.disabled = true);
+      modal.querySelectorAll('input').forEach(i => i.disabled = true);
+    }
+
+    function unlockWizard() {
+      const modal = document.getElementById('add-modal');
+      modal.querySelectorAll('.btn').forEach(b => b.disabled = false);
+      modal.querySelectorAll('input').forEach(i => i.disabled = false);
+    }
+
+    async function wizardClone() {
       const name = document.getElementById('bot-name').value.trim();
       const url = document.getElementById('bot-url').value.trim();
       const branch = document.getElementById('bot-branch').value.trim() || 'main';
@@ -552,31 +640,103 @@
         return;
       }
 
-      const modal = document.getElementById('add-modal');
-      const buttons = modal.querySelectorAll('.btn');
-      const inputs = modal.querySelectorAll('input');
-      const addBtn = modal.querySelector('.btn-primary');
-      const originalText = addBtn.textContent;
-
-      buttons.forEach(b => b.disabled = true);
-      inputs.forEach(i => i.disabled = true);
-      addBtn.textContent = 'Adding...';
+      lockWizard();
+      const cloneBtn = document.querySelector('#wizard-content .btn-primary');
+      const originalText = cloneBtn.textContent;
+      cloneBtn.textContent = 'Cloning...';
 
       try {
         const res = await api('POST', '/bots', { name, url, branch });
         if (res.success) {
-          showMessage('success', 'Bot added successfully');
-          hideAddBotModal();
-          loadBots();
+          wizardBotId = res.bot.id;
+          wizardBotData = res.bot;
+          wizardStep = 2;
+          renderWizard();
         } else {
-          showMessage('error', res.error || 'Failed to add bot');
+          showMessage('error', res.error || 'Failed to clone repository');
         }
       } catch (err) {
-        showMessage('error', 'Failed to add bot');
+        showMessage('error', 'Failed to clone repository');
       } finally {
-        buttons.forEach(b => b.disabled = false);
-        inputs.forEach(i => i.disabled = false);
-        addBtn.textContent = originalText;
+        unlockWizard();
+        if (cloneBtn.isConnected) cloneBtn.textContent = originalText;
+      }
+    }
+
+    function addEnvRow(key, value) {
+      const container = document.getElementById('env-rows');
+      const row = document.createElement('div');
+      row.className = 'env-row';
+      row.innerHTML = `
+        <input type="text" placeholder="Key" value="${escapeHtml(key || '')}" class="env-key">
+        <input type="text" placeholder="Value" value="${escapeHtml(value || '')}" class="env-value">
+        <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+      `;
+      container.appendChild(row);
+    }
+
+    function removeEnvRow(btn) {
+      btn.closest('.env-row').remove();
+    }
+
+    async function wizardSaveEnv() {
+      const rows = document.querySelectorAll('#env-rows .env-row');
+      const vars = {};
+      rows.forEach(row => {
+        const key = row.querySelector('.env-key').value.trim();
+        const value = row.querySelector('.env-value').value.trim();
+        if (key) vars[key] = value;
+      });
+
+      lockWizard();
+      const saveBtn = document.querySelector('#wizard-content .btn-primary');
+      const originalText = saveBtn.textContent;
+      saveBtn.textContent = 'Saving...';
+
+      try {
+        const res = await api('PUT', `/bots/${wizardBotId}/env`, { vars });
+        if (res.success) {
+          wizardStep = 3;
+          renderWizard();
+        } else {
+          showMessage('error', res.error || 'Failed to save environment variables');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to save environment variables');
+      } finally {
+        unlockWizard();
+        if (saveBtn.isConnected) saveBtn.textContent = originalText;
+      }
+    }
+
+    function wizardSkipEnv() {
+      wizardStep = 3;
+      renderWizard();
+    }
+
+    async function wizardBuild() {
+      lockWizard();
+      const buildBtn = document.querySelector('#build-actions .btn-primary');
+      const statusEl = document.getElementById('build-status');
+      buildBtn.textContent = 'Building...';
+      statusEl.innerHTML = '<div class="detection-info">Building Docker image... This may take a few minutes.</div>';
+
+      try {
+        const res = await api('POST', `/bots/${wizardBotId}/build`);
+        if (res.success) {
+          statusEl.innerHTML = '<div class="success-message">Build complete!</div>';
+          document.getElementById('build-actions').innerHTML = `
+            <button class="btn btn-primary" onclick="hideAddBotModal()">Done</button>
+          `;
+        } else {
+          statusEl.innerHTML = `<div class="error-message">${escapeHtml(res.error || 'Build failed')}</div>`;
+          unlockWizard();
+          buildBtn.textContent = 'Build';
+        }
+      } catch (err) {
+        statusEl.innerHTML = '<div class="error-message">Build failed. You can try again or close and start the bot later.</div>';
+        unlockWizard();
+        buildBtn.textContent = 'Build';
       }
     }
 

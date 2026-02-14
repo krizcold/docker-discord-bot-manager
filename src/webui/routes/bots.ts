@@ -237,6 +237,27 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * POST /api/bots/:id/build - Build bot image without starting
+   */
+  router.post('/:id/build', async (req: Request, res: Response) => {
+    try {
+      const result = await containerManager.buildBot(req.params.id);
+
+      if (!result.success) {
+        res.status(400).json(result);
+        return;
+      }
+
+      const bot = containerManager.getBot(req.params.id);
+      broadcastToClients(wss, 'bot:built', bot);
+
+      res.json({ success: true, bot });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * GET /api/bots/:id/logs - Get bot logs
    */
   router.get('/:id/logs', async (req: Request, res: Response) => {

@@ -355,6 +355,9 @@
     let bots = [];
     let currentLogsBotId = null;
 
+    // Get hash from URL for authenticated API calls
+    const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
+
     // WebSocket for real-time updates
     let ws = null;
     function connectWebSocket() {
@@ -370,9 +373,6 @@
       ws.onclose = () => setTimeout(connectWebSocket, 3000);
     }
     connectWebSocket();
-
-    // Get hash from URL for authenticated API calls
-    const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
 
     // API helper
     async function api(method, endpoint, data = null) {

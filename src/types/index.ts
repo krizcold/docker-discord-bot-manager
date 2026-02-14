@@ -35,6 +35,9 @@ export interface BotConfig {
   botType?: BotType;
   hasDatabase?: boolean;
 
+  // Lifecycle
+  hasBeenStarted?: boolean;
+
   // Metadata
   createdAt: string;
   updatedAt: string;

@@ -279,6 +279,9 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
 
   if (bot) {
     bot.status = status;
+    if (status === 'running') {
+      bot.hasBeenStarted = true;
+    }
     if (containerIds !== undefined) {
       bot.containerIds = containerIds || [];
     }

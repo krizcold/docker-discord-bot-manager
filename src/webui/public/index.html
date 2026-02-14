@@ -104,6 +104,11 @@
       color: white;
     }
 
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     .btn-small {
       padding: 6px 12px;
       font-size: 0.8rem;
@@ -125,7 +130,6 @@
 
     .bot-card:hover {
       border-color: #e94560;
-      transform: translateY(-2px);
     }
 
     .bot-card-header {
@@ -355,14 +359,17 @@
     let bots = [];
     let currentLogsBotId = null;
 
-    // Get hash from URL for authenticated API calls
+    // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
+    if (urlHash) {
+      fetch(`/nhl-auth/establish-session?hash=${urlHash}`);
+    }
 
     // WebSocket for real-time updates
     let ws = null;
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws${urlHash ? '?hash=' + urlHash : ''}`;
+      const wsUrl = `${protocol}//${window.location.host}/ws`;
       ws = new WebSocket(wsUrl);
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
@@ -381,9 +388,7 @@
         headers: { 'Content-Type': 'application/json' }
       };
       if (data) options.body = JSON.stringify(data);
-
-      const separator = endpoint.includes('?') ? '&' : '?';
-      const res = await fetch(`/api${endpoint}${urlHash ? separator + 'hash=' + urlHash : ''}`, options);
+      const res = await fetch(`/api${endpoint}`, options);
       return res.json();
     }
 
@@ -392,7 +397,7 @@
       const el = document.getElementById('message');
       el.className = type === 'error' ? 'error-message' : 'success-message';
       el.textContent = text;
-      setTimeout(() => el.textContent = '', 5000);
+      setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000);
     }
 
     // Load bots
@@ -442,12 +447,16 @@
                 ${bot.status === 'running' ? `
                   <button class="btn btn-danger btn-small" onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small" onclick="restartBot('${bot.id}')">Restart</button>
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                ` : bot.hasBeenStarted ? `
+                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-secondary btn-small" onclick="pullBot('${bot.id}')">Pull</button>
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                  <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
-                <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
-                <button class="btn btn-secondary btn-small" onclick="pullBot('${bot.id}')">Pull</button>
-                <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
               </div>
             </div>
           `).join('')}
@@ -543,13 +552,31 @@
         return;
       }
 
-      const res = await api('POST', '/bots', { name, url, branch });
-      if (res.success) {
-        showMessage('success', 'Bot added successfully');
-        hideAddBotModal();
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to add bot');
+      const modal = document.getElementById('add-modal');
+      const buttons = modal.querySelectorAll('.btn');
+      const inputs = modal.querySelectorAll('input');
+      const addBtn = modal.querySelector('.btn-primary');
+      const originalText = addBtn.textContent;
+
+      buttons.forEach(b => b.disabled = true);
+      inputs.forEach(i => i.disabled = true);
+      addBtn.textContent = 'Adding...';
+
+      try {
+        const res = await api('POST', '/bots', { name, url, branch });
+        if (res.success) {
+          showMessage('success', 'Bot added successfully');
+          hideAddBotModal();
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Failed to add bot');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to add bot');
+      } finally {
+        buttons.forEach(b => b.disabled = false);
+        inputs.forEach(i => i.disabled = false);
+        addBtn.textContent = originalText;
       }
     }
 
@@ -572,14 +599,21 @@
       const container = document.getElementById('logs-container');
       container.innerHTML = '<div class="loading">Loading logs...</div>';
 
-      const res = await api('GET', `/bots/${currentLogsBotId}/logs?tail=100`);
-      if (res.success && res.logs) {
-        container.innerHTML = res.logs.map(log =>
-          `<div class="log-line">${escapeHtml(log)}</div>`
-        ).join('') || '<div class="log-line">No logs available</div>';
-        container.scrollTop = container.scrollHeight;
-      } else {
-        container.innerHTML = `<div class="log-line error">${res.error || 'Failed to load logs'}</div>`;
+      try {
+        const res = await api('GET', `/bots/${currentLogsBotId}/logs?tail=100`);
+        if (res.success && res.logs) {
+          container.innerHTML = res.logs.map(log =>
+            `<div class="log-line">${escapeHtml(log)}</div>`
+          ).join('') || '<div class="log-line">No logs available</div>';
+          container.scrollTop = container.scrollHeight;
+        } else {
+          const msg = (res.error && res.error.includes('no containers'))
+            ? 'No logs yet — start the bot first.'
+            : (res.error || 'Failed to load logs');
+          container.innerHTML = `<div class="log-line error">${escapeHtml(msg)}</div>`;
+        }
+      } catch (err) {
+        container.innerHTML = '<div class="log-line error">Failed to load logs. Please try again.</div>';
       }
     }
 

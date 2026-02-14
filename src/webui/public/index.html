@@ -358,7 +358,9 @@
     // WebSocket for real-time updates
     let ws = null;
     function connectWebSocket() {
-      ws = new WebSocket(`ws://${window.location.host}/ws`);
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws${urlHash ? '?hash=' + urlHash : ''}`;
+      ws = new WebSocket(wsUrl);
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.type.startsWith('bot:')) {
@@ -369,6 +371,9 @@
     }
     connectWebSocket();
 
+    // Get hash from URL for authenticated API calls
+    const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
+
     // API helper
     async function api(method, endpoint, data = null) {
       const options = {
@@ -377,7 +382,8 @@
       };
       if (data) options.body = JSON.stringify(data);
 
-      const res = await fetch(`/api${endpoint}`, options);
+      const separator = endpoint.includes('?') ? '&' : '?';
+      const res = await fetch(`/api${endpoint}${urlHash ? separator + 'hash=' + urlHash : ''}`, options);
       return res.json();
     }
 
@@ -395,11 +401,15 @@
         const res = await api('GET', '/bots');
         if (res.success) {
           bots = res.bots;
-          renderBots();
+        } else {
+          bots = [];
+          showMessage('error', res.error || 'Failed to load bots');
         }
       } catch (err) {
+        bots = [];
         showMessage('error', 'Failed to load bots');
       }
+      renderBots();
     }
 
     // Render bots

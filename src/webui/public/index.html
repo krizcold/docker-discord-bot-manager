@@ -923,7 +923,7 @@
     }
 
     function streamBuildLogs(botId) {
-      const url = `/api/bots/${botId}/build-logs`;
+      const url = `/api/bots/${botId}/build-logs?fresh=true`;
       terminalEventSource = new EventSource(url);
 
       terminalEventSource.onmessage = (event) => {

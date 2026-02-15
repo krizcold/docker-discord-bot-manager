@@ -23,7 +23,7 @@ export interface BotConfig {
   status: BotStatus;
   containerIds: string[];
 
-  // Tokens (Yundera-style)
+  // Authentication tokens
   updateToken?: string;
   authHash?: string;
 

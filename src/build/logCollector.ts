@@ -1,10 +1,9 @@
 /**
  * Build Log Collector
  * EventEmitter-based log collector for real-time build log streaming.
- * Adapted from Yundera GitHub Compiler's build-queue.ts pattern.
  *
- * Fixes the Yundera log accumulation bug: logs are always cleared
- * when a new build starts, so old logs never leak into new sessions.
+ * Logs are always cleared when a new build starts, so old logs
+ * never leak into new sessions.
  */
 
 import { EventEmitter } from 'events';

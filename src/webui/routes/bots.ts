@@ -272,7 +272,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * GET /api/bots/:id/build-logs - Stream build logs via Server-Sent Events
-   * Adapted from Yundera GitHub Compiler's SSE log streaming pattern.
    */
   router.get('/:id/build-logs', (req: Request, res: Response) => {
     const bot = containerManager.getBot(req.params.id);
@@ -294,6 +293,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     // Get log collector (creates one if needed)
     const logCollector = logCollectors.get(req.params.id);
+
+    // If fresh=true, clear old logs (new terminal popup for a new action)
+    if (req.query.fresh === 'true') {
+      logCollector.clear();
+    }
 
     // Send any existing logs (so late-joiners see history)
     const existingLogs = logCollector.getLogs();

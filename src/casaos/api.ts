@@ -3,7 +3,7 @@
  * Wrapper for CasaOS container management API (via docker exec)
  */
 
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
@@ -97,30 +97,64 @@ export async function uninstallApp(appName: string): Promise<boolean> {
 
 /**
  * Deploy a compose app using docker compose up -d
- * This is the primary deployment method for CasaOS
+ * Uses spawn for reliable execution and log streaming.
  */
 export async function deployApp(
   appName: string,
-  composePath: string
+  composePath: string,
+  onLog?: (message: string) => void,
+  timeoutMs: number = 300000
 ): Promise<{ success: boolean; error?: string }> {
-  try {
-    const cmd = `docker compose -p ${appName} -f ${composePath} up -d`;
-    const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
+  return new Promise((resolve) => {
+    console.log(`[CasaOS API] Deploying ${appName} from ${composePath}`);
 
-    if (stderr && !stderr.includes('Creating') && !stderr.includes('Started')) {
-      console.warn(`[CasaOS API] Deploy warning for ${appName}:`, stderr);
-    }
+    const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--remove-orphans'];
+    const child = spawn('docker', args);
 
-    console.log(`[CasaOS API] Deployed app: ${appName}`);
-    return { success: true };
-  } catch (error: unknown) {
-    const errMsg = error instanceof Error ? error.message : String(error);
-    // Extract stderr from exec errors which contain the actual docker compose error
-    const stderr = (error as { stderr?: string })?.stderr;
-    const detail = stderr ? stderr.trim() : errMsg;
-    console.error(`[CasaOS API] Failed to deploy app ${appName}:`, detail);
-    return { success: false, error: detail };
-  }
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      setTimeout(() => { if (!child.killed) child.kill('SIGKILL'); }, 5000);
+      resolve({ success: false, error: `Deploy timed out after ${Math.round(timeoutMs / 1000)}s` });
+    }, timeoutMs);
+
+    const processLog = (data: Buffer) => {
+      const lines = data.toString().split(/[\r\n]+/);
+      lines.forEach(line => {
+        if (!line.trim()) return;
+        console.log(`[Compose ${appName}] ${line}`);
+        if (onLog) onLog(line);
+      });
+    };
+
+    child.stdout.on('data', processLog);
+    child.stderr.on('data', processLog);
+
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      child.stdout.removeAllListeners();
+      child.stderr.removeAllListeners();
+      child.removeAllListeners();
+
+      if (code === 0) {
+        console.log(`[CasaOS API] Deployed app: ${appName}`);
+        resolve({ success: true });
+      } else {
+        const msg = `docker compose up failed (exit code ${code})`;
+        console.error(`[CasaOS API] ${msg}`);
+        resolve({ success: false, error: msg });
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      child.stdout.removeAllListeners();
+      child.stderr.removeAllListeners();
+      child.removeAllListeners();
+
+      console.error(`[CasaOS API] Failed to spawn docker compose for ${appName}:`, err);
+      resolve({ success: false, error: `Failed to start deploy: ${err.message}` });
+    });
+  });
 }
 
 /**

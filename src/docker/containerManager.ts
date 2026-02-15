@@ -2,11 +2,10 @@
  * Container Manager
  * High-level management of bot containers
  *
- * Follows Yundera GitHub Compiler pattern:
- * - Use repo's docker-compose.yml when it exists
- * - Apply variable substitution ($APP_ID, $API_HASH, etc.)
- * - Generate compose only when repo doesn't have one
- * - Support pre-built Docker images (docker-image source type)
+ * - Uses repo's docker-compose.yml when it exists
+ * - Applies variable substitution ($APP_ID, $API_HASH, etc.)
+ * - Generates compose only when repo doesn't have one
+ * - Supports pre-built Docker images (docker-image source type)
  */
 
 import * as fs from 'fs';
@@ -112,7 +111,7 @@ export function getBot(botId: string): BotConfig | null {
 /**
  * Create a new bot from a GitHub repository or Docker image
  * Supports two source types:
- * - 'git': Clone repo and use its docker-compose.yml (Yundera pattern)
+ * - 'git': Clone repo and use its docker-compose.yml
  * - 'docker-image': Use pre-built image from registry
  */
 export async function createBot(request: CreateBotRequest): Promise<BotConfig> {
@@ -122,7 +121,7 @@ export async function createBot(request: CreateBotRequest): Promise<BotConfig> {
   const now = new Date().toISOString();
   const sourceType: BotSourceType = request.sourceType || 'git';
 
-  // Generate tokens (Yundera-style)
+  // Generate authentication tokens
   const updateToken = uuidv4();
   const authHash = generateHash();
 
@@ -174,7 +173,7 @@ export async function createBot(request: CreateBotRequest): Promise<BotConfig> {
     status: 'stopped',
     containerIds: [],
 
-    // Tokens (Yundera-style)
+    // Authentication tokens
     updateToken,
     authHash,
 
@@ -318,7 +317,7 @@ export async function startBot(botId: string): Promise<{ success: boolean; error
 }
 
 /**
- * Start a bot from git repository (Yundera pattern)
+ * Start a bot from git repository
  * - Uses repo's docker-compose.yml when it exists
  * - Checks x-casaos.build for which service to build locally
  * - Applies variable substitution
@@ -410,7 +409,9 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
       emit('[Start] Starting containers...', 'info');
       updateBotStatus(botId, 'starting');
 
-      const deployResult = await casaosApi.deployApp(appName, composePath);
+      const deployResult = await casaosApi.deployApp(appName, composePath, (msg) => {
+        emit(`[Compose] ${msg}`, 'info');
+      });
       if (!deployResult.success) {
         throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
       }
@@ -678,7 +679,7 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
 
   const sourceType = bot.sourceType || 'git';
   const log = logCollectors.get(botId);
-  log.clear(); // Fix Yundera accumulation bug: always start fresh
+  log.clear(); // Prevent log accumulation: always start fresh
 
   const emit = (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success' = 'info') => {
     console.log(`[Build ${botId}] ${msg}`);

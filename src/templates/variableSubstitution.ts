@@ -1,8 +1,7 @@
 /**
- * Variable Substitution System (Yundera Compiler Pattern)
+ * Variable Substitution System
  *
  * Replaces placeholder variables in docker-compose.yml files with actual values.
- * This follows the same pattern as the Yundera GitHub Compiler.
  */
 
 import crypto from 'crypto';

@@ -2,10 +2,9 @@
  * Docker Compose Generator
  * Generates docker-compose.yml files for bots (CasaOS compatible)
  *
- * Follows Yundera GitHub Compiler pattern:
- * - Use repo's docker-compose.yml when it exists
- * - Apply variable substitution ($APP_ID, $API_HASH, etc.)
- * - Generate compose only when repo doesn't have one
+ * - Uses repo's docker-compose.yml when it exists
+ * - Applies variable substitution ($APP_ID, $API_HASH, etc.)
+ * - Generates compose only when repo doesn't have one
  */
 
 import * as fs from 'fs';
@@ -338,7 +337,7 @@ export function hasExistingCompose(repoPath: string): string | null {
 }
 
 /**
- * Adapt existing compose file for CasaOS (Yundera pattern)
+ * Adapt existing compose file for CasaOS
  * - Applies variable substitution
  * - Adds Bot Manager labels
  * - Adds CasaOS metadata
@@ -357,7 +356,7 @@ export function adaptExistingCompose(
   let content = fs.readFileSync(existingPath, 'utf-8');
   const appName = `bot-${bot.id}`;
 
-  // 1. Apply variable substitution (Yundera pattern)
+  // 1. Apply variable substitution
   content = applyVariableSubstitution(content, bot);
 
   // 2. Replace version with name (Compose v2 format)

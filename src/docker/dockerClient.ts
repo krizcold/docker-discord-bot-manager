@@ -1,6 +1,6 @@
 /**
  * Docker Client Wrapper
- * Uses Docker CLI (like Yundera GitHub Compiler) for cross-platform compatibility
+ * Uses Docker CLI for cross-platform compatibility
  */
 
 import { execFileSync, execSync, spawn } from 'child_process';
@@ -251,7 +251,7 @@ export async function streamContainerLogs(
 }
 
 /**
- * Build a Docker image from a Dockerfile (Yundera pattern)
+ * Build a Docker image from a Dockerfile
  */
 export async function buildImage(
   contextPath: string,

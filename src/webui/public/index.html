@@ -965,6 +965,12 @@
     }
 
     function markTerminalComplete(success) {
+      // Add a clear completion line in the terminal itself
+      addTerminalLog(
+        success ? '--- Process completed successfully ---' : '--- Process failed ---',
+        success ? 'success' : 'error'
+      );
+
       const dot = document.getElementById('terminal-dot');
       const statusText = document.getElementById('terminal-status-text');
 

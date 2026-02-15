@@ -102,7 +102,7 @@ export async function uninstallApp(appName: string): Promise<boolean> {
 export async function deployApp(
   appName: string,
   composePath: string
-): Promise<boolean> {
+): Promise<{ success: boolean; error?: string }> {
   try {
     const cmd = `docker compose -p ${appName} -f ${composePath} up -d`;
     const { stdout, stderr } = await execAsync(cmd, { timeout: 120000 });
@@ -112,10 +112,14 @@ export async function deployApp(
     }
 
     console.log(`[CasaOS API] Deployed app: ${appName}`);
-    return true;
-  } catch (error) {
-    console.error(`[CasaOS API] Failed to deploy app ${appName}:`, error);
-    return false;
+    return { success: true };
+  } catch (error: unknown) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    // Extract stderr from exec errors which contain the actual docker compose error
+    const stderr = (error as { stderr?: string })?.stderr;
+    const detail = stderr ? stderr.trim() : errMsg;
+    console.error(`[CasaOS API] Failed to deploy app ${appName}:`, detail);
+    return { success: false, error: detail };
   }
 }
 

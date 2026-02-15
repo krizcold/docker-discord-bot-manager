@@ -335,7 +335,7 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
   };
 
   try {
-    emit(`🚀 Starting ${bot.name}...`, 'system');
+    emit(`[Start] Starting ${bot.name}...`, 'system');
     updateBotStatus(botId, 'building');
 
     const repoPath = getRepoPath(botId);
@@ -346,9 +346,9 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
 
     fs.mkdirSync(dataPath, { recursive: true });
 
-    emit('🔍 Detecting bot type...', 'info');
+    emit('[Detect] Detecting bot type...', 'info');
     const detection = detectBotType(repoPath);
-    emit(`📋 Detected: ${detection.type} bot`, 'info');
+    emit(`[Info] Detected: ${detection.type} bot`, 'info');
 
     const envWithToken = {
       ...bot.envVars,
@@ -361,13 +361,13 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
     let buildTarget: string | null = null;
 
     if (existingComposePath) {
-      emit(`📋 Using existing compose file`, 'info');
+      emit(`[Info] Using existing compose file`, 'info');
 
       const buildInfo = getComposeBuildInfo(repoPath);
       buildTarget = buildInfo.buildTarget;
 
       if (buildTarget) {
-        emit(`🔧 Found build target: ${buildTarget}`, 'info');
+        emit(`[Config] Found build target: ${buildTarget}`, 'info');
       }
 
       composeContent = processExistingCompose(repoPath, botDir, botWithEnv);
@@ -376,10 +376,10 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
         composeContent = replaceServiceImageWithBuild(composeContent, buildTarget, repoPath, imageName);
       }
     } else {
-      emit(`📋 Generating compose for ${detection.type} bot`, 'info');
+      emit(`[Info] Generating compose for ${detection.type} bot`, 'info');
 
       if (!detection.hasDockerfile && detection.type !== 'compose') {
-        emit(`🔧 Generating Dockerfile for ${detection.type} bot`, 'info');
+        emit(`[Config] Generating Dockerfile for ${detection.type} bot`, 'info');
         const dockerfile = generateDockerfile(detection);
         fs.writeFileSync(path.join(repoPath, 'Dockerfile'), dockerfile);
       }
@@ -389,47 +389,47 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
     }
 
     writeComposeFile(botDir, composeContent);
-    emit('✅ Compose file written', 'success');
+    emit('[Done] Compose file written', 'success');
 
     const deploymentMode = await getDeploymentMode();
     const composePath = path.join(botDir, 'docker-compose.yml');
 
     if (deploymentMode === 'casaos') {
-      emit(`🐳 Deploying via CasaOS (docker compose)`, 'info');
+      emit(`[Deploy] Deploying via CasaOS (docker compose)`, 'info');
 
       if (buildTarget) {
-        emit(`🏗️ Building image (${imageName})...`, 'info');
+        emit(`[Build] Building image (${imageName})...`, 'info');
         await dockerClient.buildImage(repoPath, imageName, (msg) => {
-          emit(`🐳 ${msg}`, 'info');
+          emit(`[Docker] ${msg}`, 'info');
         });
-        emit('✅ Image build completed', 'success');
+        emit('[Done] Image build completed', 'success');
       } else {
-        emit('⏭️ No build target — compose will pull images', 'info');
+        emit('[Skip] No build target — compose will pull images', 'info');
       }
 
-      emit('🚀 Starting containers...', 'info');
+      emit('[Start] Starting containers...', 'info');
       updateBotStatus(botId, 'starting');
 
-      const deployed = await casaosApi.deployApp(appName, composePath);
-      if (!deployed) {
-        throw new Error('Failed to deploy via docker compose');
+      const deployResult = await casaosApi.deployApp(appName, composePath);
+      if (!deployResult.success) {
+        throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
       }
 
       const containerIds = await getContainerIdsForBot(botId);
       updateBotStatus(botId, 'running', containerIds);
-      emit(`✅ Bot deployed (${containerIds.length} containers)`, 'success');
+      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     } else {
-      emit(`🐳 Deploying via Docker API`, 'info');
+      emit(`[Deploy] Deploying via Docker API`, 'info');
 
       if (buildTarget) {
-        emit(`🏗️ Building image (${imageName})...`, 'info');
+        emit(`[Build] Building image (${imageName})...`, 'info');
         await dockerClient.buildImage(repoPath, imageName, (msg) => {
-          emit(`🐳 ${msg}`, 'info');
+          emit(`[Docker] ${msg}`, 'info');
         });
-        emit('✅ Image build completed', 'success');
+        emit('[Done] Image build completed', 'success');
       }
 
-      emit('🚀 Creating container...', 'info');
+      emit('[Start] Creating container...', 'info');
       updateBotStatus(botId, 'starting');
 
       const containerId = await dockerClient.createBotContainer(
@@ -439,19 +439,19 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
         dataPath
       );
 
-      emit('🚀 Starting container...', 'info');
+      emit('[Start] Starting container...', 'info');
       await dockerClient.startContainer(containerId);
 
       updateBotStatus(botId, 'running', [containerId]);
-      emit('✅ Bot started successfully', 'success');
+      emit('[Done] Bot started successfully', 'success');
     }
 
-    emit(`🎉 ${bot.name} is now running!`, 'success');
+    emit(`[Success] ${bot.name} is now running!`, 'success');
     return { success: true };
   } catch (error) {
     const msg = String(error);
-    emit(`❌ Start failed: ${msg}`, 'error');
-    emit('💀 Start process terminated with error', 'error');
+    emit(`[Error] Start failed: ${msg}`, 'error');
+    emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start git bot ${botId}:`, error);
     updateBotStatus(botId, 'error');
     return { success: false, error: msg };
@@ -505,9 +505,9 @@ async function startDockerImageBot(bot: BotConfig): Promise<{ success: boolean; 
       updateBotStatus(botId, 'starting');
 
       // Deploy via docker compose (docker compose will pull the image)
-      const deployed = await casaosApi.deployApp(appName, composePath);
-      if (!deployed) {
-        throw new Error('Failed to deploy via docker compose');
+      const deployResult = await casaosApi.deployApp(appName, composePath);
+      if (!deployResult.success) {
+        throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
       }
 
       // Get all container IDs for this bot
@@ -686,20 +686,20 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
   };
 
   try {
-    emit(`🚀 Build process started for ${bot.name}`, 'system');
+    emit(`[Build] Build process started for ${bot.name}`, 'system');
     updateBotStatus(botId, 'building');
 
     if (sourceType === 'docker-image') {
       if (!bot.imageRef) {
-        emit('❌ imageRef is required for docker-image source type', 'error');
+        emit('[Error] imageRef is required for docker-image source type', 'error');
         updateBotStatus(botId, 'stopped');
         return { success: false, error: 'imageRef is required for docker-image source type' };
       }
 
-      emit(`📥 Pulling image ${bot.imageRef}...`, 'info');
-      await dockerClient.pullImage(bot.imageRef, (msg) => emit(`🐳 ${msg}`, 'info'));
+      emit(`[Pull] Pulling image ${bot.imageRef}...`, 'info');
+      await dockerClient.pullImage(bot.imageRef, (msg) => emit(`[Docker] ${msg}`, 'info'));
 
-      emit('📋 Generating compose file...', 'info');
+      emit('[Info] Generating compose file...', 'info');
       const botDir = getBotDir(botId);
       const dataPath = getDataPath(botId);
       fs.mkdirSync(botDir, { recursive: true });
@@ -709,7 +709,7 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
       const composeContent = generateImageCompose(botWithEnv, botDir);
       writeComposeFile(botDir, composeContent);
-      emit('✅ Compose file written', 'success');
+      emit('[Done] Compose file written', 'success');
     } else {
       const repoPath = getRepoPath(botId);
       const botDir = getBotDir(botId);
@@ -718,9 +718,9 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
 
       fs.mkdirSync(dataPath, { recursive: true });
 
-      emit('🔍 Detecting bot type...', 'info');
+      emit('[Detect] Detecting bot type...', 'info');
       const detection = detectBotType(repoPath);
-      emit(`📋 Detected: ${detection.type} bot (hasCompose: ${detection.hasCompose}, hasDatabase: ${detection.hasDatabase})`, 'info');
+      emit(`[Info] Detected: ${detection.type} bot (hasCompose: ${detection.hasCompose}, hasDatabase: ${detection.hasDatabase})`, 'info');
 
       const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '' };
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
@@ -730,13 +730,13 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       let buildTarget: string | null = null;
 
       if (existingComposePath) {
-        emit(`📋 Using existing compose file: ${existingComposePath}`, 'info');
+        emit(`[Info] Using existing compose file: ${existingComposePath}`, 'info');
 
         const buildInfo = getComposeBuildInfo(repoPath);
         buildTarget = buildInfo.buildTarget;
 
         if (buildTarget) {
-          emit(`🔧 Found build target: ${buildTarget}`, 'info');
+          emit(`[Config] Found build target: ${buildTarget}`, 'info');
         }
 
         composeContent = processExistingCompose(repoPath, botDir, botWithEnv);
@@ -745,10 +745,10 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
           composeContent = replaceServiceImageWithBuild(composeContent, buildTarget, repoPath, imageName);
         }
       } else {
-        emit(`📋 No compose file found, generating for ${detection.type} bot`, 'info');
+        emit(`[Info] No compose file found, generating for ${detection.type} bot`, 'info');
 
         if (!detection.hasDockerfile && detection.type !== 'compose') {
-          emit(`🔧 Generating Dockerfile for ${detection.type} bot`, 'info');
+          emit(`[Config] Generating Dockerfile for ${detection.type} bot`, 'info');
           const dockerfile = generateDockerfile(detection);
           fs.writeFileSync(path.join(repoPath, 'Dockerfile'), dockerfile);
         }
@@ -758,26 +758,26 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       }
 
       writeComposeFile(botDir, composeContent);
-      emit('✅ Compose file written', 'success');
+      emit('[Done] Compose file written', 'success');
 
       if (buildTarget) {
-        emit(`🏗️ Building Docker image (${imageName})...`, 'info');
+        emit(`[Build] Building Docker image (${imageName})...`, 'info');
         await dockerClient.buildImage(repoPath, imageName, (msg) => {
-          emit(`🐳 ${msg}`, 'info');
+          emit(`[Docker] ${msg}`, 'info');
         });
-        emit('✅ Docker image build completed', 'success');
+        emit('[Done] Docker image build completed', 'success');
       } else {
-        emit('⏭️ No build target — docker compose will pull images at start', 'info');
+        emit('[Skip] No build target — docker compose will pull images at start', 'info');
       }
     }
 
     updateBotStatus(botId, 'stopped');
-    emit(`🎉 Build completed successfully for ${bot.name}`, 'success');
+    emit(`[Success] Build completed successfully for ${bot.name}`, 'success');
     return { success: true };
   } catch (error) {
     const msg = String(error);
-    emit(`❌ Build failed: ${msg}`, 'error');
-    emit('💀 Build process terminated with error', 'error');
+    emit(`[Error] Build failed: ${msg}`, 'error');
+    emit('[Fatal] Build process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to build bot ${botId}:`, error);
     updateBotStatus(botId, 'error');
     return { success: false, error: msg };

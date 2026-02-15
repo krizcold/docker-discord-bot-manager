@@ -360,9 +360,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const envVars = envManager.getEnvVarsInfo(req.params.id);
       const validation = envManager.hasRequiredEnvVars(req.params.id);
 
+      // Also parse .env.example from repo if git source
+      let envExample: Array<{ key: string; description: string; defaultValue: string }> = [];
+      if (bot.sourceType !== 'docker-image') {
+        try {
+          const repoPath = repoManager.getRepoPath(req.params.id);
+          envExample = envManager.parseEnvExample(repoPath);
+        } catch (err) {
+          // Repo might not exist yet
+        }
+      }
+
       res.json({
         success: true,
         envVars,
+        envExample,
         valid: validation.valid,
         missing: validation.missing
       });

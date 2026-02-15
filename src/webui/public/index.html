@@ -529,11 +529,13 @@
     let wizardStep = 1;
     let wizardBotId = null;
     let wizardBotData = null;
+    let wizardEnvHints = []; // pre-populated env rows from required vars + .env.example
 
     function showAddBotModal() {
       wizardStep = 1;
       wizardBotId = null;
       wizardBotData = null;
+      wizardEnvHints = [];
       document.getElementById('add-modal').classList.remove('hidden');
       renderWizard();
     }
@@ -543,6 +545,7 @@
       wizardStep = 1;
       wizardBotId = null;
       wizardBotData = null;
+      wizardEnvHints = [];
       loadBots();
     }
 
@@ -585,6 +588,29 @@
       } else if (wizardStep === 2) {
         const botType = wizardBotData?.botType || 'unknown';
         const hasDb = wizardBotData?.hasDatabase;
+        const envRowsHtml = wizardEnvHints.length > 0
+          ? wizardEnvHints.map(h => `
+            <div class="env-row">
+              <input type="text" placeholder="Key" value="${escapeHtml(h.key)}" class="env-key">
+              <input type="text" placeholder="${escapeHtml(h.description || 'Value')}" value="${escapeHtml(h.defaultValue || '')}" class="env-value">
+              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+            </div>
+          `).join('')
+          : `<div class="env-row">
+              <input type="text" placeholder="Key" value="DISCORD_TOKEN" class="env-key">
+              <input type="text" placeholder="Value" class="env-value">
+              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+            </div>
+            <div class="env-row">
+              <input type="text" placeholder="Key" value="CLIENT_ID" class="env-key">
+              <input type="text" placeholder="Value" class="env-value">
+              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+            </div>
+            <div class="env-row">
+              <input type="text" placeholder="Key" value="GUILD_ID" class="env-key">
+              <input type="text" placeholder="Value" class="env-value">
+              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
+            </div>`;
         el.innerHTML = `
           ${renderWizardSteps()}
           <h3>Configure Environment</h3>
@@ -592,11 +618,7 @@
             Detected: <strong>${escapeHtml(botType)} bot</strong>${hasDb ? ' with database' : ''}
           </div>
           <div id="env-rows">
-            <div class="env-row">
-              <input type="text" placeholder="Key" value="DISCORD_TOKEN" class="env-key">
-              <input type="text" placeholder="Value" class="env-value">
-              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-            </div>
+            ${envRowsHtml}
           </div>
           <button class="btn btn-secondary btn-small" onclick="addEnvRow()" style="margin-bottom: 10px;">+ Add Variable</button>
           <div class="modal-actions">
@@ -650,6 +672,50 @@
         if (res.success) {
           wizardBotId = res.bot.id;
           wizardBotData = res.bot;
+
+          // Fetch env hints (required vars + .env.example from repo)
+          wizardEnvHints = [];
+          try {
+            const envRes = await api('GET', `/bots/${res.bot.id}/env`);
+            if (envRes.success) {
+              // Build hints: start with .env.example vars, then add missing required vars
+              const seen = new Set();
+              const hints = [];
+
+              // .env.example vars first (they have descriptions)
+              if (envRes.envExample) {
+                for (const ex of envRes.envExample) {
+                  seen.add(ex.key);
+                  hints.push({ key: ex.key, description: ex.description || '', defaultValue: ex.defaultValue || '' });
+                }
+              }
+
+              // Then add required vars not already covered by .env.example
+              if (envRes.missing) {
+                for (const key of envRes.missing) {
+                  if (!seen.has(key)) {
+                    seen.add(key);
+                    hints.push({ key, description: '', defaultValue: '' });
+                  }
+                }
+              }
+
+              // Also add any required vars from envVars list not yet seen
+              if (envRes.envVars) {
+                for (const v of envRes.envVars) {
+                  if (v.required && !seen.has(v.key)) {
+                    seen.add(v.key);
+                    hints.push({ key: v.key, description: '', defaultValue: '' });
+                  }
+                }
+              }
+
+              wizardEnvHints = hints;
+            }
+          } catch (e) {
+            // Non-fatal: wizard will fall back to default required vars
+          }
+
           wizardStep = 2;
           renderWizard();
         } else {

@@ -280,6 +280,52 @@
     .detection-info { background: #0f3460; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 0.9rem; color: #aaa; }
     .detection-info strong { color: #fff; }
 
+    /* Terminal popup for build/start logs */
+    .terminal-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 2000; display: flex; align-items: center; justify-content: center;
+      background: rgba(0, 0, 0, 0.75); animation: termFadeIn 0.15s ease;
+    }
+    @keyframes termFadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .terminal-box {
+      width: 90%; max-width: 800px; max-height: 80vh;
+      background: #0d1117; border-radius: 12px; overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5); display: flex; flex-direction: column;
+    }
+    .terminal-header {
+      background: #161b22; padding: 12px 16px; display: flex;
+      justify-content: space-between; align-items: center;
+      border-bottom: 1px solid #21262d;
+    }
+    .terminal-title { color: #fff; font-weight: 600; font-size: 0.9rem; }
+    .terminal-close {
+      background: none; border: none; color: #8b949e; font-size: 1.2rem;
+      cursor: pointer; padding: 4px 8px; border-radius: 4px;
+    }
+    .terminal-close:hover { color: #fff; background: #30363d; }
+    .terminal-body {
+      flex: 1; overflow-y: auto; padding: 12px 16px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: 0.8rem; line-height: 1.6; min-height: 300px; max-height: 60vh;
+    }
+    .terminal-body .log-line { color: #8b949e; white-space: pre-wrap; word-break: break-all; }
+    .terminal-body .log-line.system { color: #58a6ff; }
+    .terminal-body .log-line.success { color: #3ba55d; }
+    .terminal-body .log-line.error { color: #f85149; }
+    .terminal-body .log-line.warning { color: #d29922; }
+    .terminal-footer {
+      background: #161b22; padding: 8px 16px; border-top: 1px solid #21262d;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.75rem; color: #8b949e;
+    }
+    .terminal-status { display: flex; align-items: center; gap: 6px; }
+    .terminal-status .dot-live {
+      width: 8px; height: 8px; border-radius: 50%; background: #3ba55d;
+      animation: dotPulse 2s infinite;
+    }
+    .terminal-status .dot-done { width: 8px; height: 8px; border-radius: 50%; background: #8b949e; }
+    @keyframes dotPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
     .hidden { display: none !important; }
 
     .loading {
@@ -368,7 +414,18 @@
       ws = new WebSocket(wsUrl);
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.type.startsWith('bot:')) {
+        if (data.type === 'bot:built') {
+          if (terminalBotId && data.data?.id === terminalBotId) {
+            markTerminalComplete(true);
+          }
+          loadBots();
+        } else if (data.type === 'bot:build-failed') {
+          if (terminalBotId && data.data?.id === terminalBotId) {
+            addTerminalLog(`Build failed: ${data.data?.error || 'Unknown error'}`, 'error');
+            markTerminalComplete(false);
+          }
+          loadBots();
+        } else if (data.type.startsWith('bot:')) {
           loadBots();
         }
       };
@@ -468,12 +525,21 @@
 
     // Bot actions
     async function startBot(id) {
-      const res = await api('POST', `/bots/${id}/start`);
-      if (res.success) {
-        showMessage('success', 'Bot starting...');
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to start bot');
+      const bot = bots.find(b => b.id === id);
+      const botName = bot ? bot.name : id;
+      openTerminalPopup(botName, id, 'Starting');
+      try {
+        const res = await api('POST', `/bots/${id}/start`);
+        if (res.success) {
+          markTerminalComplete(true);
+          loadBots();
+        } else {
+          addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error');
+          markTerminalComplete(false);
+        }
+      } catch (err) {
+        addTerminalLog('Error: Failed to start bot', 'error');
+        markTerminalComplete(false);
       }
     }
 
@@ -530,6 +596,10 @@
     let wizardBotId = null;
     let wizardBotData = null;
     let wizardEnvHints = []; // pre-populated env rows from required vars + .env.example
+
+    // Terminal popup state
+    let terminalEventSource = null;
+    let terminalBotId = null;
 
     function showAddBotModal() {
       wizardStep = 1;
@@ -781,28 +851,135 @@
     }
 
     async function wizardBuild() {
-      lockWizard();
-      const buildBtn = document.querySelector('#build-actions .btn-primary');
-      const statusEl = document.getElementById('build-status');
-      buildBtn.textContent = 'Building...';
-      statusEl.innerHTML = '<div class="detection-info">Building Docker image... This may take a few minutes.</div>';
+      const botName = wizardBotData ? wizardBotData.name : wizardBotId;
+      const botId = wizardBotId; // Capture before openTerminalPopup resets wizard state
+
+      // Hide wizard and open terminal popup
+      document.getElementById('add-modal').classList.add('hidden');
+      openTerminalPopup(botName, botId, 'Building');
 
       try {
-        const res = await api('POST', `/bots/${wizardBotId}/build`);
-        if (res.success) {
-          statusEl.innerHTML = '<div class="success-message">Build complete!</div>';
-          document.getElementById('build-actions').innerHTML = `
-            <button class="btn btn-primary" onclick="hideAddBotModal()">Done</button>
-          `;
-        } else {
-          statusEl.innerHTML = `<div class="error-message">${escapeHtml(res.error || 'Build failed')}</div>`;
-          unlockWizard();
-          buildBtn.textContent = 'Build';
+        const res = await api('POST', `/bots/${botId}/build`);
+        if (!res.success) {
+          addTerminalLog(`Error: ${res.error || 'Build request failed'}`, 'error');
+          markTerminalComplete(false);
         }
+        // Build is fire-and-forget — logs stream via SSE
+        // Completion signaled by WebSocket bot:built / bot:build-failed
       } catch (err) {
-        statusEl.innerHTML = '<div class="error-message">Build failed. You can try again or close and start the bot later.</div>';
-        unlockWizard();
-        buildBtn.textContent = 'Build';
+        addTerminalLog('Error: Failed to start build', 'error');
+        markTerminalComplete(false);
+      }
+    }
+
+    // Terminal popup for build/start log streaming
+    function openTerminalPopup(botName, botId, action) {
+      closeTerminalPopup();
+      terminalBotId = botId;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'terminal-overlay';
+      overlay.id = 'terminal-popup';
+      overlay.innerHTML = `
+        <div class="terminal-box">
+          <div class="terminal-header">
+            <span class="terminal-title">${escapeHtml(action)}: ${escapeHtml(botName)}</span>
+            <button class="terminal-close" onclick="closeTerminalPopup()">&times;</button>
+          </div>
+          <div class="terminal-body" id="terminal-body"></div>
+          <div class="terminal-footer">
+            <div class="terminal-status">
+              <div class="dot-live" id="terminal-dot"></div>
+              <span id="terminal-status-text">Connecting...</span>
+            </div>
+            <button class="btn btn-secondary btn-small" onclick="closeTerminalPopup()">Close</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      // Start streaming build logs via SSE
+      streamBuildLogs(botId);
+    }
+
+    function closeTerminalPopup() {
+      if (terminalEventSource) {
+        terminalEventSource.close();
+        terminalEventSource = null;
+      }
+      terminalBotId = null;
+
+      const popup = document.getElementById('terminal-popup');
+      if (!popup) return; // Nothing to close — skip cleanup
+
+      popup.remove();
+
+      // Reset wizard state if wizard was in progress
+      wizardStep = 1;
+      wizardBotId = null;
+      wizardBotData = null;
+      wizardEnvHints = [];
+      loadBots();
+    }
+
+    function streamBuildLogs(botId) {
+      const url = `/api/bots/${botId}/build-logs`;
+      terminalEventSource = new EventSource(url);
+
+      terminalEventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'ping') return;
+          addTerminalLog(data.message, data.type || 'info');
+        } catch (e) {
+          addTerminalLog(event.data, 'info');
+        }
+      };
+
+      terminalEventSource.onopen = () => {
+        const statusText = document.getElementById('terminal-status-text');
+        if (statusText) statusText.textContent = 'Streaming...';
+      };
+
+      terminalEventSource.onerror = () => {
+        if (terminalEventSource && terminalEventSource.readyState === EventSource.CLOSED) {
+          const statusText = document.getElementById('terminal-status-text');
+          if (statusText) statusText.textContent = 'Disconnected';
+          const dot = document.getElementById('terminal-dot');
+          if (dot) dot.className = 'dot-done';
+        }
+      };
+    }
+
+    function addTerminalLog(message, type) {
+      const body = document.getElementById('terminal-body');
+      if (!body || !message) return;
+
+      const line = document.createElement('div');
+      line.className = `log-line ${type || 'info'}`;
+      line.textContent = message;
+      body.appendChild(line);
+
+      // Auto-scroll to bottom
+      body.scrollTop = body.scrollHeight;
+    }
+
+    function markTerminalComplete(success) {
+      const dot = document.getElementById('terminal-dot');
+      const statusText = document.getElementById('terminal-status-text');
+
+      if (dot) {
+        dot.className = 'dot-done';
+        dot.style.background = success ? '#3ba55d' : '#ed4245';
+      }
+      if (statusText) {
+        statusText.textContent = success ? 'Complete' : 'Failed';
+      }
+
+      // Stop the SSE stream once done
+      if (terminalEventSource) {
+        terminalEventSource.close();
+        terminalEventSource = null;
       }
     }
 

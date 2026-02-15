@@ -11,6 +11,7 @@ import * as envManager from '../../env/manager';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { CreateBotRequest, UpdateBotRequest, DeploymentMode } from '../../types';
+import { logCollectors } from '../../build/logCollector';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -237,24 +238,93 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/build - Build bot image without starting
+   * POST /api/bots/:id/build - Build bot image without starting (non-blocking)
+   * Returns immediately. Stream progress via GET /api/bots/:id/build-logs (SSE).
    */
   router.post('/:id/build', async (req: Request, res: Response) => {
     try {
-      const result = await containerManager.buildBot(req.params.id);
-
-      if (!result.success) {
-        res.status(400).json(result);
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
 
-      const bot = containerManager.getBot(req.params.id);
-      broadcastToClients(wss, 'bot:built', bot);
+      // Return immediately — build runs in background
+      res.json({ success: true, message: 'Build started' });
 
-      res.json({ success: true, bot });
+      // Fire-and-forget: build in background, broadcast result when done
+      const botId = req.params.id;
+      containerManager.buildBot(botId).then((result) => {
+        const updatedBot = containerManager.getBot(botId);
+        if (result.success) {
+          broadcastToClients(wss, 'bot:built', updatedBot);
+        } else {
+          broadcastToClients(wss, 'bot:build-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        console.error(`[API] Unexpected build error for bot ${botId}:`, err);
+        broadcastToClients(wss, 'bot:build-failed', { id: botId, error: String(err) });
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
+  });
+
+  /**
+   * GET /api/bots/:id/build-logs - Stream build logs via Server-Sent Events
+   * Adapted from Yundera GitHub Compiler's SSE log streaming pattern.
+   */
+  router.get('/:id/build-logs', (req: Request, res: Response) => {
+    const bot = containerManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+
+    // Set up SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*'
+    });
+
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ message: `Connected to build logs for ${bot.name}`, type: 'system' })}\n\n`);
+
+    // Get log collector (creates one if needed)
+    const logCollector = logCollectors.get(req.params.id);
+
+    // Send any existing logs (so late-joiners see history)
+    const existingLogs = logCollector.getLogs();
+    for (const log of existingLogs) {
+      res.write(`data: ${JSON.stringify(log)}\n\n`);
+    }
+
+    // Listen for new logs in real-time
+    const onLog = (log: unknown) => {
+      if (res.writable) {
+        res.write(`data: ${JSON.stringify(log)}\n\n`);
+      }
+    };
+
+    logCollector.on('log', onLog);
+
+    // Keep connection alive with periodic pings
+    const keepAlive = setInterval(() => {
+      if (res.writable) {
+        res.write(`data: ${JSON.stringify({ message: '', type: 'ping' })}\n\n`);
+      } else {
+        clearInterval(keepAlive);
+      }
+    }, 15000);
+
+    // Clean up on client disconnect
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      logCollector.removeListener('log', onLog);
+      res.end();
+    });
   });
 
   /**

@@ -4,7 +4,7 @@
 FROM node:20-alpine
 
 # Install Docker CLI (to communicate with host Docker)
-RUN apk add --no-cache docker-cli git
+RUN apk add --no-cache docker-cli docker-cli-compose git
 
 WORKDIR /app
 

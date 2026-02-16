@@ -108,8 +108,9 @@ export async function deployApp(
   return new Promise((resolve) => {
     console.log(`[CasaOS API] Deploying ${appName} from ${composePath}`);
 
-    const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--remove-orphans'];
+    const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--force-recreate', '--remove-orphans'];
     const child = spawn('docker', args);
+    const outputLines: string[] = [];
 
     const timeout = setTimeout(() => {
       child.kill('SIGTERM');
@@ -121,6 +122,7 @@ export async function deployApp(
       const lines = data.toString().split(/[\r\n]+/);
       lines.forEach(line => {
         if (!line.trim()) return;
+        outputLines.push(line);
         console.log(`[Compose ${appName}] ${line}`);
         if (onLog) onLog(line);
       });
@@ -139,7 +141,10 @@ export async function deployApp(
         console.log(`[CasaOS API] Deployed app: ${appName}`);
         resolve({ success: true });
       } else {
-        const msg = `docker compose up failed (exit code ${code})`;
+        const lastLines = outputLines.slice(-5).join('\n');
+        const msg = lastLines
+          ? `docker compose up failed (exit code ${code}):\n${lastLines}`
+          : `docker compose up failed (exit code ${code})`;
         console.error(`[CasaOS API] ${msg}`);
         resolve({ success: false, error: msg });
       }

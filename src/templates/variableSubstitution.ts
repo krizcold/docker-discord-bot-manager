@@ -21,6 +21,7 @@ export interface SubstitutionVariables {
   APP_ID: string;
   AUTH_HASH: string;
   API_HASH: string;
+  BOT_MANAGER_API: string;
   PUID: string;
   PGID: string;
   REF_DOMAIN: string;
@@ -33,15 +34,20 @@ export interface SubstitutionVariables {
  * Builds the substitution variables object from bot config and environment
  */
 export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariables {
+  const refScheme = process.env.REF_SCHEME || 'http';
+  const refDomain = process.env.REF_DOMAIN || 'localhost';
+  const refPort = process.env.REF_PORT || '3000';
+
   const vars: SubstitutionVariables = {
     APP_ID: `bot-${bot.id}`,
     AUTH_HASH: bot.authHash || generateHash(),
     API_HASH: bot.updateToken || generateHash(),
+    BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,
     PUID: process.env.PUID || '1000',
     PGID: process.env.PGID || '1000',
-    REF_DOMAIN: process.env.REF_DOMAIN || 'localhost',
-    REF_SCHEME: process.env.REF_SCHEME || 'http',
-    REF_PORT: process.env.REF_PORT || '3000',
+    REF_DOMAIN: refDomain,
+    REF_SCHEME: refScheme,
+    REF_PORT: refPort,
   };
 
   // Add bot's env vars as substitution variables

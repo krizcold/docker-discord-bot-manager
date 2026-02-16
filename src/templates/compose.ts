@@ -647,11 +647,8 @@ export function replaceServiceImageWithBuild(
       if (trimmed && currentIndent <= serviceIndent && !trimmed.startsWith('-')) {
         inTargetService = false;
       } else if (trimmed.startsWith('image:')) {
-        // Replace image: with build: configuration
+        // Replace image with the pre-built local image
         foundImage = true;
-        result.push(`    build:`);
-        result.push(`      context: ${repoPath}`);
-        result.push(`      dockerfile: Dockerfile`);
         result.push(`    image: ${imageName}`);
         continue;
       }

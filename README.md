@@ -1,5 +1,7 @@
 # Discord Bot Manager
 
+> **WORK IN PROGRESS** -- This project is under active development and is NOT ready for production use. APIs, configuration, file structure, and behavior may change without notice. Future updates will likely introduce breaking changes.
+
 A Docker-in-Docker application for managing multiple Discord bots from any GitHub repository.
 
 ## Features

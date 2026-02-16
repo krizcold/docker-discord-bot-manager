@@ -397,11 +397,15 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
       emit(`[Deploy] Deploying via CasaOS (docker compose)`, 'info');
 
       if (buildTarget) {
-        emit(`[Build] Building image (${imageName})...`, 'info');
-        await dockerClient.buildImage(repoPath, imageName, (msg) => {
-          emit(`[Docker] ${msg}`, 'info');
-        });
-        emit('[Done] Image build completed', 'success');
+        if (dockerClient.imageExists(imageName)) {
+          emit(`[Skip] Image ${imageName} already exists, skipping build`, 'info');
+        } else {
+          emit(`[Build] Building image (${imageName})...`, 'info');
+          await dockerClient.buildImage(repoPath, imageName, (msg) => {
+            emit(`[Docker] ${msg}`, 'info');
+          }, { BUILD_MODE: 'managed' });
+          emit('[Done] Image build completed', 'success');
+        }
       } else {
         emit('[Skip] No build target — compose will pull images', 'info');
       }
@@ -423,11 +427,15 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
       emit(`[Deploy] Deploying via Docker API`, 'info');
 
       if (buildTarget) {
-        emit(`[Build] Building image (${imageName})...`, 'info');
-        await dockerClient.buildImage(repoPath, imageName, (msg) => {
-          emit(`[Docker] ${msg}`, 'info');
-        });
-        emit('[Done] Image build completed', 'success');
+        if (dockerClient.imageExists(imageName)) {
+          emit(`[Skip] Image ${imageName} already exists, skipping build`, 'info');
+        } else {
+          emit(`[Build] Building image (${imageName})...`, 'info');
+          await dockerClient.buildImage(repoPath, imageName, (msg) => {
+            emit(`[Docker] ${msg}`, 'info');
+          }, { BUILD_MODE: 'managed' });
+          emit('[Done] Image build completed', 'success');
+        }
       }
 
       emit('[Start] Creating container...', 'info');
@@ -765,7 +773,7 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
         emit(`[Build] Building Docker image (${imageName})...`, 'info');
         await dockerClient.buildImage(repoPath, imageName, (msg) => {
           emit(`[Docker] ${msg}`, 'info');
-        });
+        }, { BUILD_MODE: 'managed' });
         emit('[Done] Docker image build completed', 'success');
       } else {
         emit('[Skip] No build target — docker compose will pull images at start', 'info');

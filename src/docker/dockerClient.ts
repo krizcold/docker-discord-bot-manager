@@ -251,14 +251,28 @@ export async function streamContainerLogs(
 }
 
 /**
+ * Check if a Docker image exists locally
+ */
+export function imageExists(imageName: string): boolean {
+  return execDockerSafe(['image', 'inspect', imageName]);
+}
+
+/**
  * Build a Docker image from a Dockerfile
  */
 export async function buildImage(
   contextPath: string,
   imageName: string,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  buildArgs?: Record<string, string>
 ): Promise<void> {
-  const args = ['build', '-t', imageName, contextPath];
+  const args = ['build', '-t', imageName];
+  if (buildArgs) {
+    for (const [key, value] of Object.entries(buildArgs)) {
+      args.push('--build-arg', `${key}=${value}`);
+    }
+  }
+  args.push(contextPath);
 
   console.log(`[Docker] Building image: docker ${args.join(' ')}`);
 

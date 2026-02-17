@@ -107,10 +107,14 @@ export function extractAppName(composeContent: string): string | null {
 /**
  * Apply PCS processing to compose content.
  * For each service:
- *   1. Inject user PUID:PGID (only if no user defined)
- *   2. Replace /DATA prefix in volumes with actual DATA_ROOT
- *   3. Add REF_NET network to main service (external: true)
- *   4. Inject PUID/PGID env vars if not already present
+ *   1. Replace /DATA prefix in volumes with actual DATA_ROOT
+ *   2. Add REF_NET network to main service (external: true)
+ *   3. Inject PUID/PGID env vars if not already present
+ *
+ * NOTE: Does NOT inject user: PUID:PGID on services. The compiler does this
+ * for CasaOS App Store apps designed for it, but the Bot Manager deploys
+ * arbitrary repos with standard images (redis, postgres, node) that break
+ * when their default user is overridden.
  */
 export function applyPCSProcessing(composeContent: string): string {
   const pcs = getPCSEnvironment();
@@ -123,12 +127,7 @@ export function applyPCSProcessing(composeContent: string): string {
   const mainServiceName = getMainServiceName(compose);
 
   for (const [serviceName, service] of Object.entries(services)) {
-    // 1. User rights injection
-    if (shouldAddUserToService(service)) {
-      service.user = `${pcs.PUID}:${pcs.PGID}`;
-    }
-
-    // 2. Volume path processing — replace /DATA with DATA_ROOT
+    // 1. Volume path processing — replace /DATA with DATA_ROOT
     if (service.volumes && Array.isArray(service.volumes)) {
       service.volumes = service.volumes.map((volume: unknown) => {
         if (typeof volume === 'string') {
@@ -144,7 +143,7 @@ export function applyPCSProcessing(composeContent: string): string {
       });
     }
 
-    // 3. Network injection (main service only)
+    // 2. Network injection (main service only)
     if (serviceName === mainServiceName && pcs.REF_NET) {
       // Skip if service has explicit network_mode (not bridge)
       if (!service.network_mode || service.network_mode === 'bridge') {
@@ -164,7 +163,7 @@ export function applyPCSProcessing(composeContent: string): string {
       }
     }
 
-    // 4. PUID/PGID environment variable injection
+    // 3. PUID/PGID environment variable injection
     if (!service.environment) {
       service.environment = {};
     }

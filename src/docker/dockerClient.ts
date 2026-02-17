@@ -258,6 +258,13 @@ export function imageExists(imageName: string): boolean {
 }
 
 /**
+ * Remove a Docker image
+ */
+export function removeImage(imageName: string): boolean {
+  return execDockerSafe(['rmi', imageName]);
+}
+
+/**
  * Build a Docker image from a Dockerfile
  */
 export async function buildImage(

@@ -32,12 +32,48 @@ services:
       DATA_DIR: /data
       PORT: 8080
       API_HASH: $API_HASH
+
+      # Hardcoded/built-in variables
+      PUID: $PUID
+      PGID: $PGID
+      TZ: $TZ
+      DefaultUserName: $DefaultUserName
+      DefaultPassword: $DefaultPassword
+
+      # CasaOS container OS environment variables
+      default_pwd: $default_pwd
+      public_ip: $public_ip
+      domain: $domain
+      USER: $USER
+
+      # PCS environment variables
+      PCS_DEFAULT_PASSWORD: $PCS_DEFAULT_PASSWORD
+      PCS_DOMAIN: $PCS_DOMAIN
+      PCS_DATA_ROOT: $PCS_DATA_ROOT
+      PCS_PUBLIC_IP: $PCS_PUBLIC_IP
+      PCS_PUBLIC_IPV6: $PCS_PUBLIC_IPV6
+      PCS_EMAIL: $PCS_EMAIL
+
+      # REF variables
+      REF_DOMAIN: $REF_DOMAIN
+      REF_NET: $REF_NET
+      REF_SCHEME: $REF_SCHEME
+      REF_PORT: $REF_PORT
+      REF_SEPARATOR: $REF_SEPARATOR
+      REF_DEFAULT_PORT: $REF_DEFAULT_PORT
+
+      # Data root
+      DATA_ROOT: $DATA_ROOT
+
+      # SMTP variables
+      SMTP_HOST: $SMTP_HOST
+      SMTP_PORT: $SMTP_PORT
     volumes:
       - type: bind
         source: /var/run/docker.sock
         target: /var/run/docker.sock
       - type: bind
-        source: /DATA/AppData/discordbotmanager/data
+        source: $DATA_ROOT/AppData/discordbotmanager/data
         target: /data
     networks:
       - pcs
@@ -75,7 +111,7 @@ x-casaos:
   main: discordbotmanager
   author: kriz_cold
   developer: kriz_cold
-  icon: https://cdn.statically.io/gh/krizcold/AppStore/main/Apps/Discord-Bot-Manager/icon.png
+  icon: https://cdn.jsdelivr.net/gh/krizcold/AppStore@main/Apps/DiscordBotManager/icon.png
   tagline:
     en_us: "Manage multiple Discord bots from GitHub repositories"
   category: Utilities

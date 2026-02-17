@@ -15,39 +15,71 @@ export function generateHash(): string {
 }
 
 /**
- * Standard variables that can be substituted in compose files
+ * Standard variables that can be substituted in compose files.
+ * Matches the PCS/CasaOS variable set from the github compiler.
  */
 export interface SubstitutionVariables {
-  APP_ID: string;
-  AUTH_HASH: string;
-  API_HASH: string;
-  BOT_MANAGER_API: string;
-  PUID: string;
-  PGID: string;
-  REF_DOMAIN: string;
-  REF_SCHEME: string;
-  REF_PORT: string;
   [key: string]: string;
 }
 
 /**
- * Builds the substitution variables object from bot config and environment
+ * Builds the substitution variables object from bot config and environment.
+ * Variable set matches the github compiler's replaceTemplateVars + PCS environment.
  */
 export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariables {
-  const refScheme = process.env.REF_SCHEME || 'http';
-  const refDomain = process.env.REF_DOMAIN || 'localhost';
-  const refPort = process.env.REF_PORT || '3000';
+  const env = process.env;
+
+  const refScheme = env.REF_SCHEME || 'http';
+  const refDomain = env.REF_DOMAIN || 'localhost';
+  const refPort = env.REF_PORT || '3000';
+  const refSeparator = env.REF_SEPARATOR || '-';
+  const refNet = env.REF_NET || 'pcs';
+  const dataRoot = env.DATA_ROOT || '/DATA';
+  const puid = env.PUID || '1000';
+  const pgid = env.PGID || '1000';
 
   const vars: SubstitutionVariables = {
+    // Bot-specific variables
     APP_ID: `bot-${bot.id}`,
     AUTH_HASH: bot.authHash || generateHash(),
     API_HASH: bot.updateToken || generateHash(),
     BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,
-    PUID: process.env.PUID || '1000',
-    PGID: process.env.PGID || '1000',
+
+    // User/group
+    PUID: puid,
+    PGID: pgid,
+
+    // REF variables
     REF_DOMAIN: refDomain,
     REF_SCHEME: refScheme,
     REF_PORT: refPort,
+    REF_SEPARATOR: refSeparator,
+    REF_NET: refNet,
+    REF_DEFAULT_PORT: env.REF_DEFAULT_PORT || '80',
+
+    // Data and system
+    DATA_ROOT: dataRoot,
+    TZ: env.TZ || 'UTC',
+    USER: env.USER || 'root',
+
+    // PCS variables
+    PCS_DATA_ROOT: env.PCS_DATA_ROOT || dataRoot,
+    PCS_DEFAULT_PASSWORD: env.PCS_DEFAULT_PASSWORD || env.default_pwd || 'casaos',
+    PCS_DOMAIN: env.PCS_DOMAIN || env.domain || '',
+    PCS_PUBLIC_IP: env.PCS_PUBLIC_IP || env.public_ip || '',
+    PCS_PUBLIC_IPV6: env.PCS_PUBLIC_IPV6 || '',
+    PCS_EMAIL: env.PCS_EMAIL || '',
+
+    // CasaOS legacy variables
+    DefaultUserName: env.DefaultUserName || 'admin',
+    DefaultPassword: env.DefaultPassword || env.default_pwd || env.PCS_DEFAULT_PASSWORD || 'casaos',
+    default_pwd: env.default_pwd || env.PCS_DEFAULT_PASSWORD || 'casaos',
+    public_ip: env.public_ip || env.PCS_PUBLIC_IP || '',
+    domain: env.domain || env.PCS_DOMAIN || '',
+
+    // SMTP
+    SMTP_HOST: env.SMTP_HOST || '',
+    SMTP_PORT: env.SMTP_PORT || '',
   };
 
   // Add bot's env vars as substitution variables

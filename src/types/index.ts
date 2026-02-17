@@ -38,6 +38,9 @@ export interface BotConfig {
   // Lifecycle
   hasBeenStarted?: boolean;
 
+  // CasaOS app name (from compose name: or generated bot-{id})
+  appName?: string;
+
   // Metadata
   createdAt: string;
   updatedAt: string;

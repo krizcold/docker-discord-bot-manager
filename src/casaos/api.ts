@@ -23,8 +23,8 @@ async function casaosRequest(
   body?: unknown
 ): Promise<unknown> {
   const curlCmd = body
-    ? `curl -s -X ${method} -H "Content-Type: application/json" -d '${JSON.stringify(body)}' "http://localhost:80${endpoint}"`
-    : `curl -s -X ${method} "http://localhost:80${endpoint}"`;
+    ? `curl -s -X ${method} -H "Content-Type: application/json" -d '${JSON.stringify(body)}' "http://localhost:8080${endpoint}"`
+    : `curl -s -X ${method} "http://localhost:8080${endpoint}"`;
 
   const dockerCmd = `docker exec casaos sh -c '${curlCmd}'`;
 
@@ -158,6 +158,74 @@ export async function deployApp(
 
       console.error(`[CasaOS API] Failed to spawn docker compose for ${appName}:`, err);
       resolve({ success: false, error: `Failed to start deploy: ${err.message}` });
+    });
+  });
+}
+
+/**
+ * Tear down a compose app using docker compose down
+ * Stops AND removes containers, networks, and orphans.
+ * Uses spawn for reliable execution (same pattern as deployApp).
+ */
+export async function composeDown(
+  appName: string,
+  composePath: string,
+  onLog?: (message: string) => void,
+  timeoutMs: number = 120000
+): Promise<{ success: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    console.log(`[CasaOS API] Tearing down ${appName} from ${composePath}`);
+
+    const args = ['compose', '-p', appName, '-f', composePath, 'down', '--remove-orphans'];
+    const child = spawn('docker', args);
+    const outputLines: string[] = [];
+
+    const timeout = setTimeout(() => {
+      child.kill('SIGTERM');
+      setTimeout(() => { if (!child.killed) child.kill('SIGKILL'); }, 5000);
+      resolve({ success: false, error: `Compose down timed out after ${Math.round(timeoutMs / 1000)}s` });
+    }, timeoutMs);
+
+    const processLog = (data: Buffer) => {
+      const lines = data.toString().split(/[\r\n]+/);
+      lines.forEach(line => {
+        if (!line.trim()) return;
+        outputLines.push(line);
+        console.log(`[Compose down ${appName}] ${line}`);
+        if (onLog) onLog(line);
+      });
+    };
+
+    child.stdout.on('data', processLog);
+    child.stderr.on('data', processLog);
+
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      child.stdout.removeAllListeners();
+      child.stderr.removeAllListeners();
+      child.removeAllListeners();
+
+      if (code === 0) {
+        console.log(`[CasaOS API] Torn down app: ${appName}`);
+        resolve({ success: true });
+      } else {
+        const lastLines = outputLines.slice(-5).join('\n');
+        const msg = lastLines
+          ? `docker compose down failed (exit code ${code}):\n${lastLines}`
+          : `docker compose down failed (exit code ${code})`;
+        console.error(`[CasaOS API] ${msg}`);
+        resolve({ success: false, error: msg });
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeout);
+      child.stdout.removeAllListeners();
+      child.stderr.removeAllListeners();
+      child.removeAllListeners();
+
+      console.error(`[CasaOS API] Failed to spawn docker compose down for ${appName}:`, err);
+      resolve({ success: false, error: `Failed to start compose down: ${err.message}` });
     });
   });
 }

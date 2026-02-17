@@ -23,9 +23,18 @@ import {
   processExistingCompose,
   generateImageCompose,
   getComposeBuildInfo,
-  replaceServiceImageWithBuild
+  replaceServiceImageWithBuild,
+  ComposeResult
 } from '../templates/compose';
 import { generateHash } from '../templates/variableSubstitution';
+import {
+  createVolumeDirectories,
+  saveToCasaOSMetadata,
+  removeCasaOSMetadata,
+  removeAppData,
+  fixPostDeployOwnership,
+  executeInstallCommand
+} from '../templates/pcsProcessing';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
@@ -234,15 +243,25 @@ export async function deleteBot(botId: string): Promise<boolean> {
   }
 
   const deploymentMode = await getDeploymentMode();
-  const appName = `bot-${botId}`;
+  const appName = bot.appName || `bot-${botId}`;
+  const botDir = getBotDir(botId);
 
-  // Stop and remove containers if running
+  // 1. Compose down — stop and remove all containers/networks
   try {
     if (deploymentMode === 'casaos') {
-      // CasaOS mode: uninstall the app
+      const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+      const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
+      const localComposePath = path.join(botDir, 'docker-compose.yml');
+      const composePath = fs.existsSync(metadataComposePath) ? metadataComposePath : localComposePath;
+
+      if (fs.existsSync(composePath)) {
+        console.log(`[ContainerManager] Running compose down for ${appName}...`);
+        await casaosApi.composeDown(appName, composePath);
+      }
+
+      // Also uninstall via CasaOS API for clean state
       await casaosApi.uninstallApp(appName);
     } else {
-      // Standalone Docker mode - stop all tracked containers
       const containerIds = bot.containerIds || [];
       for (const containerId of containerIds) {
         try {
@@ -257,8 +276,43 @@ export async function deleteBot(botId: string): Promise<boolean> {
     console.warn(`[ContainerManager] Failed to cleanup containers for bot ${botId}:`, error);
   }
 
-  // Remove entire bot directory (repo/, raw/, data/, env/)
-  const botDir = getBotDir(botId);
+  // 2. Remove Docker image
+  try {
+    const imageName = `bot-${botId}:latest`;
+    if (dockerClient.imageExists(imageName)) {
+      console.log(`[ContainerManager] Removing image ${imageName}...`);
+      dockerClient.removeImage(imageName);
+    }
+  } catch (error) {
+    console.warn(`[ContainerManager] Failed to remove image for bot ${botId}:`, error);
+  }
+
+  // 3. Remove named volumes belonging to this project
+  try {
+    const volumes = dockerClient.listProjectVolumes(appName);
+    for (const volumeName of volumes) {
+      console.log(`[ContainerManager] Removing volume ${volumeName}...`);
+      dockerClient.removeVolume(volumeName);
+    }
+  } catch (error) {
+    console.warn(`[ContainerManager] Failed to remove volumes for bot ${botId}:`, error);
+  }
+
+  // 4. Remove CasaOS metadata directory
+  try {
+    await removeCasaOSMetadata(appName);
+  } catch (error) {
+    console.warn(`[ContainerManager] Failed to remove CasaOS metadata for bot ${botId}:`, error);
+  }
+
+  // 5. Remove app data directory (/DATA/AppData/{appName}/)
+  try {
+    await removeAppData(appName);
+  } catch (error) {
+    console.warn(`[ContainerManager] Failed to remove app data for bot ${botId}:`, error);
+  }
+
+  // 6. Remove entire bot directory (repo/, raw/, data/, env/)
   if (fs.existsSync(botDir)) {
     fs.rmSync(botDir, { recursive: true, force: true });
   }
@@ -269,7 +323,7 @@ export async function deleteBot(botId: string): Promise<boolean> {
   // Clean up log collector
   logCollectors.remove(botId);
 
-  console.log(`[ContainerManager] Bot ${botId} deleted`);
+  console.log(`[ContainerManager] Bot ${botId} fully deleted (containers, image, volumes, metadata, app data)`);
   return true;
 }
 
@@ -288,6 +342,20 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     if (containerIds !== undefined) {
       bot.containerIds = containerIds || [];
     }
+    bot.updatedAt = new Date().toISOString();
+    registry.bots[botId] = bot;
+    saveRegistry(registry);
+  }
+}
+
+/**
+ * Update bot's appName in registry
+ */
+function updateBotAppName(botId: string, appName: string): void {
+  const registry = loadRegistry();
+  const bot = registry.bots[botId];
+  if (bot) {
+    bot.appName = appName;
     bot.updatedAt = new Date().toISOString();
     registry.bots[botId] = bot;
     saveRegistry(registry);
@@ -336,12 +404,14 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
   try {
     emit(`[Start] Starting ${bot.name}...`, 'system');
 
+    // Re-read bot from registry to get latest appName (may have been set by buildBot)
+    const latestBot = getBot(botId) || bot;
     const botDir = getBotDir(botId);
-    const appName = `bot-${botId}`;
-    const composePath = path.join(botDir, 'docker-compose.yml');
+    const appName = latestBot.appName || `bot-${botId}`;
+    const localComposePath = path.join(botDir, 'docker-compose.yml');
 
     // If compose file doesn't exist, run buildBot first (safety net)
-    if (!fs.existsSync(composePath)) {
+    if (!fs.existsSync(localComposePath)) {
       emit('[Build] No compose file found, running build first...', 'info');
       const buildResult = await buildBot(botId);
       if (!buildResult.success) {
@@ -353,7 +423,12 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
     const deploymentMode = await getDeploymentMode();
 
     if (deploymentMode === 'casaos') {
-      emit('[Start] Starting containers...', 'info');
+      // Prefer metadata compose path (CasaOS recognizes this location)
+      const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+      const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
+      const composePath = fs.existsSync(metadataComposePath) ? metadataComposePath : localComposePath;
+
+      emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
       const deployResult = await casaosApi.deployApp(appName, composePath, (msg) => {
@@ -361,6 +436,19 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
       });
       if (!deployResult.success) {
         throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
+      }
+
+      // Brief delay for CasaOS recognition
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Fix post-deploy ownership
+      emit('[PCS] Fixing post-deploy ownership...', 'info');
+      await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
+
+      // Execute post-install command on first start
+      if (!latestBot.hasBeenStarted) {
+        const composeContent = fs.readFileSync(composePath, 'utf-8');
+        await executeInstallCommand('post', composeContent, (msg) => emit(msg, 'info'));
       }
 
       const containerIds = await getContainerIdsForBot(botId);
@@ -415,12 +503,14 @@ async function startDockerImageBot(bot: BotConfig): Promise<{ success: boolean; 
   }
 
   try {
+    // Re-read bot from registry to get latest appName
+    const latestBot = getBot(botId) || bot;
     const botDir = getBotDir(botId);
-    const appName = `bot-${botId}`;
-    const composePath = path.join(botDir, 'docker-compose.yml');
+    const appName = latestBot.appName || `bot-${botId}`;
+    const localComposePath = path.join(botDir, 'docker-compose.yml');
 
     // If compose file doesn't exist, run buildBot first (safety net)
-    if (!fs.existsSync(composePath)) {
+    if (!fs.existsSync(localComposePath)) {
       console.log(`[ContainerManager] No compose file for docker-image bot ${botId}, running build first...`);
       const buildResult = await buildBot(botId);
       if (!buildResult.success) {
@@ -432,13 +522,24 @@ async function startDockerImageBot(bot: BotConfig): Promise<{ success: boolean; 
     const deploymentMode = await getDeploymentMode();
 
     if (deploymentMode === 'casaos') {
-      console.log(`[ContainerManager] Starting docker-image bot ${botId} via CasaOS`);
+      // Prefer metadata compose path
+      const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+      const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
+      const composePath = fs.existsSync(metadataComposePath) ? metadataComposePath : localComposePath;
+
+      console.log(`[ContainerManager] Starting docker-image bot ${botId} via CasaOS (${appName})`);
       updateBotStatus(botId, 'starting');
 
       const deployResult = await casaosApi.deployApp(appName, composePath);
       if (!deployResult.success) {
         throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
       }
+
+      // Brief delay for CasaOS recognition
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Fix post-deploy ownership
+      await fixPostDeployOwnership(appName);
 
       const containerIds = await getContainerIdsForBot(botId);
       updateBotStatus(botId, 'running', containerIds);
@@ -478,9 +579,10 @@ async function startDockerImageBot(bot: BotConfig): Promise<{ success: boolean; 
  */
 async function getContainerIdsForBot(botId: string): Promise<string[]> {
   const containers = await dockerClient.listBotContainers();
-  const appName = `bot-${botId}`;
+  const bot = getBot(botId);
+  const appName = bot?.appName || `bot-${botId}`;
 
-  // Match containers by bot-id label or name pattern
+  // Match containers by bot-id label or name pattern (compose uses appName as prefix)
   const botContainers = containers.filter(c =>
     c.name.startsWith(appName) ||
     c.name.includes(`-${botId}-`)
@@ -506,12 +608,21 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
     updateBotStatus(botId, 'stopping');
 
     const deploymentMode = await getDeploymentMode();
-    const appName = `bot-${botId}`;
+    const appName = bot.appName || `bot-${botId}`;
 
     if (deploymentMode === 'casaos') {
-      // CasaOS mode: use docker compose down or CasaOS API
-      console.log(`[ContainerManager] Stopping bot ${botId} via CasaOS`);
-      await casaosApi.stopApp(appName);
+      // CasaOS mode: use compose down to properly stop AND remove containers
+      const botDir = getBotDir(botId);
+      const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+      const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
+      const localComposePath = path.join(botDir, 'docker-compose.yml');
+      const composePath = fs.existsSync(metadataComposePath) ? metadataComposePath : localComposePath;
+
+      console.log(`[ContainerManager] Stopping bot ${botId} via compose down (${appName})`);
+      const downResult = await casaosApi.composeDown(appName, composePath);
+      if (!downResult.success) {
+        console.warn(`[ContainerManager] Compose down failed for ${appName}: ${downResult.error}`);
+      }
     } else {
       // Standalone Docker mode - stop all tracked containers
       const containerIds = bot.containerIds || [];
@@ -627,6 +738,9 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
     emit(`[Build] Build process started for ${bot.name}`, 'system');
     updateBotStatus(botId, 'building');
 
+    const deploymentMode = await getDeploymentMode();
+    const isCasaOS = deploymentMode === 'casaos';
+
     if (sourceType === 'docker-image') {
       if (!bot.imageRef) {
         emit('[Error] imageRef is required for docker-image source type', 'error');
@@ -646,8 +760,19 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '' };
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
       const composeContent = generateImageCompose(botWithEnv, botDir);
+      const appName = `bot-${botId}`;
+
       writeComposeFile(botDir, composeContent);
       emit('[Done] Compose file written', 'success');
+
+      // CasaOS: save compose to metadata path
+      if (isCasaOS) {
+        emit('[PCS] Saving CasaOS metadata...', 'info');
+        await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
+      }
+
+      // Store appName in registry
+      updateBotAppName(botId, appName);
     } else {
       const repoPath = getRepoPath(botId);
       const botDir = getBotDir(botId);
@@ -665,6 +790,7 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
 
       const existingComposePath = hasExistingCompose(repoPath);
       let composeContent: string;
+      let appName: string;
       let buildTarget: string | null = null;
 
       if (existingComposePath) {
@@ -677,7 +803,12 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
           emit(`[Config] Found build target: ${buildTarget}`, 'info');
         }
 
-        composeContent = processExistingCompose(repoPath, botDir, botWithEnv);
+        // processExistingCompose now returns { content, appName } with PCS processing applied
+        const result: ComposeResult = processExistingCompose(repoPath, botDir, botWithEnv);
+        composeContent = result.content;
+        appName = result.appName;
+
+        emit(`[Info] App name: ${appName}`, 'info');
 
         if (buildTarget) {
           composeContent = replaceServiceImageWithBuild(composeContent, buildTarget, repoPath, imageName);
@@ -692,12 +823,31 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
         }
 
         composeContent = generateCompose(botWithEnv, detection, botDir);
+        appName = `bot-${botId}`;
         buildTarget = 'bot';
+      }
+
+      // CasaOS: create volume directories before writing compose
+      if (isCasaOS) {
+        emit('[PCS] Creating volume directories...', 'info');
+        await createVolumeDirectories(composeContent, (msg) => emit(msg, 'info'));
+      }
+
+      // CasaOS: execute pre-install command
+      if (isCasaOS) {
+        await executeInstallCommand('pre', composeContent, (msg) => emit(msg, 'info'));
       }
 
       writeComposeFile(botDir, composeContent);
       emit('[Done] Compose file written', 'success');
 
+      // CasaOS: save compose to metadata path
+      if (isCasaOS) {
+        emit('[PCS] Saving CasaOS metadata...', 'info');
+        await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
+      }
+
+      // Build Docker image
       if (buildTarget) {
         emit(`[Build] Building Docker image (${imageName})...`, 'info');
         await dockerClient.buildImage(repoPath, imageName, (msg) => {
@@ -707,6 +857,9 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       } else {
         emit('[Skip] No build target — docker compose will pull images at start', 'info');
       }
+
+      // Store appName in registry
+      updateBotAppName(botId, appName);
     }
 
     updateBotStatus(botId, 'stopped');
@@ -819,7 +972,7 @@ export async function syncContainerStates(): Promise<void> {
   const containerMap = new Map(containers.map(c => [c.name, c]));
 
   for (const bot of Object.values(registry.bots)) {
-    const appName = `bot-${bot.id}`;
+    const appName = bot.appName || `bot-${bot.id}`;
 
     if (bot.status === 'running') {
       // Check if any tracked containers are still running

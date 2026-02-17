@@ -422,6 +422,31 @@ export async function getContainerStats(containerId: string): Promise<{
 }
 
 /**
+ * Remove a Docker volume by name
+ */
+export function removeVolume(name: string): boolean {
+  return execDockerSafe(['volume', 'rm', name]);
+}
+
+/**
+ * List volumes belonging to a compose project
+ * Docker compose names volumes as {projectName}_{volumeName}
+ */
+export function listProjectVolumes(projectName: string): string[] {
+  try {
+    const output = execDocker([
+      'volume', 'ls',
+      '--filter', `name=${projectName}_`,
+      '--format', '{{.Name}}'
+    ]);
+    if (!output) return [];
+    return output.split('\n').filter(line => line.trim());
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Run docker compose up
  */
 export async function composeUp(

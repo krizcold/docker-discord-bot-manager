@@ -75,6 +75,9 @@ services:
       - type: bind
         source: $DATA_ROOT/AppData/discordbotmanager/data
         target: /data
+      - type: bind
+        source: $DATA_ROOT/AppData
+        target: /DATA/AppData
     networks:
       - pcs
     expose:
@@ -99,6 +102,9 @@ services:
         - container: /data
           description:
             en_us: Persistent data directory for bot configurations and registry.
+        - container: /DATA/AppData
+          description:
+            en_us: CasaOS AppData directory for metadata placement and volume management.
 
 networks:
   pcs:

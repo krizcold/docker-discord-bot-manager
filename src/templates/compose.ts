@@ -11,6 +11,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { BotConfig, DetectionResult } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
+import { applyPCSProcessing, applyCasaOSMetadata, extractAppName } from './pcsProcessing';
+
+export interface ComposeResult {
+  content: string;
+  appName: string;
+}
 
 interface VolumeMount {
   type: 'bind' | 'volume';
@@ -47,6 +53,8 @@ interface CasaOSMetadata {
   category: string;
   description: { en_us: string };
   title: { en_us: string };
+  is_uncontrolled?: boolean;
+  store_app_id?: string;
 }
 
 interface ComposeFile {
@@ -136,7 +144,9 @@ export function generateCompose(
     tagline: { en_us: `Discord Bot: ${bot.name}` },
     category: 'Utilities',
     description: { en_us: `Managed Discord bot: ${bot.name}` },
-    title: { en_us: bot.name }
+    title: { en_us: bot.name },
+    is_uncontrolled: false,
+    store_app_id: appName
   };
 
   return formatComposeYaml(compose);
@@ -306,6 +316,12 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push(`    en_us: "${casaos.description.en_us}"`);
     lines.push('  title:');
     lines.push(`    en_us: "${casaos.title.en_us}"`);
+    if (casaos.is_uncontrolled !== undefined) {
+      lines.push(`  is_uncontrolled: ${casaos.is_uncontrolled}`);
+    }
+    if (casaos.store_app_id) {
+      lines.push(`  store_app_id: ${casaos.store_app_id}`);
+    }
   }
 
   return lines.join('\n');
@@ -347,14 +363,18 @@ export function adaptExistingCompose(
   repoPath: string,
   botDir: string,
   bot: BotConfig
-): string {
+): ComposeResult {
   const existingPath = hasExistingCompose(repoPath);
   if (!existingPath) {
     throw new Error('No existing compose file found');
   }
 
   let content = fs.readFileSync(existingPath, 'utf-8');
-  const appName = `bot-${bot.id}`;
+  const fallbackName = `bot-${bot.id}`;
+
+  // Extract original compose name BEFORE any modifications
+  const originalName = extractAppName(content);
+  const appName = originalName || fallbackName;
 
   // 1. Apply variable substitution
   content = applyVariableSubstitution(content, bot);
@@ -365,17 +385,10 @@ export function adaptExistingCompose(
     content = `name: ${appName}\n\n` + content;
   }
 
-  // 3. Add pcs network for CasaOS
-  if (!content.includes('networks:')) {
-    content += '\nnetworks:\n  pcs:\n    external: true\n';
-  } else if (!content.includes('pcs:')) {
-    content = content.replace(/networks:\s*\n/, 'networks:\n  pcs:\n    external: true\n');
-  }
-
-  // 4. Add Bot Manager labels to all services
+  // 3. Add Bot Manager labels to all services
   content = addBotManagerLabels(content, bot);
 
-  // 5. Add x-casaos metadata if not present
+  // 4. Add x-casaos metadata if not present
   if (!content.includes('x-casaos:')) {
     content += `
 x-casaos:
@@ -395,7 +408,13 @@ x-casaos:
 `;
   }
 
-  return content;
+  // 5. Apply CasaOS metadata processing (ports→expose, hostname, is_uncontrolled)
+  content = applyCasaOSMetadata(content, appName);
+
+  // 6. Apply PCS processing (user rights, volumes, networks, PUID/PGID)
+  content = applyPCSProcessing(content);
+
+  return { content, appName };
 }
 
 /**
@@ -544,7 +563,9 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
       tagline: { en_us: `Discord Bot: ${bot.name}` },
       category: 'Utilities',
       description: { en_us: `Managed Discord bot: ${bot.name}` },
-      title: { en_us: bot.name }
+      title: { en_us: bot.name },
+      is_uncontrolled: false,
+      store_app_id: appName
     }
   };
 
@@ -567,7 +588,7 @@ export function processExistingCompose(
   repoPath: string,
   botDir: string,
   bot: BotConfig
-): string {
+): ComposeResult {
   const composePath = hasExistingCompose(repoPath);
   if (!composePath) {
     throw new Error('No compose file found in repository');

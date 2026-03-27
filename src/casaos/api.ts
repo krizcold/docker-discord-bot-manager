@@ -108,7 +108,7 @@ export async function deployApp(
   return new Promise((resolve) => {
     console.log(`[CasaOS API] Deploying ${appName} from ${composePath}`);
 
-    const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--force-recreate', '--remove-orphans'];
+    const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--remove-orphans'];
     const child = spawn('docker', args);
     const outputLines: string[] = [];
 

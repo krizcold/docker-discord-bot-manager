@@ -28,6 +28,7 @@ import {
 } from '../templates/compose';
 import { generateHash } from '../templates/variableSubstitution';
 import {
+  processComposeForCasaOS,
   createVolumeDirectories,
   saveToCasaOSMetadata,
   removeCasaOSMetadata,
@@ -759,8 +760,9 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
 
       const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '' };
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
-      const composeContent = generateImageCompose(botWithEnv, botDir);
+      let composeContent = generateImageCompose(botWithEnv, botDir);
       const appName = `bot-${botId}`;
+      composeContent = processComposeForCasaOS(composeContent, appName, botWithEnv);
 
       writeComposeFile(botDir, composeContent);
       emit('[Done] Compose file written', 'success');
@@ -824,6 +826,7 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
 
         composeContent = generateCompose(botWithEnv, detection, botDir);
         appName = `bot-${botId}`;
+        composeContent = processComposeForCasaOS(composeContent, appName, botWithEnv);
         buildTarget = 'bot';
       }
 

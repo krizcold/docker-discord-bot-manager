@@ -16,7 +16,6 @@ export function generateHash(): string {
 
 /**
  * Standard variables that can be substituted in compose files.
- * Matches the PCS/CasaOS variable set from the github compiler.
  */
 export interface SubstitutionVariables {
   [key: string]: string;
@@ -24,7 +23,6 @@ export interface SubstitutionVariables {
 
 /**
  * Builds the substitution variables object from bot config and environment.
- * Variable set matches the github compiler's replaceTemplateVars + PCS environment.
  */
 export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariables {
   const env = process.env;
@@ -62,20 +60,11 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
     TZ: env.TZ || 'UTC',
     USER: env.USER || 'root',
 
-    // PCS variables
-    PCS_DATA_ROOT: env.PCS_DATA_ROOT || dataRoot,
-    PCS_DEFAULT_PASSWORD: env.PCS_DEFAULT_PASSWORD || env.default_pwd || 'casaos',
-    PCS_DOMAIN: env.PCS_DOMAIN || env.domain || '',
-    PCS_PUBLIC_IP: env.PCS_PUBLIC_IP || env.public_ip || '',
-    PCS_PUBLIC_IPV6: env.PCS_PUBLIC_IPV6 || '',
-    PCS_EMAIL: env.PCS_EMAIL || '',
-
-    // CasaOS legacy variables
-    DefaultUserName: env.DefaultUserName || 'admin',
-    DefaultPassword: env.DefaultPassword || env.default_pwd || env.PCS_DEFAULT_PASSWORD || 'casaos',
-    default_pwd: env.default_pwd || env.PCS_DEFAULT_PASSWORD || 'casaos',
-    public_ip: env.public_ip || env.PCS_PUBLIC_IP || '',
-    domain: env.domain || env.PCS_DOMAIN || '',
+    // APP_* variables (platform standard)
+    APP_DEFAULT_PASSWORD: env.APP_DEFAULT_PASSWORD || 'casaos',
+    APP_DOMAIN: env.APP_DOMAIN || '',
+    APP_PUBLIC_IP_DASH: env.APP_PUBLIC_IP_DASH || '',
+    AppID: `bot-${bot.id}`,
 
     // SMTP
     SMTP_HOST: env.SMTP_HOST || '',

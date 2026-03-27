@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { BotConfig, DetectionResult } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
-import { applyPCSProcessing, applyCasaOSMetadata, extractAppName } from './pcsProcessing';
+import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
 
 export interface ComposeResult {
   content: string;
@@ -34,6 +34,7 @@ interface ComposeService {
   build?: { context: string; dockerfile: string };
   container_name: string;
   restart: string;
+  cpu_shares?: number;
   environment?: Record<string, string>;
   volumes?: VolumeMount[];
   depends_on?: string[];
@@ -61,7 +62,7 @@ interface ComposeFile {
   name: string;
   services: Record<string, ComposeService>;
   volumes?: Record<string, object>;
-  networks?: Record<string, { external?: boolean }>;
+  networks?: Record<string, { name?: string; external?: boolean }>;
   'x-casaos'?: CasaOSMetadata;
 }
 
@@ -79,7 +80,7 @@ export function generateCompose(
     name: appName,
     services: {},
     networks: {
-      pcs: { external: true }
+      pcs: { name: 'pcs', external: true }
     }
   };
 
@@ -95,6 +96,7 @@ export function generateCompose(
   const botService: ComposeService = {
     container_name: `${appName}-app`,
     restart: 'unless-stopped',
+    cpu_shares: 50,
     networks: ['pcs'],
     labels: {
       'managed-by': 'discord-bot-manager',
@@ -162,6 +164,7 @@ function addDatabaseService(compose: ComposeFile, botId: string, appName: string
     image: 'postgres:15-alpine',
     container_name: `${appName}-db`,
     restart: 'unless-stopped',
+    cpu_shares: 10,
     networks: ['pcs'],
     environment: {
       POSTGRES_USER: 'bot',
@@ -223,6 +226,10 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push(`    container_name: ${service.container_name}`);
     lines.push(`    restart: ${service.restart}`);
 
+    if (service.cpu_shares !== undefined) {
+      lines.push(`    cpu_shares: ${service.cpu_shares}`);
+    }
+
     if (service.depends_on?.length) {
       lines.push('    depends_on:');
       for (const dep of service.depends_on) {
@@ -281,6 +288,9 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push('networks:');
     for (const [netName, netConfig] of Object.entries(compose.networks)) {
       lines.push(`  ${netName}:`);
+      if (netConfig.name) {
+        lines.push(`    name: ${netConfig.name}`);
+      }
       if (netConfig.external) {
         lines.push('    external: true');
       }
@@ -354,10 +364,8 @@ export function hasExistingCompose(repoPath: string): string | null {
 
 /**
  * Adapt existing compose file for CasaOS
- * - Applies variable substitution
- * - Adds Bot Manager labels
- * - Adds CasaOS metadata
- * - Ensures pcs network exists
+ * - Applies variable substitution (string-level, before YAML parse)
+ * - Processes all CasaOS modifications in a single YAML parse/stringify cycle
  */
 export function adaptExistingCompose(
   repoPath: string,
@@ -376,131 +384,15 @@ export function adaptExistingCompose(
   const originalName = extractAppName(content);
   const appName = originalName || fallbackName;
 
-  // 1. Apply variable substitution
+  // 1. Apply variable substitution (string-level $VAR replacement, must happen before YAML parse)
   content = applyVariableSubstitution(content, bot);
 
-  // 2. Replace version with name (Compose v2 format)
-  content = content.replace(/^version:\s*['"]?\d+(\.\d+)?['"]?\s*\n/m, '');
-  if (!content.includes('name:')) {
-    content = `name: ${appName}\n\n` + content;
-  }
-
-  // 3. Add Bot Manager labels to all services
-  content = addBotManagerLabels(content, bot);
-
-  // 4. Add x-casaos metadata if not present
-  if (!content.includes('x-casaos:')) {
-    content += `
-x-casaos:
-  architectures:
-    - amd64
-    - arm64
-  main: bot
-  author: discord-bot-manager
-  developer: discord-bot-manager
-  tagline:
-    en_us: "Discord Bot: ${bot.name}"
-  category: Utilities
-  description:
-    en_us: "Managed Discord bot: ${bot.name}"
-  title:
-    en_us: "${bot.name}"
-`;
-  }
-
-  // 5. Apply CasaOS metadata processing (ports→expose, hostname, is_uncontrolled)
-  content = applyCasaOSMetadata(content, appName);
-
-  // 6. Apply PCS processing (user rights, volumes, networks, PUID/PGID)
-  content = applyPCSProcessing(content);
+  // 2. Single-pass CasaOS processing: parse YAML once, apply all modifications, stringify once.
+  //    Handles: version removal, name field, labels, x-casaos metadata, ports→expose,
+  //    hostname, icon label, is_uncontrolled, volume paths, networks, PUID/PGID
+  content = processComposeForCasaOS(content, appName, bot);
 
   return { content, appName };
-}
-
-/**
- * Add Bot Manager labels to all services in compose content
- */
-export function addBotManagerLabels(content: string, bot: BotConfig): string {
-  const lines = content.split('\n');
-  const result: string[] = [];
-  let inServices = false;
-  let inServiceBlock = false;
-  let serviceIndent = 0;
-  let hasLabels = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // Detect services section
-    if (trimmed === 'services:') {
-      inServices = true;
-      result.push(line);
-      continue;
-    }
-
-    // Detect service name (key under services with no value on same line)
-    if (inServices && trimmed.endsWith(':') && !trimmed.includes(' ')) {
-      const indent = line.length - line.trimStart().length;
-      if (indent === 2) {
-        // New service - check if previous service needed labels
-        if (inServiceBlock && !hasLabels) {
-          // Add labels before this service
-          result.splice(result.length, 0,
-            `    labels:`,
-            `      managed-by: "discord-bot-manager"`,
-            `      bot-id: "${bot.id}"`,
-            `      bot-name: "${bot.name}"`
-          );
-        }
-        inServiceBlock = true;
-        serviceIndent = indent;
-        hasLabels = false;
-      }
-    }
-
-    // Detect labels in current service
-    if (inServiceBlock && trimmed === 'labels:') {
-      hasLabels = true;
-      result.push(line);
-      // Add our labels after the labels: line if they're not already there
-      const nextLine = lines[i + 1] || '';
-      if (!content.includes('managed-by')) {
-        result.push(`      managed-by: "discord-bot-manager"`);
-        result.push(`      bot-id: "${bot.id}"`);
-        result.push(`      bot-name: "${bot.name}"`);
-      }
-      continue;
-    }
-
-    // Detect end of services section (new top-level key)
-    if (inServices && trimmed.endsWith(':') && !trimmed.includes(' ')) {
-      const indent = line.length - line.trimStart().length;
-      if (indent === 0 && trimmed !== 'services:') {
-        // End of services, add labels to last service if needed
-        if (inServiceBlock && !hasLabels) {
-          result.push(`    labels:`);
-          result.push(`      managed-by: "discord-bot-manager"`);
-          result.push(`      bot-id: "${bot.id}"`);
-          result.push(`      bot-name: "${bot.name}"`);
-        }
-        inServices = false;
-        inServiceBlock = false;
-      }
-    }
-
-    result.push(line);
-  }
-
-  // Handle case where services is the last section
-  if (inServiceBlock && !hasLabels) {
-    result.push(`    labels:`);
-    result.push(`      managed-by: "discord-bot-manager"`);
-    result.push(`      bot-id: "${bot.id}"`);
-    result.push(`      bot-name: "${bot.name}"`);
-  }
-
-  return result.join('\n');
 }
 
 /**
@@ -533,6 +425,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
         image: bot.imageRef,
         container_name: `${appName}-app`,
         restart: 'unless-stopped',
+        cpu_shares: 50,
         networks: ['pcs'],
         labels: {
           'managed-by': 'discord-bot-manager',
@@ -553,7 +446,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
       }
     },
     networks: {
-      pcs: { external: true }
+      pcs: { name: 'pcs', external: true }
     },
     'x-casaos': {
       architectures: ['amd64', 'arm64'],

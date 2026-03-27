@@ -1,17 +1,16 @@
 /**
  * PCS Processing Pipeline
  *
- * Replicates the compiler's compose-processor.ts logic for CasaOS integration.
- * Handles: user rights injection, volume path processing, network configuration,
- * PUID/PGID env vars, ports→expose conversion, hostname, metadata placement,
- * volume directory creation, and pre/post install commands.
+ * All compose modifications happen on a single parsed YAML object to avoid
+ * corruption from multiple parse/stringify cycles.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { Document, parseDocument, stringify } from 'yaml';
+import { parseDocument, stringify } from 'yaml';
+import { BotConfig } from '../types';
 
 const execAsync = promisify(exec);
 
@@ -20,6 +19,7 @@ const execAsync = promisify(exec);
 interface PCSEnvironment {
   PUID: string;
   PGID: string;
+  TZ: string;
   DATA_ROOT: string;
   REF_NET: string;
   REF_DOMAIN: string;
@@ -28,11 +28,12 @@ interface PCSEnvironment {
   REF_SEPARATOR: string;
 }
 
-function getPCSEnvironment(): PCSEnvironment {
+export function getPCSEnvironment(): PCSEnvironment {
   const env = process.env;
   return {
     PUID: env.PUID || '1000',
     PGID: env.PGID || '1000',
+    TZ: env.TZ || 'UTC',
     DATA_ROOT: env.DATA_ROOT || '/DATA',
     REF_NET: env.REF_NET || 'pcs',
     REF_DOMAIN: env.REF_DOMAIN || 'localhost',
@@ -43,15 +44,6 @@ function getPCSEnvironment(): PCSEnvironment {
 }
 
 // ─── Internal Helpers ──────────────────────────────────────────────────────
-
-/**
- * Determine if PUID:PGID user injection should be applied to a service.
- * Returns true only if user is undefined or empty — never overrides explicit users.
- */
-function shouldAddUserToService(service: Record<string, unknown>): boolean {
-  const hasUser = service.user !== undefined && service.user !== '';
-  return !hasUser;
-}
 
 /**
  * Get the main service name from x-casaos.main or default to first service.
@@ -87,7 +79,7 @@ function hasPUIDInEnv(env: unknown): boolean {
 }
 
 /**
- * Extract the compose name field from YAML content.
+ * Extract the compose name field from YAML content string.
  */
 export function extractAppName(composeContent: string): string | null {
   try {
@@ -102,32 +94,146 @@ export function extractAppName(composeContent: string): string | null {
   return null;
 }
 
-// ─── PCS Processing ────────────────────────────────────────────────────────
+// ─── Single-Pass Compose Processing ────────────────────────────────────────
 
 /**
- * Apply PCS processing to compose content.
- * For each service:
- *   1. Replace /DATA prefix in volumes with actual DATA_ROOT
- *   2. Add REF_NET network to main service (external: true)
- *   3. Inject PUID/PGID env vars if not already present
+ * Process a compose file for CasaOS deployment in a SINGLE parse/stringify cycle.
+ * Single-pass approach: parse once, modify object, stringify once.
  *
- * NOTE: Does NOT inject user: PUID:PGID on services. The compiler does this
- * for CasaOS App Store apps designed for it, but the Bot Manager deploys
- * arbitrary repos with standard images (redis, postgres, node) that break
- * when their default user is overridden.
+ * Input: compose content string with variables ALREADY substituted.
+ * Applies all modifications on the parsed YAML object:
+ *   - Ensure name: field
+ *   - Remove version: field
+ *   - cpu_shares injection (50 default, 10 for infra services)
+ *   - Add Bot Manager labels to all services
+ *   - Add x-casaos metadata if missing
+ *   - Ports → expose conversion
+ *   - Hostname on main service
+ *   - Caddy reverse proxy labels on main service (when web port detected)
+ *   - Icon label on main service
+ *   - is_uncontrolled: false, store_app_id
+ *   - Volume /DATA path substitution
+ *   - REF_NET network on main service (with name: pcs)
+ *   - PUID/PGID/TZ env var injection
+ *   - webui_port and index in x-casaos (when web port detected)
  */
-export function applyPCSProcessing(composeContent: string): string {
+export function processComposeForCasaOS(
+  composeContent: string,
+  appName: string,
+  bot: BotConfig
+): string {
   const pcs = getPCSEnvironment();
   const doc = parseDocument(composeContent);
   const compose = doc.toJSON() as Record<string, unknown>;
 
+  // ── Ensure name field ──
+  delete compose.version;
+  if (!compose.name) {
+    compose.name = appName;
+  }
+
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-  if (!services) return composeContent;
+  if (!services) {
+    return stringify(compose, { lineWidth: 0 });
+  }
 
   const mainServiceName = getMainServiceName(compose);
 
+  // Known infrastructure service names that get low cpu_shares (10)
+  const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
+
+  // ── Per-service modifications ──
   for (const [serviceName, service] of Object.entries(services)) {
-    // 1. Volume path processing — replace /DATA with DATA_ROOT
+
+    // cpu_shares — mandatory on all services (50 default, 10 for infra)
+    if (service.cpu_shares === undefined) {
+      service.cpu_shares = infraServiceNames.has(serviceName) ? 10 : 50;
+    }
+
+    // Bot Manager labels
+    if (!service.labels) {
+      service.labels = {};
+    }
+    if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+      const labels = service.labels as Record<string, string>;
+      labels['managed-by'] = 'discord-bot-manager';
+      labels['bot-id'] = bot.id;
+      labels['bot-name'] = bot.name;
+    }
+
+    // Ports → expose conversion
+    if (service.ports && Array.isArray(service.ports)) {
+      const exposedPorts: string[] = [];
+      for (const portMapping of service.ports) {
+        if (typeof portMapping === 'string') {
+          const parts = portMapping.split(':');
+          let containerPort = parts.length > 1 ? parts[parts.length - 1] : parts[0];
+          containerPort = containerPort.split('/')[0];
+          if (containerPort && !exposedPorts.includes(containerPort)) {
+            exposedPorts.push(containerPort);
+          }
+        } else if (typeof portMapping === 'object' && portMapping !== null) {
+          const obj = portMapping as Record<string, unknown>;
+          if (obj.target !== undefined) {
+            const containerPort = String(obj.target);
+            if (!exposedPorts.includes(containerPort)) {
+              exposedPorts.push(containerPort);
+            }
+          }
+        }
+      }
+      if (exposedPorts.length > 0) {
+        service.expose = exposedPorts;
+      }
+      delete service.ports;
+    }
+
+    // Hostname on main service
+    if (serviceName === mainServiceName) {
+      service.hostname = appName;
+    }
+
+    // Caddy reverse proxy labels on main service (only when web port detected)
+    if (serviceName === mainServiceName) {
+      const xcMeta = compose['x-casaos'] as Record<string, unknown> | undefined;
+      let webPort: string | null = null;
+
+      // Priority: x-casaos.webui_port > first expose entry > skip
+      if (xcMeta?.webui_port !== undefined) {
+        webPort = String(xcMeta.webui_port);
+      } else if (service.expose && Array.isArray(service.expose) && service.expose.length > 0) {
+        webPort = String(service.expose[0]);
+      }
+
+      if (webPort) {
+        if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+          const labels = service.labels as Record<string, string>;
+          // Gateway-routed domain (custom CA)
+          labels['caddy_0'] = `${appName}-\${APP_DOMAIN}`;
+          labels['caddy_0.import'] = 'gateway_tls';
+          labels['caddy_0.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+          // nip.io direct access (custom CA)
+          labels['caddy_1'] = `${appName}-\${APP_PUBLIC_IP_DASH}.nip.io`;
+          labels['caddy_1.import'] = 'gateway_tls';
+          labels['caddy_1.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+          // sslip.io direct access (Let's Encrypt — no gateway_tls)
+          labels['caddy_2'] = `${appName}-\${APP_PUBLIC_IP_DASH}.sslip.io`;
+          labels['caddy_2.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+        }
+      }
+    }
+
+    // Icon label on main service
+    if (serviceName === mainServiceName) {
+      const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
+      if (xcasaos?.icon && typeof xcasaos.icon === 'string') {
+        if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+          (service.labels as Record<string, string>).icon = xcasaos.icon;
+        }
+      }
+    }
+
+    // Volume path processing — replace /DATA with actual DATA_ROOT
     if (service.volumes && Array.isArray(service.volumes)) {
       service.volumes = service.volumes.map((volume: unknown) => {
         if (typeof volume === 'string') {
@@ -143,9 +249,8 @@ export function applyPCSProcessing(composeContent: string): string {
       });
     }
 
-    // 2. Network injection (main service only)
+    // Network injection (main service only)
     if (serviceName === mainServiceName && pcs.REF_NET) {
-      // Skip if service has explicit network_mode (not bridge)
       if (!service.network_mode || service.network_mode === 'bridge') {
         if (!service.networks) {
           service.networks = [];
@@ -163,7 +268,7 @@ export function applyPCSProcessing(composeContent: string): string {
       }
     }
 
-    // 3. PUID/PGID environment variable injection
+    // PUID/PGID/TZ environment variable injection
     if (!service.environment) {
       service.environment = {};
     }
@@ -177,115 +282,85 @@ export function applyPCSProcessing(composeContent: string): string {
         env.PGID = pcs.PGID;
       }
     }
+    // TZ injection (if not already set)
+    if (Array.isArray(service.environment)) {
+      if (!service.environment.some((e: unknown) => typeof e === 'string' && /^TZ=/i.test(e))) {
+        service.environment.push(`TZ=${pcs.TZ}`);
+      }
+    } else if (typeof service.environment === 'object') {
+      const env = service.environment as Record<string, string>;
+      if (!Object.keys(env).some((k) => k.toUpperCase() === 'TZ')) {
+        env.TZ = pcs.TZ;
+      }
+    }
   }
 
-  // Ensure REF_NET network definition exists at compose level
+  // ── Compose-level network definition ──
   if (pcs.REF_NET) {
     if (!compose.networks) {
       compose.networks = {};
     }
     const networks = compose.networks as Record<string, unknown>;
     if (!networks[pcs.REF_NET]) {
-      networks[pcs.REF_NET] = { external: true };
-    }
-  }
-
-  return stringify(compose, { lineWidth: 0 });
-}
-
-// ─── CasaOS Metadata Processing ───────────────────────────────────────────
-
-/**
- * Apply CasaOS metadata processing to compose content.
- *   1. Convert ports → expose on all services
- *   2. Set hostname on main service
- *   3. Copy x-casaos.icon to main service labels
- *   4. Set is_uncontrolled: false and store_app_id
- *   5. Generate x-casaos.hostname from REF_DOMAIN
- */
-export function applyCasaOSMetadata(composeContent: string, appName: string): string {
-  const pcs = getPCSEnvironment();
-  const doc = parseDocument(composeContent);
-  const compose = doc.toJSON() as Record<string, unknown>;
-
-  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-  if (!services) return composeContent;
-
-  const mainServiceName = getMainServiceName(compose);
-
-  for (const [serviceName, service] of Object.entries(services)) {
-    // 1. Ports → expose conversion
-    if (service.ports && Array.isArray(service.ports)) {
-      const exposedPorts: string[] = [];
-
-      for (const portMapping of service.ports) {
-        if (typeof portMapping === 'string') {
-          // "8080:8080" or "8080" or "8080:8080/tcp"
-          const parts = portMapping.split(':');
-          let containerPort = parts.length > 1 ? parts[parts.length - 1] : parts[0];
-          // Strip protocol suffix
-          containerPort = containerPort.split('/')[0];
-          if (containerPort && !exposedPorts.includes(containerPort)) {
-            exposedPorts.push(containerPort);
-          }
-        } else if (typeof portMapping === 'object' && portMapping !== null) {
-          const obj = portMapping as Record<string, unknown>;
-          if (obj.target !== undefined) {
-            const containerPort = String(obj.target);
-            if (!exposedPorts.includes(containerPort)) {
-              exposedPorts.push(containerPort);
-            }
-          }
-        }
-      }
-
-      if (exposedPorts.length > 0) {
-        service.expose = exposedPorts;
-      }
-      delete service.ports;
-    }
-
-    // 2. Hostname on main service
-    if (serviceName === mainServiceName) {
-      service.hostname = appName;
-    }
-
-    // 3. Copy x-casaos.icon to main service labels
-    if (serviceName === mainServiceName) {
-      const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
-      if (xcasaos?.icon && typeof xcasaos.icon === 'string') {
-        if (!service.labels) {
-          service.labels = {};
-        }
-        if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
-          (service.labels as Record<string, string>).icon = xcasaos.icon;
-        }
+      networks[pcs.REF_NET] = { name: pcs.REF_NET, external: true };
+    } else if (networks[pcs.REF_NET] && typeof networks[pcs.REF_NET] === 'object') {
+      const net = networks[pcs.REF_NET] as Record<string, unknown>;
+      if (!net.name) {
+        net.name = pcs.REF_NET;
       }
     }
   }
 
-  // 4. Set required x-casaos fields
+  // ── x-casaos metadata ──
   if (!compose['x-casaos']) {
-    compose['x-casaos'] = {};
+    compose['x-casaos'] = {
+      architectures: ['amd64', 'arm64'],
+      main: mainServiceName || 'bot',
+      author: 'discord-bot-manager',
+      developer: 'discord-bot-manager',
+      tagline: { en_us: `Discord Bot: ${bot.name}` },
+      category: 'Utilities',
+      description: { en_us: `Managed Discord bot: ${bot.name}` },
+      title: { en_us: bot.name },
+    };
   }
+
   const xcasaos = compose['x-casaos'] as Record<string, unknown>;
   xcasaos.is_uncontrolled = false;
   xcasaos.store_app_id = appName;
 
-  // 5. Generate hostname from REF_DOMAIN
   if (pcs.REF_DOMAIN && pcs.REF_DOMAIN !== 'localhost') {
     xcasaos.hostname = `${appName}${pcs.REF_SEPARATOR}${pcs.REF_DOMAIN}`;
   }
 
+  // webui_port and index — set when main service has a web port
+  if (mainServiceName && services[mainServiceName]) {
+    const mainSvc = services[mainServiceName];
+    let webPort: string | null = null;
+
+    if (xcasaos.webui_port !== undefined) {
+      webPort = String(xcasaos.webui_port);
+    } else if (mainSvc.expose && Array.isArray(mainSvc.expose) && mainSvc.expose.length > 0) {
+      webPort = String(mainSvc.expose[0]);
+    }
+
+    if (webPort) {
+      xcasaos.webui_port = parseInt(webPort, 10);
+      if (!xcasaos.index) {
+        xcasaos.index = '/';
+      }
+    }
+  }
+
+  // ── Single stringify ──
   return stringify(compose, { lineWidth: 0 });
 }
 
 // ─── Volume Directory Creation ─────────────────────────────────────────────
 
 /**
- * Create volume directories that exist in the compose file.
- * Parses compose for volume sources starting with /DATA/AppData/.
- * Creates directories with proper ownership (1000:1000).
+ * Create volume directories from a compose file.
+ * Parses compose for volume sources under DATA_ROOT/AppData/.
  */
 export async function createVolumeDirectories(
   composeContent: string,
@@ -315,7 +390,6 @@ export async function createVolumeDirectories(
       let source: string | null = null;
 
       if (typeof volume === 'string') {
-        // "host:container" format
         const parts = volume.split(':');
         if (parts.length >= 2) source = parts[0];
       } else if (volume && typeof volume === 'object') {
@@ -333,7 +407,6 @@ export async function createVolumeDirectories(
 
   for (const dirPath of dirsToCreate) {
     try {
-      // Try via docker exec into casaos container (host filesystem access)
       await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dirPath}"`, {
         timeout: 10000,
       });
@@ -345,7 +418,6 @@ export async function createVolumeDirectories(
       });
       log(`[PCS] Created volume directory: ${dirPath}`);
     } catch {
-      // Fallback: direct filesystem access
       try {
         fs.mkdirSync(dirPath, { recursive: true });
         await execAsync(`chown -R 1000:1000 "${dirPath}"`, { timeout: 5000 });
@@ -385,7 +457,6 @@ export async function saveToCasaOSMetadata(
       timeout: 10000,
     });
   } catch {
-    // Fallback: direct creation
     try {
       fs.mkdirSync(metadataDir, { recursive: true });
       await execAsync(`chown -R 1000:1000 "${metadataDir}"`, { timeout: 5000 });
@@ -421,7 +492,6 @@ export async function saveToCasaOSMetadata(
 
 /**
  * Remove CasaOS metadata for an app.
- * Deletes /DATA/AppData/casaos/apps/{appName}/ directory.
  */
 export async function removeCasaOSMetadata(
   appName: string,
@@ -429,7 +499,6 @@ export async function removeCasaOSMetadata(
 ): Promise<void> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
-
   const metadataDir = path.join(pcs.DATA_ROOT, 'AppData', 'casaos', 'apps', appName);
 
   if (fs.existsSync(metadataDir)) {
@@ -444,7 +513,6 @@ export async function removeCasaOSMetadata(
 
 /**
  * Remove app data directory.
- * Deletes /DATA/AppData/{appName}/ if it exists.
  */
 export async function removeAppData(
   appName: string,
@@ -452,7 +520,6 @@ export async function removeAppData(
 ): Promise<void> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
-
   const appDataDir = path.join(pcs.DATA_ROOT, 'AppData', appName);
 
   if (fs.existsSync(appDataDir)) {
@@ -469,7 +536,6 @@ export async function removeAppData(
 
 /**
  * Fix ownership of directories Docker may have created as root after deploy.
- * Targets app data paths and metadata paths.
  */
 export async function fixPostDeployOwnership(
   appName: string,
@@ -529,13 +595,10 @@ export async function executeInstallCommand(
   const cmd = xcasaos[cmdKey];
   if (!cmd || typeof cmd !== 'string') return;
 
-  const pcs = getPCSEnvironment();
   const scriptId = Date.now().toString(36);
   const tempScript = `/tmp/botmgr-${type}install-${scriptId}.sh`;
-
   const scriptContent = `#!/bin/bash\nset -e\n\n${cmd}\n`;
   const scriptBase64 = Buffer.from(scriptContent).toString('base64');
-
   const dockerCommand = `docker exec --user ubuntu casaos bash -c 'umask 022 && echo "${scriptBase64}" | base64 -d > ${tempScript} && chmod 755 ${tempScript} && bash ${tempScript}'`;
 
   log(`[PCS] Executing ${type}-install command...`);

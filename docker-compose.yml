@@ -122,7 +122,7 @@ x-casaos:
   main: discordbotmanager
   author: kriz_cold
   developer: kriz_cold
-  icon: https://cdn.jsdelivr.net/gh/krizcold/AppStore@main/Apps/DiscordBotManager/icon.png
+  icon: https://cdn.jsdelivr.net/gh/krizcold/docker-discord-bot-manager/icon.png
   tagline:
     en_us: "Manage multiple Discord bots from GitHub repositories"
   category: Utilities

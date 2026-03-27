@@ -5,6 +5,12 @@ services:
     image: ghcr.io/yundera/nginx-hash-lock:latest
     restart: unless-stopped
     cpu_shares: 80
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     expose:
       - "80"
     user: "root"

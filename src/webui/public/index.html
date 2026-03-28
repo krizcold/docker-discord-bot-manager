@@ -362,33 +362,33 @@
   <!-- Uninstall Confirmation Modal -->
   <div id="delete-modal" class="modal-overlay hidden">
     <div class="modal" style="max-width: 460px;">
-      <h3>Uninstall Application</h3>
-      <p style="color: var(--text-primary); margin-bottom: 14px; font-size: 0.9rem;">Are you sure you want to uninstall <strong id="delete-bot-name"></strong>?</p>
+      <h3>Remove Bot</h3>
+      <p style="color: var(--text-primary); margin-bottom: 14px; font-size: 0.9rem;">Are you sure you want to remove <strong id="delete-bot-name"></strong>?</p>
 
       <div style="background: var(--bg-tertiary); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary); border-left: 3px solid var(--accent);">
-        This will uninstall the application from CasaOS and stop all containers.
+        This will uninstall the app from CasaOS and remove the bot.
       </div>
 
       <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 14px; padding: 12px; background: var(--bg-tertiary); border-radius: var(--radius);">
-        <input type="checkbox" id="delete-keep-data" checked style="margin-top: 3px;">
+        <input type="checkbox" id="delete-also-data" style="margin-top: 3px;">
         <span>
-          <strong style="color: var(--text-primary); font-size: 0.88rem;">Preserve application data</strong><br>
-          <span style="font-size: 0.8rem; color: var(--text-muted);">Keep user data, settings, and configurations. You can reinstall later without losing data.</span>
+          <strong style="color: var(--text-primary); font-size: 0.88rem;">Also delete application data</strong><br>
+          <span id="delete-data-desc" style="font-size: 0.8rem; color: var(--text-muted);">By default, data will be preserved. Check this to delete it permanently.</span>
         </span>
       </label>
 
       <div style="font-size: 0.83rem; color: var(--text-secondary); margin-bottom: 16px;">
-        <strong style="color: var(--warning);">What will happen:</strong>
+        <strong style="color: var(--warning);">This action cannot be undone</strong>
         <ul style="margin: 6px 0 0 18px; line-height: 1.7;">
-          <li>Application will be removed from CasaOS</li>
-          <li>Containers will be stopped and removed</li>
-          <li id="data-warning" style="color: var(--success);">User data will be preserved for future reinstallation</li>
+          <li>Bot configuration will be permanently removed</li>
+          <li>Application will be uninstalled from CasaOS</li>
+          <li id="data-warning">Without data deletion, all settings and user data will be preserved</li>
         </ul>
       </div>
 
       <div class="modal-actions">
         <button class="btn btn-secondary" onclick="hideDeleteModal()">Cancel</button>
-        <button class="btn btn-danger" onclick="confirmDeleteBot()">Uninstall Application</button>
+        <button class="btn btn-danger" onclick="confirmDeleteBot()">Remove Bot</button>
       </div>
     </div>
   </div>
@@ -609,8 +609,8 @@
       deleteBotId = id;
       const bot = bots.find(b => b.id === id);
       document.getElementById('delete-bot-name').textContent = bot?.name || id;
-      const checkbox = document.getElementById('delete-keep-data');
-      checkbox.checked = true;
+      const checkbox = document.getElementById('delete-also-data');
+      checkbox.checked = false;  // unchecked by default = preserve data
       updateDataWarning();
       checkbox.onchange = updateDataWarning;
       document.getElementById('delete-modal').classList.remove('hidden');
@@ -618,12 +618,12 @@
 
     function updateDataWarning() {
       const warn = document.getElementById('data-warning');
-      if (document.getElementById('delete-keep-data').checked) {
-        warn.textContent = 'User data will be preserved for future reinstallation';
-        warn.style.color = 'var(--success)';
-      } else {
-        warn.textContent = 'All user data, settings, and configurations will be permanently deleted';
+      if (document.getElementById('delete-also-data').checked) {
+        warn.textContent = 'All settings and user data will be permanently deleted';
         warn.style.color = 'var(--danger)';
+      } else {
+        warn.textContent = 'Without data deletion, all settings and user data will be preserved';
+        warn.style.color = 'var(--success)';
       }
     }
 
@@ -635,12 +635,13 @@
     async function confirmDeleteBot() {
       if (!deleteBotId || busyBots.has(deleteBotId)) return;
       const id = deleteBotId;
-      const preserveData = document.getElementById('delete-keep-data').checked;
+      // Inverted logic: checkbox checked = delete data, unchecked = preserve
+      const preserveData = !document.getElementById('delete-also-data').checked;
       hideDeleteModal();
       busyBots.add(id); renderBots();
       try {
         const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}`);
-        res.success ? showMessage('success', preserveData ? 'Application uninstalled (data preserved)' : 'Application uninstalled') : showMessage('error', res.error || 'Failed to uninstall');
+        res.success ? showMessage('success', preserveData ? 'Bot removed (data preserved)' : 'Bot removed') : showMessage('error', res.error || 'Failed to remove bot');
       } finally { busyBots.delete(id); loadBots(); }
     }
 
@@ -826,8 +827,8 @@
           </div>
           <div class="form-group">
             <label>Git URL *</label>
-            <input type="text" id="bot-url" placeholder="https://github.com/user/repo.git">
-            <div class="form-hint">Include token for private repos: https://TOKEN@github.com/...</div>
+            <input type="text" id="bot-url" placeholder="https://github.com/user/repo">
+            <div class="form-hint">Private repos: https://TOKEN@github.com/user/repo</div>
           </div>
           <div class="form-group">
             <label>Branch</label>

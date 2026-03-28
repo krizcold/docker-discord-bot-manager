@@ -143,20 +143,32 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * POST /api/bots/:id/start - Start a bot
+   * Returns immediately. Build/start progress is streamed via SSE (build-logs)
+   * and completion is broadcast via WebSocket.
    */
   router.post('/:id/start', async (req: Request, res: Response) => {
     try {
-      const result = await containerManager.startBot(req.params.id);
-
-      if (!result.success) {
-        res.status(400).json(result);
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
 
-      const bot = containerManager.getBot(req.params.id);
-      broadcastToClients(wss, 'bot:started', bot);
+      // Return immediately — build+start runs in background
+      res.json({ success: true, message: 'Starting bot' });
 
-      res.json({ success: true, bot });
+      const botId = req.params.id;
+      containerManager.startBot(botId).then((result) => {
+        const updatedBot = containerManager.getBot(botId);
+        if (result.success) {
+          broadcastToClients(wss, 'bot:started', updatedBot);
+        } else {
+          broadcastToClients(wss, 'bot:start-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        console.error(`[API] Start error for bot ${botId}:`, err);
+        broadcastToClients(wss, 'bot:start-failed', { id: botId, error: String(err) });
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

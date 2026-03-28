@@ -455,6 +455,17 @@
             markTerminalComplete(false);
           }
           loadBots();
+        } else if (data.type === 'bot:started') {
+          if (terminalBotId && data.data?.id === terminalBotId) markTerminalComplete(true);
+          busyBots.delete(data.data?.id);
+          loadBots();
+        } else if (data.type === 'bot:start-failed') {
+          if (terminalBotId && data.data?.id === terminalBotId) {
+            addTerminalLog(`Start failed: ${data.data?.error || 'Unknown error'}`, 'error');
+            markTerminalComplete(false);
+          }
+          busyBots.delete(data.data?.id);
+          loadBots();
         } else if (data.type.startsWith('bot:')) {
           loadBots();
         }
@@ -611,10 +622,18 @@
       openTerminalPopup(bot ? bot.name : id, id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
-        if (res.success) { markTerminalComplete(true); }
-        else { addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error'); markTerminalComplete(false); }
-      } catch (err) { addTerminalLog('Error: Failed to start bot', 'error'); markTerminalComplete(false); }
-      finally { busyBots.delete(id); loadBots(); }
+        if (!res.success) {
+          addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error');
+          markTerminalComplete(false);
+          busyBots.delete(id); loadBots();
+        }
+        // Success case: don't mark complete here — WebSocket 'bot:started' or
+        // 'bot:start-failed' event will handle it (build runs in background)
+      } catch (err) {
+        addTerminalLog('Error: Failed to start bot', 'error');
+        markTerminalComplete(false);
+        busyBots.delete(id); loadBots();
+      }
     }
 
     async function stopBot(id) {

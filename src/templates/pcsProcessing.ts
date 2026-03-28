@@ -295,6 +295,38 @@ export function processComposeForCasaOS(
     }
   }
 
+  // ── Merge bot.envVars into the target service ──
+  // User-configured env vars (from wizard/editor) must be injected into the
+  // build target service (x-casaos.build) or the main service's environment.
+  if (bot.envVars && Object.keys(bot.envVars).length > 0) {
+    const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
+    const targetServiceName = (typeof xcBuild === 'string' && services[xcBuild])
+      ? xcBuild
+      : mainServiceName;
+
+    if (targetServiceName && services[targetServiceName]) {
+      const targetService = services[targetServiceName];
+      if (!targetService.environment) {
+        targetService.environment = {};
+      }
+
+      const envVars = bot.envVars;
+      if (Array.isArray(targetService.environment)) {
+        const envArr = targetService.environment as string[];
+        for (const [key, value] of Object.entries(envVars)) {
+          const idx = envArr.findIndex((e: string) => e.startsWith(`${key}=`));
+          if (idx >= 0) envArr[idx] = `${key}=${value}`;
+          else envArr.push(`${key}=${value}`);
+        }
+      } else if (typeof targetService.environment === 'object') {
+        const envObj = targetService.environment as Record<string, string>;
+        for (const [key, value] of Object.entries(envVars)) {
+          envObj[key] = value;
+        }
+      }
+    }
+  }
+
   // ── Compose-level network definition ──
   if (pcs.REF_NET) {
     if (!compose.networks) {

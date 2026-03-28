@@ -5,6 +5,7 @@
 
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
+import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as repoManager from '../../git/repoManager';
 import * as envManager from '../../env/manager';
@@ -349,6 +350,124 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
+  });
+
+  /**
+   * GET /api/bots/:id/containers - List all containers for a bot's compose project
+   * Returns container names and status for the service sidebar.
+   */
+  router.get('/:id/containers', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const appName = bot.appName || `bot-${req.params.id}`;
+
+      // List containers matching this compose project (by name prefix or compose label)
+      const output = execSync(
+        `docker ps -a --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null || ` +
+        `docker ps -a --filter "name=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null`,
+        { encoding: 'utf8', timeout: 10000 }
+      ).trim();
+
+      const containers = output
+        .split('\n')
+        .filter(line => line.trim())
+        .map(line => {
+          const [name, state, status] = line.split('\t');
+          return { name, state: state || 'unknown', status: status || '' };
+        });
+
+      res.json({ success: true, containers, appName });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/containers/:container/logs/stream - Stream container logs via SSE
+   * Matches the Dev Kit's docker container log streaming pattern exactly:
+   * 1. Send recent logs (--tail N)
+   * 2. Stream new logs in real-time (docker logs -f --tail 0)
+   * 3. Keep-alive pings every 30s
+   * 4. Clean up on disconnect
+   */
+  router.get('/:id/containers/:container/logs/stream', (req: Request, res: Response) => {
+    const containerName = req.params.container;
+    const lines = parseInt(req.query.lines as string) || 50;
+
+    // Validate container name
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(containerName)) {
+      res.status(400).json({ success: false, error: 'Invalid container name' });
+      return;
+    }
+
+    // SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Send connected event
+    res.write(`event: connected\ndata: ${JSON.stringify({ message: `Connected to ${containerName} logs` })}\n\n`);
+
+    // Send recent logs
+    try {
+      const result = execSync(`docker logs --tail ${lines} ${containerName} 2>&1`, {
+        encoding: 'utf8',
+        timeout: 10000,
+        maxBuffer: 1024 * 1024 * 5
+      });
+
+      const logLines = result.split('\n').filter(line => line.trim().length > 0);
+      for (const logLine of logLines) {
+        res.write(`event: log\ndata: ${JSON.stringify({ log: logLine, timestamp: new Date().toISOString() })}\n\n`);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('No such container')) {
+        res.write(`event: log\ndata: ${JSON.stringify({ log: `Container '${containerName}' not found or not running`, timestamp: new Date().toISOString() })}\n\n`);
+      }
+    }
+
+    // Stream new logs in real-time
+    const logsProcess = spawn('docker', ['logs', '-f', '--tail', '0', containerName]);
+
+    const handleData = (data: Buffer) => {
+      if (!res.writable) return;
+      const lines = data.toString().split('\n').filter((l: string) => l.trim().length > 0);
+      for (const logLine of lines) {
+        res.write(`event: log\ndata: ${JSON.stringify({ log: logLine, timestamp: new Date().toISOString() })}\n\n`);
+      }
+    };
+
+    logsProcess.stdout.on('data', handleData);
+    logsProcess.stderr.on('data', handleData);
+
+    logsProcess.on('error', (error) => {
+      if (res.writable) {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
+      }
+    });
+
+    // Keep-alive ping every 30s
+    const keepAlive = setInterval(() => {
+      if (res.writable) {
+        res.write(`event: ping\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
+      }
+    }, 30000);
+
+    // Cleanup on disconnect
+    const cleanup = () => {
+      clearInterval(keepAlive);
+      logsProcess.kill('SIGTERM');
+    };
+
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    res.on('close', cleanup);
   });
 
   /**

@@ -234,6 +234,54 @@
     .terminal-status .dot-done { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+    /* ─── Service Logs Popup ─── */
+    .slp-container {
+      position: relative; width: 95%; max-width: 1200px; height: 80%; max-height: 800px;
+      background: var(--bg-primary); border-radius: var(--radius-lg); border: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.4);
+    }
+    .slp-header {
+      background: var(--bg-secondary); padding: 10px 16px; display: flex;
+      justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border); font-size: 0.88rem;
+    }
+    .slp-btn {
+      background: var(--bg-elevated); border: none; color: var(--text-secondary); padding: 5px 10px;
+      border-radius: var(--radius); cursor: pointer; font-size: 0.75rem; transition: background 0.15s;
+    }
+    .slp-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+    .slp-btn.active { background: var(--accent); color: #0f0f11; }
+    .slp-body { flex: 1; display: flex; overflow: hidden; }
+    .slp-sidebar {
+      width: 220px; background: var(--bg-secondary); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow-y: auto;
+    }
+    .slp-svc {
+      padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border);
+      transition: background 0.15s;
+    }
+    .slp-svc:hover { background: var(--bg-tertiary); }
+    .slp-svc.active { background: var(--accent); }
+    .slp-svc.active .slp-svc-name { color: #0f0f11; }
+    .slp-svc.active .slp-svc-status { color: rgba(15,15,17,0.7); }
+    .slp-svc-name { color: var(--text-primary); font-size: 0.82rem; font-weight: 500; margin-bottom: 2px; }
+    .slp-svc-status { color: var(--text-muted); font-size: 0.7rem; }
+    .slp-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .slp-toolbar {
+      background: var(--bg-secondary); padding: 6px 14px; display: flex;
+      justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .slp-viewer {
+      flex: 1; overflow-y: auto; padding: 12px 14px;
+      font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+      font-size: 0.75rem; line-height: 1.6; background: var(--bg-primary); color: var(--text-secondary);
+    }
+    .slp-viewer .log-line { margin: 1px 0; white-space: pre-wrap; word-break: break-word; }
+    .slp-viewer .log-line.system { color: var(--accent); }
+    .slp-viewer .log-line.error { color: var(--danger); }
+
     /* ─── Utilities ─── */
     .hidden { display: none !important; }
     .loading { text-align: center; padding: 32px; color: var(--text-muted); font-size: 0.9rem; }
@@ -279,16 +327,34 @@
     </div>
   </div>
 
-  <!-- Logs Modal -->
-  <div id="logs-modal" class="modal-overlay hidden">
-    <div class="modal" style="max-width: 700px;">
-      <h3>Bot Logs: <span id="logs-bot-name"></span></h3>
-      <div id="logs-container" class="logs-container">
-        <div class="loading">Loading logs...</div>
+  <!-- Service Logs Popup (matches Dev Kit layout) -->
+  <div id="logs-popup" class="hidden" style="position:fixed;top:0;left:0;right:0;bottom:0;z-index:2000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.15s ease;">
+    <div style="position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);backdrop-filter:blur(4px);" onclick="closeLogsPopup()"></div>
+    <div class="slp-container">
+      <div class="slp-header">
+        <div style="color:var(--text-primary);font-weight:600;display:flex;align-items:center;gap:8px;">Service Logs: <span id="slp-bot-name"></span></div>
+        <div style="display:flex;gap:6px;">
+          <button class="slp-btn" onclick="closeLogsPopup()" title="Close">X</button>
+        </div>
       </div>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" onclick="hideLogsModal()">Close</button>
-        <button class="btn btn-primary" onclick="refreshLogs()">Refresh</button>
+      <div class="slp-body">
+        <div class="slp-sidebar">
+          <div style="padding:10px 14px;background:var(--bg-elevated);border-bottom:1px solid var(--border);font-weight:600;font-size:0.8rem;color:var(--text-secondary);">Services</div>
+          <div id="slp-service-list"></div>
+        </div>
+        <div class="slp-main">
+          <div class="slp-toolbar">
+            <div id="slp-service-title" style="color:var(--text-primary);font-weight:500;font-size:0.82rem;">Logs</div>
+            <div style="display:flex;gap:4px;">
+              <button class="slp-btn" id="slp-refresh" title="Refresh">Refresh</button>
+              <button class="slp-btn" id="slp-clear" title="Clear">Clear</button>
+              <button class="slp-btn active" id="slp-follow" title="Auto-scroll: ON">Follow</button>
+            </div>
+          </div>
+          <div class="slp-viewer" id="slp-viewer">
+            <div class="log-line system">Loading...</div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1000,40 +1066,160 @@
       if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
     }
 
-    // ─── Logs Modal ───
-    function showLogs(botId, botName) {
-      currentLogsBotId = botId;
-      document.getElementById('logs-bot-name').textContent = botName;
-      document.getElementById('logs-modal').classList.remove('hidden');
-      refreshLogs();
-    }
+    // ─── Service Logs Popup (matches Dev Kit pattern) ───
+    let logsState = {
+      botId: null,
+      botName: '',
+      selectedContainer: null,
+      containers: [],
+      eventSource: null,
+      logHistory: {},  // per-container log history
+      autoScroll: true
+    };
 
-    function hideLogsModal() {
-      document.getElementById('logs-modal').classList.add('hidden');
-      currentLogsBotId = null;
-    }
+    async function showLogs(botId, botName) {
+      logsState.botId = botId;
+      logsState.botName = botName;
+      logsState.logHistory = {};
 
-    async function refreshLogs() {
-      if (!currentLogsBotId) return;
-      const container = document.getElementById('logs-container');
-      container.innerHTML = '<div class="loading">Loading logs...</div>';
+      document.getElementById('slp-bot-name').textContent = botName;
+      document.getElementById('logs-popup').classList.remove('hidden');
 
+      // Fetch containers for this bot
       try {
-        const res = await api('GET', `/bots/${currentLogsBotId}/logs?tail=100`);
-        if (res.success && res.logs) {
-          container.innerHTML = res.logs.map(log =>
-            `<div class="log-line">${escapeHtml(log)}</div>`
-          ).join('') || '<div class="log-line">No logs available</div>';
-          container.scrollTop = container.scrollHeight;
+        const res = await api('GET', `/bots/${botId}/containers`);
+        if (res.success && res.containers.length > 0) {
+          logsState.containers = res.containers;
+          renderServiceSidebar();
+          selectContainer(res.containers[0].name);
         } else {
-          const msg = (res.error && res.error.includes('no containers'))
-            ? 'No logs yet — start the bot first.'
-            : (res.error || 'Failed to load logs');
-          container.innerHTML = `<div class="log-line error">${escapeHtml(msg)}</div>`;
+          document.getElementById('slp-service-list').innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:0.82rem;">No containers found. Start the bot first.</div>';
+          document.getElementById('slp-viewer').innerHTML = '<div class="log-line system">No containers running.</div>';
         }
       } catch (err) {
-        container.innerHTML = '<div class="log-line error">Failed to load logs.</div>';
+        document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Failed to load containers.</div>';
       }
+
+      // Wire up toolbar buttons
+      document.getElementById('slp-refresh').onclick = () => {
+        if (logsState.selectedContainer) {
+          logsState.logHistory[logsState.selectedContainer] = [];
+          selectContainer(logsState.selectedContainer);
+        }
+      };
+      document.getElementById('slp-clear').onclick = () => {
+        const viewer = document.getElementById('slp-viewer');
+        viewer.innerHTML = '<div class="log-line system">Logs cleared</div>';
+        if (logsState.selectedContainer) logsState.logHistory[logsState.selectedContainer] = [];
+      };
+      document.getElementById('slp-follow').onclick = () => {
+        const btn = document.getElementById('slp-follow');
+        logsState.autoScroll = !logsState.autoScroll;
+        btn.classList.toggle('active', logsState.autoScroll);
+        btn.title = logsState.autoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF';
+        if (logsState.autoScroll) {
+          const viewer = document.getElementById('slp-viewer');
+          viewer.scrollTop = viewer.scrollHeight;
+        }
+      };
+    }
+
+    function renderServiceSidebar() {
+      const list = document.getElementById('slp-service-list');
+      list.innerHTML = logsState.containers.map(c => `
+        <div class="slp-svc ${c.name === logsState.selectedContainer ? 'active' : ''}" onclick="selectContainer('${escapeHtml(c.name)}')">
+          <div class="slp-svc-name">${escapeHtml(c.name)}</div>
+          <div class="slp-svc-status">${escapeHtml(c.state)} - ${escapeHtml(c.status)}</div>
+        </div>
+      `).join('');
+    }
+
+    function selectContainer(containerName) {
+      // Close existing stream
+      if (logsState.eventSource) {
+        logsState.eventSource.close();
+        logsState.eventSource = null;
+      }
+
+      logsState.selectedContainer = containerName;
+      renderServiceSidebar();
+      document.getElementById('slp-service-title').textContent = `${containerName} Logs`;
+
+      const viewer = document.getElementById('slp-viewer');
+
+      // Restore history if we have it
+      if (logsState.logHistory[containerName] && logsState.logHistory[containerName].length > 0) {
+        viewer.innerHTML = logsState.logHistory[containerName].join('');
+        viewer.scrollTop = viewer.scrollHeight;
+      } else {
+        viewer.innerHTML = '<div class="log-line system">Connecting to log stream...</div>';
+        logsState.logHistory[containerName] = [];
+      }
+
+      // Start SSE stream — matches Dev Kit's startLogStreaming()
+      const url = `/api/bots/${logsState.botId}/containers/${encodeURIComponent(containerName)}/logs/stream?lines=50`;
+      const es = new EventSource(url);
+      logsState.eventSource = es;
+
+      es.addEventListener('connected', (event) => {
+        if (logsState.selectedContainer === containerName) {
+          viewer.innerHTML = '';
+        }
+      });
+
+      es.addEventListener('log', (event) => {
+        const data = JSON.parse(event.data);
+        const time = new Date(data.timestamp).toLocaleTimeString();
+        const html = `<div class="log-line"><span style="color:var(--text-muted);font-size:0.68rem;">[${time}]</span> ${escapeHtml(data.log)}</div>`;
+
+        // Always save to history
+        if (!logsState.logHistory[containerName]) logsState.logHistory[containerName] = [];
+        logsState.logHistory[containerName].push(html);
+
+        // Limit history
+        if (logsState.logHistory[containerName].length > 500) {
+          logsState.logHistory[containerName].shift();
+        }
+
+        // Only render if this container is selected
+        if (logsState.selectedContainer === containerName) {
+          viewer.insertAdjacentHTML('beforeend', html);
+
+          // Trim DOM
+          while (viewer.children.length > 1000) viewer.removeChild(viewer.firstChild);
+
+          if (logsState.autoScroll) viewer.scrollTop = viewer.scrollHeight;
+        }
+      });
+
+      es.addEventListener('error', () => {
+        if (es.readyState === EventSource.CLOSED) {
+          const errHtml = '<div class="log-line error">Log stream disconnected. Reconnecting...</div>';
+          if (logsState.selectedContainer === containerName) {
+            viewer.insertAdjacentHTML('beforeend', errHtml);
+          }
+          logsState.eventSource = null;
+          // Reconnect after 3s
+          setTimeout(() => {
+            if (logsState.selectedContainer === containerName && !logsState.eventSource) {
+              selectContainer(containerName);
+            }
+          }, 3000);
+        }
+      });
+
+      es.addEventListener('ping', () => {});
+    }
+
+    function closeLogsPopup() {
+      if (logsState.eventSource) {
+        logsState.eventSource.close();
+        logsState.eventSource = null;
+      }
+      logsState.botId = null;
+      logsState.selectedContainer = null;
+      logsState.containers = [];
+      document.getElementById('logs-popup').classList.add('hidden');
     }
 
     // ─── Init ───

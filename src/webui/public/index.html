@@ -5,351 +5,248 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Discord Bot Manager</title>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-primary: #121214;
+      --bg-secondary: #1c1c21;
+      --bg-tertiary: #26262c;
+      --bg-elevated: #32323a;
+      --border: #2e2e36;
+      --border-focus: #2dd4a8;
+      --text-primary: #ececf0;
+      --text-secondary: #a0a0ab;
+      --text-muted: #63636e;
+      --accent: #2dd4a8;
+      --accent-hover: #25b890;
+      --success: #34d399;
+      --success-bg: rgba(52, 211, 153, 0.12);
+      --danger: #f87171;
+      --danger-bg: rgba(248, 113, 113, 0.12);
+      --warning: #fbbf24;
+      --warning-bg: rgba(251, 191, 36, 0.12);
+      --radius: 6px;
+      --radius-lg: 12px;
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: #1a1a2e;
-      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
       min-height: 100vh;
-    }
-
-    .header {
-      background: linear-gradient(135deg, #16213e, #0f3460);
-      padding: 20px 30px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 1px solid #0f3460;
-    }
-
-    .header h1 {
-      font-size: 1.5rem;
-      color: #e94560;
-    }
-
-    .header .status {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      font-size: 0.9rem;
-      color: #888;
-    }
-
-    .header .status .dot {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #3ba55d;
-    }
-
-    .container {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 30px;
-    }
-
-    .toolbar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 25px;
-    }
-
-    .toolbar h2 {
-      font-size: 1.3rem;
-      color: #fff;
-    }
-
-    .btn {
-      padding: 10px 20px;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.9rem;
-      font-weight: 500;
-      transition: all 0.2s;
-    }
-
-    .btn-primary {
-      background: linear-gradient(135deg, #e94560, #c73659);
-      color: white;
-    }
-
-    .btn-primary:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 4px 12px rgba(233, 69, 96, 0.3);
-    }
-
-    .btn-secondary {
-      background: #2a2a4a;
-      color: #fff;
-    }
-
-    .btn-secondary:hover {
-      background: #3a3a5a;
-    }
-
-    .btn-success {
-      background: #3ba55d;
-      color: white;
-    }
-
-    .btn-danger {
-      background: #ed4245;
-      color: white;
-    }
-
-    .btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    .btn-small {
-      padding: 6px 12px;
-      font-size: 0.8rem;
-    }
-
-    .bot-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-      gap: 20px;
-    }
-
-    .bot-card {
-      background: #16213e;
-      border-radius: 12px;
-      padding: 20px;
-      border: 1px solid #0f3460;
-      transition: all 0.2s;
-    }
-
-    .bot-card:hover {
-      border-color: #e94560;
-    }
-
-    .bot-card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: flex-start;
-      margin-bottom: 15px;
-    }
-
-    .bot-card h3 {
-      font-size: 1.1rem;
-      color: #fff;
-      margin-bottom: 5px;
-    }
-
-    .bot-card .repo-url {
-      font-size: 0.8rem;
-      color: #666;
-      word-break: break-all;
-    }
-
-    .status-badge {
-      padding: 4px 10px;
-      border-radius: 12px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-    }
-
-    .status-running { background: #3ba55d20; color: #3ba55d; }
-    .status-stopped { background: #ed424520; color: #ed4245; }
-    .status-building { background: #f5af1920; color: #f5af19; }
-    .status-error { background: #ed424520; color: #ed4245; }
-
-    .bot-card-actions {
-      display: flex;
-      gap: 8px;
-      margin-top: 15px;
-      padding-top: 15px;
-      border-top: 1px solid #0f3460;
-    }
-
-    .empty-state {
-      text-align: center;
-      padding: 60px 20px;
-      background: #16213e;
-      border-radius: 12px;
-      border: 2px dashed #0f3460;
-    }
-
-    .empty-state h3 {
-      margin-bottom: 10px;
-      color: #888;
-    }
-
-    .empty-state p {
-      color: #666;
-      margin-bottom: 20px;
-    }
-
-    .modal-overlay {
-      position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      background: rgba(0, 0, 0, 0.7);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 1000;
-    }
-
-    .modal {
-      background: #16213e;
-      border-radius: 12px;
-      padding: 25px;
-      width: 100%;
-      max-width: 500px;
-      border: 1px solid #0f3460;
-    }
-
-    .modal h3 {
-      margin-bottom: 20px;
-      color: #fff;
-    }
-
-    .form-group {
-      margin-bottom: 15px;
-    }
-
-    .form-group label {
-      display: block;
-      margin-bottom: 5px;
-      color: #aaa;
-      font-size: 0.9rem;
-    }
-
-    .form-group input {
-      width: 100%;
-      padding: 10px 12px;
-      background: #1a1a2e;
-      border: 1px solid #0f3460;
-      border-radius: 6px;
-      color: #fff;
-      font-size: 0.95rem;
-    }
-
-    .form-group input:focus {
-      outline: none;
-      border-color: #e94560;
-    }
-
-    .modal-actions {
-      display: flex;
-      gap: 10px;
-      justify-content: flex-end;
-      margin-top: 20px;
-    }
-
-    .logs-container {
-      background: #0d1117;
-      border-radius: 8px;
-      padding: 15px;
-      max-height: 300px;
-      overflow-y: auto;
-      font-family: monospace;
-      font-size: 0.85rem;
       line-height: 1.5;
     }
 
-    .logs-container .log-line {
-      color: #8b949e;
+    /* ─── Header ─── */
+    .header {
+      background: var(--bg-secondary);
+      padding: 16px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 1.15rem; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; }
+    .header .status {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 0.8rem; color: var(--text-secondary);
+    }
+    .header .status .dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--success);
     }
 
-    .logs-container .log-line.error {
-      color: #f85149;
+    /* ─── Layout ─── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    .toolbar {
+      display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;
+    }
+    .toolbar h2 { font-size: 1rem; font-weight: 600; color: var(--text-primary); }
+
+    /* ─── Buttons ─── */
+    .btn {
+      padding: 8px 16px; border: none; border-radius: var(--radius); cursor: pointer;
+      font-size: 0.82rem; font-weight: 500; transition: background 0.15s, opacity 0.15s;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .btn-primary { background: var(--accent); color: #0f0f11; }
+    .btn-primary:hover { background: var(--accent-hover); box-shadow: 0 0 0 3px rgba(45, 212, 168, 0.25); }
+    .btn-secondary { background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border); }
+    .btn-secondary:hover { background: var(--bg-tertiary); border-color: #3e3e48; }
+    .btn-success { background: var(--success); color: #fff; }
+    .btn-success:hover { opacity: 0.9; }
+    .btn-danger { background: var(--danger-bg); color: var(--danger); }
+    .btn-danger:hover { background: rgba(248, 113, 113, 0.22); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-small { padding: 5px 10px; font-size: 0.78rem; }
+
+    /* ─── Bot Grid ─── */
+    .bot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+    .bot-card {
+      background: var(--bg-secondary); border-radius: var(--radius-lg); padding: 18px;
+      border: 1px solid var(--border); transition: border-color 0.15s;
+    }
+    .bot-card:hover { border-color: #3e3e48; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25); }
+    .bot-card-header {
+      display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px;
+    }
+    .bot-card h3 { font-size: 0.95rem; font-weight: 600; color: var(--text-primary); margin-bottom: 3px; }
+    .bot-card .repo-url { font-size: 0.75rem; color: var(--text-muted); word-break: break-all; }
+    .status-badge {
+      padding: 3px 8px; border-radius: 10px; font-size: 0.7rem;
+      font-weight: 600; text-transform: uppercase; white-space: nowrap; letter-spacing: 0.02em;
+    }
+    .status-running { background: var(--success-bg); color: var(--success); }
+    .status-stopped { background: var(--danger-bg); color: var(--danger); }
+    .status-building { background: var(--warning-bg); color: var(--warning); }
+    .status-error { background: var(--danger-bg); color: var(--danger); }
+    .bot-card-actions {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px;
+      padding-top: 14px; border-top: 1px solid var(--border);
     }
 
-    .wizard-steps { display: flex; gap: 8px; margin-bottom: 20px; align-items: center; }
-    .wizard-step { padding: 4px 12px; border-radius: 12px; font-size: 0.8rem; background: #2a2a4a; color: #666; }
-    .wizard-step.active { background: #e94560; color: white; }
-    .wizard-step.completed { background: #3ba55d40; color: #3ba55d; }
-    .wizard-separator { color: #444; font-size: 0.8rem; }
-    .env-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
-    .env-row input { flex: 1; padding: 8px 10px; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 6px; color: #fff; font-size: 0.85rem; }
-    .env-row .btn-remove { padding: 8px; background: none; border: none; color: #ed4245; cursor: pointer; font-size: 1rem; }
-    .detection-info { background: #0f3460; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; font-size: 0.9rem; color: #aaa; }
-    .detection-info strong { color: #fff; }
+    /* ─── Empty State ─── */
+    .empty-state {
+      text-align: center; padding: 48px 20px; background: var(--bg-secondary);
+      border-radius: var(--radius-lg); border: 1px dashed var(--border);
+    }
+    .empty-state h3 { margin-bottom: 8px; color: var(--text-secondary); font-size: 1rem; }
+    .empty-state p { color: var(--text-muted); margin-bottom: 16px; font-size: 0.9rem; }
 
-    /* Terminal popup for build/start logs */
+    /* ─── Modals ─── */
+    .modal-overlay {
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.6); display: flex;
+      align-items: center; justify-content: center; z-index: 1000;
+      backdrop-filter: blur(2px);
+    }
+    .modal {
+      background: var(--bg-secondary); border-radius: var(--radius-lg); padding: 24px;
+      width: 100%; max-width: 520px; border: 1px solid var(--border);
+      max-height: 90vh; overflow-y: auto;
+    }
+    .modal h3 { margin-bottom: 16px; font-size: 1rem; font-weight: 600; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+    /* ─── Forms ─── */
+    .form-group { margin-bottom: 14px; }
+    .form-group label {
+      display: block; margin-bottom: 4px; color: var(--text-secondary);
+      font-size: 0.82rem; font-weight: 500;
+    }
+    .form-group input, .form-group select {
+      width: 100%; padding: 9px 12px; background: var(--bg-primary);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-primary); font-size: 0.88rem;
+    }
+    .form-group input:focus { outline: none; border-color: var(--border-focus); }
+    .form-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 3px; }
+
+    /* ─── Wizard ─── */
+    .wizard-steps { display: flex; gap: 6px; margin-bottom: 18px; align-items: center; }
+    .wizard-step {
+      padding: 3px 10px; border-radius: 10px; font-size: 0.75rem; font-weight: 500;
+      background: var(--bg-elevated); color: var(--text-muted);
+    }
+    .wizard-step.active { background: var(--accent); color: #fff; }
+    .wizard-step.completed { background: var(--success-bg); color: var(--success); }
+    .wizard-separator { color: var(--text-muted); font-size: 0.7rem; }
+
+    /* ─── Env Rows ─── */
+    .env-row {
+      display: flex; gap: 6px; margin-bottom: 6px; align-items: center;
+    }
+    .env-row input {
+      flex: 1; padding: 7px 10px; background: var(--bg-primary);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-primary); font-size: 0.82rem;
+    }
+    .env-row input:focus { outline: none; border-color: var(--border-focus); }
+    .env-row .btn-remove {
+      padding: 6px; background: none; border: none; color: var(--danger);
+      cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
+    }
+    .env-row .btn-remove:hover { opacity: 1; }
+    .env-label {
+      font-size: 0.72rem; color: var(--text-muted); padding: 0 2px; margin-bottom: 2px;
+    }
+    .env-label.required { color: var(--warning); }
+    .detection-info {
+      background: var(--bg-tertiary); padding: 10px 14px; border-radius: var(--radius);
+      margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary);
+      border-left: 3px solid var(--accent);
+    }
+    .detection-info strong { color: var(--text-primary); }
+
+    /* ─── Logs ─── */
+    .logs-container {
+      background: var(--bg-primary); border-radius: var(--radius); padding: 14px;
+      max-height: 300px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+      font-size: 0.8rem; line-height: 1.6;
+    }
+    .logs-container .log-line { color: var(--text-secondary); }
+    .logs-container .log-line.error { color: var(--danger); }
+
+    /* ─── Terminal ─── */
     .terminal-overlay {
       position: fixed; top: 0; left: 0; right: 0; bottom: 0;
       z-index: 2000; display: flex; align-items: center; justify-content: center;
-      background: rgba(0, 0, 0, 0.75); animation: termFadeIn 0.15s ease;
+      background: rgba(0, 0, 0, 0.7); animation: fadeIn 0.12s ease;
+      backdrop-filter: blur(2px);
     }
-    @keyframes termFadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     .terminal-box {
-      width: 90%; max-width: 800px; max-height: 80vh;
-      background: #0d1117; border-radius: 12px; overflow: hidden;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.5); display: flex; flex-direction: column;
+      width: 90%; max-width: 780px; max-height: 80vh;
+      background: var(--bg-primary); border-radius: var(--radius-lg); overflow: hidden;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.4); display: flex; flex-direction: column;
+      border: 1px solid var(--border);
     }
     .terminal-header {
-      background: #161b22; padding: 12px 16px; display: flex;
+      background: var(--bg-secondary); padding: 10px 16px; display: flex;
       justify-content: space-between; align-items: center;
-      border-bottom: 1px solid #21262d;
+      border-bottom: 1px solid var(--border);
     }
-    .terminal-title { color: #fff; font-weight: 600; font-size: 0.9rem; }
+    .terminal-title { color: var(--text-primary); font-weight: 600; font-size: 0.85rem; }
     .terminal-close {
-      background: none; border: none; color: #8b949e; font-size: 1.2rem;
-      cursor: pointer; padding: 4px 8px; border-radius: 4px;
+      background: none; border: none; color: var(--text-muted); font-size: 1.1rem;
+      cursor: pointer; padding: 4px 8px; border-radius: var(--radius);
     }
-    .terminal-close:hover { color: #fff; background: #30363d; }
+    .terminal-close:hover { color: var(--text-primary); background: var(--bg-elevated); }
     .terminal-body {
       flex: 1; overflow-y: auto; padding: 12px 16px;
-      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-      font-size: 0.8rem; line-height: 1.6; min-height: 300px; max-height: 60vh;
+      font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
+      font-size: 0.78rem; line-height: 1.7; min-height: 280px; max-height: 60vh;
     }
-    .terminal-body .log-line { color: #8b949e; white-space: pre-wrap; word-break: break-all; }
-    .terminal-body .log-line.system { color: #58a6ff; }
-    .terminal-body .log-line.success { color: #3ba55d; }
-    .terminal-body .log-line.error { color: #f85149; }
-    .terminal-body .log-line.warning { color: #d29922; }
+    .terminal-body .log-line { color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; }
+    .terminal-body .log-line.system { color: var(--accent); }
+    .terminal-body .log-line.success { color: var(--success); }
+    .terminal-body .log-line.error { color: var(--danger); }
+    .terminal-body .log-line.warning { color: var(--warning); }
     .terminal-footer {
-      background: #161b22; padding: 8px 16px; border-top: 1px solid #21262d;
+      background: var(--bg-secondary); padding: 8px 16px; border-top: 1px solid var(--border);
       display: flex; justify-content: space-between; align-items: center;
-      font-size: 0.75rem; color: #8b949e;
+      font-size: 0.72rem; color: var(--text-muted);
     }
     .terminal-status { display: flex; align-items: center; gap: 6px; }
     .terminal-status .dot-live {
-      width: 8px; height: 8px; border-radius: 50%; background: #3ba55d;
-      animation: dotPulse 2s infinite;
+      width: 7px; height: 7px; border-radius: 50%; background: var(--success);
+      animation: pulse 2s infinite;
     }
-    .terminal-status .dot-done { width: 8px; height: 8px; border-radius: 50%; background: #8b949e; }
-    @keyframes dotPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .terminal-status .dot-done { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
+    /* ─── Utilities ─── */
     .hidden { display: none !important; }
-
-    .loading {
-      text-align: center;
-      padding: 40px;
-      color: #888;
-    }
-
+    .loading { text-align: center; padding: 32px; color: var(--text-muted); font-size: 0.9rem; }
     .error-message {
-      background: #ed424520;
-      border: 1px solid #ed4245;
-      color: #ed4245;
-      padding: 10px 15px;
-      border-radius: 6px;
-      margin-bottom: 20px;
+      background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger);
+      padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
     }
-
     .success-message {
-      background: #3ba55d20;
-      border: 1px solid #3ba55d;
-      color: #3ba55d;
-      padding: 10px 15px;
-      border-radius: 6px;
-      margin-bottom: 20px;
+      background: var(--success-bg); border: 1px solid var(--success); color: var(--success);
+      padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
+    }
+    .tooltip {
+      font-size: 0.72rem; color: var(--text-muted); font-style: italic;
     }
   </style>
 </head>
@@ -396,9 +293,17 @@
     </div>
   </div>
 
+  <!-- Env Editor Modal -->
+  <div id="env-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 600px;">
+      <div id="env-editor-content"></div>
+    </div>
+  </div>
+
   <script>
     let bots = [];
     let currentLogsBotId = null;
+    let envEditorBotId = null;
 
     // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
@@ -406,7 +311,7 @@
       fetch(`/nhl-auth/establish-session?hash=${urlHash}`);
     }
 
-    // WebSocket for real-time updates
+    // ─── WebSocket ───
     let ws = null;
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -415,9 +320,7 @@
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.type === 'bot:built') {
-          if (terminalBotId && data.data?.id === terminalBotId) {
-            markTerminalComplete(true);
-          }
+          if (terminalBotId && data.data?.id === terminalBotId) markTerminalComplete(true);
           loadBots();
         } else if (data.type === 'bot:build-failed') {
           if (terminalBotId && data.data?.id === terminalBotId) {
@@ -433,18 +336,14 @@
     }
     connectWebSocket();
 
-    // API helper
+    // ─── API Helper ───
     async function api(method, endpoint, data = null) {
-      const options = {
-        method,
-        headers: { 'Content-Type': 'application/json' }
-      };
+      const options = { method, headers: { 'Content-Type': 'application/json' } };
       if (data) options.body = JSON.stringify(data);
       const res = await fetch(`/api${endpoint}`, options);
       return res.json();
     }
 
-    // Show message
     function showMessage(type, text) {
       const el = document.getElementById('message');
       el.className = type === 'error' ? 'error-message' : 'success-message';
@@ -452,16 +351,54 @@
       setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000);
     }
 
-    // Load bots
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function getDisplayUrl(url) {
+      if (!url) return '';
+      return url.replace(/\/\/([^@]+)@/, '//***@');
+    }
+
+    // ─── Known env var display names ───
+    const ENV_LABELS = {
+      'TOKEN': 'Discord Bot Token',
+      'DISCORD_TOKEN': 'Discord Bot Token',
+      'BOT_TOKEN': 'Discord Bot Token',
+      'CLIENT_TOKEN': 'Discord Bot Token',
+      'CLIENT_ID': 'Discord Client ID',
+      'DISCORD_CLIENT_ID': 'Discord Client ID',
+      'GUILD_ID': 'Discord Guild ID',
+      'MONGO_URI': 'MongoDB Connection URI',
+      'MONGODB_URI': 'MongoDB Connection URI',
+      'DATABASE_URL': 'Database URL',
+      'REDIS_URL': 'Redis URL',
+      'LAVALINK_HOST': 'Lavalink Host',
+      'LAVALINK_PORT': 'Lavalink Port',
+      'LAVALINK_PASSWORD': 'Lavalink Password',
+    };
+
+    const REQUIRED_KEYS = new Set([
+      'TOKEN', 'DISCORD_TOKEN', 'BOT_TOKEN', 'CLIENT_TOKEN',
+      'CLIENT_ID', 'DISCORD_CLIENT_ID',
+    ]);
+
+    function getEnvLabel(key) {
+      return ENV_LABELS[key] || null;
+    }
+
+    function isRequiredEnv(key) {
+      return REQUIRED_KEYS.has(key);
+    }
+
+    // ─── Load & Render Bots ───
     async function loadBots() {
       try {
         const res = await api('GET', '/bots');
-        if (res.success) {
-          bots = res.bots;
-        } else {
-          bots = [];
-          showMessage('error', res.error || 'Failed to load bots');
-        }
+        bots = res.success ? res.bots : [];
+        if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
         bots = [];
         showMessage('error', 'Failed to load bots');
@@ -469,7 +406,6 @@
       renderBots();
     }
 
-    // Render bots
     function renderBots() {
       const container = document.getElementById('bots-container');
 
@@ -486,7 +422,9 @@
 
       container.innerHTML = `
         <div class="bot-grid">
-          ${bots.map(bot => `
+          ${bots.map(bot => {
+            const isRunning = bot.status === 'running';
+            return `
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
@@ -496,126 +434,216 @@
                 <span class="status-badge status-${bot.status}">${bot.status}</span>
               </div>
               <div class="bot-card-actions">
-                ${bot.status === 'running' ? `
+                ${isRunning ? `
                   <button class="btn btn-danger btn-small" onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small" onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
                 ` : bot.hasBeenStarted ? `
                   <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
                   <button class="btn btn-secondary btn-small" onclick="pullBot('${bot.id}')">Pull</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
               </div>
-            </div>
-          `).join('')}
+            </div>`;
+          }).join('')}
         </div>
       `;
     }
 
-    // Escape HTML
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
-
-    // Bot actions
+    // ─── Bot Actions ───
     async function startBot(id) {
       const bot = bots.find(b => b.id === id);
-      const botName = bot ? bot.name : id;
-      openTerminalPopup(botName, id, 'Starting');
+      openTerminalPopup(bot ? bot.name : id, id, 'Starting');
       try {
         const res = await api('POST', `/bots/${id}/start`);
-        if (res.success) {
-          markTerminalComplete(true);
-          loadBots();
-        } else {
-          addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error');
-          markTerminalComplete(false);
-        }
-      } catch (err) {
-        addTerminalLog('Error: Failed to start bot', 'error');
-        markTerminalComplete(false);
-      }
+        if (res.success) { markTerminalComplete(true); loadBots(); }
+        else { addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error'); markTerminalComplete(false); }
+      } catch (err) { addTerminalLog('Error: Failed to start bot', 'error'); markTerminalComplete(false); }
     }
 
     async function stopBot(id) {
       const res = await api('POST', `/bots/${id}/stop`);
-      if (res.success) {
-        showMessage('success', 'Bot stopped');
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to stop bot');
-      }
+      res.success ? (showMessage('success', 'Bot stopped'), loadBots()) : showMessage('error', res.error || 'Failed to stop bot');
     }
 
     async function restartBot(id) {
       const res = await api('POST', `/bots/${id}/restart`);
-      if (res.success) {
-        showMessage('success', 'Bot restarting...');
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to restart bot');
-      }
+      res.success ? (showMessage('success', 'Bot restarting...'), loadBots()) : showMessage('error', res.error || 'Failed to restart bot');
     }
 
     async function pullBot(id) {
       showMessage('success', 'Pulling latest code...');
       const res = await api('POST', `/bots/${id}/pull`);
-      if (res.success) {
-        showMessage('success', 'Code updated and rebuilt');
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to pull');
-      }
+      res.success ? (showMessage('success', 'Code updated and rebuilt'), loadBots()) : showMessage('error', res.error || 'Failed to pull');
     }
 
     async function deleteBot(id) {
       if (!confirm('Delete this bot? This will remove all files and stop the container.')) return;
       const res = await api('DELETE', `/bots/${id}`);
-      if (res.success) {
-        showMessage('success', 'Bot deleted');
-        loadBots();
-      } else {
-        showMessage('error', res.error || 'Failed to delete bot');
+      res.success ? (showMessage('success', 'Bot deleted'), loadBots()) : showMessage('error', res.error || 'Failed to delete bot');
+    }
+
+    // ─── Environment Editor ───
+    async function showEnvEditor(botId) {
+      envEditorBotId = botId;
+      const bot = bots.find(b => b.id === botId);
+      const modal = document.getElementById('env-modal');
+      const content = document.getElementById('env-editor-content');
+
+      content.innerHTML = `<h3>Environment Variables: ${escapeHtml(bot?.name || botId)}</h3><div class="loading">Loading...</div>`;
+      modal.classList.remove('hidden');
+
+      try {
+        const res = await api('GET', `/bots/${botId}/env`);
+        if (!res.success) {
+          content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">${escapeHtml(res.error || 'Failed to load')}</div>
+            <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
+          return;
+        }
+
+        // Build env rows from existing vars + .env.example hints
+        const existing = {};
+        if (res.envVars) res.envVars.forEach(v => { existing[v.key] = v; });
+
+        const seen = new Set();
+        let rowsHtml = '';
+
+        // Show existing env vars first
+        if (res.envVars && res.envVars.length > 0) {
+          for (const v of res.envVars) {
+            seen.add(v.key);
+            const label = getEnvLabel(v.key);
+            const req = isRequiredEnv(v.key);
+            const displayValue = v.sensitive ? '' : (v.value || '');
+            rowsHtml += buildEnvRowHtml(v.key, displayValue, label, req, v.sensitive ? 'Sensitive - enter new value to change' : '');
+          }
+        }
+
+        // Add hints from .env.example that aren't already set
+        if (res.envExample) {
+          for (const ex of res.envExample) {
+            if (!seen.has(ex.key)) {
+              seen.add(ex.key);
+              const label = getEnvLabel(ex.key) || ex.description;
+              const req = isRequiredEnv(ex.key);
+              rowsHtml += buildEnvRowHtml(ex.key, ex.defaultValue || '', label, req, '');
+            }
+          }
+        }
+
+        // Add missing required vars
+        if (res.missing) {
+          for (const key of res.missing) {
+            if (!seen.has(key)) {
+              seen.add(key);
+              rowsHtml += buildEnvRowHtml(key, '', getEnvLabel(key), true, '');
+            }
+          }
+        }
+
+        if (!rowsHtml) {
+          rowsHtml = buildEnvRowHtml('', '', null, false, '');
+        }
+
+        content.innerHTML = `
+          <h3>Environment Variables: ${escapeHtml(bot?.name || botId)}</h3>
+          ${!res.valid ? `<div class="error-message">Missing required: ${res.missing.join(', ')}</div>` : ''}
+          <div id="env-editor-rows">${rowsHtml}</div>
+          <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="hideEnvEditor()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveEnvEditor()">Save</button>
+          </div>
+        `;
+      } catch (err) {
+        content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">Failed to load environment variables</div>
+          <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
       }
     }
 
-    // Hide token in URL for display
-    function getDisplayUrl(url) {
-      if (!url) return '';
-      return url.replace(/\/\/([^@]+)@/, '//***@');
+    function buildEnvRowHtml(key, value, label, required, placeholder) {
+      const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${required ? ' (required)' : ''}</div>` : '';
+      return `<div>
+        ${labelHtml}
+        <div class="env-row">
+          <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
+          <input type="text" value="${escapeHtml(value)}" class="env-value" placeholder="${escapeHtml(placeholder || 'Value')}">
+          <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
+        </div>
+      </div>`;
     }
 
-    // Wizard state
+    function addEnvEditorRow() {
+      const container = document.getElementById('env-editor-rows');
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = `<div class="env-row">
+        <input type="text" class="env-key" placeholder="KEY">
+        <input type="text" class="env-value" placeholder="Value">
+        <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
+      </div>`;
+      container.appendChild(wrapper);
+    }
+
+    async function saveEnvEditor() {
+      const rows = document.querySelectorAll('#env-editor-rows .env-row');
+      const vars = {};
+      rows.forEach(row => {
+        const key = row.querySelector('.env-key').value.trim();
+        const value = row.querySelector('.env-value').value;
+        if (key) vars[key] = value;
+      });
+
+      const saveBtn = document.querySelector('#env-editor-content .btn-primary');
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving...';
+
+      try {
+        const res = await api('PUT', `/bots/${envEditorBotId}/env`, { vars });
+        if (res.success) {
+          showMessage('success', 'Environment variables saved');
+          hideEnvEditor();
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Failed to save');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to save environment variables');
+      } finally {
+        if (saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+      }
+    }
+
+    function hideEnvEditor() {
+      document.getElementById('env-modal').classList.add('hidden');
+      envEditorBotId = null;
+    }
+
+    // ─── Wizard State ───
     let wizardStep = 1;
     let wizardBotId = null;
     let wizardBotData = null;
-    let wizardEnvHints = []; // pre-populated env rows from required vars + .env.example
+    let wizardEnvHints = [];
 
     // Terminal popup state
     let terminalEventSource = null;
     let terminalBotId = null;
 
     function showAddBotModal() {
-      wizardStep = 1;
-      wizardBotId = null;
-      wizardBotData = null;
-      wizardEnvHints = [];
+      wizardStep = 1; wizardBotId = null; wizardBotData = null; wizardEnvHints = [];
       document.getElementById('add-modal').classList.remove('hidden');
       renderWizard();
     }
 
     function hideAddBotModal() {
       document.getElementById('add-modal').classList.add('hidden');
-      wizardStep = 1;
-      wizardBotId = null;
-      wizardBotData = null;
-      wizardEnvHints = [];
+      wizardStep = 1; wizardBotId = null; wizardBotData = null; wizardEnvHints = [];
       loadBots();
     }
 
@@ -643,8 +671,9 @@
             <input type="text" id="bot-name" placeholder="My Discord Bot">
           </div>
           <div class="form-group">
-            <label>Git URL * (include token for private repos)</label>
-            <input type="text" id="bot-url" placeholder="https://TOKEN@github.com/user/repo.git">
+            <label>Git URL *</label>
+            <input type="text" id="bot-url" placeholder="https://github.com/user/repo.git">
+            <div class="form-hint">Include token for private repos: https://TOKEN@github.com/...</div>
           </div>
           <div class="form-group">
             <label>Branch</label>
@@ -658,39 +687,28 @@
       } else if (wizardStep === 2) {
         const botType = wizardBotData?.botType || 'unknown';
         const hasDb = wizardBotData?.hasDatabase;
-        const envRowsHtml = wizardEnvHints.length > 0
-          ? wizardEnvHints.map(h => `
-            <div class="env-row">
-              <input type="text" placeholder="Key" value="${escapeHtml(h.key)}" class="env-key">
-              <input type="text" placeholder="${escapeHtml(h.description || 'Value')}" value="${escapeHtml(h.defaultValue || '')}" class="env-value">
-              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-            </div>
-          `).join('')
-          : `<div class="env-row">
-              <input type="text" placeholder="Key" value="DISCORD_TOKEN" class="env-key">
-              <input type="text" placeholder="Value" class="env-value">
-              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-            </div>
-            <div class="env-row">
-              <input type="text" placeholder="Key" value="CLIENT_ID" class="env-key">
-              <input type="text" placeholder="Value" class="env-value">
-              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-            </div>
-            <div class="env-row">
-              <input type="text" placeholder="Key" value="GUILD_ID" class="env-key">
-              <input type="text" placeholder="Value" class="env-value">
-              <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-            </div>`;
+
+        let envRowsHtml = '';
+        if (wizardEnvHints.length > 0) {
+          envRowsHtml = wizardEnvHints.map(h => {
+            const label = getEnvLabel(h.key) || h.description;
+            const req = isRequiredEnv(h.key);
+            return buildEnvRowHtml(h.key, h.defaultValue || '', label, req, '');
+          }).join('');
+        } else {
+          envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
+            + buildEnvRowHtml('CLIENT_ID', '', 'Discord Client ID', true, '')
+            + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', false, '');
+        }
+
         el.innerHTML = `
           ${renderWizardSteps()}
           <h3>Configure Environment</h3>
           <div class="detection-info">
             Detected: <strong>${escapeHtml(botType)} bot</strong>${hasDb ? ' with database' : ''}
           </div>
-          <div id="env-rows">
-            ${envRowsHtml}
-          </div>
-          <button class="btn btn-secondary btn-small" onclick="addEnvRow()" style="margin-bottom: 10px;">+ Add Variable</button>
+          <div id="env-rows">${envRowsHtml}</div>
+          <button class="btn btn-secondary btn-small" onclick="addEnvRow()" style="margin-bottom: 8px;">+ Add Variable</button>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="wizardSkipEnv()">Skip</button>
             <button class="btn btn-primary" onclick="wizardSaveEnv()">Save &amp; Continue</button>
@@ -700,9 +718,8 @@
         el.innerHTML = `
           ${renderWizardSteps()}
           <h3>Build Image</h3>
-          <p style="color: #aaa; margin-bottom: 20px;">Ready to build Docker image for your bot. You can also skip this step — the image will be built automatically when you start the bot.</p>
-          <div id="build-status"></div>
-          <div class="modal-actions" id="build-actions">
+          <p style="color: var(--text-secondary); margin-bottom: 16px; font-size: 0.9rem;">Ready to build Docker image. You can skip this — the image builds automatically on first start.</p>
+          <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideAddBotModal()">Close</button>
             <button class="btn btn-primary" onclick="wizardBuild()">Build</button>
           </div>
@@ -715,7 +732,6 @@
       modal.querySelectorAll('.btn').forEach(b => b.disabled = true);
       modal.querySelectorAll('input').forEach(i => i.disabled = true);
     }
-
     function unlockWizard() {
       const modal = document.getElementById('add-modal');
       modal.querySelectorAll('.btn').forEach(b => b.disabled = false);
@@ -727,10 +743,7 @@
       const url = document.getElementById('bot-url').value.trim();
       const branch = document.getElementById('bot-branch').value.trim() || 'main';
 
-      if (!name || !url) {
-        showMessage('error', 'Name and URL are required');
-        return;
-      }
+      if (!name || !url) { showMessage('error', 'Name and URL are required'); return; }
 
       lockWizard();
       const cloneBtn = document.querySelector('#wizard-content .btn-primary');
@@ -742,49 +755,33 @@
         if (res.success) {
           wizardBotId = res.bot.id;
           wizardBotData = res.bot;
-
-          // Fetch env hints (required vars + .env.example from repo)
           wizardEnvHints = [];
+
           try {
             const envRes = await api('GET', `/bots/${res.bot.id}/env`);
             if (envRes.success) {
-              // Build hints: start with .env.example vars, then add missing required vars
               const seen = new Set();
               const hints = [];
 
-              // .env.example vars first (they have descriptions)
               if (envRes.envExample) {
                 for (const ex of envRes.envExample) {
                   seen.add(ex.key);
                   hints.push({ key: ex.key, description: ex.description || '', defaultValue: ex.defaultValue || '' });
                 }
               }
-
-              // Then add required vars not already covered by .env.example
               if (envRes.missing) {
                 for (const key of envRes.missing) {
-                  if (!seen.has(key)) {
-                    seen.add(key);
-                    hints.push({ key, description: '', defaultValue: '' });
-                  }
+                  if (!seen.has(key)) { seen.add(key); hints.push({ key, description: '', defaultValue: '' }); }
                 }
               }
-
-              // Also add any required vars from envVars list not yet seen
               if (envRes.envVars) {
                 for (const v of envRes.envVars) {
-                  if (v.required && !seen.has(v.key)) {
-                    seen.add(v.key);
-                    hints.push({ key: v.key, description: '', defaultValue: '' });
-                  }
+                  if (v.required && !seen.has(v.key)) { seen.add(v.key); hints.push({ key: v.key, description: '', defaultValue: '' }); }
                 }
               }
-
               wizardEnvHints = hints;
             }
-          } catch (e) {
-            // Non-fatal: wizard will fall back to default required vars
-          }
+          } catch (e) { /* Non-fatal */ }
 
           wizardStep = 2;
           renderWizard();
@@ -801,18 +798,13 @@
 
     function addEnvRow(key, value) {
       const container = document.getElementById('env-rows');
-      const row = document.createElement('div');
-      row.className = 'env-row';
-      row.innerHTML = `
-        <input type="text" placeholder="Key" value="${escapeHtml(key || '')}" class="env-key">
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = `<div class="env-row">
+        <input type="text" placeholder="KEY" value="${escapeHtml(key || '')}" class="env-key">
         <input type="text" placeholder="Value" value="${escapeHtml(value || '')}" class="env-value">
-        <button class="btn-remove" onclick="removeEnvRow(this)" title="Remove">&times;</button>
-      `;
-      container.appendChild(row);
-    }
-
-    function removeEnvRow(btn) {
-      btn.closest('.env-row').remove();
+        <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
+      </div>`;
+      container.appendChild(wrapper);
     }
 
     async function wizardSaveEnv() {
@@ -826,35 +818,22 @@
 
       lockWizard();
       const saveBtn = document.querySelector('#wizard-content .btn-primary');
-      const originalText = saveBtn.textContent;
       saveBtn.textContent = 'Saving...';
 
       try {
         const res = await api('PUT', `/bots/${wizardBotId}/env`, { vars });
-        if (res.success) {
-          wizardStep = 3;
-          renderWizard();
-        } else {
-          showMessage('error', res.error || 'Failed to save environment variables');
-        }
+        if (res.success) { wizardStep = 3; renderWizard(); }
+        else showMessage('error', res.error || 'Failed to save environment variables');
       } catch (err) {
         showMessage('error', 'Failed to save environment variables');
-      } finally {
-        unlockWizard();
-        if (saveBtn.isConnected) saveBtn.textContent = originalText;
-      }
+      } finally { unlockWizard(); }
     }
 
-    function wizardSkipEnv() {
-      wizardStep = 3;
-      renderWizard();
-    }
+    function wizardSkipEnv() { wizardStep = 3; renderWizard(); }
 
     async function wizardBuild() {
       const botName = wizardBotData ? wizardBotData.name : wizardBotId;
-      const botId = wizardBotId; // Capture before openTerminalPopup resets wizard state
-
-      // Hide wizard and open terminal popup
+      const botId = wizardBotId;
       document.getElementById('add-modal').classList.add('hidden');
       openTerminalPopup(botName, botId, 'Building');
 
@@ -864,15 +843,13 @@
           addTerminalLog(`Error: ${res.error || 'Build request failed'}`, 'error');
           markTerminalComplete(false);
         }
-        // Build is fire-and-forget — logs stream via SSE
-        // Completion signaled by WebSocket bot:built / bot:build-failed
       } catch (err) {
         addTerminalLog('Error: Failed to start build', 'error');
         markTerminalComplete(false);
       }
     }
 
-    // Terminal popup for build/start log streaming
+    // ─── Terminal Popup ───
     function openTerminalPopup(botName, botId, action) {
       closeTerminalPopup();
       terminalBotId = botId;
@@ -897,54 +874,36 @@
         </div>
       `;
       document.body.appendChild(overlay);
-
-      // Start streaming build logs via SSE
       streamBuildLogs(botId);
     }
 
     function closeTerminalPopup() {
-      if (terminalEventSource) {
-        terminalEventSource.close();
-        terminalEventSource = null;
-      }
+      if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
       terminalBotId = null;
-
       const popup = document.getElementById('terminal-popup');
-      if (!popup) return; // Nothing to close — skip cleanup
-
+      if (!popup) return;
       popup.remove();
-
-      // Reset wizard state if wizard was in progress
-      wizardStep = 1;
-      wizardBotId = null;
-      wizardBotData = null;
-      wizardEnvHints = [];
+      wizardStep = 1; wizardBotId = null; wizardBotData = null; wizardEnvHints = [];
       loadBots();
     }
 
     function streamBuildLogs(botId) {
-      const url = `/api/bots/${botId}/build-logs?fresh=true`;
-      terminalEventSource = new EventSource(url);
-
+      terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs?fresh=true`);
       terminalEventSource.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'ping') return;
           addTerminalLog(data.message, data.type || 'info');
-        } catch (e) {
-          addTerminalLog(event.data, 'info');
-        }
+        } catch (e) { addTerminalLog(event.data, 'info'); }
       };
-
       terminalEventSource.onopen = () => {
-        const statusText = document.getElementById('terminal-status-text');
-        if (statusText) statusText.textContent = 'Streaming...';
+        const st = document.getElementById('terminal-status-text');
+        if (st) st.textContent = 'Streaming...';
       };
-
       terminalEventSource.onerror = () => {
-        if (terminalEventSource && terminalEventSource.readyState === EventSource.CLOSED) {
-          const statusText = document.getElementById('terminal-status-text');
-          if (statusText) statusText.textContent = 'Disconnected';
+        if (terminalEventSource?.readyState === EventSource.CLOSED) {
+          const st = document.getElementById('terminal-status-text');
+          if (st) st.textContent = 'Disconnected';
           const dot = document.getElementById('terminal-dot');
           if (dot) dot.className = 'dot-done';
         }
@@ -954,42 +913,23 @@
     function addTerminalLog(message, type) {
       const body = document.getElementById('terminal-body');
       if (!body || !message) return;
-
       const line = document.createElement('div');
       line.className = `log-line ${type || 'info'}`;
       line.textContent = message;
       body.appendChild(line);
-
-      // Auto-scroll to bottom
       body.scrollTop = body.scrollHeight;
     }
 
     function markTerminalComplete(success) {
-      // Add a clear completion line in the terminal itself
-      addTerminalLog(
-        success ? '--- Process completed successfully ---' : '--- Process failed ---',
-        success ? 'success' : 'error'
-      );
-
+      addTerminalLog(success ? '--- Process completed successfully ---' : '--- Process failed ---', success ? 'success' : 'error');
       const dot = document.getElementById('terminal-dot');
-      const statusText = document.getElementById('terminal-status-text');
-
-      if (dot) {
-        dot.className = 'dot-done';
-        dot.style.background = success ? '#3ba55d' : '#ed4245';
-      }
-      if (statusText) {
-        statusText.textContent = success ? 'Complete' : 'Failed';
-      }
-
-      // Stop the SSE stream once done
-      if (terminalEventSource) {
-        terminalEventSource.close();
-        terminalEventSource = null;
-      }
+      const st = document.getElementById('terminal-status-text');
+      if (dot) { dot.className = 'dot-done'; dot.style.background = success ? 'var(--success)' : 'var(--danger)'; }
+      if (st) st.textContent = success ? 'Complete' : 'Failed';
+      if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
     }
 
-    // Logs modal
+    // ─── Logs Modal ───
     function showLogs(botId, botName) {
       currentLogsBotId = botId;
       document.getElementById('logs-bot-name').textContent = botName;
@@ -1004,7 +944,6 @@
 
     async function refreshLogs() {
       if (!currentLogsBotId) return;
-
       const container = document.getElementById('logs-container');
       container.innerHTML = '<div class="loading">Loading logs...</div>';
 
@@ -1022,11 +961,11 @@
           container.innerHTML = `<div class="log-line error">${escapeHtml(msg)}</div>`;
         }
       } catch (err) {
-        container.innerHTML = '<div class="log-line error">Failed to load logs. Please try again.</div>';
+        container.innerHTML = '<div class="log-line error">Failed to load logs.</div>';
       }
     }
 
-    // Initialize
+    // ─── Init ───
     loadBots();
   </script>
 </body>

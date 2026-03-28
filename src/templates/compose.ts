@@ -62,7 +62,7 @@ interface ComposeFile {
   name: string;
   services: Record<string, ComposeService>;
   volumes?: Record<string, object>;
-  networks?: Record<string, { name?: string; external?: boolean }>;
+  networks?: Record<string, { name?: string; driver?: string; external?: boolean }>;
   'x-casaos'?: CasaOSMetadata;
 }
 
@@ -80,6 +80,7 @@ export function generateCompose(
     name: appName,
     services: {},
     networks: {
+      internal: { driver: 'bridge' },
       pcs: { name: 'pcs', external: true }
     }
   };
@@ -97,7 +98,7 @@ export function generateCompose(
     container_name: `${appName}-app`,
     restart: 'unless-stopped',
     cpu_shares: 50,
-    networks: ['pcs'],
+    networks: ['internal', 'pcs'],
     labels: {
       'managed-by': 'discord-bot-manager',
       'bot-id': bot.id,
@@ -165,7 +166,7 @@ function addDatabaseService(compose: ComposeFile, botId: string, appName: string
     container_name: `${appName}-db`,
     restart: 'unless-stopped',
     cpu_shares: 10,
-    networks: ['pcs'],
+    networks: ['internal'],
     environment: {
       POSTGRES_USER: 'bot',
       POSTGRES_PASSWORD: 'bot_password',
@@ -288,6 +289,9 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push('networks:');
     for (const [netName, netConfig] of Object.entries(compose.networks)) {
       lines.push(`  ${netName}:`);
+      if (netConfig.driver) {
+        lines.push(`    driver: ${netConfig.driver}`);
+      }
       if (netConfig.name) {
         lines.push(`    name: ${netConfig.name}`);
       }
@@ -426,7 +430,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
         container_name: `${appName}-app`,
         restart: 'unless-stopped',
         cpu_shares: 50,
-        networks: ['pcs'],
+        networks: ['internal', 'pcs'],
         labels: {
           'managed-by': 'discord-bot-manager',
           'bot-id': bot.id,
@@ -446,6 +450,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
       }
     },
     networks: {
+      internal: { driver: 'bridge' },
       pcs: { name: 'pcs', external: true }
     },
     'x-casaos': {

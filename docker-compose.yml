@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:80/", "||", "exit", "1"]
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:80/ | grep -qE '(200|301|302|403)'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -33,6 +33,7 @@ services:
     depends_on:
       - discordbotmanagerapp
     networks:
+      - internal
       - pcs
     privileged: true
     cap_add:
@@ -83,6 +84,7 @@ services:
         source: $DATA_ROOT/AppData
         target: /DATA/AppData
     networks:
+      - internal
       - pcs
     expose:
       - 8080
@@ -111,6 +113,8 @@ services:
             en_us: CasaOS AppData directory for metadata placement and volume management.
 
 networks:
+  internal:
+    driver: bridge
   pcs:
     name: pcs
     external: true

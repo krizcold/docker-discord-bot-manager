@@ -293,18 +293,36 @@
     </div>
   </div>
 
-  <!-- Delete Confirmation Modal -->
+  <!-- Uninstall Confirmation Modal -->
   <div id="delete-modal" class="modal-overlay hidden">
-    <div class="modal" style="max-width: 420px;">
-      <h3>Uninstall Bot: <span id="delete-bot-name"></span></h3>
-      <p style="color: var(--text-secondary); margin-bottom: 14px; font-size: 0.9rem;">This will stop all containers and remove the app from CasaOS.</p>
-      <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.88rem; color: var(--text-primary); margin-bottom: 6px;">
-        <input type="checkbox" id="delete-keep-data"> Keep user data (for reinstall)
+    <div class="modal" style="max-width: 460px;">
+      <h3>Uninstall Application</h3>
+      <p style="color: var(--text-primary); margin-bottom: 14px; font-size: 0.9rem;">Are you sure you want to uninstall <strong id="delete-bot-name"></strong>?</p>
+
+      <div style="background: var(--bg-tertiary); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary); border-left: 3px solid var(--accent);">
+        This will uninstall the application from CasaOS and stop all containers.
+      </div>
+
+      <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 14px; padding: 12px; background: var(--bg-tertiary); border-radius: var(--radius);">
+        <input type="checkbox" id="delete-keep-data" checked style="margin-top: 3px;">
+        <span>
+          <strong style="color: var(--text-primary); font-size: 0.88rem;">Preserve application data</strong><br>
+          <span style="font-size: 0.8rem; color: var(--text-muted);">Keep user data, settings, and configurations. You can reinstall later without losing data.</span>
+        </span>
       </label>
-      <div class="form-hint" style="margin-bottom: 16px;">When checked, volumes and app data at /DATA/AppData are preserved.</div>
+
+      <div style="font-size: 0.83rem; color: var(--text-secondary); margin-bottom: 16px;">
+        <strong style="color: var(--warning);">What will happen:</strong>
+        <ul style="margin: 6px 0 0 18px; line-height: 1.7;">
+          <li>Application will be removed from CasaOS</li>
+          <li>Containers will be stopped and removed</li>
+          <li id="data-warning" style="color: var(--success);">User data will be preserved for future reinstallation</li>
+        </ul>
+      </div>
+
       <div class="modal-actions">
         <button class="btn btn-secondary" onclick="hideDeleteModal()">Cancel</button>
-        <button class="btn btn-danger" onclick="confirmDeleteBot()">Uninstall</button>
+        <button class="btn btn-danger" onclick="confirmDeleteBot()">Uninstall Application</button>
       </div>
     </div>
   </div>
@@ -320,6 +338,7 @@
     let bots = [];
     let currentLogsBotId = null;
     let envEditorBotId = null;
+    const busyBots = new Set();
 
     // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
@@ -441,6 +460,8 @@
         <div class="bot-grid">
           ${bots.map(bot => {
             const isRunning = bot.status === 'running';
+            const busy = busyBots.has(bot.id);
+            const d = busy ? ' disabled' : '';
             return `
             <div class="bot-card">
               <div class="bot-card-header">
@@ -448,24 +469,24 @@
                   <h3>${escapeHtml(bot.name)}</h3>
                   <div class="repo-url">${escapeHtml(getDisplayUrl(bot.url || bot.imageRef || ''))}</div>
                 </div>
-                <span class="status-badge status-${bot.status}">${bot.status}</span>
+                <span class="status-badge status-${busy ? 'building' : bot.status}">${busy ? 'busy' : bot.status}</span>
               </div>
               <div class="bot-card-actions">
                 ${isRunning ? `
-                  <button class="btn btn-danger btn-small" onclick="stopBot('${bot.id}')">Stop</button>
-                  <button class="btn btn-secondary btn-small" onclick="restartBot('${bot.id}')">Restart</button>
+                  <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
                 ` : bot.hasBeenStarted ? `
-                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
-                  <button class="btn btn-secondary btn-small" onclick="pullBot('${bot.id}')">Pull</button>
+                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="pullBot('${bot.id}')">Pull</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
-                  <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
-                  <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
+                  <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
-                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Install &amp; Run</button>
-                  <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
-                  <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
+                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
+                  <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
               </div>
             </div>`;
@@ -474,31 +495,46 @@
       `;
     }
 
-    // ─── Bot Actions ───
+    // ─── Bot Actions (all guarded by busyBots to prevent double-clicks) ───
     async function startBot(id) {
+      if (busyBots.has(id)) return;
+      busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
-      openTerminalPopup(bot ? bot.name : id, id, 'Starting');
+      openTerminalPopup(bot ? bot.name : id, id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
-        if (res.success) { markTerminalComplete(true); loadBots(); }
+        if (res.success) { markTerminalComplete(true); }
         else { addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error'); markTerminalComplete(false); }
       } catch (err) { addTerminalLog('Error: Failed to start bot', 'error'); markTerminalComplete(false); }
+      finally { busyBots.delete(id); loadBots(); }
     }
 
     async function stopBot(id) {
-      const res = await api('POST', `/bots/${id}/stop`);
-      res.success ? (showMessage('success', 'Bot stopped'), loadBots()) : showMessage('error', res.error || 'Failed to stop bot');
+      if (busyBots.has(id)) return;
+      busyBots.add(id); renderBots();
+      try {
+        const res = await api('POST', `/bots/${id}/stop`);
+        res.success ? showMessage('success', 'Bot stopped') : showMessage('error', res.error || 'Failed to stop bot');
+      } finally { busyBots.delete(id); loadBots(); }
     }
 
     async function restartBot(id) {
-      const res = await api('POST', `/bots/${id}/restart`);
-      res.success ? (showMessage('success', 'Bot restarting...'), loadBots()) : showMessage('error', res.error || 'Failed to restart bot');
+      if (busyBots.has(id)) return;
+      busyBots.add(id); renderBots();
+      try {
+        const res = await api('POST', `/bots/${id}/restart`);
+        res.success ? showMessage('success', 'Bot restarting...') : showMessage('error', res.error || 'Failed to restart bot');
+      } finally { busyBots.delete(id); loadBots(); }
     }
 
     async function pullBot(id) {
+      if (busyBots.has(id)) return;
+      busyBots.add(id); renderBots();
       showMessage('success', 'Pulling latest code...');
-      const res = await api('POST', `/bots/${id}/pull`);
-      res.success ? (showMessage('success', 'Code updated and rebuilt'), loadBots()) : showMessage('error', res.error || 'Failed to pull');
+      try {
+        const res = await api('POST', `/bots/${id}/pull`);
+        res.success ? showMessage('success', 'Code updated and rebuilt') : showMessage('error', res.error || 'Failed to pull');
+      } finally { busyBots.delete(id); loadBots(); }
     }
 
     let deleteBotId = null;
@@ -507,8 +543,22 @@
       deleteBotId = id;
       const bot = bots.find(b => b.id === id);
       document.getElementById('delete-bot-name').textContent = bot?.name || id;
-      document.getElementById('delete-keep-data').checked = false;
+      const checkbox = document.getElementById('delete-keep-data');
+      checkbox.checked = true;
+      updateDataWarning();
+      checkbox.onchange = updateDataWarning;
       document.getElementById('delete-modal').classList.remove('hidden');
+    }
+
+    function updateDataWarning() {
+      const warn = document.getElementById('data-warning');
+      if (document.getElementById('delete-keep-data').checked) {
+        warn.textContent = 'User data will be preserved for future reinstallation';
+        warn.style.color = 'var(--success)';
+      } else {
+        warn.textContent = 'All user data, settings, and configurations will be permanently deleted';
+        warn.style.color = 'var(--danger)';
+      }
     }
 
     function hideDeleteModal() {
@@ -517,11 +567,15 @@
     }
 
     async function confirmDeleteBot() {
-      if (!deleteBotId) return;
-      const keepData = document.getElementById('delete-keep-data').checked;
+      if (!deleteBotId || busyBots.has(deleteBotId)) return;
+      const id = deleteBotId;
+      const preserveData = document.getElementById('delete-keep-data').checked;
       hideDeleteModal();
-      const res = await api('DELETE', `/bots/${deleteBotId}?keepData=${keepData}`);
-      res.success ? (showMessage('success', keepData ? 'Bot uninstalled (data kept)' : 'Bot uninstalled'), loadBots()) : showMessage('error', res.error || 'Failed to uninstall bot');
+      busyBots.add(id); renderBots();
+      try {
+        const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}`);
+        res.success ? showMessage('success', preserveData ? 'Application uninstalled (data preserved)' : 'Application uninstalled') : showMessage('error', res.error || 'Failed to uninstall');
+      } finally { busyBots.delete(id); loadBots(); }
     }
 
     // ─── Environment Editor ───
@@ -682,7 +736,7 @@
     }
 
     function renderWizardSteps() {
-      const steps = ['Clone', 'Configure', 'Build'];
+      const steps = ['Import', 'Configure', 'Done'];
       return `<div class="wizard-steps">
         ${steps.map((s, i) => {
           const num = i + 1;
@@ -699,7 +753,7 @@
       if (wizardStep === 1) {
         el.innerHTML = `
           ${renderWizardSteps()}
-          <h3>Clone Repository</h3>
+          <h3>Import Repository</h3>
           <div class="form-group">
             <label>Bot Name *</label>
             <input type="text" id="bot-name" placeholder="My Discord Bot">
@@ -715,7 +769,7 @@
           </div>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideAddBotModal()">Cancel</button>
-            <button class="btn btn-primary" onclick="wizardClone()">Clone</button>
+            <button class="btn btn-primary" onclick="wizardClone()">Import</button>
           </div>
         `;
       } else if (wizardStep === 2) {
@@ -751,11 +805,10 @@
       } else if (wizardStep === 3) {
         el.innerHTML = `
           ${renderWizardSteps()}
-          <h3>Build Image</h3>
-          <p style="color: var(--text-secondary); margin-bottom: 16px; font-size: 0.9rem;">Ready to build Docker image. You can skip this — the image builds automatically on first start.</p>
+          <h3>Installation Complete</h3>
+          <p style="color: var(--text-secondary); margin-bottom: 16px; font-size: 0.9rem;">Your bot has been imported and configured. Press <strong>Install &amp; Run</strong> on the bot card to build the image and start it.</p>
           <div class="modal-actions">
-            <button class="btn btn-secondary" onclick="hideAddBotModal()">Close</button>
-            <button class="btn btn-primary" onclick="wizardBuild()">Build</button>
+            <button class="btn btn-primary" onclick="hideAddBotModal()">Done</button>
           </div>
         `;
       }
@@ -782,7 +835,7 @@
       lockWizard();
       const cloneBtn = document.querySelector('#wizard-content .btn-primary');
       const originalText = cloneBtn.textContent;
-      cloneBtn.textContent = 'Cloning...';
+      cloneBtn.textContent = 'Importing...';
 
       try {
         const res = await api('POST', '/bots', { name, url, branch });
@@ -865,23 +918,7 @@
 
     function wizardSkipEnv() { wizardStep = 3; renderWizard(); }
 
-    async function wizardBuild() {
-      const botName = wizardBotData ? wizardBotData.name : wizardBotId;
-      const botId = wizardBotId;
-      document.getElementById('add-modal').classList.add('hidden');
-      openTerminalPopup(botName, botId, 'Building');
-
-      try {
-        const res = await api('POST', `/bots/${botId}/build`);
-        if (!res.success) {
-          addTerminalLog(`Error: ${res.error || 'Build request failed'}`, 'error');
-          markTerminalComplete(false);
-        }
-      } catch (err) {
-        addTerminalLog('Error: Failed to start build', 'error');
-        markTerminalComplete(false);
-      }
-    }
+    // wizardBuild removed — build happens via "Install & Run" on the bot card
 
     // ─── Terminal Popup ───
     function openTerminalPopup(botName, botId, action) {

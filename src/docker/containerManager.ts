@@ -10,7 +10,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
+
+const execAsync = promisify(exec);
 import { BotConfig, BotRegistry, BotStatus, BotSourceType, CreateBotRequest, UpdateBotRequest } from '../types';
 import * as dockerClient from './dockerClient';
 import { cloneRepository, pullRepository, getRepoPath, getBotDir, getDataPath } from '../git/repoManager';
@@ -274,6 +278,48 @@ function resolveComposePath(botId: string, appName: string): string {
 /**
  * Delete a bot and its containers
  */
+/**
+ * Manual cleanup of containers and networks for an app.
+ * Matches the Dev Kit's performManualCleanup() approach:
+ * finds containers by name AND compose project label, removes networks.
+ */
+async function performManualCleanup(appName: string, removeData: boolean): Promise<void> {
+  console.log(`[ContainerManager] Manual cleanup for ${appName} (removeData: ${removeData})`);
+
+  // Stop and remove containers by name and compose project label
+  try {
+    await execAsync(
+      `docker ps -aq --filter "name=${appName}" | xargs -r docker rm -f 2>/dev/null; ` +
+      `docker ps -aq --filter "label=com.docker.compose.project=${appName}" | xargs -r docker rm -f 2>/dev/null`,
+      { timeout: 30000 }
+    );
+  } catch { /* best effort */ }
+
+  // Remove related networks
+  try {
+    await execAsync(
+      `docker network ls --filter "name=${appName}" --format "{{.Name}}" | xargs -r docker network rm 2>/dev/null`,
+      { timeout: 10000 }
+    );
+  } catch { /* best effort */ }
+
+  // Remove CasaOS metadata directory (always)
+  const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+  const metadataDir = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName);
+  if (fs.existsSync(metadataDir)) {
+    fs.rmSync(metadataDir, { recursive: true, force: true });
+  }
+
+  // Remove app data directory only if requested
+  if (removeData) {
+    const appDataDir = path.join(pcsDataRoot, 'AppData', appName);
+    if (fs.existsSync(appDataDir)) {
+      fs.rmSync(appDataDir, { recursive: true, force: true });
+      console.log(`[ContainerManager] Removed app data: ${appDataDir}`);
+    }
+  }
+}
+
 export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
   const registry = loadRegistry();
   const bot = registry.bots[botId];
@@ -286,39 +332,37 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
   const appName = resolveAppName(botId);
   const botDir = getBotDir(botId);
 
-  // 1. Compose down — stop and remove all containers/networks
+  // 1. Uninstall from CasaOS — mirrors the Dev Kit's uninstallCasaOSApp()
   try {
     if (deploymentMode === 'casaos') {
-      const composePath = resolveComposePath(botId, appName);
+      if (keepData) {
+        // Dev Kit: when preserving data, skip CasaOS API DELETE (it removes data)
+        // Only do manual container stop + metadata cleanup
+        console.log(`[ContainerManager] Preserving data — manual cleanup only for ${appName}`);
+        await performManualCleanup(appName, false);
+      } else {
+        // Full uninstall: try CasaOS API with retries, then verify, then manual fallback
+        let apiSuccess = false;
 
-      if (fs.existsSync(composePath)) {
-        console.log(`[ContainerManager] Running compose down for ${appName}...`);
-        await casaosApi.composeDown(appName, composePath);
-      }
-
-      // Uninstall via CasaOS API
-      await casaosApi.uninstallApp(appName);
-
-      // Force-remove any orphan containers that CasaOS didn't clean up
-      // (handles "External Apps" case where CasaOS doesn't recognize the app)
-      try {
-        const containers = await dockerClient.listBotContainers();
-        const orphans = containers.filter(c =>
-          c.name.startsWith(appName) || c.name.includes(`-${botId}-`)
-        );
-        for (const c of orphans) {
-          try {
-            await dockerClient.stopContainer(c.id);
-            await dockerClient.removeContainer(c.id);
-            console.log(`[ContainerManager] Force-removed orphan container: ${c.name}`);
-          } catch {
-            // Container may already be stopped/removed by compose down
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          console.log(`[ContainerManager] CasaOS API uninstall attempt ${attempt}/3 for ${appName}...`);
+          const result = await casaosApi.uninstallApp(appName);
+          if (result) {
+            apiSuccess = true;
+            break;
           }
+          if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
         }
-      } catch {
-        // Non-fatal
+
+        // Verify + manual fallback regardless of API result
+        await performManualCleanup(appName, true);
+
+        if (!apiSuccess) {
+          console.warn(`[ContainerManager] CasaOS API uninstall failed for ${appName}, manual cleanup performed`);
+        }
       }
     } else {
+      // Standalone Docker mode
       const containerIds = bot.containerIds || [];
       for (const containerId of containerIds) {
         try {
@@ -330,7 +374,7 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
       }
     }
   } catch (error) {
-    console.warn(`[ContainerManager] Failed to cleanup containers for bot ${botId}:`, error);
+    console.warn(`[ContainerManager] Uninstall error for bot ${botId}:`, error);
   }
 
   // 2. Remove Docker image
@@ -344,7 +388,7 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
     console.warn(`[ContainerManager] Failed to remove image for bot ${botId}:`, error);
   }
 
-  // 3. Remove named volumes
+  // 3. Remove named volumes (only when not keeping data)
   if (!keepData) {
     try {
       const volumes = dockerClient.listProjectVolumes(appName);
@@ -357,23 +401,7 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
     }
   }
 
-  // 4. Remove CasaOS metadata directory (always — gets recreated on reinstall)
-  try {
-    await removeCasaOSMetadata(appName);
-  } catch (error) {
-    console.warn(`[ContainerManager] Failed to remove CasaOS metadata for bot ${botId}:`, error);
-  }
-
-  // 5. Remove app data (/DATA/AppData/{appName}/) — only when not keeping data
-  if (!keepData) {
-    try {
-      await removeAppData(appName);
-    } catch (error) {
-      console.warn(`[ContainerManager] Failed to remove app data for bot ${botId}:`, error);
-    }
-  }
-
-  // 6. Remove bot directory
+  // 4. Remove bot directory
   if (!keepData) {
     if (fs.existsSync(botDir)) {
       fs.rmSync(botDir, { recursive: true, force: true });
@@ -390,7 +418,7 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
   saveRegistry(registry);
   logCollectors.remove(botId);
 
-  console.log(`[ContainerManager] Bot ${botId} deleted (keepData: ${keepData})`);
+  console.log(`[ContainerManager] Bot ${botId} uninstalled (keepData: ${keepData})`);
   return true;
 }
 

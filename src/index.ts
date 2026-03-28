@@ -8,6 +8,7 @@
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates } from './docker/containerManager';
+import { startAutoUpdater, stopAutoUpdater } from './autoUpdater';
 
 async function main(): Promise<void> {
   console.log('='.repeat(50));
@@ -33,16 +34,21 @@ async function main(): Promise<void> {
   // Start web server
   console.log('[Init] Starting web server...');
   startServer();
+
+  // Start auto-update scheduler
+  startAutoUpdater();
 }
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Shutdown] Received SIGTERM, shutting down...');
+  stopAutoUpdater();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('[Shutdown] Received SIGINT, shutting down...');
+  stopAutoUpdater();
   process.exit(0);
 });
 

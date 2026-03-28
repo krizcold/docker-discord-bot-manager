@@ -99,6 +99,32 @@
     .status-stopped { background: var(--danger-bg); color: var(--danger); }
     .status-building { background: var(--warning-bg); color: var(--warning); }
     .status-error { background: var(--danger-bg); color: var(--danger); }
+    .bot-card-update {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; border-radius: var(--radius); font-size: 0.78rem; margin-top: 10px;
+    }
+    .bot-card-update.has-updates { background: var(--warning-bg); color: var(--warning); }
+    .bot-card-update.up-to-date { background: var(--success-bg); color: var(--success); }
+    .bot-card-update.checking { background: var(--bg-tertiary); color: var(--text-muted); }
+    .bot-card-update.error { background: var(--danger-bg); color: var(--danger); }
+    .bot-card-auto-update {
+      display: flex; align-items: center; gap: 8px; margin-top: 8px;
+      font-size: 0.75rem; color: var(--text-secondary);
+    }
+    .toggle-switch {
+      position: relative; width: 32px; height: 18px; cursor: pointer;
+    }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      background: var(--bg-elevated); border-radius: 9px; transition: background 0.2s;
+    }
+    .toggle-slider::before {
+      content: ''; position: absolute; width: 14px; height: 14px; left: 2px; bottom: 2px;
+      background: var(--text-muted); border-radius: 50%; transition: transform 0.2s, background 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-slider { background: var(--accent); }
+    .toggle-switch input:checked + .toggle-slider::before { transform: translateX(14px); background: #fff; }
     .bot-card-actions {
       display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px;
       padding-top: 14px; border-top: 1px solid var(--border);
@@ -495,6 +521,9 @@
       return REQUIRED_KEYS.has(key);
     }
 
+    // ─── Update Status Cache ───
+    const updateCache = {}; // { botId: { hasUpdates, behindBy, message, checking, error } }
+
     // ─── Load & Render Bots ───
     async function loadBots() {
       try {
@@ -528,6 +557,17 @@
             const isRunning = bot.status === 'running';
             const busy = busyBots.has(bot.id);
             const d = busy ? ' disabled' : '';
+            const isGit = bot.sourceType !== 'docker-image';
+            const uc = updateCache[bot.id];
+            const updateHtml = isGit && bot.hasBeenStarted ? renderUpdateIndicator(bot.id, uc) : '';
+            const autoUpdateHtml = isGit && bot.hasBeenStarted ? `
+              <div class="bot-card-auto-update">
+                <label class="toggle-switch" title="Auto-update: check for updates every 30 minutes and apply automatically">
+                  <input type="checkbox" ${bot.autoUpdate ? 'checked' : ''} onchange="toggleAutoUpdate('${bot.id}', this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+                <span>Auto-update</span>
+              </div>` : '';
             return `
             <div class="bot-card">
               <div class="bot-card-header">
@@ -536,18 +576,20 @@
                   <div class="repo-url">${escapeHtml(getDisplayUrl(bot.url || bot.imageRef || ''))}</div>
                 </div>
                 <span class="status-badge status-${busy ? 'building' : bot.status}">${busy ? 'busy' : bot.status}</span>
-              </div>
+              </div>${updateHtml}${autoUpdateHtml}
               <div class="bot-card-actions">
                 ${isRunning ? `
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
+                  ${isGit ? `<button class="btn btn-secondary btn-small"${d} onclick="checkBotUpdates('${bot.id}')">Check Updates</button>` : ''}
                 ` : bot.hasBeenStarted ? `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="pullBot('${bot.id}')">Pull</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
+                  ${isGit ? `<button class="btn btn-secondary btn-small"${d} onclick="checkBotUpdates('${bot.id}')">Check Updates</button>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
@@ -599,8 +641,52 @@
       showMessage('success', 'Pulling latest code...');
       try {
         const res = await api('POST', `/bots/${id}/pull`);
-        res.success ? showMessage('success', 'Code updated and rebuilt') : showMessage('error', res.error || 'Failed to pull');
+        if (res.success) {
+          showMessage('success', 'Code updated and rebuilt');
+          delete updateCache[id]; // Clear cached update status after pull
+        } else {
+          showMessage('error', res.error || 'Failed to pull');
+        }
       } finally { busyBots.delete(id); loadBots(); }
+    }
+
+    // ─── Update Checking ───
+    function renderUpdateIndicator(botId, uc) {
+      if (!uc) return '';
+      if (uc.checking) return `<div class="bot-card-update checking">Checking for updates...</div>`;
+      if (uc.error) return `<div class="bot-card-update error">${escapeHtml(uc.error)}</div>`;
+      if (uc.hasUpdates) return `<div class="bot-card-update has-updates">${uc.behindBy} commit${uc.behindBy !== 1 ? 's' : ''} behind</div>`;
+      return `<div class="bot-card-update up-to-date">Up to date</div>`;
+    }
+
+    async function checkBotUpdates(id) {
+      updateCache[id] = { checking: true };
+      renderBots();
+      try {
+        const res = await api('GET', `/bots/${id}/updates`);
+        if (res.success) {
+          updateCache[id] = { hasUpdates: res.hasUpdates, behindBy: res.behindBy || 0 };
+        } else {
+          updateCache[id] = { error: res.error || 'Failed to check' };
+        }
+      } catch (err) {
+        updateCache[id] = { error: 'Failed to check for updates' };
+      }
+      renderBots();
+    }
+
+    async function toggleAutoUpdate(id, enabled) {
+      try {
+        const res = await api('PUT', `/bots/${id}/auto-update`, { enabled });
+        if (res.success) {
+          showMessage('success', `Auto-update ${enabled ? 'enabled' : 'disabled'}`);
+        } else {
+          showMessage('error', res.error || 'Failed to toggle auto-update');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to toggle auto-update');
+      }
+      loadBots();
     }
 
     let deleteBotId = null;

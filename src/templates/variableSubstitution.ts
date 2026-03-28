@@ -42,6 +42,7 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
     AUTH_HASH: bot.authHash || generateHash(),
     API_HASH: bot.updateToken || generateHash(),
     BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,
+    BOT_MANAGER_INTERNAL_URL: env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${env.PORT || '8080'}`,
 
     // User/group
     PUID: puid,

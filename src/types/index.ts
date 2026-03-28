@@ -38,6 +38,9 @@ export interface BotConfig {
   // Lifecycle
   hasBeenStarted?: boolean;
 
+  // Auto-update (opt-in per bot)
+  autoUpdate?: boolean;
+
   // CasaOS app name (from compose name: or generated bot-{id})
   appName?: string;
 
@@ -105,4 +108,5 @@ export interface UpdateBotRequest {
   name?: string;
   branch?: string;
   envVars?: Record<string, string>;
+  autoUpdate?: boolean;
 }

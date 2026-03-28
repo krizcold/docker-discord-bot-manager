@@ -656,6 +656,38 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /**
+   * PUT /api/bots/:id/auto-update - Toggle auto-update for a bot
+   */
+  router.put('/:id/auto-update', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      if (bot.sourceType === 'docker-image') {
+        res.status(400).json({ success: false, error: 'Auto-update not available for docker-image source type' });
+        return;
+      }
+
+      const { enabled } = req.body as { enabled: boolean };
+      if (typeof enabled !== 'boolean') {
+        res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+        return;
+      }
+
+      await containerManager.updateBot(req.params.id, { autoUpdate: enabled });
+
+      console.log(`[API] Auto-update ${enabled ? 'enabled' : 'disabled'} for bot ${req.params.id}`);
+      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json({ success: true, autoUpdate: enabled });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   return router;
 }
 

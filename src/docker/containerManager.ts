@@ -229,6 +229,7 @@ export async function updateBot(botId: string, update: UpdateBotRequest): Promis
   if (update.name) bot.name = update.name;
   if (update.branch) bot.branch = update.branch;
   if (update.envVars) bot.envVars = { ...bot.envVars, ...update.envVars };
+  if (update.autoUpdate !== undefined) bot.autoUpdate = update.autoUpdate;
   bot.updatedAt = new Date().toISOString();
 
   registry.bots[botId] = bot;
@@ -551,9 +552,12 @@ async function startGitBot(bot: BotConfig): Promise<{ success: boolean; error?: 
     } else {
       const imageName = `bot-${botId}:latest`;
       const dataPath = getDataPath(botId);
+      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
       const envWithToken = {
         ...bot.envVars,
-        BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || ''
+        BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '',
+        BOT_ID: bot.id,
+        BOT_MANAGER_INTERNAL_URL: internalUrl
       };
 
       emit('[Start] Creating container...', 'info');
@@ -634,9 +638,12 @@ async function startDockerImageBot(bot: BotConfig): Promise<{ success: boolean; 
       console.log(`[ContainerManager] Docker-image bot ${botId} started via CasaOS`);
     } else {
       const dataPath = getDataPath(botId);
+      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
       const envWithToken = {
         ...bot.envVars,
-        BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || ''
+        BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '',
+        BOT_ID: bot.id,
+        BOT_MANAGER_INTERNAL_URL: internalUrl
       };
 
       console.log(`[ContainerManager] Starting docker-image bot ${botId} via Docker API`);
@@ -839,7 +846,8 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       fs.mkdirSync(botDir, { recursive: true });
       fs.mkdirSync(dataPath, { recursive: true });
 
-      const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '' };
+      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
+      const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '', BOT_ID: bot.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
       let composeContent = generateImageCompose(botWithEnv, botDir);
       const appName = `bot-${botId}`;
@@ -868,7 +876,8 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
       const detection = detectBotType(repoPath);
       emit(`[Info] Detected: ${detection.type} bot (hasCompose: ${detection.hasCompose}, hasDatabase: ${detection.hasDatabase})`, 'info');
 
-      const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '' };
+      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
+      const envWithToken = { ...bot.envVars, BOT_MANAGER_UPDATE_TOKEN: bot.updateToken || '', BOT_ID: bot.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
       const botWithEnv: BotConfig = { ...bot, envVars: envWithToken };
 
       const existingComposePath = hasExistingCompose(repoPath);

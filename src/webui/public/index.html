@@ -293,6 +293,22 @@
     </div>
   </div>
 
+  <!-- Delete Confirmation Modal -->
+  <div id="delete-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 420px;">
+      <h3>Uninstall Bot: <span id="delete-bot-name"></span></h3>
+      <p style="color: var(--text-secondary); margin-bottom: 14px; font-size: 0.9rem;">This will stop all containers and remove the app from CasaOS.</p>
+      <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.88rem; color: var(--text-primary); margin-bottom: 6px;">
+        <input type="checkbox" id="delete-keep-data"> Keep user data (for reinstall)
+      </label>
+      <div class="form-hint" style="margin-bottom: 16px;">When checked, volumes and app data at /DATA/AppData are preserved.</div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideDeleteModal()">Cancel</button>
+        <button class="btn btn-danger" onclick="confirmDeleteBot()">Uninstall</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Env Editor Modal -->
   <div id="env-modal" class="modal-overlay hidden">
     <div class="modal" style="max-width: 600px;">
@@ -447,7 +463,7 @@
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
-                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-success btn-small" onclick="startBot('${bot.id}')">Install &amp; Run</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small" onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
@@ -485,13 +501,27 @@
       res.success ? (showMessage('success', 'Code updated and rebuilt'), loadBots()) : showMessage('error', res.error || 'Failed to pull');
     }
 
-    async function deleteBot(id) {
-      const choice = prompt('Delete this bot?\n\nType "delete" to remove everything.\nType "keep" to remove the bot but keep user data (for reinstall).\nPress Cancel to abort.');
-      if (!choice) return;
-      const keepData = choice.trim().toLowerCase() === 'keep';
-      if (choice.trim().toLowerCase() !== 'delete' && !keepData) return;
-      const res = await api('DELETE', `/bots/${id}?keepData=${keepData}`);
-      res.success ? (showMessage('success', keepData ? 'Bot removed (data kept)' : 'Bot deleted'), loadBots()) : showMessage('error', res.error || 'Failed to delete bot');
+    let deleteBotId = null;
+
+    function deleteBot(id) {
+      deleteBotId = id;
+      const bot = bots.find(b => b.id === id);
+      document.getElementById('delete-bot-name').textContent = bot?.name || id;
+      document.getElementById('delete-keep-data').checked = false;
+      document.getElementById('delete-modal').classList.remove('hidden');
+    }
+
+    function hideDeleteModal() {
+      document.getElementById('delete-modal').classList.add('hidden');
+      deleteBotId = null;
+    }
+
+    async function confirmDeleteBot() {
+      if (!deleteBotId) return;
+      const keepData = document.getElementById('delete-keep-data').checked;
+      hideDeleteModal();
+      const res = await api('DELETE', `/bots/${deleteBotId}?keepData=${keepData}`);
+      res.success ? (showMessage('success', keepData ? 'Bot uninstalled (data kept)' : 'Bot uninstalled'), loadBots()) : showMessage('error', res.error || 'Failed to uninstall bot');
     }
 
     // ─── Environment Editor ───

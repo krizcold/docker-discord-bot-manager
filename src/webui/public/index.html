@@ -486,9 +486,12 @@
     }
 
     async function deleteBot(id) {
-      if (!confirm('Delete this bot? This will remove all files and stop the container.')) return;
-      const res = await api('DELETE', `/bots/${id}`);
-      res.success ? (showMessage('success', 'Bot deleted'), loadBots()) : showMessage('error', res.error || 'Failed to delete bot');
+      const choice = prompt('Delete this bot?\n\nType "delete" to remove everything.\nType "keep" to remove the bot but keep user data (for reinstall).\nPress Cancel to abort.');
+      if (!choice) return;
+      const keepData = choice.trim().toLowerCase() === 'keep';
+      if (choice.trim().toLowerCase() !== 'delete' && !keepData) return;
+      const res = await api('DELETE', `/bots/${id}?keepData=${keepData}`);
+      res.success ? (showMessage('success', keepData ? 'Bot removed (data kept)' : 'Bot deleted'), loadBots()) : showMessage('error', res.error || 'Failed to delete bot');
     }
 
     // ─── Environment Editor ───

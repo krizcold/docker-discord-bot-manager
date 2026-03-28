@@ -235,7 +235,7 @@ export async function updateBot(botId: string, update: UpdateBotRequest): Promis
 /**
  * Delete a bot and its containers
  */
-export async function deleteBot(botId: string): Promise<boolean> {
+export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
   const registry = loadRegistry();
   const bot = registry.bots[botId];
 
@@ -260,8 +260,28 @@ export async function deleteBot(botId: string): Promise<boolean> {
         await casaosApi.composeDown(appName, composePath);
       }
 
-      // Also uninstall via CasaOS API for clean state
+      // Uninstall via CasaOS API
       await casaosApi.uninstallApp(appName);
+
+      // Force-remove any orphan containers that CasaOS didn't clean up
+      // (handles "External Apps" case where CasaOS doesn't recognize the app)
+      try {
+        const containers = await dockerClient.listBotContainers();
+        const orphans = containers.filter(c =>
+          c.name.startsWith(appName) || c.name.includes(`-${botId}-`)
+        );
+        for (const c of orphans) {
+          try {
+            await dockerClient.stopContainer(c.id);
+            await dockerClient.removeContainer(c.id);
+            console.log(`[ContainerManager] Force-removed orphan container: ${c.name}`);
+          } catch {
+            // Container may already be stopped/removed by compose down
+          }
+        }
+      } catch {
+        // Non-fatal
+      }
     } else {
       const containerIds = bot.containerIds || [];
       for (const containerId of containerIds) {
@@ -288,43 +308,53 @@ export async function deleteBot(botId: string): Promise<boolean> {
     console.warn(`[ContainerManager] Failed to remove image for bot ${botId}:`, error);
   }
 
-  // 3. Remove named volumes belonging to this project
-  try {
-    const volumes = dockerClient.listProjectVolumes(appName);
-    for (const volumeName of volumes) {
-      console.log(`[ContainerManager] Removing volume ${volumeName}...`);
-      dockerClient.removeVolume(volumeName);
+  // 3. Remove named volumes
+  if (!keepData) {
+    try {
+      const volumes = dockerClient.listProjectVolumes(appName);
+      for (const volumeName of volumes) {
+        console.log(`[ContainerManager] Removing volume ${volumeName}...`);
+        dockerClient.removeVolume(volumeName);
+      }
+    } catch (error) {
+      console.warn(`[ContainerManager] Failed to remove volumes for bot ${botId}:`, error);
     }
-  } catch (error) {
-    console.warn(`[ContainerManager] Failed to remove volumes for bot ${botId}:`, error);
   }
 
-  // 4. Remove CasaOS metadata directory
+  // 4. Remove CasaOS metadata directory (always — gets recreated on reinstall)
   try {
     await removeCasaOSMetadata(appName);
   } catch (error) {
     console.warn(`[ContainerManager] Failed to remove CasaOS metadata for bot ${botId}:`, error);
   }
 
-  // 5. Remove app data directory (/DATA/AppData/{appName}/)
-  try {
-    await removeAppData(appName);
-  } catch (error) {
-    console.warn(`[ContainerManager] Failed to remove app data for bot ${botId}:`, error);
+  // 5. Remove app data (/DATA/AppData/{appName}/) — only when not keeping data
+  if (!keepData) {
+    try {
+      await removeAppData(appName);
+    } catch (error) {
+      console.warn(`[ContainerManager] Failed to remove app data for bot ${botId}:`, error);
+    }
   }
 
-  // 6. Remove entire bot directory (repo/, raw/, data/, env/)
-  if (fs.existsSync(botDir)) {
-    fs.rmSync(botDir, { recursive: true, force: true });
+  // 6. Remove bot directory
+  if (!keepData) {
+    if (fs.existsSync(botDir)) {
+      fs.rmSync(botDir, { recursive: true, force: true });
+    }
+  } else {
+    // Keep env/ and data/ but remove repo and compose (recreated on reinstall)
+    const repoPath = path.join(botDir, 'repo');
+    const composePath = path.join(botDir, 'docker-compose.yml');
+    if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
+    if (fs.existsSync(composePath)) fs.rmSync(composePath, { force: true });
   }
 
   delete registry.bots[botId];
   saveRegistry(registry);
-
-  // Clean up log collector
   logCollectors.remove(botId);
 
-  console.log(`[ContainerManager] Bot ${botId} fully deleted (containers, image, volumes, metadata, app data)`);
+  console.log(`[ContainerManager] Bot ${botId} deleted (keepData: ${keepData})`);
   return true;
 }
 

@@ -78,11 +78,11 @@ services:
         source: /var/run/docker.sock
         target: /var/run/docker.sock
       - type: bind
-        source: $DATA_ROOT/AppData/discordbotmanager/data
+        source: $DATA_ROOT/AppData/discordbotmanager/data/
         target: /data
       - type: bind
-        source: $DATA_ROOT/AppData
-        target: /DATA/AppData
+        source: $DATA_ROOT/AppData/
+        target: /DATA/AppData/
     networks:
       - internal
       - pcs

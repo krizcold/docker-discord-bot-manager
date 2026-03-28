@@ -125,7 +125,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    */
   router.delete('/:id', async (req: Request, res: Response) => {
     try {
-      const success = await containerManager.deleteBot(req.params.id);
+      const keepData = req.query.keepData === 'true';
+      const success = await containerManager.deleteBot(req.params.id, keepData);
 
       if (!success) {
         res.status(404).json({ success: false, error: 'Bot not found' });

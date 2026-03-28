@@ -26,6 +26,8 @@ interface PCSEnvironment {
   REF_SCHEME: string;
   REF_PORT: string;
   REF_SEPARATOR: string;
+  APP_DOMAIN: string;
+  APP_PUBLIC_IP_DASH: string;
 }
 
 export function getPCSEnvironment(): PCSEnvironment {
@@ -40,6 +42,8 @@ export function getPCSEnvironment(): PCSEnvironment {
     REF_SCHEME: env.REF_SCHEME || 'http',
     REF_PORT: env.REF_PORT || '80',
     REF_SEPARATOR: env.REF_SEPARATOR || '-',
+    APP_DOMAIN: env.APP_DOMAIN || '',
+    APP_PUBLIC_IP_DASH: env.APP_PUBLIC_IP_DASH || '',
   };
 }
 
@@ -205,20 +209,22 @@ export function processComposeForCasaOS(
         webPort = String(service.expose[0]);
       }
 
-      if (webPort) {
+      if (webPort && pcs.APP_DOMAIN) {
         if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
           const labels = service.labels as Record<string, string>;
           // Gateway-routed domain (custom CA)
-          labels['caddy_0'] = `${appName}-\${APP_DOMAIN}`;
+          labels['caddy_0'] = `${appName}-${pcs.APP_DOMAIN}`;
           labels['caddy_0.import'] = 'gateway_tls';
           labels['caddy_0.reverse_proxy'] = `{{upstreams ${webPort}}}`;
           // nip.io direct access (custom CA)
-          labels['caddy_1'] = `${appName}-\${APP_PUBLIC_IP_DASH}.nip.io`;
-          labels['caddy_1.import'] = 'gateway_tls';
-          labels['caddy_1.reverse_proxy'] = `{{upstreams ${webPort}}}`;
-          // sslip.io direct access (Let's Encrypt — no gateway_tls)
-          labels['caddy_2'] = `${appName}-\${APP_PUBLIC_IP_DASH}.sslip.io`;
-          labels['caddy_2.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+          if (pcs.APP_PUBLIC_IP_DASH) {
+            labels['caddy_1'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.nip.io`;
+            labels['caddy_1.import'] = 'gateway_tls';
+            labels['caddy_1.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+            // sslip.io direct access (Let's Encrypt — no gateway_tls)
+            labels['caddy_2'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`;
+            labels['caddy_2.reverse_proxy'] = `{{upstreams ${webPort}}}`;
+          }
         }
       }
     }
@@ -361,8 +367,16 @@ export function processComposeForCasaOS(
   xcasaos.is_uncontrolled = false;
   xcasaos.store_app_id = appName;
 
-  if (pcs.REF_DOMAIN && pcs.REF_DOMAIN !== 'localhost') {
-    xcasaos.hostname = `${appName}${pcs.REF_SEPARATOR}${pcs.REF_DOMAIN}`;
+  if (pcs.APP_DOMAIN) {
+    xcasaos.hostname = `${appName}${pcs.REF_SEPARATOR}${pcs.APP_DOMAIN}`;
+  }
+
+  // scheme and port_map for CasaOS web UI routing
+  if (pcs.REF_SCHEME && pcs.REF_SCHEME !== 'http') {
+    xcasaos.scheme = pcs.REF_SCHEME;
+  }
+  if (pcs.REF_PORT && pcs.REF_PORT !== '80') {
+    xcasaos.port_map = pcs.REF_PORT;
   }
 
   // webui_port and index — set when main service has a web port

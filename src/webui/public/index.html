@@ -565,6 +565,13 @@
         bots = [];
         showMessage('error', 'Failed to load bots');
       }
+      // Clear busy state for bots that have reached a terminal state
+      // (safety net in case a WebSocket event was missed)
+      for (const bot of bots) {
+        if (busyBots.has(bot.id) && (bot.status === 'running' || bot.status === 'stopped' || bot.status === 'error')) {
+          busyBots.delete(bot.id);
+        }
+      }
       renderBots();
     }
 

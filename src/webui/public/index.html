@@ -322,6 +322,69 @@
     .tooltip {
       font-size: 0.72rem; color: var(--text-muted); font-style: italic;
     }
+
+    /* ─── Source Sidebar ─── */
+    .app-layout { display: flex; min-height: calc(100vh - 53px); }
+    .source-sidebar {
+      width: 260px; min-width: 260px; background: var(--bg-secondary);
+      border-right: 1px solid var(--border); display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .source-sidebar-header {
+      padding: 14px 16px; display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .source-sidebar-header h3 { font-size: 0.88rem; font-weight: 600; color: var(--text-primary); }
+    .source-list { flex: 1; overflow-y: auto; }
+    .source-card {
+      padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: default;
+      transition: background 0.15s;
+    }
+    .source-card:hover { background: var(--bg-tertiary); }
+    .source-card-name { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); margin-bottom: 2px; }
+    .source-card-url { font-size: 0.7rem; color: var(--text-muted); word-break: break-all; margin-bottom: 6px; }
+    .source-card-meta { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 8px; }
+    .source-card-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .source-card-auto-update {
+      display: flex; align-items: center; gap: 6px; margin-top: 6px;
+      font-size: 0.72rem; color: var(--text-secondary);
+    }
+    .source-empty {
+      padding: 20px 16px; text-align: center; color: var(--text-muted); font-size: 0.82rem;
+    }
+    .app-main { flex: 1; min-width: 0; }
+
+    /* ─── Name Input Group (Install Modal) ─── */
+    .name-input-group { position: relative; }
+    .name-input-group input:disabled { opacity: 0.6; }
+    .name-input-group .name-edit-btn {
+      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; color: var(--text-muted); cursor: pointer;
+      font-size: 0.9rem; padding: 4px;
+    }
+    .name-input-group .name-edit-btn:hover { color: var(--accent); }
+    .name-preview {
+      font-size: 0.72rem; color: var(--text-muted); margin-top: 3px;
+    }
+    .name-preview .sanitized { color: var(--accent); font-family: monospace; }
+    .name-error { font-size: 0.72rem; color: var(--danger); margin-top: 3px; }
+
+    /* ─── Update Badge (Bot Cards) ─── */
+    .update-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600;
+      background: var(--warning-bg); color: var(--warning);
+    }
+    .source-tag {
+      font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;
+    }
+    .source-tag .not-found { color: var(--danger); }
+    .source-select {
+      background: var(--bg-tertiary); border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-secondary); font-size: 0.72rem; padding: 1px 4px; cursor: pointer;
+      max-width: 200px;
+    }
+    .source-select:focus { outline: none; border-color: var(--border-focus); }
   </style>
 </head>
 <body>
@@ -333,16 +396,59 @@
     </div>
   </div>
 
-  <div class="container">
-    <div id="message"></div>
+  <div class="app-layout">
+    <!-- Source Sidebar -->
+    <aside class="source-sidebar">
+      <div class="source-sidebar-header">
+        <h3>Sources</h3>
+        <button class="btn btn-primary btn-small" onclick="showAddSourceModal()">+ Add</button>
+      </div>
+      <div class="source-list" id="source-list">
+        <div class="source-empty">Loading...</div>
+      </div>
+    </aside>
 
-    <div class="toolbar">
-      <h2>Your Bots</h2>
-      <button class="btn btn-primary" onclick="showAddBotModal()">+ Add Bot</button>
+    <!-- Main Content -->
+    <div class="app-main">
+      <div class="container">
+        <div id="message"></div>
+
+        <div class="toolbar">
+          <h2>Your Bots</h2>
+          <button class="btn btn-secondary btn-small" onclick="showAddBotModal()">+ Docker Image</button>
+        </div>
+
+        <div id="bots-container">
+          <div class="loading">Loading bots...</div>
+        </div>
+      </div>
     </div>
+  </div>
 
-    <div id="bots-container">
-      <div class="loading">Loading bots...</div>
+  <!-- Add Source Modal -->
+  <div id="source-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 480px;">
+      <h3>Add Source Repository</h3>
+      <div class="form-group">
+        <label>Git URL *</label>
+        <input type="text" id="source-url" placeholder="https://github.com/user/repo">
+        <div class="form-hint">Private repos: https://TOKEN@github.com/user/repo</div>
+      </div>
+      <div class="form-group">
+        <label>Branch</label>
+        <input type="text" id="source-branch" placeholder="main" value="main">
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="hideAddSourceModal()">Cancel</button>
+        <button class="btn btn-primary" id="source-add-btn" onclick="addSource()">Add Source</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Install from Source Modal -->
+  <div id="install-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 520px;">
+      <div id="install-modal-content"></div>
     </div>
   </div>
 
@@ -428,9 +534,13 @@
 
   <script>
     let bots = [];
+    let sources = [];
     let currentLogsBotId = null;
     let envEditorBotId = null;
     const busyBots = new Set();
+    let installSourceId = null;
+    let installNameLocked = true;
+    let nameValidationTimeout = null;
 
     // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
@@ -485,6 +595,9 @@
         } else if (data.type === 'bot:pull-failed') {
           showMessage('error', data.data?.error || 'Pull failed');
           busyBots.delete(id);
+          loadBots();
+        } else if (data.type === 'source:created' || data.type === 'source:updated' || data.type === 'source:deleted') {
+          loadSources();
           loadBots();
         } else if (data.type.startsWith('bot:')) {
           loadBots();
@@ -582,8 +695,7 @@
         container.innerHTML = `
           <div class="empty-state">
             <h3>No Bots Yet</h3>
-            <p>Add your first Discord bot from a GitHub repository.</p>
-            <button class="btn btn-primary" onclick="showAddBotModal()">+ Add Bot</button>
+            <p>Add a source in the sidebar, then click Install to create a bot instance.</p>
           </div>
         `;
         return;
@@ -592,42 +704,58 @@
       container.innerHTML = `
         <div class="bot-grid">
           ${bots.map(bot => {
+            const botName = bot.displayName || bot.name || 'Unnamed';
             const isRunning = bot.status === 'running';
             const busy = busyBots.has(bot.id);
             const d = busy ? ' disabled' : '';
             const isGit = bot.sourceType !== 'docker-image';
+
+            // Source dropdown (git) or image tag (docker-image)
+            let sourceTag = '';
+            if (isGit) {
+              const opts = sources.map(s => {
+                const sName = s.composeName || getRepoName(s.url) || s.id;
+                const selected = s.id === bot.sourceId ? ' selected' : '';
+                return `<option value="${s.id}"${selected}>${escapeHtml(sName)}</option>`;
+              }).join('');
+              const notFoundOpt = (!bot.sourceId || !sources.find(s => s.id === bot.sourceId))
+                ? `<option value="" selected style="color:var(--danger)">[Not Found]</option>` : '';
+              sourceTag = `<div class="source-tag">
+                <select class="source-select" onchange="changeSource('${bot.id}', this.value)" title="Change source">${notFoundOpt}${opts}</select>
+              </div>`;
+            } else {
+              sourceTag = `<div class="source-tag">Image: ${escapeHtml(bot.imageRef || '')}</div>`;
+            }
+
+            // Update badge
+            const updateBadge = bot.updateAvailable
+              ? '<span class="update-badge">Update available</span>'
+              : '';
+
             const uc = updateCache[bot.id];
-            const updateHtml = isGit && bot.hasBeenStarted ? renderUpdateIndicator(bot.id, uc) : '';
-            const autoUpdateHtml = isGit && bot.hasBeenStarted ? `
-              <div class="bot-card-auto-update">
-                <label class="toggle-switch" title="Auto-update: check for updates every 30 minutes and apply automatically">
-                  <input type="checkbox" ${bot.autoUpdate ? 'checked' : ''} onchange="toggleAutoUpdate('${bot.id}', this.checked)">
-                  <span class="toggle-slider"></span>
-                </label>
-                <span>Auto-update</span>
-              </div>` : '';
+            const updateHtml = isGit && bot.hasBeenStarted && !bot.updateAvailable ? renderUpdateIndicator(bot.id, uc) : '';
+
             return `
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(bot.name)}</h3>
-                  <div class="repo-url">${escapeHtml(getDisplayUrl(bot.url || bot.imageRef || ''))}</div>
+                  <h3>${escapeHtml(botName)} ${updateBadge}</h3>
+                  ${sourceTag}
                 </div>
                 <span class="status-badge status-${busy ? 'building' : bot.status}">${busy ? 'busy' : bot.status}</span>
-              </div>${updateHtml}${autoUpdateHtml}
+              </div>${updateHtml}
               <div class="bot-card-actions">
                 ${isRunning ? `
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
-                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
-                  ${isGit ? `<button class="btn btn-secondary btn-small"${d} onclick="checkBotUpdates('${bot.id}')">Check Updates</button>` : ''}
+                  ${bot.updateAvailable ? `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>` : ''}
                 ` : bot.hasBeenStarted ? `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
-                  <button class="btn btn-secondary btn-small"${d} onclick="pullBot('${bot.id}')">Pull</button>
-                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(bot.name)}')">Logs</button>
+                  ${bot.updateAvailable ? `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>` : `<button class="btn btn-secondary btn-small"${d} onclick="pullBot('${bot.id}')">Pull</button>`}
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
-                  ${isGit ? `<button class="btn btn-secondary btn-small"${d} onclick="checkBotUpdates('${bot.id}')">Check Updates</button>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
@@ -641,12 +769,44 @@
       `;
     }
 
+    function getRepoName(url) {
+      if (!url) return null;
+      const match = url.replace(/\/\/([^@]+)@/, '//').match(/\/([^\/]+?)(?:\.git)?$/);
+      return match ? match[1] : url;
+    }
+
+    async function updateBot(id) {
+      if (busyBots.has(id)) return;
+      busyBots.add(id); renderBots();
+      const bot = bots.find(b => b.id === id);
+      openTerminalPopup(bot ? (bot.displayName || bot.name) : id, id, 'Updating');
+      try { await api('POST', `/bots/${id}/update`); }
+      catch (err) { showMessage('error', 'Update failed'); busyBots.delete(id); renderBots(); }
+    }
+
+    async function changeSource(botId, newSourceId) {
+      if (!newSourceId) return;
+      try {
+        const res = await api('PUT', `/bots/${botId}/source`, { sourceId: newSourceId });
+        if (res.success) {
+          showMessage('success', 'Source changed — rebuild needed');
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Failed to change source');
+          loadBots();
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to change source');
+        loadBots();
+      }
+    }
+
     // ─── Bot Actions (all guarded by busyBots to prevent double-clicks) ───
     async function startBot(id) {
       if (busyBots.has(id)) return;
       busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
-      openTerminalPopup(bot ? bot.name : id, id, 'Installing');
+      openTerminalPopup(bot ? (bot.displayName || bot.name) : id, id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
         if (!res.success) {
@@ -751,7 +911,7 @@
     function deleteBot(id) {
       deleteBotId = id;
       const bot = bots.find(b => b.id === id);
-      document.getElementById('delete-bot-name').textContent = bot?.name || id;
+      document.getElementById('delete-bot-name').textContent = bot?.displayName || bot?.name || id;
       const checkbox = document.getElementById('delete-also-data');
       checkbox.checked = false;  // unchecked by default = preserve data
       updateDataWarning();
@@ -795,7 +955,7 @@
       const modal = document.getElementById('env-modal');
       const content = document.getElementById('env-editor-content');
 
-      content.innerHTML = `<h3>Environment Variables: ${escapeHtml(bot?.name || botId)}</h3><div class="loading">Loading...</div>`;
+      content.innerHTML = `<h3>Environment Variables: ${escapeHtml(bot?.displayName || bot?.name || botId)}</h3><div class="loading">Loading...</div>`;
       modal.classList.remove('hidden');
 
       try {
@@ -1366,7 +1526,278 @@
       document.getElementById('logs-popup').classList.add('hidden');
     }
 
+    // ─── Source Sidebar ───
+    async function loadSources() {
+      try {
+        const res = await api('GET', '/sources');
+        sources = res.success ? res.sources : [];
+      } catch (err) {
+        sources = [];
+      }
+      renderSourceSidebar();
+    }
+
+    function renderSourceSidebar() {
+      const list = document.getElementById('source-list');
+      if (sources.length === 0) {
+        list.innerHTML = '<div class="source-empty">No sources yet.<br>Click + Add to import a repository.</div>';
+        return;
+      }
+      list.innerHTML = sources.map(s => {
+        const name = s.composeName || getRepoName(s.url) || 'Unknown';
+        const lastChecked = s.lastChecked ? new Date(s.lastChecked).toLocaleString() : 'Never';
+        const commit = s.lastCommitHash ? s.lastCommitHash.substring(0, 7) : '—';
+        // Count instances from this source that need updates
+        const instanceCount = bots.filter(b => b.sourceId === s.id).length;
+        const needsUpdate = bots.filter(b => b.sourceId === s.id && b.updateAvailable).length;
+        const instanceBadge = instanceCount > 0
+          ? `<span style="font-size:0.68rem;color:var(--text-muted);">${instanceCount} instance${instanceCount !== 1 ? 's' : ''}</span>`
+          : '';
+        const updateBadge = needsUpdate > 0
+          ? ` <span class="update-badge">${needsUpdate} update${needsUpdate !== 1 ? 's' : ''}</span>`
+          : '';
+        return `
+        <div class="source-card">
+          <div class="source-card-name">${escapeHtml(name)} ${updateBadge}</div>
+          <div class="source-card-url">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
+          <div class="source-card-meta">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>
+          <div class="source-card-actions">
+            <button class="btn btn-success btn-small" onclick="showInstallModal('${s.id}')">Install</button>
+            <button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
+            <button class="btn btn-danger btn-small" onclick="deleteSource('${s.id}')">Remove</button>
+          </div>
+          <div class="source-card-auto-update">
+            <label class="toggle-switch" title="Auto-update: periodically fetch and check for new commits">
+              <input type="checkbox" ${s.autoUpdate ? 'checked' : ''} onchange="toggleSourceAutoUpdate('${s.id}', this.checked)">
+              <span class="toggle-slider"></span>
+            </label>
+            <span>Auto-update</span>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    function showAddSourceModal() {
+      document.getElementById('source-url').value = '';
+      document.getElementById('source-branch').value = 'main';
+      document.getElementById('source-modal').classList.remove('hidden');
+    }
+    function hideAddSourceModal() {
+      document.getElementById('source-modal').classList.add('hidden');
+    }
+
+    async function addSource() {
+      const url = document.getElementById('source-url').value.trim();
+      const branch = document.getElementById('source-branch').value.trim() || 'main';
+      if (!url) { showMessage('error', 'URL is required'); return; }
+
+      const btn = document.getElementById('source-add-btn');
+      btn.disabled = true; btn.textContent = 'Cloning...';
+
+      try {
+        const res = await api('POST', '/sources', { url, branch });
+        if (res.success) {
+          hideAddSourceModal();
+          showMessage('success', 'Source added');
+          loadSources();
+        } else {
+          showMessage('error', res.error || 'Failed to add source');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to add source');
+      } finally {
+        btn.disabled = false; btn.textContent = 'Add Source';
+      }
+    }
+
+    async function deleteSource(id) {
+      if (!confirm('Remove this source? Bot instances will keep running but show "Source: [Not Found]".')) return;
+      try {
+        const res = await api('DELETE', `/sources/${id}`);
+        if (res.success) { showMessage('success', 'Source removed'); loadSources(); loadBots(); }
+        else showMessage('error', res.error || 'Failed to remove source');
+      } catch (err) { showMessage('error', 'Failed to remove source'); }
+    }
+
+    async function fetchSource(id) {
+      try {
+        const res = await api('POST', `/sources/${id}/fetch`);
+        if (res.success) {
+          showMessage('success', res.hasUpdates ? 'Source updated with new commits' : 'Source is up to date');
+          loadSources();
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Fetch failed');
+        }
+      } catch (err) { showMessage('error', 'Fetch failed'); }
+    }
+
+    async function toggleSourceAutoUpdate(id, enabled) {
+      try {
+        await api('PUT', `/sources/${id}`, { autoUpdate: enabled });
+      } catch (err) { showMessage('error', 'Failed to update setting'); }
+    }
+
+    // ─── Install from Source Modal ───
+    function showInstallModal(sourceId) {
+      installSourceId = sourceId;
+      installNameLocked = true;
+      const source = sources.find(s => s.id === sourceId);
+      const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
+
+      document.getElementById('install-modal').classList.remove('hidden');
+      renderInstallModal(defaultName, source);
+    }
+
+    function hideInstallModal() {
+      document.getElementById('install-modal').classList.add('hidden');
+      installSourceId = null;
+    }
+
+    function renderInstallModal(defaultName, source) {
+      const el = document.getElementById('install-modal-content');
+      const botType = source ? '' : '';
+      el.innerHTML = `
+        <div class="wizard-steps">
+          <span class="wizard-step active">1. Name</span>
+          <span class="wizard-separator">&rarr;</span>
+          <span class="wizard-step">2. Configure</span>
+          <span class="wizard-separator">&rarr;</span>
+          <span class="wizard-step">3. Done</span>
+        </div>
+        <h3>Install from Source</h3>
+        <div class="form-group">
+          <label>Bot Name</label>
+          <div class="name-input-group">
+            <input type="text" id="install-name" value="${escapeHtml(defaultName)}" ${installNameLocked ? 'disabled' : ''} oninput="onNameInput()">
+            <button class="name-edit-btn" onclick="toggleNameLock()" title="${installNameLocked ? 'Edit name' : 'Lock name'}">
+              ${installNameLocked ? '&#9998;' : '&#128274;'}
+            </button>
+          </div>
+          <div class="name-preview" id="install-name-preview"></div>
+          <div class="name-error" id="install-name-error"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" onclick="hideInstallModal()">Cancel</button>
+          ${!installNameLocked ? `<button class="btn btn-secondary btn-small" onclick="resetInstallName('${escapeHtml(defaultName)}')">Reset</button>` : ''}
+          <button class="btn btn-primary" id="install-btn" onclick="doInstall()">Install</button>
+        </div>
+      `;
+      onNameInput();
+    }
+
+    function toggleNameLock() {
+      installNameLocked = !installNameLocked;
+      const source = sources.find(s => s.id === installSourceId);
+      const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
+      renderInstallModal(defaultName, source);
+    }
+
+    function resetInstallName(defaultName) {
+      document.getElementById('install-name').value = defaultName;
+      onNameInput();
+    }
+
+    async function onNameInput() {
+      const name = document.getElementById('install-name').value.trim();
+      const preview = document.getElementById('install-name-preview');
+      const error = document.getElementById('install-name-error');
+      if (!name) {
+        preview.innerHTML = '';
+        error.textContent = '';
+        return;
+      }
+
+      // Immediate local preview
+      const sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
+      preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(sanitized)}</span>`;
+
+      // Debounced server validation
+      clearTimeout(nameValidationTimeout);
+      nameValidationTimeout = setTimeout(async () => {
+        try {
+          const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}`);
+          if (res.valid) {
+            error.textContent = '';
+            let previewText = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>`;
+            if (res.reuseAvailable) {
+              previewText += `<br><label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:0.75rem;color:var(--warning);cursor:pointer;">
+                <input type="checkbox" id="reuse-data" checked>
+                Reuse existing data &amp; credentials from previous installation
+              </label>`;
+              if (res.previousInstanceId) {
+                window._reuseInstanceId = res.previousInstanceId;
+              } else {
+                window._reuseInstanceId = null;
+              }
+            } else {
+              window._reuseInstanceId = null;
+            }
+            preview.innerHTML = previewText;
+          } else {
+            error.textContent = res.errors.join(', ');
+            window._reuseInstanceId = null;
+          }
+        } catch (err) { /* ignore */ }
+      }, 300);
+    }
+
+    async function doInstall() {
+      const name = document.getElementById('install-name').value.trim();
+      if (!name) { showMessage('error', 'Name is required'); return; }
+
+      const btn = document.getElementById('install-btn');
+      btn.disabled = true; btn.textContent = 'Creating...';
+
+      try {
+        // Check if reuse checkbox is checked
+        const reuseCheckbox = document.getElementById('reuse-data');
+        const reuseId = (reuseCheckbox && reuseCheckbox.checked && window._reuseInstanceId) ? window._reuseInstanceId : undefined;
+        const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name, reuseFromInstanceId: reuseId });
+        if (res.success) {
+          // Move to env config step (reuse wizard step 2)
+          wizardBotId = res.bot.id;
+          wizardBotData = res.bot;
+          wizardEnvHints = [];
+
+          try {
+            const envRes = await api('GET', `/bots/${res.bot.id}/env`);
+            if (envRes.success) {
+              const seen = new Set();
+              const hints = [];
+              if (envRes.envExample) {
+                for (const ex of envRes.envExample) {
+                  seen.add(ex.key);
+                  hints.push({ key: ex.key, description: ex.description || '', defaultValue: ex.defaultValue || '' });
+                }
+              }
+              if (envRes.missing) {
+                for (const key of envRes.missing) {
+                  if (!seen.has(key)) { seen.add(key); hints.push({ key, description: '', defaultValue: '' }); }
+                }
+              }
+              wizardEnvHints = hints;
+            }
+          } catch (e) { /* non-fatal */ }
+
+          // Show env config in install modal
+          hideInstallModal();
+          wizardStep = 2;
+          document.getElementById('add-modal').classList.remove('hidden');
+          renderWizard();
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Failed to create instance');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to create instance');
+      } finally {
+        btn.disabled = false; btn.textContent = 'Install';
+      }
+    }
+
     // ─── Init ───
+    loadSources();
     loadBots();
   </script>
 </body>

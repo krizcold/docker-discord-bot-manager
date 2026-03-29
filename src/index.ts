@@ -8,7 +8,8 @@
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates } from './docker/containerManager';
-import { startAutoUpdater, stopAutoUpdater } from './autoUpdater';
+import { migrateV1toV2 } from './migration/v1ToV2';
+import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 
 async function main(): Promise<void> {
   console.log('='.repeat(50));
@@ -27,6 +28,10 @@ async function main(): Promise<void> {
 
   console.log('[Init] Docker connection OK');
 
+  // Run V1 -> V2 migration (idempotent)
+  console.log('[Init] Checking for data migration...');
+  await migrateV1toV2();
+
   // Sync container states on startup
   console.log('[Init] Syncing container states...');
   await syncContainerStates();
@@ -35,20 +40,20 @@ async function main(): Promise<void> {
   console.log('[Init] Starting web server...');
   startServer();
 
-  // Start auto-update scheduler
-  startAutoUpdater();
+  // Start source auto-update scheduler
+  startSourceUpdater();
 }
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Shutdown] Received SIGTERM, shutting down...');
-  stopAutoUpdater();
+  stopSourceUpdater();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('[Shutdown] Received SIGINT, shutting down...');
-  stopAutoUpdater();
+  stopSourceUpdater();
   process.exit(0);
 });
 

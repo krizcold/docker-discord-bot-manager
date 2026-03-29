@@ -8,7 +8,9 @@ import cors from 'cors';
 import path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
-import { createBotRoutes, createSystemRoutes } from './routes/bots';
+import { createBotRoutes, createSystemRoutes, createValidationRoutes } from './routes/bots';
+import { createSourceRoutes } from './routes/sources';
+import { setSourceBroadcast } from '../source/sourceUpdater';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -27,8 +29,13 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
   app.use(express.static(path.join(__dirname, 'public')));
 
   // API Routes
+  app.use('/api/sources', createSourceRoutes(wss));
   app.use('/api/bots', createBotRoutes(wss));
+  app.use('/api', createValidationRoutes());
   app.use('/api/system', createSystemRoutes());
+
+  // Wire source updater broadcast to WebSocket
+  setSourceBroadcast((type, data) => broadcastToClients(wss, type, data));
 
   // Health check
   app.get('/api/health', (req: Request, res: Response) => {

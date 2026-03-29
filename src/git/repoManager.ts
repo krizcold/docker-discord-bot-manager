@@ -16,6 +16,7 @@ import simpleGit, { SimpleGit } from 'simple-git';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
+const SOURCES_DIR = path.join(DATA_DIR, 'sources');
 
 /**
  * Get the base directory for a bot (contains repo/, raw/, data/, env/)
@@ -267,4 +268,27 @@ export function listRepoFiles(botId: string): string[] {
 
   walkDir(repoPath);
   return files.slice(0, 100); // Limit to first 100 files
+}
+
+// ─── Source-Centric Path Helpers ───
+
+/**
+ * Get the base directory for a source
+ */
+export function getSourceDir(sourceId: string): string {
+  return path.join(SOURCES_DIR, sourceId);
+}
+
+/**
+ * Get the working repository path for a source
+ */
+export function getSourceRepoPath(sourceId: string): string {
+  return path.join(SOURCES_DIR, sourceId, 'repo');
+}
+
+/**
+ * Get the RAW backup path for a source
+ */
+export function getSourceRawPath(sourceId: string): string {
+  return path.join(SOURCES_DIR, sourceId, 'raw');
 }

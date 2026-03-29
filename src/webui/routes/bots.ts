@@ -1,6 +1,6 @@
 /**
  * Bot API Routes
- * RESTful API for managing Discord bots
+ * RESTful API for managing Discord bot instances
  */
 
 import { Router, Request, Response } from 'express';
@@ -9,106 +9,165 @@ import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as repoManager from '../../git/repoManager';
 import * as envManager from '../../env/manager';
+import * as sourceManager from '../../source/sourceManager';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
-import { CreateBotRequest, UpdateBotRequest, DeploymentMode } from '../../types';
+import { DeploymentMode } from '../../types';
 import { logCollectors } from '../../build/logCollector';
+import { validateName, resolveNames, checkFolderReuse } from '../../naming';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
 
   /**
-   * GET /api/bots - List all bots
+   * GET /api/bots - List all bot instances
+   * Joins source info for each instance.
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
       const bots = containerManager.getAllBots();
-      res.json({ success: true, bots });
+
+      // Join source info
+      const botsWithSource = bots.map(bot => {
+        let source = null;
+        let updateAvailable = false;
+
+        if (bot.sourceId) {
+          source = sourceManager.getSource(bot.sourceId);
+          if (source && bot.lastBuiltCommit && source.lastCommitHash) {
+            updateAvailable = bot.lastBuiltCommit !== source.lastCommitHash;
+          }
+        }
+
+        return {
+          ...bot,
+          source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url } : null,
+          updateAvailable,
+        };
+      });
+
+      res.json({ success: true, bots: botsWithSource });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
   });
 
   /**
-   * POST /api/bots - Create a new bot
+   * POST /api/bots - Create a new bot instance
    *
-   * Supports two source types:
-   * - git (default): { name, url, branch?, envVars? }
-   *   URL should include token if private: https://TOKEN@github.com/owner/repo.git
-   * - docker-image: { name, sourceType: 'docker-image', imageRef, envVars? }
+   * Two formats:
+   * - From source: { sourceId, displayName?, envVars? }
+   * - Docker image: { sourceType: 'docker-image', displayName, imageRef, envVars? }
+   *
+   * Also accepts legacy format: { name, sourceType?, url?, branch?, imageRef?, envVars? }
    */
   router.post('/', async (req: Request, res: Response) => {
     try {
-      const request: CreateBotRequest = req.body;
+      const body = req.body;
 
-      if (!request.name) {
-        res.status(400).json({ success: false, error: 'Name is required' });
-        return;
-      }
-
-      const sourceType = request.sourceType || 'git';
-
-      // Validate based on source type
-      if (sourceType === 'git') {
-        if (!request.url) {
-          res.status(400).json({ success: false, error: 'url is required for git source type' });
+      // Docker image flow
+      if (body.sourceType === 'docker-image') {
+        const displayName = body.displayName || body.name;
+        if (!displayName) {
+          res.status(400).json({ success: false, error: 'displayName is required' });
           return;
         }
-      } else if (sourceType === 'docker-image') {
-        if (!request.imageRef) {
+        if (!body.imageRef) {
           res.status(400).json({ success: false, error: 'imageRef is required for docker-image source type' });
           return;
         }
-      } else {
-        res.status(400).json({ success: false, error: 'Invalid sourceType. Must be "git" or "docker-image"' });
+
+        const bot = await containerManager.createDockerImageInstance({
+          displayName,
+          imageRef: body.imageRef,
+          envVars: body.envVars,
+        });
+        broadcastToClients(wss, 'bot:created', bot);
+        res.json({ success: true, bot });
         return;
       }
 
-      const bot = await containerManager.createBot(request);
-      broadcastToClients(wss, 'bot:created', bot);
+      // Source-based flow
+      if (body.sourceId) {
+        const bot = await containerManager.createInstance({
+          sourceId: body.sourceId,
+          displayName: body.displayName,
+          envVars: body.envVars,
+          reuseFromInstanceId: body.reuseFromInstanceId,
+        });
+        broadcastToClients(wss, 'bot:created', bot);
+        res.json({ success: true, bot });
+        return;
+      }
 
-      res.json({ success: true, bot });
+      // Legacy flow: { name, url, branch? }
+      if (body.name || body.url) {
+        const name = body.name || body.displayName;
+        if (!name) {
+          res.status(400).json({ success: false, error: 'Name is required' });
+          return;
+        }
+        if (!body.url) {
+          res.status(400).json({ success: false, error: 'url or sourceId is required' });
+          return;
+        }
+
+        const bot = await containerManager.createBot({
+          name,
+          url: body.url,
+          branch: body.branch,
+          envVars: body.envVars,
+        });
+        broadcastToClients(wss, 'bot:created', bot);
+        res.json({ success: true, bot });
+        return;
+      }
+
+      res.status(400).json({ success: false, error: 'Must provide sourceId, url, or sourceType=docker-image' });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
   });
 
   /**
-   * GET /api/bots/:id - Get bot details
+   * GET /api/bots/:id - Get bot instance details
    */
   router.get('/:id', async (req: Request, res: Response) => {
     try {
       const bot = containerManager.getBot(req.params.id);
-
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
 
-      // Get additional repo info (only for git source)
+      // Source info
+      let source = null;
       let repoInfo = null;
-      if (bot.sourceType === 'git' || !bot.sourceType) {
-        try {
-          repoInfo = await repoManager.getRepoInfo(req.params.id);
-        } catch (err) {
-          // Repo might not exist for docker-image bots
+      let updateAvailable = false;
+
+      if (bot.sourceId) {
+        source = sourceManager.getSource(bot.sourceId);
+        if (source) {
+          repoInfo = await sourceManager.getSourceRepoInfo(bot.sourceId);
+          if (bot.lastBuiltCommit && source.lastCommitHash) {
+            updateAvailable = bot.lastBuiltCommit !== source.lastCommitHash;
+          }
         }
       }
 
-      res.json({ success: true, bot, repoInfo });
+      res.json({ success: true, bot, source, repoInfo, updateAvailable });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
   });
 
   /**
-   * PUT /api/bots/:id - Update bot configuration
+   * PUT /api/bots/:id - Update bot instance configuration
    */
   router.put('/:id', async (req: Request, res: Response) => {
     try {
-      const update: UpdateBotRequest = req.body;
+      const update = req.body;
       const bot = await containerManager.updateBot(req.params.id, update);
-
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
@@ -122,13 +181,36 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * DELETE /api/bots/:id - Delete a bot
+   * PUT /api/bots/:id/source - Reassign instance to a different source
+   */
+  router.put('/:id/source', async (req: Request, res: Response) => {
+    try {
+      const { sourceId } = req.body as { sourceId: string };
+      if (!sourceId) {
+        res.status(400).json({ success: false, error: 'sourceId is required' });
+        return;
+      }
+
+      const bot = containerManager.reassignSource(req.params.id, sourceId);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot or source not found' });
+        return;
+      }
+
+      broadcastToClients(wss, 'bot:updated', bot);
+      res.json({ success: true, bot });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * DELETE /api/bots/:id - Delete a bot instance
    */
   router.delete('/:id', async (req: Request, res: Response) => {
     try {
       const keepData = req.query.keepData === 'true';
       const success = await containerManager.deleteBot(req.params.id, keepData);
-
       if (!success) {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
@@ -142,9 +224,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/start - Start a bot
-   * Returns immediately. Build/start progress is streamed via SSE (build-logs)
-   * and completion is broadcast via WebSocket.
+   * POST /api/bots/:id/start - Start a bot (non-blocking)
    */
   router.post('/:id/start', async (req: Request, res: Response) => {
     try {
@@ -154,7 +234,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Return immediately — build+start runs in background
       res.json({ success: true, message: 'Starting bot' });
 
       const botId = req.params.id;
@@ -166,7 +245,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           broadcastToClients(wss, 'bot:start-failed', { id: botId, error: result.error });
         }
       }).catch((err) => {
-        console.error(`[API] Start error for bot ${botId}:`, err);
         broadcastToClients(wss, 'bot:start-failed', { id: botId, error: String(err) });
       });
     } catch (error) {
@@ -180,7 +258,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.post('/:id/stop', async (req: Request, res: Response) => {
     try {
       const result = await containerManager.stopBot(req.params.id);
-
       if (!result.success) {
         res.status(400).json(result);
         return;
@@ -188,7 +265,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const bot = containerManager.getBot(req.params.id);
       broadcastToClients(wss, 'bot:stopped', bot);
-
       res.json({ success: true, bot });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -196,8 +272,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/restart - Restart a bot
-   * Returns immediately. Completion broadcast via WebSocket.
+   * POST /api/bots/:id/restart - Restart a bot (non-blocking)
    */
   router.post('/:id/restart', async (req: Request, res: Response) => {
     try {
@@ -218,7 +293,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: result.error });
         }
       }).catch((err) => {
-        console.error(`[API] Restart error for bot ${botId}:`, err);
         broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: String(err) });
       });
     } catch (error) {
@@ -227,8 +301,42 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/pull - Pull latest code and rebuild (git source only)
-   * Returns immediately. Completion broadcast via WebSocket.
+   * POST /api/bots/:id/update - Rebuild instance from latest source commit
+   * Replaces the old /pull endpoint for source-backed instances.
+   */
+  router.post('/:id/update', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      if (bot.sourceType === 'docker-image') {
+        res.status(400).json({ success: false, error: 'Cannot update docker-image instances this way' });
+        return;
+      }
+
+      broadcastToClients(wss, 'bot:pulling', { id: req.params.id });
+      res.json({ success: true, message: 'Updating instance from source' });
+
+      const botId = req.params.id;
+      containerManager.pullAndRebuild(botId).then((result) => {
+        if (result.success) {
+          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
+        } else {
+          broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/pull - Pull latest code and rebuild (legacy, delegates to /update)
    */
   router.post('/:id/pull', async (req: Request, res: Response) => {
     try {
@@ -238,9 +346,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Only git source type can pull updates
       if (bot.sourceType === 'docker-image') {
-        res.status(400).json({ success: false, error: 'Cannot pull updates for docker-image source type. Use docker pull instead.' });
+        res.status(400).json({ success: false, error: 'Cannot pull updates for docker-image source type' });
         return;
       }
 
@@ -255,7 +362,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
       }).catch((err) => {
-        console.error(`[API] Pull error for bot ${botId}:`, err);
         broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
       });
     } catch (error) {
@@ -265,7 +371,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * POST /api/bots/:id/build - Build bot image without starting (non-blocking)
-   * Returns immediately. Stream progress via GET /api/bots/:id/build-logs (SSE).
    */
   router.post('/:id/build', async (req: Request, res: Response) => {
     try {
@@ -275,10 +380,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Return immediately — build runs in background
       res.json({ success: true, message: 'Build started' });
 
-      // Fire-and-forget: build in background, broadcast result when done
       const botId = req.params.id;
       containerManager.buildBot(botId).then((result) => {
         const updatedBot = containerManager.getBot(botId);
@@ -288,7 +391,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           broadcastToClients(wss, 'bot:build-failed', { id: botId, error: result.error });
         }
       }).catch((err) => {
-        console.error(`[API] Unexpected build error for bot ${botId}:`, err);
         broadcastToClients(wss, 'bot:build-failed', { id: botId, error: String(err) });
       });
     } catch (error) {
@@ -297,7 +399,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * GET /api/bots/:id/build-logs - Stream build logs via Server-Sent Events
+   * GET /api/bots/:id/build-logs - Stream build logs via SSE
    */
   router.get('/:id/build-logs', (req: Request, res: Response) => {
     const bot = containerManager.getBot(req.params.id);
@@ -306,7 +408,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       return;
     }
 
-    // Set up SSE headers
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -314,24 +415,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       'Access-Control-Allow-Origin': '*'
     });
 
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ message: `Connected to build logs for ${bot.name}`, type: 'system' })}\n\n`);
+    res.write(`data: ${JSON.stringify({ message: `Connected to build logs for ${bot.displayName}`, type: 'system' })}\n\n`);
 
-    // Get log collector (creates one if needed)
     const logCollector = logCollectors.get(req.params.id);
 
-    // If fresh=true, clear old logs (new terminal popup for a new action)
     if (req.query.fresh === 'true') {
       logCollector.clear();
     }
 
-    // Send any existing logs (so late-joiners see history)
     const existingLogs = logCollector.getLogs();
     for (const log of existingLogs) {
       res.write(`data: ${JSON.stringify(log)}\n\n`);
     }
 
-    // Listen for new logs in real-time
     const onLog = (log: unknown) => {
       if (res.writable) {
         res.write(`data: ${JSON.stringify(log)}\n\n`);
@@ -340,7 +436,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     logCollector.on('log', onLog);
 
-    // Keep connection alive with periodic pings
     const keepAlive = setInterval(() => {
       if (res.writable) {
         res.write(`data: ${JSON.stringify({ message: '', type: 'ping' })}\n\n`);
@@ -349,7 +444,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
     }, 15000);
 
-    // Clean up on client disconnect
     req.on('close', () => {
       clearInterval(keepAlive);
       logCollector.removeListener('log', onLog);
@@ -364,12 +458,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     try {
       const tail = parseInt(req.query.tail as string) || 100;
       const result = await containerManager.getBotLogs(req.params.id, tail);
-
       if (!result.success) {
         res.status(400).json(result);
         return;
       }
-
       res.json({ success: true, logs: result.logs });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -378,7 +470,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * GET /api/bots/:id/containers - List all containers for a bot's compose project
-   * Returns container names and status for the service sidebar.
    */
   router.get('/:id/containers', async (req: Request, res: Response) => {
     try {
@@ -388,9 +479,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const appName = bot.appName || `bot-${req.params.id}`;
+      const appName = bot.appName || bot.sanitizedName || `bot-${req.params.id}`;
 
-      // List containers matching this compose project (by name prefix or compose label)
       const output = execSync(
         `docker ps -a --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null || ` +
         `docker ps -a --filter "name=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null`,
@@ -413,38 +503,26 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * GET /api/bots/:id/containers/:container/logs/stream - Stream container logs via SSE
-   * Matches the Dev Kit's docker container log streaming pattern exactly:
-   * 1. Send recent logs (--tail N)
-   * 2. Stream new logs in real-time (docker logs -f --tail 0)
-   * 3. Keep-alive pings every 30s
-   * 4. Clean up on disconnect
    */
   router.get('/:id/containers/:container/logs/stream', (req: Request, res: Response) => {
     const containerName = req.params.container;
     const lines = parseInt(req.query.lines as string) || 50;
 
-    // Validate container name
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(containerName)) {
       res.status(400).json({ success: false, error: 'Invalid container name' });
       return;
     }
 
-    // SSE headers
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // Send connected event
     res.write(`event: connected\ndata: ${JSON.stringify({ message: `Connected to ${containerName} logs` })}\n\n`);
 
-    // Send recent logs
     try {
       const result = execSync(`docker logs --tail ${lines} ${containerName} 2>&1`, {
-        encoding: 'utf8',
-        timeout: 10000,
-        maxBuffer: 1024 * 1024 * 5
+        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 * 5
       });
-
       const logLines = result.split('\n').filter(line => line.trim().length > 0);
       for (const logLine of logLines) {
         res.write(`event: log\ndata: ${JSON.stringify({ log: logLine, timestamp: new Date().toISOString() })}\n\n`);
@@ -456,7 +534,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
     }
 
-    // Stream new logs in real-time
     const logsProcess = spawn('docker', ['logs', '-f', '--tail', '0', containerName]);
 
     const handleData = (data: Buffer) => {
@@ -469,21 +546,18 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     logsProcess.stdout.on('data', handleData);
     logsProcess.stderr.on('data', handleData);
-
     logsProcess.on('error', (error) => {
       if (res.writable) {
         res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
       }
     });
 
-    // Keep-alive ping every 30s
     const keepAlive = setInterval(() => {
       if (res.writable) {
         res.write(`event: ping\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
       }
     }, 30000);
 
-    // Cleanup on disconnect
     const cleanup = () => {
       clearInterval(keepAlive);
       logsProcess.kill('SIGTERM');
@@ -500,12 +574,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/:id/stats', async (req: Request, res: Response) => {
     try {
       const result = await containerManager.getBotStats(req.params.id);
-
       if (!result.success) {
         res.status(400).json(result);
         return;
       }
-
       res.json({ success: true, stats: result.stats });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -513,7 +585,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * GET /api/bots/:id/files - List bot repository files (git source only)
+   * GET /api/bots/:id/files - List repository files
    */
   router.get('/:id/files', async (req: Request, res: Response) => {
     try {
@@ -523,12 +595,23 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Only git source type has files
       if (bot.sourceType === 'docker-image') {
         res.json({ success: true, files: [], message: 'No files for docker-image source type' });
         return;
       }
 
+      // Read from source repo, not bot directory
+      if (bot.sourceId) {
+        const repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
+        if (repoPath && require('fs').existsSync(repoPath)) {
+          // Use a simple file listing from the source path
+          const files = listFiles(repoPath);
+          res.json({ success: true, files });
+          return;
+        }
+      }
+
+      // Fallback to legacy
       const files = repoManager.listRepoFiles(req.params.id);
       res.json({ success: true, files });
     } catch (error) {
@@ -537,7 +620,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * GET /api/bots/:id/updates - Check for updates (git source only)
+   * GET /api/bots/:id/updates - Check if instance needs update
    */
   router.get('/:id/updates', async (req: Request, res: Response) => {
     try {
@@ -547,18 +630,23 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Only git source type can check for updates
       if (bot.sourceType === 'docker-image') {
-        res.json({
-          success: true,
-          hasUpdates: false,
-          message: 'Cannot check updates for docker-image source type. Check registry for new image versions.'
-        });
+        res.json({ success: true, hasUpdates: false, message: 'Cannot check updates for docker-image source type' });
         return;
       }
 
-      const updates = await repoManager.checkForUpdates(req.params.id);
-      res.json({ success: true, ...updates });
+      // Check against source's latest commit
+      if (bot.sourceId) {
+        const source = sourceManager.getSource(bot.sourceId);
+        if (source && bot.lastBuiltCommit && source.lastCommitHash) {
+          const hasUpdates = bot.lastBuiltCommit !== source.lastCommitHash;
+          res.json({ success: true, hasUpdates, behindBy: hasUpdates ? 1 : 0 });
+          return;
+        }
+      }
+
+      // If no source or no commit tracking, report unknown
+      res.json({ success: true, hasUpdates: false, behindBy: 0 });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -578,14 +666,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const envVars = envManager.getEnvVarsInfo(req.params.id);
       const validation = envManager.hasRequiredEnvVars(req.params.id);
 
-      // Also parse .env.example from repo if git source
+      // Parse .env.example from source repo
       let envExample: Array<{ key: string; description: string; defaultValue: string }> = [];
       if (bot.sourceType !== 'docker-image') {
         try {
-          const repoPath = repoManager.getRepoPath(req.params.id);
+          let repoPath: string | null = null;
+          if (bot.sourceId) {
+            repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
+          }
+          if (!repoPath || !require('fs').existsSync(repoPath)) {
+            repoPath = repoManager.getRepoPath(req.params.id);
+          }
           envExample = envManager.parseEnvExample(repoPath);
         } catch (err) {
-          // Repo might not exist yet
+          // Repo might not exist
         }
       }
 
@@ -619,26 +713,18 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       envManager.setEnvVars(req.params.id, vars);
-
-      // Also update bot config
       await containerManager.updateBot(req.params.id, { envVars: vars });
 
       const validation = envManager.hasRequiredEnvVars(req.params.id);
-
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
-      res.json({
-        success: true,
-        valid: validation.valid,
-        missing: validation.missing
-      });
+      res.json({ success: true, valid: validation.valid, missing: validation.missing });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
   });
 
   /**
-   * POST /api/bots/:id/request-update - Bot requests its own update (called by bots)
-   * Header: X-Bot-Token: {token}
+   * POST /api/bots/:id/request-update - Bot requests its own update
    */
   router.post('/:id/request-update', async (req: Request, res: Response) => {
     try {
@@ -656,7 +742,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Validate token
       if (bot.updateToken !== token) {
         res.status(403).json({ success: false, error: 'Invalid token' });
         return;
@@ -664,11 +749,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       console.log(`[API] Bot ${botId} requested self-update`);
       broadcastToClients(wss, 'bot:update-requested', { id: botId });
-
-      // Return immediately — the bot container will be restarted during the update
       res.json({ success: true, message: 'Update started' });
 
-      // Perform update in background
+      // Fetch source first if available, then rebuild
+      if (bot.sourceId) {
+        try {
+          await sourceManager.fetchSource(bot.sourceId);
+        } catch (err) {
+          console.warn(`[API] Failed to fetch source for self-update: ${err}`);
+        }
+      }
+
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
           broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
@@ -676,7 +767,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
       }).catch((err) => {
-        console.error(`[API] Self-update error for bot ${botId}:`, err);
         broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
       });
     } catch (error) {
@@ -685,7 +775,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * PUT /api/bots/:id/auto-update - Toggle auto-update for a bot
+   * PUT /api/bots/:id/auto-update - Toggle auto-update (now on source level)
+   * Kept for backward compat — redirects to source auto-update if applicable.
    */
   router.put('/:id/auto-update', async (req: Request, res: Response) => {
     try {
@@ -695,20 +786,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      if (bot.sourceType === 'docker-image') {
-        res.status(400).json({ success: false, error: 'Auto-update not available for docker-image source type' });
-        return;
-      }
-
       const { enabled } = req.body as { enabled: boolean };
       if (typeof enabled !== 'boolean') {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
       }
 
-      await containerManager.updateBot(req.params.id, { autoUpdate: enabled });
+      // If instance has a source, toggle auto-update on the source
+      if (bot.sourceId) {
+        sourceManager.updateSource(bot.sourceId, { autoUpdate: enabled });
+      }
 
-      console.log(`[API] Auto-update ${enabled ? 'enabled' : 'disabled'} for bot ${req.params.id}`);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json({ success: true, autoUpdate: enabled });
     } catch (error) {
@@ -720,15 +808,41 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 }
 
 /**
+ * GET /api/validate-name - Validate a bot name
+ * Query: ?name=...&excludeId=...
+ */
+export function createValidationRoutes(): Router {
+  const router = Router();
+
+  router.get('/validate-name', async (req: Request, res: Response) => {
+    try {
+      const name = req.query.name as string;
+      if (!name) {
+        res.json({ valid: false, errors: ['Name is required'] });
+        return;
+      }
+
+      const excludeId = req.query.excludeId as string;
+      const existingInstances = containerManager.getAllBots();
+      const result = validateName(name, existingInstances, excludeId);
+      const names = resolveNames(name);
+      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, previousInstanceId: null };
+
+      res.json({ ...result, ...names, ...reuse });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  return router;
+}
+
+/**
  * System API Routes
- * Routes for deployment mode and system configuration
  */
 export function createSystemRoutes(): Router {
   const router = Router();
 
-  /**
-   * GET /api/system/deployment - Get deployment mode info
-   */
   router.get('/deployment', async (req: Request, res: Response) => {
     try {
       const info = await getDeploymentInfo();
@@ -738,17 +852,13 @@ export function createSystemRoutes(): Router {
     }
   });
 
-  /**
-   * PUT /api/system/deployment - Set deployment mode
-   */
   router.put('/deployment', async (req: Request, res: Response) => {
     try {
       const { mode } = req.body as { mode: DeploymentMode };
       if (!mode || !['casaos', 'docker'].includes(mode)) {
-        res.status(400).json({ success: false, error: 'Invalid mode. Must be "casaos" or "docker"' });
+        res.status(400).json({ success: false, error: 'Invalid mode' });
         return;
       }
-
       setDeploymentMode(mode);
       const info = await getDeploymentInfo();
       res.json({ success: true, ...info });
@@ -758,4 +868,27 @@ export function createSystemRoutes(): Router {
   });
 
   return router;
+}
+
+// Helper: list files in a directory (max 100)
+function listFiles(dirPath: string): string[] {
+  const fs = require('fs');
+  const path = require('path');
+  const files: string[] = [];
+
+  function walkDir(dir: string, prefix = ''): void {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        walkDir(path.join(dir, entry.name), relativePath);
+      } else {
+        files.push(relativePath);
+      }
+    }
+  }
+
+  walkDir(dirPath);
+  return files.slice(0, 100);
 }

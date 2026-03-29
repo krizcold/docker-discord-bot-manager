@@ -12,6 +12,7 @@ import * as path from 'path';
 import { BotConfig, DetectionResult } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
 import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
+export { extractAppName } from './pcsProcessing';
 
 export interface ComposeResult {
   content: string;
@@ -102,7 +103,7 @@ export function generateCompose(
     labels: {
       'managed-by': 'discord-bot-manager',
       'bot-id': bot.id,
-      'bot-name': bot.name
+      'bot-name': (bot.name || bot.displayName)
     }
   };
 
@@ -144,10 +145,10 @@ export function generateCompose(
     build: 'bot',
     author: 'discord-bot-manager',
     developer: 'discord-bot-manager',
-    tagline: { en_us: `Discord Bot: ${bot.name}` },
+    tagline: { en_us: `Discord Bot: ${(bot.name || bot.displayName)}` },
     category: 'Utilities',
-    description: { en_us: `Managed Discord bot: ${bot.name}` },
-    title: { en_us: bot.name },
+    description: { en_us: `Managed Discord bot: ${(bot.name || bot.displayName)}` },
+    title: { en_us: (bot.name || bot.displayName) },
     is_uncontrolled: false,
     store_app_id: appName
   };
@@ -434,7 +435,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
         labels: {
           'managed-by': 'discord-bot-manager',
           'bot-id': bot.id,
-          'bot-name': bot.name
+          'bot-name': (bot.name || bot.displayName)
         },
         volumes: [{
           type: 'bind',
@@ -458,10 +459,10 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
       main: 'bot',
       author: 'discord-bot-manager',
       developer: 'discord-bot-manager',
-      tagline: { en_us: `Discord Bot: ${bot.name}` },
+      tagline: { en_us: `Discord Bot: ${(bot.name || bot.displayName)}` },
       category: 'Utilities',
-      description: { en_us: `Managed Discord bot: ${bot.name}` },
-      title: { en_us: bot.name },
+      description: { en_us: `Managed Discord bot: ${(bot.name || bot.displayName)}` },
+      title: { en_us: (bot.name || bot.displayName) },
       is_uncontrolled: false,
       store_app_id: appName
     }

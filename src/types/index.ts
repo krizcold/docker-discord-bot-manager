@@ -1,25 +1,53 @@
 /**
  * Discord Bot Manager Types
+ * Phase 5: Source/Instance Architecture
  */
+
+// ─── Enums / Literals ───
 
 export type BotType = 'nodejs' | 'python' | 'go' | 'java' | 'dockerfile' | 'compose' | 'unknown';
 export type DeploymentMode = 'casaos' | 'docker';
 export type BotStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'building';
 export type BotSourceType = 'git' | 'docker-image';
 
-export interface BotConfig {
+// ─── Source ───
+
+export interface SourceMeta {
   id: string;
-  name: string;
-  sourceType: BotSourceType;
+  url: string;                         // Git clone URL (includes token if private)
+  branch: string;                      // e.g. "main"
+  lastCommitHash: string | null;       // SHA of HEAD after last fetch/clone
+  lastCommitMessage: string | null;
+  lastCommitDate: string | null;
+  lastChecked: string | null;          // ISO timestamp of last fetch
+  autoUpdate: boolean;                 // default true
+  composeName: string | null;          // original "name:" from repo compose, or null
+  createdAt: string;
+  updatedAt: string;
+}
 
-  // For git source (URL includes token if private: https://TOKEN@github.com/...)
-  url?: string;
-  branch?: string;
+export interface SourceRegistry {
+  sources: Record<string, SourceMeta>;
+}
 
-  // For docker-image source
-  imageRef?: string;
+// ─── Instance (Bot) ───
 
-  // Common
+export interface InstanceConfig {
+  id: string;
+  sourceId: string | null;             // FK to SourceMeta.id (null for docker-image or orphaned)
+  sourceUrl: string | null;            // Stored for re-association after source deletion
+
+  sourceType: BotSourceType;           // 'git' | 'docker-image'
+  imageRef?: string;                   // For docker-image source only
+
+  // Three name layers
+  displayName: string;                 // "My Custom Bot!" — user's raw input
+  sanitizedName: string;               // "mycustombot" — compose name, folders, Caddy labels
+  titleName: string;                   // "My Custom Bot" — x-casaos.title
+
+  /** @deprecated Use displayName. Kept for backward compat with compose/pcsProcessing templates. */
+  name?: string;
+
   status: BotStatus;
   containerIds: string[];
 
@@ -38,10 +66,10 @@ export interface BotConfig {
   // Lifecycle
   hasBeenStarted?: boolean;
 
-  // Auto-update (opt-in per bot)
-  autoUpdate?: boolean;
+  // Commit tracking
+  lastBuiltCommit: string | null;      // SHA at time of last buildBot()
 
-  // CasaOS app name (from compose name: or generated bot-{id})
+  // CasaOS app name (== sanitizedName for new instances, preserved for migrated)
   appName?: string;
 
   // Metadata
@@ -49,10 +77,82 @@ export interface BotConfig {
   updatedAt: string;
 }
 
-export interface BotRegistry {
-  bots: Record<string, BotConfig>;
+export interface InstanceRegistry {
+  instances: Record<string, InstanceConfig>;
   deploymentMode?: DeploymentMode;
 }
+
+// ─── Backward Compat Aliases ───
+
+export type BotConfig = InstanceConfig;
+export type BotRegistry = InstanceRegistry;
+
+// ─── Name Resolution ───
+
+export interface ResolvedNames {
+  displayName: string;
+  sanitizedName: string;
+  titleName: string;
+}
+
+// ─── Reserved Names ───
+
+export const RESERVED_NAMES: readonly string[] = [
+  'casaos', 'portainer', 'caddy', 'discordbotmanager',
+  'discordbotmanagerapp', 'nginx', 'redis', 'postgres',
+  'mongodb', 'mariadb', 'traefik', 'watchtower',
+  'homeassistant', 'pcs',
+] as const;
+
+// ─── API DTOs ───
+
+export interface CreateSourceRequest {
+  url: string;
+  branch?: string;
+}
+
+export interface CreateInstanceRequest {
+  sourceId: string;
+  displayName?: string;
+  envVars?: Record<string, string>;
+  reuseFromInstanceId?: string;       // Previous instance ID to copy credentials from
+}
+
+export interface CreateDockerImageInstanceRequest {
+  displayName: string;
+  imageRef: string;
+  envVars?: Record<string, string>;
+}
+
+export interface UpdateInstanceRequest {
+  displayName?: string;
+  envVars?: Record<string, string>;
+}
+
+export interface UpdateSourceRequest {
+  autoUpdate?: boolean;
+  branch?: string;
+}
+
+/** @deprecated Use CreateInstanceRequest or CreateDockerImageInstanceRequest */
+export interface CreateBotRequest {
+  name: string;
+  sourceType?: BotSourceType;
+  url?: string;
+  branch?: string;
+  imageRef?: string;
+  envVars?: Record<string, string>;
+}
+
+/** @deprecated Use UpdateInstanceRequest */
+export interface UpdateBotRequest {
+  name?: string;
+  branch?: string;
+  envVars?: Record<string, string>;
+  autoUpdate?: boolean;
+}
+
+// ─── Detection ───
 
 export interface DetectionResult {
   type: BotType;
@@ -62,6 +162,8 @@ export interface DetectionResult {
   entryPoint?: string;
   packageManager?: 'npm' | 'yarn' | 'pnpm' | 'pip' | 'poetry' | 'go' | 'maven' | 'gradle';
 }
+
+// ─── Docker ───
 
 export interface ContainerInfo {
   id: string;
@@ -83,30 +185,10 @@ export interface LogEntry {
   stream: 'stdout' | 'stderr';
 }
 
+// ─── API ───
+
 export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;
-}
-
-export interface CreateBotRequest {
-  name: string;
-  sourceType?: BotSourceType;
-
-  // For git source (URL includes token if private: https://TOKEN@github.com/...)
-  url?: string;
-  branch?: string;
-
-  // For docker-image source
-  imageRef?: string;
-
-  // Common
-  envVars?: Record<string, string>;
-}
-
-export interface UpdateBotRequest {
-  name?: string;
-  branch?: string;
-  envVars?: Record<string, string>;
-  autoUpdate?: boolean;
 }

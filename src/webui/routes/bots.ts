@@ -197,20 +197,30 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * POST /api/bots/:id/restart - Restart a bot
+   * Returns immediately. Completion broadcast via WebSocket.
    */
   router.post('/:id/restart', async (req: Request, res: Response) => {
     try {
-      const result = await containerManager.restartBot(req.params.id);
-
-      if (!result.success) {
-        res.status(400).json(result);
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
 
-      const bot = containerManager.getBot(req.params.id);
-      broadcastToClients(wss, 'bot:restarted', bot);
+      res.json({ success: true, message: 'Restarting bot' });
 
-      res.json({ success: true, bot });
+      const botId = req.params.id;
+      containerManager.restartBot(botId).then((result) => {
+        const updatedBot = containerManager.getBot(botId);
+        if (result.success) {
+          broadcastToClients(wss, 'bot:restarted', updatedBot);
+        } else {
+          broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        console.error(`[API] Restart error for bot ${botId}:`, err);
+        broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: String(err) });
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -218,6 +228,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * POST /api/bots/:id/pull - Pull latest code and rebuild (git source only)
+   * Returns immediately. Completion broadcast via WebSocket.
    */
   router.post('/:id/pull', async (req: Request, res: Response) => {
     try {
@@ -234,18 +245,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       broadcastToClients(wss, 'bot:pulling', { id: req.params.id });
+      res.json({ success: true, message: 'Pulling and rebuilding' });
 
-      const result = await containerManager.pullAndRebuild(req.params.id);
-
-      if (!result.success) {
-        res.status(400).json(result);
-        return;
-      }
-
-      const updatedBot = containerManager.getBot(req.params.id);
-      broadcastToClients(wss, 'bot:rebuilt', updatedBot);
-
-      res.json({ success: true, bot: updatedBot });
+      const botId = req.params.id;
+      containerManager.pullAndRebuild(botId).then((result) => {
+        if (result.success) {
+          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
+        } else {
+          broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        console.error(`[API] Pull error for bot ${botId}:`, err);
+        broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -653,16 +665,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       console.log(`[API] Bot ${botId} requested self-update`);
       broadcastToClients(wss, 'bot:update-requested', { id: botId });
 
-      // Perform update
-      const result = await containerManager.pullAndRebuild(botId);
+      // Return immediately — the bot container will be restarted during the update
+      res.json({ success: true, message: 'Update started' });
 
-      if (!result.success) {
-        res.status(400).json(result);
-        return;
-      }
-
-      broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
-      res.json({ success: true, message: 'Update completed' });
+      // Perform update in background
+      containerManager.pullAndRebuild(botId).then((result) => {
+        if (result.success) {
+          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
+        } else {
+          broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
+        }
+      }).catch((err) => {
+        console.error(`[API] Self-update error for bot ${botId}:`, err);
+        broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

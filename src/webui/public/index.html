@@ -446,25 +446,45 @@
       ws = new WebSocket(wsUrl);
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
+        const id = data.data?.id;
         if (data.type === 'bot:built') {
-          if (terminalBotId && data.data?.id === terminalBotId) markTerminalComplete(true);
+          if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
+          busyBots.delete(id);
           loadBots();
         } else if (data.type === 'bot:build-failed') {
-          if (terminalBotId && data.data?.id === terminalBotId) {
+          if (terminalBotId && id === terminalBotId) {
             addTerminalLog(`Build failed: ${data.data?.error || 'Unknown error'}`, 'error');
             markTerminalComplete(false);
           }
+          busyBots.delete(id);
           loadBots();
         } else if (data.type === 'bot:started') {
-          if (terminalBotId && data.data?.id === terminalBotId) markTerminalComplete(true);
-          busyBots.delete(data.data?.id);
+          if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
+          busyBots.delete(id);
           loadBots();
         } else if (data.type === 'bot:start-failed') {
-          if (terminalBotId && data.data?.id === terminalBotId) {
+          if (terminalBotId && id === terminalBotId) {
             addTerminalLog(`Start failed: ${data.data?.error || 'Unknown error'}`, 'error');
             markTerminalComplete(false);
           }
-          busyBots.delete(data.data?.id);
+          busyBots.delete(id);
+          loadBots();
+        } else if (data.type === 'bot:restarted') {
+          showMessage('success', 'Bot restarted');
+          busyBots.delete(id);
+          loadBots();
+        } else if (data.type === 'bot:restart-failed') {
+          showMessage('error', data.data?.error || 'Restart failed');
+          busyBots.delete(id);
+          loadBots();
+        } else if (data.type === 'bot:rebuilt') {
+          showMessage('success', 'Code updated and rebuilt');
+          busyBots.delete(id);
+          delete updateCache[id];
+          loadBots();
+        } else if (data.type === 'bot:pull-failed') {
+          showMessage('error', data.data?.error || 'Pull failed');
+          busyBots.delete(id);
           loadBots();
         } else if (data.type.startsWith('bot:')) {
           loadBots();
@@ -650,8 +670,17 @@
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/restart`);
-        res.success ? showMessage('success', 'Bot restarting...') : showMessage('error', res.error || 'Failed to restart bot');
-      } finally { busyBots.delete(id); loadBots(); }
+        if (!res.success) {
+          showMessage('error', res.error || 'Failed to restart bot');
+          busyBots.delete(id); loadBots();
+        } else {
+          showMessage('success', 'Bot restarting...');
+          // busyBots cleared by WebSocket 'bot:restarted' or 'bot:restart-failed'
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to restart bot');
+        busyBots.delete(id); loadBots();
+      }
     }
 
     async function pullBot(id) {
@@ -660,13 +689,15 @@
       showMessage('success', 'Pulling latest code...');
       try {
         const res = await api('POST', `/bots/${id}/pull`);
-        if (res.success) {
-          showMessage('success', 'Code updated and rebuilt');
-          delete updateCache[id]; // Clear cached update status after pull
-        } else {
+        if (!res.success) {
           showMessage('error', res.error || 'Failed to pull');
+          busyBots.delete(id); loadBots();
         }
-      } finally { busyBots.delete(id); loadBots(); }
+        // busyBots cleared by WebSocket 'bot:rebuilt' or 'bot:pull-failed'
+      } catch (err) {
+        showMessage('error', 'Failed to pull');
+        busyBots.delete(id); loadBots();
+      }
     }
 
     // ─── Update Checking ───

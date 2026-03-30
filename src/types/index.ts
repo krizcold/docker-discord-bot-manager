@@ -130,6 +130,7 @@ export interface UpdateInstanceRequest {
 }
 
 export interface UpdateSourceRequest {
+  url?: string;
   autoUpdate?: boolean;
   branch?: string;
 }

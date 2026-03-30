@@ -226,6 +226,7 @@ export function updateSource(sourceId: string, update: UpdateSourceRequest): Sou
   const source = registry.sources[sourceId];
   if (!source) return null;
 
+  if (update.url !== undefined) source.url = update.url;
   if (update.autoUpdate !== undefined) source.autoUpdate = update.autoUpdate;
   if (update.branch !== undefined) source.branch = update.branch;
   source.updatedAt = new Date().toISOString();

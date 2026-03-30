@@ -167,16 +167,6 @@
     .form-group input:focus { outline: none; border-color: var(--border-focus); }
     .form-hint { font-size: 0.75rem; color: var(--text-muted); margin-top: 3px; }
 
-    /* ─── Wizard ─── */
-    .wizard-steps { display: flex; gap: 6px; margin-bottom: 18px; align-items: center; }
-    .wizard-step {
-      padding: 3px 10px; border-radius: 10px; font-size: 0.75rem; font-weight: 500;
-      background: var(--bg-elevated); color: var(--text-muted);
-    }
-    .wizard-step.active { background: var(--accent); color: #fff; }
-    .wizard-step.completed { background: var(--success-bg); color: var(--success); }
-    .wizard-separator { color: var(--text-muted); font-size: 0.7rem; }
-
     /* ─── Env Rows ─── */
     .env-row {
       display: flex; gap: 6px; margin-bottom: 6px; align-items: center;
@@ -355,13 +345,15 @@
     .app-main { flex: 1; min-width: 0; }
 
     /* ─── Name Input Group (Install Modal) ─── */
-    .name-input-group { position: relative; }
+    .name-input-group { display: flex; align-items: center; gap: 6px; }
+    .name-input-group input { flex: 1; }
     .name-input-group input:disabled { opacity: 0.6; }
+    .name-input-group .name-reset-btn,
     .name-input-group .name-edit-btn {
-      position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
       background: none; border: none; color: var(--text-muted); cursor: pointer;
-      font-size: 0.9rem; padding: 4px;
+      font-size: 0.9rem; padding: 4px; flex-shrink: 0;
     }
+    .name-input-group .name-reset-btn:hover,
     .name-input-group .name-edit-btn:hover { color: var(--accent); }
     .name-preview {
       font-size: 0.72rem; color: var(--text-muted); margin-top: 3px;
@@ -466,17 +458,11 @@
 
   <!-- Install from Source Modal -->
   <div id="install-modal" class="modal-overlay hidden">
-    <div class="modal" style="max-width: 520px;">
+    <div class="modal" style="max-width: 580px;">
       <div id="install-modal-content"></div>
     </div>
   </div>
 
-  <!-- Add Bot Wizard Modal -->
-  <div id="add-modal" class="modal-overlay hidden">
-    <div class="modal">
-      <div id="wizard-content"></div>
-    </div>
-  </div>
 
   <!-- Service Logs Popup (matches Dev Kit layout) -->
   <div id="logs-popup" class="hidden" style="position:fixed;top:0;left:0;right:0;bottom:0;z-index:2000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.15s ease;">
@@ -774,10 +760,12 @@
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
                   ${bot.updateAvailable ? `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>` : `<button class="btn btn-secondary btn-small"${d} onclick="pullBot('${bot.id}')">Pull</button>`}
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
+                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
@@ -1102,126 +1090,9 @@
       envEditorBotId = null;
     }
 
-    // ─── Wizard State ───
-    let wizardStep = 1;
-    let wizardBotId = null;
-    let wizardBotData = null;
-    let wizardEnvHints = [];
-
     // Terminal popup state
     let terminalEventSource = null;
     let terminalBotId = null;
-
-    function hideAddBotModal() {
-      document.getElementById('add-modal').classList.add('hidden');
-      wizardStep = 2; wizardBotId = null; wizardBotData = null; wizardEnvHints = [];
-      loadBots();
-    }
-
-    function renderWizardSteps() {
-      const steps = ['Name', 'Configure', 'Done'];
-      return `<div class="wizard-steps">
-        ${steps.map((s, i) => {
-          const num = i + 1;
-          let cls = 'wizard-step';
-          if (num === wizardStep) cls += ' active';
-          else if (num < wizardStep) cls += ' completed';
-          return `<span class="${cls}">${num}. ${s}</span>${num < 3 ? '<span class="wizard-separator">&rarr;</span>' : ''}`;
-        }).join('')}
-      </div>`;
-    }
-
-    function renderWizard() {
-      const el = document.getElementById('wizard-content');
-      if (wizardStep === 2) {
-        const botType = wizardBotData?.botType || 'unknown';
-        const hasDb = wizardBotData?.hasDatabase;
-
-        let envRowsHtml = '';
-        if (wizardEnvHints.length > 0) {
-          envRowsHtml = wizardEnvHints.map(h => {
-            const label = getEnvLabel(h.key) || h.description;
-            const req = isRequiredEnv(h.key);
-            return buildEnvRowHtml(h.key, h.defaultValue || '', label, req, '');
-          }).join('');
-        } else {
-          envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
-            + buildEnvRowHtml('CLIENT_ID', '', 'Discord Client ID', true, '')
-            + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', false, '');
-        }
-
-        el.innerHTML = `
-          ${renderWizardSteps()}
-          <h3>Configure Environment</h3>
-          <div class="detection-info">
-            Detected: <strong>${escapeHtml(botType)} bot</strong>${hasDb ? ' with database' : ''}
-          </div>
-          <div id="env-rows">${envRowsHtml}</div>
-          <button class="btn btn-secondary btn-small" onclick="addEnvRow()" style="margin-bottom: 8px;">+ Add Variable</button>
-          <div class="modal-actions">
-            <button class="btn btn-secondary" onclick="wizardSkipEnv()">Skip</button>
-            <button class="btn btn-primary" onclick="wizardSaveEnv()">Save &amp; Continue</button>
-          </div>
-        `;
-      } else if (wizardStep === 3) {
-        el.innerHTML = `
-          ${renderWizardSteps()}
-          <h3>Installation Complete</h3>
-          <p style="color: var(--text-secondary); margin-bottom: 16px; font-size: 0.9rem;">Your bot has been imported and configured. Press <strong>Install &amp; Run</strong> on the bot card to build the image and start it.</p>
-          <div class="modal-actions">
-            <button class="btn btn-primary" onclick="hideAddBotModal()">Done</button>
-          </div>
-        `;
-      }
-    }
-
-    function lockWizard() {
-      const modal = document.getElementById('add-modal');
-      modal.querySelectorAll('.btn').forEach(b => b.disabled = true);
-      modal.querySelectorAll('input').forEach(i => i.disabled = true);
-    }
-    function unlockWizard() {
-      const modal = document.getElementById('add-modal');
-      modal.querySelectorAll('.btn').forEach(b => b.disabled = false);
-      modal.querySelectorAll('input').forEach(i => i.disabled = false);
-    }
-
-    function addEnvRow(key, value) {
-      const container = document.getElementById('env-rows');
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = `<div class="env-row">
-        <input type="text" placeholder="KEY" value="${escapeHtml(key || '')}" class="env-key">
-        <input type="text" placeholder="Value" value="${escapeHtml(value || '')}" class="env-value">
-        <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
-      </div>`;
-      container.appendChild(wrapper);
-    }
-
-    async function wizardSaveEnv() {
-      const rows = document.querySelectorAll('#env-rows .env-row');
-      const vars = {};
-      rows.forEach(row => {
-        const key = row.querySelector('.env-key').value.trim();
-        const value = row.querySelector('.env-value').value.trim();
-        if (key) vars[key] = value;
-      });
-
-      lockWizard();
-      const saveBtn = document.querySelector('#wizard-content .btn-primary');
-      saveBtn.textContent = 'Saving...';
-
-      try {
-        const res = await api('PUT', `/bots/${wizardBotId}/env`, { vars });
-        if (res.success) { wizardStep = 3; renderWizard(); }
-        else showMessage('error', res.error || 'Failed to save environment variables');
-      } catch (err) {
-        showMessage('error', 'Failed to save environment variables');
-      } finally { unlockWizard(); }
-    }
-
-    function wizardSkipEnv() { wizardStep = 3; renderWizard(); }
-
-    // wizardBuild removed — build happens via "Install & Run" on the bot card
 
     // ─── Terminal Popup ───
     function openTerminalPopup(botName, botId, action) {
@@ -1248,7 +1119,7 @@
         </div>
       `;
       document.body.appendChild(overlay);
-      streamBuildLogs(botId);
+      streamBuildLogs(botId, true);
     }
 
     function closeTerminalPopup() {
@@ -1257,12 +1128,40 @@
       const popup = document.getElementById('terminal-popup');
       if (!popup) return;
       popup.remove();
-      wizardStep = 1; wizardBotId = null; wizardBotData = null; wizardEnvHints = [];
       loadBots();
     }
 
-    function streamBuildLogs(botId) {
-      terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs?fresh=true`);
+    function showBuildLogs(botId, botName) {
+      closeTerminalPopup();
+      terminalBotId = botId;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'terminal-overlay';
+      overlay.id = 'terminal-popup';
+      overlay.innerHTML = `
+        <div class="terminal-box">
+          <div class="terminal-header">
+            <span class="terminal-title">Build Logs: ${escapeHtml(botName)}</span>
+            <button class="terminal-close" onclick="closeTerminalPopup()">&times;</button>
+          </div>
+          <div class="terminal-body" id="terminal-body"></div>
+          <div class="terminal-footer">
+            <div class="terminal-status">
+              <div class="dot-done" id="terminal-dot" style="background:var(--text-muted);"></div>
+              <span id="terminal-status-text">History</span>
+            </div>
+            <button class="btn btn-secondary btn-small" onclick="closeTerminalPopup()">Close</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      // Stream WITHOUT fresh=true to get existing log history
+      streamBuildLogs(botId, false);
+    }
+
+    function streamBuildLogs(botId, fresh) {
+      const freshParam = fresh !== false ? '?fresh=true' : '';
+      terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs${freshParam}`);
       terminalEventSource.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
@@ -1617,36 +1516,64 @@
     }
 
     // ─── Install from Source Modal ───
-    function showInstallModal(sourceId) {
+    let installEnvHints = [];
+    let installBotId = null;
+
+    async function showInstallModal(sourceId) {
       installSourceId = sourceId;
       installNameLocked = true;
+      installEnvHints = [];
+      installBotId = null;
+      window._reuseInstanceId = null;
+
       const source = sources.find(s => s.id === sourceId);
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
 
       document.getElementById('install-modal').classList.remove('hidden');
-      renderInstallModal(defaultName, source);
+
+      // Pre-load env hints from source repo's .env.example
+      try {
+        const res = await api('GET', `/sources/${sourceId}`);
+        if (res.success && res.source) {
+          // Try to get env example from the source repo via a temp peek
+          // For now, use default env hints — they'll be overridden after instance creation
+        }
+      } catch (e) { /* non-fatal */ }
+
+      renderInstallModal(defaultName);
     }
 
     function hideInstallModal() {
       document.getElementById('install-modal').classList.add('hidden');
       installSourceId = null;
+      installBotId = null;
+      installEnvHints = [];
+      loadBots();
     }
 
-    function renderInstallModal(defaultName, source) {
+    function renderInstallModal(defaultName) {
       const el = document.getElementById('install-modal-content');
-      const botType = source ? '' : '';
+
+      // Build env rows
+      let envRowsHtml = '';
+      if (installEnvHints.length > 0) {
+        envRowsHtml = installEnvHints.map(h => {
+          const label = getEnvLabel(h.key) || h.description;
+          const req = isRequiredEnv(h.key);
+          return buildEnvRowHtml(h.key, h.defaultValue || '', label, req, '');
+        }).join('');
+      } else {
+        envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
+          + buildEnvRowHtml('CLIENT_ID', '', 'Discord Client ID', true, '')
+          + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', false, '');
+      }
+
       el.innerHTML = `
-        <div class="wizard-steps">
-          <span class="wizard-step active">1. Name</span>
-          <span class="wizard-separator">&rarr;</span>
-          <span class="wizard-step">2. Configure</span>
-          <span class="wizard-separator">&rarr;</span>
-          <span class="wizard-step">3. Done</span>
-        </div>
         <h3>Install from Source</h3>
         <div class="form-group">
           <label>Bot Name</label>
           <div class="name-input-group">
+            ${!installNameLocked ? `<button class="name-reset-btn" onclick="resetInstallName('${escapeHtml(defaultName)}')" title="Reset to default">&#128260;</button>` : ''}
             <input type="text" id="install-name" value="${escapeHtml(defaultName)}" ${installNameLocked ? 'disabled' : ''} oninput="onNameInput()">
             <button class="name-edit-btn" onclick="toggleNameLock()" title="${installNameLocked ? 'Edit name' : 'Lock name'}">
               ${installNameLocked ? '&#9998;' : '&#128274;'}
@@ -1655,20 +1582,35 @@
           <div class="name-preview" id="install-name-preview"></div>
           <div class="name-error" id="install-name-error"></div>
         </div>
+        <div class="form-group">
+          <label>Environment Variables</label>
+          <div id="install-env-rows">${envRowsHtml}</div>
+          <button class="btn btn-secondary btn-small" onclick="addInstallEnvRow()" style="margin-top: 4px;">+ Add Variable</button>
+        </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideInstallModal()">Cancel</button>
-          ${!installNameLocked ? `<button class="btn btn-secondary btn-small" onclick="resetInstallName('${escapeHtml(defaultName)}')">Reset</button>` : ''}
-          <button class="btn btn-primary" id="install-btn" onclick="doInstall()">Install</button>
+          <button class="btn btn-primary" id="install-btn" onclick="doInstall()">Save &amp; Install</button>
         </div>
       `;
       onNameInput();
+    }
+
+    function addInstallEnvRow(key, value) {
+      const container = document.getElementById('install-env-rows');
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = `<div class="env-row">
+        <input type="text" placeholder="KEY" value="${escapeHtml(key || '')}" class="env-key">
+        <input type="text" placeholder="Value" value="${escapeHtml(value || '')}" class="env-value">
+        <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
+      </div>`;
+      container.appendChild(wrapper);
     }
 
     function toggleNameLock() {
       installNameLocked = !installNameLocked;
       const source = sources.find(s => s.id === installSourceId);
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
-      renderInstallModal(defaultName, source);
+      renderInstallModal(defaultName);
     }
 
     function resetInstallName(defaultName) {
@@ -1686,11 +1628,9 @@
         return;
       }
 
-      // Immediate local preview
       const sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
       preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(sanitized)}</span>`;
 
-      // Debounced server validation
       clearTimeout(nameValidationTimeout);
       nameValidationTimeout = setTimeout(async () => {
         try {
@@ -1703,11 +1643,7 @@
                 <input type="checkbox" id="reuse-data" checked>
                 Reuse existing data &amp; credentials from previous installation
               </label>`;
-              if (res.previousInstanceId) {
-                window._reuseInstanceId = res.previousInstanceId;
-              } else {
-                window._reuseInstanceId = null;
-              }
+              window._reuseInstanceId = res.previousInstanceId || null;
             } else {
               window._reuseInstanceId = null;
             }
@@ -1724,53 +1660,40 @@
       const name = document.getElementById('install-name').value.trim();
       if (!name) { showMessage('error', 'Name is required'); return; }
 
+      // Collect env vars
+      const rows = document.querySelectorAll('#install-env-rows .env-row');
+      const vars = {};
+      rows.forEach(row => {
+        const key = row.querySelector('.env-key').value.trim();
+        const value = row.querySelector('.env-value').value.trim();
+        if (key) vars[key] = value;
+      });
+
       const btn = document.getElementById('install-btn');
       btn.disabled = true; btn.textContent = 'Creating...';
 
       try {
-        // Check if reuse checkbox is checked
         const reuseCheckbox = document.getElementById('reuse-data');
         const reuseId = (reuseCheckbox && reuseCheckbox.checked && window._reuseInstanceId) ? window._reuseInstanceId : undefined;
         const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name, reuseFromInstanceId: reuseId });
         if (res.success) {
-          // Move to env config step (reuse wizard step 2)
-          wizardBotId = res.bot.id;
-          wizardBotData = res.bot;
-          wizardEnvHints = [];
+          installBotId = res.bot.id;
 
-          try {
-            const envRes = await api('GET', `/bots/${res.bot.id}/env`);
-            if (envRes.success) {
-              const seen = new Set();
-              const hints = [];
-              if (envRes.envExample) {
-                for (const ex of envRes.envExample) {
-                  seen.add(ex.key);
-                  hints.push({ key: ex.key, description: ex.description || '', defaultValue: ex.defaultValue || '' });
-                }
-              }
-              if (envRes.missing) {
-                for (const key of envRes.missing) {
-                  if (!seen.has(key)) { seen.add(key); hints.push({ key, description: '', defaultValue: '' }); }
-                }
-              }
-              wizardEnvHints = hints;
-            }
-          } catch (e) { /* non-fatal */ }
+          // Save env vars if any were filled
+          const hasVars = Object.keys(vars).some(k => vars[k]);
+          if (hasVars) {
+            await api('PUT', `/bots/${res.bot.id}/env`, { vars });
+          }
 
-          // Show env config in install modal
+          showMessage('success', 'Bot instance created. Press Install & Run on the bot card.');
           hideInstallModal();
-          wizardStep = 2;
-          document.getElementById('add-modal').classList.remove('hidden');
-          renderWizard();
-          loadBots();
         } else {
           showMessage('error', res.error || 'Failed to create instance');
         }
       } catch (err) {
         showMessage('error', 'Failed to create instance');
       } finally {
-        btn.disabled = false; btn.textContent = 'Install';
+        btn.disabled = false; btn.textContent = 'Save & Install';
       }
     }
 

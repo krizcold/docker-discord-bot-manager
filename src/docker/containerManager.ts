@@ -391,6 +391,24 @@ function getLegacyImageName(instanceId: string): string {
 async function performManualCleanup(appName: string, removeData: boolean): Promise<void> {
   console.log(`[ContainerManager] Manual cleanup for ${appName} (removeData: ${removeData})`);
 
+  const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+
+  // 1. Try compose down first — this properly tears down the compose project
+  //    so CasaOS detects the removal and deregisters the app from its UI
+  const composePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
+  if (fs.existsSync(composePath)) {
+    try {
+      await execAsync(
+        `docker compose -p ${appName} -f "${composePath}" down --remove-orphans 2>/dev/null`,
+        { timeout: 60000 }
+      );
+      console.log(`[ContainerManager] Compose down succeeded for ${appName}`);
+    } catch (err) {
+      console.warn(`[ContainerManager] Compose down failed for ${appName}, falling back to manual removal`);
+    }
+  }
+
+  // 2. Force-remove any remaining containers (belt and suspenders)
   try {
     await execAsync(
       `docker ps -aq --filter "name=${appName}" | xargs -r docker rm -f 2>/dev/null; ` +
@@ -399,6 +417,7 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
     );
   } catch { /* best effort */ }
 
+  // 3. Remove orphan networks
   try {
     await execAsync(
       `docker network ls --filter "name=${appName}" --format "{{.Name}}" | xargs -r docker network rm 2>/dev/null`,
@@ -406,12 +425,13 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
     );
   } catch { /* best effort */ }
 
-  const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+  // 4. Remove CasaOS metadata directory
   const metadataDir = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName);
   if (fs.existsSync(metadataDir)) {
     fs.rmSync(metadataDir, { recursive: true, force: true });
   }
 
+  // 5. Remove app data directory if requested
   if (removeData) {
     const appDataDir = path.join(pcsDataRoot, 'AppData', appName);
     if (fs.existsSync(appDataDir)) {

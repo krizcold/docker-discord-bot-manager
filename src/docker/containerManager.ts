@@ -1039,13 +1039,8 @@ async function buildGitInstance(
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
-  // CasaOS: save to metadata path
-  if (isCasaOS) {
-    emit('[PCS] Saving CasaOS metadata...', 'info');
-    await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
-  }
-
-  // Build Docker image
+  // Build Docker image BEFORE saving CasaOS metadata
+  // (so a failed build doesn't leave a ghost app registered in CasaOS)
   if (buildTarget) {
     emit(`[Build] Building Docker image (${imageName})...`, 'info');
     await dockerClient.buildImage(repoPath, imageName, (msg) => {
@@ -1054,6 +1049,12 @@ async function buildGitInstance(
     emit('[Done] Docker image build completed', 'success');
   } else {
     emit('[Skip] No build target — docker compose will pull images at start', 'info');
+  }
+
+  // CasaOS: save to metadata path (only after successful build)
+  if (isCasaOS) {
+    emit('[PCS] Saving CasaOS metadata...', 'info');
+    await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
   }
 
   // Store appName and lastBuiltCommit

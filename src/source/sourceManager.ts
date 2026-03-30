@@ -247,8 +247,37 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
   if (!source) throw new Error(`Source ${sourceId} not found`);
 
   const repoPath = getSourceRepoPath(sourceId);
+
+  // If repo hasn't been cloned yet (default source), clone it now
   if (!fs.existsSync(path.join(repoPath, '.git'))) {
-    throw new Error(`No git repository at ${repoPath}`);
+    console.log(`[SourceManager] Source ${sourceId} not cloned yet, cloning...`);
+    const sourceDir = getSourceDir(sourceId);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const git: SimpleGit = simpleGit();
+    await git.clone(source.url, repoPath, ['--branch', source.branch, '--single-branch']);
+    createSourceRawBackup(sourceId);
+
+    // Save original compose if exists
+    const composePath = hasExistingCompose(repoPath);
+    if (composePath) {
+      fs.writeFileSync(getOriginalComposePath(sourceId), fs.readFileSync(composePath, 'utf-8'));
+    }
+
+    // Update registry with initial commit info
+    const headCommit = await readHeadCommit(repoPath);
+    const registry = loadSourceRegistry();
+    const s = registry.sources[sourceId];
+    if (s) {
+      s.lastCommitHash = headCommit?.hash || null;
+      s.lastCommitMessage = headCommit?.message || null;
+      s.lastCommitDate = headCommit?.date || null;
+      s.lastChecked = new Date().toISOString();
+      s.composeName = extractComposeName(repoPath);
+      s.updatedAt = new Date().toISOString();
+      saveSourceRegistry(registry);
+    }
+
+    return { hasUpdates: false, behindBy: 0 };
   }
 
   const git: SimpleGit = simpleGit(repoPath);
@@ -374,4 +403,68 @@ export function findSourceByUrl(url: string): SourceMeta | null {
   const normalizedUrl = normalize(url);
   const sources = getAllSources();
   return sources.find(s => normalize(s.url) === normalizedUrl) || null;
+}
+
+// ─── Default Sources (seeded on first run) ───
+
+const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
+  // Tier 1 — Have Docker + compose
+  { url: 'https://github.com/eritislami/evobot', branch: 'main' },
+  { url: 'https://github.com/modmail-dev/Modmail', branch: 'main' },
+  { url: 'https://github.com/bongodevs/lavamusic', branch: 'main' },
+  { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: 'main' },
+  { url: 'https://github.com/open-discord-bots/open-ticket', branch: 'main' },
+  { url: 'https://github.com/python-discord/bot', branch: 'main' },
+  { url: 'https://github.com/disbored/egglord', branch: 'main' },
+  { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: 'main' },
+  // Tier 2 — Have Dockerfile, no compose
+  { url: 'https://github.com/Androz2091/AtlantaBot', branch: 'main' },
+  { url: 'https://github.com/nadeko-bot/nadekobot', branch: 'main' },
+  { url: 'https://github.com/discord-tickets/bot', branch: 'main' },
+  // Tier 3 — No Docker
+  { url: 'https://github.com/Cog-Creators/Red-DiscordBot', branch: 'main' },
+  { url: 'https://github.com/jagrosh/MusicBot', branch: 'main' },
+  { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: 'main' },
+  { url: 'https://github.com/kkrypt0nn/Python-Discord-Bot-Template', branch: 'main' },
+  { url: 'https://github.com/botlabs-gg/yagpdb', branch: 'main' },
+  { url: 'https://github.com/jagrosh/GiveawayBot', branch: 'main' },
+  { url: 'https://github.com/LorittaBot/Loritta', branch: 'main' },
+];
+
+/**
+ * Seed default sources on first run (empty registry only).
+ * Sources are added as metadata-only entries — NOT cloned.
+ * The repo is cloned on-demand when the user clicks Install or Fetch.
+ */
+export function seedDefaultSources(): void {
+  const registry = loadSourceRegistry();
+  if (Object.keys(registry.sources).length > 0) return; // Already has sources
+
+  const now = new Date().toISOString();
+
+  for (const { url, branch } of DEFAULT_SOURCES) {
+    const sourceId = uuidv4();
+    // Extract repo name from URL for display
+    const match = url.match(/\/([^\/]+?)(?:\.git)?$/);
+    const repoName = match ? match[1] : null;
+
+    const source: SourceMeta = {
+      id: sourceId,
+      url,
+      branch,
+      lastCommitHash: null,
+      lastCommitMessage: null,
+      lastCommitDate: null,
+      lastChecked: null,
+      autoUpdate: false,  // Off for defaults — user hasn't cloned them yet
+      composeName: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    registry.sources[sourceId] = source;
+  }
+
+  saveSourceRegistry(registry);
+  console.log(`[SourceManager] Seeded ${DEFAULT_SOURCES.length} default sources`);
 }

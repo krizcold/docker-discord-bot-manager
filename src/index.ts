@@ -9,6 +9,7 @@ import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates } from './docker/containerManager';
 import { migrateV1toV2 } from './migration/v1ToV2';
+import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 
 async function main(): Promise<void> {
@@ -31,6 +32,9 @@ async function main(): Promise<void> {
   // Run V1 -> V2 migration (idempotent)
   console.log('[Init] Checking for data migration...');
   await migrateV1toV2();
+
+  // Seed default sources on first run
+  seedDefaultSources();
 
   // Sync container states on startup
   console.log('[Init] Syncing container states...');

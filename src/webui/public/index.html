@@ -1378,7 +1378,8 @@
       list.innerHTML = sources.map(s => {
         const repoName = getRepoName(s.url) || 'Unknown';
         const codeName = s.composeName || null;
-        const lastChecked = s.lastChecked ? new Date(s.lastChecked).toLocaleString() : 'Never';
+        const isCloned = !!s.lastChecked;
+        const lastChecked = s.lastChecked ? new Date(s.lastChecked).toLocaleString() : 'Not cloned';
         const commit = s.lastCommitHash ? s.lastCommitHash.substring(0, 7) : '—';
         // Count instances from this source that need updates
         const instanceCount = bots.filter(b => b.sourceId === s.id).length;
@@ -1565,7 +1566,7 @@
       } else {
         envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
           + buildEnvRowHtml('CLIENT_ID', '', 'Discord Client ID', true, '')
-          + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', false, '');
+          + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', true, '');
       }
 
       el.innerHTML = `

@@ -408,6 +408,8 @@ export function findSourceByUrl(url: string): SourceMeta | null {
 // ─── Default Sources (seeded on first run) ───
 
 const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
+  // Our bot
+  { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: 'main' },
   // Tier 1 — Have Docker + compose
   { url: 'https://github.com/eritislami/evobot', branch: 'main' },
   { url: 'https://github.com/modmail-dev/Modmail', branch: 'main' },

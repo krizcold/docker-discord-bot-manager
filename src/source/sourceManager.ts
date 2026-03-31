@@ -458,7 +458,7 @@ export function seedDefaultSources(): void {
       lastCommitMessage: null,
       lastCommitDate: null,
       lastChecked: null,
-      autoUpdate: false,  // Off for defaults — user hasn't cloned them yet
+      autoUpdate: true,   // Enabled — locked in UI until cloned, active once cloned
       composeName: null,
       createdAt: now,
       updatedAt: now,

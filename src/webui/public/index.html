@@ -351,8 +351,19 @@
     }
     .source-toggle-btn { color: var(--text-muted); }
     .source-toggle-btn:hover { color: var(--text-primary); background: var(--bg-elevated); }
-    .source-trash-btn { color: var(--text-muted); margin-left: auto; }
+    .source-trash-btn { color: var(--text-muted); }
     .source-trash-btn:hover { color: var(--danger); background: var(--danger-bg); }
+    .source-header-actions { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+    .source-action-btn {
+      background: rgba(45, 212, 168, 0.15); color: var(--accent); border: none;
+      padding: 2px 8px; border-radius: var(--radius); font-size: 0.68rem; font-weight: 500;
+      cursor: pointer; white-space: nowrap;
+    }
+    .source-action-btn:hover { background: rgba(45, 212, 168, 0.25); }
+    .source-action-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .source-action-btn.cloning {
+      background: rgba(251, 191, 36, 0.15); color: var(--warning); cursor: wait;
+    }
     .app-main { flex: 1; min-width: 0; overflow-y: auto; height: 100%; }
 
     /* ─── Name Input Group (Install Modal) ─── */
@@ -558,6 +569,7 @@
     let installNameLocked = true;
     let nameValidationTimeout = null;
     const collapsedSources = new Set(); // Track collapsed source cards
+    const cloningSources = new Set();   // Track sources being cloned
 
     // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
@@ -1397,6 +1409,18 @@
       list.innerHTML = sources.map(s => {
         const repoName = getRepoName(s.url) || 'Unknown';
         const collapsed = collapsedSources.has(s.id);
+        const isCloned = !!s.lastChecked;
+        const isCloning = cloningSources.has(s.id);
+
+        // Header action button: Install (not cloned) / Cloning... / Add Bot (cloned)
+        let headerAction = '';
+        if (isCloning) {
+          headerAction = `<button class="source-action-btn cloning" disabled>Cloning...</button>`;
+        } else if (!isCloned) {
+          headerAction = `<button class="source-action-btn" onclick="event.stopPropagation(); cloneAndInstallSource('${s.id}')">Install</button>`;
+        } else {
+          headerAction = `<button class="source-action-btn" onclick="event.stopPropagation(); showInstallModal('${s.id}')">Add Bot</button>`;
+        }
 
         if (collapsed) {
           return `
@@ -1404,7 +1428,9 @@
             <div class="source-card-header">
               <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Expand">&#9660;</button>
               <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)}</span>
-              <button class="source-trash-btn" onclick="deleteSource('${s.id}')" title="Remove">&#128465;</button>
+              <div class="source-header-actions">
+                ${headerAction}
+              </div>
             </div>
           </div>`;
         }
@@ -1420,28 +1446,42 @@
         const updateBadge = needsUpdate > 0
           ? ` <span class="update-badge">${needsUpdate} update${needsUpdate !== 1 ? 's' : ''}</span>`
           : '';
+
+        // Auto-update: locked visual when not cloned, functional when cloned
+        const autoUpdateHtml = isCloned
+          ? `<div class="source-card-auto-update" style="margin-left:26px;">
+              <label class="toggle-switch" title="Auto-update: periodically fetch and check for new commits">
+                <input type="checkbox" ${s.autoUpdate ? 'checked' : ''} onchange="toggleSourceAutoUpdate('${s.id}', this.checked)">
+                <span class="toggle-slider"></span>
+              </label>
+              <span>Auto-update</span>
+            </div>`
+          : `<div class="source-card-auto-update" style="margin-left:26px;opacity:0.4;" title="Clone the source first to enable auto-update">
+              <label class="toggle-switch">
+                <input type="checkbox" checked disabled>
+                <span class="toggle-slider"></span>
+              </label>
+              <span>Auto-update</span>
+            </div>`;
+
         return `
         <div class="source-card">
           <div class="source-card-header">
             <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Collapse">&#9650;</button>
             <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)} ${updateBadge}</span>
-            <button class="source-trash-btn" onclick="deleteSource('${s.id}')" title="Remove">&#128465;</button>
+            <div class="source-header-actions">
+              ${headerAction}
+            </div>
           </div>
           ${codeName ? `<div style="font-size:0.72rem;color:var(--text-secondary);margin:4px 0 2px 26px;">compose: <span style="font-family:monospace;">${escapeHtml(codeName)}</span></div>` : ''}
           <div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
           <div class="source-card-meta" style="margin-left:26px;">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>
           <div class="source-card-actions" style="margin-left:26px;">
-            <button class="btn btn-success btn-small" onclick="showInstallModal('${s.id}')">Install</button>
-            <button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
-            <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>
+            ${isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
+            <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>` : ''}
+            <button class="btn btn-danger btn-small" onclick="deleteSource('${s.id}')">Remove</button>
           </div>
-          <div class="source-card-auto-update" style="margin-left:26px;">
-            <label class="toggle-switch" title="Auto-update: periodically fetch and check for new commits">
-              <input type="checkbox" ${s.autoUpdate ? 'checked' : ''} onchange="toggleSourceAutoUpdate('${s.id}', this.checked)">
-              <span class="toggle-slider"></span>
-            </label>
-            <span>Auto-update</span>
-          </div>
+          ${autoUpdateHtml}
         </div>`;
       }).join('');
     }
@@ -1453,6 +1493,31 @@
         collapsedSources.add(id);
       }
       renderSourceSidebar();
+    }
+
+    async function cloneAndInstallSource(id) {
+      if (cloningSources.has(id)) return;
+      cloningSources.add(id);
+      renderSourceSidebar();
+
+      try {
+        // Fetch triggers clone for uncloned sources
+        const res = await api('POST', `/sources/${id}/fetch`);
+        if (res.success) {
+          cloningSources.delete(id);
+          await loadSources();
+          // Now open install modal
+          showInstallModal(id);
+        } else {
+          showMessage('error', res.error || 'Failed to clone source');
+          cloningSources.delete(id);
+          renderSourceSidebar();
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to clone source');
+        cloningSources.delete(id);
+        renderSourceSidebar();
+      }
     }
 
     function showAddSourceModal() {

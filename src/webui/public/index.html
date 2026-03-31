@@ -342,6 +342,17 @@
     .source-empty {
       padding: 20px 16px; text-align: center; color: var(--text-muted); font-size: 0.82rem;
     }
+    .source-card-header {
+      display: flex; align-items: center; gap: 8px; min-height: 32px;
+    }
+    .source-toggle-btn, .source-trash-btn {
+      background: none; border: none; cursor: pointer; padding: 2px 4px;
+      font-size: 0.8rem; flex-shrink: 0; line-height: 1;
+    }
+    .source-toggle-btn { color: var(--text-muted); }
+    .source-toggle-btn:hover { color: var(--text-primary); }
+    .source-trash-btn { color: var(--text-muted); margin-left: auto; }
+    .source-trash-btn:hover { color: var(--danger); }
     .app-main { flex: 1; min-width: 0; }
 
     /* ─── Name Input Group (Install Modal) ─── */
@@ -546,6 +557,7 @@
     let installSourceId = null;
     let installNameLocked = true;
     let nameValidationTimeout = null;
+    const collapsedSources = new Set(); // Track collapsed source cards
 
     // Establish session cookie from URL hash (nginx-hash-lock)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
@@ -677,7 +689,7 @@
     async function loadBots() {
       try {
         const res = await api('GET', '/bots');
-        bots = res.success ? res.bots : [];
+        bots = res.success ? (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
         if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
         bots = [];
@@ -1362,7 +1374,7 @@
     async function loadSources() {
       try {
         const res = await api('GET', '/sources');
-        sources = res.success ? res.sources : [];
+        sources = res.success ? (res.sources || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
       } catch (err) {
         sources = [];
       }
@@ -1375,13 +1387,31 @@
         list.innerHTML = '<div class="source-empty">No sources yet.<br>Click + Add to import a repository.</div>';
         return;
       }
+      // Default sources start collapsed, user-added start expanded
+      if (collapsedSources.size === 0 && sources.length > 0) {
+        for (const s of sources) {
+          if (!s.lastChecked) collapsedSources.add(s.id); // Default (uncloned) sources start collapsed
+        }
+      }
+
       list.innerHTML = sources.map(s => {
         const repoName = getRepoName(s.url) || 'Unknown';
+        const collapsed = collapsedSources.has(s.id);
+
+        if (collapsed) {
+          return `
+          <div class="source-card" style="padding:8px 16px;">
+            <div class="source-card-header">
+              <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Expand">&#9660;</button>
+              <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)}</span>
+              <button class="source-trash-btn" onclick="deleteSource('${s.id}')" title="Remove">&#128465;</button>
+            </div>
+          </div>`;
+        }
+
         const codeName = s.composeName || null;
-        const isCloned = !!s.lastChecked;
         const lastChecked = s.lastChecked ? new Date(s.lastChecked).toLocaleString() : 'Not cloned';
         const commit = s.lastCommitHash ? s.lastCommitHash.substring(0, 7) : '—';
-        // Count instances from this source that need updates
         const instanceCount = bots.filter(b => b.sourceId === s.id).length;
         const needsUpdate = bots.filter(b => b.sourceId === s.id && b.updateAvailable).length;
         const instanceBadge = instanceCount > 0
@@ -1392,17 +1422,20 @@
           : '';
         return `
         <div class="source-card">
-          <div class="source-card-name">${escapeHtml(repoName)} ${updateBadge}</div>
-          ${codeName ? `<div style="font-size:0.72rem;color:var(--text-secondary);margin-bottom:2px;">compose: <span style="font-family:monospace;">${escapeHtml(codeName)}</span></div>` : ''}
-          <div class="source-card-url">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
-          <div class="source-card-meta">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>
-          <div class="source-card-actions">
+          <div class="source-card-header">
+            <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Collapse">&#9650;</button>
+            <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)} ${updateBadge}</span>
+            <button class="source-trash-btn" onclick="deleteSource('${s.id}')" title="Remove">&#128465;</button>
+          </div>
+          ${codeName ? `<div style="font-size:0.72rem;color:var(--text-secondary);margin:4px 0 2px 26px;">compose: <span style="font-family:monospace;">${escapeHtml(codeName)}</span></div>` : ''}
+          <div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
+          <div class="source-card-meta" style="margin-left:26px;">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>
+          <div class="source-card-actions" style="margin-left:26px;">
             <button class="btn btn-success btn-small" onclick="showInstallModal('${s.id}')">Install</button>
             <button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
             <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>
-            <button class="btn btn-danger btn-small" onclick="deleteSource('${s.id}')">Remove</button>
           </div>
-          <div class="source-card-auto-update">
+          <div class="source-card-auto-update" style="margin-left:26px;">
             <label class="toggle-switch" title="Auto-update: periodically fetch and check for new commits">
               <input type="checkbox" ${s.autoUpdate ? 'checked' : ''} onchange="toggleSourceAutoUpdate('${s.id}', this.checked)">
               <span class="toggle-slider"></span>
@@ -1411,6 +1444,15 @@
           </div>
         </div>`;
       }).join('');
+    }
+
+    function toggleSourceCollapse(id) {
+      if (collapsedSources.has(id)) {
+        collapsedSources.delete(id);
+      } else {
+        collapsedSources.add(id);
+      }
+      renderSourceSidebar();
     }
 
     function showAddSourceModal() {

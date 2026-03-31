@@ -33,7 +33,9 @@
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
       background: var(--bg-primary);
       color: var(--text-primary);
-      min-height: 100vh;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
       line-height: 1.5;
     }
 
@@ -45,6 +47,7 @@
       justify-content: space-between;
       align-items: center;
       border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
     }
     .header h1 { font-size: 1.15rem; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; }
     .header .status {
@@ -314,7 +317,7 @@
     }
 
     /* ─── Source Sidebar ─── */
-    .app-layout { display: flex; height: calc(100vh - 53px); overflow: hidden; }
+    .app-layout { display: flex; flex: 1; min-height: 0; }
     .source-sidebar {
       width: 358px; min-width: 358px; background: var(--bg-secondary);
       border-right: 1px solid var(--border); display: flex; flex-direction: column;
@@ -365,6 +368,84 @@
       background: rgba(251, 191, 36, 0.15); color: var(--warning); cursor: wait;
     }
     .app-main { flex: 1; min-width: 0; overflow-y: auto; height: 100%; }
+
+    /* ─── Vault Sidebar (Right) ─── */
+    .vault-sidebar {
+      width: 400px; min-width: 400px; background: var(--bg-secondary);
+      border-left: 1px solid var(--border); display: flex; flex-direction: column;
+      height: 100%; overflow: hidden;
+    }
+    .vault-sidebar-header {
+      padding: 14px 16px; display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .vault-sidebar-header h3 { font-size: 0.88rem; font-weight: 600; color: var(--text-primary); }
+    .vault-list { flex: 1; overflow-y: auto; }
+    .vault-group {
+      border-bottom: 1px solid var(--border);
+    }
+    .vault-group-header {
+      display: flex; align-items: center; gap: 8px; padding: 10px 14px; cursor: pointer;
+      height: 36px;
+    }
+    .vault-group-header:hover { background: var(--bg-tertiary); }
+    .vault-group-name { flex: 1; font-size: 0.82rem; font-weight: 600; color: var(--text-primary); }
+    .vault-group-count { font-size: 0.68rem; color: var(--text-muted); }
+    .vault-entry {
+      display: flex; align-items: center; gap: 4px; padding: 3px 14px 3px 30px;
+    }
+    .vault-entry input {
+      padding: 3px 6px; background: var(--bg-primary); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text-primary); font-size: 0.72rem;
+    }
+    .vault-entry input:focus { outline: none; border-color: var(--border-focus); }
+    .vault-entry-key-input { width: 110px; font-family: monospace; flex-shrink: 0; }
+    .vault-entry-value-input { flex: 1; min-width: 0; }
+    .vault-entry-value-input.masked {
+      -webkit-text-security: disc; text-security: disc;
+    }
+    .vault-entry-btn {
+      background: var(--bg-elevated); border: 1px solid var(--border); cursor: pointer;
+      padding: 3px 8px; font-size: 0.72rem; flex-shrink: 0; color: var(--text-muted);
+      border-radius: var(--radius); display: flex; align-items: center; justify-content: center;
+      min-width: 28px; height: 24px;
+    }
+    .vault-entry-btn:hover { color: var(--text-primary); border-color: #3e3e48; }
+    .vault-entry-btn.delete:hover { color: var(--danger); background: var(--danger-bg); border-color: var(--danger); }
+    .vault-entry-btn.save { color: var(--accent); display: none; }
+    .vault-entry-btn.save:hover { background: rgba(45, 212, 168, 0.15); border-color: var(--accent); }
+    .vault-entry.dirty .vault-entry-btn.save { display: flex; }
+    .vault-add-row {
+      display: flex; gap: 4px; padding: 4px 14px 6px 30px; align-items: center;
+    }
+    .vault-add-row input {
+      padding: 3px 6px; background: var(--bg-primary); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text-primary); font-size: 0.72rem;
+    }
+    .vault-add-row input:focus { outline: none; border-color: var(--border-focus); }
+    .vault-add-row .vault-key-input { width: 110px; font-family: monospace; flex-shrink: 0; }
+    .vault-add-row .vault-value-input { flex: 1; min-width: 0; }
+
+    /* ─── Env Vault Dropdown (Install Modal) ─── */
+    .env-vault-wrapper { position: relative; flex: 1; display: flex; }
+    .env-vault-wrapper input { flex: 1; padding-right: 28px; }
+    .env-vault-trigger {
+      position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+      background: none; border: none; color: var(--text-muted); cursor: pointer;
+      font-size: 0.7rem; padding: 2px;
+    }
+    .env-vault-trigger:hover { color: var(--accent); }
+    .env-vault-dropdown {
+      position: absolute; top: 100%; right: 0; z-index: 10;
+      background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius);
+      max-height: 160px; overflow-y: auto; min-width: 200px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+    .env-vault-option {
+      padding: 6px 10px; cursor: pointer; font-size: 0.75rem;
+      display: flex; justify-content: space-between; gap: 8px;
+    }
+    .env-vault-option:hover { background: var(--bg-tertiary); }
+    .env-vault-option-source { color: var(--text-muted); font-size: 0.68rem; }
 
     /* ─── Name Input Group (Install Modal) ─── */
     .name-input-group { display: flex; align-items: center; gap: 6px; }
@@ -436,6 +517,16 @@
         </div>
       </div>
     </div>
+
+    <!-- Vault Sidebar (Right) -->
+    <aside class="vault-sidebar">
+      <div class="vault-sidebar-header">
+        <h3>Credentials</h3>
+      </div>
+      <div class="vault-list" id="vault-list">
+        <div class="source-empty">Loading...</div>
+      </div>
+    </aside>
   </div>
 
   <!-- Add Source Modal -->
@@ -630,6 +721,7 @@
           loadBots();
         } else if (data.type.startsWith('bot:')) {
           loadBots();
+          loadVault();
         }
       };
       ws.onclose = () => setTimeout(connectWebSocket, 3000);
@@ -1063,7 +1155,10 @@
         ${labelHtml}
         <div class="env-row">
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
-          <input type="text" value="${escapeHtml(value)}" class="env-value" placeholder="${escapeHtml(placeholder || 'Value')}">
+          <div class="env-vault-wrapper">
+            <input type="text" value="${escapeHtml(value)}" class="env-value" placeholder="${escapeHtml(placeholder || 'Value')}">
+            <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, '${escapeHtml(key)}')" title="Pick from vault" type="button">&#9660;</button>
+          </div>
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
         </div>
       </div>`;
@@ -1805,9 +1900,230 @@
       }
     }
 
+    // ─── Credentials Vault ───
+    let vaultGroups = [];
+    const expandedVaultGroups = new Set(['standalone']);
+
+    async function loadVault() {
+      try {
+        const res = await api('GET', '/vault');
+        vaultGroups = res.success ? res.groups : [];
+      } catch {
+        vaultGroups = [];
+      }
+      renderVault();
+    }
+
+    function renderVault() {
+      const list = document.getElementById('vault-list');
+      if (vaultGroups.length === 0 || vaultGroups.every(g => g.entries.length === 0 && g.type !== 'standalone')) {
+        list.innerHTML = '<div class="source-empty">No credentials yet.<br>Install a bot or add standalone entries.</div>';
+        return;
+      }
+
+      list.innerHTML = vaultGroups.map(g => {
+        // Skip empty instance groups
+        if (g.type === 'instance' && g.entries.length === 0) return '';
+        const isExpanded = expandedVaultGroups.has(g.id);
+        const arrow = isExpanded ? '&#9650;' : '&#9660;';
+
+        let entriesHtml = '';
+        if (isExpanded) {
+          entriesHtml = g.entries.map(e => {
+            const valueDisplay = e.hidden ? '' : e.value;
+            const valuePlaceholder = e.hidden ? e.masked : 'Value';
+            return `
+            <div class="vault-entry" data-group-id="${g.id}" data-group-type="${g.type}" data-original-key="${escapeHtml(e.key)}"
+              data-orig-value="${escapeHtml(valueDisplay)}" onfocusout="revertVaultIfClean(this, event)">
+              <input class="vault-entry-key-input" value="${escapeHtml(e.key)}" autocomplete="off"
+                oninput="this.closest('.vault-entry').classList.add('dirty')">
+              <input class="vault-entry-value-input ${e.hidden ? 'masked' : ''}" type="text" autocomplete="off" value="${escapeHtml(valueDisplay)}" placeholder="${escapeHtml(valuePlaceholder)}"
+                oninput="this.closest('.vault-entry').classList.add('dirty')">
+              <button class="vault-entry-btn save" onclick="saveVaultRow(this.closest('.vault-entry'))" title="Save">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
+              </button>
+              ${g.type === 'standalone' ? `<button class="vault-entry-btn delete" onclick="deleteVaultEntry('${escapeHtml(e.key)}')" title="Delete">&times;</button>` : ''}
+            </div>`;
+          }).join('');
+
+          // Add row for standalone group
+          if (g.type === 'standalone') {
+            entriesHtml += `
+              <div class="vault-add-row">
+                <input class="vault-key-input" type="text" id="vault-new-key" placeholder="KEY" autocomplete="off">
+                <input class="vault-value-input" type="text" id="vault-new-value" placeholder="Value" autocomplete="off">
+                <button class="vault-entry-btn" onclick="toggleNewVaultHidden()" id="vault-new-eye" title="Hidden by default">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                </button>
+                <button class="vault-entry-btn" style="color:var(--accent);" onclick="addVaultEntry()" title="Add entry">+</button>
+              </div>`;
+          }
+        }
+
+        return `
+        <div class="vault-group">
+          <div class="vault-group-header" onclick="toggleVaultGroup('${g.id}')">
+            <span style="color:var(--text-muted);font-size:0.75rem;">${arrow}</span>
+            <span class="vault-group-name">${escapeHtml(g.name)}</span>
+            <span class="vault-group-count">${g.entries.length}</span>
+          </div>
+          ${entriesHtml}
+        </div>`;
+      }).join('');
+    }
+
+    function toggleVaultGroup(id) {
+      if (expandedVaultGroups.has(id)) expandedVaultGroups.delete(id);
+      else expandedVaultGroups.add(id);
+      renderVault();
+    }
+
+    let newVaultHidden = true; // default: new entries are hidden
+
+    function revertVaultIfClean(row, event) {
+      // If focus moved to another element inside this row (save button, other input), don't revert
+      setTimeout(() => {
+        if (row.contains(document.activeElement)) return;
+        if (!row.classList.contains('dirty')) return;
+        // Revert values and remove dirty
+        const keyInput = row.querySelector('.vault-entry-key-input');
+        const valueInput = row.querySelector('.vault-entry-value-input');
+        keyInput.value = row.dataset.originalKey;
+        valueInput.value = row.dataset.origValue;
+        row.classList.remove('dirty');
+      }, 150);
+    }
+
+    async function saveVaultRow(row) {
+      const groupId = row.dataset.groupId;
+      const groupType = row.dataset.groupType;
+      const originalKey = row.dataset.originalKey;
+      const newKey = row.querySelector('.vault-entry-key-input').value.trim();
+      const newValue = row.querySelector('.vault-entry-value-input').value;
+
+      try {
+        if (groupType === 'standalone') {
+          const body = {};
+          if (newKey !== originalKey) body.newKey = newKey;
+          if (newValue) body.value = newValue;
+          await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
+        } else {
+          // Bot instance — update via env manager
+          if (newValue) {
+            const envRes = await api('GET', `/bots/${groupId}/env`);
+            if (envRes.success) {
+              const vars = {};
+              for (const v of (envRes.envVars || [])) {
+                vars[v.key] = v.value || '';
+              }
+              vars[originalKey] = newValue;
+              await api('PUT', `/bots/${groupId}/env`, { vars });
+            }
+          }
+        }
+        row.classList.remove('dirty');
+        vaultValuesCache = null;
+        loadVault();
+      } catch (err) {
+        showMessage('error', 'Failed to save');
+      }
+    }
+
+    async function deleteVaultEntry(key) {
+      try {
+        await api('DELETE', `/vault/standalone/${encodeURIComponent(key)}`);
+        vaultValuesCache = null;
+        loadVault();
+      } catch (err) {
+        showMessage('error', 'Failed to delete entry');
+      }
+    }
+
+    function toggleNewVaultHidden() {
+      newVaultHidden = !newVaultHidden;
+      const btn = document.getElementById('vault-new-eye');
+      if (btn) {
+        btn.innerHTML = newVaultHidden
+          ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>'
+          : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+      }
+    }
+
+    async function addVaultEntry() {
+      const key = document.getElementById('vault-new-key').value.trim();
+      const value = document.getElementById('vault-new-value').value.trim();
+      if (!key) return;
+
+      try {
+        await api('POST', '/vault/standalone', { key, value, hidden: newVaultHidden });
+        loadVault();
+      } catch (err) {
+        showMessage('error', 'Failed to add vault entry');
+      }
+    }
+
+    // ─── Env Vault Dropdown ───
+    let vaultValuesCache = null;
+
+    async function getVaultValues() {
+      if (vaultValuesCache) return vaultValuesCache;
+      try {
+        const res = await api('GET', '/vault/all-values');
+        vaultValuesCache = res.success ? res.values : [];
+        // Invalidate cache after 10s
+        setTimeout(() => { vaultValuesCache = null; }, 10000);
+        return vaultValuesCache;
+      } catch {
+        return [];
+      }
+    }
+
+    async function toggleEnvVaultDropdown(triggerBtn, envKey) {
+      // Close any existing dropdown
+      document.querySelectorAll('.env-vault-dropdown').forEach(d => d.remove());
+
+      const wrapper = triggerBtn.closest('.env-vault-wrapper');
+      const input = wrapper.querySelector('.env-value');
+
+      const values = await getVaultValues();
+      // Filter: show entries matching this key, or all if no match
+      const matching = values.filter(v => v.key.toUpperCase() === envKey.toUpperCase());
+      const toShow = matching.length > 0 ? matching : values.filter(v => v.value);
+
+      if (toShow.length === 0) return;
+
+      const dropdown = document.createElement('div');
+      dropdown.className = 'env-vault-dropdown';
+      dropdown.innerHTML = toShow.map(v =>
+        `<div class="env-vault-option" data-value="${escapeHtml(v.value)}">
+          <span>${escapeHtml(v.key)}</span>
+          <span class="env-vault-option-source">${escapeHtml(v.source)}</span>
+        </div>`
+      ).join('');
+
+      dropdown.querySelectorAll('.env-vault-option').forEach(opt => {
+        opt.addEventListener('click', () => {
+          input.value = opt.dataset.value;
+          dropdown.remove();
+        });
+      });
+
+      wrapper.appendChild(dropdown);
+
+      // Close on outside click
+      const closeHandler = (e) => {
+        if (!wrapper.contains(e.target)) {
+          dropdown.remove();
+          document.removeEventListener('click', closeHandler);
+        }
+      };
+      setTimeout(() => document.addEventListener('click', closeHandler), 0);
+    }
+
     // ─── Init ───
     loadSources();
     loadBots();
+    loadVault();
   </script>
 </body>
 </html>

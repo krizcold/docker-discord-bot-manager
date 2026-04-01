@@ -283,6 +283,27 @@ export async function createBot(request: CreateBotRequest): Promise<InstanceConf
   });
 }
 
+/**
+ * Update instance auto-update settings.
+ */
+export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, autoUpdateInterval?: number, autoUpdateHour?: number): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+
+  instance.autoUpdate = autoUpdate;
+  if (autoUpdateInterval !== undefined) {
+    instance.autoUpdateInterval = autoUpdateInterval;
+  }
+  if (autoUpdateHour !== undefined) {
+    instance.autoUpdateHour = Math.max(0, Math.min(23, autoUpdateHour));
+  }
+  instance.updatedAt = new Date().toISOString();
+  registry.instances[botId] = instance;
+  saveRegistry(registry);
+  return instance;
+}
+
 // ─── Instance Update ───
 
 export async function updateBot(botId: string, update: UpdateBotRequest | UpdateInstanceRequest): Promise<InstanceConfig | null> {

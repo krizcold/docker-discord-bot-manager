@@ -118,11 +118,11 @@
       position: relative; width: 32px; height: 18px; cursor: pointer;
     }
     .toggle-switch input { opacity: 0; width: 0; height: 0; }
-    .toggle-slider {
+    .toggle-switch .toggle-slider {
       position: absolute; top: 0; left: 0; right: 0; bottom: 0;
       background: var(--bg-elevated); border-radius: 9px; transition: background 0.2s;
     }
-    .toggle-slider::before {
+    .toggle-switch .toggle-slider::before {
       content: ''; position: absolute; width: 14px; height: 14px; left: 2px; bottom: 2px;
       background: var(--text-muted); border-radius: 50%; transition: transform 0.2s, background 0.2s;
     }
@@ -133,20 +133,16 @@
       padding: 8px 0; font-size: 0.82rem;
     }
     .toggle-row {
-      display: flex; align-items: center; gap: 6px; cursor: pointer; position: relative;
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
       color: var(--text-muted); font-size: 0.78rem; user-select: none;
     }
-    .toggle-row input { display: none; }
-    .toggle-row .toggle-slider {
-      position: relative; width: 32px; height: 18px; background: var(--bg-tertiary);
-      border-radius: 9px; transition: background 0.2s; flex-shrink: 0;
+    .auto-update-interval {
+      background: var(--bg-tertiary); color: var(--text-secondary); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 2px 4px; font-size: 0.72rem; cursor: pointer;
+      outline: none;
     }
-    .toggle-row .toggle-slider::after {
-      content: ''; position: absolute; left: 2px; top: 2px;
-      width: 14px; height: 14px; background: #fff; border-radius: 50%; transition: 0.2s;
-    }
-    .toggle-row input:checked + .toggle-slider { background: var(--accent); }
-    .toggle-row input:checked + .toggle-slider::after { left: 16px; }
+    .auto-update-interval:disabled { opacity: 0.4; cursor: not-allowed; }
+    .auto-update-interval:focus { border-color: var(--border-focus); }
 
     .bot-card-actions {
       display: flex; gap: 6px; flex-wrap: wrap; margin-top: 14px;
@@ -882,13 +878,37 @@
               : '';
 
             // Per-instance auto-update toggle (only for git sources)
-            const srcAutoUpdate = bot.source?.autoUpdate;
+            const instanceAutoUpdate = bot.autoUpdate;
+            const instanceInterval = bot.autoUpdateInterval || 86400000;
+            const instanceHour = bot.autoUpdateHour ?? 4;
+            const intervalOptions = [
+              { value: 1800000, label: '30min' },
+              { value: 3600000, label: '1h' },
+              { value: 21600000, label: '6h' },
+              { value: 43200000, label: '12h' },
+              { value: 86400000, label: '24h' },
+            ];
+            const intervalSelect = intervalOptions.map(o =>
+              `<option value="${o.value}" ${o.value === instanceInterval ? 'selected' : ''}>${o.label}</option>`
+            ).join('');
+            const hourOptions = Array.from({ length: 24 }, (_, h) =>
+              `<option value="${h}" ${h === instanceHour ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`
+            ).join('');
+            const showHourPicker = instanceInterval >= 86400000;
             const autoUpdateToggle = isGit ? `
-              <label class="toggle-row" title="Automatically check for source updates every 30 minutes">
-                <span class="toggle-label">Auto-update</span>
-                <input type="checkbox" ${srcAutoUpdate ? 'checked' : ''} onchange="toggleBotAutoUpdate('${bot.id}', this.checked)">
-                <span class="toggle-slider"></span>
-              </label>` : '';
+              <div class="toggle-row" title="Automatically rebuild this instance when the source has new commits">
+                <label class="toggle-switch">
+                  <input type="checkbox" ${instanceAutoUpdate ? 'checked' : ''} onchange="toggleBotAutoUpdate('${bot.id}', this.checked)">
+                  <span class="toggle-slider"></span>
+                </label>
+                <span>Auto-update</span>
+              </div>
+              <select class="auto-update-interval" title="Check interval" onchange="setBotAutoUpdateInterval('${bot.id}', Number(this.value))" ${!instanceAutoUpdate ? 'disabled' : ''}>
+                ${intervalSelect}
+              </select>
+              <select class="auto-update-interval" title="Preferred hour" onchange="setBotAutoUpdateHour('${bot.id}', Number(this.value))" ${!instanceAutoUpdate || !showHourPicker ? 'disabled' : ''} style="${showHourPicker ? '' : 'opacity:0.4'}">
+                ${hourOptions}
+              </select>` : '';
 
             return `
             <div class="bot-card">
@@ -1012,9 +1032,33 @@
       try {
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled });
         if (!res.success) showMessage('error', res.error || 'Failed to toggle auto-update');
+        else loadBots();
       } catch (err) {
         showMessage('error', 'Failed to toggle auto-update');
         loadBots();
+      }
+    }
+
+    async function setBotAutoUpdateInterval(id, interval) {
+      try {
+        const bot = bots.find(b => b.id === id);
+        const enabled = bot?.autoUpdate || false;
+        const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, interval });
+        if (!res.success) showMessage('error', res.error || 'Failed to set interval');
+        else loadBots(); // re-render to show/hide hour picker
+      } catch (err) {
+        showMessage('error', 'Failed to set auto-update interval');
+      }
+    }
+
+    async function setBotAutoUpdateHour(id, hour) {
+      try {
+        const bot = bots.find(b => b.id === id);
+        const enabled = bot?.autoUpdate || false;
+        const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, hour });
+        if (!res.success) showMessage('error', res.error || 'Failed to set hour');
+      } catch (err) {
+        showMessage('error', 'Failed to set auto-update hour');
       }
     }
 

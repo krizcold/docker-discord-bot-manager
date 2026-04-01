@@ -12,6 +12,7 @@ import { createBotRoutes, createSystemRoutes, createValidationRoutes } from './r
 import { createSourceRoutes } from './routes/sources';
 import { createVaultRoutes } from './routes/vault';
 import { setSourceBroadcast } from '../source/sourceUpdater';
+import { setInstanceBroadcast } from '../instance/instanceUpdater';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -38,6 +39,9 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
 
   // Wire source updater broadcast to WebSocket
   setSourceBroadcast((type, data) => broadcastToClients(wss, type, data));
+
+  // Wire instance updater broadcast to WebSocket
+  setInstanceBroadcast((type, data) => broadcastToClients(wss, type, data));
 
   // Health check
   app.get('/api/health', (req: Request, res: Response) => {

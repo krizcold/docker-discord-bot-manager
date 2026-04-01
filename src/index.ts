@@ -11,6 +11,7 @@ import { syncContainerStates } from './docker/containerManager';
 import { migrateV1toV2 } from './migration/v1ToV2';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
+import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 
 async function main(): Promise<void> {
   console.log('='.repeat(50));
@@ -46,18 +47,23 @@ async function main(): Promise<void> {
 
   // Start source auto-update scheduler
   startSourceUpdater();
+
+  // Start instance auto-update scheduler
+  startInstanceUpdater();
 }
 
 // Handle graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Shutdown] Received SIGTERM, shutting down...');
   stopSourceUpdater();
+  stopInstanceUpdater();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('[Shutdown] Received SIGINT, shutting down...');
   stopSourceUpdater();
+  stopInstanceUpdater();
   process.exit(0);
 });
 

@@ -41,6 +41,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
         return {
           ...bot,
+          autoUpdate: bot.autoUpdate || false,
+          autoUpdateInterval: bot.autoUpdateInterval || 86400000,
+          autoUpdateHour: bot.autoUpdateHour ?? 4,
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
         };
@@ -790,8 +793,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * PUT /api/bots/:id/auto-update - Toggle auto-update (now on source level)
-   * Kept for backward compat — redirects to source auto-update if applicable.
+   * PUT /api/bots/:id/auto-update - Toggle instance auto-update
+   * Sets autoUpdate and optional autoUpdateInterval on the INSTANCE (not source).
    */
   router.put('/:id/auto-update', async (req: Request, res: Response) => {
     try {
@@ -801,19 +804,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const { enabled } = req.body as { enabled: boolean };
+      const { enabled, interval, hour } = req.body as { enabled: boolean; interval?: number; hour?: number };
       if (typeof enabled !== 'boolean') {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
       }
 
-      // If instance has a source, toggle auto-update on the source
-      if (bot.sourceId) {
-        sourceManager.updateSource(bot.sourceId, { autoUpdate: enabled });
-      }
-
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
-      res.json({ success: true, autoUpdate: enabled });
+      const updated = containerManager.updateInstanceAutoUpdate(req.params.id, enabled, interval, hour);
+      broadcastToClients(wss, 'bot:updated', updated);
+      res.json({ success: true, autoUpdate: enabled, autoUpdateInterval: updated?.autoUpdateInterval, autoUpdateHour: updated?.autoUpdateHour });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

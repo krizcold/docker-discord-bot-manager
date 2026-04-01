@@ -69,6 +69,11 @@ export interface InstanceConfig {
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
 
+  // Instance auto-update (independent from source auto-update)
+  autoUpdate?: boolean;                // default false — auto-rebuild when source has new commits
+  autoUpdateInterval?: number;         // milliseconds between checks, default 86400000 (24 hours)
+  autoUpdateHour?: number;             // 0-23, preferred hour for daily checks, default 4 (4am)
+
   // CasaOS app name (== sanitizedName for new instances, preserved for migrated)
   appName?: string;
 

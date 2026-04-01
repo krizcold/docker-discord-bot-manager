@@ -33,6 +33,9 @@ async function runSourceUpdateCycle(): Promise<void> {
   for (const source of sources) {
     if (!source.autoUpdate) continue;
 
+    // Skip sources that haven't been cloned yet — don't auto-clone default sources
+    if (!source.lastChecked) continue;
+
     try {
       const result = await sourceManager.fetchSource(source.id);
 

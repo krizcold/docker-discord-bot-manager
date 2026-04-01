@@ -41,7 +41,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
         return {
           ...bot,
-          source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url } : null,
+          source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
         };
       });
@@ -210,6 +210,39 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.delete('/:id', async (req: Request, res: Response) => {
     try {
       const keepData = req.query.keepData === 'true';
+      const keepEnv = req.query.keepEnv !== 'false'; // default true (preserve env)
+      const bot = containerManager.getBot(req.params.id);
+
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      // If not keeping env, move env vars to vault under "[DELETED] BotName"
+      if (!keepEnv) {
+        try {
+          const envVars = envManager.getEnvVars(req.params.id);
+          if (envVars && Object.keys(envVars).length > 0) {
+            const vaultPath = require('path').join(process.env.DATA_DIR || '/data/data', 'vault.json');
+            const fs = require('fs');
+            let vault = { standalone: [] as Array<{ key: string; value: string; hidden: boolean }> };
+            try {
+              if (fs.existsSync(vaultPath)) vault = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
+            } catch { /* ignore */ }
+
+            const botName = bot.displayName || bot.sanitizedName || req.params.id;
+            const prefix = `[DELETED:${botName}] `;
+            for (const [key, value] of Object.entries(envVars)) {
+              vault.standalone.push({ key: `${prefix}${key}`, value, hidden: true });
+            }
+            fs.mkdirSync(require('path').dirname(vaultPath), { recursive: true });
+            fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+          }
+        } catch (err) {
+          console.warn(`[API] Failed to move env vars to vault: ${err}`);
+        }
+      }
+
       const success = await containerManager.deleteBot(req.params.id, keepData);
       if (!success) {
         res.status(404).json({ success: false, error: 'Bot not found' });
@@ -321,40 +354,16 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json({ success: true, message: 'Updating instance from source' });
 
       const botId = req.params.id;
-      containerManager.pullAndRebuild(botId).then((result) => {
-        if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
-        } else {
-          broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
+
+      // Fetch source first to ensure we have the latest code
+      if (bot.sourceId) {
+        try {
+          await sourceManager.fetchSource(bot.sourceId);
+        } catch (err) {
+          console.warn(`[API] Failed to fetch source before update: ${err}`);
         }
-      }).catch((err) => {
-        broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
-      });
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * POST /api/bots/:id/pull - Pull latest code and rebuild (legacy, delegates to /update)
-   */
-  router.post('/:id/pull', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
       }
 
-      if (bot.sourceType === 'docker-image') {
-        res.status(400).json({ success: false, error: 'Cannot pull updates for docker-image source type' });
-        return;
-      }
-
-      broadcastToClients(wss, 'bot:pulling', { id: req.params.id });
-      res.json({ success: true, message: 'Pulling and rebuilding' });
-
-      const botId = req.params.id;
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
           broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
@@ -635,8 +644,14 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Check against source's latest commit
+      // Fetch source first to ensure we have the latest remote state
       if (bot.sourceId) {
+        try {
+          await sourceManager.fetchSource(bot.sourceId);
+        } catch (err) {
+          console.warn(`[API] Failed to fetch source for update check: ${err}`);
+        }
+
         const source = sourceManager.getSource(bot.sourceId);
         if (source && bot.lastBuiltCommit && source.lastCommitHash) {
           const hasUpdates = bot.lastBuiltCommit !== source.lastCommitHash;

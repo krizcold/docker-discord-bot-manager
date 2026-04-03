@@ -647,24 +647,35 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Fetch source first to ensure we have the latest remote state
-      if (bot.sourceId) {
-        try {
-          await sourceManager.fetchSource(bot.sourceId);
-        } catch (err) {
-          console.warn(`[API] Failed to fetch source for update check: ${err}`);
-        }
-
-        const source = sourceManager.getSource(bot.sourceId);
-        if (source && bot.lastBuiltCommit && source.lastCommitHash) {
-          const hasUpdates = bot.lastBuiltCommit !== source.lastCommitHash;
-          res.json({ success: true, hasUpdates, behindBy: hasUpdates ? 1 : 0 });
-          return;
-        }
+      if (!bot.sourceId) {
+        res.json({ success: true, hasUpdates: false, behindBy: 0 });
+        return;
       }
 
-      // If no source or no commit tracking, report unknown
-      res.json({ success: true, hasUpdates: false, behindBy: 0 });
+      // Fetch source first to ensure we have the latest remote state
+      let fetchBehindBy = 0;
+      try {
+        const fetchResult = await sourceManager.fetchSource(bot.sourceId);
+        fetchBehindBy = fetchResult.behindBy;
+      } catch (err) {
+        console.warn(`[API] Failed to fetch source for update check: ${err}`);
+      }
+
+      const source = sourceManager.getSource(bot.sourceId);
+      if (!source || !source.lastCommitHash) {
+        // Source not cloned or no commit info — can't determine
+        res.json({ success: true, hasUpdates: false, behindBy: 0 });
+        return;
+      }
+
+      if (!bot.lastBuiltCommit) {
+        // Never tracked what commit was built — assume behind
+        res.json({ success: true, hasUpdates: true, behindBy: fetchBehindBy || 1 });
+        return;
+      }
+
+      const hasUpdates = bot.lastBuiltCommit !== source.lastCommitHash;
+      res.json({ success: true, hasUpdates, behindBy: hasUpdates ? fetchBehindBy || 1 : 0 });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

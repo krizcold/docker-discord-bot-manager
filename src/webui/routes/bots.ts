@@ -221,8 +221,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // If not keeping env, move env vars to vault under "[DELETED] BotName"
-      if (!keepEnv) {
+      // When keepEnv=true, preserve env vars in vault so they survive directory deletion.
+      // When keepEnv=false, user explicitly wants them gone — don't save.
+      if (keepEnv && !keepData) {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
           if (envVars && Object.keys(envVars).length > 0) {
@@ -242,7 +243,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
             fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
           }
         } catch (err) {
-          console.warn(`[API] Failed to move env vars to vault: ${err}`);
+          console.warn(`[API] Failed to preserve env vars in vault: ${err}`);
         }
       }
 

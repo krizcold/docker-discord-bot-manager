@@ -47,6 +47,7 @@ import { logCollectors, LogCollector } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
 import { sanitizeName, titleizeName, resolveNames, validateName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
+import YAML from 'yaml';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
@@ -596,6 +597,68 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   }
 }
 
+/**
+ * Sync current instance env vars into the on-disk compose file.
+ * CasaOS deploys from the compose file, so env changes after build
+ * must be written back before start.
+ */
+function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void {
+  if (!fs.existsSync(composePath)) return;
+
+  try {
+    const raw = fs.readFileSync(composePath, 'utf-8');
+    const doc = YAML.parseDocument(raw);
+    const compose = doc.toJSON();
+
+    const services = compose?.services;
+    if (!services || typeof services !== 'object') return;
+
+    // Determine target service (x-casaos.build target or first service)
+    const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
+    const serviceNames = Object.keys(services);
+    const targetName = (typeof xcBuild === 'string' && services[xcBuild])
+      ? xcBuild
+      : serviceNames[0];
+    if (!targetName) return;
+
+    const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
+    const allEnv: Record<string, string> = {
+      ...instance.envVars,
+      BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
+      BOT_ID: instance.id,
+      BOT_MANAGER_INTERNAL_URL: internalUrl
+    };
+
+    const service = services[targetName];
+    const env = service.environment;
+
+    if (Array.isArray(env)) {
+      // Array format: ["KEY=value", ...]
+      // Remove existing keys we're about to set, then add all
+      const existingKeys = new Set(Object.keys(allEnv));
+      const filtered = env.filter((e: string) => {
+        const key = typeof e === 'string' ? e.split('=')[0] : '';
+        return !existingKeys.has(key);
+      });
+      for (const [key, value] of Object.entries(allEnv)) {
+        filtered.push(`${key}=${value}`);
+      }
+      service.environment = filtered;
+    } else if (typeof env === 'object' && env !== null) {
+      // Object format: { KEY: "value", ... }
+      Object.assign(env, allEnv);
+    } else {
+      // No environment section — create one
+      service.environment = { ...allEnv };
+    }
+
+    compose.services[targetName] = service;
+    fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+  } catch (err) {
+    console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
+  }
+}
+
 // ─── Start ───
 
 export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
@@ -641,6 +704,10 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
 
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
+
+      // Sync env vars into compose before deploy (env changes after build)
+      syncComposeEnvVars(latestInstance, composePath);
+
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 

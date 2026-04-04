@@ -221,9 +221,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // When keepEnv=true, preserve env vars in vault so they survive directory deletion.
+      // When keepEnv=true (default), preserve env vars in vault for recovery.
       // When keepEnv=false, user explicitly wants them gone — don't save.
-      if (keepEnv && !keepData) {
+      if (keepEnv) {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
           if (envVars && Object.keys(envVars).length > 0) {

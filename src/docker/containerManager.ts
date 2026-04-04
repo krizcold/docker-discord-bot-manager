@@ -598,6 +598,63 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
 }
 
 /**
+ * Write a .botmanager marker file inside the AppData folder.
+ * This identifies the folder as Bot Manager-managed, surviving even if
+ * the Bot Manager itself is wiped. Used by name validation and folder reuse.
+ *
+ * Location: /DATA/AppData/{appName}/.botmanager
+ */
+function writeBotManagerMarker(instance: InstanceConfig, appName: string): void {
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const appDataPath = path.join(dataRoot, 'AppData', appName);
+
+  try {
+    fs.mkdirSync(appDataPath, { recursive: true });
+    const marker = {
+      managedBy: 'docker-discord-bot-manager',
+      instanceId: instance.id,
+      displayName: instance.displayName,
+      sanitizedName: instance.sanitizedName,
+      sourceUrl: instance.sourceUrl || null,
+      sourceType: instance.sourceType || 'git',
+      createdAt: instance.createdAt,
+      lastBuildAt: new Date().toISOString()
+    };
+    fs.writeFileSync(
+      path.join(appDataPath, '.botmanager'),
+      JSON.stringify(marker, null, 2)
+    );
+  } catch (err) {
+    console.warn(`[ContainerManager] Failed to write .botmanager marker: ${err}`);
+  }
+}
+
+/**
+ * Read the .botmanager marker from an AppData folder.
+ * Returns the parsed marker or null if not found/invalid.
+ */
+export function readBotManagerMarker(appName: string): {
+  managedBy: string;
+  instanceId: string;
+  displayName: string;
+  sanitizedName: string;
+  sourceUrl: string | null;
+  sourceType: string;
+  createdAt: string;
+  lastBuildAt: string;
+} | null {
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const markerPath = path.join(dataRoot, 'AppData', appName, '.botmanager');
+
+  try {
+    if (!fs.existsSync(markerPath)) return null;
+    return JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Sync current instance env vars into the on-disk compose file.
  * CasaOS deploys from the compose file, so env changes after build
  * must be written back before start.
@@ -1009,6 +1066,9 @@ async function buildDockerImageInstance(
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
+  // Write .botmanager marker inside AppData (identifies folder as ours)
+  writeBotManagerMarker(instance, appName);
+
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
@@ -1118,6 +1178,9 @@ async function buildGitInstance(
     emit('[PCS] Creating volume directories...', 'info');
     await createVolumeDirectories(composeContent, (msg) => emit(msg, 'info'));
   }
+
+  // Write .botmanager marker inside AppData (identifies folder as ours)
+  writeBotManagerMarker(instance, appName);
 
   // CasaOS: execute pre-install command
   if (isCasaOS) {

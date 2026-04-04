@@ -54,7 +54,9 @@ export function isReservedName(sanitized: string): boolean {
 }
 
 /**
- * Check if /DATA/AppData/{sanitized} exists and is NOT tracked by any current instance.
+ * Check if /DATA/AppData/{sanitized} exists and is NOT managed by Bot Manager.
+ * Uses the .botmanager marker file inside the AppData folder itself —
+ * survives even if Bot Manager is fully wiped and reinstalled.
  */
 export function isAppDataOccupied(sanitized: string, existingInstances: InstanceConfig[]): boolean {
   const dataRoot = process.env.DATA_ROOT || '/DATA';
@@ -62,11 +64,18 @@ export function isAppDataOccupied(sanitized: string, existingInstances: Instance
 
   if (!fs.existsSync(appDataPath)) return false;
 
-  // If any existing instance owns this sanitized name, it's tracked (not "occupied by an unknown")
+  // If any existing instance owns this sanitized name, it's tracked (not occupied)
   const tracked = existingInstances.some(
     inst => inst.sanitizedName === sanitized || inst.appName === sanitized
   );
-  return !tracked;
+  if (tracked) return false;
+
+  // Check for .botmanager marker — if present, this is a Bot Manager folder (allow reuse)
+  const markerPath = path.join(appDataPath, '.botmanager');
+  if (fs.existsSync(markerPath)) return false;
+
+  // Genuinely unknown/external folder — block
+  return true;
 }
 
 /**
@@ -120,20 +129,18 @@ export function validateName(
 
 /**
  * Check if a sanitized name has reusable data from a previous bot manager instance.
- * Returns the previous instance ID if found, or null.
- *
- * Condition: /DATA/AppData/{sanitized} exists AND is tracked by a bot manager instance
- * that no longer exists in the current registry (deleted but data preserved).
+ * Reads the .botmanager marker inside the AppData folder for metadata.
  */
 export function checkFolderReuse(sanitizedName: string, existingInstances: InstanceConfig[]): {
   reuseAvailable: boolean;
   previousInstanceId: string | null;
+  marker: any | null;
 } {
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const appDataPath = path.join(dataRoot, 'AppData', sanitizedName);
 
   if (!fs.existsSync(appDataPath)) {
-    return { reuseAvailable: false, previousInstanceId: null };
+    return { reuseAvailable: false, previousInstanceId: null, marker: null };
   }
 
   // If a current instance owns this name, it's not "reusable" — it's in active use
@@ -141,32 +148,43 @@ export function checkFolderReuse(sanitizedName: string, existingInstances: Insta
     i => i.sanitizedName === sanitizedName || i.appName === sanitizedName
   );
   if (activeOwner) {
-    return { reuseAvailable: false, previousInstanceId: null };
+    return { reuseAvailable: false, previousInstanceId: null, marker: null };
   }
 
-  // Check if any bot manager instance directory has env data for this sanitized name
-  // by scanning /data/data/bots/*/env/storage.json
+  // Check for .botmanager marker
+  const markerPath = path.join(appDataPath, '.botmanager');
+  if (fs.existsSync(markerPath)) {
+    try {
+      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+      return {
+        reuseAvailable: true,
+        previousInstanceId: marker.instanceId || null,
+        marker
+      };
+    } catch {
+      // Marker exists but unreadable — still ours, allow reuse
+      return { reuseAvailable: true, previousInstanceId: null, marker: null };
+    }
+  }
+
+  // Fallback: scan Bot Manager's internal bots directory for orphaned env data
   const botsDir = path.join(process.env.DATA_DIR || '/data/data', 'bots');
-  if (!fs.existsSync(botsDir)) {
-    return { reuseAvailable: false, previousInstanceId: null };
-  }
-
-  try {
-    const entries = fs.readdirSync(botsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const envStoragePath = path.join(botsDir, entry.name, 'env', 'storage.json');
-      if (fs.existsSync(envStoragePath)) {
-        // This bot directory has credentials — check if it maps to our sanitized name
-        // by seeing if this instance id is NOT in the current registry
-        const isActive = existingInstances.some(i => i.id === entry.name);
-        if (!isActive) {
-          return { reuseAvailable: true, previousInstanceId: entry.name };
+  if (fs.existsSync(botsDir)) {
+    try {
+      const entries = fs.readdirSync(botsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const envStoragePath = path.join(botsDir, entry.name, 'env', 'storage.json');
+        if (fs.existsSync(envStoragePath)) {
+          const isActive = existingInstances.some(i => i.id === entry.name);
+          if (!isActive) {
+            return { reuseAvailable: true, previousInstanceId: entry.name, marker: null };
+          }
         }
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  }
 
-  // AppData exists but no previous credentials found — still offer reuse of data directory
-  return { reuseAvailable: true, previousInstanceId: null };
+  // AppData exists but no marker and no internal data — still offer reuse
+  return { reuseAvailable: true, previousInstanceId: null, marker: null };
 }

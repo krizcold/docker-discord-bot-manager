@@ -852,7 +852,7 @@ export function createValidationRoutes(): Router {
       const existingInstances = containerManager.getAllBots();
       const result = validateName(name, existingInstances, excludeId);
       const names = resolveNames(name);
-      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, previousInstanceId: null };
+      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, previousInstanceId: null, marker: null };
 
       res.json({ ...result, ...names, ...reuse });
     } catch (error) {

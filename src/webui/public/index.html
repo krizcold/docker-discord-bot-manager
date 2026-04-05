@@ -2234,8 +2234,8 @@
     }
 
     // ─── Init ───
-    loadSources();
-    loadBots();
+    // Sources must load before bots (bot cards need sources for dropdown)
+    loadSources().then(() => loadBots());
     loadVault();
   </script>
 </body>

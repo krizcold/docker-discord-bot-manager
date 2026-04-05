@@ -1211,11 +1211,22 @@ async function buildGitInstance(
   // Store appName and lastBuiltCommit
   updateBotAppName(botId, appName);
 
-  // Record the commit this was built from
+  // Record the commit this was built from — read directly from the repo
+  // (source registry may not be up-to-date if clone just happened)
   if (instance.sourceId) {
-    const source = sourceManager.getSource(instance.sourceId);
-    if (source?.lastCommitHash) {
-      updateLastBuiltCommit(botId, source.lastCommitHash);
+    try {
+      const simpleGit = require('simple-git').simpleGit;
+      const git = simpleGit(repoPath);
+      const log = await git.log({ maxCount: 1 });
+      if (log.latest?.hash) {
+        updateLastBuiltCommit(botId, log.latest.hash);
+      }
+    } catch (err) {
+      // Fallback to source registry
+      const source = sourceManager.getSource(instance.sourceId);
+      if (source?.lastCommitHash) {
+        updateLastBuiltCommit(botId, source.lastCommitHash);
+      }
     }
   }
 

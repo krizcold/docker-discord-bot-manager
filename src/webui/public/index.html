@@ -667,7 +667,7 @@
         <input type="checkbox" id="delete-also-env" style="margin-top: 3px;">
         <span>
           <strong style="color: var(--text-primary); font-size: 0.88rem;">Also remove environment variables</strong><br>
-          <span style="font-size: 0.8rem; color: var(--text-muted);">Env vars will be moved to the Credentials Vault under [DELETED] for recovery.</span>
+          <span style="font-size: 0.8rem; color: var(--text-muted);">Env vars will be preserved in the Credentials Vault for recovery.</span>
         </span>
       </label>
 
@@ -2045,17 +2045,20 @@
           entriesHtml = g.entries.map(e => {
             const valueDisplay = e.hidden ? '' : e.value;
             const valuePlaceholder = e.hidden ? e.masked : 'Value';
+            const botNameAttr = e.botName ? ` data-bot-name="${escapeHtml(e.botName)}"` : '';
             return `
             <div class="vault-entry" data-group-id="${g.id}" data-group-type="${g.type}" data-original-key="${escapeHtml(e.key)}"
-              data-orig-value="${escapeHtml(valueDisplay)}" onfocusout="revertVaultIfClean(this, event)">
+              data-orig-value="${escapeHtml(valueDisplay)}"${botNameAttr} onfocusout="revertVaultIfClean(this, event)">
               <input class="vault-entry-key-input" value="${escapeHtml(e.key)}" autocomplete="off"
                 oninput="this.closest('.vault-entry').classList.add('dirty')">
               <input class="vault-entry-value-input ${e.hidden ? 'masked' : ''}" type="text" autocomplete="off" value="${escapeHtml(valueDisplay)}" placeholder="${escapeHtml(valuePlaceholder)}"
                 oninput="this.closest('.vault-entry').classList.add('dirty')">
+              ${e.botName ? `<span style="font-size:0.65rem;color:var(--text-muted);white-space:nowrap;" title="From deleted bot">${escapeHtml(e.botName)}</span>` : ''}
               <button class="vault-entry-btn save" onclick="saveVaultRow(this.closest('.vault-entry'))" title="Save">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
               </button>
               ${g.type === 'standalone' ? `<button class="vault-entry-btn delete" onclick="deleteVaultEntry('${escapeHtml(e.key)}')" title="Delete">&times;</button>` : ''}
+              ${g.type === 'deleted' ? `<button class="vault-entry-btn delete" onclick="deleteDeletedVaultEntry('${escapeHtml(e.key)}', '${escapeHtml(e.botName)}')" title="Delete">&times;</button>` : ''}
             </div>`;
           }).join('');
 
@@ -2115,7 +2118,13 @@
       const newValue = row.querySelector('.vault-entry-value-input').value;
 
       try {
-        if (groupType === 'standalone') {
+        if (groupType === 'deleted') {
+          const botName = row.dataset.botName;
+          const body = {};
+          if (newKey !== originalKey) body.newKey = newKey;
+          if (newValue) body.value = newValue;
+          await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?botName=${encodeURIComponent(botName)}`, body);
+        } else if (groupType === 'standalone') {
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
@@ -2145,6 +2154,16 @@
     async function deleteVaultEntry(key) {
       try {
         await api('DELETE', `/vault/standalone/${encodeURIComponent(key)}`);
+        vaultValuesCache = null;
+        loadVault();
+      } catch (err) {
+        showMessage('error', 'Failed to delete entry');
+      }
+    }
+
+    async function deleteDeletedVaultEntry(key, botName) {
+      try {
+        await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?botName=${encodeURIComponent(botName)}`);
         vaultValuesCache = null;
         loadVault();
       } catch (err) {

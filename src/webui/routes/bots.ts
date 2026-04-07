@@ -229,15 +229,25 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           if (envVars && Object.keys(envVars).length > 0) {
             const vaultPath = require('path').join(process.env.DATA_DIR || '/data/data', 'vault.json');
             const fs = require('fs');
-            let vault = { standalone: [] as Array<{ key: string; value: string; hidden: boolean }> };
+            let vault: { standalone: Array<{ key: string; value: string; hidden: boolean }>; deleted: Array<{ key: string; value: string; botName: string; deletedAt: number }> } = { standalone: [], deleted: [] };
             try {
-              if (fs.existsSync(vaultPath)) vault = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
+              if (fs.existsSync(vaultPath)) {
+                const raw = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
+                vault = { standalone: raw.standalone || [], deleted: raw.deleted || [] };
+              }
             } catch { /* ignore */ }
 
             const botName = bot.displayName || bot.sanitizedName || req.params.id;
-            const prefix = `[DELETED:${botName}] `;
+            const now = Date.now();
             for (const [key, value] of Object.entries(envVars)) {
-              vault.standalone.push({ key: `${prefix}${key}`, value, hidden: true });
+              // Upsert: latest wins by key+botName
+              const idx = vault.deleted.findIndex(d => d.key === key && d.botName === botName);
+              const entry = { key, value, botName, deletedAt: now };
+              if (idx >= 0) {
+                vault.deleted[idx] = entry;
+              } else {
+                vault.deleted.push(entry);
+              }
             }
             fs.mkdirSync(require('path').dirname(vaultPath), { recursive: true });
             fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));

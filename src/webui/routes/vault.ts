@@ -21,17 +21,55 @@ interface VaultEntry {
   hidden: boolean;  // true = value masked in UI, false = shown in plain
 }
 
+interface DeletedVaultEntry {
+  key: string;
+  value: string;
+  botName: string;
+  deletedAt: number;
+}
+
 interface VaultConfig {
   standalone: VaultEntry[];
+  deleted: DeletedVaultEntry[];
 }
 
 function loadVault(): VaultConfig {
   try {
     if (fs.existsSync(VAULT_FILE)) {
-      return JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
+      const raw = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
+      if (!raw.deleted) raw.deleted = [];
+
+      // Migrate legacy [DELETED:...] entries from standalone to deleted[]
+      const deletedPrefix = /^\[DELETED:(.+?)\]\s*/;
+      const migrated: VaultEntry[] = [];
+      let didMigrate = false;
+      for (const entry of (raw.standalone || [])) {
+        const match = entry.key.match(deletedPrefix);
+        if (match) {
+          const botName = match[1];
+          const cleanKey = entry.key.replace(deletedPrefix, '');
+          // Upsert: latest wins by key+botName
+          const idx = raw.deleted.findIndex((d: DeletedVaultEntry) => d.key === cleanKey && d.botName === botName);
+          const newEntry: DeletedVaultEntry = { key: cleanKey, value: entry.value, botName, deletedAt: Date.now() };
+          if (idx >= 0) {
+            raw.deleted[idx] = newEntry;
+          } else {
+            raw.deleted.push(newEntry);
+          }
+          didMigrate = true;
+        } else {
+          migrated.push(entry);
+        }
+      }
+      if (didMigrate) {
+        raw.standalone = migrated;
+        saveVault(raw);
+      }
+
+      return raw;
     }
   } catch { /* ignore */ }
-  return { standalone: [] };
+  return { standalone: [], deleted: [] };
 }
 
 function saveVault(config: VaultConfig): void {
@@ -56,12 +94,12 @@ export function createVaultRoutes(): Router {
       const instances = containerManager.getAllBots();
       const vault = loadVault();
 
-      // Build groups: one per bot instance + standalone
+      // Build groups: one per bot instance + standalone + deleted
       const groups: Array<{
         id: string;
         name: string;
-        type: 'instance' | 'standalone';
-        entries: Array<{ key: string; value: string; masked: string }>;
+        type: 'instance' | 'standalone' | 'deleted';
+        entries: Array<{ key: string; value: string; masked: string; hidden?: boolean; botName?: string }>;
       }> = [];
 
       // Standalone group first
@@ -76,6 +114,22 @@ export function createVaultRoutes(): Router {
           hidden: e.hidden !== false  // default hidden
         }))
       });
+
+      // Deleted group
+      if (vault.deleted && vault.deleted.length > 0) {
+        groups.push({
+          id: 'deleted',
+          name: 'Deleted / Recoverable',
+          type: 'deleted',
+          entries: vault.deleted.map(e => ({
+            key: e.key,
+            value: '',
+            masked: maskValue(e.value),
+            hidden: true,
+            botName: e.botName
+          }))
+        });
+      }
 
       // Bot instance groups
       for (const inst of instances) {
@@ -122,6 +176,11 @@ export function createVaultRoutes(): Router {
       // Standalone
       for (const e of vault.standalone) {
         values.push({ key: e.key, value: e.value, source: 'Standalone' });
+      }
+
+      // Deleted (preserved from uninstalled bots)
+      for (const e of (vault.deleted || [])) {
+        values.push({ key: e.key, value: e.value, source: `Deleted: ${e.botName}` });
       }
 
       // Bot instances
@@ -198,6 +257,43 @@ export function createVaultRoutes(): Router {
     try {
       const vault = loadVault();
       vault.standalone = vault.standalone.filter(e => e.key !== req.params.key);
+      saveVault(vault);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * DELETE /api/vault/deleted/:key - Delete a deleted vault entry by key+botName
+   */
+  router.delete('/deleted/:key', (req: Request, res: Response) => {
+    try {
+      const botName = req.query.botName as string;
+      const vault = loadVault();
+      vault.deleted = vault.deleted.filter(e => !(e.key === req.params.key && e.botName === botName));
+      saveVault(vault);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * PUT /api/vault/deleted/:key - Update a deleted vault entry (value or key rename)
+   */
+  router.put('/deleted/:key', (req: Request, res: Response) => {
+    try {
+      const botName = req.query.botName as string;
+      const { value, newKey } = req.body;
+      const vault = loadVault();
+      const entry = vault.deleted.find(e => e.key === req.params.key && e.botName === botName);
+      if (!entry) {
+        res.status(404).json({ success: false, error: 'Entry not found' });
+        return;
+      }
+      if (value !== undefined) entry.value = value;
+      if (newKey !== undefined && newKey !== entry.key) entry.key = newKey;
       saveVault(vault);
       res.json({ success: true });
     } catch (error) {

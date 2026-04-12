@@ -897,6 +897,10 @@
               ? '<span class="update-badge">Update available</span>'
               : '';
 
+            // Fetch vs Update: show Fetch when the bot is up to date and its source still exists
+            const hasValidSource = isGit && bot.sourceId && sources.some(s => s.id === bot.sourceId);
+            const showFetch = !bot.updateAvailable && hasValidSource;
+
             // Commit info line
             let commitInfo = '';
             if (isGit && bot.lastBuiltCommit) {
@@ -964,10 +968,14 @@
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
-                  ${isGit ? `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">${bot.updateAvailable ? 'Update' : 'Update'}</button>` : ''}
+                  ${isGit ? (showFetch
+                    ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
+                    : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
                 ` : bot.hasBeenStarted ? `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
-                  <button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>
+                  ${showFetch
+                    ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
+                    : `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`}
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>

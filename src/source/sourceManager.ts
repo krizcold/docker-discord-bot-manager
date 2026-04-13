@@ -331,6 +331,23 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
 }
 
 /**
+ * Count commits between `fromCommit` and the source repo's HEAD.
+ * Returns 0 if the commit is unreachable, missing, or the repo isn't cloned.
+ */
+export async function getCommitsBehind(sourceId: string, fromCommit: string): Promise<number> {
+  const repoPath = getSourceRepoPath(sourceId);
+  if (!fromCommit || !fs.existsSync(path.join(repoPath, '.git'))) return 0;
+
+  try {
+    const git: SimpleGit = simpleGit(repoPath);
+    const result = await git.raw(['rev-list', '--count', `${fromCommit}..HEAD`]);
+    return parseInt(result.trim(), 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Get repo info for a source.
  */
 export async function getSourceRepoInfo(sourceId: string): Promise<{

@@ -45,6 +45,7 @@ import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
+import * as envManager from '../env/manager';
 import { sanitizeName, titleizeName, resolveNames, validateName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
@@ -117,6 +118,52 @@ export function getBot(botId: string): InstanceConfig | null {
 export const getAllInstances = getAllBots;
 export const getInstance = getBot;
 
+// Env keys written by the bot manager itself — filtered out when restoring
+const BOT_MANAGER_ENV_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
+
+/**
+ * Read env vars from a docker-compose.yml. Picks the build-target service (or first).
+ * Handles both array ("KEY=value") and object ({ KEY: value }) environment formats.
+ * Returns null if the file is missing or unparseable.
+ */
+function readEnvsFromComposeFile(composePath: string): Record<string, string> | null {
+  try {
+    if (!fs.existsSync(composePath)) return null;
+    const raw = fs.readFileSync(composePath, 'utf-8');
+    const compose = YAML.parseDocument(raw).toJSON();
+    const services = compose?.services;
+    if (!services || typeof services !== 'object') return null;
+
+    const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
+    const serviceNames = Object.keys(services);
+    const targetName = (typeof xcBuild === 'string' && services[xcBuild]) ? xcBuild : serviceNames[0];
+    if (!targetName) return null;
+
+    const env = services[targetName]?.environment;
+    const out: Record<string, string> = {};
+
+    if (Array.isArray(env)) {
+      for (const entry of env) {
+        if (typeof entry !== 'string') continue;
+        const eq = entry.indexOf('=');
+        if (eq < 0) continue;
+        const key = entry.slice(0, eq);
+        const value = entry.slice(eq + 1);
+        if (key && !BOT_MANAGER_ENV_KEYS.has(key)) out[key] = value;
+      }
+    } else if (env && typeof env === 'object') {
+      for (const [key, value] of Object.entries(env)) {
+        if (!BOT_MANAGER_ENV_KEYS.has(key)) out[key] = String(value ?? '');
+      }
+    }
+
+    return Object.keys(out).length > 0 ? out : null;
+  } catch (err) {
+    console.warn(`[ContainerManager] Failed to parse compose for env restore (${composePath}):`, err);
+    return null;
+  }
+}
+
 // ─── Instance Creation ───
 
 /**
@@ -153,13 +200,25 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
   fs.mkdirSync(botDir, { recursive: true });
   fs.mkdirSync(envPath, { recursive: true });
 
-  // Reuse credentials from a previous instance if requested
+  // Reuse credentials from a previous instance if requested.
+  // Two restore paths, tried in order:
+  //   1. Bot manager's own storage.json (only survives if data dir wasn't wiped).
+  //   2. CasaOS compose file (survives bot manager reinstall — envs are plaintext there).
+  let restoredEnvs: Record<string, string> | null = null;
   if (request.reuseFromInstanceId) {
-    const prevEnvPath = path.join(DATA_DIR, 'bots', request.reuseFromInstanceId, 'env');
-    const prevStoragePath = path.join(prevEnvPath, 'storage.json');
+    const prevStoragePath = path.join(DATA_DIR, 'bots', request.reuseFromInstanceId, 'env', 'storage.json');
     if (fs.existsSync(prevStoragePath)) {
       fs.copyFileSync(prevStoragePath, path.join(envPath, 'storage.json'));
-      console.log(`[ContainerManager] Reused credentials from previous instance ${request.reuseFromInstanceId}`);
+      console.log(`[ContainerManager] Reused credentials from storage.json of previous instance ${request.reuseFromInstanceId}`);
+    } else {
+      const dataRoot = process.env.DATA_ROOT || '/DATA';
+      const prevComposePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', names.sanitizedName, 'docker-compose.yml');
+      restoredEnvs = readEnvsFromComposeFile(prevComposePath);
+      if (restoredEnvs) {
+        console.log(`[ContainerManager] Restored ${Object.keys(restoredEnvs).length} env var(s) from compose file ${prevComposePath}`);
+      } else {
+        console.log(`[ContainerManager] No reusable envs found for previous instance ${request.reuseFromInstanceId} (storage.json missing and compose file empty/missing)`);
+      }
     }
   }
 
@@ -170,6 +229,9 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     detection = detectBotType(repoPath);
     console.log(`[ContainerManager] Instance ${instanceId} detected: type=${detection.type}, hasCompose=${detection.hasCompose}`);
   }
+
+  // Merge: restored envs (from compose fallback) as baseline, request.envVars wins
+  const mergedEnvVars = { ...(restoredEnvs || {}), ...(request.envVars || {}) };
 
   const instance: InstanceConfig = {
     id: instanceId,
@@ -183,7 +245,7 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     containerIds: [],
     updateToken,
     authHash,
-    envVars: request.envVars || {},
+    envVars: mergedEnvVars,
     botType: detection?.type,
     hasDatabase: detection?.hasDatabase,
     lastBuiltCommit: null,
@@ -194,6 +256,16 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
 
   registry.instances[instanceId] = instance;
   saveRegistry(registry);
+
+  // Persist restored envs to envManager storage (encrypted for sensitive vars)
+  // so the Env editor UI shows them. Skip if compose-fallback didn't find any.
+  if (restoredEnvs && Object.keys(restoredEnvs).length > 0) {
+    try {
+      envManager.setEnvVars(instanceId, restoredEnvs);
+    } catch (err) {
+      console.warn(`[ContainerManager] Failed to persist restored envs to storage.json:`, err);
+    }
+  }
 
   console.log(`[ContainerManager] Instance ${instanceId} created ("${displayName}" -> ${names.sanitizedName})`);
   return instance;
@@ -1087,10 +1159,21 @@ async function buildGitInstance(
 ): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
 
-  // Resolve source repo path
+  // Resolve source repo path — fetch from origin first so build uses latest commits
   let repoPath: string;
   if (instance.sourceId) {
     repoPath = sourceManager.getSourceRepoPath(instance.sourceId);
+    emit('[Fetch] Pulling latest commits from origin...', 'info');
+    try {
+      const fetchResult = await sourceManager.fetchSource(instance.sourceId);
+      if (fetchResult.hasUpdates) {
+        emit(`[Fetch] Source updated with ${fetchResult.behindBy} new commit(s)`, 'success');
+      } else {
+        emit('[Fetch] Source already up to date', 'info');
+      }
+    } catch (err: any) {
+      emit(`[Fetch] Warning: could not fetch from origin (${err?.message || err}); building from local repo`, 'warning');
+    }
     if (!fs.existsSync(repoPath)) {
       emit('[Error] Source repository not found', 'error');
       updateBotStatus(botId, 'error');
@@ -1112,6 +1195,29 @@ async function buildGitInstance(
   const dataPath = getDataPath(botId);
   const imageName = getImageName(instance);
   fs.mkdirSync(dataPath, { recursive: true });
+
+  // Tear down any ghost compose project from a previous bot manager install
+  // (compose file at the CasaOS metadata path would otherwise be overwritten
+  // while old containers keep running under the old project label)
+  if (isCasaOS) {
+    const earlyAppName = instance.sanitizedName || instance.appName || `bot-${botId}`;
+    const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+    const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', earlyAppName, 'docker-compose.yml');
+    if (fs.existsSync(metadataComposePath)) {
+      const marker = readBotManagerMarker(earlyAppName);
+      if (!marker || marker.instanceId !== botId) {
+        emit(`[Cleanup] Stale compose found at ${metadataComposePath} (instanceId=${marker?.instanceId || 'none'}, current=${botId}) — tearing down ghost containers`, 'warning');
+        try {
+          const downResult = await casaosApi.composeDown(earlyAppName, metadataComposePath, (msg) => emit(`[Compose down] ${msg}`, 'info'));
+          if (!downResult.success) {
+            emit(`[Cleanup] composeDown reported: ${downResult.error || 'failed'} — continuing`, 'warning');
+          }
+        } catch (err: any) {
+          emit(`[Cleanup] composeDown threw: ${err?.message || err} — continuing`, 'warning');
+        }
+      }
+    }
+  }
 
   emit('[Detect] Detecting bot type...', 'info');
   const detection = detectBotType(repoPath);

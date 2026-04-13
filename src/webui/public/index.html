@@ -479,6 +479,24 @@
     }
     .name-preview .sanitized { color: var(--accent); font-family: monospace; }
     .name-error { font-size: 0.72rem; color: var(--danger); margin-top: 3px; }
+    .install-reuse-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 10px 12px; margin-top: 10px;
+      background: rgba(255, 176, 32, 0.08);
+      border: 1px solid rgba(255, 176, 32, 0.3);
+      border-radius: 6px;
+      color: var(--warning);
+      cursor: pointer;
+      font-size: 0.8rem;
+      line-height: 1.35;
+    }
+    .install-reuse-row input[type="checkbox"] {
+      margin: 2px 0 0 0; flex-shrink: 0; cursor: pointer;
+      width: 14px; height: 14px;
+    }
+    .install-reuse-row .reuse-text { flex: 1; }
+    .install-reuse-row .reuse-title { font-weight: 600; display: block; margin-bottom: 2px; }
+    .install-reuse-row .reuse-detail { color: var(--text-muted); font-size: 0.72rem; }
 
     /* ─── Update Badge (Bot Cards) ─── */
     .update-badge {
@@ -851,6 +869,8 @@
         }
       }
       renderBots();
+      // Source sidebar's "[N updates]" badge depends on bots[].updateAvailable — re-render it too
+      if (sources.length > 0) renderSourceSidebar();
     }
 
     function renderBots() {
@@ -907,7 +927,7 @@
               const shortCommit = bot.lastBuiltCommit.substring(0, 7);
               const sourceCommit = bot.source?.lastCommitHash?.substring(0, 7);
               const uc = updateCache[bot.id];
-              const behindBy = uc?.behindBy || 0;
+              const behindBy = uc?.behindBy ?? bot.behindBy ?? 0;
               if (bot.updateAvailable && sourceCommit) {
                 const behindLabel = behindBy > 0 ? ` (${behindBy} commit${behindBy !== 1 ? 's' : ''} behind)` : '';
                 commitInfo = `<div class="bot-commit-info behind"><span class="commit-hash">${shortCommit}</span> <span class="commit-arrow">&rarr;</span> <span class="commit-hash">${sourceCommit}</span><span class="commit-behind">${behindLabel}</span></div>`;
@@ -1905,6 +1925,13 @@
           </div>
           <div class="name-preview" id="install-name-preview"></div>
           <div class="name-error" id="install-name-error"></div>
+          <div class="install-reuse-row" id="install-reuse-row" style="display:none;" onclick="document.getElementById('reuse-data').click()">
+            <input type="checkbox" id="reuse-data" checked onclick="event.stopPropagation()">
+            <span class="reuse-text">
+              <span class="reuse-title">Reuse existing data &amp; credentials</span>
+              <span class="reuse-detail">Found a previous installation for this name. Import its env vars (token, client/guild IDs) so you don't re-enter them.</span>
+            </span>
+          </div>
         </div>
         <div class="form-group">
           <label>Environment Variables</label>
@@ -1959,22 +1986,22 @@
       nameValidationTimeout = setTimeout(async () => {
         try {
           const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}`);
+          const reuseRow = document.getElementById('install-reuse-row');
           if (res.valid) {
             error.textContent = '';
-            let previewText = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>`;
+            preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>`;
             if (res.reuseAvailable) {
-              previewText += `<br><label style="display:flex;align-items:center;gap:6px;margin-top:6px;font-size:0.75rem;color:var(--warning);cursor:pointer;">
-                <input type="checkbox" id="reuse-data" checked>
-                Reuse existing data &amp; credentials from previous installation
-              </label>`;
               window._reuseInstanceId = res.previousInstanceId || null;
+              if (reuseRow) reuseRow.style.display = 'flex';
             } else {
               window._reuseInstanceId = null;
+              if (reuseRow) reuseRow.style.display = 'none';
             }
-            preview.innerHTML = previewText;
           } else {
             error.textContent = res.errors.join(', ');
+            preview.innerHTML = '';
             window._reuseInstanceId = null;
+            if (reuseRow) reuseRow.style.display = 'none';
           }
         } catch (err) { /* ignore */ }
       }, 300);

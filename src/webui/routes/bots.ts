@@ -27,15 +27,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     try {
       const bots = containerManager.getAllBots();
 
-      // Join source info
-      const botsWithSource = bots.map(bot => {
+      // Join source info + compute commits-behind for bots that are behind
+      const botsWithSource = await Promise.all(bots.map(async bot => {
         let source = null;
         let updateAvailable = false;
+        let behindBy = 0;
 
         if (bot.sourceId) {
           source = sourceManager.getSource(bot.sourceId);
           if (source && bot.lastBuiltCommit && source.lastCommitHash) {
             updateAvailable = bot.lastBuiltCommit !== source.lastCommitHash;
+            if (updateAvailable) {
+              behindBy = await sourceManager.getCommitsBehind(bot.sourceId, bot.lastBuiltCommit);
+            }
           }
         }
 
@@ -46,8 +50,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
+          behindBy,
         };
-      });
+      }));
 
       res.json({ success: true, bots: botsWithSource });
     } catch (error) {

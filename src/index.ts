@@ -5,6 +5,7 @@
  * A Docker-in-Docker application for managing multiple Discord bots
  */
 
+import { execSync } from 'child_process';
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates } from './docker/containerManager';
@@ -13,10 +14,29 @@ import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 
+/**
+ * Tell git to trust repositories under the bot manager's bind-mounted data dirs.
+ * Source repos cloned inside the container sit on a host volume; their files may
+ * end up owned by a UID that doesn't match the container user (PUID/PGID remap,
+ * post-deploy chown by CasaOS, etc.), tripping Git 2.35+'s "dubious ownership"
+ * check. Writing to /root/.gitconfig inside the container, not the host.
+ */
+function configureGitSafeDirectories(): void {
+  try {
+    execSync(`git config --global --add safe.directory '*'`, { stdio: 'pipe' });
+    console.log('[Init] Git safe.directory configured');
+  } catch (err: any) {
+    console.warn(`[Init] Failed to configure git safe.directory: ${err?.message || err}`);
+  }
+}
+
 async function main(): Promise<void> {
   console.log('='.repeat(50));
   console.log('Discord Bot Manager - Starting up...');
   console.log('='.repeat(50));
+
+  // Git ownership workaround for bind-mounted source repos
+  configureGitSafeDirectories();
 
   // Check Docker connection
   console.log('[Init] Checking Docker connection...');

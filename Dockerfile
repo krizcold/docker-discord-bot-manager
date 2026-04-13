@@ -31,6 +31,10 @@ FROM node:20-alpine
 # Install Docker CLI (to communicate with host Docker)
 RUN apk add --no-cache docker-cli docker-cli-compose git
 
+# Trust any repository we operate on (bind-mounted source repos may have
+# mismatched UIDs after CasaOS post-deploy chown). Scoped to this image only.
+RUN git config --global --add safe.directory '*'
+
 WORKDIR /app
 
 # Copy package files and install production dependencies only

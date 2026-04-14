@@ -286,11 +286,15 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
   await git.fetch();
   const status = await git.status();
   const behindBy = status.behind || 0;
+  const aheadOrDirty = (status.ahead || 0) > 0 || status.files.length > 0;
 
-  if (behindBy > 0) {
-    // Pull
-    console.log(`[SourceManager] Source ${sourceId} is ${behindBy} commits behind, pulling...`);
-    await git.pull('origin');
+  if (behindBy > 0 || aheadOrDirty) {
+    // Source repos are read-only mirrors of origin. Any local divergence
+    // (commits, modified files, untracked files) is wiped via hard reset
+    // so we never hit merge conflicts during fetch.
+    console.log(`[SourceManager] Source ${sourceId} diverged (behind=${behindBy}, ahead=${status.ahead || 0}, dirty=${status.files.length}), hard-resetting to origin/${source.branch}`);
+    await git.raw(['reset', '--hard', `origin/${source.branch}`]);
+    await git.raw(['clean', '-fd']);
 
     // Update raw backup
     createSourceRawBackup(sourceId);

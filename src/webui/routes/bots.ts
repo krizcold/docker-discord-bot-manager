@@ -7,14 +7,16 @@ import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
 import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
-import * as repoManager from '../../git/repoManager';
 import * as envManager from '../../env/manager';
 import * as sourceManager from '../../source/sourceManager';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
 import { logCollectors } from '../../build/logCollector';
-import { validateName, resolveNames, checkFolderReuse } from '../../naming';
+import { validateName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
+import * as fs from 'fs';
+import * as path from 'path';
+import { readEnvsFromComposeFile } from '../../docker/containerManager';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -66,17 +68,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * Two formats:
    * - From source: { sourceId, displayName?, envVars? }
    * - Docker image: { sourceType: 'docker-image', displayName, imageRef, envVars? }
-   *
-   * Also accepts legacy format: { name, sourceType?, url?, branch?, imageRef?, envVars? }
    */
   router.post('/', async (req: Request, res: Response) => {
     try {
       const body = req.body;
 
-      // Docker image flow
       if (body.sourceType === 'docker-image') {
-        const displayName = body.displayName || body.name;
-        if (!displayName) {
+        if (!body.displayName) {
           res.status(400).json({ success: false, error: 'displayName is required' });
           return;
         }
@@ -86,7 +84,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
 
         const bot = await containerManager.createDockerImageInstance({
-          displayName,
+          displayName: body.displayName,
           imageRef: body.imageRef,
           envVars: body.envVars,
         });
@@ -95,43 +93,18 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Source-based flow
       if (body.sourceId) {
         const bot = await containerManager.createInstance({
           sourceId: body.sourceId,
           displayName: body.displayName,
           envVars: body.envVars,
-          reuseFromInstanceId: body.reuseFromInstanceId,
         });
         broadcastToClients(wss, 'bot:created', bot);
         res.json({ success: true, bot });
         return;
       }
 
-      // Legacy flow: { name, url, branch? }
-      if (body.name || body.url) {
-        const name = body.name || body.displayName;
-        if (!name) {
-          res.status(400).json({ success: false, error: 'Name is required' });
-          return;
-        }
-        if (!body.url) {
-          res.status(400).json({ success: false, error: 'url or sourceId is required' });
-          return;
-        }
-
-        const bot = await containerManager.createBot({
-          name,
-          url: body.url,
-          branch: body.branch,
-          envVars: body.envVars,
-        });
-        broadcastToClients(wss, 'bot:created', bot);
-        res.json({ success: true, bot });
-        return;
-      }
-
-      res.status(400).json({ success: false, error: 'Must provide sourceId, url, or sourceType=docker-image' });
+      res.status(400).json({ success: false, error: 'Must provide sourceId or sourceType=docker-image' });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -234,7 +207,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           if (envVars && Object.keys(envVars).length > 0) {
             const vaultPath = require('path').join(process.env.DATA_DIR || '/data/data', 'vault.json');
             const fs = require('fs');
-            let vault: { standalone: Array<{ key: string; value: string; hidden: boolean }>; deleted: Array<{ key: string; value: string; botName: string; deletedAt: number }> } = { standalone: [], deleted: [] };
+            let vault: { standalone: Array<{ key: string; value: string; hidden: boolean }>; deleted: Array<{ key: string; value: string; botName: string; sanitizedName?: string; deletedAt: number }> } = { standalone: [], deleted: [] };
             try {
               if (fs.existsSync(vaultPath)) {
                 const raw = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
@@ -242,12 +215,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
               }
             } catch { /* ignore */ }
 
-            const botName = bot.displayName || bot.sanitizedName || req.params.id;
+            const botName = bot.displayName;
+            const sanitizedName = bot.sanitizedName;
             const now = Date.now();
             for (const [key, value] of Object.entries(envVars)) {
               // Upsert: latest wins by key+botName
               const idx = vault.deleted.findIndex(d => d.key === key && d.botName === botName);
-              const entry = { key, value, botName, deletedAt: now };
+              const entry = { key, value, botName, sanitizedName, deletedAt: now };
               if (idx >= 0) {
                 vault.deleted[idx] = entry;
               } else {
@@ -507,7 +481,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const appName = bot.appName || bot.sanitizedName || `bot-${req.params.id}`;
+      const appName = bot.sanitizedName;
 
       const output = execSync(
         `docker ps -a --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null || ` +
@@ -628,19 +602,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Read from source repo, not bot directory
-      if (bot.sourceId) {
-        const repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
-        if (repoPath && require('fs').existsSync(repoPath)) {
-          // Use a simple file listing from the source path
-          const files = listFiles(repoPath);
-          res.json({ success: true, files });
-          return;
-        }
+      if (!bot.sourceId) {
+        res.json({ success: true, files: [] });
+        return;
       }
-
-      // Fallback to legacy
-      const files = repoManager.listRepoFiles(req.params.id);
+      const repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
+      const files = (repoPath && require('fs').existsSync(repoPath)) ? listFiles(repoPath) : [];
       res.json({ success: true, files });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -713,16 +680,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       // Parse .env.example from source repo
       let envExample: Array<{ key: string; description: string; defaultValue: string }> = [];
-      if (bot.sourceType !== 'docker-image') {
+      if (bot.sourceType !== 'docker-image' && bot.sourceId) {
         try {
-          let repoPath: string | null = null;
-          if (bot.sourceId) {
-            repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
+          const repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
+          if (require('fs').existsSync(repoPath)) {
+            envExample = envManager.parseEnvExample(repoPath);
           }
-          if (!repoPath || !require('fs').existsSync(repoPath)) {
-            repoPath = repoManager.getRepoPath(req.params.id);
-          }
-          envExample = envManager.parseEnvExample(repoPath);
         } catch (err) {
           // Repo might not exist
         }
@@ -867,11 +830,84 @@ export function createValidationRoutes(): Router {
       const existingInstances = containerManager.getAllBots();
       const result = validateName(name, existingInstances, excludeId);
       const names = resolveNames(name);
-      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, previousInstanceId: null, marker: null };
+      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, marker: null };
 
       res.json({ ...result, ...names, ...reuse });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/recover-envs?name=<displayName>
+   * Returns recoverable plaintext env vars for a name, pulled from:
+   *   1. vault.deleted entries matching sanitizedName (or botName -> sanitize)
+   *   2. CasaOS compose file at /DATA/AppData/casaos/apps/<sanitizedName>/docker-compose.yml
+   * Vault entries win over compose when the same key exists in both.
+   * Bot-manager-injected keys (BOT_ID, BOT_MANAGER_UPDATE_TOKEN, BOT_MANAGER_INTERNAL_URL) are stripped.
+   * Frontend calls this when the user clicks "Load envs from previous installation".
+   */
+  router.get('/recover-envs', async (req: Request, res: Response) => {
+    try {
+      const name = req.query.name as string;
+      if (!name) {
+        res.json({ success: false, error: 'Name is required', envs: [] });
+        return;
+      }
+
+      const targetSanitized = sanitizeName(name);
+      const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
+      const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
+      const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
+
+      // Source 1: vault.deleted entries matching this name
+      const vaultPath = path.join(process.env.DATA_DIR || '/data/data', 'vault.json');
+      const fromVault: Record<string, string> = {};
+      try {
+        if (fs.existsSync(vaultPath)) {
+          const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
+          const deleted = Array.isArray(vault.deleted) ? vault.deleted : [];
+          for (const entry of deleted) {
+            if (entry.sanitizedName !== targetSanitized) continue;
+            if (BOT_MANAGER_KEYS.has(entry.key)) continue;
+            fromVault[entry.key] = entry.value;
+          }
+        }
+      } catch (err) {
+        console.warn(`[RecoverEnvs] Failed to read vault: ${err}`);
+      }
+
+      // Source 2: surviving compose file at CasaOS metadata path
+      const dataRoot = process.env.DATA_ROOT || '/DATA';
+      const composePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', targetSanitized, 'docker-compose.yml');
+      const fromCompose = readEnvsFromComposeFile(composePath) || {};
+
+      // Merge: vault wins over compose
+      const merged: Record<string, { value: string; source: 'vault' | 'compose' }> = {};
+      for (const [k, v] of Object.entries(fromCompose)) {
+        if (!BOT_MANAGER_KEYS.has(k)) merged[k] = { value: v, source: 'compose' };
+      }
+      for (const [k, v] of Object.entries(fromVault)) {
+        merged[k] = { value: v, source: 'vault' };
+      }
+
+      const envs = Object.entries(merged).map(([key, { value, source }]) => ({
+        key,
+        value,
+        sensitive: isSensitive(key),
+        source,
+      }));
+
+      res.json({
+        success: true,
+        envs,
+        sources: {
+          vault: Object.keys(fromVault).length,
+          compose: Object.keys(fromCompose).length,
+        },
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error), envs: [] });
     }
   });
 

@@ -185,16 +185,17 @@ export function getEnvVarsInfo(botId: string): Array<{
     });
   }
 
-  // Add missing required vars
+  // Add missing required vars. Use result.some() rather than !vars[required]
+  // so an empty-but-present value (e.g., after a failed decrypt) does not
+  // cause a second entry for the same key.
   for (const required of REQUIRED_DISCORD_ENVS) {
-    if (!vars[required]) {
-      result.push({
-        key: required,
-        value: '',
-        sensitive: isSensitive(required),
-        required: true
-      });
-    }
+    if (result.some(e => e.key === required)) continue;
+    result.push({
+      key: required,
+      value: '',
+      sensitive: isSensitive(required),
+      required: true
+    });
   }
 
   return result;

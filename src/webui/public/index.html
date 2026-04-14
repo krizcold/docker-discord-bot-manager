@@ -480,23 +480,20 @@
     .name-preview .sanitized { color: var(--accent); font-family: monospace; }
     .name-error { font-size: 0.72rem; color: var(--danger); margin-top: 3px; }
     .install-reuse-row {
-      display: flex; align-items: flex-start; gap: 10px;
+      display: flex; align-items: center; gap: 10px;
       padding: 10px 12px; margin-top: 10px;
       background: rgba(255, 176, 32, 0.08);
       border: 1px solid rgba(255, 176, 32, 0.3);
       border-radius: 6px;
       color: var(--warning);
-      cursor: pointer;
       font-size: 0.8rem;
       line-height: 1.35;
     }
-    .install-reuse-row input[type="checkbox"] {
-      margin: 2px 0 0 0; flex-shrink: 0; cursor: pointer;
-      width: 14px; height: 14px;
-    }
-    .install-reuse-row .reuse-text { flex: 1; }
+    .install-reuse-row .reuse-text { flex: 1; min-width: 0; }
     .install-reuse-row .reuse-title { font-weight: 600; display: block; margin-bottom: 2px; }
     .install-reuse-row .reuse-detail { color: var(--text-muted); font-size: 0.72rem; }
+    .install-reuse-row .install-reuse-btn { flex-shrink: 0; }
+    .install-reuse-row.loaded { background: rgba(45, 212, 168, 0.08); border-color: rgba(45, 212, 168, 0.3); color: var(--accent); }
 
     /* ─── Update Badge (Bot Cards) ─── */
     .update-badge {
@@ -889,7 +886,7 @@
       container.innerHTML = `
         <div class="bot-grid">
           ${bots.map(bot => {
-            const botName = bot.displayName || bot.name || 'Unnamed';
+            const botName = bot.displayName || 'Unnamed';
             const isRunning = bot.status === 'running';
             const busy = busyBots.has(bot.id);
             const d = busy ? ' disabled' : '';
@@ -1023,7 +1020,7 @@
       if (busyBots.has(id)) return;
       busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
-      openTerminalPopup(bot ? (bot.displayName || bot.name) : id, id, 'Updating');
+      openTerminalPopup(bot ? bot.displayName : id, id, 'Updating');
       try { await api('POST', `/bots/${id}/update`); }
       catch (err) { showMessage('error', 'Update failed'); busyBots.delete(id); renderBots(); }
     }
@@ -1050,7 +1047,7 @@
       if (busyBots.has(id)) return;
       busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
-      openTerminalPopup(bot ? (bot.displayName || bot.name) : id, id, 'Installing');
+      openTerminalPopup(bot ? bot.displayName : id, id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
         if (!res.success) {
@@ -1172,7 +1169,7 @@
     function deleteBot(id) {
       deleteBotId = id;
       const bot = bots.find(b => b.id === id);
-      document.getElementById('delete-bot-name').textContent = bot?.displayName || bot?.name || id;
+      document.getElementById('delete-bot-name').textContent = bot?.displayName || id;
       const dataCheckbox = document.getElementById('delete-also-data');
       const envCheckbox = document.getElementById('delete-also-env');
       dataCheckbox.checked = false;
@@ -1219,7 +1216,7 @@
       const modal = document.getElementById('env-modal');
       const content = document.getElementById('env-editor-content');
 
-      content.innerHTML = `<h3>Environment Variables: ${escapeHtml(bot?.displayName || bot?.name || botId)}</h3><div class="loading">Loading...</div>`;
+      content.innerHTML = `<h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
       modal.classList.remove('hidden');
 
       try {
@@ -1275,7 +1272,7 @@
         }
 
         content.innerHTML = `
-          <h3>Environment Variables: ${escapeHtml(bot?.name || botId)}</h3>
+          <h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3>
           ${!res.valid ? `<div class="error-message">Missing required: ${res.missing.join(', ')}</div>` : ''}
           <div id="env-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
@@ -1868,7 +1865,6 @@
       installNameLocked = true;
       installEnvHints = [];
       installBotId = null;
-      window._reuseInstanceId = null;
 
       const source = sources.find(s => s.id === sourceId);
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
@@ -1925,12 +1921,12 @@
           </div>
           <div class="name-preview" id="install-name-preview"></div>
           <div class="name-error" id="install-name-error"></div>
-          <div class="install-reuse-row" id="install-reuse-row" style="display:none;" onclick="document.getElementById('reuse-data').click()">
-            <input type="checkbox" id="reuse-data" checked onclick="event.stopPropagation()">
+          <div class="install-reuse-row" id="install-reuse-row" style="display:none;">
             <span class="reuse-text">
-              <span class="reuse-title">Reuse existing data &amp; credentials</span>
-              <span class="reuse-detail">Found a previous installation for this name. Import its env vars (token, client/guild IDs) so you don't re-enter them.</span>
+              <span class="reuse-title">Previous installation detected</span>
+              <span class="reuse-detail" id="install-reuse-detail">Envs from a prior install are available. Click to load them into the fields below.</span>
             </span>
+            <button type="button" class="btn btn-small install-reuse-btn" id="install-reuse-btn" onclick="loadPreviousEnvs()">Load envs</button>
           </div>
         </div>
         <div class="form-group">
@@ -1987,24 +1983,86 @@
         try {
           const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}`);
           const reuseRow = document.getElementById('install-reuse-row');
+          if (reuseRow) {
+            // Clear any "loaded" state when name changes
+            reuseRow.classList.remove('loaded');
+            const detailEl = document.getElementById('install-reuse-detail');
+            if (detailEl) detailEl.textContent = 'Envs from a prior install are available. Click to load them into the fields below.';
+            const btn = document.getElementById('install-reuse-btn');
+            if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
+          }
           if (res.valid) {
             error.textContent = '';
             preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>`;
-            if (res.reuseAvailable) {
-              window._reuseInstanceId = res.previousInstanceId || null;
-              if (reuseRow) reuseRow.style.display = 'flex';
-            } else {
-              window._reuseInstanceId = null;
-              if (reuseRow) reuseRow.style.display = 'none';
-            }
+            if (reuseRow) reuseRow.style.display = res.reuseAvailable ? 'flex' : 'none';
           } else {
             error.textContent = res.errors.join(', ');
             preview.innerHTML = '';
-            window._reuseInstanceId = null;
             if (reuseRow) reuseRow.style.display = 'none';
           }
         } catch (err) { /* ignore */ }
       }, 300);
+    }
+
+    async function loadPreviousEnvs() {
+      const name = document.getElementById('install-name').value.trim();
+      if (!name) return;
+      const btn = document.getElementById('install-reuse-btn');
+      const detailEl = document.getElementById('install-reuse-detail');
+      const row = document.getElementById('install-reuse-row');
+      if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+
+      try {
+        const res = await api('GET', `/recover-envs?name=${encodeURIComponent(name)}`);
+        if (!res.success) {
+          if (detailEl) detailEl.textContent = res.error || 'Failed to load previous envs';
+          if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
+          return;
+        }
+
+        const envs = Array.isArray(res.envs) ? res.envs : [];
+        if (envs.length === 0) {
+          if (detailEl) detailEl.textContent = 'No recoverable envs found for this name.';
+          if (btn) { btn.disabled = true; btn.textContent = 'None found'; }
+          return;
+        }
+
+        // Populate the install form: update matching rows, add missing ones
+        const container = document.getElementById('install-env-rows');
+        const existingRows = Array.from(container.querySelectorAll('.env-row'));
+        const loadedByKey = {};
+        for (const env of envs) loadedByKey[env.key] = env.value;
+
+        const seen = new Set();
+        for (const row of existingRows) {
+          const keyInput = row.querySelector('.env-key');
+          const valueInput = row.querySelector('.env-value');
+          if (!keyInput) continue;
+          const key = keyInput.value.trim();
+          if (key && Object.prototype.hasOwnProperty.call(loadedByKey, key)) {
+            valueInput.value = loadedByKey[key];
+            seen.add(key);
+          }
+        }
+        // Add any keys not already shown in the form
+        for (const env of envs) {
+          if (seen.has(env.key)) continue;
+          addInstallEnvRow(env.key, env.value);
+        }
+
+        if (detailEl) {
+          const sources = res.sources || {};
+          const parts = [];
+          if (sources.vault) parts.push(`${sources.vault} from vault`);
+          if (sources.compose) parts.push(`${sources.compose} from compose`);
+          detailEl.textContent = `Loaded ${envs.length} env(s) into the form (${parts.join(', ') || 'recovered'}). Review before saving.`;
+        }
+        if (row) row.classList.add('loaded');
+        if (btn) { btn.disabled = true; btn.textContent = 'Loaded'; }
+      } catch (err) {
+        if (detailEl) detailEl.textContent = 'Failed to load previous envs';
+        if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
+      }
     }
 
     async function doInstall() {
@@ -2024,9 +2082,7 @@
       btn.disabled = true; btn.textContent = 'Creating...';
 
       try {
-        const reuseCheckbox = document.getElementById('reuse-data');
-        const reuseId = (reuseCheckbox && reuseCheckbox.checked && window._reuseInstanceId) ? window._reuseInstanceId : undefined;
-        const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name, reuseFromInstanceId: reuseId });
+        const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name });
         if (res.success) {
           installBotId = res.bot.id;
 

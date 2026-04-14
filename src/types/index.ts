@@ -34,7 +34,7 @@ export interface SourceRegistry {
 
 export interface InstanceConfig {
   id: string;
-  sourceId: string | null;             // FK to SourceMeta.id (null for docker-image or orphaned)
+  sourceId: string | null;             // FK to SourceMeta.id (null for docker-image)
   sourceUrl: string | null;            // Stored for re-association after source deletion
 
   sourceType: BotSourceType;           // 'git' | 'docker-image'
@@ -44,9 +44,6 @@ export interface InstanceConfig {
   displayName: string;                 // "My Custom Bot!" — user's raw input
   sanitizedName: string;               // "mycustombot" — compose name, folders, Caddy labels
   titleName: string;                   // "My Custom Bot" — x-casaos.title
-
-  /** @deprecated Use displayName. Kept for backward compat with compose/pcsProcessing templates. */
-  name?: string;
 
   status: BotStatus;
   containerIds: string[];
@@ -73,9 +70,6 @@ export interface InstanceConfig {
   autoUpdate?: boolean;                // default false — auto-rebuild when source has new commits
   autoUpdateInterval?: number;         // milliseconds between checks, default 86400000 (24 hours)
   autoUpdateHour?: number;             // 0-23, preferred hour for daily checks, default 4 (4am)
-
-  // CasaOS app name (== sanitizedName for new instances, preserved for migrated)
-  appName?: string;
 
   // Metadata
   createdAt: string;
@@ -120,7 +114,6 @@ export interface CreateInstanceRequest {
   sourceId: string;
   displayName?: string;
   envVars?: Record<string, string>;
-  reuseFromInstanceId?: string;       // Previous instance ID to copy credentials from
 }
 
 export interface CreateDockerImageInstanceRequest {
@@ -138,24 +131,6 @@ export interface UpdateSourceRequest {
   url?: string;
   autoUpdate?: boolean;
   branch?: string;
-}
-
-/** @deprecated Use CreateInstanceRequest or CreateDockerImageInstanceRequest */
-export interface CreateBotRequest {
-  name: string;
-  sourceType?: BotSourceType;
-  url?: string;
-  branch?: string;
-  imageRef?: string;
-  envVars?: Record<string, string>;
-}
-
-/** @deprecated Use UpdateInstanceRequest */
-export interface UpdateBotRequest {
-  name?: string;
-  branch?: string;
-  envVars?: Record<string, string>;
-  autoUpdate?: boolean;
 }
 
 // ─── Detection ───

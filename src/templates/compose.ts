@@ -103,7 +103,7 @@ export function generateCompose(
     labels: {
       'managed-by': 'discord-bot-manager',
       'bot-id': bot.id,
-      'bot-name': (bot.name || bot.displayName)
+      'bot-name': bot.displayName
     }
   };
 
@@ -145,10 +145,10 @@ export function generateCompose(
     build: 'bot',
     author: 'discord-bot-manager',
     developer: 'discord-bot-manager',
-    tagline: { en_us: `Discord Bot: ${(bot.name || bot.displayName)}` },
+    tagline: { en_us: `Discord Bot: ${bot.displayName}` },
     category: 'Utilities',
-    description: { en_us: `Managed Discord bot: ${(bot.name || bot.displayName)}` },
-    title: { en_us: (bot.name || bot.displayName) },
+    description: { en_us: `Managed Discord bot: ${bot.displayName}` },
+    title: { en_us: bot.displayName },
     is_uncontrolled: false,
     store_app_id: appName
   };
@@ -435,7 +435,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
         labels: {
           'managed-by': 'discord-bot-manager',
           'bot-id': bot.id,
-          'bot-name': (bot.name || bot.displayName)
+          'bot-name': bot.displayName
         },
         volumes: [{
           type: 'bind',
@@ -459,10 +459,10 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
       main: 'bot',
       author: 'discord-bot-manager',
       developer: 'discord-bot-manager',
-      tagline: { en_us: `Discord Bot: ${(bot.name || bot.displayName)}` },
+      tagline: { en_us: `Discord Bot: ${bot.displayName}` },
       category: 'Utilities',
-      description: { en_us: `Managed Discord bot: ${(bot.name || bot.displayName)}` },
-      title: { en_us: (bot.name || bot.displayName) },
+      description: { en_us: `Managed Discord bot: ${bot.displayName}` },
+      title: { en_us: bot.displayName },
       is_uncontrolled: false,
       store_app_id: appName
     }

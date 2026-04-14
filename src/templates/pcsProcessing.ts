@@ -162,7 +162,7 @@ export function processComposeForCasaOS(
       const labels = service.labels as Record<string, string>;
       labels['managed-by'] = 'discord-bot-manager';
       labels['bot-id'] = bot.id;
-      labels['bot-name'] = (bot.name || bot.displayName);
+      labels['bot-name'] = bot.displayName;
     }
 
     // Ports → expose conversion
@@ -356,10 +356,10 @@ export function processComposeForCasaOS(
       main: mainServiceName || 'bot',
       author: 'discord-bot-manager',
       developer: 'discord-bot-manager',
-      tagline: { en_us: `Discord Bot: ${(bot.name || bot.displayName)}` },
+      tagline: { en_us: `Discord Bot: ${bot.displayName}` },
       category: 'Utilities',
-      description: { en_us: `Managed Discord bot: ${(bot.name || bot.displayName)}` },
-      title: { en_us: (bot.name || bot.displayName) },
+      description: { en_us: `Managed Discord bot: ${bot.displayName}` },
+      title: { en_us: bot.displayName },
     };
   }
 

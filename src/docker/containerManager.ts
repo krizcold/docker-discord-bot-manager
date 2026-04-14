@@ -17,7 +17,6 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  CreateBotRequest, UpdateBotRequest
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { getBotDir, getDataPath, getEnvPath } from '../git/repoManager';
@@ -45,7 +44,6 @@ import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
-import * as envManager from '../env/manager';
 import { sanitizeName, titleizeName, resolveNames, validateName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
@@ -126,7 +124,7 @@ const BOT_MANAGER_ENV_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT
  * Handles both array ("KEY=value") and object ({ KEY: value }) environment formats.
  * Returns null if the file is missing or unparseable.
  */
-function readEnvsFromComposeFile(composePath: string): Record<string, string> | null {
+export function readEnvsFromComposeFile(composePath: string): Record<string, string> | null {
   try {
     if (!fs.existsSync(composePath)) return null;
     const raw = fs.readFileSync(composePath, 'utf-8');
@@ -200,28 +198,6 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
   fs.mkdirSync(botDir, { recursive: true });
   fs.mkdirSync(envPath, { recursive: true });
 
-  // Reuse credentials from a previous instance if requested.
-  // Two restore paths, tried in order:
-  //   1. Bot manager's own storage.json (only survives if data dir wasn't wiped).
-  //   2. CasaOS compose file (survives bot manager reinstall — envs are plaintext there).
-  let restoredEnvs: Record<string, string> | null = null;
-  if (request.reuseFromInstanceId) {
-    const prevStoragePath = path.join(DATA_DIR, 'bots', request.reuseFromInstanceId, 'env', 'storage.json');
-    if (fs.existsSync(prevStoragePath)) {
-      fs.copyFileSync(prevStoragePath, path.join(envPath, 'storage.json'));
-      console.log(`[ContainerManager] Reused credentials from storage.json of previous instance ${request.reuseFromInstanceId}`);
-    } else {
-      const dataRoot = process.env.DATA_ROOT || '/DATA';
-      const prevComposePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', names.sanitizedName, 'docker-compose.yml');
-      restoredEnvs = readEnvsFromComposeFile(prevComposePath);
-      if (restoredEnvs) {
-        console.log(`[ContainerManager] Restored ${Object.keys(restoredEnvs).length} env var(s) from compose file ${prevComposePath}`);
-      } else {
-        console.log(`[ContainerManager] No reusable envs found for previous instance ${request.reuseFromInstanceId} (storage.json missing and compose file empty/missing)`);
-      }
-    }
-  }
-
   // Detect bot type from source repo
   const repoPath = sourceManager.getSourceRepoPath(request.sourceId);
   let detection = null;
@@ -229,9 +205,6 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     detection = detectBotType(repoPath);
     console.log(`[ContainerManager] Instance ${instanceId} detected: type=${detection.type}, hasCompose=${detection.hasCompose}`);
   }
-
-  // Merge: restored envs (from compose fallback) as baseline, request.envVars wins
-  const mergedEnvVars = { ...(restoredEnvs || {}), ...(request.envVars || {}) };
 
   const instance: InstanceConfig = {
     id: instanceId,
@@ -245,27 +218,16 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     containerIds: [],
     updateToken,
     authHash,
-    envVars: mergedEnvVars,
+    envVars: request.envVars || {},
     botType: detection?.type,
     hasDatabase: detection?.hasDatabase,
     lastBuiltCommit: null,
-    appName: names.sanitizedName,
     createdAt: now,
     updatedAt: now,
   };
 
   registry.instances[instanceId] = instance;
   saveRegistry(registry);
-
-  // Persist restored envs to envManager storage (encrypted for sensitive vars)
-  // so the Env editor UI shows them. Skip if compose-fallback didn't find any.
-  if (restoredEnvs && Object.keys(restoredEnvs).length > 0) {
-    try {
-      envManager.setEnvVars(instanceId, restoredEnvs);
-    } catch (err) {
-      console.warn(`[ContainerManager] Failed to persist restored envs to storage.json:`, err);
-    }
-  }
 
   console.log(`[ContainerManager] Instance ${instanceId} created ("${displayName}" -> ${names.sanitizedName})`);
   return instance;
@@ -312,7 +274,6 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
     authHash,
     envVars: request.envVars || {},
     lastBuiltCommit: null,
-    appName: names.sanitizedName,
     createdAt: now,
     updatedAt: now,
   };
@@ -322,38 +283,6 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
 
   console.log(`[ContainerManager] Docker-image instance ${instanceId} created (${request.imageRef})`);
   return instance;
-}
-
-/**
- * Legacy createBot wrapper for backward compatibility.
- */
-export async function createBot(request: CreateBotRequest): Promise<InstanceConfig> {
-  if (request.sourceType === 'docker-image') {
-    return createDockerImageInstance({
-      displayName: request.name,
-      imageRef: request.imageRef!,
-      envVars: request.envVars,
-    });
-  }
-
-  // For git source, we need to find or create the source first
-  if (!request.url) {
-    throw new Error('url is required for git source type');
-  }
-
-  let source = sourceManager.findSourceByUrl(request.url);
-  if (!source) {
-    source = await sourceManager.createSource({
-      url: request.url,
-      branch: request.branch,
-    });
-  }
-
-  return createInstance({
-    sourceId: source.id,
-    displayName: request.name,
-    envVars: request.envVars,
-  });
 }
 
 /**
@@ -379,15 +308,13 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
 
 // ─── Instance Update ───
 
-export async function updateBot(botId: string, update: UpdateBotRequest | UpdateInstanceRequest): Promise<InstanceConfig | null> {
+export async function updateBot(botId: string, update: UpdateInstanceRequest): Promise<InstanceConfig | null> {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
 
-  // Handle both old and new update formats
-  const displayName = (update as UpdateInstanceRequest).displayName || (update as UpdateBotRequest).name;
-  if (displayName) {
-    const names = resolveNames(displayName);
+  if (update.displayName) {
+    const names = resolveNames(update.displayName);
     instance.displayName = names.displayName;
     instance.sanitizedName = names.sanitizedName;
     instance.titleName = names.titleName;
@@ -427,26 +354,14 @@ export function reassignSource(botId: string, newSourceId: string): InstanceConf
 // ─── Name Resolution ───
 
 /**
- * Resolve appName for an instance.
- * Precedence: instance.appName -> instance.sanitizedName -> fallback bot-{uuid}
+ * Resolve appName for an instance. Equivalent to `getBot(botId)?.sanitizedName`.
+ * Throws if the instance doesn't exist, since callers always follow up with
+ * operations that require a real app name.
  */
 function resolveAppName(botId: string): string {
   const instance = getBot(botId);
-  if (instance?.appName) return instance.appName;
-  if (instance?.sanitizedName) return instance.sanitizedName;
-
-  // Fallback: read from compose file
-  const botDir = getBotDir(botId);
-  const localComposePath = path.join(botDir, 'docker-compose.yml');
-  if (fs.existsSync(localComposePath)) {
-    const name = extractAppName(fs.readFileSync(localComposePath, 'utf-8'));
-    if (name) {
-      updateBotAppName(botId, name);
-      return name;
-    }
-  }
-
-  return `bot-${botId}`;
+  if (!instance) throw new Error(`Instance ${botId} not found`);
+  return instance.sanitizedName;
 }
 
 /**
@@ -462,22 +377,10 @@ function resolveComposePath(botId: string, appName: string): string {
 }
 
 /**
- * Get the Docker image name for an instance.
- * New: {sanitizedName}-{instanceId}:latest
- * Legacy: bot-{instanceId}:latest
+ * Docker image name: {sanitizedName}-{instanceId}:latest
  */
 function getImageName(instance: InstanceConfig): string {
-  if (instance.sanitizedName) {
-    return `${instance.sanitizedName}-${instance.id}:latest`;
-  }
-  return `bot-${instance.id}:latest`;
-}
-
-/**
- * Get the legacy image name (for cleanup of migrated instances).
- */
-function getLegacyImageName(instanceId: string): string {
-  return `bot-${instanceId}:latest`;
+  return `${instance.sanitizedName}-${instance.id}:latest`;
 }
 
 // ─── Delete ───
@@ -581,16 +484,15 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
     console.warn(`[ContainerManager] Uninstall error for instance ${botId}:`, error);
   }
 
-  // 2. Remove Docker images (try both new and legacy naming)
-  for (const imageName of [getImageName(instance), getLegacyImageName(botId)]) {
-    try {
-      if (dockerClient.imageExists(imageName)) {
-        console.log(`[ContainerManager] Removing image ${imageName}...`);
-        dockerClient.removeImage(imageName);
-      }
-    } catch (error) {
-      console.warn(`[ContainerManager] Failed to remove image ${imageName}:`, error);
+  // 2. Remove Docker image
+  const imageName = getImageName(instance);
+  try {
+    if (dockerClient.imageExists(imageName)) {
+      console.log(`[ContainerManager] Removing image ${imageName}...`);
+      dockerClient.removeImage(imageName);
     }
+  } catch (error) {
+    console.warn(`[ContainerManager] Failed to remove image ${imageName}:`, error);
   }
 
   // 3. Remove named volumes
@@ -641,17 +543,6 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     if (containerIds !== undefined) {
       instance.containerIds = containerIds || [];
     }
-    instance.updatedAt = new Date().toISOString();
-    registry.instances[botId] = instance;
-    saveRegistry(registry);
-  }
-}
-
-function updateBotAppName(botId: string, appName: string): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (instance) {
-    instance.appName = appName;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
@@ -1036,14 +927,10 @@ export async function pullAndRebuild(botId: string): Promise<{ success: boolean;
       }
     }
 
-    // Remove old images
+    // Remove old image
     const imageName = getImageName(instance);
     if (dockerClient.imageExists(imageName)) {
       dockerClient.removeImage(imageName);
-    }
-    const legacyName = getLegacyImageName(botId);
-    if (dockerClient.imageExists(legacyName)) {
-      dockerClient.removeImage(legacyName);
     }
 
     // Rebuild
@@ -1130,9 +1017,9 @@ async function buildDockerImageInstance(
   const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
 
   // Use displayName for the compose bot config (BotConfig compat)
-  const botForCompose: any = { ...instance, name: instance.displayName, envVars: envWithToken };
+  const botForCompose: any = { ...instance, envVars: envWithToken };
   let composeContent = generateImageCompose(botForCompose, botDir);
-  const appName = instance.sanitizedName || `bot-${botId}`;
+  const appName = instance.sanitizedName;
   composeContent = processComposeForCasaOS(composeContent, appName, botForCompose);
 
   writeComposeFile(botDir, composeContent);
@@ -1146,7 +1033,6 @@ async function buildDockerImageInstance(
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
   }
 
-  updateBotAppName(botId, appName);
   updateBotStatus(botId, 'stopped');
   emit(`[Success] Build completed for ${instance.displayName}`, 'success');
   return { success: true };
@@ -1180,15 +1066,9 @@ async function buildGitInstance(
       return { success: false, error: 'Source repository not found' };
     }
   } else {
-    // Orphaned instance — try legacy path
-    const legacyRepoPath = path.join(getBotDir(botId), 'repo');
-    if (fs.existsSync(legacyRepoPath)) {
-      repoPath = legacyRepoPath;
-    } else {
-      emit('[Error] No source or legacy repo available', 'error');
-      updateBotStatus(botId, 'error');
-      return { success: false, error: 'No source or legacy repo available' };
-    }
+    emit('[Error] Git instance has no sourceId', 'error');
+    updateBotStatus(botId, 'error');
+    return { success: false, error: 'Git instance has no sourceId' };
   }
 
   const botDir = getBotDir(botId);
@@ -1200,13 +1080,13 @@ async function buildGitInstance(
   // (compose file at the CasaOS metadata path would otherwise be overwritten
   // while old containers keep running under the old project label)
   if (isCasaOS) {
-    const earlyAppName = instance.sanitizedName || instance.appName || `bot-${botId}`;
+    const earlyAppName = instance.sanitizedName;
     const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
     const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', earlyAppName, 'docker-compose.yml');
     if (fs.existsSync(metadataComposePath)) {
       const marker = readBotManagerMarker(earlyAppName);
       if (!marker || marker.instanceId !== botId) {
-        emit(`[Cleanup] Stale compose found at ${metadataComposePath} (instanceId=${marker?.instanceId || 'none'}, current=${botId}) — tearing down ghost containers`, 'warning');
+        emit(`[Cleanup] Stale compose found at ${metadataComposePath} (instanceId=${marker?.instanceId || 'none'}, current=${botId}), tearing down ghost containers`, 'warning');
         try {
           const downResult = await casaosApi.composeDown(earlyAppName, metadataComposePath, (msg) => emit(`[Compose down] ${msg}`, 'info'));
           if (!downResult.success) {
@@ -1225,7 +1105,7 @@ async function buildGitInstance(
 
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
-  const botWithEnv: any = { ...instance, name: instance.displayName, envVars: envWithToken };
+  const botWithEnv: any = { ...instance, envVars: envWithToken };
 
   const existingComposePath = hasExistingCompose(repoPath);
   let composeContent: string;
@@ -1245,7 +1125,7 @@ async function buildGitInstance(
     // Read original compose
     let rawCompose = fs.readFileSync(existingComposePath, 'utf-8');
     const originalComposeName = extractAppName(rawCompose);
-    appName = instance.sanitizedName || originalComposeName || `bot-${botId}`;
+    appName = instance.sanitizedName;
 
     // Apply name substitution if we have an original compose name to replace
     if (originalComposeName && originalComposeName !== appName) {
@@ -1274,7 +1154,7 @@ async function buildGitInstance(
     }
 
     composeContent = generateCompose(botWithEnv, detection, botDir);
-    appName = instance.sanitizedName || `bot-${botId}`;
+    appName = instance.sanitizedName;
     composeContent = processComposeForCasaOS(composeContent, appName, botWithEnv);
     buildTarget = 'bot';
   }
@@ -1314,10 +1194,7 @@ async function buildGitInstance(
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
   }
 
-  // Store appName and lastBuiltCommit
-  updateBotAppName(botId, appName);
-
-  // Record the commit this was built from — read directly from the repo
+  // Record the commit this was built from, read directly from the repo
   // (source registry may not be up-to-date if clone just happened)
   if (instance.sourceId) {
     try {

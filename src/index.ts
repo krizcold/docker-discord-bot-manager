@@ -9,7 +9,6 @@ import { execSync } from 'child_process';
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates } from './docker/containerManager';
-import { migrateV1toV2 } from './migration/v1ToV2';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
@@ -49,10 +48,6 @@ async function main(): Promise<void> {
   }
 
   console.log('[Init] Docker connection OK');
-
-  // Run V1 -> V2 migration (idempotent)
-  console.log('[Init] Checking for data migration...');
-  await migrateV1toV2();
 
   // Seed default sources on first run
   seedDefaultSources();

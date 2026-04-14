@@ -25,6 +25,7 @@ interface DeletedVaultEntry {
   key: string;
   value: string;
   botName: string;
+  sanitizedName: string;
   deletedAt: number;
 }
 
@@ -37,36 +38,10 @@ function loadVault(): VaultConfig {
   try {
     if (fs.existsSync(VAULT_FILE)) {
       const raw = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
-      if (!raw.deleted) raw.deleted = [];
-
-      // Migrate legacy [DELETED:...] entries from standalone to deleted[]
-      const deletedPrefix = /^\[DELETED:(.+?)\]\s*/;
-      const migrated: VaultEntry[] = [];
-      let didMigrate = false;
-      for (const entry of (raw.standalone || [])) {
-        const match = entry.key.match(deletedPrefix);
-        if (match) {
-          const botName = match[1];
-          const cleanKey = entry.key.replace(deletedPrefix, '');
-          // Upsert: latest wins by key+botName
-          const idx = raw.deleted.findIndex((d: DeletedVaultEntry) => d.key === cleanKey && d.botName === botName);
-          const newEntry: DeletedVaultEntry = { key: cleanKey, value: entry.value, botName, deletedAt: Date.now() };
-          if (idx >= 0) {
-            raw.deleted[idx] = newEntry;
-          } else {
-            raw.deleted.push(newEntry);
-          }
-          didMigrate = true;
-        } else {
-          migrated.push(entry);
-        }
-      }
-      if (didMigrate) {
-        raw.standalone = migrated;
-        saveVault(raw);
-      }
-
-      return raw;
+      return {
+        standalone: raw.standalone || [],
+        deleted: raw.deleted || [],
+      };
     }
   } catch { /* ignore */ }
   return { standalone: [], deleted: [] };

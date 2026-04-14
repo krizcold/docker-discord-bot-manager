@@ -1180,9 +1180,25 @@ async function buildGitInstance(
   // (so a failed build doesn't leave a ghost app registered in CasaOS)
   if (buildTarget) {
     emit(`[Build] Building Docker image (${imageName})...`, 'info');
+
+    const buildArgs: Record<string, string> = { BUILD_MODE: 'managed' };
+    try {
+      if (fs.existsSync(path.join(repoPath, '.git'))) {
+        const simpleGit = require('simple-git').simpleGit;
+        const git = simpleGit(repoPath);
+        const log = await git.log({ maxCount: 1 });
+        const branch = await git.revparse(['--abbrev-ref', 'HEAD']);
+        if (log.latest?.hash) buildArgs.GIT_COMMIT = log.latest.hash;
+        if (branch) buildArgs.GIT_BRANCH = branch.trim();
+      }
+      buildArgs.BUILD_DATE = new Date().toISOString();
+    } catch (err: any) {
+      emit(`[Build] Could not read git info: ${err?.message || err} (continuing with unknown)`, 'warning');
+    }
+
     await dockerClient.buildImage(repoPath, imageName, (msg) => {
       emit(`[Docker] ${msg}`, 'info');
-    }, { BUILD_MODE: 'managed' });
+    }, buildArgs);
     emit('[Done] Docker image build completed', 'success');
   } else {
     emit('[Skip] No build target — docker compose will pull images at start', 'info');

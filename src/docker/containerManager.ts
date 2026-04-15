@@ -1181,19 +1181,39 @@ async function buildGitInstance(
   if (buildTarget) {
     emit(`[Build] Building Docker image (${imageName})...`, 'info');
 
-    const buildArgs: Record<string, string> = { BUILD_MODE: 'managed' };
-    try {
-      if (fs.existsSync(path.join(repoPath, '.git'))) {
+    const buildArgs: Record<string, string> = {
+      BUILD_MODE: 'managed',
+      BUILD_DATE: new Date().toISOString()
+    };
+
+    let metaCommit: string | null = null;
+    let metaBranch: string | null = null;
+    if (instance.sourceId) {
+      const source = sourceManager.getSource(instance.sourceId);
+      metaCommit = source?.lastCommitHash || null;
+      metaBranch = source?.branch || null;
+    }
+    if (!metaCommit && fs.existsSync(path.join(repoPath, '.git'))) {
+      try {
         const simpleGit = require('simple-git').simpleGit;
         const git = simpleGit(repoPath);
         const log = await git.log({ maxCount: 1 });
-        const branch = await git.revparse(['--abbrev-ref', 'HEAD']);
-        if (log.latest?.hash) buildArgs.GIT_COMMIT = log.latest.hash;
-        if (branch) buildArgs.GIT_BRANCH = branch.trim();
+        if (log.latest?.hash) metaCommit = log.latest.hash;
+        if (!metaBranch) {
+          const br = await git.revparse(['--abbrev-ref', 'HEAD']);
+          metaBranch = (br || '').trim() || null;
+        }
+      } catch {
+        // leave nulls; bot will fall back to BUILD_DATE for buildId
       }
-      buildArgs.BUILD_DATE = new Date().toISOString();
+    }
+    try {
+      fs.writeFileSync(
+        path.join(repoPath, '.build-meta.json'),
+        JSON.stringify({ commit: metaCommit, branch: metaBranch, builtAt: buildArgs.BUILD_DATE }, null, 2)
+      );
     } catch (err: any) {
-      emit(`[Build] Could not read git info: ${err?.message || err} (continuing with unknown)`, 'warning');
+      emit(`[Build] Could not write .build-meta.json: ${err?.message || err}`, 'warning');
     }
 
     await dockerClient.buildImage(repoPath, imageName, (msg) => {

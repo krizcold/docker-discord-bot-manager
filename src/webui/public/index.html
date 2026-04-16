@@ -728,61 +728,140 @@
     }
 
     // ─── WebSocket ───
+    // State-update strategy: keep bots[] as single source of truth for rendering.
+    // Bot lifecycle events merge the incoming bot into bots[] by id (preserving
+    // enriched fields like updateAvailable). Only events that change bots[]'s
+    // shape (created/deleted) or enrichment (source/rebuilt) refetch.
     let ws = null;
+    let hasConnectedBefore = false;
+
+    function mergeBotState(incoming) {
+      if (!incoming || !incoming.id) return;
+      const idx = bots.findIndex(b => b.id === incoming.id);
+      if (idx >= 0) bots[idx] = { ...bots[idx], ...incoming };
+    }
+    function setBotStatus(id, status) {
+      const bot = bots.find(b => b.id === id);
+      if (bot) bot.status = status;
+    }
+    function redraw() {
+      renderBots();
+      if (sources.length > 0) renderSourceSidebar();
+    }
+
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
       ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        if (hasConnectedBefore) {
+          // Reconnect: resync in case events were missed during the gap.
+          loadBots();
+          loadSources();
+        }
+        hasConnectedBefore = true;
+      };
+
       ws.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        const id = data.data?.id;
-        if (data.type === 'bot:built') {
-          if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:build-failed') {
-          if (terminalBotId && id === terminalBotId) {
-            addTerminalLog(`Build failed: ${data.data?.error || 'Unknown error'}`, 'error');
-            markTerminalComplete(false);
-          }
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:started') {
-          if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:start-failed') {
-          if (terminalBotId && id === terminalBotId) {
-            addTerminalLog(`Start failed: ${data.data?.error || 'Unknown error'}`, 'error');
-            markTerminalComplete(false);
-          }
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:restarted') {
-          showMessage('success', 'Bot restarted');
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:restart-failed') {
-          showMessage('error', data.data?.error || 'Restart failed');
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'bot:rebuilt') {
-          showMessage('success', 'Code updated and rebuilt');
-          busyBots.delete(id);
-          delete updateCache[id];
-          loadBots();
-        } else if (data.type === 'bot:pull-failed') {
-          showMessage('error', data.data?.error || 'Pull failed');
-          busyBots.delete(id);
-          loadBots();
-        } else if (data.type === 'source:created' || data.type === 'source:updated' || data.type === 'source:deleted') {
-          loadSources();
-          loadBots();
-        } else if (data.type.startsWith('bot:')) {
-          loadBots();
-          loadVault();
+        const payload = data.data;
+        const id = payload?.id;
+
+        switch (data.type) {
+          // Real-time status transitions during operations - in-memory patch only
+          case 'bot:status':
+            setBotStatus(payload.id, payload.status);
+            redraw();
+            break;
+
+          // Operation success - payload is the full bot object
+          case 'bot:started':
+            if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
+            mergeBotState(payload);
+            busyBots.delete(id);
+            redraw();
+            break;
+          case 'bot:stopped':
+            mergeBotState(payload);
+            busyBots.delete(id);
+            redraw();
+            break;
+          case 'bot:restarted':
+            showMessage('success', 'Bot restarted');
+            mergeBotState(payload);
+            busyBots.delete(id);
+            redraw();
+            break;
+
+          // Rebuild/build change lastBuiltCommit, which flips updateAvailable.
+          // Refetch so enriched fields (updateAvailable, behindBy) stay accurate.
+          case 'bot:rebuilt':
+            showMessage('success', 'Code updated and rebuilt');
+            busyBots.delete(id);
+            delete updateCache[id];
+            loadBots();
+            break;
+          case 'bot:built':
+            if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
+            busyBots.delete(id);
+            loadBots();
+            break;
+
+          // Failures - no state change, just clear busy + surface error
+          case 'bot:start-failed':
+            if (terminalBotId && id === terminalBotId) {
+              addTerminalLog(`Start failed: ${payload?.error || 'Unknown error'}`, 'error');
+              markTerminalComplete(false);
+            }
+            busyBots.delete(id);
+            redraw();
+            break;
+          case 'bot:build-failed':
+            if (terminalBotId && id === terminalBotId) {
+              addTerminalLog(`Build failed: ${payload?.error || 'Unknown error'}`, 'error');
+              markTerminalComplete(false);
+            }
+            busyBots.delete(id);
+            redraw();
+            break;
+          case 'bot:restart-failed':
+            showMessage('error', payload?.error || 'Restart failed');
+            busyBots.delete(id);
+            redraw();
+            break;
+          case 'bot:pull-failed':
+            showMessage('error', payload?.error || 'Pull failed');
+            busyBots.delete(id);
+            redraw();
+            break;
+
+          // Phase signals - no state change, subsequent bot:status drives UI
+          case 'bot:pulling':
+          case 'bot:update-requested':
+            break;
+
+          // Structural changes or edits that can touch env/vault - refetch
+          case 'bot:created':
+          case 'bot:deleted':
+          case 'bot:updated':
+            loadBots();
+            loadVault();
+            break;
+
+          // Sources affect bot enrichment
+          case 'source:created':
+          case 'source:updated':
+          case 'source:deleted':
+            loadSources();
+            loadBots();
+            break;
+
+          default:
+            console.debug('[WebSocket] Unhandled event:', data.type);
         }
       };
+
       ws.onclose = () => setTimeout(connectWebSocket, 3000);
     }
     connectWebSocket();

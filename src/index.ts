@@ -12,6 +12,7 @@ import { syncContainerStates } from './docker/containerManager';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
+import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 
 /**
  * Tell git to trust repositories under the bot manager's bind-mounted data dirs.
@@ -58,13 +59,16 @@ async function main(): Promise<void> {
 
   // Start web server
   console.log('[Init] Starting web server...');
-  startServer();
+  const { wss } = startServer();
 
   // Start source auto-update scheduler
   startSourceUpdater();
 
   // Start instance auto-update scheduler
   startInstanceUpdater();
+
+  // Start Docker<->registry state reconciler (polls only while UI clients are connected)
+  startStateReconciler(() => wss.clients.size);
 }
 
 // Handle graceful shutdown
@@ -72,6 +76,7 @@ process.on('SIGTERM', () => {
   console.log('[Shutdown] Received SIGTERM, shutting down...');
   stopSourceUpdater();
   stopInstanceUpdater();
+  stopStateReconciler();
   process.exit(0);
 });
 
@@ -79,6 +84,7 @@ process.on('SIGINT', () => {
   console.log('[Shutdown] Received SIGINT, shutting down...');
   stopSourceUpdater();
   stopInstanceUpdater();
+  stopStateReconciler();
   process.exit(0);
 });
 

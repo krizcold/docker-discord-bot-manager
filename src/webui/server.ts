@@ -13,6 +13,8 @@ import { createSourceRoutes } from './routes/sources';
 import { createVaultRoutes } from './routes/vault';
 import { setSourceBroadcast } from '../source/sourceUpdater';
 import { setInstanceBroadcast } from '../instance/instanceUpdater';
+import { setContainerBroadcast } from '../docker/containerManager';
+import { reconcileNow } from '../docker/stateReconciler';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -43,6 +45,9 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
   // Wire instance updater broadcast to WebSocket
   setInstanceBroadcast((type, data) => broadcastToClients(wss, type, data));
 
+  // Wire container manager status broadcasts (fires on every bot status transition)
+  setContainerBroadcast((type, data) => broadcastToClients(wss, type, data));
+
   // Health check
   app.get('/api/health', (req: Request, res: Response) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -61,10 +66,12 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
 
   // WebSocket handling
   wss.on('connection', (ws: WebSocket) => {
-    console.log('[WebSocket] Client connected');
+    const wasEmpty = wss.clients.size === 1;
+    console.log(`[WebSocket] Client connected (${wss.clients.size} total)`);
+    if (wasEmpty) reconcileNow();
 
     ws.on('close', () => {
-      console.log('[WebSocket] Client disconnected');
+      console.log(`[WebSocket] Client disconnected (${wss.clients.size} remaining)`);
     });
 
     ws.on('error', (error) => {
@@ -75,13 +82,15 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
   return { app, server, wss };
 }
 
-export function startServer(): void {
-  const { server } = createServer();
+export function startServer(): { wss: WebSocketServer } {
+  const { server, wss } = createServer();
 
   server.listen(PORT, () => {
     console.log(`[Server] Discord Bot Manager running on port ${PORT}`);
     console.log(`[Server] Web UI: http://localhost:${PORT}`);
   });
+
+  return { wss };
 }
 
 /**

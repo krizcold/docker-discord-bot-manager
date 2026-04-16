@@ -51,6 +51,13 @@ import YAML from 'yaml';
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
 
+type BroadcastFn = (type: string, data: any) => void;
+let broadcastFn: BroadcastFn | null = null;
+
+export function setContainerBroadcast(fn: BroadcastFn): void {
+  broadcastFn = fn;
+}
+
 // Simple write queue to prevent concurrent registry writes
 let writeQueue: Promise<void> = Promise.resolve();
 
@@ -546,6 +553,9 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
+    if (broadcastFn) {
+      broadcastFn('bot:status', { id: botId, status });
+    }
   }
 }
 
@@ -1319,30 +1329,47 @@ export async function getBotStats(botId: string): Promise<{ success: boolean; st
 
 // ─── Container State Sync ───
 
+/**
+ * Reconcile registry state with actual Docker container state.
+ *
+ * Detects drift from external events:
+ *   - CasaOS stop/start of a managed bot
+ *   - Container crash (exit, OOM, etc.)
+ *   - Host reboot with restart: unless-stopped bringing containers back up
+ *   - Manual docker stop/start on the host
+ *
+ * Only reconciles bots in terminal states (running/stopped/error). Transient
+ * states (stopping/starting/building) are skipped to avoid interfering with
+ * in-flight operations the manager is driving itself.
+ */
 export async function syncContainerStates(): Promise<void> {
   const registry = loadRegistry();
   const containers = await dockerClient.listBotContainers();
 
   for (const instance of Object.values(registry.instances)) {
+    if (instance.status !== 'running' && instance.status !== 'stopped' && instance.status !== 'error') {
+      continue;
+    }
+
     const appName = resolveAppName(instance.id);
+    const botContainers = containers.filter(c => c.name.startsWith(appName));
+    const runningContainers = botContainers.filter(c => c.state === 'running');
+    const runningIds = runningContainers.map(c => c.id);
 
-    if (instance.status === 'running') {
-      const containerIds = instance.containerIds || [];
-      const runningContainers = containers.filter(c =>
-        c.name.startsWith(appName) && c.state === 'running'
-      );
-
-      if (runningContainers.length === 0) {
-        console.log(`[ContainerManager] Instance ${instance.id} has no running containers, updating status`);
-        updateBotStatus(instance.id, 'stopped', []);
-      } else if (runningContainers.length !== containerIds.length) {
-        const newContainerIds = runningContainers.map(c => c.id);
-        updateBotStatus(instance.id, 'running', newContainerIds);
+    if (instance.status === 'running' && runningContainers.length === 0) {
+      console.log(`[Reconciler] ${instance.id} registry=running but no running containers - marking stopped`);
+      updateBotStatus(instance.id, 'stopped', []);
+    } else if (instance.status !== 'running' && runningContainers.length > 0) {
+      console.log(`[Reconciler] ${instance.id} registry=${instance.status} but containers are running - marking running`);
+      updateBotStatus(instance.id, 'running', runningIds);
+    } else if (instance.status === 'running') {
+      const currentIds = (instance.containerIds || []).slice().sort().join(',');
+      const newIds = runningIds.slice().sort().join(',');
+      if (currentIds !== newIds) {
+        updateBotStatus(instance.id, 'running', runningIds);
       }
     }
   }
-
-  console.log('[ContainerManager] Container state sync complete');
 }
 
 // ─── Helpers ───

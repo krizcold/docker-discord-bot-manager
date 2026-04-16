@@ -102,6 +102,8 @@
     .status-stopped { background: var(--danger-bg); color: var(--danger); }
     .status-building { background: var(--warning-bg); color: var(--warning); }
     .status-error { background: var(--danger-bg); color: var(--danger); }
+    .status-starting { background: var(--warning-bg); color: var(--warning); }
+    .status-stopping { background: var(--warning-bg); color: var(--warning); }
     .bot-card-update {
       display: flex; align-items: center; justify-content: space-between;
       padding: 8px 12px; border-radius: var(--radius); font-size: 0.78rem; margin-top: 10px;
@@ -715,6 +717,9 @@
     let currentLogsBotId = null;
     let envEditorBotId = null;
     const busyBots = new Set();
+    function isTransientStatus(status) {
+      return status === 'building' || status === 'starting' || status === 'stopping';
+    }
     let installSourceId = null;
     let installNameLocked = true;
     let nameValidationTimeout = null;
@@ -967,7 +972,7 @@
           ${bots.map(bot => {
             const botName = bot.displayName || 'Unnamed';
             const isRunning = bot.status === 'running';
-            const busy = busyBots.has(bot.id);
+            const busy = busyBots.has(bot.id) || isTransientStatus(bot.status);
             const d = busy ? ' disabled' : '';
             const isGit = bot.sourceType !== 'docker-image';
 
@@ -1055,7 +1060,7 @@
                   ${sourceTag}
                   ${commitInfo}
                 </div>
-                <span class="status-badge status-${busy ? 'building' : bot.status}">${busy ? 'busy' : bot.status}</span>
+                <span class="status-badge status-${bot.status}">${busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status}</span>
               </div>
               ${isGit ? `<div class="bot-card-meta">${autoUpdateToggle}</div>` : ''}
               <div class="bot-card-actions">
@@ -1096,9 +1101,9 @@
     }
 
     async function updateBot(id) {
-      if (busyBots.has(id)) return;
-      busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      busyBots.add(id); renderBots();
       openTerminalPopup(bot ? bot.displayName : id, id, 'Updating');
       try { await api('POST', `/bots/${id}/update`); }
       catch (err) { showMessage('error', 'Update failed'); busyBots.delete(id); renderBots(); }
@@ -1123,9 +1128,9 @@
 
     // ─── Bot Actions (all guarded by busyBots to prevent double-clicks) ───
     async function startBot(id) {
-      if (busyBots.has(id)) return;
-      busyBots.add(id); renderBots();
       const bot = bots.find(b => b.id === id);
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      busyBots.add(id); renderBots();
       openTerminalPopup(bot ? bot.displayName : id, id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
@@ -1144,7 +1149,8 @@
     }
 
     async function stopBot(id) {
-      if (busyBots.has(id)) return;
+      const bot = bots.find(b => b.id === id);
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/stop`);
@@ -1153,7 +1159,8 @@
     }
 
     async function restartBot(id) {
-      if (busyBots.has(id)) return;
+      const bot = bots.find(b => b.id === id);
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/restart`);
@@ -1275,7 +1282,8 @@
     }
 
     async function confirmDeleteBot() {
-      if (!deleteBotId || busyBots.has(deleteBotId)) return;
+      const delBot = bots.find(b => b.id === deleteBotId);
+      if (!deleteBotId || busyBots.has(deleteBotId) || (delBot && isTransientStatus(delBot.status))) return;
       const id = deleteBotId;
       const preserveData = !document.getElementById('delete-also-data').checked;
       const keepEnv = !document.getElementById('delete-also-env').checked;

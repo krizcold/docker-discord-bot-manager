@@ -322,6 +322,22 @@
     /* ─── Utilities ─── */
     .hidden { display: none !important; }
     .loading { text-align: center; padding: 32px; color: var(--text-muted); font-size: 0.9rem; }
+    /* Sidebar / inline loading indicator with a visible spinner. Distinct
+       from `.source-empty` (which is "no items in list") so the user can
+       tell "we're fetching" from "the list is genuinely empty". */
+    .sidebar-loading {
+      padding: 20px 16px; text-align: center; color: var(--text-muted);
+      font-size: 0.82rem; display: flex; flex-direction: column;
+      align-items: center; gap: 10px;
+    }
+    .sidebar-loading::before {
+      content: ''; width: 22px; height: 22px;
+      border: 2.5px solid rgba(255,255,255,0.12);
+      border-top-color: var(--primary, #5865F2);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
     .error-message {
       background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger);
       padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
@@ -429,6 +445,8 @@
       min-width: 28px; height: 24px;
     }
     .vault-entry-btn:hover { color: var(--text-primary); border-color: #3e3e48; }
+    .vault-entry-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .vault-entry-btn:disabled:hover { color: var(--text-muted); border-color: var(--border); background: transparent; }
     .vault-entry-btn.delete:hover { color: var(--danger); background: var(--danger-bg); border-color: var(--danger); }
     .vault-entry-btn.save { color: var(--accent); display: none; }
     .vault-entry-btn.save:hover { background: rgba(45, 212, 168, 0.15); border-color: var(--accent); }
@@ -552,7 +570,7 @@
         <button class="btn btn-primary btn-small" onclick="showAddSourceModal()">+ Add</button>
       </div>
       <div class="source-list" id="source-list">
-        <div class="source-empty">Loading...</div>
+        <div class="sidebar-loading">Loading sources…</div>
       </div>
     </aside>
 
@@ -577,7 +595,7 @@
         <h3>Credentials</h3>
       </div>
       <div class="vault-list" id="vault-list">
-        <div class="source-empty">Loading...</div>
+        <div class="sidebar-loading">Loading credentials…</div>
       </div>
     </aside>
   </div>
@@ -950,7 +968,7 @@
         }
       }
       renderBots();
-      // Source sidebar's "[N updates]" badge depends on bots[].updateAvailable — re-render it too
+      // Source sidebar's "[N updates]" badge depends on bots[].updateAvailable; re-render it too
       if (sources.length > 0) renderSourceSidebar();
     }
 
@@ -1114,7 +1132,7 @@
       try {
         const res = await api('PUT', `/bots/${botId}/source`, { sourceId: newSourceId });
         if (res.success) {
-          showMessage('success', 'Source changed — rebuild needed');
+          showMessage('success', 'Source changed: rebuild needed');
           loadBots();
         } else {
           showMessage('error', res.error || 'Failed to change source');
@@ -1139,7 +1157,7 @@
           markTerminalComplete(false);
           busyBots.delete(id); loadBots();
         }
-        // Success case: don't mark complete here — WebSocket 'bot:started' or
+        // Success case: don't mark complete here; WebSocket 'bot:started' or
         // 'bot:start-failed' event will handle it (build runs in background)
       } catch (err) {
         addTerminalLog('Error: Failed to start bot', 'error');
@@ -1292,7 +1310,7 @@
       try {
         const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`);
         const msg = preserveData ? 'Bot removed (data preserved)' : 'Bot removed';
-        res.success ? showMessage('success', !keepEnv ? msg + ' — env vars moved to vault' : msg) : showMessage('error', res.error || 'Failed to remove bot');
+        res.success ? showMessage('success', !keepEnv ? msg + ' (env vars moved to vault)' : msg) : showMessage('error', res.error || 'Failed to remove bot');
       } finally { busyBots.delete(id); loadBots(); }
     }
 
@@ -1636,7 +1654,7 @@
         logsState.logHistory[containerName] = [];
       }
 
-      // Start SSE stream — matches Dev Kit's startLogStreaming()
+      // Start SSE stream: matches Dev Kit's startLogStreaming()
       const url = `/api/bots/${logsState.botId}/containers/${encodeURIComponent(containerName)}/logs/stream?lines=50`;
       const es = new EventSource(url);
       logsState.eventSource = es;
@@ -1757,7 +1775,7 @@
 
         const codeName = s.composeName || null;
         const lastChecked = s.lastChecked ? new Date(s.lastChecked).toLocaleString() : 'Not cloned';
-        const commit = s.lastCommitHash ? s.lastCommitHash.substring(0, 7) : '—';
+        const commit = s.lastCommitHash ? s.lastCommitHash.substring(0, 7) : '-';
         const instanceCount = bots.filter(b => b.sourceId === s.id).length;
         const needsUpdate = bots.filter(b => b.sourceId === s.id && b.updateAvailable).length;
         const instanceBadge = instanceCount > 0
@@ -1963,7 +1981,7 @@
         const res = await api('GET', `/sources/${sourceId}`);
         if (res.success && res.source) {
           // Try to get env example from the source repo via a temp peek
-          // For now, use default env hints — they'll be overridden after instance creation
+          // For now, use default env hints; they'll be overridden after instance creation
         }
       } catch (e) { /* non-fatal */ }
 
@@ -2288,12 +2306,33 @@
       }, 150);
     }
 
+    // Disable a NodeList of buttons during an async operation and return
+    // a restore function for `finally`. Visual feedback (opacity / cursor)
+    // is handled by the matching `:disabled` CSS rule for each button
+    // class - keep it that way so this helper stays minimal and the
+    // styling stays in CSS where the rest of the project keeps it.
+    function lockBtns(buttons) {
+      const wasEnabled = [];
+      for (const btn of buttons) {
+        if (!btn) continue;
+        wasEnabled.push({ btn, prev: btn.disabled });
+        btn.disabled = true;
+      }
+      return () => {
+        for (const r of wasEnabled) {
+          if (!r.btn.isConnected) continue;
+          r.btn.disabled = r.prev;
+        }
+      };
+    }
+
     async function saveVaultRow(row) {
       const groupId = row.dataset.groupId;
       const groupType = row.dataset.groupType;
       const originalKey = row.dataset.originalKey;
       const newKey = row.querySelector('.vault-entry-key-input').value.trim();
       const newValue = row.querySelector('.vault-entry-value-input').value;
+      const unlock = lockBtns(row.querySelectorAll('.vault-entry-btn'));
 
       try {
         if (groupType === 'deleted') {
@@ -2308,7 +2347,7 @@
           if (newValue) body.value = newValue;
           await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
         } else {
-          // Bot instance — update via env manager
+          // Bot instance: update via env manager
           if (newValue) {
             const envRes = await api('GET', `/bots/${groupId}/env`);
             if (envRes.success) {
@@ -2326,26 +2365,36 @@
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to save');
+      } finally {
+        unlock();
       }
     }
 
     async function deleteVaultEntry(key) {
+      // Lock every delete-button in the list during the request so the
+      // user can't trigger parallel deletes by rapid-clicking.
+      const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
         await api('DELETE', `/vault/standalone/${encodeURIComponent(key)}`);
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to delete entry');
+      } finally {
+        unlock();
       }
     }
 
     async function deleteDeletedVaultEntry(key, botName) {
+      const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
         await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?botName=${encodeURIComponent(botName)}`);
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to delete entry');
+      } finally {
+        unlock();
       }
     }
 

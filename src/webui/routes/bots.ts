@@ -200,7 +200,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       // When keepEnv=true (default), preserve env vars in vault for recovery.
-      // When keepEnv=false, user explicitly wants them gone — don't save.
+      // When keepEnv=false, user explicitly wants them gone; don't save.
       if (keepEnv) {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
@@ -646,13 +646,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const source = sourceManager.getSource(bot.sourceId);
       if (!source || !source.lastCommitHash) {
-        // Source not cloned or no commit info — can't determine
+        // Source not cloned or no commit info; can't determine
         res.json({ success: true, hasUpdates: false, behindBy: 0 });
         return;
       }
 
       if (!bot.lastBuiltCommit) {
-        // Never tracked what commit was built — assume behind
+        // Never tracked what commit was built; assume behind
         res.json({ success: true, hasUpdates: true, behindBy: fetchBehindBy || 1 });
         return;
       }

@@ -14,7 +14,7 @@ const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
 
-// WebSocket broadcast function — set by wiring code
+// WebSocket broadcast function, set by wiring code
 let broadcastFn: ((type: string, data: unknown) => void) | null = null;
 
 /**
@@ -33,7 +33,7 @@ async function runSourceUpdateCycle(): Promise<void> {
   for (const source of sources) {
     if (!source.autoUpdate) continue;
 
-    // Skip sources that haven't been cloned yet — don't auto-clone default sources
+    // Skip sources that haven't been cloned yet; don't auto-clone default sources
     if (!source.lastChecked) continue;
 
     try {

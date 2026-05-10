@@ -2,9 +2,9 @@
  * Name Resolution, Validation, and Collision Detection
  *
  * Three name layers:
- *   Display name:   "My Custom Bot!"  — user's raw input, shown in UI
- *   Sanitized name: "mycustombot"     — compose name, folders, Caddy labels, CasaOS app name
- *   Title name:     "My Custom Bot"   — x-casaos.title.en_us (uppercase + spaces, no special chars)
+ *   Display name:   "My Custom Bot!"  - user's raw input, shown in UI
+ *   Sanitized name: "mycustombot"     - compose name, folders, Caddy labels, CasaOS app name
+ *   Title name:     "My Custom Bot"   - x-casaos.title.en_us (uppercase + spaces, no special chars)
  */
 
 import * as fs from 'fs';
@@ -55,8 +55,8 @@ export function isReservedName(sanitized: string): boolean {
 
 /**
  * Check if /DATA/AppData/{sanitized} exists and is NOT managed by Bot Manager.
- * Uses the .botmanager marker file inside the AppData folder itself —
- * survives even if Bot Manager is fully wiped and reinstalled.
+ * Uses the .botmanager marker file inside the AppData folder itself,
+ * which survives even if Bot Manager is fully wiped and reinstalled.
  */
 export function isAppDataOccupied(sanitized: string, existingInstances: InstanceConfig[]): boolean {
   const dataRoot = process.env.DATA_ROOT || '/DATA';
@@ -68,11 +68,11 @@ export function isAppDataOccupied(sanitized: string, existingInstances: Instance
   const tracked = existingInstances.some(inst => inst.sanitizedName === sanitized);
   if (tracked) return false;
 
-  // Check for .botmanager marker — if present, this is a Bot Manager folder (allow reuse)
+  // Check for .botmanager marker: if present, this is a Bot Manager folder (allow reuse)
   const markerPath = path.join(appDataPath, '.botmanager');
   if (fs.existsSync(markerPath)) return false;
 
-  // Genuinely unknown/external folder — block
+  // Genuinely unknown/external folder: block
   return true;
 }
 

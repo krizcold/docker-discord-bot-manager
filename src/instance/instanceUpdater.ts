@@ -24,7 +24,7 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
 // Track last check time per instance (in-memory)
 const lastCheckTimes: Map<string, number> = new Map();
 
-// WebSocket broadcast function — set by wiring code
+// WebSocket broadcast function, set by wiring code
 let broadcastFn: ((type: string, data: unknown) => void) | null = null;
 
 // Guard against concurrent rebuild of the same instance
@@ -85,8 +85,8 @@ async function runInstanceUpdateTick(): Promise<void> {
       if (!bot.lastBuiltCommit) continue;
       if (bot.lastBuiltCommit === source.lastCommitHash) continue;
 
-      // Mismatch detected — auto-rebuild
-      console.log(`[InstanceUpdater] Instance ${bot.displayName} (${bot.id}) is behind source — triggering auto-rebuild`);
+      // Mismatch detected: auto-rebuild
+      console.log(`[InstanceUpdater] Instance ${bot.displayName} (${bot.id}) is behind source; triggering auto-rebuild`);
       rebuildingInstances.add(bot.id);
 
       if (broadcastFn) {

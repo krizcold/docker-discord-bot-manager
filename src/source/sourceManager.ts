@@ -431,7 +431,7 @@ export function findSourceByUrl(url: string): SourceMeta | null {
 const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
   // Our bot
   { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: 'main' },
-  // Tier 1 — Have Docker + compose
+  // Tier 1: Have Docker + compose
   { url: 'https://github.com/eritislami/evobot', branch: 'main' },
   { url: 'https://github.com/modmail-dev/Modmail', branch: 'main' },
   { url: 'https://github.com/bongodevs/lavamusic', branch: 'main' },
@@ -440,11 +440,11 @@ const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
   { url: 'https://github.com/python-discord/bot', branch: 'main' },
   { url: 'https://github.com/disbored/egglord', branch: 'main' },
   { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: 'main' },
-  // Tier 2 — Have Dockerfile, no compose
+  // Tier 2: Have Dockerfile, no compose
   { url: 'https://github.com/Androz2091/AtlantaBot', branch: 'main' },
   { url: 'https://github.com/nadeko-bot/nadekobot', branch: 'main' },
   { url: 'https://github.com/discord-tickets/bot', branch: 'main' },
-  // Tier 3 — No Docker
+  // Tier 3: No Docker
   { url: 'https://github.com/Cog-Creators/Red-DiscordBot', branch: 'main' },
   { url: 'https://github.com/jagrosh/MusicBot', branch: 'main' },
   { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: 'main' },
@@ -456,7 +456,7 @@ const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
 
 /**
  * Seed default sources on first run (empty registry only).
- * Sources are added as metadata-only entries — NOT cloned.
+ * Sources are added as metadata-only entries, NOT cloned.
  * The repo is cloned on-demand when the user clicks Install or Fetch.
  */
 export function seedDefaultSources(): void {
@@ -479,7 +479,7 @@ export function seedDefaultSources(): void {
       lastCommitMessage: null,
       lastCommitDate: null,
       lastChecked: null,
-      autoUpdate: true,   // Enabled — locked in UI until cloned, active once cloned
+      autoUpdate: true,   // Enabled: locked in UI until cloned, active once cloned
       composeName: null,
       createdAt: now,
       updatedAt: now,

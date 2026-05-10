@@ -109,7 +109,7 @@ export function substituteComposeNames(
         }
       }
 
-      // volumes — replace first segment after /AppData/
+      // volumes: replace first segment after /AppData/
       if (Array.isArray(service.volumes)) {
         service.volumes = service.volumes.map((vol: any) => {
           if (typeof vol === 'string') {
@@ -122,7 +122,7 @@ export function substituteComposeNames(
         });
       }
 
-      // networks — replace name references
+      // networks: replace name references
       if (Array.isArray(service.networks)) {
         service.networks = service.networks.map((net: string) =>
           replaceInString(net, originalName, newSanitizedName)
@@ -145,7 +145,7 @@ export function substituteComposeNames(
       const serviceNameMap = doc.services
         ? buildServiceNameMap(Object.keys(doc.services), originalName, newSanitizedName)
         : {};
-      // main might have already been renamed — check both forms
+      // main might have already been renamed, check both forms
       xcasaos.main = serviceNameMap[xcasaos.main] || replaceInString(xcasaos.main, originalName, newSanitizedName);
     }
 
@@ -157,7 +157,7 @@ export function substituteComposeNames(
       xcasaos.store_app_id = replaceInString(xcasaos.store_app_id, originalName, newSanitizedName);
     }
 
-    // Title — set to titleName if provided
+    // Title: set to titleName if provided
     if (titleName && xcasaos.title && typeof xcasaos.title === 'object') {
       for (const lang of Object.keys(xcasaos.title)) {
         xcasaos.title[lang] = titleName;
@@ -170,7 +170,7 @@ export function substituteComposeNames(
       }
     }
 
-    // Tagline and description — replace name references
+    // Tagline and description: replace name references
     for (const field of ['tagline', 'description'] as const) {
       if (xcasaos[field] && typeof xcasaos[field] === 'object') {
         for (const lang of Object.keys(xcasaos[field])) {
@@ -182,7 +182,7 @@ export function substituteComposeNames(
     }
   }
 
-  // 4. Top-level volumes — rename keys
+  // 4. Top-level volumes: rename keys
   if (doc.volumes && typeof doc.volumes === 'object') {
     const newVolumes: Record<string, any> = {};
     for (const [key, value] of Object.entries(doc.volumes)) {
@@ -192,7 +192,7 @@ export function substituteComposeNames(
     doc.volumes = newVolumes;
   }
 
-  // 5. Top-level networks — rename keys
+  // 5. Top-level networks: rename keys
   if (doc.networks && typeof doc.networks === 'object') {
     const newNetworks: Record<string, any> = {};
     for (const [key, value] of Object.entries(doc.networks)) {

@@ -149,7 +149,7 @@ export function processComposeForCasaOS(
   // ── Per-service modifications ──
   for (const [serviceName, service] of Object.entries(services)) {
 
-    // cpu_shares — mandatory on all services (50 default, 10 for infra)
+    // cpu_shares: mandatory on all services (50 default, 10 for infra)
     if (service.cpu_shares === undefined) {
       service.cpu_shares = infraServiceNames.has(serviceName) ? 10 : 50;
     }
@@ -221,7 +221,7 @@ export function processComposeForCasaOS(
             labels['caddy_1'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.nip.io`;
             labels['caddy_1.import'] = 'gateway_tls';
             labels['caddy_1.reverse_proxy'] = `{{upstreams ${webPort}}}`;
-            // sslip.io direct access (Let's Encrypt — no gateway_tls)
+            // sslip.io direct access (Let's Encrypt, no gateway_tls)
             labels['caddy_2'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`;
             labels['caddy_2.reverse_proxy'] = `{{upstreams ${webPort}}}`;
           }
@@ -239,7 +239,7 @@ export function processComposeForCasaOS(
       }
     }
 
-    // Volume path processing — replace /DATA with actual DATA_ROOT
+    // Volume path processing: replace /DATA with actual DATA_ROOT
     if (service.volumes && Array.isArray(service.volumes)) {
       service.volumes = service.volumes.map((volume: unknown) => {
         if (typeof volume === 'string') {
@@ -379,7 +379,7 @@ export function processComposeForCasaOS(
     xcasaos.port_map = pcs.REF_PORT;
   }
 
-  // webui_port and index — set when main service has a web port
+  // webui_port and index: set when main service has a web port
   if (mainServiceName && services[mainServiceName]) {
     const mainSvc = services[mainServiceName];
     let webPort: string | null = null;

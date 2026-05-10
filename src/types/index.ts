@@ -41,9 +41,9 @@ export interface InstanceConfig {
   imageRef?: string;                   // For docker-image source only
 
   // Three name layers
-  displayName: string;                 // "My Custom Bot!" — user's raw input
-  sanitizedName: string;               // "mycustombot" — compose name, folders, Caddy labels
-  titleName: string;                   // "My Custom Bot" — x-casaos.title
+  displayName: string;                 // "My Custom Bot!", user's raw input
+  sanitizedName: string;               // "mycustombot", compose name, folders, Caddy labels
+  titleName: string;                   // "My Custom Bot", x-casaos.title
 
   status: BotStatus;
   containerIds: string[];
@@ -67,7 +67,7 @@ export interface InstanceConfig {
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
 
   // Instance auto-update (independent from source auto-update)
-  autoUpdate?: boolean;                // default false — auto-rebuild when source has new commits
+  autoUpdate?: boolean;                // default false; auto-rebuild when source has new commits
   autoUpdateInterval?: number;         // milliseconds between checks, default 86400000 (24 hours)
   autoUpdateHour?: number;             // 0-23, preferred hour for daily checks, default 4 (4am)
 

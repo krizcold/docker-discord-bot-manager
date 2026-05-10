@@ -57,14 +57,14 @@ export class LogCollector extends EventEmitter {
 
 /**
  * Global registry of per-bot log collectors.
- * One collector per bot — always cleared on new build start.
+ * One collector per bot, always cleared on new build start.
  */
 class LogCollectorRegistry {
   private collectors = new Map<string, LogCollector>();
 
   /**
    * Get or create a log collector for a bot.
-   * Does NOT clear — call clear() explicitly when starting a new build.
+   * Does NOT clear; call clear() explicitly when starting a new build.
    */
   get(botId: string): LogCollector {
     let collector = this.collectors.get(botId);
@@ -76,7 +76,7 @@ class LogCollectorRegistry {
   }
 
   /**
-   * Get collector only if it exists (for SSE endpoint — don't create empty ones)
+   * Get collector only if it exists (for SSE endpoint; don't create empty ones)
    */
   getIfExists(botId: string): LogCollector | undefined {
     return this.collectors.get(botId);

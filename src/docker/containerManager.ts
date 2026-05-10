@@ -123,7 +123,7 @@ export function getBot(botId: string): InstanceConfig | null {
 export const getAllInstances = getAllBots;
 export const getInstance = getBot;
 
-// Env keys written by the bot manager itself — filtered out when restoring
+// Env keys written by the bot manager itself, filtered out when restoring
 const BOT_MANAGER_ENV_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
 /**
@@ -392,57 +392,88 @@ function getImageName(instance: InstanceConfig): string {
 
 // ─── Delete ───
 
-async function performManualCleanup(appName: string, removeData: boolean): Promise<void> {
+async function performManualCleanup(appName: string, removeData: boolean): Promise<{ failures: string[] }> {
   console.log(`[ContainerManager] Manual cleanup for ${appName} (removeData: ${removeData})`);
 
   const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
+  const failures: string[] = [];
 
-  // 1. Try compose down first — this properly tears down the compose project
-  //    so CasaOS detects the removal and deregisters the app from its UI
+  // 1. Try compose down first: this properly tears down the compose project
+  //    so CasaOS detects the removal and deregisters the app from its UI.
+  //    Failure here is recoverable (next steps force-remove anyway), but
+  //    track it so deleteBot can surface partial issues.
   const composePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName, 'docker-compose.yml');
   if (fs.existsSync(composePath)) {
     try {
       await execAsync(
-        `docker compose -p ${appName} -f "${composePath}" down --remove-orphans 2>/dev/null`,
+        `docker compose -p ${appName} -f "${composePath}" down --remove-orphans`,
         { timeout: 60000 }
       );
       console.log(`[ContainerManager] Compose down succeeded for ${appName}`);
     } catch (err) {
-      console.warn(`[ContainerManager] Compose down failed for ${appName}, falling back to manual removal`);
+      const msg = err instanceof Error ? err.message : String(err);
+      failures.push(`compose down ${appName}: ${msg}`);
     }
   }
 
-  // 2. Force-remove any remaining containers (belt and suspenders)
+  // 2. Force-remove any remaining containers (belt and suspenders).
+  // Verify after with `docker ps` so we know they're actually gone.
   try {
     await execAsync(
-      `docker ps -aq --filter "name=${appName}" | xargs -r docker rm -f 2>/dev/null; ` +
-      `docker ps -aq --filter "label=com.docker.compose.project=${appName}" | xargs -r docker rm -f 2>/dev/null`,
+      `docker ps -aq --filter "name=${appName}" | xargs -r docker rm -f; ` +
+      `docker ps -aq --filter "label=com.docker.compose.project=${appName}" | xargs -r docker rm -f`,
       { timeout: 30000 }
     );
-  } catch { /* best effort */ }
+    // Verify no containers linger
+    const { stdout } = await execAsync(
+      `docker ps -aq --filter "name=${appName}" --filter "label=com.docker.compose.project=${appName}"`,
+      { timeout: 10000 }
+    );
+    const remaining = stdout.trim().split('\n').filter(Boolean);
+    if (remaining.length > 0) {
+      failures.push(`containers still present after force-remove: ${remaining.join(', ')}`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    failures.push(`force-remove containers ${appName}: ${msg}`);
+  }
 
   // 3. Remove orphan networks
   try {
     await execAsync(
-      `docker network ls --filter "name=${appName}" --format "{{.Name}}" | xargs -r docker network rm 2>/dev/null`,
+      `docker network ls --filter "name=${appName}" --format "{{.Name}}" | xargs -r docker network rm`,
       { timeout: 10000 }
     );
-  } catch { /* best effort */ }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    failures.push(`networks ${appName}: ${msg}`);
+  }
 
   // 4. Remove CasaOS metadata directory
   const metadataDir = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName);
   if (fs.existsSync(metadataDir)) {
-    fs.rmSync(metadataDir, { recursive: true, force: true });
+    try { fs.rmSync(metadataDir, { recursive: true, force: true }); }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failures.push(`metadata dir ${metadataDir}: ${msg}`);
+    }
   }
 
   // 5. Remove app data directory if requested
   if (removeData) {
     const appDataDir = path.join(pcsDataRoot, 'AppData', appName);
     if (fs.existsSync(appDataDir)) {
-      fs.rmSync(appDataDir, { recursive: true, force: true });
-      console.log(`[ContainerManager] Removed app data: ${appDataDir}`);
+      try {
+        fs.rmSync(appDataDir, { recursive: true, force: true });
+        console.log(`[ContainerManager] Removed app data: ${appDataDir}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`app data ${appDataDir}: ${msg}`);
+      }
     }
   }
+
+  return { failures };
 }
 
 export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
@@ -454,12 +485,20 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
   const appName = resolveAppName(botId);
   const botDir = getBotDir(botId);
 
+  // Track per-step failures so the function reports an honest result. We
+  // still attempt every cleanup step (a stuck container shouldn't prevent
+  // image removal etc.) but the aggregate failure list propagates upstream
+  // - silently returning true while orphaned containers/images linger is
+  // exactly the false-positive pattern we're banning project-wide.
+  const failures: string[] = [];
+
   // 1. Uninstall containers
   try {
     if (deploymentMode === 'casaos') {
       if (keepData) {
-        console.log(`[ContainerManager] Preserving data — manual cleanup only for ${appName}`);
-        await performManualCleanup(appName, false);
+        console.log(`[ContainerManager] Preserving data; manual cleanup only for ${appName}`);
+        const cleanup = await performManualCleanup(appName, false);
+        failures.push(...cleanup.failures);
       } else {
         let apiSuccess = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
@@ -471,9 +510,10 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
           }
           if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
         }
-        await performManualCleanup(appName, true);
+        const cleanup = await performManualCleanup(appName, true);
+        failures.push(...cleanup.failures);
         if (!apiSuccess) {
-          console.warn(`[ContainerManager] CasaOS API uninstall failed for ${appName}, manual cleanup performed`);
+          failures.push(`CasaOS API uninstall failed after 3 attempts for ${appName} (manual cleanup attempted)`);
         }
       }
     } else {
@@ -483,12 +523,14 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
           await dockerClient.stopContainer(containerId);
           await dockerClient.removeContainer(containerId);
         } catch (err) {
-          console.warn(`[ContainerManager] Failed to remove container ${containerId}:`, err);
+          const msg = err instanceof Error ? err.message : String(err);
+          failures.push(`container ${containerId}: ${msg}`);
         }
       }
     }
   } catch (error) {
-    console.warn(`[ContainerManager] Uninstall error for instance ${botId}:`, error);
+    const msg = error instanceof Error ? error.message : String(error);
+    failures.push(`uninstall step: ${msg}`);
   }
 
   // 2. Remove Docker image
@@ -496,10 +538,18 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
   try {
     if (dockerClient.imageExists(imageName)) {
       console.log(`[ContainerManager] Removing image ${imageName}...`);
-      dockerClient.removeImage(imageName);
+      const ok = dockerClient.removeImage(imageName);
+      if (!ok) failures.push(`image ${imageName}: docker rmi reported failure`);
+      // Verify the image is actually gone - rmi can return success in some
+      // edge cases (force-removed dangling tag) while another tag of the
+      // same image keeps it present. Treat lingering image as a failure.
+      else if (dockerClient.imageExists(imageName)) {
+        failures.push(`image ${imageName}: still present after rmi`);
+      }
     }
   } catch (error) {
-    console.warn(`[ContainerManager] Failed to remove image ${imageName}:`, error);
+    const msg = error instanceof Error ? error.message : String(error);
+    failures.push(`image ${imageName}: ${msg}`);
   }
 
   // 3. Remove named volumes
@@ -508,29 +558,51 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
       const volumes = dockerClient.listProjectVolumes(appName);
       for (const volumeName of volumes) {
         console.log(`[ContainerManager] Removing volume ${volumeName}...`);
-        dockerClient.removeVolume(volumeName);
+        const ok = dockerClient.removeVolume(volumeName);
+        if (!ok) failures.push(`volume ${volumeName}: docker volume rm reported failure`);
       }
     } catch (error) {
-      console.warn(`[ContainerManager] Failed to remove volumes for instance ${botId}:`, error);
+      const msg = error instanceof Error ? error.message : String(error);
+      failures.push(`volumes for ${botId}: ${msg}`);
     }
   }
 
   // 4. Remove instance directory
   if (!keepData) {
     if (fs.existsSync(botDir)) {
-      fs.rmSync(botDir, { recursive: true, force: true });
+      try { fs.rmSync(botDir, { recursive: true, force: true }); }
+      catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`bot directory ${botDir}: ${msg}`);
+      }
     }
   } else {
     // Keep env/ but remove compose (recreated on reinstall)
     const composePath = path.join(botDir, 'docker-compose.yml');
-    if (fs.existsSync(composePath)) fs.rmSync(composePath, { force: true });
+    if (fs.existsSync(composePath)) {
+      try { fs.rmSync(composePath, { force: true }); }
+      catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`compose file ${composePath}: ${msg}`);
+      }
+    }
   }
 
   delete registry.instances[botId];
   saveRegistry(registry);
   logCollectors.remove(botId);
 
-  console.log(`[ContainerManager] Instance ${botId} uninstalled (keepData: ${keepData})`);
+  if (failures.length > 0) {
+    // Throw rather than return false: callers (API routes) translate
+    // exceptions into HTTP errors with the full message, so the user sees
+    // exactly which step(s) didn't complete. Returning false would hide
+    // the detail.
+    const summary = `Bot ${botId} uninstall completed with ${failures.length} failure(s):\n  - ${failures.join('\n  - ')}`;
+    console.error(`[ContainerManager] ${summary}`);
+    throw new Error(summary);
+  }
+
+  console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData})`);
   return true;
 }
 
@@ -678,7 +750,7 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       // Object format: { KEY: "value", ... }
       Object.assign(env, allEnv);
     } else {
-      // No environment section — create one
+      // No environment section, create one
       service.environment = { ...allEnv };
     }
 
@@ -933,7 +1005,7 @@ export async function pullAndRebuild(botId: string): Promise<{ success: boolean;
     if (instance.sourceId) {
       const source = sourceManager.getSource(instance.sourceId);
       if (!source) {
-        return { success: false, error: 'Source not found — cannot rebuild' };
+        return { success: false, error: 'Source not found, cannot rebuild' };
       }
     }
 
@@ -1055,7 +1127,7 @@ async function buildGitInstance(
 ): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
 
-  // Resolve source repo path — fetch from origin first so build uses latest commits
+  // Resolve source repo path: fetch from origin first so build uses latest commits
   let repoPath: string;
   if (instance.sourceId) {
     repoPath = sourceManager.getSourceRepoPath(instance.sourceId);
@@ -1100,10 +1172,10 @@ async function buildGitInstance(
         try {
           const downResult = await casaosApi.composeDown(earlyAppName, metadataComposePath, (msg) => emit(`[Compose down] ${msg}`, 'info'));
           if (!downResult.success) {
-            emit(`[Cleanup] composeDown reported: ${downResult.error || 'failed'} — continuing`, 'warning');
+            emit(`[Cleanup] composeDown reported: ${downResult.error || 'failed'}; continuing`, 'warning');
           }
         } catch (err: any) {
-          emit(`[Cleanup] composeDown threw: ${err?.message || err} — continuing`, 'warning');
+          emit(`[Cleanup] composeDown threw: ${err?.message || err}; continuing`, 'warning');
         }
       }
     }
@@ -1231,7 +1303,7 @@ async function buildGitInstance(
     }, buildArgs);
     emit('[Done] Docker image build completed', 'success');
   } else {
-    emit('[Skip] No build target — docker compose will pull images at start', 'info');
+    emit('[Skip] No build target, docker compose will pull images at start', 'info');
   }
 
   // CasaOS: save to metadata path (only after successful build)

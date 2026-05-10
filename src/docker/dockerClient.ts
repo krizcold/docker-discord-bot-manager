@@ -159,10 +159,87 @@ export async function createBotContainer(
 }
 
 /**
- * Start a container
+ * Start a container and verify it's actually running. Just running
+ * `docker start` and exiting on success is a false-positive: containers
+ * frequently exit immediately after start (bad command, missing env, port
+ * collision) and `docker start` still returns 0 because it succeeded in
+ * issuing the start command.
  */
-export async function startContainer(containerId: string): Promise<void> {
+export async function startContainer(containerId: string, verifyTimeoutMs = 5000): Promise<void> {
   execDocker(['start', containerId]);
+  const ok = await waitForContainerRunning(containerId, verifyTimeoutMs);
+  if (!ok) {
+    // Pull the latest state so the error message tells the operator what
+    // happened (exited with code N, dead, etc.) rather than just "didn't
+    // run". Fall through to the throw if inspect fails too.
+    let stateInfo = 'unknown';
+    try {
+      stateInfo = execDocker(['inspect', '--format', '{{.State.Status}} (exit={{.State.ExitCode}})', containerId]).trim();
+    } catch { /* ignore */ }
+    throw new Error(`Container ${containerId} did not reach 'running' state within ${verifyTimeoutMs}ms; current state: ${stateInfo}`);
+  }
+}
+
+/**
+ * Poll `docker inspect` until the container state is 'running', or the
+ * timeout elapses. Returns true on success, false if the container is in
+ * any non-running state (exited, dead, created, etc.) when time runs out.
+ *
+ * Used after start / compose up to confirm the container actually came
+ * up and stayed up rather than crash-looping out of the gate.
+ */
+export async function waitForContainerRunning(containerId: string, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const state = execDocker(['inspect', '--format', '{{.State.Status}}', containerId]).trim();
+      if (state === 'running') return true;
+      // 'exited', 'dead', 'restarting' etc. are terminal-ish; keep polling
+      // briefly in case of restart loops, but most failures stay failed.
+    } catch { /* container not yet visible to inspect; retry */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return false;
+}
+
+/**
+ * Verify every container in a compose project reaches 'running' state
+ * within the timeout. Returns { allRunning: boolean, problems: string[] }
+ * where problems is a per-container list like
+ * `["myapp-worker: exited (Exited (1) 2 seconds ago)"]`.
+ *
+ * Compose-up reports exit code 0 the moment the API call succeeds, even
+ * if a container immediately crashes on init. This is the post-condition
+ * check that closes that gap.
+ */
+export async function verifyComposeProjectRunning(
+  appName: string,
+  timeoutMs = 5000,
+): Promise<{ allRunning: boolean; problems: string[] }> {
+  const deadline = Date.now() + timeoutMs;
+  let lastProblems: string[] = ['no containers found yet'];
+  while (Date.now() < deadline) {
+    try {
+      const output = execDocker([
+        'ps', '-a',
+        '--filter', `label=com.docker.compose.project=${appName}`,
+        '--format', '{{.Names}}|{{.State}}|{{.Status}}',
+      ]);
+      const lines = (output || '').split('\n').map(l => l.trim()).filter(Boolean);
+      if (lines.length === 0) {
+        lastProblems = ['no containers found in compose project'];
+      } else {
+        const problems = lines
+          .map(l => l.split('|'))
+          .filter(parts => parts[1] !== 'running')
+          .map(([name, state, status]) => `${name}: ${state} (${status})`);
+        if (problems.length === 0) return { allRunning: true, problems: [] };
+        lastProblems = problems;
+      }
+    } catch { /* docker call hiccup; retry */ }
+    await new Promise(r => setTimeout(r, 200));
+  }
+  return { allRunning: false, problems: lastProblems };
 }
 
 /**

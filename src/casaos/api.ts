@@ -5,6 +5,7 @@
 
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
+import { verifyComposeProjectRunning } from '../docker/dockerClient';
 
 const execAsync = promisify(exec);
 
@@ -22,9 +23,14 @@ async function casaosRequest(
   endpoint: string,
   body?: unknown
 ): Promise<unknown> {
+  // -s silences progress, -f makes curl exit non-zero on HTTP >=400 so
+  // execAsync rejects (instead of "successfully" returning an error body
+  // that we then JSON.parse as "success"). Without -f, a 4xx/5xx response
+  // would be swallowed: the curl exits 0, we parse the body, and callers
+  // see what looks like a successful response.
   const curlCmd = body
-    ? `curl -s -X ${method} -H "Content-Type: application/json" -d '${JSON.stringify(body)}' "http://localhost:8080${endpoint}"`
-    : `curl -s -X ${method} "http://localhost:8080${endpoint}"`;
+    ? `curl -sf -X ${method} -H "Content-Type: application/json" -d '${JSON.stringify(body)}' "http://localhost:8080${endpoint}"`
+    : `curl -sf -X ${method} "http://localhost:8080${endpoint}"`;
 
   const dockerCmd = `docker exec casaos sh -c '${curlCmd}'`;
 
@@ -33,10 +39,31 @@ async function casaosRequest(
     if (stderr) {
       console.error('[CasaOS API] stderr:', stderr);
     }
+    // CasaOS may return 200 with an empty body on no-content endpoints;
+    // treat that as "no payload" rather than parse failure.
+    if (!stdout || stdout.trim() === '') return null;
     return JSON.parse(stdout);
   } catch (error) {
     console.error('[CasaOS API] Request failed:', error);
     throw error;
+  }
+}
+
+/**
+ * Inspect a CasaOS response object for explicit error markers. Even with
+ * curl -f, CasaOS sometimes returns 200 with a body like
+ * `{ status: "error", message: "..." }` for no-op or partial-failure cases.
+ * Throwing here surfaces those instead of silently treating the request as
+ * successful.
+ */
+function rejectIfErrorEnvelope(response: unknown, context: string): void {
+  if (!response || typeof response !== 'object') return;
+  const r = response as Record<string, unknown>;
+  if (r.error) {
+    throw new Error(`CasaOS ${context}: ${typeof r.error === 'string' ? r.error : JSON.stringify(r.error)}`);
+  }
+  if (r.status === 'error') {
+    throw new Error(`CasaOS ${context}: ${typeof r.message === 'string' ? r.message : JSON.stringify(r)}`);
   }
 }
 
@@ -58,7 +85,8 @@ export async function listApps(): Promise<CasaOSApp[]> {
  */
 export async function startApp(appName: string): Promise<boolean> {
   try {
-    await casaosRequest('POST', `/v2/app_management/compose/${appName}/start`);
+    const response = await casaosRequest('POST', `/v2/app_management/compose/${appName}/start`);
+    rejectIfErrorEnvelope(response, `start ${appName}`);
     console.log(`[CasaOS API] Started app: ${appName}`);
     return true;
   } catch (error) {
@@ -72,7 +100,8 @@ export async function startApp(appName: string): Promise<boolean> {
  */
 export async function stopApp(appName: string): Promise<boolean> {
   try {
-    await casaosRequest('POST', `/v2/app_management/compose/${appName}/stop`);
+    const response = await casaosRequest('POST', `/v2/app_management/compose/${appName}/stop`);
+    rejectIfErrorEnvelope(response, `stop ${appName}`);
     console.log(`[CasaOS API] Stopped app: ${appName}`);
     return true;
   } catch (error) {
@@ -82,13 +111,28 @@ export async function stopApp(appName: string): Promise<boolean> {
 }
 
 /**
- * Uninstall a compose app
+ * Uninstall a compose app. After the API call returns, verify the app is
+ * actually gone from the CasaOS app list. CasaOS occasionally returns 200
+ * for an uninstall that didn't fully complete (e.g. partial container
+ * removal); without the listApps probe we'd report success with the app
+ * still registered.
  */
 export async function uninstallApp(appName: string): Promise<boolean> {
   try {
-    await casaosRequest('DELETE', `/v2/app_management/compose/${appName}`);
-    console.log(`[CasaOS API] Uninstalled app: ${appName}`);
-    return true;
+    const response = await casaosRequest('DELETE', `/v2/app_management/compose/${appName}`);
+    rejectIfErrorEnvelope(response, `uninstall ${appName}`);
+
+    // Verify removal by polling listApps for up to 5 seconds.
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const apps = await listApps();
+      if (!apps.some(a => a.name === appName)) {
+        console.log(`[CasaOS API] Uninstalled app: ${appName}`);
+        return true;
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+    throw new Error(`CasaOS reported uninstall success but '${appName}' still appears in the app list after 5s`);
   } catch (error) {
     console.error(`[CasaOS API] Failed to uninstall app ${appName}:`, error);
     return false;
@@ -131,23 +175,34 @@ export async function deployApp(
     child.stdout.on('data', processLog);
     child.stderr.on('data', processLog);
 
-    child.on('close', (code) => {
+    child.on('close', async (code) => {
       clearTimeout(timeout);
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
 
-      if (code === 0) {
-        console.log(`[CasaOS API] Deployed app: ${appName}`);
-        resolve({ success: true });
-      } else {
+      if (code !== 0) {
         const lastLines = outputLines.slice(-5).join('\n');
         const msg = lastLines
           ? `docker compose up failed (exit code ${code}):\n${lastLines}`
           : `docker compose up failed (exit code ${code})`;
         console.error(`[CasaOS API] ${msg}`);
         resolve({ success: false, error: msg });
+        return;
       }
+
+      // compose up exits 0 the moment the API call succeeds. Containers
+      // can immediately exit on init (bad command, missing env, port clash)
+      // and we'd still report success without this check.
+      const verification = await verifyComposeProjectRunning(appName, 5000);
+      if (!verification.allRunning) {
+        const msg = `docker compose up exited 0 but containers aren't running: ${verification.problems.join('; ')}`;
+        console.error(`[CasaOS API] ${msg}`);
+        resolve({ success: false, error: msg });
+        return;
+      }
+      console.log(`[CasaOS API] Deployed app: ${appName}`);
+      resolve({ success: true });
     });
 
     child.on('error', (err) => {

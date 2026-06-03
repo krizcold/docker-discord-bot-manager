@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
-import { detectEnvVars } from '../../env/manager';
+import { detectEnvVars, normalizeEnvLabel } from '../../env/manager';
 import { detectBotType } from '../../detection';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
@@ -174,6 +174,22 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       const vars = detectEnvVars(repoPath, { scanSource }).map(v =>
         autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
       );
+
+      // Always surface the bot's token var as a required field, even if the repo
+      // declares it elsewhere (config file, hardcoded) and detection missed it.
+      const tokenVar = detection.tokenVarName;
+      if (tokenVar && !vars.some(v => v.key === tokenVar)) {
+        vars.unshift({
+          key: tokenVar,
+          displayLabel: normalizeEnvLabel(tokenVar),
+          description: '',
+          defaultValue: '',
+          required: true,
+          source: 'env-example',
+          sensitive: true,
+          autoWired: false,
+        });
+      }
 
       res.json({ success: true, vars, tier2Ran: scanSource || !hasEnvExample, hasEnvExample });
     } catch (error) {

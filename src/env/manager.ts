@@ -273,7 +273,7 @@ export function parseEnvExample(repoPath: string): Array<{
 
 // ─── Universal env var detection (install wizard) ───
 
-export type DetectedEnvSource = 'env-example' | 'compose' | 'config' | 'source' | 'readme';
+export type DetectedEnvSource = 'env-example' | 'compose' | 'source';
 
 export interface DetectedEnvVar {
   key: string;
@@ -301,6 +301,29 @@ export function normalizeEnvLabel(key: string): string {
     if (match.test(key)) return label;
   }
   return key;
+}
+
+// Platform / runtime / bot-manager-internal vars that are auto-provided (or
+// resolved via $-substitution) and must never be shown as user input. Only
+// truly auto-managed vars belong here; app/proxy config with real literal
+// values (e.g. BACKEND_HOST) is intentionally NOT hidden.
+const PLATFORM_ENV_DENYLIST = new Set([
+  'TZ', 'PUID', 'PGID', 'PORT', 'NODE_ENV', 'HOSTNAME', 'LANG', 'TERM', 'HOME', 'PATH', 'PWD', 'SHELL', 'USER',
+  'APP_ID', 'APP_DOMAIN', 'APP_PUBLIC_IP_DASH', 'APP_DEFAULT_PASSWORD', 'API_HASH', 'AUTH_HASH', 'APP_TOKEN',
+  'DATA_ROOT', 'BOT_ID', 'UPDATE_TOKEN', 'DOCKER_IMAGE_NAME', 'BUILD_MODE', 'BUILD_DATE',
+]);
+
+function isPlatformEnv(key: string): boolean {
+  return PLATFORM_ENV_DENYLIST.has(key.toUpperCase()) || /^(BOT_MANAGER_|REF_|CADDY_)/i.test(key);
+}
+
+const REQUIRED_TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
+
+// Vars a Discord bot genuinely needs to run, so they show as required in the
+// wizard even without an explicit `# MANDATORY` marker in the compose.
+function isWellKnownRequired(key: string): boolean {
+  const upper = key.toUpperCase();
+  return REQUIRED_TOKEN_RE.test(key) || upper === 'CLIENT_ID' || upper === 'GUILD_ID';
 }
 
 const SOURCE_SCAN_EXTS = new Set(['.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rs', '.cs']);
@@ -370,13 +393,6 @@ export function scanSourceForEnvVars(repoPath: string): string[] {
   return [...found];
 }
 
-function stripEnvRef(value: string): string {
-  const withDefault = value.match(/^\$\{[^:}]+:-(.*)\}$/);
-  if (withDefault) return withDefault[1];
-  if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) return '';
-  return value;
-}
-
 function findComposeFile(repoPath: string): string | null {
   for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
     const p = path.join(repoPath, f);
@@ -385,6 +401,14 @@ function findComposeFile(repoPath: string): string | null {
   return null;
 }
 
+function isSubstitutionValue(value: string): boolean {
+  return value.includes('$');
+}
+
+/**
+ * Read compose `environment:` keys, skipping $-substituted entries (those are
+ * auto-filled by the platform / variable substitution and are never user input).
+ */
 function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: string }> {
   const result: Array<{ key: string; defaultValue: string }> = [];
   const composePath = findComposeFile(repoPath);
@@ -404,11 +428,12 @@ function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: s
           const eq = entry.indexOf('=');
           const key = eq >= 0 ? entry.slice(0, eq) : entry;
           const val = eq >= 0 ? entry.slice(eq + 1) : '';
-          if (key && !seen.has(key)) { seen.add(key); result.push({ key, defaultValue: stripEnvRef(val) }); }
+          if (key && !seen.has(key) && !isSubstitutionValue(val)) { seen.add(key); result.push({ key, defaultValue: val }); }
         }
       } else if (env && typeof env === 'object') {
-        for (const [key, val] of Object.entries(env)) {
-          if (!seen.has(key)) { seen.add(key); result.push({ key, defaultValue: stripEnvRef(val == null ? '' : String(val)) }); }
+        for (const [key, raw] of Object.entries(env)) {
+          const val = raw == null ? '' : String(raw);
+          if (!seen.has(key) && !isSubstitutionValue(val)) { seen.add(key); result.push({ key, defaultValue: val }); }
         }
       }
     }
@@ -418,52 +443,36 @@ function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: s
   return result;
 }
 
-function parseConfigExample(repoPath: string): Array<{ key: string; defaultValue: string }> {
-  const result: Array<{ key: string; defaultValue: string }> = [];
-  for (const f of ['config.example.json', 'config.json.example', 'config.sample.json']) {
-    const p = path.join(repoPath, f);
-    if (!fs.existsSync(p)) continue;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
-      if (parsed && typeof parsed === 'object') {
-        for (const [key, val] of Object.entries(parsed)) {
-          if (val === null || typeof val !== 'object') {
-            result.push({ key, defaultValue: val == null ? '' : String(val) });
-          }
-        }
-      }
-    } catch {
-      // ignore malformed config
+/**
+ * Find compose env keys explicitly marked mandatory via a trailing
+ * `# MANDATORY` / `# required` comment.
+ */
+function findMandatoryComposeKeys(repoPath: string): Set<string> {
+  const keys = new Set<string>();
+  const composePath = findComposeFile(repoPath);
+  if (!composePath) return keys;
+  try {
+    const content = fs.readFileSync(composePath, 'utf-8');
+    for (const line of content.split('\n')) {
+      const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:[^#]*#\s*(?:mandatory|required)\b/i);
+      if (m) keys.add(m[1]);
     }
-    break;
+  } catch {
+    // ignore
   }
-  return result;
-}
-
-function scanReadmeForEnvVars(repoPath: string): string[] {
-  for (const name of ['README.md', 'readme.md', 'README.MD', 'Readme.md']) {
-    const p = path.join(repoPath, name);
-    if (!fs.existsSync(p)) continue;
-    try {
-      const content = fs.readFileSync(p, 'utf-8');
-      const found = new Set<string>();
-      const re = /\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(content)) !== null) {
-        if (!ENV_SCAN_DENYLIST.has(m[1])) found.add(m[1]);
-      }
-      return [...found];
-    } catch {
-      return [];
-    }
-  }
-  return [];
+  return keys;
 }
 
 /**
- * Detect all environment variables a repo expects, for the install wizard.
- * Tier 1 (.env.example, compose, config) always runs. Tier 2 (source + README scan)
- * runs when there is no .env.example or when scanSource is forced.
+ * Detect environment variables a repo expects, for the install wizard.
+ *
+ * Default view returns only the vars the user genuinely must provide:
+ *   - .env.example entries with no default value
+ *   - compose env keys explicitly marked `# MANDATORY` / `# required`
+ * Platform / $-substituted / bot-manager-internal vars are always excluded.
+ *
+ * scanSource=true additionally returns optional/discovered vars (compose
+ * entries with defaults + a source-code `process.env` scan).
  */
 export function detectEnvVars(
   repoPath: string,
@@ -471,31 +480,40 @@ export function detectEnvVars(
 ): DetectedEnvVar[] {
   const byKey = new Map<string, DetectedEnvVar>();
 
-  const add = (key: string, defaultValue: string, source: DetectedEnvSource, description = '') => {
-    if (!key || byKey.has(key)) return;   // first source wins (precedence by call order)
+  const add = (key: string, defaultValue: string, source: DetectedEnvSource, required: boolean, description = '') => {
+    if (!key || isPlatformEnv(key) || byKey.has(key)) return;   // first source wins
     byKey.set(key, {
       key,
       displayLabel: normalizeEnvLabel(key),
       description,
       defaultValue,
-      required: defaultValue.trim() === '',
+      required,
       source,
       sensitive: isSensitive(key),
       autoWired: false,
     });
   };
 
-  // Tier 1
-  const fromExample = parseEnvExample(repoPath);
-  for (const e of fromExample) add(e.key, e.defaultValue, 'env-example', e.description);
-  for (const e of parseComposeEnv(repoPath)) add(e.key, e.defaultValue, 'compose');
-  for (const e of parseConfigExample(repoPath)) add(e.key, e.defaultValue, 'config');
-
-  // Tier 2
-  if (options?.scanSource || fromExample.length === 0) {
-    for (const key of scanSourceForEnvVars(repoPath)) add(key, '', 'source');
-    for (const key of scanReadmeForEnvVars(repoPath)) add(key, '', 'readme');
+  // .env.example: required when no default
+  for (const e of parseEnvExample(repoPath)) {
+    add(e.key, e.defaultValue, 'env-example', e.defaultValue.trim() === '', e.description);
   }
 
-  return [...byKey.values()];
+  // compose: required when marked mandatory or a well-known required Discord var
+  const mandatory = findMandatoryComposeKeys(repoPath);
+  for (const e of parseComposeEnv(repoPath)) {
+    add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isWellKnownRequired(e.key));
+  }
+
+  // Tier 2 source scan: explicit opt-in only, always optional
+  if (options?.scanSource) {
+    for (const key of scanSourceForEnvVars(repoPath)) add(key, '', 'source', false);
+  }
+
+  const all = [...byKey.values()];
+  if (options?.scanSource) return all;
+  // Default view: required vars + any var that has a real pre-filled (non-$)
+  // value, so the user can see/override it. Empty optional vars stay behind the
+  // "Scan source for envs" button.
+  return all.filter(v => v.required || v.defaultValue.trim() !== '');
 }

@@ -127,6 +127,34 @@ async function readHeadCommit(repoPath: string): Promise<{ hash: string; message
   }
 }
 
+/**
+ * Clone a repo, returning the actual branch cloned. When no branch is given
+ * (or the requested branch does not exist), clone the remote's default branch
+ * and report its real name so the registry stores the correct branch.
+ */
+async function cloneRepo(url: string, repoPath: string, branch?: string | null): Promise<string> {
+  // Clean any leftover dir from a previous failed clone so git won't refuse a non-empty target
+  if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
+  const git: SimpleGit = simpleGit();
+  if (branch) {
+    try {
+      await git.clone(url, repoPath, ['--branch', branch, '--single-branch']);
+      return branch;
+    } catch (err) {
+      if (!/Remote branch .* not found/i.test(String(err))) throw err;
+      console.warn(`[SourceManager] Branch '${branch}' not found for ${getDisplayUrl(url)}; falling back to the default branch`);
+      if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
+    }
+  }
+  await git.clone(url, repoPath, ['--single-branch']);
+  try {
+    const actual = (await simpleGit(repoPath).revparse(['--abbrev-ref', 'HEAD'])).trim();
+    return actual || 'main';
+  } catch {
+    return 'main';
+  }
+}
+
 function extractComposeName(repoPath: string): string | null {
   const composePath = hasExistingCompose(repoPath);
   if (!composePath) return null;
@@ -149,7 +177,6 @@ export function getSource(sourceId: string): SourceMeta | null {
 export async function createSource(request: CreateSourceRequest): Promise<SourceMeta> {
   const registry = loadSourceRegistry();
   const sourceId = uuidv4();
-  const branch = request.branch || 'main';
   const now = new Date().toISOString();
 
   // Create directory structure
@@ -157,11 +184,10 @@ export async function createSource(request: CreateSourceRequest): Promise<Source
   const repoPath = getSourceRepoPath(sourceId);
   fs.mkdirSync(sourceDir, { recursive: true });
 
-  // Clone repository
-  console.log(`[SourceManager] Cloning ${getDisplayUrl(request.url)} (branch: ${branch})`);
-  const git: SimpleGit = simpleGit();
-  await git.clone(request.url, repoPath, ['--branch', branch, '--single-branch']);
-  console.log(`[SourceManager] Repository cloned to ${repoPath}`);
+  // Clone repository (auto-detects the default branch when none is given)
+  console.log(`[SourceManager] Cloning ${getDisplayUrl(request.url)} (branch: ${request.branch || 'auto'})`);
+  const branch = await cloneRepo(request.url, repoPath, request.branch);
+  console.log(`[SourceManager] Repository cloned to ${repoPath} (branch: ${branch})`);
 
   // Raw backup
   createSourceRawBackup(sourceId);
@@ -253,8 +279,7 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     console.log(`[SourceManager] Source ${sourceId} not cloned yet, cloning...`);
     const sourceDir = getSourceDir(sourceId);
     fs.mkdirSync(sourceDir, { recursive: true });
-    const git: SimpleGit = simpleGit();
-    await git.clone(source.url, repoPath, ['--branch', source.branch, '--single-branch']);
+    const actualBranch = await cloneRepo(source.url, repoPath, source.branch);
     createSourceRawBackup(sourceId);
 
     // Save original compose if exists
@@ -268,6 +293,7 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     const registry = loadSourceRegistry();
     const s = registry.sources[sourceId];
     if (s) {
+      s.branch = actualBranch;
       s.lastCommitHash = headCommit?.hash || null;
       s.lastCommitMessage = headCommit?.message || null;
       s.lastCommitDate = headCommit?.date || null;
@@ -428,30 +454,32 @@ export function findSourceByUrl(url: string): SourceMeta | null {
 
 // ─── Default Sources (seeded on first run) ───
 
+// branch '' means auto-detect the remote's default branch at clone time
+// (repos vary between main / master / develop).
 const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
   // Our bot
-  { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: 'main' },
+  { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: '' },
   // Tier 1: Have Docker + compose
-  { url: 'https://github.com/eritislami/evobot', branch: 'main' },
-  { url: 'https://github.com/modmail-dev/Modmail', branch: 'main' },
-  { url: 'https://github.com/bongodevs/lavamusic', branch: 'main' },
-  { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: 'main' },
-  { url: 'https://github.com/open-discord-bots/open-ticket', branch: 'main' },
-  { url: 'https://github.com/python-discord/bot', branch: 'main' },
-  { url: 'https://github.com/disbored/egglord', branch: 'main' },
-  { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: 'main' },
+  { url: 'https://github.com/eritislami/evobot', branch: '' },
+  { url: 'https://github.com/modmail-dev/Modmail', branch: '' },
+  { url: 'https://github.com/bongodevs/lavamusic', branch: '' },
+  { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: '' },
+  { url: 'https://github.com/open-discord-bots/open-ticket', branch: '' },
+  { url: 'https://github.com/python-discord/bot', branch: '' },
+  { url: 'https://github.com/disbored/egglord', branch: '' },
+  { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: '' },
   // Tier 2: Have Dockerfile, no compose
-  { url: 'https://github.com/Androz2091/AtlantaBot', branch: 'main' },
-  { url: 'https://github.com/nadeko-bot/nadekobot', branch: 'main' },
-  { url: 'https://github.com/discord-tickets/bot', branch: 'main' },
+  { url: 'https://github.com/Androz2091/AtlantaBot', branch: '' },
+  { url: 'https://github.com/nadeko-bot/nadekobot', branch: '' },
+  { url: 'https://github.com/discord-tickets/bot', branch: '' },
   // Tier 3: No Docker
-  { url: 'https://github.com/Cog-Creators/Red-DiscordBot', branch: 'main' },
-  { url: 'https://github.com/jagrosh/MusicBot', branch: 'main' },
-  { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: 'main' },
-  { url: 'https://github.com/kkrypt0nn/Python-Discord-Bot-Template', branch: 'main' },
-  { url: 'https://github.com/botlabs-gg/yagpdb', branch: 'main' },
-  { url: 'https://github.com/jagrosh/GiveawayBot', branch: 'main' },
-  { url: 'https://github.com/LorittaBot/Loritta', branch: 'main' },
+  { url: 'https://github.com/Cog-Creators/Red-DiscordBot', branch: '' },
+  { url: 'https://github.com/jagrosh/MusicBot', branch: '' },
+  { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: '' },
+  { url: 'https://github.com/kkrypt0nn/Python-Discord-Bot-Template', branch: '' },
+  { url: 'https://github.com/botlabs-gg/yagpdb', branch: '' },
+  { url: 'https://github.com/jagrosh/GiveawayBot', branch: '' },
+  { url: 'https://github.com/LorittaBot/Loritta', branch: '' },
 ];
 
 /**

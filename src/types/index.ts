@@ -5,10 +5,21 @@
 
 // ─── Enums / Literals ───
 
-export type BotType = 'nodejs' | 'python' | 'go' | 'java' | 'dockerfile' | 'compose' | 'unknown';
+export type BotType = 'nodejs' | 'python' | 'go' | 'java' | 'rust' | 'csharp' | 'dockerfile' | 'compose' | 'unknown';
 export type DeploymentMode = 'casaos' | 'docker';
 export type BotStatus = 'stopped' | 'starting' | 'running' | 'stopping' | 'error' | 'building';
 export type BotSourceType = 'git' | 'docker-image';
+
+export type PackageManager =
+  | 'npm' | 'yarn' | 'pnpm' | 'bun'
+  | 'pip' | 'poetry' | 'uv' | 'pipenv' | 'setuptools'
+  | 'go'
+  | 'cargo'
+  | 'maven' | 'gradle'
+  | 'dotnet';
+
+export type DatabaseKind = 'postgres' | 'mongo' | 'mariadb' | 'mysql' | 'redis' | 'sqlite';
+export type SystemDep = 'ffmpeg' | 'libopus' | 'libsodium' | 'build-essential' | 'libcairo';
 
 // ─── Source ───
 
@@ -59,6 +70,10 @@ export interface InstanceConfig {
   // Detection (for git source)
   botType?: BotType;
   hasDatabase?: boolean;
+  databases?: DatabaseKind[];
+  needsLavalink?: boolean;
+  hasWebDashboard?: boolean;
+  tokenVarName?: string;
 
   // Lifecycle
   hasBeenStarted?: boolean;
@@ -141,7 +156,19 @@ export interface DetectionResult {
   hasCompose: boolean;
   hasDatabase: boolean;
   entryPoint?: string;
-  packageManager?: 'npm' | 'yarn' | 'pnpm' | 'pip' | 'poetry' | 'go' | 'maven' | 'gradle';
+  packageManager?: PackageManager;
+
+  databases: DatabaseKind[];
+  needsLavalink: boolean;
+  hasMusic: boolean;
+  hasWebDashboard: boolean;
+  systemDeps: SystemDep[];
+  tokenVarName: string;
+  isTypeScript: boolean;
+  packageName?: string;         // Rust binary name / C# assembly name
+  webPort?: number;             // detected web dashboard port, if any
+  jarPattern?: string;          // Java jar glob to COPY (shade/shadow aware)
+  prebuiltJar?: boolean;        // Java repo ships a .jar with no build files
 }
 
 // ─── Docker ───

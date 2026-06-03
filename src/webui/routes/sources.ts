@@ -5,8 +5,12 @@
 
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
+import { detectEnvVars } from '../../env/manager';
+import { detectBotType } from '../../detection';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
 export function createSourceRoutes(wss: WebSocketServer): Router {
@@ -126,6 +130,52 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       }
 
       res.json({ success: true, ...result });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/sources/:id/envs - Detect env vars from the source repo for the wizard.
+   * ?scan=true forces the Tier 2 source-code scan.
+   */
+  router.get('/:id/envs', async (req: Request, res: Response) => {
+    try {
+      const source = sourceManager.getSource(req.params.id);
+      if (!source) {
+        res.status(404).json({ success: false, error: 'Source not found' });
+        return;
+      }
+
+      const repoPath = sourceManager.getSourceRepoPath(req.params.id);
+      if (!fs.existsSync(repoPath)) {
+        res.json({ success: true, vars: [], tier2Ran: false, hasEnvExample: false, notCloned: true });
+        return;
+      }
+
+      const scanSource = req.query.scan === 'true';
+      const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
+      const detection = detectBotType(repoPath);
+
+      const autoWiredKeys = new Set<string>();
+      if (!detection.hasCompose) {
+        for (const db of detection.databases) {
+          if (db === 'postgres' || db === 'mariadb' || db === 'mysql') autoWiredKeys.add('DATABASE_URL');
+          if (db === 'mongo') { autoWiredKeys.add('MONGO_URI'); autoWiredKeys.add('MONGODB_URI'); }
+          if (db === 'redis') autoWiredKeys.add('REDIS_URL');
+        }
+        if (detection.needsLavalink) {
+          autoWiredKeys.add('LAVALINK_HOST');
+          autoWiredKeys.add('LAVALINK_PORT');
+          autoWiredKeys.add('LAVALINK_PASSWORD');
+        }
+      }
+
+      const vars = detectEnvVars(repoPath, { scanSource }).map(v =>
+        autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
+      );
+
+      res.json({ success: true, vars, tier2Ran: scanSource || !hasEnvExample, hasEnvExample });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

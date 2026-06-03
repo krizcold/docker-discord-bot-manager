@@ -30,6 +30,14 @@ interface CasaOSVolumeDescription {
   description: { en_us: string };
 }
 
+interface HealthCheck {
+  test: string[];
+  interval?: string;
+  timeout?: string;
+  retries?: number;
+  start_period?: string;
+}
+
 interface ComposeService {
   image?: string;
   build?: { context: string; dockerfile: string };
@@ -42,6 +50,7 @@ interface ComposeService {
   labels?: Record<string, string>;
   networks?: string[];
   expose?: string[];
+  healthcheck?: HealthCheck;
   'x-casaos'?: { volumes?: CasaOSVolumeDescription[] };
 }
 
@@ -133,10 +142,8 @@ export function generateCompose(
 
   compose.services['bot'] = botService;
 
-  // Add database if detected
-  if (detection.hasDatabase && !detection.hasCompose) {
-    addDatabaseService(compose, bot.id, appName);
-  }
+  // Add backing services (databases + Lavalink) detected from dependencies
+  addBackingServices(compose, bot, appName, detection);
 
   // CasaOS metadata
   compose['x-casaos'] = {
@@ -157,49 +164,178 @@ export function generateCompose(
 }
 
 /**
- * Add database service (PostgreSQL)
+ * Add backing services (databases + Lavalink) based on detection, wiring the
+ * connection env vars onto the bot service. Lavalink is driven by needsLavalink;
+ * databases are added per detected engine. SQLite needs no service (the existing
+ * /app/data bind persists the db file).
  */
-function addDatabaseService(compose: ComposeFile, botId: string, appName: string): void {
-  const dbVolumeName = `${appName}-db-data`;
+function addBackingServices(
+  compose: ComposeFile,
+  bot: BotConfig,
+  appName: string,
+  detection: DetectionResult
+): void {
+  const botService = compose.services['bot'];
+  const pw = defaultDbPassword();
 
-  compose.services['db'] = {
-    image: 'postgres:15-alpine',
-    container_name: `${appName}-db`,
+  for (const db of detection.databases) {
+    switch (db) {
+      case 'postgres': addPostgres(compose, botService, bot.id, appName, pw); break;
+      case 'mongo': addMongo(compose, botService, bot.id, appName, pw); break;
+      case 'mariadb':
+      case 'mysql': addMariadb(compose, botService, bot.id, appName, pw); break;
+      case 'redis': addRedis(compose, botService, bot.id, appName); break;
+      case 'sqlite': break;
+    }
+  }
+
+  if (detection.needsLavalink) {
+    addLavalink(compose, botService, bot.id, appName);
+  }
+}
+
+function defaultDbPassword(): string {
+  return process.env.APP_DEFAULT_PASSWORD || 'casaos';
+}
+
+function dbLabels(botId: string, serviceType: string): Record<string, string> {
+  return { 'managed-by': 'discord-bot-manager', 'bot-id': botId, 'service-type': serviceType };
+}
+
+function addDependency(botService: ComposeService, dep: string): void {
+  if (!botService.depends_on) botService.depends_on = [];
+  if (!botService.depends_on.includes(dep)) botService.depends_on.push(dep);
+}
+
+function setBotEnv(botService: ComposeService, vars: Record<string, string>): void {
+  if (!botService.environment) botService.environment = {};
+  for (const [key, value] of Object.entries(vars)) {
+    if (!(key in botService.environment)) botService.environment[key] = value;
+  }
+}
+
+function registerVolume(compose: ComposeFile, name: string): void {
+  compose.volumes = compose.volumes || {};
+  compose.volumes[name] = {};
+}
+
+function addPostgres(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string): void {
+  if (compose.services['postgres']) return;
+  const volName = `${appName}-postgres-data`;
+  compose.services['postgres'] = {
+    image: 'postgres:16-alpine',
+    container_name: `${appName}-postgres`,
     restart: 'unless-stopped',
     cpu_shares: 10,
     networks: ['internal'],
     environment: {
       POSTGRES_USER: 'bot',
-      POSTGRES_PASSWORD: 'bot_password',
+      POSTGRES_PASSWORD: pw,
       POSTGRES_DB: 'bot_data'
     },
-    volumes: [{
-      type: 'volume',
-      source: dbVolumeName,
-      target: '/var/lib/postgresql/data'
-    }],
-    labels: {
-      'managed-by': 'discord-bot-manager',
-      'bot-id': botId,
-      'service-type': 'database'
-    },
-    'x-casaos': {
-      volumes: [{
-        container: '/var/lib/postgresql/data',
-        description: { en_us: 'PostgreSQL database storage.' }
-      }]
-    }
+    volumes: [{ type: 'volume', source: volName, target: '/var/lib/postgresql/data' }],
+    labels: dbLabels(botId, 'database'),
+    'x-casaos': { volumes: [{ container: '/var/lib/postgresql/data', description: { en_us: 'PostgreSQL database storage.' } }] }
   };
+  addDependency(botService, 'postgres');
+  setBotEnv(botService, { DATABASE_URL: `postgresql://bot:${pw}@postgres:5432/bot_data` });
+  registerVolume(compose, volName);
+}
 
-  compose.services['bot'].depends_on = ['db'];
+function addMongo(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string): void {
+  if (compose.services['mongo']) return;
+  const volName = `${appName}-mongo-data`;
+  compose.services['mongo'] = {
+    image: 'mongo:7',
+    container_name: `${appName}-mongo`,
+    restart: 'unless-stopped',
+    cpu_shares: 10,
+    networks: ['internal'],
+    environment: {
+      MONGO_INITDB_ROOT_USERNAME: 'bot',
+      MONGO_INITDB_ROOT_PASSWORD: pw
+    },
+    volumes: [{ type: 'volume', source: volName, target: '/data/db' }],
+    labels: dbLabels(botId, 'database'),
+    'x-casaos': { volumes: [{ container: '/data/db', description: { en_us: 'MongoDB database storage.' } }] }
+  };
+  addDependency(botService, 'mongo');
+  const uri = `mongodb://bot:${pw}@mongo:27017/bot_data?authSource=admin`;
+  setBotEnv(botService, { MONGO_URI: uri, MONGODB_URI: uri });
+  registerVolume(compose, volName);
+}
 
-  if (!compose.services['bot'].environment) {
-    compose.services['bot'].environment = {};
-  }
-  compose.services['bot'].environment['DATABASE_URL'] = 'postgresql://bot:bot_password@db:5432/bot_data';
+function addMariadb(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string): void {
+  if (compose.services['mariadb']) return;
+  const volName = `${appName}-mariadb-data`;
+  compose.services['mariadb'] = {
+    image: 'mariadb:11',
+    container_name: `${appName}-mariadb`,
+    restart: 'unless-stopped',
+    cpu_shares: 10,
+    networks: ['internal'],
+    environment: {
+      MARIADB_USER: 'bot',
+      MARIADB_PASSWORD: pw,
+      MARIADB_DATABASE: 'bot_data',
+      MARIADB_ROOT_PASSWORD: pw
+    },
+    volumes: [{ type: 'volume', source: volName, target: '/var/lib/mysql' }],
+    labels: dbLabels(botId, 'database'),
+    'x-casaos': { volumes: [{ container: '/var/lib/mysql', description: { en_us: 'MariaDB database storage.' } }] }
+  };
+  addDependency(botService, 'mariadb');
+  setBotEnv(botService, { DATABASE_URL: `mysql://bot:${pw}@mariadb:3306/bot_data` });
+  registerVolume(compose, volName);
+}
 
-  compose.volumes = compose.volumes || {};
-  compose.volumes[dbVolumeName] = {};
+function addRedis(compose: ComposeFile, botService: ComposeService, botId: string, appName: string): void {
+  if (compose.services['redis']) return;
+  const volName = `${appName}-redis-data`;
+  compose.services['redis'] = {
+    image: 'redis:7-alpine',
+    container_name: `${appName}-redis`,
+    restart: 'unless-stopped',
+    cpu_shares: 10,
+    networks: ['internal'],
+    volumes: [{ type: 'volume', source: volName, target: '/data' }],
+    labels: dbLabels(botId, 'cache'),
+    'x-casaos': { volumes: [{ container: '/data', description: { en_us: 'Redis data storage.' } }] }
+  };
+  addDependency(botService, 'redis');
+  setBotEnv(botService, { REDIS_URL: 'redis://redis:6379' });
+  registerVolume(compose, volName);
+}
+
+function addLavalink(compose: ComposeFile, botService: ComposeService, botId: string, appName: string): void {
+  if (compose.services['lavalink']) return;
+  compose.services['lavalink'] = {
+    image: 'ghcr.io/lavalink-devs/lavalink:4',
+    container_name: `${appName}-lavalink`,
+    restart: 'unless-stopped',
+    cpu_shares: 20,
+    networks: ['internal'],
+    environment: {
+      _JAVA_OPTIONS: '-Xmx1G',
+      SERVER_PORT: '2333',
+      LAVALINK_SERVER_PASSWORD: 'youshallnotpass'
+    },
+    expose: ['2333'],
+    healthcheck: {
+      test: ['CMD-SHELL', "curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: youshallnotpass' http://localhost:2333/version | grep -q 200"],
+      interval: '30s',
+      timeout: '10s',
+      retries: 5,
+      start_period: '30s'
+    },
+    labels: dbLabels(botId, 'lavalink')
+  };
+  addDependency(botService, 'lavalink');
+  setBotEnv(botService, {
+    LAVALINK_HOST: 'lavalink',
+    LAVALINK_PORT: '2333',
+    LAVALINK_PASSWORD: 'youshallnotpass'
+  });
 }
 
 /**
@@ -246,6 +382,23 @@ function formatComposeYaml(compose: ComposeFile): string {
         const formatted = needsQuotes ? `"${value.replace(/"/g, '\\"')}"` : value;
         lines.push(`      ${key}: ${formatted}`);
       }
+    }
+
+    if (service.expose?.length) {
+      lines.push('    expose:');
+      for (const port of service.expose) {
+        lines.push(`      - "${port}"`);
+      }
+    }
+
+    if (service.healthcheck) {
+      const hc = service.healthcheck;
+      lines.push('    healthcheck:');
+      lines.push(`      test: [${hc.test.map(t => JSON.stringify(t)).join(', ')}]`);
+      if (hc.interval) lines.push(`      interval: ${hc.interval}`);
+      if (hc.timeout) lines.push(`      timeout: ${hc.timeout}`);
+      if (hc.retries !== undefined) lines.push(`      retries: ${hc.retries}`);
+      if (hc.start_period) lines.push(`      start_period: ${hc.start_period}`);
     }
 
     if (service.volumes?.length) {
@@ -395,7 +548,7 @@ export function adaptExistingCompose(
   // 2. Single-pass CasaOS processing: parse YAML once, apply all modifications, stringify once.
   //    Handles: version removal, name field, labels, x-casaos metadata, ports→expose,
   //    hostname, icon label, is_uncontrolled, volume paths, networks, PUID/PGID
-  content = processComposeForCasaOS(content, appName, bot);
+  content = processComposeForCasaOS(content, appName, bot).content;
 
   return { content, appName };
 }

@@ -198,6 +198,7 @@
       color: var(--text-primary); font-size: 0.82rem;
     }
     .env-row input:focus { outline: none; border-color: var(--border-focus); }
+    .env-row.env-autowired input { opacity: 0.55; cursor: not-allowed; }
     .env-row .btn-remove {
       padding: 6px; background: none; border: none; color: var(--danger);
       cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
@@ -1976,12 +1977,11 @@
 
       document.getElementById('install-modal').classList.remove('hidden');
 
-      // Pre-load env hints from source repo's .env.example
+      // Detect env vars from the source repo (Tier 1; Tier 2 auto-runs when no .env.example)
       try {
-        const res = await api('GET', `/sources/${sourceId}`);
-        if (res.success && res.source) {
-          // Try to get env example from the source repo via a temp peek
-          // For now, use default env hints; they'll be overridden after instance creation
+        const res = await api('GET', `/sources/${sourceId}/envs`);
+        if (res.success && Array.isArray(res.vars)) {
+          installEnvHints = res.vars;
         }
       } catch (e) { /* non-fatal */ }
 
@@ -2003,9 +2003,13 @@
       let envRowsHtml = '';
       if (installEnvHints.length > 0) {
         envRowsHtml = installEnvHints.map(h => {
-          const label = getEnvLabel(h.key) || h.description;
-          const req = isRequiredEnv(h.key);
-          return buildEnvRowHtml(h.key, h.defaultValue || '', label, req, '');
+          const label = h.displayLabel || getEnvLabel(h.key) || h.description || '';
+          if (h.autoWired) {
+            return buildAutoWiredRowHtml(h.key, label);
+          }
+          const placeholder = h.sensitive ? 'Sensitive value' : (h.defaultValue || 'Value');
+          const value = h.sensitive ? '' : (h.defaultValue || '');
+          return buildEnvRowHtml(h.key, value, label, !!h.required, placeholder);
         }).join('');
       } else {
         envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
@@ -2037,7 +2041,10 @@
         <div class="form-group">
           <label>Environment Variables</label>
           <div id="install-env-rows">${envRowsHtml}</div>
-          <button class="btn btn-secondary btn-small" onclick="addInstallEnvRow()" style="margin-top: 4px;">+ Add Variable</button>
+          <div style="margin-top: 4px; display: flex; gap: 6px;">
+            <button class="btn btn-secondary btn-small" onclick="addInstallEnvRow()">+ Add Variable</button>
+            <button class="btn btn-secondary btn-small" onclick="scanInstallEnvs()">Scan source for envs</button>
+          </div>
         </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideInstallModal()">Cancel</button>
@@ -2056,6 +2063,38 @@
         <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
       </div>`;
       container.appendChild(wrapper);
+    }
+
+    function buildAutoWiredRowHtml(key, label) {
+      const labelHtml = label ? `<div class="env-label">${escapeHtml(label)}</div>` : '';
+      return `<div>
+        ${labelHtml}
+        <div class="env-row env-autowired">
+          <input type="text" value="${escapeHtml(key)}" class="env-key" disabled>
+          <input type="text" value="Auto-configured" class="env-value" disabled title="Configured automatically by the bot manager">
+        </div>
+      </div>`;
+    }
+
+    async function scanInstallEnvs() {
+      if (!installSourceId) return;
+      try {
+        const res = await api('GET', `/sources/${installSourceId}/envs?scan=true`);
+        if (!res.success || !Array.isArray(res.vars)) { showMessage('error', 'Scan failed'); return; }
+        const existing = new Set(
+          Array.from(document.querySelectorAll('#install-env-rows .env-key')).map(i => i.value.trim())
+        );
+        let added = 0;
+        for (const v of res.vars) {
+          if (v.autoWired || existing.has(v.key)) continue;
+          addInstallEnvRow(v.key, v.defaultValue || '');
+          existing.add(v.key);
+          added++;
+        }
+        showMessage('success', added > 0 ? `Found ${added} additional variable(s)` : 'No new variables found');
+      } catch (e) {
+        showMessage('error', 'Scan failed');
+      }
     }
 
     function toggleNameLock() {
@@ -2174,10 +2213,11 @@
       const name = document.getElementById('install-name').value.trim();
       if (!name) { showMessage('error', 'Name is required'); return; }
 
-      // Collect env vars
+      // Collect env vars (skip auto-wired rows; those are injected by the compose generator)
       const rows = document.querySelectorAll('#install-env-rows .env-row');
       const vars = {};
       rows.forEach(row => {
+        if (row.classList.contains('env-autowired')) return;
         const key = row.querySelector('.env-key').value.trim();
         const value = row.querySelector('.env-value').value.trim();
         if (key) vars[key] = value;

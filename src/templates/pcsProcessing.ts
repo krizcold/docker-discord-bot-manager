@@ -11,6 +11,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
 import { BotConfig } from '../types';
+import { buildStatusPageService } from './statusPage';
 
 const execAsync = promisify(exec);
 
@@ -125,7 +126,7 @@ export function processComposeForCasaOS(
   composeContent: string,
   appName: string,
   bot: BotConfig
-): string {
+): { content: string; sidecarInjected: boolean } {
   const pcs = getPCSEnvironment();
   const doc = parseDocument(composeContent);
   const compose = doc.toJSON() as Record<string, unknown>;
@@ -138,16 +139,40 @@ export function processComposeForCasaOS(
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) {
-    return stringify(compose, { lineWidth: 0 });
+    return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
   }
 
-  const mainServiceName = getMainServiceName(compose);
+  let mainServiceName = getMainServiceName(compose);
+
+  // ── Status-page sidecar ──
+  // Bots with no web port get an nginx tile so CasaOS has something to "Open".
+  // Injected before the per-service pass so it inherits Caddy labels, webui_port,
+  // network, and PUID/TZ handling as the new main service.
+  let sidecarInjected = false;
+  const mainSvcForPort = mainServiceName ? services[mainServiceName] : undefined;
+  const xcEarly = compose['x-casaos'] as Record<string, unknown> | undefined;
+  const mainHasPort =
+    (Array.isArray(mainSvcForPort?.ports) && (mainSvcForPort!.ports as unknown[]).length > 0) ||
+    (Array.isArray(mainSvcForPort?.expose) && (mainSvcForPort!.expose as unknown[]).length > 0);
+  if (!(xcEarly?.webui_port !== undefined || mainHasPort)) {
+    services['status-page'] = buildStatusPageService(appName, bot.id);
+    if (!compose['x-casaos']) compose['x-casaos'] = {};
+    (compose['x-casaos'] as Record<string, unknown>).main = 'status-page';
+    mainServiceName = 'status-page';
+    sidecarInjected = true;
+  }
 
   // Known infrastructure service names that get low cpu_shares (10)
   const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
 
   // ── Per-service modifications ──
   for (const [serviceName, service] of Object.entries(services)) {
+
+    // Activate all compose profiles: strip the key so every service runs
+    // unconditionally (survives CasaOS re-deploys, unlike a --profile flag)
+    if (service.profiles !== undefined) {
+      delete service.profiles;
+    }
 
     // cpu_shares: mandatory on all services (50 default, 10 for infra)
     if (service.cpu_shares === undefined) {
@@ -399,7 +424,7 @@ export function processComposeForCasaOS(
   }
 
   // ── Single stringify ──
-  return stringify(compose, { lineWidth: 0 });
+  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected };
 }
 
 // ─── Volume Directory Creation ─────────────────────────────────────────────
@@ -534,6 +559,52 @@ export async function saveToCasaOSMetadata(
 
   log(`[PCS] Saved CasaOS metadata compose to ${composePath}`);
   return composePath;
+}
+
+/**
+ * Write the status-page index.html into the sidecar's bind-mounted dir.
+ * Mirrors saveToCasaOSMetadata's docker-exec-into-casaos write pattern.
+ */
+export async function writeStatusPage(
+  appName: string,
+  html: string,
+  logFn?: (msg: string) => void
+): Promise<string> {
+  const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const pcs = getPCSEnvironment();
+
+  const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'status-page');
+  const filePath = path.join(dir, 'index.html');
+
+  try {
+    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dir}"`, { timeout: 10000 });
+  } catch {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      await execAsync(`chown -R 1000:1000 "${dir}"`, { timeout: 5000 });
+    } catch (fallbackErr) {
+      log(`[PCS] Warning: Could not set ownership on ${dir}: ${fallbackErr}`);
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  fs.writeFileSync(filePath, html);
+
+  try {
+    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chmod 644 "${filePath}"`, { timeout: 10000 });
+  } catch {
+    try {
+      await execAsync(`chown 1000:1000 "${filePath}"`, { timeout: 5000 });
+      await execAsync(`chmod 644 "${filePath}"`, { timeout: 5000 });
+    } catch {
+      // Best effort
+    }
+  }
+
+  log(`[PCS] Wrote status page to ${filePath}`);
+  return filePath;
 }
 
 /**

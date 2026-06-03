@@ -17,6 +17,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
+  DetectionResult,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { getBotDir, getDataPath, getEnvPath } from '../git/repoManager';
@@ -37,9 +38,11 @@ import {
   extractAppName,
   createVolumeDirectories,
   saveToCasaOSMetadata,
+  writeStatusPage,
   fixPostDeployOwnership,
   executeInstallCommand
 } from '../templates/pcsProcessing';
+import { generateStatusPageHtml } from '../templates/statusPage';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
@@ -228,6 +231,10 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     envVars: request.envVars || {},
     botType: detection?.type,
     hasDatabase: detection?.hasDatabase,
+    databases: detection?.databases,
+    needsLavalink: detection?.needsLavalink,
+    hasWebDashboard: detection?.hasWebDashboard,
+    tokenVarName: detection?.tokenVarName,
     lastBuiltCommit: null,
     createdAt: now,
     updatedAt: now,
@@ -636,6 +643,22 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   const instance = registry.instances[botId];
   if (instance) {
     instance.lastBuiltCommit = commitHash;
+    instance.updatedAt = new Date().toISOString();
+    registry.instances[botId] = instance;
+    saveRegistry(registry);
+  }
+}
+
+function updateInstanceDetection(botId: string, detection: DetectionResult): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (instance) {
+    instance.botType = detection.type;
+    instance.hasDatabase = detection.hasDatabase;
+    instance.databases = detection.databases;
+    instance.needsLavalink = detection.needsLavalink;
+    instance.hasWebDashboard = detection.hasWebDashboard;
+    instance.tokenVarName = detection.tokenVarName;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
@@ -1102,7 +1125,8 @@ async function buildDockerImageInstance(
   const botForCompose: any = { ...instance, envVars: envWithToken };
   let composeContent = generateImageCompose(botForCompose, botDir);
   const appName = instance.sanitizedName;
-  composeContent = processComposeForCasaOS(composeContent, appName, botForCompose);
+  const processed = processComposeForCasaOS(composeContent, appName, botForCompose);
+  composeContent = processed.content;
 
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
@@ -1113,6 +1137,10 @@ async function buildDockerImageInstance(
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
+    if (processed.sidecarInjected) {
+      emit('[PCS] Writing status page...', 'info');
+      await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
+    }
   }
 
   updateBotStatus(botId, 'stopped');
@@ -1183,7 +1211,8 @@ async function buildGitInstance(
 
   emit('[Detect] Detecting bot type...', 'info');
   const detection = detectBotType(repoPath);
-  emit(`[Info] Detected: ${detection.type} bot (hasCompose: ${detection.hasCompose}, hasDatabase: ${detection.hasDatabase})`, 'info');
+  emit(`[Info] Detected: ${detection.type} bot (compose: ${detection.hasCompose}, databases: [${detection.databases.join(', ')}], music: ${detection.hasMusic}, lavalink: ${detection.needsLavalink}, web: ${detection.hasWebDashboard})`, 'info');
+  updateInstanceDetection(botId, detection);
 
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
@@ -1193,6 +1222,7 @@ async function buildGitInstance(
   let composeContent: string;
   let appName: string;
   let buildTarget: string | null = null;
+  let sidecarInjected = false;
 
   if (existingComposePath) {
     emit(`[Info] Using existing compose file: ${existingComposePath}`, 'info');
@@ -1219,7 +1249,11 @@ async function buildGitInstance(
     rawCompose = applyVariableSubstitution(rawCompose, botWithEnv);
 
     // Apply CasaOS processing
-    composeContent = processComposeForCasaOS(rawCompose, appName, botWithEnv);
+    {
+      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv);
+      composeContent = processed.content;
+      sidecarInjected = processed.sidecarInjected;
+    }
 
     emit(`[Info] App name: ${appName}`, 'info');
 
@@ -1237,7 +1271,11 @@ async function buildGitInstance(
 
     composeContent = generateCompose(botWithEnv, detection, botDir);
     appName = instance.sanitizedName;
-    composeContent = processComposeForCasaOS(composeContent, appName, botWithEnv);
+    {
+      const processed = processComposeForCasaOS(composeContent, appName, botWithEnv);
+      composeContent = processed.content;
+      sidecarInjected = processed.sidecarInjected;
+    }
     buildTarget = 'bot';
   }
 
@@ -1310,6 +1348,10 @@ async function buildGitInstance(
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
+    if (sidecarInjected) {
+      emit('[PCS] Writing status page...', 'info');
+      await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
+    }
   }
 
   // Record the commit this was built from, read directly from the repo

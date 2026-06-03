@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { parseDocument } from 'yaml';
 import { getEnvPath } from '../git/repoManager';
 
 // Encryption key from environment or generate one
@@ -268,4 +269,233 @@ export function parseEnvExample(repoPath: string): Array<{
   }
 
   return result;
+}
+
+// ─── Universal env var detection (install wizard) ───
+
+export type DetectedEnvSource = 'env-example' | 'compose' | 'config' | 'source' | 'readme';
+
+export interface DetectedEnvVar {
+  key: string;
+  displayLabel: string;
+  description: string;
+  defaultValue: string;
+  required: boolean;
+  source: DetectedEnvSource;
+  sensitive: boolean;
+  autoWired: boolean;
+}
+
+const ENV_LABELS: Array<{ match: RegExp; label: string }> = [
+  { match: /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i, label: 'Discord Bot Token' },
+  { match: /^(DISCORD_)?CLIENT_ID$/i, label: 'Discord Client ID' },
+  { match: /^(DISCORD_)?GUILD_ID$/i, label: 'Discord Server (Guild) ID' },
+  { match: /^(MONGO_?URI|MONGODB_?URI|DATABASE_URL)$/i, label: 'Database URL' },
+  { match: /^LAVALINK_HOST$/i, label: 'Lavalink Host' },
+  { match: /^LAVALINK_PORT$/i, label: 'Lavalink Port' },
+  { match: /^LAVALINK_PASSWORD$/i, label: 'Lavalink Password' },
+];
+
+export function normalizeEnvLabel(key: string): string {
+  for (const { match, label } of ENV_LABELS) {
+    if (match.test(key)) return label;
+  }
+  return key;
+}
+
+const SOURCE_SCAN_EXTS = new Set(['.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rs', '.cs']);
+const SOURCE_SCAN_SKIP = new Set(['node_modules', 'dist', 'build', 'target', 'venv', '.venv', '__pycache__', 'bin', 'obj', 'vendor']);
+const SOURCE_SCAN_FILE_CAP = 400;
+
+// Common process-level vars that are not bot configuration; excluded from scan results.
+const ENV_SCAN_DENYLIST = new Set(['NODE_ENV', 'PATH', 'PWD', 'HOME', 'PORT', 'HOSTNAME', 'TERM', 'LANG', 'TZ', 'PUID', 'PGID']);
+
+function walkSourceFiles(root: string): string[] {
+  const out: string[] = [];
+  const stack: string[] = [root];
+  while (stack.length > 0 && out.length < SOURCE_SCAN_FILE_CAP) {
+    const dir = stack.pop() as string;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (out.length >= SOURCE_SCAN_FILE_CAP) break;
+      if (entry.isDirectory()) {
+        if (!SOURCE_SCAN_SKIP.has(entry.name) && !entry.name.startsWith('.')) {
+          stack.push(path.join(dir, entry.name));
+        }
+      } else if (SOURCE_SCAN_EXTS.has(path.extname(entry.name))) {
+        out.push(path.join(dir, entry.name));
+      }
+    }
+  }
+  return out;
+}
+
+const ENV_REF_PATTERNS: RegExp[] = [
+  /process\.env\.([A-Z_][A-Z0-9_]*)/g,
+  /process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]\]/g,
+  /os\.getenv\(['"]([A-Z_][A-Z0-9_]*)['"]/g,
+  /os\.environ(?:\.get)?\(?\[?['"]([A-Z_][A-Z0-9_]*)['"]/g,
+  /System\.getenv\(['"]([A-Z_][A-Z0-9_]*)['"]/g,
+  /os\.Getenv\(['"]([A-Z_][A-Z0-9_]*)['"]/g,
+  /env::var\(['"]([A-Z_][A-Z0-9_]*)['"]/g,
+  /Environment\.GetEnvironmentVariable\(['"]([A-Z_][A-Z0-9_]*)['"]/g,
+];
+
+/**
+ * Scan source files for env var references. Used by the wizard's Tier 2 detection
+ * and by token-variable detection.
+ */
+export function scanSourceForEnvVars(repoPath: string): string[] {
+  const found = new Set<string>();
+  for (const file of walkSourceFiles(repoPath)) {
+    let content: string;
+    try {
+      content = fs.readFileSync(file, 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const pattern of ENV_REF_PATTERNS) {
+      pattern.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = pattern.exec(content)) !== null) {
+        if (!ENV_SCAN_DENYLIST.has(m[1])) found.add(m[1]);
+      }
+    }
+  }
+  return [...found];
+}
+
+function stripEnvRef(value: string): string {
+  const withDefault = value.match(/^\$\{[^:}]+:-(.*)\}$/);
+  if (withDefault) return withDefault[1];
+  if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(value)) return '';
+  return value;
+}
+
+function findComposeFile(repoPath: string): string | null {
+  for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    const p = path.join(repoPath, f);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: string }> {
+  const result: Array<{ key: string; defaultValue: string }> = [];
+  const composePath = findComposeFile(repoPath);
+  if (!composePath) return result;
+
+  try {
+    const compose = parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON() as Record<string, any>;
+    const services = compose?.services as Record<string, any> | undefined;
+    if (!services) return result;
+
+    const seen = new Set<string>();
+    for (const service of Object.values(services)) {
+      const env = service?.environment;
+      if (Array.isArray(env)) {
+        for (const entry of env) {
+          if (typeof entry !== 'string') continue;
+          const eq = entry.indexOf('=');
+          const key = eq >= 0 ? entry.slice(0, eq) : entry;
+          const val = eq >= 0 ? entry.slice(eq + 1) : '';
+          if (key && !seen.has(key)) { seen.add(key); result.push({ key, defaultValue: stripEnvRef(val) }); }
+        }
+      } else if (env && typeof env === 'object') {
+        for (const [key, val] of Object.entries(env)) {
+          if (!seen.has(key)) { seen.add(key); result.push({ key, defaultValue: stripEnvRef(val == null ? '' : String(val)) }); }
+        }
+      }
+    }
+  } catch {
+    // ignore malformed compose
+  }
+  return result;
+}
+
+function parseConfigExample(repoPath: string): Array<{ key: string; defaultValue: string }> {
+  const result: Array<{ key: string; defaultValue: string }> = [];
+  for (const f of ['config.example.json', 'config.json.example', 'config.sample.json']) {
+    const p = path.join(repoPath, f);
+    if (!fs.existsSync(p)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      if (parsed && typeof parsed === 'object') {
+        for (const [key, val] of Object.entries(parsed)) {
+          if (val === null || typeof val !== 'object') {
+            result.push({ key, defaultValue: val == null ? '' : String(val) });
+          }
+        }
+      }
+    } catch {
+      // ignore malformed config
+    }
+    break;
+  }
+  return result;
+}
+
+function scanReadmeForEnvVars(repoPath: string): string[] {
+  for (const name of ['README.md', 'readme.md', 'README.MD', 'Readme.md']) {
+    const p = path.join(repoPath, name);
+    if (!fs.existsSync(p)) continue;
+    try {
+      const content = fs.readFileSync(p, 'utf-8');
+      const found = new Set<string>();
+      const re = /\b([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(content)) !== null) {
+        if (!ENV_SCAN_DENYLIST.has(m[1])) found.add(m[1]);
+      }
+      return [...found];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/**
+ * Detect all environment variables a repo expects, for the install wizard.
+ * Tier 1 (.env.example, compose, config) always runs. Tier 2 (source + README scan)
+ * runs when there is no .env.example or when scanSource is forced.
+ */
+export function detectEnvVars(
+  repoPath: string,
+  options?: { scanSource?: boolean }
+): DetectedEnvVar[] {
+  const byKey = new Map<string, DetectedEnvVar>();
+
+  const add = (key: string, defaultValue: string, source: DetectedEnvSource, description = '') => {
+    if (!key || byKey.has(key)) return;   // first source wins (precedence by call order)
+    byKey.set(key, {
+      key,
+      displayLabel: normalizeEnvLabel(key),
+      description,
+      defaultValue,
+      required: defaultValue.trim() === '',
+      source,
+      sensitive: isSensitive(key),
+      autoWired: false,
+    });
+  };
+
+  // Tier 1
+  const fromExample = parseEnvExample(repoPath);
+  for (const e of fromExample) add(e.key, e.defaultValue, 'env-example', e.description);
+  for (const e of parseComposeEnv(repoPath)) add(e.key, e.defaultValue, 'compose');
+  for (const e of parseConfigExample(repoPath)) add(e.key, e.defaultValue, 'config');
+
+  // Tier 2
+  if (options?.scanSource || fromExample.length === 0) {
+    for (const key of scanSourceForEnvVars(repoPath)) add(key, '', 'source');
+    for (const key of scanReadmeForEnvVars(repoPath)) add(key, '', 'readme');
+  }
+
+  return [...byKey.values()];
 }

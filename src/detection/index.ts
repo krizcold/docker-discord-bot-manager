@@ -5,8 +5,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { BotType, DatabaseKind, DetectionResult, PackageManager, SystemDep } from '../types';
-import { scanSourceForEnvVars } from '../env/manager';
+import { parseDocument } from 'yaml';
+import { BotType, DatabaseKind, DetectedConfigFile, DetectionResult, PackageManager, SystemDep } from '../types';
+import { configFileFormat, extractConfigKeys, scanSourceForEnvVars } from '../env/manager';
 
 /**
  * Detect bot type from repository path
@@ -25,6 +26,7 @@ export function detectBotType(repoPath: string): DetectionResult {
     systemDeps: [],
     tokenVarName: 'DISCORD_TOKEN',
     isTypeScript: false,
+    configFiles: [],
   };
 
   if (fs.existsSync(path.join(repoPath, 'Dockerfile'))) {
@@ -69,8 +71,10 @@ export function detectBotType(repoPath: string): DetectionResult {
   result.systemDeps = caps.systemDeps;
 
   result.tokenVarName = detectTokenVarName(repoPath);
+  result.configFiles = detectConfigFiles(repoPath);
+  result.interactiveSetup = detectInteractiveSetup(repoPath, deps, rawText);
 
-  console.log(`[Detection] type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName}`);
+  console.log(`[Detection] type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
   return result;
 }
 
@@ -375,6 +379,130 @@ function findFirstFile(root: string, pattern: RegExp, maxDepth = 2): string | nu
     }
   }
   return null;
+}
+
+/**
+ * Strip an example/sample/dist/template marker from a template file name to get
+ * the real config file name (config.json.example -> config.json,
+ * config.example.json -> config.json, example.config.py -> config.py).
+ */
+function stripExampleMarker(name: string): string {
+  return name
+    .replace(/\.(example|sample|dist|template)$/i, '')
+    .replace(/[._-](example|sample|dist|template)(\.[^.]+)$/i, '$2')
+    .replace(/^(example|sample|dist|template)[._-]/i, '');
+}
+
+const CONFIG_TARGET_RE = /\.(json|ya?ml|toml|js|cjs|mjs|py|txt|conf|ini|properties|json5)$/i;
+const CONFIG_NAME_RE = /^(config|configuration|creds|credentials|settings)/i;
+
+/**
+ * Best-effort in-container mount path for a config file: reuse a matching bind
+ * from the repo's own compose, else default under /app.
+ */
+function findInContainerPath(repoPath: string, targetName: string): string | null {
+  for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    const text = readFileSafe(path.join(repoPath, f));
+    if (!text) continue;
+    try {
+      const compose = parseDocument(text).toJSON() as Record<string, any>;
+      const services = compose?.services as Record<string, any> | undefined;
+      if (!services) return null;
+      for (const service of Object.values(services)) {
+        if (!Array.isArray(service?.volumes)) continue;
+        for (const vol of service.volumes) {
+          let target: string | null = null;
+          if (typeof vol === 'string') {
+            const parts = vol.split(':');
+            if (parts.length >= 2) target = parts[1];
+          } else if (vol && typeof vol === 'object' && typeof vol.target === 'string') {
+            target = vol.target;
+          }
+          if (target && path.basename(target) === targetName) return target;
+        }
+      }
+    } catch {
+      // ignore malformed compose
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
+ * Detect config-file templates a repo ships (config.json.example etc.). Scans
+ * the repo root and a top-level config/ dir for *.example / *.sample files that
+ * resolve to a config-looking target name.
+ */
+function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
+  const out: DetectedConfigFile[] = [];
+  const seen = new Set<string>();
+
+  for (const sub of ['.', 'config']) {
+    const dir = path.join(repoPath, sub);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const name = entry.name;
+      if (!/[._-](example|sample|dist|template)([._-]|$)|^(example|sample|dist|template)[._-]/i.test(name)) continue;
+
+      const targetName = stripExampleMarker(name);
+      if (targetName === name) continue;                                   // no marker stripped
+      if (/^\.env/i.test(targetName) || /compose/i.test(targetName) || /dockerfile/i.test(targetName)) continue;
+      if (!CONFIG_TARGET_RE.test(targetName) && !CONFIG_NAME_RE.test(targetName)) continue;
+      if (seen.has(targetName)) continue;
+
+      const rawBody = readFileSafe(path.join(dir, name)).slice(0, 65536);
+      if (!rawBody.trim()) continue;
+
+      const format = configFileFormat(targetName);
+      const relTarget = sub === '.' ? targetName : `${sub}/${targetName}`;
+      seen.add(targetName);
+      out.push({
+        exampleName: sub === '.' ? name : `${sub}/${name}`,
+        targetName,
+        format,
+        inContainerPath: findInContainerPath(repoPath, targetName) || `/app/${relTarget}`,
+        keys: extractConfigKeys(rawBody, format),
+        rawBody,
+      });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Detect bots that require an interactive first-run step the manager cannot run
+ * unattended. Returns guidance for the wizard, not a hard block.
+ */
+function detectInteractiveSetup(
+  repoPath: string,
+  deps: string[],
+  rawText: string
+): { reason: string; advice: string } | undefined {
+  const hay = deps.join(' ') + ' ' + rawText.toLowerCase();
+
+  if (deps.includes('red-discordbot') || /red-discordbot|\bredbot\b/.test(hay)) {
+    return {
+      reason: 'Red-DiscordBot uses an interactive redbot-setup step that cannot run unattended.',
+      advice: 'Add this bot as a Docker image source instead (e.g. phasecorex/red-discordbot), which is fully configurable via environment variables.',
+    };
+  }
+
+  if (fs.existsSync(path.join(repoPath, 'src', 'main', 'resources', 'reference.conf')) || /jmusicbot/.test(hay)) {
+    return {
+      reason: 'This bot prompts for input on first run if its config file is missing or incomplete.',
+      advice: 'Paste a complete config file (e.g. config.txt) in the Config Files section below so it starts without prompting.',
+    };
+  }
+
+  return undefined;
 }
 
 /**

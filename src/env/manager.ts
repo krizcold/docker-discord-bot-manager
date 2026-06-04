@@ -40,7 +40,7 @@ function isSensitive(key: string): boolean {
 /**
  * Encrypt a value
  */
-function encrypt(text: string): string {
+export function encrypt(text: string): string {
   const key = Buffer.from(ENCRYPTION_KEY.slice(0, 32).padEnd(32, '0'));
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
@@ -52,7 +52,7 @@ function encrypt(text: string): string {
 /**
  * Decrypt a value
  */
-function decrypt(encrypted: string): string {
+export function decrypt(encrypted: string): string {
   try {
     const key = Buffer.from(ENCRYPTION_KEY.slice(0, 32).padEnd(32, '0'));
     const [ivHex, encryptedText] = encrypted.split(':');
@@ -271,9 +271,57 @@ export function parseEnvExample(repoPath: string): Array<{
   return result;
 }
 
+// ─── Config-file parsing (config.json / config.yml templates) ───
+
+export type ConfigFileFormat = 'json' | 'yaml' | 'raw';
+
+/**
+ * Pick a parse strategy from a config file's name. Only json/yaml are parsed for
+ * keys; everything else (toml, .js, .py, HOCON, .txt) is treated as raw text.
+ */
+export function configFileFormat(fileName: string): ConfigFileFormat {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return 'yaml';
+  return 'raw';
+}
+
+/**
+ * Extract top-level scalar keys from a config-file body. Nested objects/arrays
+ * are skipped (they cannot be expressed as a single env var). Used to surface a
+ * config-file bot's settings as env vars (env-first), e.g. EvoBot's TOKEN/LOCALE.
+ */
+export function extractConfigKeys(
+  body: string,
+  format: ConfigFileFormat
+): Array<{ key: string; defaultValue: string; sensitive: boolean }> {
+  if (format === 'raw') return [];
+
+  let obj: unknown;
+  try {
+    obj = format === 'json' ? JSON.parse(body) : parseDocument(body).toJSON();
+  } catch {
+    return [];
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return [];
+
+  const out: Array<{ key: string; defaultValue: string; sensitive: boolean }> = [];
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    if (value === null) {
+      out.push({ key, defaultValue: '', sensitive: isSensitive(key) });
+      continue;
+    }
+    const t = typeof value;
+    if (t === 'string' || t === 'number' || t === 'boolean') {
+      out.push({ key, defaultValue: String(value), sensitive: isSensitive(key) });
+    }
+  }
+  return out;
+}
+
 // ─── Universal env var detection (install wizard) ───
 
-export type DetectedEnvSource = 'env-example' | 'compose' | 'source';
+export type DetectedEnvSource = 'env-example' | 'compose' | 'config' | 'source';
 
 export interface DetectedEnvVar {
   key: string;

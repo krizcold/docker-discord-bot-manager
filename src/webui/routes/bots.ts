@@ -8,6 +8,8 @@ import { WebSocketServer } from 'ws';
 import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
+import * as configFileManager from '../../config/configFileManager';
+import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -726,6 +728,115 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const validation = envManager.hasRequiredEnvVars(req.params.id);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/config - Get config files for a bot
+   */
+  router.get('/:id/config', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, files: configFileManager.getConfigFiles(req.params.id) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * PUT /api/bots/:id/config - Replace config files for a bot
+   * Body: { files: [{ path, body }] }
+   */
+  router.put('/:id/config', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const { files } = req.body as { files: Array<{ path: string; body: string }> };
+      if (!Array.isArray(files)) {
+        res.status(400).json({ success: false, error: 'files array is required' });
+        return;
+      }
+
+      configFileManager.setConfigFiles(req.params.id, files);
+      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * Per-bot file browser/editor (Console + Files feature).
+   * `target` is either a container name belonging to the bot, or "host" for the
+   * bot's persistent /DATA/AppData/<app> folder. Scoping/validation happens in
+   * the terminal module.
+   */
+  router.get('/:id/fs/list', async (req: Request, res: Response) => {
+    try {
+      const result = await terminal.fsList(req.params.id, String(req.query.target || 'host'), String(req.query.path || ''));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.get('/:id/fs/read', async (req: Request, res: Response) => {
+    try {
+      const result = await terminal.fsRead(req.params.id, String(req.query.target || 'host'), String(req.query.path || ''));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.put('/:id/fs/write', async (req: Request, res: Response) => {
+    try {
+      const { target, path, body } = req.body as { target?: string; path?: string; body?: string };
+      if (typeof path !== 'string' || typeof body !== 'string') {
+        res.status(400).json({ success: false, error: 'path and body are required' });
+        return;
+      }
+      res.json(await terminal.fsWrite(req.params.id, target || 'host', path, body));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.post('/:id/fs/mkdir', async (req: Request, res: Response) => {
+    try {
+      const { target, path } = req.body as { target?: string; path?: string };
+      if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
+      res.json(await terminal.fsMkdir(req.params.id, target || 'host', path));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.post('/:id/fs/delete', async (req: Request, res: Response) => {
+    try {
+      const { target, path } = req.body as { target?: string; path?: string };
+      if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
+      res.json(await terminal.fsDelete(req.params.id, target || 'host', path));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.post('/:id/fs/rename', async (req: Request, res: Response) => {
+    try {
+      const { target, from, to } = req.body as { target?: string; from?: string; to?: string };
+      if (typeof from !== 'string' || typeof to !== 'string') { res.status(400).json({ success: false, error: 'from and to are required' }); return; }
+      res.json(await terminal.fsRename(req.params.id, target || 'host', from, to));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

@@ -15,6 +15,7 @@ import { setSourceBroadcast } from '../source/sourceUpdater';
 import { setInstanceBroadcast } from '../instance/instanceUpdater';
 import { setContainerBroadcast } from '../docker/containerManager';
 import { reconcileNow } from '../docker/stateReconciler';
+import { handleTerminalMessage, closeTerminal } from './terminal';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -70,7 +71,14 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
     console.log(`[WebSocket] Client connected (${wss.clients.size} total)`);
     if (wasEmpty) reconcileNow();
 
+    ws.on('message', (raw) => {
+      // Terminal control messages are multiplexed on this socket; broadcasts are
+      // server -> client only, so any other inbound message is ignored.
+      try { handleTerminalMessage(ws, raw.toString()); } catch (err) { console.error('[WebSocket] terminal message error:', err); }
+    });
+
     ws.on('close', () => {
+      closeTerminal(ws);
       console.log(`[WebSocket] Client disconnected (${wss.clients.size} remaining)`);
     });
 

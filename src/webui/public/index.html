@@ -4,6 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Discord Bot Manager</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -730,11 +733,56 @@
     </div>
   </div>
 
+  <!-- Config File Editor Modal -->
+  <div id="config-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 640px;">
+      <div id="config-editor-content"></div>
+    </div>
+  </div>
+
+  <!-- Console (Terminal) Modal -->
+  <div id="console-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 900px; width: 92%;">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+        <h3 style="margin: 0; flex: 1;">Console: <span id="console-bot-name"></span></h3>
+        <select id="console-container" onchange="reconnectConsole()" style="max-width: 240px;"></select>
+        <button class="btn btn-secondary btn-small" onclick="hideConsole()">Close</button>
+      </div>
+      <div id="console-term" style="height: 60vh; background: #000; border-radius: 6px; padding: 6px;"></div>
+      <div style="font-size: 0.68rem; color: var(--text-muted); margin-top: 6px;">
+        Live shell inside the bot's container. Changes to files outside mounted volumes are lost on rebuild.
+      </div>
+    </div>
+  </div>
+
+  <!-- Files Modal -->
+  <div id="files-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 900px; width: 92%;">
+      <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+        <h3 style="margin: 0; flex: 1;">Files: <span id="files-bot-name"></span></h3>
+        <select id="files-scope" onchange="filesChangeScope()" style="max-width: 260px;"></select>
+        <button class="btn btn-secondary btn-small" onclick="hideFiles()">Close</button>
+      </div>
+      <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 8px;">
+        <button class="btn btn-secondary btn-small" onclick="filesUp()" title="Up one level">&uarr;</button>
+        <input type="text" id="files-path" onkeydown="if(event.key==='Enter')filesGoto()" style="flex: 1; font-family: monospace; font-size: 0.78rem;">
+        <button class="btn btn-secondary btn-small" onclick="filesRefresh()">Refresh</button>
+        <button class="btn btn-secondary btn-small" onclick="filesNewFile()">New File</button>
+        <button class="btn btn-secondary btn-small" onclick="filesNewFolder()">New Folder</button>
+      </div>
+      <div style="display: flex; gap: 10px; min-height: 50vh;">
+        <div id="files-list" style="width: 38%; max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; padding: 4px;"></div>
+        <div id="files-editor" style="flex: 1; display: flex; flex-direction: column;"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     let bots = [];
     let sources = [];
     let currentLogsBotId = null;
     let envEditorBotId = null;
+    let configEditorBotId = null;
     const busyBots = new Set();
     function isTransientStatus(status) {
       return status === 'building' || status === 'starting' || status === 'stopping';
@@ -881,6 +929,20 @@
             loadBots();
             break;
 
+          // Interactive console (multiplexed on this socket)
+          case 'terminal:data':
+            if (window.__termWrite) window.__termWrite(data.data);
+            break;
+          case 'terminal:ready':
+            if (window.__termReady) window.__termReady(data.container);
+            break;
+          case 'terminal:exit':
+            if (window.__termExit) window.__termExit();
+            break;
+          case 'terminal:error':
+            if (window.__termError) window.__termError(data.message);
+            break;
+
           default:
             console.debug('[WebSocket] Unhandled event:', data.type);
         }
@@ -896,6 +958,10 @@
       if (data) options.body = JSON.stringify(data);
       const res = await fetch(`/api${endpoint}`, options);
       return res.json();
+    }
+
+    function wsSend(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     }
 
     function showMessage(type, text) {
@@ -1088,6 +1154,9 @@
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
+                  <button class="btn btn-secondary btn-small" onclick="showConfigEditor('${bot.id}')" disabled title="Stop the bot to edit config files">Config</button>
+                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', '${escapeHtml(botName)}')" title="Open an interactive shell inside the bot's container">Console</button>
+                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', '${escapeHtml(botName)}')" title="Browse and edit the bot's files">Files</button>
                   ${isGit ? (showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
@@ -1099,11 +1168,15 @@
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
+                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', '${escapeHtml(botName)}')" disabled title="Start the bot to open a console">Console</button>
+                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', '${escapeHtml(botName)}')" title="Browse and edit the bot's persistent files">Files</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
                   <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
+                  <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 `}
               </div>
@@ -1964,12 +2037,16 @@
 
     // ─── Install from Source Modal ───
     let installEnvHints = [];
+    let installConfigHints = [];
+    let installInteractiveSetup = null;
     let installBotId = null;
 
     async function showInstallModal(sourceId) {
       installSourceId = sourceId;
       installNameLocked = true;
       installEnvHints = [];
+      installConfigHints = [];
+      installInteractiveSetup = null;
       installBotId = null;
 
       const source = sources.find(s => s.id === sourceId);
@@ -1983,6 +2060,12 @@
         if (res.success && Array.isArray(res.vars)) {
           installEnvHints = res.vars;
         }
+        if (res.success && Array.isArray(res.configFiles)) {
+          installConfigHints = res.configFiles;
+        }
+        if (res.success && res.interactiveSetup) {
+          installInteractiveSetup = res.interactiveSetup;
+        }
       } catch (e) { /* non-fatal */ }
 
       renderInstallModal(defaultName);
@@ -1993,6 +2076,8 @@
       installSourceId = null;
       installBotId = null;
       installEnvHints = [];
+      installConfigHints = [];
+      installInteractiveSetup = null;
       loadBots();
     }
 
@@ -2017,8 +2102,27 @@
           + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', true, '');
       }
 
+      // Interactive-setup guidance banner
+      let interactiveSetupHtml = '';
+      if (installInteractiveSetup) {
+        interactiveSetupHtml = `<div style="border: 1px solid #b8860b; background: rgba(184,134,11,0.12); color: var(--text); border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; font-size: 0.75rem;">
+          <strong>Heads up:</strong> ${escapeHtml(installInteractiveSetup.reason)}<br>${escapeHtml(installInteractiveSetup.advice)}
+        </div>`;
+      }
+
+      // Detected config-file templates the user can deliver as a file
+      let configTemplatesHtml = '';
+      if (installConfigHints.length > 0) {
+        const chips = installConfigHints.map((cf, i) =>
+          `<button type="button" class="btn btn-secondary btn-small" onclick="useConfigTemplate(${i})" title="Add ${escapeHtml(cf.inContainerPath)}">+ ${escapeHtml(cf.targetName)}</button>`
+        ).join(' ');
+        configTemplatesHtml = `<div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 4px;">Detected template(s):</div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;">${chips}</div>`;
+      }
+
       el.innerHTML = `
         <h3>Install from Source</h3>
+        ${interactiveSetupHtml}
         <div class="form-group">
           <label>Bot Name</label>
           <div class="name-input-group">
@@ -2045,6 +2149,16 @@
             <button class="btn btn-secondary btn-small" onclick="addInstallEnvRow()">+ Add Variable</button>
             <button class="btn btn-secondary btn-small" onclick="scanInstallEnvs()">Scan source for envs</button>
           </div>
+        </div>
+        <div class="form-group">
+          <label>Config Files (advanced)</label>
+          <div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 6px;">
+            Most bots are configured by the variables above. If this bot reads a config file instead,
+            deliver it here. The file is bind-mounted into the container (read-only) and persists across updates.
+          </div>
+          ${configTemplatesHtml}
+          <div id="install-config-files"></div>
+          <button class="btn btn-secondary btn-small" style="margin-top: 4px;" onclick="addConfigFileRow()">+ Add config file</button>
         </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideInstallModal()">Cancel</button>
@@ -2095,6 +2209,307 @@
       } catch (e) {
         showMessage('error', 'Scan failed');
       }
+    }
+
+    function buildConfigFileBlockHtml(containerPath, body, readOnly) {
+      const writable = readOnly === false;
+      return `<div class="config-file-block" style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
+        <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 6px;">
+          <input type="text" class="cf-path" placeholder="/app/config.json" value="${escapeHtml(containerPath || '')}"
+            title="In-container path the bot reads" style="flex: 1;">
+          <button class="btn-remove" onclick="this.closest('.config-file-block').remove()" title="Remove">&times;</button>
+        </div>
+        <textarea class="cf-body" placeholder="File contents" spellcheck="false"
+          style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical;">${escapeHtml(body || '')}</textarea>
+        <label style="display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 0.7rem; color: var(--text-muted);">
+          <input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}>
+          Writable (let the bot modify this file; default is read-only)
+        </label>
+      </div>`;
+    }
+
+    function addConfigFileRow(containerPath, body, readOnly) {
+      document.getElementById('install-config-files').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml(containerPath, body, readOnly));
+    }
+
+    function useConfigTemplate(index) {
+      const cf = installConfigHints[index];
+      if (!cf) return;
+      addConfigFileRow(cf.inContainerPath, cf.rawBody, true);
+    }
+
+    // ─── Config File Editor (post-install) ───
+    async function showConfigEditor(botId) {
+      configEditorBotId = botId;
+      const bot = bots.find(b => b.id === botId);
+      const modal = document.getElementById('config-modal');
+      const content = document.getElementById('config-editor-content');
+
+      content.innerHTML = `<h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
+      modal.classList.remove('hidden');
+
+      try {
+        const res = await api('GET', `/bots/${botId}/config`);
+        if (!res.success) {
+          content.innerHTML = `<h3>Config Files</h3><div class="error-message">${escapeHtml(res.error || 'Failed to load')}</div>
+            <div class="modal-actions"><button class="btn btn-secondary" onclick="hideConfigEditor()">Close</button></div>`;
+          return;
+        }
+
+        const files = Array.isArray(res.files) ? res.files : [];
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly)).join('');
+
+        content.innerHTML = `
+          <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
+          <div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 8px;">
+            Files bind-mounted into the container (read-only). Changes take effect on the next build, so
+            press Update (or Install &amp; Run) after saving.
+          </div>
+          <div id="config-editor-rows">${rowsHtml}</div>
+          <button class="btn btn-secondary btn-small" onclick="addConfigEditorRow()" style="margin-bottom: 4px;">+ Add config file</button>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="hideConfigEditor()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveConfigEditor()">Save</button>
+          </div>
+        `;
+      } catch (err) {
+        content.innerHTML = `<h3>Config Files</h3><div class="error-message">Failed to load config files</div>
+          <div class="modal-actions"><button class="btn btn-secondary" onclick="hideConfigEditor()">Close</button></div>`;
+      }
+    }
+
+    function addConfigEditorRow() {
+      document.getElementById('config-editor-rows').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml('', ''));
+    }
+
+    async function saveConfigEditor() {
+      const files = [];
+      document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
+        const path = block.querySelector('.cf-path').value.trim();
+        const body = block.querySelector('.cf-body').value;
+        const readOnly = !block.querySelector('.cf-writable').checked;
+        if (path && body.trim()) files.push({ path, body, readOnly });
+      });
+
+      const saveBtn = document.querySelector('#config-editor-content .btn-primary');
+      if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
+
+      try {
+        const res = await api('PUT', `/bots/${configEditorBotId}/config`, { files });
+        if (res.success) {
+          showMessage('success', 'Config files saved. Press Update to apply.');
+          hideConfigEditor();
+          loadBots();
+        } else {
+          showMessage('error', res.error || 'Failed to save');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to save config files');
+      } finally {
+        if (saveBtn && saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+      }
+    }
+
+    function hideConfigEditor() {
+      document.getElementById('config-modal').classList.add('hidden');
+      configEditorBotId = null;
+    }
+
+    // ─── Console (interactive terminal) ───
+    let consoleBotId = null;
+    let consoleTerm = null;
+    let consoleFit = null;
+
+    function b64FromBytes(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
+    function bytesFromB64(b64) { const s = atob(b64); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+
+    window.__termWrite = (b64) => { if (consoleTerm) consoleTerm.write(bytesFromB64(b64)); };
+    window.__termReady = () => { if (consoleTerm) { if (consoleFit) { try { consoleFit.fit(); } catch (e) {} } consoleTerm.focus(); } };
+    window.__termExit = () => { if (consoleTerm) consoleTerm.write('\r\n\x1b[33m[session ended]\x1b[0m\r\n'); };
+    window.__termError = (msg) => { if (consoleTerm) consoleTerm.write('\r\n\x1b[31m[error] ' + (msg || '') + '\x1b[0m\r\n'); else showMessage('error', msg || 'Console error'); };
+
+    async function showConsole(botId, name) {
+      if (!window.Terminal) { showMessage('error', 'Terminal library failed to load (check network)'); return; }
+      consoleBotId = botId;
+      document.getElementById('console-bot-name').textContent = name;
+      document.getElementById('console-modal').classList.remove('hidden');
+
+      const res = await api('GET', `/bots/${botId}/containers`);
+      const running = (res.containers || []).filter(c => /run/i.test(c.state));
+      const sel = document.getElementById('console-container');
+      sel.innerHTML = running.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+      if (running.length === 0) { showMessage('error', 'No running containers for this bot'); return; }
+
+      if (consoleTerm) { try { consoleTerm.dispose(); } catch (e) {} consoleTerm = null; }
+      const el = document.getElementById('console-term');
+      el.innerHTML = '';
+      consoleTerm = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'monospace', theme: { background: '#000000' } });
+      consoleFit = new FitAddon.FitAddon();
+      consoleTerm.loadAddon(consoleFit);
+      consoleTerm.open(el);
+      setTimeout(() => { try { consoleFit.fit(); } catch (e) {} }, 30);
+      consoleTerm.onData(d => wsSend({ type: 'terminal:input', data: b64FromBytes(new TextEncoder().encode(d)) }));
+      consoleTerm.onResize(({ cols, rows }) => wsSend({ type: 'terminal:resize', cols, rows }));
+
+      connectConsole();
+    }
+
+    function connectConsole() {
+      const container = document.getElementById('console-container').value;
+      if (!container || !consoleTerm) return;
+      consoleTerm.clear();
+      wsSend({ type: 'terminal:start', botId: consoleBotId, container, cols: consoleTerm.cols, rows: consoleTerm.rows });
+    }
+
+    function reconnectConsole() {
+      wsSend({ type: 'terminal:stop' });
+      connectConsole();
+    }
+
+    function hideConsole() {
+      wsSend({ type: 'terminal:stop' });
+      document.getElementById('console-modal').classList.add('hidden');
+      if (consoleTerm) { try { consoleTerm.dispose(); } catch (e) {} consoleTerm = null; }
+      consoleBotId = null;
+    }
+
+    window.addEventListener('resize', () => {
+      if (consoleFit && !document.getElementById('console-modal').classList.contains('hidden')) {
+        try { consoleFit.fit(); } catch (e) {}
+      }
+    });
+
+    // ─── Files (browser + editor) ───
+    let filesBotId = null;
+    let filesScope = 'host';
+    let filesCwd = '';
+    let filesBase = '/';
+    let filesEditingPath = null;
+    let filesEntries = [];
+
+    function joinPath(base, name) {
+      const parts = (base + '/' + name).split('/');
+      const out = [];
+      for (const p of parts) { if (p === '' || p === '.') continue; if (p === '..') out.pop(); else out.push(p); }
+      return '/' + out.join('/');
+    }
+    function parentPath(p) { const t = p.replace(/\/+$/, ''); const i = t.lastIndexOf('/'); return i <= 0 ? '/' : t.slice(0, i); }
+
+    async function showFiles(botId, name) {
+      filesBotId = botId;
+      document.getElementById('files-bot-name').textContent = name;
+      document.getElementById('files-modal').classList.remove('hidden');
+      document.getElementById('files-editor').innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem; padding: 8px;">Select a file to edit.</div>';
+
+      const res = await api('GET', `/bots/${botId}/containers`);
+      const running = (res.containers || []).filter(c => /run/i.test(c.state));
+      const opts = running.map(c => `<option value="${escapeHtml(c.name)}">Container: ${escapeHtml(c.name)}</option>`).join('')
+        + `<option value="host">Persistent data (host)</option>`;
+      const sel = document.getElementById('files-scope');
+      sel.innerHTML = opts;
+      filesScope = running.length > 0 ? running[0].name : 'host';
+      sel.value = filesScope;
+      filesCwd = '';
+      await filesList();
+      filesBase = filesCwd;
+    }
+
+    function filesChangeScope() {
+      filesScope = document.getElementById('files-scope').value;
+      filesCwd = '';
+      filesEditingPath = null;
+      document.getElementById('files-editor').innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem; padding: 8px;">Select a file to edit.</div>';
+      filesList().then(() => { filesBase = filesCwd; });
+    }
+
+    async function filesList() {
+      const res = await api('GET', `/bots/${filesBotId}/fs/list?target=${encodeURIComponent(filesScope)}&path=${encodeURIComponent(filesCwd)}`);
+      const list = document.getElementById('files-list');
+      if (!res.success) { list.innerHTML = `<div class="error-message" style="margin:4px;">${escapeHtml(res.error || 'Failed to list')}</div>`; return; }
+      filesCwd = res.path;
+      document.getElementById('files-path').value = res.path;
+      filesEntries = res.entries || [];
+      const rows = filesEntries.map((e, i) => {
+        const icon = e.isDir ? '&#128193;' : '&#128196;';
+        return `<div class="files-row" style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-radius:4px;cursor:pointer;">
+          <span style="flex:1;" onclick="filesEntryClick(${i})">${icon} ${escapeHtml(e.name)}${e.isDir ? '/' : ''}</span>
+          <button class="btn-remove" title="Rename" onclick="filesRenameIdx(${i})" style="font-size:0.7rem;">&#9998;</button>
+          <button class="btn-remove" title="Delete" onclick="filesDeleteIdx(${i})">&times;</button>
+        </div>`;
+      }).join('');
+      list.innerHTML = rows || '<div style="color: var(--text-muted); font-size: 0.78rem; padding: 6px;">Empty directory</div>';
+    }
+
+    function filesEntryClick(i) { const e = filesEntries[i]; if (!e) return; if (e.isDir) filesOpenDir(e.name); else filesOpenFile(e.name); }
+    function filesRenameIdx(i) { const e = filesEntries[i]; if (e) filesRename(e.name); }
+    function filesDeleteIdx(i) { const e = filesEntries[i]; if (e) filesDelete(e.name); }
+    function filesOpenDir(name) { filesCwd = joinPath(filesCwd, name); filesList(); }
+    function filesUp() {
+      const parent = parentPath(filesCwd);
+      if (filesScope === 'host' && parent !== filesBase && !parent.startsWith(filesBase)) { filesCwd = filesBase; }
+      else { filesCwd = parent; }
+      filesList();
+    }
+    function filesGoto() { filesCwd = document.getElementById('files-path').value.trim() || filesCwd; filesList(); }
+    function filesRefresh() { filesList(); }
+
+    async function filesOpenFile(name) {
+      const full = joinPath(filesCwd, name);
+      const res = await api('GET', `/bots/${filesBotId}/fs/read?target=${encodeURIComponent(filesScope)}&path=${encodeURIComponent(full)}`);
+      const editor = document.getElementById('files-editor');
+      if (!res.success) { editor.innerHTML = `<div class="error-message" style="margin:4px;">${escapeHtml(res.error || 'Cannot open file')}</div>`; return; }
+      filesEditingPath = full;
+      editor.innerHTML = `
+        <div style="font-family: monospace; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 4px; word-break: break-all;">${escapeHtml(full)}</div>
+        <textarea id="files-body" spellcheck="false" style="flex:1; width:100%; min-height: 46vh; font-family: monospace; font-size: 0.78rem; resize: vertical;"></textarea>
+        <div style="display:flex; gap:6px; margin-top:6px;">
+          <button class="btn btn-primary btn-small" onclick="filesSave()">Save</button>
+          <span id="files-save-status" style="font-size:0.72rem; color: var(--text-muted); align-self:center;"></span>
+        </div>`;
+      document.getElementById('files-body').value = res.body || '';
+    }
+
+    async function filesSave() {
+      if (!filesEditingPath) return;
+      const body = document.getElementById('files-body').value;
+      const status = document.getElementById('files-save-status');
+      status.textContent = 'Saving...';
+      const res = await api('PUT', `/bots/${filesBotId}/fs/write`, { target: filesScope, path: filesEditingPath, body });
+      status.textContent = res.success ? 'Saved' : (res.error || 'Failed');
+    }
+
+    async function filesNewFile() {
+      const name = prompt('New file name:');
+      if (!name) return;
+      const res = await api('PUT', `/bots/${filesBotId}/fs/write`, { target: filesScope, path: joinPath(filesCwd, name), body: '' });
+      if (!res.success) showMessage('error', res.error || 'Failed to create file');
+      filesList();
+    }
+    async function filesNewFolder() {
+      const name = prompt('New folder name:');
+      if (!name) return;
+      const res = await api('POST', `/bots/${filesBotId}/fs/mkdir`, { target: filesScope, path: joinPath(filesCwd, name) });
+      if (!res.success) showMessage('error', res.error || 'Failed to create folder');
+      filesList();
+    }
+    async function filesDelete(name) {
+      if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+      const res = await api('POST', `/bots/${filesBotId}/fs/delete`, { target: filesScope, path: joinPath(filesCwd, name) });
+      if (!res.success) showMessage('error', res.error || 'Failed to delete');
+      filesList();
+    }
+    async function filesRename(name) {
+      const to = prompt('Rename to:', name);
+      if (!to || to === name) return;
+      const res = await api('POST', `/bots/${filesBotId}/fs/rename`, { target: filesScope, from: joinPath(filesCwd, name), to: joinPath(filesCwd, to) });
+      if (!res.success) showMessage('error', res.error || 'Failed to rename');
+      filesList();
+    }
+
+    function hideFiles() {
+      document.getElementById('files-modal').classList.add('hidden');
+      filesBotId = null;
+      filesEditingPath = null;
     }
 
     function toggleNameLock() {
@@ -2223,6 +2638,15 @@
         if (key) vars[key] = value;
       });
 
+      // Collect config files (path + verbatim body)
+      const configFiles = [];
+      document.querySelectorAll('#install-config-files .config-file-block').forEach(block => {
+        const path = block.querySelector('.cf-path').value.trim();
+        const body = block.querySelector('.cf-body').value;
+        const readOnly = !block.querySelector('.cf-writable').checked;
+        if (path && body.trim()) configFiles.push({ path, body, readOnly });
+      });
+
       const btn = document.getElementById('install-btn');
       btn.disabled = true; btn.textContent = 'Creating...';
 
@@ -2235,6 +2659,11 @@
           const hasVars = Object.keys(vars).some(k => vars[k]);
           if (hasVars) {
             await api('PUT', `/bots/${res.bot.id}/env`, { vars });
+          }
+
+          // Save config files if any were supplied
+          if (configFiles.length > 0) {
+            await api('PUT', `/bots/${res.bot.id}/config`, { files: configFiles });
           }
 
           showMessage('success', 'Bot instance created. Press Install & Run on the bot card.');

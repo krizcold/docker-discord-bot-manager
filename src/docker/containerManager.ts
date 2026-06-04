@@ -39,10 +39,13 @@ import {
   createVolumeDirectories,
   saveToCasaOSMetadata,
   writeStatusPage,
+  addConfigFileBinds,
+  writeConfigFiles,
   fixPostDeployOwnership,
   executeInstallCommand
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
+import * as configFileManager from '../config/configFileManager';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
@@ -1128,6 +1131,13 @@ async function buildDockerImageInstance(
   const processed = processComposeForCasaOS(composeContent, appName, botForCompose);
   composeContent = processed.content;
 
+  // Config files: bind user-supplied config files into the bot service.
+  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
+  if (configFiles.length > 0) {
+    emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
+    composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+  }
+
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
@@ -1140,6 +1150,10 @@ async function buildDockerImageInstance(
     if (processed.sidecarInjected) {
       emit('[PCS] Writing status page...', 'info');
       await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
+    }
+    if (configFiles.length > 0) {
+      emit('[PCS] Writing config files...', 'info');
+      await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info'));
     }
   }
 
@@ -1285,6 +1299,14 @@ async function buildGitInstance(
     await createVolumeDirectories(composeContent, (msg) => emit(msg, 'info'));
   }
 
+  // Config files: bind user-supplied config files into the bot service. Injected
+  // AFTER createVolumeDirectories so the file path is not created as a directory.
+  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
+  if (configFiles.length > 0) {
+    emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
+    composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+  }
+
   // Write .botmanager marker inside AppData (identifies folder as ours)
   writeBotManagerMarker(instance, appName);
 
@@ -1351,6 +1373,10 @@ async function buildGitInstance(
     if (sidecarInjected) {
       emit('[PCS] Writing status page...', 'info');
       await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
+    }
+    if (configFiles.length > 0) {
+      emit('[PCS] Writing config files...', 'info');
+      await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info'));
     }
   }
 

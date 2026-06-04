@@ -608,6 +608,100 @@ export async function writeStatusPage(
 }
 
 /**
+ * Add bind mounts for user-supplied config files onto the build-target (or main)
+ * service. Source is the host file written by writeConfigFiles under
+ * /DATA/AppData/<app>/config; mounted read-only at the in-container path.
+ * Must run AFTER createVolumeDirectories so the file path is not mkdir'd as a dir.
+ */
+export function addConfigFileBinds(
+  composeContent: string,
+  appName: string,
+  files: Array<{ path: string; readOnly?: boolean }>
+): string {
+  if (!files.length) return composeContent;
+  const pcs = getPCSEnvironment();
+
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+
+  const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
+  const targetName = (typeof xcBuild === 'string' && services[xcBuild])
+    ? xcBuild
+    : getMainServiceName(compose);
+  if (!targetName || !services[targetName]) return composeContent;
+
+  const service = services[targetName];
+  if (!Array.isArray(service.volumes)) {
+    service.volumes = service.volumes ? [service.volumes] : [];
+  }
+  const volumes = service.volumes as unknown[];
+
+  for (const f of files) {
+    const base = path.basename(f.path);
+    const source = `${pcs.DATA_ROOT}/AppData/${appName}/config/${base}`;
+    const exists = volumes.some(
+      (v) => v && typeof v === 'object' && (v as Record<string, unknown>).target === f.path
+    );
+    if (exists) continue;
+    volumes.push({ type: 'bind', source, target: f.path, read_only: f.readOnly !== false });
+  }
+
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/**
+ * Write user-supplied config files into the bind-mounted config dir.
+ * Mirrors writeStatusPage's docker-exec-into-casaos write pattern.
+ */
+export async function writeConfigFiles(
+  appName: string,
+  files: Array<{ path: string; body: string }>,
+  logFn?: (msg: string) => void
+): Promise<void> {
+  if (!files.length) return;
+  const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const pcs = getPCSEnvironment();
+  const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'config');
+
+  try {
+    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dir}"`, { timeout: 10000 });
+  } catch {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      await execAsync(`chown -R 1000:1000 "${dir}"`, { timeout: 5000 });
+    } catch (fallbackErr) {
+      log(`[PCS] Warning: Could not set ownership on ${dir}: ${fallbackErr}`);
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  for (const f of files) {
+    const filePath = path.join(dir, path.basename(f.path));
+    fs.writeFileSync(filePath, f.body);
+    try {
+      await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
+      await execAsync(`docker exec casaos chmod 644 "${filePath}"`, { timeout: 10000 });
+    } catch {
+      try {
+        await execAsync(`chown 1000:1000 "${filePath}"`, { timeout: 5000 });
+        await execAsync(`chmod 644 "${filePath}"`, { timeout: 5000 });
+      } catch {
+        // Best effort
+      }
+    }
+    log(`[PCS] Wrote config file to ${filePath}`);
+  }
+}
+
+/**
  * Remove CasaOS metadata for an app.
  */
 export async function removeCasaOSMetadata(

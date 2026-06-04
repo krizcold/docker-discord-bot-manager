@@ -169,6 +169,27 @@ export interface DetectionResult {
   webPort?: number;             // detected web dashboard port, if any
   jarPattern?: string;          // Java jar glob to COPY (shade/shadow aware)
   prebuiltJar?: boolean;        // Java repo ships a .jar with no build files
+  configFiles: DetectedConfigFile[];
+  interactiveSetup?: InteractiveSetupHint;  // bot needs an interactive first-run step we cannot automate
+}
+
+// Guidance shown when a bot requires an interactive setup the manager cannot run
+// unattended (e.g. redbot-setup, a first-run stdin prompt).
+export interface InteractiveSetupHint {
+  reason: string;
+  advice: string;
+}
+
+// A config file the repo expects (copied from a *.example / *.sample template).
+// Used by the wizard to surface its keys as env vars (env-first) and to offer
+// raw file delivery for bots that are configured by a file rather than env.
+export interface DetectedConfigFile {
+  exampleName: string;          // template file as found, e.g. "config.json.example"
+  targetName: string;           // resolved real name, e.g. "config.json"
+  format: 'json' | 'yaml' | 'raw';
+  inContainerPath: string;      // best-effort mount path, e.g. "/app/config.json"
+  keys: Array<{ key: string; defaultValue: string; sensitive: boolean }>;
+  rawBody: string;              // verbatim template contents (prefills the wizard)
 }
 
 // ─── Docker ───

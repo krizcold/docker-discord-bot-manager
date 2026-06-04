@@ -9,6 +9,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { parseDocument, stringify } from 'yaml';
 import { BotConfig, DetectionResult } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
 import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
@@ -82,7 +83,8 @@ interface ComposeFile {
 export function generateCompose(
   bot: BotConfig,
   detection: DetectionResult,
-  botDir: string
+  botDir: string,
+  imageName: string
 ): string {
   const appName = `bot-${bot.id}`;
 
@@ -116,12 +118,10 @@ export function generateCompose(
     }
   };
 
-  if (detection.hasDockerfile || detection.type !== 'compose') {
-    botService.build = {
-      context: path.join(botDir, 'repo'),
-      dockerfile: 'Dockerfile'
-    };
-  }
+  // Reference the image the manager pre-builds (see buildGitInstance). Deploy is
+  // `docker compose up` (no --build); a build: context here would point at an
+  // unpopulated dir and fail, so we use the already-built image instead.
+  botService.image = imageName;
 
   if (Object.keys(envMap).length > 0) {
     botService.environment = envMap;
@@ -508,7 +508,19 @@ export function writeComposeFile(botDir: string, content: string): void {
  * Check if bot has existing docker-compose.yml in repo
  */
 export function hasExistingCompose(repoPath: string): string | null {
-  const composeFiles = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
+  // Standard names take precedence (unchanged behavior); deploy-intent variants
+  // (prod / production / standalone) are a fallback for repos that ship only a
+  // named compose. Dev/test/example/override variants are intentionally NOT
+  // matched so we never grab a development-only compose.
+  const composeFiles = [
+    'docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml',
+    'docker-compose.prod.yml', 'docker-compose.prod.yaml',
+    'docker-compose.production.yml', 'docker-compose.production.yaml',
+    'docker-compose.standalone.yml', 'docker-compose.standalone.yaml',
+    'compose.prod.yml', 'compose.prod.yaml',
+    'compose.production.yml', 'compose.production.yaml',
+    'compose.standalone.yml', 'compose.standalone.yaml',
+  ];
 
   for (const file of composeFiles) {
     const filePath = path.join(repoPath, file);
@@ -648,6 +660,131 @@ export function processExistingCompose(
 
   console.log(`[Compose] Using existing compose file: ${composePath}`);
   return adaptExistingCompose(repoPath, botDir, bot);
+}
+
+/**
+ * Resolve a compose build-arg value. Plain literals pass through; `${VAR:-default}`
+ * / `${VAR-default}` yield the default; an unresolved `${VAR}` / `$VAR` returns null
+ * (we must not pass an empty arg, which would override a Dockerfile's own default).
+ */
+function resolveBuildArgValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (s === '') return null;
+  if (s.startsWith('$')) {
+    const m = s.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-|-)?([^}]*)\}$/);
+    if (m && m[2]) return m[2];
+    return null;
+  }
+  return s;
+}
+
+function extractArgsFromBuild(build: any): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!build || typeof build !== 'object') return out;
+  const rawArgs = build.args;
+  if (!rawArgs) return out;
+  const put = (key: string, value: unknown) => {
+    if (!key) return;
+    const resolved = resolveBuildArgValue(value);
+    if (resolved !== null) out[key] = resolved;
+  };
+  if (Array.isArray(rawArgs)) {
+    for (const entry of rawArgs) {
+      if (typeof entry !== 'string') continue;
+      const eq = entry.indexOf('=');
+      if (eq < 0) continue;   // "KEY" (pull from environment) - we cannot resolve it
+      put(entry.slice(0, eq), entry.slice(eq + 1));
+    }
+  } else if (typeof rawArgs === 'object') {
+    for (const [key, value] of Object.entries(rawArgs)) put(key, value);
+  }
+  return out;
+}
+
+/**
+ * Extract the build-target service's `build.args` from a repo compose so they can
+ * be relayed to `docker build` (the manager builds with plain docker build, which
+ * otherwise drops the args the repo author defined).
+ */
+export function extractComposeBuildArgs(composeContent: string, serviceName: string | null): Record<string, string> {
+  if (!serviceName) return {};
+  let compose: any;
+  try {
+    compose = parseDocument(composeContent).toJSON();
+  } catch {
+    return {};
+  }
+  const build = compose?.services?.[serviceName]?.build;
+  if (!build || typeof build === 'string') return {};
+  return extractArgsFromBuild(build);
+}
+
+export interface ComposeBuildService {
+  serviceName: string;
+  context: string;       // absolute build context
+  dockerfile: string;    // absolute Dockerfile path
+  args: Record<string, string>;
+}
+
+/**
+ * Find every service in a compose that builds from source, resolving each one's
+ * build context + dockerfile to absolute paths under the repo. The manager
+ * pre-builds these (with the right context/dockerfile/args) because deploy is a
+ * plain `docker compose up` whose relative build contexts would otherwise resolve
+ * against the metadata dir, not the repo.
+ */
+export function findBuildServices(composeContent: string, repoPath: string, exclude?: string | null): ComposeBuildService[] {
+  let compose: any;
+  try {
+    compose = parseDocument(composeContent).toJSON();
+  } catch {
+    return [];
+  }
+  const services = compose?.services;
+  if (!services || typeof services !== 'object') return [];
+
+  const out: ComposeBuildService[] = [];
+  for (const [name, svc] of Object.entries<any>(services)) {
+    if (exclude && name === exclude) continue;
+    const build = svc?.build;
+    if (!build) continue;
+
+    let ctx = '.';
+    let df = 'Dockerfile';
+    if (typeof build === 'string') {
+      ctx = build;
+    } else if (typeof build === 'object') {
+      if (typeof build.context === 'string') ctx = build.context;
+      if (typeof build.dockerfile === 'string') df = build.dockerfile;
+    }
+    const absContext = path.resolve(repoPath, ctx);
+    const absDockerfile = path.isAbsolute(df) ? df : path.resolve(absContext, df);
+    out.push({ serviceName: name, context: absContext, dockerfile: absDockerfile, args: extractArgsFromBuild(build) });
+  }
+  return out;
+}
+
+/**
+ * Rewrite a compose so the given services use a pre-built image instead of a
+ * build section.
+ */
+export function replaceBuildsWithImages(composeContent: string, mapping: Record<string, string>): string {
+  let compose: any;
+  try {
+    compose = parseDocument(composeContent).toJSON();
+  } catch {
+    return composeContent;
+  }
+  const services = compose?.services;
+  if (!services) return composeContent;
+  for (const [name, tag] of Object.entries(mapping)) {
+    if (services[name]) {
+      services[name].image = tag;
+      delete services[name].build;
+    }
+  }
+  return stringify(compose, { lineWidth: 0 });
 }
 
 /**

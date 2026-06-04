@@ -1819,7 +1819,10 @@
       }
 
       list.innerHTML = sources.map(s => {
-        const repoName = getRepoName(s.url) || 'Unknown';
+        const isImage = s.sourceType === 'docker-image';
+        const repoName = isImage
+          ? ((s.imageRef || '').split('/').pop() || 'Image').split(':')[0]
+          : (getRepoName(s.url) || 'Unknown');
         const collapsed = collapsedSources.has(s.id);
         const isCloned = !!s.lastChecked;
         const isCloning = cloningSources.has(s.id);
@@ -1885,15 +1888,17 @@
               ${headerAction}
             </div>
           </div>
-          ${codeName ? `<div style="font-size:0.72rem;color:var(--text-secondary);margin:4px 0 2px 26px;">compose: <span style="font-family:monospace;">${escapeHtml(codeName)}</span></div>` : ''}
-          <div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
-          <div class="source-card-meta" style="margin-left:26px;">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>
+          ${!isImage && codeName ? `<div style="font-size:0.72rem;color:var(--text-secondary);margin:4px 0 2px 26px;">compose: <span style="font-family:monospace;">${escapeHtml(codeName)}</span></div>` : ''}
+          ${isImage
+            ? `<div class="source-card-url" style="margin-left:26px;">Image: <span style="font-family:monospace;">${escapeHtml(s.imageRef || '')}</span> ${instanceBadge}</div>`
+            : `<div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
+          <div class="source-card-meta" style="margin-left:26px;">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>`}
           <div class="source-card-actions" style="margin-left:26px;">
-            ${isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
+            ${!isImage && isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
             <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>` : ''}
             <button class="btn btn-danger btn-small" onclick="deleteSource('${s.id}')">Remove</button>
           </div>
-          ${autoUpdateHtml}
+          ${isImage ? '' : autoUpdateHtml}
         </div>`;
       }).join('');
     }

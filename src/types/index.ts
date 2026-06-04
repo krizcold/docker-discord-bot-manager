@@ -25,6 +25,8 @@ export type SystemDep = 'ffmpeg' | 'libopus' | 'libsodium' | 'build-essential' |
 
 export interface SourceMeta {
   id: string;
+  sourceType?: BotSourceType;          // 'git' (default) | 'docker-image'
+  imageRef?: string;                   // prebuilt image, for docker-image sources
   url: string;                         // Git clone URL (includes token if private)
   branch: string;                      // e.g. "main"
   lastCommitHash: string | null;       // SHA of HEAD after last fetch/clone

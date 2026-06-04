@@ -348,9 +348,13 @@ export async function buildImage(
   contextPath: string,
   imageName: string,
   onProgress?: (message: string) => void,
-  buildArgs?: Record<string, string>
+  buildArgs?: Record<string, string>,
+  dockerfilePath?: string
 ): Promise<void> {
   const args = ['build', '-t', imageName];
+  if (dockerfilePath) {
+    args.push('-f', dockerfilePath);
+  }
   if (buildArgs) {
     for (const [key, value] of Object.entries(buildArgs)) {
       args.push('--build-arg', `${key}=${value}`);

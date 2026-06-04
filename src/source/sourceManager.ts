@@ -456,7 +456,7 @@ export function findSourceByUrl(url: string): SourceMeta | null {
 
 // branch '' means auto-detect the remote's default branch at clone time
 // (repos vary between main / master / develop).
-const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
+const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string; displayName?: string }> = [
   // Our bot
   { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: '' },
   // Tier 1: Have Docker + compose
@@ -472,14 +472,14 @@ const DEFAULT_SOURCES: Array<{ url: string; branch: string }> = [
   { url: 'https://github.com/Androz2091/AtlantaBot', branch: '' },
   { url: 'https://github.com/nadeko-bot/nadekobot', branch: '' },
   { url: 'https://github.com/discord-tickets/bot', branch: '' },
-  // Tier 3: No Docker
-  { url: 'https://github.com/Cog-Creators/Red-DiscordBot', branch: '' },
+  // Tier 3: No Docker (build/generate from source)
   { url: 'https://github.com/jagrosh/MusicBot', branch: '' },
   { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: '' },
   { url: 'https://github.com/kkrypt0nn/Python-Discord-Bot-Template', branch: '' },
   { url: 'https://github.com/botlabs-gg/yagpdb', branch: '' },
-  { url: 'https://github.com/jagrosh/GiveawayBot', branch: '' },
-  { url: 'https://github.com/LorittaBot/Loritta', branch: '' },
+  // Prebuilt-image sources: bots whose only unattended path is a published image
+  // (e.g. an interactive first-run setup that cannot be automated from source).
+  { imageRef: 'phasecorex/red-discordbot', displayName: 'Red-DiscordBot' },
 ];
 
 /**
@@ -493,16 +493,34 @@ export function seedDefaultSources(): void {
 
   const now = new Date().toISOString();
 
-  for (const { url, branch } of DEFAULT_SOURCES) {
+  for (const entry of DEFAULT_SOURCES) {
     const sourceId = uuidv4();
-    // Extract repo name from URL for display
-    const match = url.match(/\/([^\/]+?)(?:\.git)?$/);
-    const repoName = match ? match[1] : null;
 
-    const source: SourceMeta = {
+    if (entry.imageRef) {
+      // Prebuilt-image source: ready to install immediately (no clone step).
+      registry.sources[sourceId] = {
+        id: sourceId,
+        sourceType: 'docker-image',
+        imageRef: entry.imageRef,
+        url: '',
+        branch: '',
+        lastCommitHash: null,
+        lastCommitMessage: null,
+        lastCommitDate: null,
+        lastChecked: now,
+        autoUpdate: false,
+        composeName: entry.displayName || null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      continue;
+    }
+
+    registry.sources[sourceId] = {
       id: sourceId,
-      url,
-      branch,
+      sourceType: 'git',
+      url: entry.url || '',
+      branch: entry.branch || '',
       lastCommitHash: null,
       lastCommitMessage: null,
       lastCommitDate: null,
@@ -512,8 +530,6 @@ export function seedDefaultSources(): void {
       createdAt: now,
       updatedAt: now,
     };
-
-    registry.sources[sourceId] = source;
   }
 
   saveSourceRegistry(registry);

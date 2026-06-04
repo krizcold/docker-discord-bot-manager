@@ -72,7 +72,7 @@ export function detectBotType(repoPath: string): DetectionResult {
 
   result.tokenVarName = detectTokenVarName(repoPath);
   result.configFiles = detectConfigFiles(repoPath);
-  result.interactiveSetup = detectInteractiveSetup(repoPath, deps, rawText);
+  result.interactiveSetup = detectManualSetup(repoPath, result.configFiles);
 
   console.log(`[Detection] type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
   return result;
@@ -477,32 +477,33 @@ function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
   return out;
 }
 
+// Config-defaults files that signal a file-first (not env-first) bot, by
+// convention/format rather than by any specific project name.
+const MANUAL_CONFIG_MARKERS = [
+  'reference.conf',                              // Typesafe Config (HOCON) defaults
+  'application.conf',
+  path.join('src', 'main', 'resources', 'reference.conf'),
+];
+
 /**
- * Detect bots that require an interactive first-run step the manager cannot run
- * unattended. Returns guidance for the wizard, not a hard block.
+ * General heuristic: flag a bot that is configured primarily by a hand-written
+ * file rather than environment variables, since it may need a complete config
+ * (or a manual first-run step) the manager cannot perform unattended. The signal
+ * is structural (a non-env-mappable config template, or a HOCON defaults file),
+ * not tied to any specific project. Returns guidance for the wizard, not a block.
  */
-function detectInteractiveSetup(
+function detectManualSetup(
   repoPath: string,
-  deps: string[],
-  rawText: string
+  configFiles: DetectedConfigFile[]
 ): { reason: string; advice: string } | undefined {
-  const hay = deps.join(' ') + ' ' + rawText.toLowerCase();
+  const hasRawConfig = configFiles.some(c => c.format === 'raw');
+  const hasConfigDefaults = MANUAL_CONFIG_MARKERS.some(f => fs.existsSync(path.join(repoPath, f)));
+  if (!hasRawConfig && !hasConfigDefaults) return undefined;
 
-  if (deps.includes('red-discordbot') || /red-discordbot|\bredbot\b/.test(hay)) {
-    return {
-      reason: 'Red-DiscordBot uses an interactive redbot-setup step that cannot run unattended.',
-      advice: 'Add this bot as a Docker image source instead (e.g. phasecorex/red-discordbot), which is fully configurable via environment variables.',
-    };
-  }
-
-  if (fs.existsSync(path.join(repoPath, 'src', 'main', 'resources', 'reference.conf')) || /jmusicbot/.test(hay)) {
-    return {
-      reason: 'This bot prompts for input on first run if its config file is missing or incomplete.',
-      advice: 'Paste a complete config file (e.g. config.txt) in the Config Files section below so it starts without prompting.',
-    };
-  }
-
-  return undefined;
+  return {
+    reason: 'This bot is configured by a file rather than environment variables, so it may need a complete config (or a manual first-run step) to start.',
+    advice: 'Fill in the Config Files section below with a complete config. If it needs an interactive setup, run it from the Console after installing, or add the project\'s prebuilt Docker image as a Docker-image source.',
+  };
 }
 
 /**

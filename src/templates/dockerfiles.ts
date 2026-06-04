@@ -324,12 +324,12 @@ WORKDIR /app
 
 COPY . .
 RUN ${buildCmd}
-
+${SELECT_JAR_BLOCK('build/libs')}
 FROM eclipse-temurin:17-jre-alpine
 
 WORKDIR /app
 
-COPY --from=builder /app/${jarPattern} app.jar
+COPY --from=builder /app/app.jar app.jar
 
 RUN mkdir -p /app/data
 
@@ -347,16 +347,26 @@ RUN mvn dependency:go-offline
 
 COPY src ./src
 RUN mvn package -DskipTests
-
+${SELECT_JAR_BLOCK('target')}
 FROM eclipse-temurin:17-jre-alpine
 
 WORKDIR /app
 
-COPY --from=builder /app/${jarPattern} app.jar
+COPY --from=builder /app/app.jar app.jar
 
 RUN mkdir -p /app/data
 
 CMD ["java", "-jar", "app.jar"]
+`;
+}
+
+// Select the runnable fat/shaded jar robustly: the largest jar in the build
+// output, excluding the non-runnable originals (original-*, *-plain, sources,
+// javadoc). Handles maven-shade classifier jars (e.g. *-All.jar) and gradle-shadow
+// output without guessing the exact filename.
+function SELECT_JAR_BLOCK(dir: string): string {
+  return `RUN set -eu; jar=$(ls -S ${dir}/*.jar 2>/dev/null | grep -vE 'original-|-sources|-javadoc|-plain' | head -n1); \\
+    test -n "$jar"; cp "$jar" /app/app.jar
 `;
 }
 

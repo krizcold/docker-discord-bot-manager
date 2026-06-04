@@ -30,6 +30,9 @@ import {
   generateImageCompose,
   getComposeBuildInfo,
   replaceServiceImageWithBuild,
+  extractComposeBuildArgs,
+  findBuildServices,
+  replaceBuildsWithImages,
   ComposeResult
 } from '../templates/compose';
 import { generateHash, applyVariableSubstitution } from '../templates/variableSubstitution';
@@ -39,6 +42,7 @@ import {
   createVolumeDirectories,
   saveToCasaOSMetadata,
   writeStatusPage,
+  writeComposeEnvFile,
   addConfigFileBinds,
   writeConfigFiles,
   fixPostDeployOwnership,
@@ -186,6 +190,15 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
   const source = sourceManager.getSource(request.sourceId);
   if (!source) {
     throw new Error(`Source ${request.sourceId} not found`);
+  }
+
+  // Prebuilt-image source: create a docker-image instance instead of cloning.
+  if (source.sourceType === 'docker-image' && source.imageRef) {
+    return createDockerImageInstance({
+      displayName: request.displayName || source.composeName || source.imageRef.split('/').pop()!.split(':')[0],
+      imageRef: source.imageRef,
+      envVars: request.envVars,
+    });
   }
 
   // Derive names
@@ -726,6 +739,20 @@ export function readBotManagerMarker(appName: string): {
 }
 
 /**
+ * The bot's effective env: user-configured vars plus the manager-injected
+ * wiring. Used both for per-service compose injection and the deployed .env file.
+ */
+function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
+  const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
+  return {
+    ...instance.envVars,
+    BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
+    BOT_ID: instance.id,
+    BOT_MANAGER_INTERNAL_URL: internalUrl,
+  };
+}
+
+/**
  * Sync current instance env vars into the on-disk compose file.
  * CasaOS deploys from the compose file, so env changes after build
  * must be written back before start.
@@ -749,13 +776,7 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       : serviceNames[0];
     if (!targetName) return;
 
-    const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
-    const allEnv: Record<string, string> = {
-      ...instance.envVars,
-      BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
-      BOT_ID: instance.id,
-      BOT_MANAGER_INTERNAL_URL: internalUrl
-    };
+    const allEnv = buildEffectiveEnv(instance);
 
     const service = services[targetName];
     const env = service.environment;
@@ -835,6 +856,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
 
       // Sync env vars into compose before deploy (env changes after build)
       syncComposeEnvVars(latestInstance, composePath);
+      await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
 
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
@@ -1162,6 +1184,53 @@ async function buildDockerImageInstance(
   return { success: true };
 }
 
+// Safe defaults for build args a Dockerfile commonly declares WITHOUT a default
+// and expects to be supplied externally (compose/build script). Only applied when
+// the Dockerfile declares the bare `ARG NAME` (no `=default`) and the compose did
+// not already provide it, so a real author default is never overridden.
+const KNOWN_BUILD_ARG_DEFAULTS: Record<string, string> = {
+  USER: 'node',
+  UID: '1000',
+  GID: '1000',
+  PUID: '1000',
+  PGID: '1000',
+  NODE_VERSION: '20',
+};
+
+// When a repo ships its own Dockerfile, detection.type stays 'dockerfile'; the
+// real language lives in packageManager. Used to generate a fallback Dockerfile
+// if the repo's own Dockerfile fails to build.
+function languageTypeFromDetection(detection: DetectionResult): DetectionResult['type'] {
+  switch (detection.packageManager) {
+    case 'npm': case 'yarn': case 'pnpm': case 'bun': return 'nodejs';
+    case 'pip': case 'poetry': case 'uv': case 'pipenv': case 'setuptools': return 'python';
+    case 'go': return 'go';
+    case 'cargo': return 'rust';
+    case 'maven': case 'gradle': return 'java';
+    case 'dotnet': return 'csharp';
+    default: return 'unknown';
+  }
+}
+
+function fillKnownDockerfileArgs(dockerfilePath: string, provided: Record<string, string>): Record<string, string> {
+  let text: string;
+  try {
+    text = fs.readFileSync(dockerfilePath, 'utf-8');
+  } catch {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  const re = /^\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)\s*$/gm;   // bare `ARG NAME`, no '='
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1];
+    if (name in provided || name in out) continue;
+    const def = KNOWN_BUILD_ARG_DEFAULTS[name.toUpperCase()];
+    if (def !== undefined) out[name] = def;
+  }
+  return out;
+}
+
 async function buildGitInstance(
   instance: InstanceConfig,
   emit: (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success') => void,
@@ -1237,6 +1306,8 @@ async function buildGitInstance(
   let appName: string;
   let buildTarget: string | null = null;
   let sidecarInjected = false;
+  let composeBuildArgs: Record<string, string> = {};
+  let usedGeneratedDockerfile = false;
 
   if (existingComposePath) {
     emit(`[Info] Using existing compose file: ${existingComposePath}`, 'info');
@@ -1272,7 +1343,36 @@ async function buildGitInstance(
     emit(`[Info] App name: ${appName}`, 'info');
 
     if (buildTarget) {
+      composeBuildArgs = extractComposeBuildArgs(rawCompose, buildTarget);
+      if (Object.keys(composeBuildArgs).length > 0) {
+        emit(`[Config] Relaying build args from compose: ${Object.keys(composeBuildArgs).join(', ')}`, 'info');
+      }
       composeContent = replaceServiceImageWithBuild(composeContent, buildTarget, repoPath, imageName);
+    }
+
+    // Pre-build any service that builds from source, honoring the repo's own
+    // build.context / build.dockerfile / build.args, then point each at the built
+    // image. Deploy is `docker compose up` (no --build); relative contexts would
+    // otherwise resolve against the metadata dir, not the repo, and fail.
+    const buildSvcs = findBuildServices(composeContent, repoPath, buildTarget);
+    if (buildSvcs.length > 0) {
+      const imageMap: Record<string, string> = {};
+      const stamp = new Date().toISOString();
+      for (const bs of buildSvcs) {
+        const safeSvc = bs.serviceName.toLowerCase().replace(/[^a-z0-9._-]/g, '-');
+        const tag = `${instance.sanitizedName}-${instance.id}-${safeSvc}:latest`;
+        emit(`[Build] Building service '${bs.serviceName}' (dockerfile ${bs.dockerfile})...`, 'info');
+        const svcArgs: Record<string, string> = {
+          ...fillKnownDockerfileArgs(bs.dockerfile, bs.args),
+          ...bs.args,
+          BUILD_MODE: 'managed',
+          BUILD_DATE: stamp,
+        };
+        await dockerClient.buildImage(bs.context, tag, (m) => emit(`[Docker] ${m}`, 'info'), svcArgs, bs.dockerfile);
+        imageMap[bs.serviceName] = tag;
+      }
+      composeContent = replaceBuildsWithImages(composeContent, imageMap);
+      emit(`[Build] Pre-built ${buildSvcs.length} compose service image(s) from source`, 'success');
     }
   } else {
     emit(`[Info] No compose file found, generating for ${detection.type} bot`, 'info');
@@ -1281,9 +1381,10 @@ async function buildGitInstance(
       emit(`[Config] Generating Dockerfile for ${detection.type} bot`, 'info');
       const dockerfile = generateDockerfile(detection);
       fs.writeFileSync(path.join(repoPath, 'Dockerfile'), dockerfile);
+      usedGeneratedDockerfile = true;
     }
 
-    composeContent = generateCompose(botWithEnv, detection, botDir);
+    composeContent = generateCompose(botWithEnv, detection, botDir, imageName);
     appName = instance.sanitizedName;
     {
       const processed = processComposeForCasaOS(composeContent, appName, botWithEnv);
@@ -1323,10 +1424,21 @@ async function buildGitInstance(
   if (buildTarget) {
     emit(`[Build] Building Docker image (${imageName})...`, 'info');
 
+    // Build args: repo compose args (authoritative) + safe defaults for known
+    // args the Dockerfile declares with NO default (so e.g. a parameterized
+    // `COPY --chown=${USER}` does not fail with an empty USER). Our own
+    // BUILD_MODE/BUILD_DATE always win.
+    const dockerfileArgDefaults = fillKnownDockerfileArgs(path.join(repoPath, 'Dockerfile'), composeBuildArgs);
     const buildArgs: Record<string, string> = {
+      ...dockerfileArgDefaults,
+      ...composeBuildArgs,
       BUILD_MODE: 'managed',
       BUILD_DATE: new Date().toISOString()
     };
+    const relayed = { ...dockerfileArgDefaults, ...composeBuildArgs };
+    if (Object.keys(relayed).length > 0) {
+      emit(`[Build] Build args: ${Object.entries(relayed).map(([k, v]) => `${k}=${v}`).join(' ')}`, 'info');
+    }
 
     let metaCommit: string | null = null;
     let metaBranch: string | null = null;
@@ -1358,10 +1470,26 @@ async function buildGitInstance(
       emit(`[Build] Could not write .build-meta.json: ${err?.message || err}`, 'warning');
     }
 
-    await dockerClient.buildImage(repoPath, imageName, (msg) => {
-      emit(`[Docker] ${msg}`, 'info');
-    }, buildArgs);
-    emit('[Done] Docker image build completed', 'success');
+    const onBuildLog = (msg: string) => emit(`[Docker] ${msg}`, 'info');
+    try {
+      await dockerClient.buildImage(repoPath, imageName, onBuildLog, buildArgs);
+      emit('[Done] Docker image build completed', 'success');
+    } catch (buildErr: any) {
+      // Fallback: the repo's own Dockerfile failed (e.g. a broken multi-stage
+      // ARG/ENV scope, or build steps the host can't satisfy). If we can generate
+      // one for the detected language, retry with it rather than failing install.
+      const lang = languageTypeFromDetection(detection);
+      if (usedGeneratedDockerfile || lang === 'unknown') {
+        throw buildErr;
+      }
+      emit(`[Build] Repo Dockerfile failed: ${buildErr?.message || buildErr}`, 'warning');
+      emit(`[Build] Retrying with a generated ${lang} Dockerfile...`, 'warning');
+      const genDockerfile = generateDockerfile({ ...detection, type: lang });
+      const genPath = path.join(repoPath, 'Dockerfile.botmgr');
+      fs.writeFileSync(genPath, genDockerfile);
+      await dockerClient.buildImage(repoPath, imageName, onBuildLog, buildArgs, genPath);
+      emit('[Done] Fallback build with generated Dockerfile completed', 'success');
+    }
   } else {
     emit('[Skip] No build target, docker compose will pull images at start', 'info');
   }
@@ -1370,6 +1498,7 @@ async function buildGitInstance(
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
+    await writeComposeEnvFile(appName, buildEffectiveEnv(instance), (msg) => emit(msg, 'info'));
     if (sidecarInjected) {
       emit('[PCS] Writing status page...', 'info');
       await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));

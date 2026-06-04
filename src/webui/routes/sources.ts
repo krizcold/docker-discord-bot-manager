@@ -147,6 +147,12 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      // Prebuilt-image source: no repo to scan; the user supplies the image's envs.
+      if (source.sourceType === 'docker-image') {
+        res.json({ success: true, vars: [], configFiles: [], interactiveSetup: null, isImage: true });
+        return;
+      }
+
       const repoPath = sourceManager.getSourceRepoPath(req.params.id);
       if (!fs.existsSync(repoPath)) {
         res.json({ success: true, vars: [], tier2Ran: false, hasEnvExample: false, notCloned: true });

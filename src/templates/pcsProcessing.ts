@@ -50,20 +50,66 @@ export function getPCSEnvironment(): PCSEnvironment {
 
 // ─── Internal Helpers ──────────────────────────────────────────────────────
 
+// Service names that are backing infrastructure, never the web tile.
+const INFRA_SERVICE_NAMES = new Set([
+  'mysql', 'mariadb', 'postgres', 'postgresql', 'db', 'database', 'redis',
+  'mongo', 'mongodb', 'lavalink', 'migrate', 'migration', 'migrations',
+  'adminer', 'phpmyadmin', 'meilisearch', 'rabbitmq', 'memcached', 'elasticsearch',
+]);
+
+// Ports a browser-facing web UI typically listens on.
+const WEB_PORT_RE = /(^|[^0-9])(80|443|3000|3300|4000|5000|5173|8000|8080|8443)([^0-9]|$)/;
+
+function isInfraServiceName(name: string): boolean {
+  return INFRA_SERVICE_NAMES.has(name.toLowerCase());
+}
+
+function serviceHasWebPort(service: Record<string, unknown> | undefined): boolean {
+  if (!service) return false;
+  const flat = (v: unknown): string[] =>
+    Array.isArray(v) ? v.map((x) => (x && typeof x === 'object') ? JSON.stringify(x) : String(x)) : [];
+  const blob = [...flat(service.ports), ...flat(service.expose)].join(' ');
+  return WEB_PORT_RE.test(blob);
+}
+
 /**
- * Get the main service name from x-casaos.main or default to first service.
+ * The web-facing service: x-casaos.main if set, else (for a multi-service compose)
+ * the first non-infra service exposing a web port, else the first non-infra
+ * service, else the first service. Used for the CasaOS tile, Caddy, hostname,
+ * webui_port and the status-page decision. Kept separate from the env-injection
+ * target so a reverse-proxy/dashboard service is not treated as the bot.
  */
 function getMainServiceName(compose: Record<string, unknown>): string | null {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
-  if (xcasaos?.main && typeof xcasaos.main === 'string') {
+  if (xcasaos?.main && typeof xcasaos.main === 'string' && services?.[xcasaos.main]) {
     return xcasaos.main;
   }
-  const services = compose.services as Record<string, unknown> | undefined;
-  if (services) {
-    const keys = Object.keys(services);
-    if (keys.length > 0) return keys[0];
+  if (!services) return null;
+  const keys = Object.keys(services);
+  if (keys.length <= 1) return keys[0] || null;
+  const nonInfra = keys.filter((k) => !isInfraServiceName(k));
+  for (const k of nonInfra) {
+    if (serviceHasWebPort(services[k])) return k;
   }
-  return null;
+  return nonInfra[0] || keys[0];
+}
+
+/**
+ * The app service that receives the bot's env vars: x-casaos.build if set, else
+ * the first non-infra service, else the first service. Decoupled from the
+ * web-facing main service.
+ */
+function getAppServiceName(compose: Record<string, unknown>): string | null {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
+  if (xcasaos?.build && typeof xcasaos.build === 'string' && services?.[xcasaos.build]) {
+    return xcasaos.build;
+  }
+  if (!services) return null;
+  const keys = Object.keys(services);
+  const nonInfra = keys.filter((k) => !isInfraServiceName(k));
+  return nonInfra[0] || keys[0] || null;
 }
 
 /**
@@ -326,14 +372,13 @@ export function processComposeForCasaOS(
     }
   }
 
-  // ── Merge bot.envVars into the target service ──
-  // User-configured env vars (from wizard/editor) must be injected into the
-  // build target service (x-casaos.build) or the main service's environment.
+  // ── Merge bot.envVars into the app service ──
+  // User-configured env vars (from wizard/editor) go to the app service (the
+  // build target, or the first non-infra service), NOT the web-facing main
+  // service, which may be a reverse proxy. A .env file written next to the
+  // compose covers services that read env via env_file.
   if (bot.envVars && Object.keys(bot.envVars).length > 0) {
-    const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
-    const targetServiceName = (typeof xcBuild === 'string' && services[xcBuild])
-      ? xcBuild
-      : mainServiceName;
+    const targetServiceName = getAppServiceName(compose);
 
     if (targetServiceName && services[targetServiceName]) {
       const targetService = services[targetServiceName];
@@ -699,6 +744,53 @@ export async function writeConfigFiles(
     }
     log(`[PCS] Wrote config file to ${filePath}`);
   }
+}
+
+function formatDotenvValue(value: string): string {
+  const s = (value == null ? '' : String(value)).replace(/[\r\n]+/g, ' ');
+  if (s === '' || /[\s#"'$=]/.test(s)) {
+    return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  }
+  return s;
+}
+
+/**
+ * Write a .env file next to the deployed compose with the bot's effective env
+ * vars. General mechanism: services using `env_file:` and any `${VAR}`
+ * interpolation in the compose resolve from it. Harmless for composes that use
+ * neither (docker compose simply ignores an unreferenced .env).
+ */
+export async function writeComposeEnvFile(
+  appName: string,
+  env: Record<string, string>,
+  logFn?: (msg: string) => void
+): Promise<string> {
+  const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const pcs = getPCSEnvironment();
+
+  const dir = path.join(pcs.DATA_ROOT, 'AppData', 'casaos', 'apps', appName);
+  const filePath = path.join(dir, '.env');
+  const lines = Object.entries(env)
+    .filter(([key]) => key)
+    .map(([key, value]) => `${key}=${formatDotenvValue(value)}`);
+
+  try {
+    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
+  } catch {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best effort */ }
+  }
+
+  fs.writeFileSync(filePath, lines.join('\n') + '\n');
+
+  try {
+    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chmod 600 "${filePath}"`, { timeout: 10000 });
+  } catch {
+    try { await execAsync(`chmod 600 "${filePath}"`, { timeout: 5000 }); } catch { /* best effort */ }
+  }
+
+  log(`[PCS] Wrote ${lines.length} env var(s) to ${filePath}`);
+  return filePath;
 }
 
 /**

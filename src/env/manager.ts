@@ -232,6 +232,11 @@ export function writeEnvFile(botId: string): string {
  * `[{"a":1}]` is kept whole).
  */
 function splitEnvValueAndComment(rest: string): { value: string; comment: string } {
+  // Empty value followed by an inline comment: `KEY=   # comment`. Requires
+  // whitespace before the `#`, so `KEY=#literal` stays a value (dotenv-style).
+  const emptyComment = rest.match(/^\s+#(.*)$/);
+  if (emptyComment) return { value: '', comment: emptyComment[1].trim() };
+
   const s = rest.replace(/^\s+/, '');
   if (s === '') return { value: '', comment: '' };
 
@@ -402,11 +407,21 @@ function isPlatformEnv(key: string): boolean {
 
 const REQUIRED_TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
 
-// Vars a Discord bot genuinely needs to run, so they show as required in the
-// wizard even without an explicit `# MANDATORY` marker in the compose.
-function isWellKnownRequired(key: string): boolean {
-  const upper = key.toUpperCase();
-  return REQUIRED_TOKEN_RE.test(key) || upper === 'CLIENT_ID' || upper === 'GUILD_ID';
+// A var is required only when it positively signals so. The bot token is the one
+// universally-required var; every other var is optional unless its comment or
+// placeholder value says otherwise, so optional features left blank in a template
+// are never mislabeled as required. An explicit "optional" signal always wins.
+const REQUIRED_COMMENT_RE = /\b(required|mandatory|must be set|cannot be (empty|blank))\b/i;
+const OPTIONAL_COMMENT_RE = /\b(optional|if you (want|wish|enter|need)|leave (it )?(blank|empty)|leave as it is|left blank|not required|single server)\b/i;
+const FILL_ME_VALUE_RE = /^(<.*>|your[_-].*|.*[_-]here|change[_-]?me|replace[_-]?me|x{3,}|todo|placeholder)$/i;
+
+function isEnvRequired(key: string, value: string, comment: string): boolean {
+  if (REQUIRED_TOKEN_RE.test(key)) return true;
+  const c = comment || '';
+  if (OPTIONAL_COMMENT_RE.test(c)) return false;
+  if (REQUIRED_COMMENT_RE.test(c)) return true;
+  const v = value.trim();
+  return v !== '' && FILL_ME_VALUE_RE.test(v);
 }
 
 const SOURCE_SCAN_EXTS = new Set(['.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rs', '.cs']);
@@ -577,15 +592,15 @@ export function detectEnvVars(
     });
   };
 
-  // .env.example: required when no default
+  // .env.example: required only when the key/comment/value signals it
   for (const e of parseEnvExample(repoPath)) {
-    add(e.key, e.defaultValue, 'env-example', e.defaultValue.trim() === '', e.description);
+    add(e.key, e.defaultValue, 'env-example', isEnvRequired(e.key, e.defaultValue, e.description), e.description);
   }
 
-  // compose: required when marked mandatory or a well-known required Discord var
+  // compose: required when marked `# MANDATORY`/`# required`, or signaled by key/value
   const mandatory = findMandatoryComposeKeys(repoPath);
   for (const e of parseComposeEnv(repoPath)) {
-    add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isWellKnownRequired(e.key));
+    add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isEnvRequired(e.key, e.defaultValue, ''));
   }
 
   // Tier 2 source scan: explicit opt-in only, always optional
@@ -593,10 +608,7 @@ export function detectEnvVars(
     for (const key of scanSourceForEnvVars(repoPath)) add(key, '', 'source', false);
   }
 
-  const all = [...byKey.values()];
-  if (options?.scanSource) return all;
-  // Default view: required vars + any var that has a real pre-filled (non-$)
-  // value, so the user can see/override it. Empty optional vars stay behind the
-  // "Scan source for envs" button.
-  return all.filter(v => v.required || v.defaultValue.trim() !== '');
+  // Author-curated vars (.env.example + compose) always show, required-flagged or
+  // not, each with its tip. The opt-in source scan only adds extra discovered vars.
+  return [...byKey.values()];
 }

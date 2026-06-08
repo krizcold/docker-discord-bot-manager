@@ -207,6 +207,7 @@
       cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
     }
     .env-row .btn-remove:hover { opacity: 1; }
+    .env-tip { font-size: 0.7rem; color: var(--text-muted); margin: 2px 0 8px; line-height: 1.35; }
     .env-label {
       font-size: 0.72rem; color: var(--text-muted); padding: 0 2px; margin-bottom: 2px;
     }
@@ -972,9 +973,13 @@
     }
 
     function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
+      if (text == null) return '';
+      return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
     function getDisplayUrl(url) {
@@ -1466,8 +1471,9 @@
       }
     }
 
-    function buildEnvRowHtml(key, value, label, required, placeholder) {
+    function buildEnvRowHtml(key, value, label, required, placeholder, description) {
       const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${required ? ' (required)' : ''}</div>` : '';
+      const tipHtml = description ? `<div class="env-tip">${escapeHtml(description)}</div>` : '';
       return `<div>
         ${labelHtml}
         <div class="env-row">
@@ -1478,6 +1484,7 @@
           </div>
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
         </div>
+        ${tipHtml}
       </div>`;
     }
 
@@ -2093,13 +2100,13 @@
       let envRowsHtml = '';
       if (installEnvHints.length > 0) {
         envRowsHtml = installEnvHints.map(h => {
-          const label = h.displayLabel || getEnvLabel(h.key) || h.description || '';
+          const label = h.displayLabel || getEnvLabel(h.key) || '';
           if (h.autoWired) {
             return buildAutoWiredRowHtml(h.key, label);
           }
           const placeholder = h.sensitive ? 'Sensitive value' : (h.defaultValue || 'Value');
           const value = h.sensitive ? '' : (h.defaultValue || '');
-          return buildEnvRowHtml(h.key, value, label, !!h.required, placeholder);
+          return buildEnvRowHtml(h.key, value, label, !!h.required, placeholder, h.description || '');
         }).join('');
       } else {
         envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')

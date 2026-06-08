@@ -460,7 +460,6 @@ const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string;
   // Our bot
   { url: 'https://github.com/krizcold/fully-modular-discord-bot', branch: '' },
   // Tier 1: Have Docker + compose
-  { url: 'https://github.com/eritislami/evobot', branch: '' },
   { url: 'https://github.com/modmail-dev/Modmail', branch: '' },
   { url: 'https://github.com/bongodevs/lavamusic', branch: '' },
   { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: '' },

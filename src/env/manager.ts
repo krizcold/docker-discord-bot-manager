@@ -225,6 +225,40 @@ export function writeEnvFile(botId: string): string {
 }
 
 /**
+ * Split the right-hand side of a KEY=... line into its value and any trailing
+ * inline comment, dotenv-style: surrounding matching quotes are stripped, and a
+ * `#` only starts a comment when it is outside quotes and preceded by whitespace
+ * (so `http://x#frag` and `#ff0000` stay in the value, and inline JSON like
+ * `[{"a":1}]` is kept whole).
+ */
+function splitEnvValueAndComment(rest: string): { value: string; comment: string } {
+  const s = rest.replace(/^\s+/, '');
+  if (s === '') return { value: '', comment: '' };
+
+  const quote = s[0];
+  if (quote === '"' || quote === "'") {
+    let i = 1;
+    let value = '';
+    while (i < s.length) {
+      const c = s[i];
+      if (c === '\\' && quote === '"' && i + 1 < s.length) { value += s[i + 1]; i += 2; continue; }
+      if (c === quote) { i++; break; }
+      value += c;
+      i++;
+    }
+    const after = s.slice(i);
+    const hashAt = after.indexOf('#');
+    return { value, comment: hashAt >= 0 ? after.slice(hashAt + 1).trim() : '' };
+  }
+
+  const m = s.match(/\s#/);
+  if (m && m.index !== undefined) {
+    return { value: s.slice(0, m.index).replace(/\s+$/, ''), comment: s.slice(m.index + m[0].length).trim() };
+  }
+  return { value: s.replace(/\s+$/, ''), comment: '' };
+}
+
+/**
  * Parse .env.example from a repository
  */
 export function parseEnvExample(repoPath: string): Array<{
@@ -256,10 +290,11 @@ export function parseEnvExample(repoPath: string): Array<{
       // Key=value line
       const match = trimmed.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/i);
       if (match) {
+        const { value, comment } = splitEnvValueAndComment(match[2]);
         result.push({
           key: match[1],
-          description: currentDescription,
-          defaultValue: match[2]
+          description: comment || currentDescription,
+          defaultValue: value
         });
         currentDescription = '';
       }
@@ -289,7 +324,7 @@ export function configFileFormat(fileName: string): ConfigFileFormat {
 /**
  * Extract top-level scalar keys from a config-file body. Nested objects/arrays
  * are skipped (they cannot be expressed as a single env var). Used to surface a
- * config-file bot's settings as env vars (env-first), e.g. EvoBot's TOKEN/LOCALE.
+ * config-file bot's settings as env vars (env-first), e.g. a TOKEN/LOCALE pair.
  */
 export function extractConfigKeys(
   body: string,

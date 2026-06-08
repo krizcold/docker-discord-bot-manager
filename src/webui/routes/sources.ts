@@ -182,7 +182,7 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       );
 
       // Env-first: surface a config file's top-level scalar keys as env vars, so
-      // file-based bots that also read process.env (e.g. EvoBot) are fully
+      // file-based bots that also read process.env are fully
       // configurable without delivering a file. Token-family keys are required;
       // others show only when they have a pre-filled value (mirrors detectEnvVars).
       for (const cf of detection.configFiles || []) {

@@ -220,6 +220,12 @@ export async function fsWrite(botId: string, target: string, reqPath: string, bo
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
 
+  // Guard against accidentally truncating a file to nothing (a blank editor save
+  // would erase a config). Deleting is the explicit way to remove a file.
+  if (body.length === 0) {
+    return { success: false, error: 'Refusing to save an empty file (this would erase its contents). Use delete if you mean to remove it.' };
+  }
+
   // Pass the path as $1 (argv), never interpolated into the shell.
   const { stderr, code } = await spawnCapture(
     'docker',

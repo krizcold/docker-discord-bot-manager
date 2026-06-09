@@ -570,8 +570,10 @@ const SKIP_DELIVER = new Set(['node_modules', '.git']);
  */
 async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
   if (fs.existsSync(target)) {
-    if (fs.statSync(target).isFile()) return;   // seed: keep an already-delivered/mutated file
-    // Wrong type (an empty dir Docker created where a file belongs): replace it.
+    const st = fs.statSync(target);
+    if (st.isFile() && st.size > 0) return;   // seed: keep an already-delivered/mutated (non-empty) file
+    // Re-deliver over an EMPTY file (e.g. a config blanked by accident) or a
+    // wrong-type target (an empty dir Docker created where a file belongs).
     try { await execAsync(`docker exec casaos rm -rf "${target}"`, { timeout: 10000 }); }
     catch { try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ } }
   }

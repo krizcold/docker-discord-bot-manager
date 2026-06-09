@@ -407,21 +407,19 @@ function isPlatformEnv(key: string): boolean {
 
 const REQUIRED_TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
 
-// A var is required only when it positively signals so. The bot token is the one
-// universally-required var; every other var is optional unless its comment or
-// placeholder value says otherwise, so optional features left blank in a template
-// are never mislabeled as required. An explicit "optional" signal always wins.
-const REQUIRED_COMMENT_RE = /\b(required|mandatory|must be set|cannot be (empty|blank))\b/i;
-const OPTIONAL_COMMENT_RE = /\b(optional|if you (want|wish|enter|need)|leave (it )?(blank|empty)|leave as it is|left blank|not required|single server)\b/i;
-const FILL_ME_VALUE_RE = /^(<.*>|your[_-].*|.*[_-]here|change[_-]?me|replace[_-]?me|x{3,}|todo|placeholder)$/i;
+// A var is required only when it positively signals so: it is the bot token, or
+// its comment explicitly says required/mandatory (and not "optional"). We never
+// infer required from a blank value, so optional features are never mislabeled.
+// (`# MANDATORY`/`# required` compose markers are honored separately via
+// findMandatoryComposeKeys.)
+const OPTIONAL_COMMENT_RE = /\b(optional|not required)\b/i;
+const REQUIRED_COMMENT_RE = /\b(required|mandatory|must be set)\b/i;
 
-function isEnvRequired(key: string, value: string, comment: string): boolean {
+function isEnvRequired(key: string, comment: string): boolean {
   if (REQUIRED_TOKEN_RE.test(key)) return true;
   const c = comment || '';
   if (OPTIONAL_COMMENT_RE.test(c)) return false;
-  if (REQUIRED_COMMENT_RE.test(c)) return true;
-  const v = value.trim();
-  return v !== '' && FILL_ME_VALUE_RE.test(v);
+  return REQUIRED_COMMENT_RE.test(c);
 }
 
 const SOURCE_SCAN_EXTS = new Set(['.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs', '.py', '.java', '.kt', '.go', '.rs', '.cs']);
@@ -564,13 +562,15 @@ function findMandatoryComposeKeys(repoPath: string): Set<string> {
 /**
  * Detect environment variables a repo expects, for the install wizard.
  *
- * Default view returns only the vars the user genuinely must provide:
- *   - .env.example entries with no default value
- *   - compose env keys explicitly marked `# MANDATORY` / `# required`
- * Platform / $-substituted / bot-manager-internal vars are always excluded.
+ * Returns every author-curated var (.env.example entries + compose `environment:`
+ * keys), excluding platform / $-substituted / bot-manager-internal vars. Each is
+ * flagged required per isEnvRequired (the bot token, or a comment that explicitly
+ * says required/mandatory); everything else is optional, so opt-in features are
+ * not mislabeled required. The `required` flag governs the wizard label only, not
+ * visibility, all returned vars are shown.
  *
- * scanSource=true additionally returns optional/discovered vars (compose
- * entries with defaults + a source-code `process.env` scan).
+ * scanSource=true additionally appends vars discovered by a source-code
+ * `process.env` scan (always optional).
  */
 export function detectEnvVars(
   repoPath: string,
@@ -592,15 +592,15 @@ export function detectEnvVars(
     });
   };
 
-  // .env.example: required only when the key/comment/value signals it
+  // .env.example: required only when it is the token or the comment says so
   for (const e of parseEnvExample(repoPath)) {
-    add(e.key, e.defaultValue, 'env-example', isEnvRequired(e.key, e.defaultValue, e.description), e.description);
+    add(e.key, e.defaultValue, 'env-example', isEnvRequired(e.key, e.description), e.description);
   }
 
-  // compose: required when marked `# MANDATORY`/`# required`, or signaled by key/value
+  // compose: required when marked `# MANDATORY`/`# required`, or it is the token
   const mandatory = findMandatoryComposeKeys(repoPath);
   for (const e of parseComposeEnv(repoPath)) {
-    add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isEnvRequired(e.key, e.defaultValue, ''));
+    add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isEnvRequired(e.key, ''));
   }
 
   // Tier 2 source scan: explicit opt-in only, always optional

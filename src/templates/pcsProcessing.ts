@@ -168,6 +168,34 @@ export function extractAppName(composeContent: string): string | null {
  *   - PUID/PGID/TZ env var injection
  *   - webui_port and index in x-casaos (when web port detected)
  */
+/**
+ * Map a bind-mount host path to the platform's per-app data dir. `/DATA` prefixes
+ * become DATA_ROOT; relative paths (`./x`, `../x`) become
+ * <DATA_ROOT>/AppData/<app>/x. Named volumes and other absolute paths are left
+ * untouched.
+ */
+function rewriteBindSource(source: string, appData: string, dataRoot: string): string {
+  if (source === '/DATA' || source.startsWith('/DATA/')) return dataRoot + source.slice(5);
+  if (source.startsWith('./') || source.startsWith('../')) {
+    const rel = source.replace(/^(\.\.?\/)+/, '').replace(/\/+$/, '');
+    return rel ? `${appData}/${rel}` : appData;
+  }
+  return source;
+}
+
+/**
+ * Rewrite the host-path field of a short-form volume string `SRC:DEST[:MODE]`.
+ * Only the source (first field) is a host path; named volumes (no `/` or `.`
+ * prefix) are left untouched.
+ */
+function rewriteVolumeString(volume: string, appData: string, dataRoot: string): string {
+  const firstColon = volume.indexOf(':');
+  if (firstColon <= 0) return volume;
+  const source = volume.slice(0, firstColon);
+  if (!source.startsWith('/') && !source.startsWith('.')) return volume;
+  return rewriteBindSource(source, appData, dataRoot) + volume.slice(firstColon);
+}
+
 export function processComposeForCasaOS(
   composeContent: string,
   appName: string,
@@ -310,16 +338,19 @@ export function processComposeForCasaOS(
       }
     }
 
-    // Volume path processing: replace /DATA with actual DATA_ROOT
+    // Volume path processing: map /DATA and relative bind sources to the app's
+    // AppData dir, so third-party composes that use `./foo` persist under the
+    // platform's data location (named volumes and other absolute paths untouched).
     if (service.volumes && Array.isArray(service.volumes)) {
+      const appData = `${pcs.DATA_ROOT}/AppData/${appName}`;
       service.volumes = service.volumes.map((volume: unknown) => {
         if (typeof volume === 'string') {
-          return volume.replace(/^\/DATA/, pcs.DATA_ROOT);
+          return rewriteVolumeString(volume, appData, pcs.DATA_ROOT);
         }
         if (volume && typeof volume === 'object') {
           const vol = volume as Record<string, unknown>;
-          if (typeof vol.source === 'string' && vol.source.startsWith('/DATA')) {
-            vol.source = vol.source.replace(/^\/DATA/, pcs.DATA_ROOT);
+          if (typeof vol.source === 'string' && vol.type !== 'volume') {
+            vol.source = rewriteBindSource(vol.source, appData, pcs.DATA_ROOT);
           }
         }
         return volume;
@@ -478,8 +509,75 @@ export function processComposeForCasaOS(
  * Create volume directories from a compose file.
  * Parses compose for volume sources under DATA_ROOT/AppData/.
  */
+/**
+ * mkdir a volume directory under AppData and give it the platform's ownership.
+ */
+async function ensureVolumeDir(dirPath: string, log: (msg: string) => void): Promise<void> {
+  try {
+    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dirPath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dirPath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chmod -R 755 "${dirPath}"`, { timeout: 10000 });
+  } catch {
+    fs.mkdirSync(dirPath, { recursive: true });
+    try {
+      await execAsync(`chown -R 1000:1000 "${dirPath}"`, { timeout: 5000 });
+      await execAsync(`chmod -R 755 "${dirPath}"`, { timeout: 5000 });
+    } catch { /* best effort */ }
+  }
+}
+
+// Repo entries never delivered into a bind mount (heavy / irrelevant).
+const SKIP_DELIVER = new Set(['node_modules', '.git']);
+
+/**
+ * Copy a repo file to its AppData bind target (parent dir created first), so a
+ * compose that bind-mounts a config file from the repo (e.g. application.yml)
+ * actually delivers it instead of Docker auto-creating an empty directory.
+ * Seed semantics: an already-present target is left untouched, so a redeploy
+ * never reverts a file the running app has since modified.
+ */
+async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
+  if (fs.existsSync(target)) return;
+  await ensureVolumeDir(path.dirname(target), log);
+  fs.writeFileSync(target, fs.readFileSync(repoSrc));
+  try {
+    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${target}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chmod 644 "${target}"`, { timeout: 10000 });
+  } catch {
+    try {
+      await execAsync(`chown 1000:1000 "${target}"`, { timeout: 5000 });
+      await execAsync(`chmod 644 "${target}"`, { timeout: 5000 });
+    } catch { /* best effort */ }
+  }
+}
+
+/**
+ * Recursively copy a repo directory to its AppData bind target.
+ */
+async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
+  await ensureVolumeDir(target, log);
+  for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
+    if (SKIP_DELIVER.has(entry.name)) continue;
+    const childRepo = path.join(repoSrc, entry.name);
+    const childTarget = `${target}/${entry.name}`;
+    if (entry.isDirectory()) {
+      await deliverRepoDir(childRepo, childTarget, log);
+    } else if (entry.isFile()) {
+      await deliverRepoFile(childRepo, childTarget, log);
+    }
+  }
+}
+
+/**
+ * Prepare every AppData bind-mount path a compose declares. A path that maps from
+ * a file/dir present in the cloned repo is delivered (copied) so repo-provided
+ * config is not lost and a file mount is not mkdir'd as a directory; a path with
+ * no repo counterpart (e.g. a database data dir) is created empty.
+ */
 export async function createVolumeDirectories(
   composeContent: string,
+  appName: string,
+  repoPath: string | null,
   logFn?: (msg: string) => void
 ): Promise<void> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
@@ -487,8 +585,7 @@ export async function createVolumeDirectories(
 
   let compose: Record<string, unknown>;
   try {
-    const doc = parseDocument(composeContent);
-    compose = doc.toJSON() as Record<string, unknown>;
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
   } catch {
     log('[PCS] Failed to parse compose for volume directory creation');
     return;
@@ -497,51 +594,49 @@ export async function createVolumeDirectories(
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return;
 
-  const dirsToCreate = new Set<string>();
+  const appDataPrefix = `${pcs.DATA_ROOT}/AppData`;
+  const appDir = `${appDataPrefix}/${appName}`;
+  const sources = new Set<string>();
 
   for (const service of Object.values(services)) {
-    if (!service.volumes || !Array.isArray(service.volumes)) continue;
-
+    if (!Array.isArray(service.volumes)) continue;
     for (const volume of service.volumes) {
       let source: string | null = null;
-
       if (typeof volume === 'string') {
-        const parts = volume.split(':');
-        if (parts.length >= 2) source = parts[0];
+        const idx = volume.indexOf(':');
+        if (idx > 0) source = volume.slice(0, idx);
       } else if (volume && typeof volume === 'object') {
         const vol = volume as Record<string, unknown>;
-        if (typeof vol.source === 'string' && vol.type !== 'volume') {
-          source = vol.source;
-        }
+        if (typeof vol.source === 'string' && vol.type !== 'volume') source = vol.source;
       }
-
-      if (source && source.startsWith(`${pcs.DATA_ROOT}/AppData`)) {
-        dirsToCreate.add(source);
-      }
+      if (source && source.startsWith(appDataPrefix)) sources.add(source);
     }
   }
 
-  for (const dirPath of dirsToCreate) {
+  for (const target of sources) {
     try {
-      await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dirPath}"`, {
-        timeout: 10000,
-      });
-      await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dirPath}"`, {
-        timeout: 10000,
-      });
-      await execAsync(`docker exec casaos chmod -R 755 "${dirPath}"`, {
-        timeout: 10000,
-      });
-      log(`[PCS] Created volume directory: ${dirPath}`);
-    } catch {
-      try {
-        fs.mkdirSync(dirPath, { recursive: true });
-        await execAsync(`chown -R 1000:1000 "${dirPath}"`, { timeout: 5000 });
-        await execAsync(`chmod -R 755 "${dirPath}"`, { timeout: 5000 });
-        log(`[PCS] Created volume directory (fallback): ${dirPath}`);
-      } catch (fallbackErr) {
-        log(`[PCS] Warning: Failed to create volume directory ${dirPath}: ${fallbackErr}`);
+      // If this bind maps from content inside the cloned repo, deliver it.
+      // Containment: path.resolve normalizes any `..`, and we require the result
+      // to stay within the repo so a crafted source cannot read outside it.
+      let repoSrc: string | null = null;
+      if (repoPath && target.startsWith(`${appDir}/`)) {
+        const candidate = path.resolve(repoPath, target.slice(appDir.length + 1));
+        const repoRoot = path.resolve(repoPath);
+        if (candidate.startsWith(repoRoot + path.sep) && fs.existsSync(candidate)) repoSrc = candidate;
       }
+
+      if (repoSrc && fs.statSync(repoSrc).isFile()) {
+        await deliverRepoFile(repoSrc, target, log);
+        log(`[PCS] Delivered file to volume path: ${target}`);
+      } else if (repoSrc && fs.statSync(repoSrc).isDirectory()) {
+        await deliverRepoDir(repoSrc, target, log);
+        log(`[PCS] Delivered directory to volume path: ${target}`);
+      } else {
+        await ensureVolumeDir(target, log);
+        log(`[PCS] Created volume directory: ${target}`);
+      }
+    } catch (err) {
+      log(`[PCS] Warning: could not prepare volume path ${target}: ${err}`);
     }
   }
 }
@@ -839,6 +934,10 @@ export async function removeAppData(
 
 /**
  * Fix ownership of directories Docker may have created as root after deploy.
+ * Only ROOT-owned paths are reassigned (`--from=root`): a service that chowned
+ * its own bind mount to its runtime user (e.g. Postgres setting its data dir to
+ * uid 999, mode 0700) is left alone, otherwise this would steal it back to 1000
+ * and break the container with a permission error.
  */
 export async function fixPostDeployOwnership(
   appName: string,
@@ -853,12 +952,12 @@ export async function fixPostDeployOwnership(
   const fixDir = async (dirPath: string) => {
     if (!fs.existsSync(dirPath)) return;
     try {
-      await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dirPath}"`, {
+      await execAsync(`docker exec casaos chown -R --from=root ubuntu:ubuntu "${dirPath}"`, {
         timeout: 10000,
       });
     } catch {
       try {
-        await execAsync(`chown -R 1000:1000 "${dirPath}"`, { timeout: 5000 });
+        await execAsync(`chown -R --from=root 1000:1000 "${dirPath}"`, { timeout: 5000 });
       } catch {
         // Best effort
       }

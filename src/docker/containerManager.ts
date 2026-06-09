@@ -1397,7 +1397,7 @@ async function buildGitInstance(
   // CasaOS: create volume directories
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');
-    await createVolumeDirectories(composeContent, (msg) => emit(msg, 'info'));
+    await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'));
   }
 
   // Config files: bind user-supplied config files into the bot service. Injected

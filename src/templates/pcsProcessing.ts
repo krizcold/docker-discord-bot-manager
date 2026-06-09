@@ -506,24 +506,56 @@ export function processComposeForCasaOS(
 // ─── Volume Directory Creation ─────────────────────────────────────────────
 
 /**
- * Create volume directories from a compose file.
- * Parses compose for volume sources under DATA_ROOT/AppData/.
+ * Ensure a volume directory exists under AppData with platform ownership.
+ * Non-recursive (contents are never re-chowned). `preserveExisting` (default)
+ * skips an already-present dir, so a service that took ownership of its bind mount
+ * (e.g. Postgres chowning its data dir to uid 999, mode 0700) is never clobbered
+ * on redeploy. `mode` lets a delivered dir a container must write to be made
+ * world-writable (e.g. a Lavalink plugins dir it downloads into at startup).
  */
-/**
- * mkdir a volume directory under AppData and give it the platform's ownership.
- */
-async function ensureVolumeDir(dirPath: string, log: (msg: string) => void): Promise<void> {
+async function ensureVolumeDir(
+  dirPath: string,
+  log: (msg: string) => void,
+  mode = '755',
+  preserveExisting = true,
+): Promise<void> {
+  if (preserveExisting && fs.existsSync(dirPath)) return;
   try {
     await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dirPath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dirPath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chmod -R 755 "${dirPath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${dirPath}"`, { timeout: 10000 });
+    await execAsync(`docker exec casaos chmod ${mode} "${dirPath}"`, { timeout: 10000 });
   } catch {
     fs.mkdirSync(dirPath, { recursive: true });
     try {
-      await execAsync(`chown -R 1000:1000 "${dirPath}"`, { timeout: 5000 });
-      await execAsync(`chmod -R 755 "${dirPath}"`, { timeout: 5000 });
+      await execAsync(`chown 1000:1000 "${dirPath}"`, { timeout: 5000 });
+      await execAsync(`chmod ${mode} "${dirPath}"`, { timeout: 5000 });
     } catch { /* best effort */ }
   }
+}
+
+/**
+ * For a bind-mounted config file the repo does not ship directly (commonly
+ * gitignored and provided as a template), find a sibling template variant to seed
+ * from: example.NAME.EXT, NAME.EXT.example, NAME.example.EXT (and .sample/.dist/
+ * .template/.default). The general "copy the example config" convention.
+ */
+function findConfigTemplate(filePath: string): string | null {
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const ext = path.extname(base);
+  const stem = ext ? base.slice(0, -ext.length) : base;
+  const markers = ['example', 'sample', 'dist', 'template', 'default'];
+  const names: string[] = [];
+  for (const m of markers) {
+    names.push(`${m}.${base}`);
+    names.push(`${base}.${m}`);
+    if (ext) names.push(`${stem}.${m}${ext}`);
+  }
+  for (const name of names) {
+    const p = path.join(dir, name);
+    try { if (fs.existsSync(p) && fs.statSync(p).isFile()) return p; } catch { /* ignore */ }
+  }
+  return null;
 }
 
 // Repo entries never delivered into a bind mount (heavy / irrelevant).
@@ -537,7 +569,12 @@ const SKIP_DELIVER = new Set(['node_modules', '.git']);
  * never reverts a file the running app has since modified.
  */
 async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
-  if (fs.existsSync(target)) return;
+  if (fs.existsSync(target)) {
+    if (fs.statSync(target).isFile()) return;   // seed: keep an already-delivered/mutated file
+    // Wrong type (an empty dir Docker created where a file belongs): replace it.
+    try { await execAsync(`docker exec casaos rm -rf "${target}"`, { timeout: 10000 }); }
+    catch { try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ } }
+  }
   await ensureVolumeDir(path.dirname(target), log);
   fs.writeFileSync(target, fs.readFileSync(repoSrc));
   try {
@@ -555,7 +592,9 @@ async function deliverRepoFile(repoSrc: string, target: string, log: (msg: strin
  * Recursively copy a repo directory to its AppData bind target.
  */
 async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
-  await ensureVolumeDir(target, log);
+  // A repo-provided bind dir is app-managed and a foreign-uid container may need
+  // to write into it (e.g. Lavalink downloading plugin jars), so make it writable.
+  await ensureVolumeDir(target, log, '777', false);
   for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
     if (SKIP_DELIVER.has(entry.name)) continue;
     const childRepo = path.join(repoSrc, entry.name);
@@ -620,9 +659,12 @@ export async function createVolumeDirectories(
       // to stay within the repo so a crafted source cannot read outside it.
       let repoSrc: string | null = null;
       if (repoPath && target.startsWith(`${appDir}/`)) {
-        const candidate = path.resolve(repoPath, target.slice(appDir.length + 1));
         const repoRoot = path.resolve(repoPath);
-        if (candidate.startsWith(repoRoot + path.sep) && fs.existsSync(candidate)) repoSrc = candidate;
+        const candidate = path.resolve(repoPath, target.slice(appDir.length + 1));
+        if (candidate.startsWith(repoRoot + path.sep)) {
+          if (fs.existsSync(candidate)) repoSrc = candidate;
+          else repoSrc = findConfigTemplate(candidate);   // gitignored config shipped as a template
+        }
       }
 
       if (repoSrc && fs.statSync(repoSrc).isFile()) {

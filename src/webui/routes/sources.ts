@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
 import { buildWizardEnvList } from '../../env/envList';
+import { applyTemplateModifiers } from '../../config/templateModifiers';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
 export function createSourceRoutes(wss: WebSocketServer): Router {
@@ -162,10 +163,17 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
       const { vars, detection } = buildWizardEnvList(repoPath, { scanSource });
 
+      // Apply any per-source template modifier to the prefilled config defaults
+      // (data-driven; the user can still tweak/revert in the wizard).
+      const configFiles = (detection.configFiles || []).map(cf => ({
+        ...cf,
+        rawBody: applyTemplateModifiers(source.url, cf.targetName, cf.format, cf.rawBody),
+      }));
+
       res.json({
         success: true,
         vars,
-        configFiles: detection.configFiles || [],
+        configFiles,
         interactiveSetup: detection.interactiveSetup || null,
         tier2Ran: scanSource || !hasEnvExample,
         hasEnvExample,

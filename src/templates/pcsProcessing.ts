@@ -12,6 +12,7 @@ import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
 import { BotConfig } from '../types';
 import { buildStatusPageService } from './statusPage';
+import { findConfigTemplate } from '../config/configTemplates';
 
 const execAsync = promisify(exec);
 
@@ -533,31 +534,6 @@ async function ensureVolumeDir(
   }
 }
 
-/**
- * For a bind-mounted config file the repo does not ship directly (commonly
- * gitignored and provided as a template), find a sibling template variant to seed
- * from: example.NAME.EXT, NAME.EXT.example, NAME.example.EXT (and .sample/.dist/
- * .template/.default). The general "copy the example config" convention.
- */
-function findConfigTemplate(filePath: string): string | null {
-  const dir = path.dirname(filePath);
-  const base = path.basename(filePath);
-  const ext = path.extname(base);
-  const stem = ext ? base.slice(0, -ext.length) : base;
-  const markers = ['example', 'sample', 'dist', 'template', 'default'];
-  const names: string[] = [];
-  for (const m of markers) {
-    names.push(`${m}.${base}`);
-    names.push(`${base}.${m}`);
-    if (ext) names.push(`${stem}.${m}${ext}`);
-  }
-  for (const name of names) {
-    const p = path.join(dir, name);
-    try { if (fs.existsSync(p) && fs.statSync(p).isFile()) return p; } catch { /* ignore */ }
-  }
-  return null;
-}
-
 // Repo entries never delivered into a bind mount (heavy / irrelevant).
 const SKIP_DELIVER = new Set(['node_modules', '.git']);
 
@@ -883,6 +859,80 @@ export async function writeConfigFiles(
     }
     log(`[PCS] Wrote config file to ${filePath}`);
   }
+}
+
+/**
+ * Deliver user-edited config files (from the wizard / post-install editor) by
+ * writing them over the HOST source of the bind the repo compose ALREADY declares,
+ * so the user's content overrides the repo template on that existing bind - no
+ * second bind. Returns the set of container paths it handled, so the caller skips
+ * addConfigFileBinds for those (which would otherwise double-bind the same target).
+ */
+export async function applyUserConfigOverrides(
+  composeContent: string,
+  appName: string,
+  configFiles: Array<{ path: string; body: string }>,
+  logFn?: (msg: string) => void,
+): Promise<Set<string>> {
+  const handled = new Set<string>();
+  if (!configFiles.length) return handled;
+  const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const pcs = getPCSEnvironment();
+  const appDataPrefix = `${pcs.DATA_ROOT}/AppData`;
+
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return handled;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return handled;
+
+  // Map each container DEST to its AppData host source, for binds under AppData.
+  const destToSource = new Map<string, string>();
+  for (const service of Object.values(services)) {
+    if (!Array.isArray(service.volumes)) continue;
+    for (const vol of service.volumes) {
+      let src: string | null = null;
+      let dest: string | null = null;
+      if (typeof vol === 'string') {
+        const idx = vol.indexOf(':');
+        if (idx > 0) { src = vol.slice(0, idx); dest = vol.slice(idx + 1).split(':')[0]; }
+      } else if (vol && typeof vol === 'object') {
+        const v = vol as Record<string, unknown>;
+        if (typeof v.source === 'string' && typeof v.target === 'string' && v.type !== 'volume') { src = v.source; dest = v.target; }
+      }
+      if (src && dest && src.startsWith(appDataPrefix)) destToSource.set(dest, src);
+    }
+  }
+
+  for (const cf of configFiles) {
+    const source = destToSource.get(cf.path);
+    if (!source) continue;   // not a compose-declared bind -> caller adds a bind instead
+    handled.add(cf.path);
+    try {
+      await ensureVolumeDir(path.dirname(source), log);
+      // The user's stored config is authoritative for this bind: replace whatever
+      // createVolumeDirectories delivered (the repo template) with the user's body.
+      try { await execAsync(`docker exec casaos rm -rf "${source}"`, { timeout: 10000 }); }
+      catch { try { fs.rmSync(source, { recursive: true, force: true }); } catch { /* best effort */ } }
+      fs.writeFileSync(source, cf.body);
+      try {
+        await execAsync(`docker exec casaos chown ubuntu:ubuntu "${source}"`, { timeout: 10000 });
+        await execAsync(`docker exec casaos chmod 644 "${source}"`, { timeout: 10000 });
+      } catch {
+        try {
+          await execAsync(`chown 1000:1000 "${source}"`, { timeout: 5000 });
+          await execAsync(`chmod 644 "${source}"`, { timeout: 5000 });
+        } catch { /* best effort */ }
+      }
+      log(`[PCS] Delivered user config to ${source} (bind ${cf.path})`);
+    } catch (err) {
+      log(`[PCS] Warning: could not deliver user config for ${cf.path}: ${err}`);
+    }
+  }
+  return handled;
 }
 
 function formatDotenvValue(value: string): string {

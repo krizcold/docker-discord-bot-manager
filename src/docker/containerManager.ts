@@ -45,6 +45,7 @@ import {
   writeComposeEnvFile,
   addConfigFileBinds,
   writeConfigFiles,
+  applyUserConfigOverrides,
   fixPostDeployOwnership,
   executeInstallCommand
 } from '../templates/pcsProcessing';
@@ -1394,18 +1395,23 @@ async function buildGitInstance(
     buildTarget = 'bot';
   }
 
-  // CasaOS: create volume directories
+  // CasaOS: create volume directories + deliver user-edited config files
+  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
+  let bindOnlyConfigs = configFiles;
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');
     await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'));
+    // A config whose path matches a bind the compose already declares is delivered
+    // over that existing bind (no second bind). The rest fall through to a fresh bind.
+    const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'));
+    bindOnlyConfigs = configFiles.filter(c => !handled.has(c.path));
   }
 
-  // Config files: bind user-supplied config files into the bot service. Injected
-  // AFTER createVolumeDirectories so the file path is not created as a directory.
-  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
-  if (configFiles.length > 0) {
-    emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
-    composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+  // Config files the compose does NOT already mount: bind them in. Injected AFTER
+  // createVolumeDirectories so the file path is not created as a directory.
+  if (bindOnlyConfigs.length > 0) {
+    emit(`[Config] Delivering ${bindOnlyConfigs.length} config file(s)`, 'info');
+    composeContent = addConfigFileBinds(composeContent, appName, bindOnlyConfigs);
   }
 
   // Write .botmanager marker inside AppData (identifies folder as ours)
@@ -1503,9 +1509,9 @@ async function buildGitInstance(
       emit('[PCS] Writing status page...', 'info');
       await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
     }
-    if (configFiles.length > 0) {
+    if (bindOnlyConfigs.length > 0) {
       emit('[PCS] Writing config files...', 'info');
-      await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info'));
+      await writeConfigFiles(appName, bindOnlyConfigs, (msg) => emit(msg, 'info'));
     }
   }
 

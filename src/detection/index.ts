@@ -8,6 +8,7 @@ import * as path from 'path';
 import { parseDocument } from 'yaml';
 import { BotType, DatabaseKind, DetectedConfigFile, DetectionResult, PackageManager, SystemDep } from '../types';
 import { configFileFormat, extractConfigKeys, scanSourceForEnvVars } from '../env/manager';
+import { findConfigTemplate } from '../config/configTemplates';
 
 /**
  * Detect bot type from repository path
@@ -430,6 +431,74 @@ function findInContainerPath(repoPath: string, targetName: string): string | nul
 }
 
 /**
+ * Detect config files the repo's own compose BIND-MOUNTS from a relative path
+ * (e.g. ./Lavalink/application.yml:/opt/Lavalink/application.yml). These live in
+ * subdirs that the marker-file scan does not reach, and the source is often
+ * gitignored and shipped as an example template - so resolve the repo file or its
+ * template and surface its content, keyed to the bind's in-container target. This
+ * ties the wizard's editable config directly to what volume-delivery delivers.
+ */
+function detectComposeConfigFiles(repoPath: string): DetectedConfigFile[] {
+  const out: DetectedConfigFile[] = [];
+  for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    const text = readFileSafe(path.join(repoPath, f));
+    if (!text) continue;
+    let compose: Record<string, any>;
+    try {
+      compose = parseDocument(text).toJSON() as Record<string, any>;
+    } catch {
+      return out;
+    }
+    const services = compose?.services as Record<string, any> | undefined;
+    if (!services) return out;
+    for (const service of Object.values(services)) {
+      if (!Array.isArray(service?.volumes)) continue;
+      for (const vol of service.volumes) {
+        let src: string | null = null;
+        let dest: string | null = null;
+        if (typeof vol === 'string') {
+          const idx = vol.indexOf(':');
+          if (idx > 0) { src = vol.slice(0, idx); dest = vol.slice(idx + 1).split(':')[0]; }
+        } else if (vol && typeof vol === 'object' && typeof vol.source === 'string' && typeof vol.target === 'string' && vol.type !== 'volume') {
+          src = vol.source; dest = vol.target;
+        }
+        if (!src || !dest) continue;
+        if (!(src.startsWith('./') || src.startsWith('../'))) continue;       // relative bind only
+        const targetName = path.basename(dest);
+        if (!CONFIG_TARGET_RE.test(targetName)) continue;                     // looks like a config FILE
+        if (/^\.env/i.test(targetName) || /compose/i.test(targetName) || /dockerfile/i.test(targetName)) continue;
+
+        const rel = src.replace(/^(\.\.?\/)+/, '');
+        const direct = path.join(repoPath, rel);
+        let repoFile: string | null = null;
+        try {
+          if (fs.existsSync(direct) && fs.statSync(direct).isFile()) repoFile = direct;
+          else repoFile = findConfigTemplate(direct);
+        } catch {
+          repoFile = null;
+        }
+        if (!repoFile) continue;
+
+        const rawBody = readFileSafe(repoFile).slice(0, 65536);
+        if (!rawBody.trim()) continue;
+        if (out.some(o => o.inContainerPath === dest)) continue;
+        const format = configFileFormat(targetName);
+        out.push({
+          exampleName: path.relative(repoPath, repoFile).split(path.sep).join('/'),
+          targetName,
+          format,
+          inContainerPath: dest,
+          keys: extractConfigKeys(rawBody, format),
+          rawBody,
+        });
+      }
+    }
+    break;   // first compose found wins
+  }
+  return out;
+}
+
+/**
  * Detect config-file templates a repo ships (config.json.example etc.). Scans
  * the repo root and a top-level config/ dir for *.example / *.sample files that
  * resolve to a config-looking target name.
@@ -472,6 +541,14 @@ function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
         rawBody,
       });
     }
+  }
+
+  // Also surface configs the compose bind-mounts from a (possibly subdir) relative
+  // path, which the root/config scan above does not reach.
+  for (const cf of detectComposeConfigFiles(repoPath)) {
+    if (seen.has(cf.targetName)) continue;
+    seen.add(cf.targetName);
+    out.push(cf);
   }
 
   return out;

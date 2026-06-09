@@ -2062,15 +2062,10 @@
         </div>`;
       }
 
-      // Detected config-file templates the user can deliver as a file
-      let configTemplatesHtml = '';
-      if (installConfigHints.length > 0) {
-        const chips = installConfigHints.map((cf, i) =>
-          `<button type="button" class="btn btn-secondary btn-small" onclick="useConfigTemplate(${i})" title="Add ${escapeHtml(cf.inContainerPath)}">+ ${escapeHtml(cf.targetName)}</button>`
-        ).join(' ');
-        configTemplatesHtml = `<div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 4px;">Detected template(s):</div>
-          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px;">${chips}</div>`;
-      }
+      // Auto-render an editable block per detected config template (prefilled).
+      const configBlocksHtml = installConfigHints
+        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true))
+        .join('');
 
       el.innerHTML = `
         <h3>Install from Source</h3>
@@ -2103,13 +2098,12 @@
           </div>
         </div>
         <div class="form-group">
-          <label>Config Files (advanced)</label>
+          <label>Config Files</label>
           <div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 6px;">
-            Most bots are configured by the variables above. If this bot reads a config file instead,
-            deliver it here. The file is bind-mounted into the container (read-only) and persists across updates.
+            Config files this bot reads, prefilled from its template. Tweak them here before installing;
+            each is delivered into the container and persists across updates.
           </div>
-          ${configTemplatesHtml}
-          <div id="install-config-files"></div>
+          <div id="install-config-files">${configBlocksHtml}</div>
           <button class="btn btn-secondary btn-small" style="margin-top: 4px;" onclick="addConfigFileRow()">+ Add config file</button>
         </div>
         <div class="modal-actions">
@@ -2201,12 +2195,6 @@
 
     function addConfigFileRow(containerPath, body, readOnly) {
       document.getElementById('install-config-files').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml(containerPath, body, readOnly));
-    }
-
-    function useConfigTemplate(index) {
-      const cf = installConfigHints[index];
-      if (!cf) return;
-      addConfigFileRow(cf.inContainerPath, cf.rawBody, true);
     }
 
     // ─── Config File Editor (post-install) ───

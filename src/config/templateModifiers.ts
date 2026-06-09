@@ -31,8 +31,11 @@ export const TEMPLATE_MODIFIERS: TemplateModifier[] = [
     //  - youtube.remoteCipher pointed at a yt-cipher server on localhost:8001;
     //    its presence forces remote signature deciphering, so every WEB-family
     //    client fails with "Connection refused" and nothing ever plays.
-    // Default the sources off and drop remoteCipher so it boots and plays; the
-    // user re-enables sources / adds a real cipher server in the wizard if wanted.
+    // We also enable youtube.oauth: a datacenter IP hits YouTube's "Sign in to
+    // confirm you're not a bot" wall, and OAuth is youtube-source's only bypass.
+    // With oauth.enabled true and no refreshToken, Lavalink logs a device code on
+    // boot; the user authorizes once (burner Google account advised) and pastes the
+    // logged refreshToken back into this config to persist it across restarts.
     match: { urlContains: 'lavamusic' },
     target: 'application.yml',
     edits: [
@@ -41,6 +44,7 @@ export const TEMPLATE_MODIFIERS: TemplateModifier[] = [
       { kind: 'setYamlKey', path: 'plugins.lavasrc.sources.deezer', value: false },
       { kind: 'setYamlKey', path: 'plugins.lavasrc.sources.yandexmusic', value: false },
       { kind: 'deleteYamlKey', path: 'plugins.youtube.remoteCipher' },
+      { kind: 'setYamlKey', path: 'plugins.youtube.oauth.enabled', value: true },
     ],
   },
 ];

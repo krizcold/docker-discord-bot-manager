@@ -12,7 +12,8 @@ import { parseDocument } from 'yaml';
 
 export type TemplateEdit =
   | { kind: 'replace'; find: string | RegExp; replace: string }
-  | { kind: 'setYamlKey'; path: string; value: string | number | boolean };
+  | { kind: 'setYamlKey'; path: string; value: string | number | boolean }
+  | { kind: 'deleteYamlKey'; path: string };
 
 export interface TemplateModifier {
   match: { url?: string; urlContains?: string };
@@ -22,10 +23,16 @@ export interface TemplateModifier {
 
 export const TEMPLATE_MODIFIERS: TemplateModifier[] = [
   {
-    // Lavamusic (bongodevs/lavamusic) ships example.application.yml with every
-    // lavasrc source enabled but only placeholder credentials; LavaSrc crashes
-    // Lavalink on boot (the Apple Music placeholder token). Default them off so it
-    // boots out-of-the-box - the user re-enables and adds keys for any they want.
+    // Lavamusic (bongodevs/lavamusic) ships example.application.yml wired for
+    // companion services / credentials we never deploy, all of which break the
+    // out-of-the-box experience:
+    //  - every lavasrc source enabled with only placeholder credentials; the
+    //    Apple Music placeholder token crashes LavaSrc on boot.
+    //  - youtube.remoteCipher pointed at a yt-cipher server on localhost:8001;
+    //    its presence forces remote signature deciphering, so every WEB-family
+    //    client fails with "Connection refused" and nothing ever plays.
+    // Default the sources off and drop remoteCipher so it boots and plays; the
+    // user re-enables sources / adds a real cipher server in the wizard if wanted.
     match: { urlContains: 'lavamusic' },
     target: 'application.yml',
     edits: [
@@ -33,6 +40,7 @@ export const TEMPLATE_MODIFIERS: TemplateModifier[] = [
       { kind: 'setYamlKey', path: 'plugins.lavasrc.sources.applemusic', value: false },
       { kind: 'setYamlKey', path: 'plugins.lavasrc.sources.deezer', value: false },
       { kind: 'setYamlKey', path: 'plugins.lavasrc.sources.yandexmusic', value: false },
+      { kind: 'deleteYamlKey', path: 'plugins.youtube.remoteCipher' },
     ],
   },
 ];
@@ -49,8 +57,21 @@ function applyEdit(edit: TemplateEdit, format: string, body: string): string {
   if (edit.kind === 'replace') {
     return body.replace(edit.find as RegExp, edit.replace);
   }
-  // setYamlKey: only touch an EXISTING key (never create spurious keys).
   const keys = edit.path.split('.');
+  // deleteYamlKey: drop an existing key/block (e.g. an integration pointed at a
+  // companion service we never deploy). Yaml-only; comments on the node go with it.
+  if (edit.kind === 'deleteYamlKey') {
+    if (format !== 'yaml') return body;
+    try {
+      const doc = parseDocument(body);
+      if (!doc.hasIn(keys)) return body;
+      doc.deleteIn(keys);
+      return doc.toString();
+    } catch {
+      return body;
+    }
+  }
+  // setYamlKey: only touch an EXISTING key (never create spurious keys).
   if (format === 'yaml') {
     try {
       const doc = parseDocument(body);

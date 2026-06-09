@@ -1005,18 +1005,8 @@
       'LAVALINK_PASSWORD': 'Lavalink Password',
     };
 
-    const REQUIRED_KEYS = new Set([
-      'TOKEN', 'DISCORD_TOKEN', 'BOT_TOKEN', 'CLIENT_TOKEN',
-      'CLIENT_ID', 'DISCORD_CLIENT_ID',
-      'GUILD_ID',
-    ]);
-
     function getEnvLabel(key) {
       return ENV_LABELS[key] || null;
-    }
-
-    function isRequiredEnv(key) {
-      return REQUIRED_KEYS.has(key);
     }
 
     // ─── Update Status Cache ───
@@ -1411,49 +1401,8 @@
           return;
         }
 
-        // Build env rows from existing vars + .env.example hints
-        const existing = {};
-        if (res.envVars) res.envVars.forEach(v => { existing[v.key] = v; });
-
-        const seen = new Set();
-        let rowsHtml = '';
-
-        // Show existing env vars first
-        if (res.envVars && res.envVars.length > 0) {
-          for (const v of res.envVars) {
-            seen.add(v.key);
-            const label = getEnvLabel(v.key);
-            const req = isRequiredEnv(v.key);
-            const displayValue = v.sensitive ? '' : (v.value || '');
-            rowsHtml += buildEnvRowHtml(v.key, displayValue, label, req, v.sensitive ? 'Sensitive - enter new value to change' : '');
-          }
-        }
-
-        // Add hints from .env.example that aren't already set
-        if (res.envExample) {
-          for (const ex of res.envExample) {
-            if (!seen.has(ex.key)) {
-              seen.add(ex.key);
-              const label = getEnvLabel(ex.key) || ex.description;
-              const req = isRequiredEnv(ex.key);
-              rowsHtml += buildEnvRowHtml(ex.key, ex.defaultValue || '', label, req, '');
-            }
-          }
-        }
-
-        // Add missing required vars
-        if (res.missing) {
-          for (const key of res.missing) {
-            if (!seen.has(key)) {
-              seen.add(key);
-              rowsHtml += buildEnvRowHtml(key, '', getEnvLabel(key), true, '');
-            }
-          }
-        }
-
-        if (!rowsHtml) {
-          rowsHtml = buildEnvRowHtml('', '', null, false, '');
-        }
+        // Build rows from the merged detected + saved list (shared with the wizard)
+        const rowsHtml = renderEnvRows(res.vars || []);
 
         content.innerHTML = `
           <h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -2099,19 +2048,10 @@
       // Build env rows
       let envRowsHtml = '';
       if (installEnvHints.length > 0) {
-        envRowsHtml = installEnvHints.map(h => {
-          const label = h.displayLabel || getEnvLabel(h.key) || '';
-          if (h.autoWired) {
-            return buildAutoWiredRowHtml(h.key, label);
-          }
-          const placeholder = h.sensitive ? 'Sensitive value' : (h.defaultValue || 'Value');
-          const value = h.sensitive ? '' : (h.defaultValue || '');
-          return buildEnvRowHtml(h.key, value, label, !!h.required, placeholder, h.description || '');
-        }).join('');
+        envRowsHtml = renderEnvRows(installEnvHints);
       } else {
-        envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '')
-          + buildEnvRowHtml('CLIENT_ID', '', 'Discord Client ID', true, '')
-          + buildEnvRowHtml('GUILD_ID', '', 'Discord Guild ID', true, '');
+        // No detected envs: offer a generic token field as a last resort.
+        envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '');
       }
 
       // Interactive-setup guidance banner
@@ -2200,6 +2140,25 @@
           <input type="text" value="Auto-configured" class="env-value" disabled title="Configured automatically by the bot manager">
         </div>
       </div>`;
+    }
+
+    // Shared env-row rendering for the install wizard AND the post-install env
+    // editor, so labels, comment tips, required flags, and sensitive masking match.
+    // Entries accept either {defaultValue} (wizard hints) or {value,isSet} (editor).
+    function renderEnvRow(e) {
+      const label = e.label || e.displayLabel || getEnvLabel(e.key) || '';
+      if (e.autoWired) return buildAutoWiredRowHtml(e.key, label);
+      const current = (e.value !== undefined && e.value !== null) ? e.value : (e.defaultValue || '');
+      const value = e.sensitive ? '' : current;
+      const placeholder = e.sensitive
+        ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
+        : (current || 'Value');
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '');
+    }
+
+    function renderEnvRows(entries) {
+      if (!entries || entries.length === 0) return buildEnvRowHtml('', '', null, false, '');
+      return entries.map(renderEnvRow).join('');
     }
 
     async function scanInstallEnvs() {

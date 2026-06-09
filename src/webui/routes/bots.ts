@@ -8,6 +8,7 @@ import { WebSocketServer } from 'ws';
 import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
+import { buildBotEnvList } from '../../env/envList';
 import * as configFileManager from '../../config/configFileManager';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
@@ -677,26 +678,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const envVars = envManager.getEnvVarsInfo(req.params.id);
-      const validation = envManager.hasRequiredEnvVars(req.params.id);
+      const repoPath = (bot.sourceType !== 'docker-image' && bot.sourceId)
+        ? sourceManager.getSourceRepoPath(bot.sourceId)
+        : null;
 
-      // Parse .env.example from source repo
-      let envExample: Array<{ key: string; description: string; defaultValue: string }> = [];
-      if (bot.sourceType !== 'docker-image' && bot.sourceId) {
-        try {
-          const repoPath = sourceManager.getSourceRepoPath(bot.sourceId);
-          if (require('fs').existsSync(repoPath)) {
-            envExample = envManager.parseEnvExample(repoPath);
-          }
-        } catch (err) {
-          // Repo might not exist
-        }
-      }
+      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName);
+      const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
 
       res.json({
         success: true,
-        envVars,
-        envExample,
+        vars,
+        tokenVarName: bot.tokenVarName,
         valid: validation.valid,
         missing: validation.missing
       });
@@ -725,7 +717,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       envManager.setEnvVars(req.params.id, vars);
       await containerManager.updateBot(req.params.id, { envVars: vars });
 
-      const validation = envManager.hasRequiredEnvVars(req.params.id);
+      const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
     } catch (error) {

@@ -1,0 +1,161 @@
+/**
+ * Shared env-var list builders for the install wizard and the post-install env
+ * editor, so the two stay in parity (same labels, comment tips, required logic).
+ * Detection + config-surfacing + token handling live here once.
+ */
+
+import * as fs from 'fs';
+import { detectBotType } from '../detection';
+import { DetectionResult } from '../types';
+import {
+  detectEnvVars,
+  normalizeEnvLabel,
+  getEnvVars,
+  isSensitive,
+  DetectedEnvVar,
+} from './manager';
+
+/**
+ * Wizard view: every var a fresh install should offer, enriched with
+ * label/description/required/sensitive plus DB/Lavalink auto-wiring and the
+ * config-file-as-env surfacing. This is the single source the env wizard and the
+ * editor both build on.
+ */
+export function buildWizardEnvList(
+  repoPath: string,
+  options?: { scanSource?: boolean }
+): { vars: DetectedEnvVar[]; detection: DetectionResult } {
+  const scanSource = !!options?.scanSource;
+  const detection = detectBotType(repoPath);
+
+  const autoWiredKeys = new Set<string>();
+  if (!detection.hasCompose) {
+    for (const db of detection.databases) {
+      if (db === 'postgres' || db === 'mariadb' || db === 'mysql') autoWiredKeys.add('DATABASE_URL');
+      if (db === 'mongo') { autoWiredKeys.add('MONGO_URI'); autoWiredKeys.add('MONGODB_URI'); }
+      if (db === 'redis') autoWiredKeys.add('REDIS_URL');
+    }
+    if (detection.needsLavalink) {
+      autoWiredKeys.add('LAVALINK_HOST');
+      autoWiredKeys.add('LAVALINK_PORT');
+      autoWiredKeys.add('LAVALINK_PASSWORD');
+    }
+  }
+
+  const vars = detectEnvVars(repoPath, { scanSource }).map(v =>
+    autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
+  );
+
+  // Env-first: surface a config file's top-level scalar keys as env vars, so
+  // file-based bots that also read process.env are fully configurable without
+  // delivering a file. The token key is required; others show only when they
+  // carry a pre-filled value (mirrors detectEnvVars).
+  for (const cf of detection.configFiles || []) {
+    for (const k of cf.keys) {
+      if (vars.some(v => v.key === k.key)) continue;
+      const required = k.key === detection.tokenVarName;
+      if (!required && k.defaultValue.trim() === '') continue;
+      vars.push({
+        key: k.key,
+        displayLabel: normalizeEnvLabel(k.key),
+        description: '',
+        defaultValue: k.defaultValue,
+        required,
+        source: 'config',
+        sensitive: k.sensitive,
+        autoWired: false,
+      });
+    }
+  }
+
+  // Always surface the bot's token var as a required field.
+  const tokenVar = detection.tokenVarName;
+  if (tokenVar && !vars.some(v => v.key === tokenVar)) {
+    vars.unshift({
+      key: tokenVar,
+      displayLabel: normalizeEnvLabel(tokenVar),
+      description: '',
+      defaultValue: '',
+      required: true,
+      source: 'env-example',
+      sensitive: true,
+      autoWired: false,
+    });
+  }
+
+  return { vars, detection };
+}
+
+export interface EditorEnvVar {
+  key: string;
+  displayLabel: string;
+  description: string;
+  required: boolean;
+  sensitive: boolean;
+  value: string;   // current value; blank for sensitive (a stored secret never leaves the server)
+  isSet: boolean;  // whether a value is currently stored
+}
+
+/**
+ * Editor view: the same detected vars the wizard offers, pre-filled with the
+ * bot's saved values, plus any user-added vars not surfaced by detection.
+ * Auto-wired (deploy-injected) vars are omitted since they are not user-editable.
+ * Sensitive values are masked to '' so a stored secret is never sent to the UI.
+ */
+export function buildBotEnvList(
+  repoPath: string | null,
+  botId: string,
+  tokenVarName?: string
+): EditorEnvVar[] {
+  const stored = getEnvVars(botId);
+  const result: EditorEnvVar[] = [];
+  const seen = new Set<string>();
+
+  const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath).vars : [];
+  for (const d of detected) {
+    if (d.autoWired) continue;   // deploy-injected, not user-editable
+    seen.add(d.key);
+    const isSet = stored[d.key] !== undefined;
+    const sensitive = d.sensitive || isSensitive(d.key);
+    result.push({
+      key: d.key,
+      displayLabel: d.displayLabel,
+      description: d.description,
+      required: d.required,
+      sensitive,
+      value: sensitive ? '' : (isSet ? stored[d.key] : d.defaultValue),
+      isSet,
+    });
+  }
+
+  // User-added vars not surfaced by detection.
+  for (const [key, value] of Object.entries(stored)) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const sensitive = isSensitive(key);
+    result.push({
+      key,
+      displayLabel: '',
+      description: '',
+      required: !!tokenVarName && key === tokenVarName,
+      sensitive,
+      value: sensitive ? '' : value,
+      isSet: true,
+    });
+  }
+
+  // Always surface the token field so it can be set.
+  if (tokenVarName && !seen.has(tokenVarName)) {
+    result.unshift({
+      key: tokenVarName,
+      displayLabel: normalizeEnvLabel(tokenVarName),
+      description: '',
+      required: true,
+      sensitive: isSensitive(tokenVarName),
+      value: '',
+      isSet: false,
+    });
+  }
+
+  return result;
+}

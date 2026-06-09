@@ -1,11 +1,9 @@
 /**
  * Environment Variable Manager
- * Handles storage and retrieval of bot environment variables
+ * Handles storage and retrieval of bot environment variables.
  *
- * Required Discord env vars:
- * - DISCORD_TOKEN: Bot token from Discord Developer Portal
- * - CLIENT_ID: Application ID for slash command registration
- * - GUILD_ID: Server ID for command registration
+ * A deployed bot's only hard requirement is its own token var (whatever the repo
+ * names it), tracked per-instance as tokenVarName and passed in by callers.
  */
 
 import * as fs from 'fs';
@@ -16,10 +14,6 @@ import { getEnvPath } from '../git/repoManager';
 
 // Encryption key from environment or generate one
 const ENCRYPTION_KEY = process.env.ENV_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
-
-// Required env vars for all Discord bots
-export const REQUIRED_DISCORD_ENVS = ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID'] as const;
-export type RequiredDiscordEnv = typeof REQUIRED_DISCORD_ENVS[number];
 
 // Sensitive env vars that should be encrypted
 const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN'];
@@ -32,7 +26,7 @@ interface EnvStorage {
 /**
  * Check if a variable name is sensitive
  */
-function isSensitive(key: string): boolean {
+export function isSensitive(key: string): boolean {
   const upperKey = key.toUpperCase();
   return SENSITIVE_VARS.some(s => upperKey.includes(s));
 }
@@ -143,71 +137,25 @@ export function deleteEnvVar(botId: string, key: string): void {
 }
 
 /**
- * Check if all required Discord env vars are set
+ * Check whether the bot's required env (its token var) is set. The token var name
+ * is detected per-bot (tokenVarName); when unknown (e.g. a prebuilt-image bot) we
+ * require nothing, since we cannot know what the image expects.
  */
-export function hasRequiredEnvVars(botId: string): {
+export function hasRequiredEnvVars(botId: string, tokenVarName?: string): {
   valid: boolean;
-  missing: RequiredDiscordEnv[];
+  missing: string[];
 } {
   const vars = getEnvVars(botId);
-  const missing: RequiredDiscordEnv[] = [];
+  const missing: string[] = [];
 
-  for (const required of REQUIRED_DISCORD_ENVS) {
-    if (!vars[required] || vars[required].trim() === '') {
-      missing.push(required);
-    }
+  if (tokenVarName && (!vars[tokenVarName] || vars[tokenVarName].trim() === '')) {
+    missing.push(tokenVarName);
   }
 
   return {
     valid: missing.length === 0,
     missing
   };
-}
-
-/**
- * Get env var info (masked values for sensitive vars)
- */
-export function getEnvVarsInfo(botId: string): Array<{
-  key: string;
-  value: string;
-  sensitive: boolean;
-  required: boolean;
-}> {
-  const vars = getEnvVars(botId);
-  const result = [];
-
-  for (const [key, value] of Object.entries(vars)) {
-    const sensitive = isSensitive(key);
-    result.push({
-      key,
-      value: sensitive ? maskValue(value) : value,
-      sensitive,
-      required: REQUIRED_DISCORD_ENVS.includes(key as RequiredDiscordEnv)
-    });
-  }
-
-  // Add missing required vars. Use result.some() rather than !vars[required]
-  // so an empty-but-present value (e.g., after a failed decrypt) does not
-  // cause a second entry for the same key.
-  for (const required of REQUIRED_DISCORD_ENVS) {
-    if (result.some(e => e.key === required)) continue;
-    result.push({
-      key: required,
-      value: '',
-      sensitive: isSensitive(required),
-      required: true
-    });
-  }
-
-  return result;
-}
-
-/**
- * Mask a sensitive value for display
- */
-function maskValue(value: string): string {
-  if (!value || value.length < 8) return '****';
-  return value.substring(0, 4) + '****' + value.substring(value.length - 4);
 }
 
 /**

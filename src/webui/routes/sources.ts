@@ -9,8 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
-import { detectEnvVars, normalizeEnvLabel } from '../../env/manager';
-import { detectBotType } from '../../detection';
+import { buildWizardEnvList } from '../../env/envList';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
 export function createSourceRoutes(wss: WebSocketServer): Router {
@@ -161,65 +160,16 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
 
       const scanSource = req.query.scan === 'true';
       const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
-      const detection = detectBotType(repoPath);
+      const { vars, detection } = buildWizardEnvList(repoPath, { scanSource });
 
-      const autoWiredKeys = new Set<string>();
-      if (!detection.hasCompose) {
-        for (const db of detection.databases) {
-          if (db === 'postgres' || db === 'mariadb' || db === 'mysql') autoWiredKeys.add('DATABASE_URL');
-          if (db === 'mongo') { autoWiredKeys.add('MONGO_URI'); autoWiredKeys.add('MONGODB_URI'); }
-          if (db === 'redis') autoWiredKeys.add('REDIS_URL');
-        }
-        if (detection.needsLavalink) {
-          autoWiredKeys.add('LAVALINK_HOST');
-          autoWiredKeys.add('LAVALINK_PORT');
-          autoWiredKeys.add('LAVALINK_PASSWORD');
-        }
-      }
-
-      const vars = detectEnvVars(repoPath, { scanSource }).map(v =>
-        autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
-      );
-
-      // Env-first: surface a config file's top-level scalar keys as env vars, so
-      // file-based bots that also read process.env are fully
-      // configurable without delivering a file. Token-family keys are required;
-      // others show only when they have a pre-filled value (mirrors detectEnvVars).
-      for (const cf of detection.configFiles || []) {
-        for (const k of cf.keys) {
-          if (vars.some(v => v.key === k.key)) continue;
-          const required = k.key === detection.tokenVarName;
-          if (!required && k.defaultValue.trim() === '') continue;
-          vars.push({
-            key: k.key,
-            displayLabel: normalizeEnvLabel(k.key),
-            description: '',
-            defaultValue: k.defaultValue,
-            required,
-            source: 'config',
-            sensitive: k.sensitive,
-            autoWired: false,
-          });
-        }
-      }
-
-      // Always surface the bot's token var as a required field, even if the repo
-      // declares it elsewhere (config file, hardcoded) and detection missed it.
-      const tokenVar = detection.tokenVarName;
-      if (tokenVar && !vars.some(v => v.key === tokenVar)) {
-        vars.unshift({
-          key: tokenVar,
-          displayLabel: normalizeEnvLabel(tokenVar),
-          description: '',
-          defaultValue: '',
-          required: true,
-          source: 'env-example',
-          sensitive: true,
-          autoWired: false,
-        });
-      }
-
-      res.json({ success: true, vars, configFiles: detection.configFiles || [], interactiveSetup: detection.interactiveSetup || null, tier2Ran: scanSource || !hasEnvExample, hasEnvExample });
+      res.json({
+        success: true,
+        vars,
+        configFiles: detection.configFiles || [],
+        interactiveSetup: detection.interactiveSetup || null,
+        tier2Ran: scanSource || !hasEnvExample,
+        hasEnvExample,
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

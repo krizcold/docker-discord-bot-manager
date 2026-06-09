@@ -545,9 +545,19 @@ export function detectEnvVars(
     add(e.key, e.defaultValue, 'env-example', isEnvRequired(e.key, e.description), e.description);
   }
 
-  // compose: required when marked `# MANDATORY`/`# required`, or it is the token
+  // compose: required when marked `# MANDATORY`/`# required`, or it is the token.
+  // A concrete compose `environment:` literal is the author's working in-network
+  // value (e.g. CONNECTION_URI=mongodb://mongo), so when the same key already came
+  // from .env.example it overrides that default, since .env.example commonly ships
+  // a non-working placeholder (e.g. mongodb+srv://mongodburi) the user would
+  // otherwise unknowingly keep. parseComposeEnv already drops $-substituted values.
   const mandatory = findMandatoryComposeKeys(repoPath);
   for (const e of parseComposeEnv(repoPath)) {
+    const existing = byKey.get(e.key);
+    if (existing) {
+      if (existing.source === 'env-example' && e.defaultValue) existing.defaultValue = e.defaultValue;
+      continue;
+    }
     add(e.key, e.defaultValue, 'compose', mandatory.has(e.key) || isEnvRequired(e.key, ''));
   }
 

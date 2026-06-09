@@ -11,6 +11,10 @@ import * as path from 'path';
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 
+export function getDataDir(): string {
+  return DATA_DIR;
+}
+
 export function getBotDir(botId: string): string {
   return path.join(BOTS_DIR, botId);
 }

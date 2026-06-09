@@ -10,10 +10,41 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { parseDocument } from 'yaml';
-import { getEnvPath } from '../git/repoManager';
+import { getEnvPath, getDataDir } from '../git/repoManager';
 
-// Encryption key from environment or generate one
-const ENCRYPTION_KEY = process.env.ENV_ENCRYPTION_KEY || crypto.randomBytes(32).toString('hex');
+/**
+ * Resolve the AES key used to encrypt sensitive env/config values. It MUST be
+ * stable across manager restarts, otherwise every previously-encrypted value
+ * (bot tokens, stored config files) becomes undecryptable on the next boot and
+ * the bot reads as "missing required token". Precedence: an explicit
+ * ENV_ENCRYPTION_KEY, else a key persisted under the data volume (generated once
+ * on first run). Only an in-memory fallback (lost on restart) if persistence
+ * fails, with a loud warning.
+ */
+function loadOrCreateEncryptionKey(): string {
+  if (process.env.ENV_ENCRYPTION_KEY) return process.env.ENV_ENCRYPTION_KEY;
+
+  const keyPath = path.join(getDataDir(), 'env-encryption.key');
+  try {
+    if (fs.existsSync(keyPath)) {
+      const existing = fs.readFileSync(keyPath, 'utf-8').trim();
+      if (existing) return existing;
+    }
+  } catch (error) {
+    console.error('[EnvManager] Failed to read persisted encryption key:', error);
+  }
+
+  const generated = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(getDataDir(), { recursive: true });
+    fs.writeFileSync(keyPath, generated, { mode: 0o600 });
+  } catch (error) {
+    console.error('[EnvManager] Could not persist encryption key; stored tokens will NOT survive a restart:', error);
+  }
+  return generated;
+}
+
+const ENCRYPTION_KEY = loadOrCreateEncryptionKey();
 
 // Sensitive env vars that should be encrypted
 const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN'];

@@ -2245,8 +2245,8 @@
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
           <div style="font-size: 0.7rem; color: var(--text-muted); margin-bottom: 8px;">
-            Files bind-mounted into the container (read-only). Changes take effect on the next build, so
-            press Update (or Install &amp; Run) after saving.
+            Files bind-mounted into the container. Saved changes are applied the next time the bot
+            starts, so press Start (or Update / Install &amp; Run) after saving.
           </div>
           <div id="config-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addConfigEditorRow()" style="margin-bottom: 4px;">+ Add config file</button>
@@ -2283,7 +2283,7 @@
       try {
         const res = await api('PUT', `/bots/${configEditorBotId}/config`, { files });
         if (res.success) {
-          showMessage('success', 'Config files saved. Press Update to apply.');
+          showMessage('success', 'Config files saved. Press Start (or Update) to apply.');
           hideConfigEditor();
           loadBots();
         } else {

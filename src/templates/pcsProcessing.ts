@@ -862,6 +862,25 @@ export async function writeConfigFiles(
 }
 
 /**
+ * Re-write the bind-mounted host config files from the current stored bodies,
+ * WITHOUT touching the compose (its binds already exist from the build). Called on
+ * start so config edits made while the bot is stopped take effect on the next run,
+ * mirroring how env vars are re-synced into the compose on start. Idempotent: the
+ * same overrides + bind-only writes the build performs, minus the compose mutation.
+ */
+export async function redeliverConfigFiles(
+  composeContent: string,
+  appName: string,
+  configFiles: Array<{ path: string; body: string }>,
+  logFn?: (msg: string) => void,
+): Promise<void> {
+  if (!configFiles.length) return;
+  const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, logFn);
+  const bindOnly = configFiles.filter(c => !handled.has(c.path));
+  if (bindOnly.length) await writeConfigFiles(appName, bindOnly, logFn);
+}
+
+/**
  * Deliver user-edited config files (from the wizard / post-install editor) by
  * writing them over the HOST source of the bind the repo compose ALREADY declares,
  * so the user's content overrides the repo template on that existing bind - no

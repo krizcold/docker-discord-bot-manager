@@ -46,6 +46,7 @@ import {
   addConfigFileBinds,
   writeConfigFiles,
   applyUserConfigOverrides,
+  redeliverConfigFiles,
   fixPostDeployOwnership,
   executeInstallCommand
 } from '../templates/pcsProcessing';
@@ -859,6 +860,20 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       syncComposeEnvVars(latestInstance, composePath);
       await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
 
+      // Re-apply edited config files so config changes made while stopped take
+      // effect on start (mirrors the env re-sync above). Binds already exist from
+      // the build, so this only rewrites the bind-mounted host files.
+      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      if (cfgFiles.length > 0) {
+        try {
+          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
+          const composeForCfg = fs.readFileSync(composePath, 'utf-8');
+          await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
+        } catch (err) {
+          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+        }
+      }
+
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
@@ -940,6 +955,17 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
       updateBotStatus(botId, 'starting');
+
+      // Re-apply edited config files so config changes take effect on start.
+      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      if (cfgFiles.length > 0) {
+        try {
+          const composeForCfg = fs.readFileSync(composePath, 'utf-8');
+          await redeliverConfigFiles(composeForCfg, appName, cfgFiles);
+        } catch (err) {
+          console.warn(`[ContainerManager] Could not re-apply config files for ${appName}:`, err);
+        }
+      }
 
       const deployResult = await casaosApi.deployApp(appName, composePath);
       if (!deployResult.success) {

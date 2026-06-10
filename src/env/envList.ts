@@ -7,6 +7,8 @@
 import * as fs from 'fs';
 import { detectBotType } from '../detection';
 import { DetectionResult } from '../types';
+import * as configFileManager from '../config/configFileManager';
+import { applyTemplateModifiers } from '../config/templateModifiers';
 import {
   detectEnvVars,
   normalizeEnvLabel,
@@ -155,6 +157,43 @@ export function buildBotEnvList(
       value: '',
       isSet: false,
     });
+  }
+
+  return result;
+}
+
+/**
+ * Config-editor view: the detected config files a fresh install would offer
+ * (default body run through any per-source template modifier), overlaid with the
+ * bot's saved bodies so the post-install editor surfaces baked-in configs even
+ * when nothing was saved yet (parity with the env editor). Stored body wins; any
+ * stored config not surfaced by detection is appended.
+ */
+export function buildBotConfigList(
+  repoPath: string | null,
+  botId: string,
+  sourceUrl?: string
+): Array<{ path: string; body: string; readOnly: boolean }> {
+  const stored = configFileManager.getConfigFiles(botId);
+  const storedByPath = new Map(stored.map(s => [s.path, s]));
+  const seen = new Set<string>();
+  const result: Array<{ path: string; body: string; readOnly: boolean }> = [];
+
+  const detected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
+  for (const cf of detected) {
+    seen.add(cf.inContainerPath);
+    const s = storedByPath.get(cf.inContainerPath);
+    result.push({
+      path: cf.inContainerPath,
+      body: s ? s.body : applyTemplateModifiers(sourceUrl || '', cf.targetName, cf.format, cf.rawBody),
+      readOnly: s ? s.readOnly !== false : true,
+    });
+  }
+
+  for (const s of stored) {
+    if (seen.has(s.path)) continue;
+    seen.add(s.path);
+    result.push({ path: s.path, body: s.body, readOnly: s.readOnly !== false });
   }
 
   return result;

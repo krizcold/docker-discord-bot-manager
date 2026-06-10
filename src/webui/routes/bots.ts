@@ -8,7 +8,7 @@ import { WebSocketServer } from 'ws';
 import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
-import { buildBotEnvList } from '../../env/envList';
+import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
 import * as configFileManager from '../../config/configFileManager';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
@@ -735,7 +735,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, files: configFileManager.getConfigFiles(req.params.id) });
+      const repoPath = (bot.sourceType !== 'docker-image' && bot.sourceId)
+        ? sourceManager.getSourceRepoPath(bot.sourceId)
+        : null;
+      const source = bot.sourceId ? sourceManager.getSource(bot.sourceId) : null;
+      res.json({ success: true, files: buildBotConfigList(repoPath, req.params.id, source?.url) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

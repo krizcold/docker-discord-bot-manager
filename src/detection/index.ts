@@ -498,14 +498,85 @@ function detectComposeConfigFiles(repoPath: string): DetectedConfigFile[] {
   return out;
 }
 
+// Data-format config files we surface from a config directory even when shipped
+// as real files (no .example marker, no compose bind), e.g. a bot whose
+// config/*.jsonc are baked into the image. Code files (.js/.py) are excluded -
+// those are surfaced only via an explicit .example template. Editing+persisting
+// these is the only way to configure such a bot through the manager.
+const DIR_CONFIG_RE = /\.(jsonc?|json5|ya?ml|toml|ini|conf)$/i;
+const CONFIG_DIRS = ['config', 'configuration', 'settings'];
+
+/**
+ * Resolve the image WORKDIR from the repo's own Dockerfile (last WORKDIR wins,
+ * relative ones joined onto the prior), so a baked-in config file's mount path
+ * matches where the app actually reads it (e.g. /home/container/config/x.jsonc,
+ * not /app/...). Defaults to /app when there is no Dockerfile or it is
+ * ARG/ENV-interpolated.
+ */
+function detectDockerfileWorkdir(repoPath: string): string {
+  const text = readFileSafe(path.join(repoPath, 'Dockerfile'));
+  if (!text) return '/app';
+  let workdir = '/app';
+  for (const raw of text.split('\n')) {
+    const m = raw.match(/^\s*WORKDIR\s+(.+?)\s*$/i);
+    if (!m) continue;
+    const w = m[1].trim().replace(/^["']|["']$/g, '');
+    if (!w || w.includes('$')) continue;
+    workdir = w.startsWith('/') ? w : `${workdir.replace(/\/+$/, '')}/${w}`;
+  }
+  return workdir.replace(/\/+$/, '') || '/';
+}
+
+/**
+ * Surface real (non-template) data config files shipped in a config/ directory,
+ * baked into the image with placeholder values the user must replace. Keyed to
+ * the Dockerfile WORKDIR so volume-delivery binds them over the baked copies.
+ */
+function detectDirConfigFiles(repoPath: string, workdir: string, seen: Set<string>): DetectedConfigFile[] {
+  const out: DetectedConfigFile[] = [];
+  for (const sub of CONFIG_DIRS) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(path.join(repoPath, sub), { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const name = entry.name;
+      if (!DIR_CONFIG_RE.test(name)) continue;
+      if (/^\.env/i.test(name) || /compose/i.test(name) || /dockerfile/i.test(name)) continue;
+      if (seen.has(name)) continue;
+
+      const rawBody = readFileSafe(path.join(repoPath, sub, name)).slice(0, 65536);
+      if (!rawBody.trim()) continue;
+
+      const relTarget = `${sub}/${name}`;
+      const format = configFileFormat(name);
+      seen.add(name);
+      out.push({
+        exampleName: relTarget,
+        targetName: name,
+        format,
+        inContainerPath: `${workdir}/${relTarget}`,
+        keys: extractConfigKeys(rawBody, format),
+        rawBody,
+      });
+    }
+  }
+  return out;
+}
+
 /**
  * Detect config-file templates a repo ships (config.json.example etc.). Scans
  * the repo root and a top-level config/ dir for *.example / *.sample files that
- * resolve to a config-looking target name.
+ * resolve to a config-looking target name. Also surfaces real (non-template)
+ * data config files in a config/ dir (baked-in configs with placeholder values).
  */
 function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
   const out: DetectedConfigFile[] = [];
   const seen = new Set<string>();
+  const workdir = detectDockerfileWorkdir(repoPath);
 
   for (const sub of ['.', 'config']) {
     const dir = path.join(repoPath, sub);
@@ -536,7 +607,7 @@ function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
         exampleName: sub === '.' ? name : `${sub}/${name}`,
         targetName,
         format,
-        inContainerPath: findInContainerPath(repoPath, targetName) || `/app/${relTarget}`,
+        inContainerPath: findInContainerPath(repoPath, targetName) || `${workdir}/${relTarget}`,
         keys: extractConfigKeys(rawBody, format),
         rawBody,
       });
@@ -550,6 +621,10 @@ function detectConfigFiles(repoPath: string): DetectedConfigFile[] {
     seen.add(cf.targetName);
     out.push(cf);
   }
+
+  // Finally, real (non-template) data config files in a config/ dir - baked into
+  // the image with placeholders, the only way to configure some bots.
+  for (const cf of detectDirConfigFiles(repoPath, workdir, seen)) out.push(cf);
 
   return out;
 }

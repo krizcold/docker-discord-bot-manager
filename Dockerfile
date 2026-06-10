@@ -28,8 +28,11 @@ RUN cp -r src/webui/public dist/webui/public
 # Stage 2: Runtime (built for each target platform)
 FROM node:20-alpine
 
-# Install Docker CLI (to communicate with host Docker)
-RUN apk add --no-cache docker-cli docker-cli-compose git
+# Install Docker CLI (to communicate with host Docker). docker-cli-buildx
+# provides BuildKit support, required to build Dockerfiles that use
+# `RUN --mount=...`; without it those builds fall back to the legacy builder
+# and fail.
+RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git
 
 # Trust any repository we operate on (bind-mounted source repos may have
 # mismatched UIDs after CasaOS post-deploy chown). Scoped to this image only.

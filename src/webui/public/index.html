@@ -2538,7 +2538,10 @@
           }
           if (res.valid) {
             error.textContent = '';
-            preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>`;
+            const note = res.adjusted
+              ? ` <span style="opacity:0.7">(saved as "${escapeHtml(res.displayName)}" to keep it unique)</span>`
+              : '';
+            preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>${note}`;
             if (reuseRow) reuseRow.style.display = res.reuseAvailable ? 'flex' : 'none';
           } else {
             error.textContent = res.errors.join(', ');

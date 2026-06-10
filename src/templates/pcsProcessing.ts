@@ -469,6 +469,16 @@ export function processComposeForCasaOS(
   xcasaos.is_uncontrolled = false;
   xcasaos.store_app_id = appName;
 
+  // A repo that ships its own x-casaos block may omit the title, leaving the
+  // CasaOS tile with no name. Guarantee a display title and a main service.
+  const xcTitle = xcasaos.title as Record<string, unknown> | undefined;
+  if (!xcTitle || !xcTitle.en_us) {
+    xcasaos.title = { en_us: bot.displayName || appName };
+  }
+  if (!xcasaos.main) {
+    xcasaos.main = mainServiceName || 'bot';
+  }
+
   if (pcs.APP_DOMAIN) {
     xcasaos.hostname = `${appName}${pcs.REF_SEPARATOR}${pcs.APP_DOMAIN}`;
   }

@@ -51,18 +51,6 @@ export async function checkDockerConnection(): Promise<boolean> {
 }
 
 /**
- * Check if Docker buildx is available for BuildKit support
- */
-export function isBuildxAvailable(): boolean {
-  try {
-    execSync('docker buildx version', { stdio: 'pipe', timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * List all bot containers managed by this application
  */
 export async function listBotContainers(): Promise<ContainerInfo[]> {
@@ -365,11 +353,10 @@ export async function buildImage(
   console.log(`[Docker] Building image: docker ${args.join(' ')}`);
 
   return new Promise((resolve, reject) => {
-    const env = { ...process.env };
-    if (isBuildxAvailable()) {
-      env.DOCKER_BUILDKIT = '1';
-      console.log('[Docker] BuildKit enabled');
-    }
+    // BuildKit is required for Dockerfiles using `RUN --mount=...`. The daemon's
+    // integrated BuildKit handles this with DOCKER_BUILDKIT=1 alone; the buildx
+    // CLI plugin is not needed, so enable it unconditionally.
+    const env = { ...process.env, DOCKER_BUILDKIT: '1' };
 
     const child = spawn('docker', args, { env });
 
@@ -540,10 +527,7 @@ export async function composeUp(
   console.log(`[Docker] Running: docker ${args.join(' ')}`);
 
   return new Promise((resolve, reject) => {
-    const env = { ...process.env };
-    if (isBuildxAvailable()) {
-      env.DOCKER_BUILDKIT = '1';
-    }
+    const env = { ...process.env, DOCKER_BUILDKIT: '1' };
 
     const child = spawn('docker', args, { env });
 

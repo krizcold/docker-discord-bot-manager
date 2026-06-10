@@ -56,7 +56,7 @@ import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
-import { sanitizeName, titleizeName, resolveNames, validateName } from '../naming';
+import { sanitizeName, titleizeName, resolveNames, makeUniqueName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 
@@ -203,17 +203,12 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     });
   }
 
-  // Derive names
-  const defaultName = source.composeName || extractRepoName(source.url);
-  const displayName = request.displayName || defaultName;
-  const names = resolveNames(displayName);
-
-  // Validate name
+  // Derive names. A reserved or already-used name is auto-uniquified
+  // ("Bot" -> "Bot 2") rather than rejected.
   const existing = Object.values(registry.instances);
-  const validation = validateName(displayName, existing);
-  if (!validation.valid) {
-    throw new Error(`Invalid name: ${validation.errors.join(', ')}`);
-  }
+  const defaultName = source.composeName || extractRepoName(source.url);
+  const displayName = makeUniqueName(request.displayName || defaultName, existing);
+  const names = resolveNames(displayName);
 
   const instanceId = uuidv4();
   const now = new Date().toISOString();
@@ -271,14 +266,9 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
 export async function createDockerImageInstance(request: CreateDockerImageInstanceRequest): Promise<InstanceConfig> {
   const registry = loadRegistry();
 
-  const names = resolveNames(request.displayName);
-
-  // Validate name
+  // Auto-uniquify a reserved or already-used name ("Bot" -> "Bot 2").
   const existing = Object.values(registry.instances);
-  const validation = validateName(request.displayName, existing);
-  if (!validation.valid) {
-    throw new Error(`Invalid name: ${validation.errors.join(', ')}`);
-  }
+  const names = resolveNames(makeUniqueName(request.displayName, existing));
 
   const instanceId = uuidv4();
   const now = new Date().toISOString();
@@ -441,17 +431,19 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
     }
   }
 
-  // 2. Force-remove any remaining containers (belt and suspenders).
-  // Verify after with `docker ps` so we know they're actually gone.
+  // 2. Force-remove any remaining containers from this compose project.
+  // Scope strictly to the compose-project label, which is an exact match.
+  // Docker's `name` filter is a SUBSTRING match, so a generic appName like
+  // "bot" would force-remove every container whose name contains it - including
+  // the manager itself (discordbotmanagerapp).
   try {
     await execAsync(
-      `docker ps -aq --filter "name=${appName}" | xargs -r docker rm -f; ` +
       `docker ps -aq --filter "label=com.docker.compose.project=${appName}" | xargs -r docker rm -f`,
       { timeout: 30000 }
     );
     // Verify no containers linger
     const { stdout } = await execAsync(
-      `docker ps -aq --filter "name=${appName}" --filter "label=com.docker.compose.project=${appName}"`,
+      `docker ps -aq --filter "label=com.docker.compose.project=${appName}"`,
       { timeout: 10000 }
     );
     const remaining = stdout.trim().split('\n').filter(Boolean);
@@ -463,10 +455,11 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
     failures.push(`force-remove containers ${appName}: ${msg}`);
   }
 
-  // 3. Remove orphan networks
+  // 3. Remove orphan networks (same project-label scoping as containers; the
+  // shared external `pcs` network carries no project label and is never matched).
   try {
     await execAsync(
-      `docker network ls --filter "name=${appName}" --format "{{.Name}}" | xargs -r docker network rm`,
+      `docker network ls --filter "label=com.docker.compose.project=${appName}" --format "{{.Name}}" | xargs -r docker network rm`,
       { timeout: 10000 }
     );
   } catch (err) {

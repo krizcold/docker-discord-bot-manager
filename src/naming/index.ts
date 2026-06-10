@@ -126,6 +126,36 @@ export function validateName(
 }
 
 /**
+ * Return a display name guaranteed to pass validateName, appending an
+ * incrementing numeric suffix ("Bot" -> "Bot 2" -> "Bot 3") when the requested
+ * name is reserved, already in use on any layer, or maps to an occupied AppData
+ * folder. Empty / alphanumeric-less names are unfixable and throw.
+ */
+export function makeUniqueName(
+  displayName: string,
+  existingInstances: InstanceConfig[],
+  excludeInstanceId?: string,
+): string {
+  const base = (displayName || '').trim();
+  if (!base) {
+    throw new Error('Name cannot be empty');
+  }
+  const baseSanitized = sanitizeName(base);
+  if (!baseSanitized || baseSanitized === 'unnamed') {
+    throw new Error('Name must contain at least one letter or digit');
+  }
+
+  let candidate = base;
+  for (let suffix = 2; suffix < 1000; suffix++) {
+    if (validateName(candidate, existingInstances, excludeInstanceId).valid) {
+      return candidate;
+    }
+    candidate = `${base} ${suffix}`;
+  }
+  throw new Error(`Could not derive a unique name from "${base}"`);
+}
+
+/**
  * Check if a sanitized name has reusable data from a previous bot manager instance.
  * Returns reuseAvailable=true when an AppData folder exists at that name and no
  * active instance currently owns it. The .botmanager marker is returned when present.

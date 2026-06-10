@@ -16,7 +16,7 @@ import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
 import { logCollectors } from '../../build/logCollector';
-import { validateName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
+import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
@@ -935,11 +935,20 @@ export function createValidationRoutes(): Router {
 
       const excludeId = req.query.excludeId as string;
       const existingInstances = containerManager.getAllBots();
-      const result = validateName(name, existingInstances, excludeId);
-      const names = resolveNames(name);
-      const reuse = result.valid ? checkFolderReuse(names.sanitizedName, existingInstances) : { reuseAvailable: false, marker: null };
 
-      res.json({ ...result, ...names, ...reuse });
+      // A reserved or already-used name is auto-uniquified on install rather than
+      // rejected, so report the name we would actually use instead of an error.
+      let uniqueName: string;
+      try {
+        uniqueName = makeUniqueName(name, existingInstances, excludeId);
+      } catch (err) {
+        res.json({ valid: false, errors: [err instanceof Error ? err.message : String(err)] });
+        return;
+      }
+      const names = resolveNames(uniqueName);
+      const reuse = checkFolderReuse(names.sanitizedName, existingInstances);
+
+      res.json({ valid: true, errors: [], ...names, ...reuse, adjusted: uniqueName !== name, requestedName: name });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

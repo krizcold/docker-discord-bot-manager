@@ -15,10 +15,11 @@ export interface BotConfigFile {
   path: string;       // in-container mount path, e.g. /app/config.json
   body: string;       // verbatim file contents
   readOnly?: boolean; // default true; false lets the bot write back to the file
+  enabled?: boolean;  // default true; false = keep the user's choice but do not deliver/override (bot uses its baked-in copy)
 }
 
 interface ConfigFileStorage {
-  files: Array<{ path: string; body: string; readOnly?: boolean }>;   // body encrypted
+  files: Array<{ path: string; body: string; readOnly?: boolean; enabled?: boolean }>;   // body encrypted
 }
 
 function storageFile(botId: string): string {
@@ -39,7 +40,7 @@ function load(botId: string): ConfigFileStorage {
  * Get a bot's config files with decrypted bodies.
  */
 export function getConfigFiles(botId: string): BotConfigFile[] {
-  return load(botId).files.map(f => ({ path: f.path, body: decrypt(f.body), readOnly: f.readOnly !== false }));
+  return load(botId).files.map(f => ({ path: f.path, body: decrypt(f.body), readOnly: f.readOnly !== false, enabled: f.enabled !== false }));
 }
 
 /**
@@ -52,7 +53,7 @@ export function setConfigFiles(botId: string, files: BotConfigFile[]): void {
   const storage: ConfigFileStorage = {
     files: (files || [])
       .filter(f => f && typeof f.path === 'string' && f.path.trim() && typeof f.body === 'string')
-      .map(f => ({ path: f.path.trim(), body: encrypt(f.body), readOnly: f.readOnly !== false })),
+      .map(f => ({ path: f.path.trim(), body: encrypt(f.body), readOnly: f.readOnly !== false, enabled: f.enabled !== false })),
   };
 
   fs.writeFileSync(storageFile(botId), JSON.stringify(storage, null, 2));

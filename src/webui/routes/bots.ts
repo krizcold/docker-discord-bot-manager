@@ -747,7 +747,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * PUT /api/bots/:id/config - Replace config files for a bot
-   * Body: { files: [{ path, body }] }
+   * Body: { files: [{ path, body, readOnly?, enabled? }] }
    */
   router.put('/:id/config', async (req: Request, res: Response) => {
     try {
@@ -757,7 +757,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const { files } = req.body as { files: Array<{ path: string; body: string }> };
+      const { files } = req.body as { files: Array<{ path: string; body: string; readOnly?: boolean; enabled?: boolean }> };
       if (!Array.isArray(files)) {
         res.status(400).json({ success: false, error: 'files array is required' });
         return;

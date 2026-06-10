@@ -173,11 +173,11 @@ export function buildBotConfigList(
   repoPath: string | null,
   botId: string,
   sourceUrl?: string
-): Array<{ path: string; body: string; readOnly: boolean }> {
+): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean }> {
   const stored = configFileManager.getConfigFiles(botId);
   const storedByPath = new Map(stored.map(s => [s.path, s]));
   const seen = new Set<string>();
-  const result: Array<{ path: string; body: string; readOnly: boolean }> = [];
+  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean }> = [];
 
   const detected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
   for (const cf of detected) {
@@ -187,13 +187,14 @@ export function buildBotConfigList(
       path: cf.inContainerPath,
       body: s ? s.body : applyTemplateModifiers(sourceUrl || '', cf.targetName, cf.format, cf.rawBody),
       readOnly: s ? s.readOnly !== false : true,
+      enabled: s ? s.enabled !== false : true,
     });
   }
 
   for (const s of stored) {
     if (seen.has(s.path)) continue;
     seen.add(s.path);
-    result.push({ path: s.path, body: s.body, readOnly: s.readOnly !== false });
+    result.push({ path: s.path, body: s.body, readOnly: s.readOnly !== false, enabled: s.enabled !== false });
   }
 
   return result;

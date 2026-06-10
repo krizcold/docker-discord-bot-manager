@@ -1420,7 +1420,7 @@
       }
     }
 
-    function buildEnvRowHtml(key, value, label, required, placeholder, description) {
+    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive) {
       const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${required ? ' (required)' : ''}</div>` : '';
       const tipHtml = description ? `<div class="env-tip">${escapeHtml(description)}</div>` : '';
       return `<div>
@@ -1428,7 +1428,7 @@
         <div class="env-row">
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
           <div class="env-vault-wrapper">
-            <input type="text" value="${escapeHtml(value)}" class="env-value" placeholder="${escapeHtml(placeholder || 'Value')}">
+            <input type="text" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
             <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, '${escapeHtml(key)}')" title="Pick from vault" type="button">&#9660;</button>
           </div>
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
@@ -1453,8 +1453,14 @@
       const vars = {};
       rows.forEach(row => {
         const key = row.querySelector('.env-key').value.trim();
-        const value = row.querySelector('.env-value').value;
-        if (key) vars[key] = value;
+        const valueInput = row.querySelector('.env-value');
+        if (!key || !valueInput) return;
+        const value = valueInput.value;
+        // A blank secret field means "keep the stored value" (it was masked on load).
+        // Omit it so the server-side merge preserves the secret; sending the blank
+        // would re-encrypt an empty string and wipe the token.
+        if (valueInput.dataset.sensitive === 'true' && value === '') return;
+        vars[key] = value;
       });
 
       const saveBtn = document.querySelector('#env-editor-content .btn-primary');
@@ -2064,7 +2070,7 @@
 
       // Auto-render an editable block per detected config template (prefilled).
       const configBlocksHtml = installConfigHints
-        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true))
+        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true, true))
         .join('');
 
       el.innerHTML = `
@@ -2147,7 +2153,7 @@
       const placeholder = e.sensitive
         ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
         : (current || 'Value');
-      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '');
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive);
     }
 
     function renderEnvRows(entries) {
@@ -2176,25 +2182,43 @@
       }
     }
 
-    function buildConfigFileBlockHtml(containerPath, body, readOnly) {
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled) {
       const writable = readOnly === false;
+      const isEnabled = enabled !== false;
+      const dim = isEnabled ? '1' : '0.45';
       return `<div class="config-file-block" style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
         <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 6px;">
           <input type="text" class="cf-path" placeholder="/app/config.json" value="${escapeHtml(containerPath || '')}"
-            title="In-container path the bot reads" style="flex: 1;">
+            title="In-container path the bot reads" style="flex: 1; opacity: ${dim};">
           <button class="btn-remove" onclick="this.closest('.config-file-block').remove()" title="Remove">&times;</button>
         </div>
         <textarea class="cf-body" placeholder="File contents" spellcheck="false"
-          style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical;">${escapeHtml(body || '')}</textarea>
-        <label style="display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 0.7rem; color: var(--text-muted);">
-          <input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}>
-          Writable (let the bot modify this file; default is read-only)
-        </label>
+          style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical; opacity: ${dim};">${escapeHtml(body || '')}</textarea>
+        <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
+          <label class="toggle-row" title="When off, the manager does not apply your edits to this file - the bot keeps its default configuration.">
+            <span class="toggle-switch"><input type="checkbox" class="cf-enabled" ${isEnabled ? 'checked' : ''} onchange="onConfigEnabledToggle(this)"><span class="toggle-slider"></span></span>
+            Enabled
+          </label>
+          <label class="toggle-row" title="Let the bot modify this file at runtime; default is read-only.">
+            <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}><span class="toggle-slider"></span></span>
+            Writable
+          </label>
+        </div>
       </div>`;
     }
 
-    function addConfigFileRow(containerPath, body, readOnly) {
-      document.getElementById('install-config-files').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml(containerPath, body, readOnly));
+    function onConfigEnabledToggle(input) {
+      const block = input.closest('.config-file-block');
+      if (!block) return;
+      const dim = input.checked ? '1' : '0.45';
+      const body = block.querySelector('.cf-body');
+      const pathInput = block.querySelector('.cf-path');
+      if (body) body.style.opacity = dim;
+      if (pathInput) pathInput.style.opacity = dim;
+    }
+
+    function addConfigFileRow(containerPath, body, readOnly, enabled) {
+      document.getElementById('install-config-files').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml(containerPath, body, readOnly, enabled));
     }
 
     // ─── Config File Editor (post-install) ───
@@ -2216,7 +2240,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -2247,7 +2271,10 @@
         const path = block.querySelector('.cf-path').value.trim();
         const body = block.querySelector('.cf-body').value;
         const readOnly = !block.querySelector('.cf-writable').checked;
-        if (path && body.trim()) files.push({ path, body, readOnly });
+        const enabled = block.querySelector('.cf-enabled').checked;
+        // Persist disabled rows even with an empty body so the off choice sticks;
+        // an enabled row needs real content or it is dropped (never deliver empty).
+        if (path && (body.trim() || !enabled)) files.push({ path, body, readOnly, enabled });
       });
 
       const saveBtn = document.querySelector('#config-editor-content .btn-primary');
@@ -2593,8 +2620,12 @@
       rows.forEach(row => {
         if (row.classList.contains('env-autowired')) return;
         const key = row.querySelector('.env-key').value.trim();
-        const value = row.querySelector('.env-value').value.trim();
-        if (key) vars[key] = value;
+        const valueInput = row.querySelector('.env-value');
+        if (!key || !valueInput) return;
+        const value = valueInput.value.trim();
+        // Omit a blank secret (masked on load) so it is never stored as empty.
+        if (valueInput.dataset.sensitive === 'true' && value === '') return;
+        vars[key] = value;
       });
 
       // Collect config files (path + verbatim body)
@@ -2603,7 +2634,9 @@
         const path = block.querySelector('.cf-path').value.trim();
         const body = block.querySelector('.cf-body').value;
         const readOnly = !block.querySelector('.cf-writable').checked;
-        if (path && body.trim()) configFiles.push({ path, body, readOnly });
+        const enabled = block.querySelector('.cf-enabled').checked;
+        // Persist a disabled row even with an empty body so the off choice sticks.
+        if (path && (body.trim() || !enabled)) configFiles.push({ path, body, readOnly, enabled });
       });
 
       const btn = document.getElementById('install-btn');
@@ -2775,17 +2808,11 @@
           if (newValue) body.value = newValue;
           await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
         } else {
-          // Bot instance: update via env manager
+          // Bot instance: update just this one var. The server-side merge preserves
+          // every other var, so we must NOT resend the whole set (the others come
+          // back with secrets masked to '' and would wipe stored tokens).
           if (newValue) {
-            const envRes = await api('GET', `/bots/${groupId}/env`);
-            if (envRes.success) {
-              const vars = {};
-              for (const v of (envRes.envVars || [])) {
-                vars[v.key] = v.value || '';
-              }
-              vars[originalKey] = newValue;
-              await api('PUT', `/bots/${groupId}/env`, { vars });
-            }
+            await api('PUT', `/bots/${groupId}/env`, { vars: { [originalKey]: newValue } });
           }
         }
         row.classList.remove('dirty');

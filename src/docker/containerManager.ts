@@ -1155,7 +1155,7 @@ async function buildDockerImageInstance(
   composeContent = processed.content;
 
   // Config files: bind user-supplied config files into the bot service.
-  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
+  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false) : [];
   if (configFiles.length > 0) {
     emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
     composeContent = addConfigFileBinds(composeContent, appName, configFiles);
@@ -1396,7 +1396,7 @@ async function buildGitInstance(
   }
 
   // CasaOS: create volume directories + deliver user-edited config files
-  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId) : [];
+  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false) : [];
   let bindOnlyConfigs = configFiles;
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');

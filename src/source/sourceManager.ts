@@ -464,7 +464,6 @@ const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string;
   { url: 'https://github.com/bongodevs/lavamusic', branch: '' },
   { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: '' },
   { url: 'https://github.com/open-discord-bots/open-ticket', branch: '' },
-  { url: 'https://github.com/python-discord/bot', branch: '' },
   { url: 'https://github.com/disbored/egglord', branch: '' },
   { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: '' },
   // Tier 2: Have Dockerfile, no compose

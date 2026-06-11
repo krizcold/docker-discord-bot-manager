@@ -197,6 +197,28 @@ function rewriteVolumeString(volume: string, appData: string, dataRoot: string):
   return rewriteBindSource(source, appData, dataRoot) + volume.slice(firstColon);
 }
 
+/**
+ * True when a volume binds the bare build-context root (`.` or `./`) - the dev
+ * live-reload overlay pattern `.:/app`. For a locally-built service the image
+ * already contains this source (`COPY . .`), and the manager deploys from AppData
+ * where `.` does NOT resolve to the repo, so the mount would overlay an empty tree
+ * and hide the baked-in code. Such mounts are dropped for built services.
+ */
+function isBuildContextOverlay(volume: unknown): boolean {
+  let source: string | undefined;
+  if (typeof volume === 'string') {
+    const firstColon = volume.indexOf(':');
+    if (firstColon <= 0) return false;
+    source = volume.slice(0, firstColon);
+  } else if (volume && typeof volume === 'object') {
+    const vol = volume as Record<string, unknown>;
+    if (vol.type === 'volume') return false;
+    if (typeof vol.source === 'string') source = vol.source;
+  }
+  if (source === undefined) return false;
+  return source.trim().replace(/\/+$/, '') === '.';
+}
+
 export function processComposeForCasaOS(
   composeContent: string,
   appName: string,
@@ -344,18 +366,26 @@ export function processComposeForCasaOS(
     // platform's data location (named volumes and other absolute paths untouched).
     if (service.volumes && Array.isArray(service.volumes)) {
       const appData = `${pcs.DATA_ROOT}/AppData/${appName}`;
-      service.volumes = service.volumes.map((volume: unknown) => {
-        if (typeof volume === 'string') {
-          return rewriteVolumeString(volume, appData, pcs.DATA_ROOT);
-        }
-        if (volume && typeof volume === 'object') {
-          const vol = volume as Record<string, unknown>;
-          if (typeof vol.source === 'string' && vol.type !== 'volume') {
-            vol.source = rewriteBindSource(vol.source, appData, pcs.DATA_ROOT);
+      const builtService = service.build !== undefined;
+      const kept = (service.volumes as unknown[]).filter(
+        volume => !(builtService && isBuildContextOverlay(volume)),
+      );
+      if (kept.length === 0) {
+        delete service.volumes;
+      } else {
+        service.volumes = kept.map((volume: unknown) => {
+          if (typeof volume === 'string') {
+            return rewriteVolumeString(volume, appData, pcs.DATA_ROOT);
           }
-        }
-        return volume;
-      });
+          if (volume && typeof volume === 'object') {
+            const vol = volume as Record<string, unknown>;
+            if (typeof vol.source === 'string' && vol.type !== 'volume') {
+              vol.source = rewriteBindSource(vol.source, appData, pcs.DATA_ROOT);
+            }
+          }
+          return volume;
+        });
+      }
     }
 
     // Network injection (main service only)

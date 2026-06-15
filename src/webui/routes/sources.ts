@@ -11,6 +11,8 @@ import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
 import { buildWizardEnvList } from '../../env/envList';
 import { applyTemplateModifiers } from '../../config/templateModifiers';
+import { findManifest, sanitizeSeedRows, manifestHasInFileToken } from '../../config/installManifests';
+import { parseConfig } from '../../config/configSerializer';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
 export function createSourceRoutes(wss: WebSocketServer): Router {
@@ -164,15 +166,31 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       const { vars, detection } = buildWizardEnvList(repoPath, { scanSource });
 
       // Apply any per-source template modifier to the prefilled config defaults
-      // (data-driven; the user can still tweak/revert in the wizard).
-      const configFiles = (detection.configFiles || []).map(cf => ({
-        ...cf,
-        rawBody: applyTemplateModifiers(source.url, cf.targetName, cf.format, cf.rawBody),
-      }));
+      // (data-driven; the user can still tweak/revert in the wizard). When a
+      // source has a guided install manifest for this file, attach it plus the
+      // parsed body so the wizard can render the guided form.
+      const configFiles = (detection.configFiles || []).map(cf => {
+        let rawBody = applyTemplateModifiers(source.url, cf.targetName, cf.format, cf.rawBody);
+        const manifest = findManifest(source.url, cf.targetName) || null;
+        let parsed: unknown = null;
+        if (manifest) {
+          rawBody = sanitizeSeedRows(manifest, rawBody);   // drop placeholder seed rows so the bot boots
+          const r = parseConfig(manifest.format, rawBody);
+          if (r.ok) parsed = r.data;
+        }
+        return { ...cf, rawBody, manifest, parsed };
+      });
+
+      // When the token is configured via a guided in-file field, the bot's env
+      // TOKEN (if any) is optional (only used with tokenFromENV); don't show it as
+      // a required field competing with the guided token.
+      const TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
+      const inFileToken = configFiles.some(cf => cf.manifest && manifestHasInFileToken(cf.manifest));
+      const outVars = inFileToken ? vars.map(v => (TOKEN_RE.test(v.key) ? { ...v, required: false } : v)) : vars;
 
       res.json({
         success: true,
-        vars,
+        vars: outVars,
         configFiles,
         interactiveSetup: detection.interactiveSetup || null,
         tier2Ran: scanSource || !hasEnvExample,

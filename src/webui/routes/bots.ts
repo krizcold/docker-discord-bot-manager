@@ -10,6 +10,8 @@ import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
 import * as configFileManager from '../../config/configFileManager';
+import { findManifest, sanitizeSeedRows } from '../../config/installManifests';
+import { parseConfig } from '../../config/configSerializer';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
@@ -739,7 +741,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
       const source = bot.sourceId ? sourceManager.getSource(bot.sourceId) : null;
-      res.json({ success: true, files: buildBotConfigList(repoPath, req.params.id, source?.url) });
+      // Attach a guided install manifest + parsed body per file when one exists,
+      // so the post-install editor renders the same guided form as the wizard.
+      const files = buildBotConfigList(repoPath, req.params.id, source?.url).map(f => {
+        const targetName = path.basename(f.path);
+        const manifest = (source?.url ? findManifest(source.url, targetName) : undefined) || null;
+        const format = envManager.configFileFormat(targetName);
+        let body = f.body;
+        let parsed: unknown = null;
+        if (manifest) {
+          body = sanitizeSeedRows(manifest, body);
+          const r = parseConfig(manifest.format, body);
+          if (r.ok) parsed = r.data;
+        }
+        return { ...f, body, format, manifest, parsed };
+      });
+      res.json({ success: true, files });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

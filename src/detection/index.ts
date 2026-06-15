@@ -26,6 +26,7 @@ export function detectBotType(repoPath: string): DetectionResult {
     hasWebDashboard: false,
     systemDeps: [],
     tokenVarName: 'DISCORD_TOKEN',
+    tokenVarDetected: false,
     isTypeScript: false,
     configFiles: [],
   };
@@ -71,7 +72,9 @@ export function detectBotType(repoPath: string): DetectionResult {
   result.hasWebDashboard = caps.hasWebDashboard;
   result.systemDeps = caps.systemDeps;
 
-  result.tokenVarName = detectTokenVarName(repoPath);
+  const token = detectTokenVarName(repoPath);
+  result.tokenVarName = token.name;
+  result.tokenVarDetected = token.detected;
   result.configFiles = detectConfigFiles(repoPath);
   result.interactiveSetup = detectManualSetup(repoPath, result.configFiles);
 
@@ -276,10 +279,27 @@ function detectDatabasesInCompose(content: string): DatabaseKind[] {
   return [...kinds];
 }
 
+// Env vars named "*TOKEN" that belong to other services, never the Discord login.
+// Used to keep the loose source-scan fallback from picking, e.g., a GITHUB_TOKEN.
+const NON_DISCORD_TOKEN_RE = /^(GITHUB|GH|GITLAB|NPM|SLACK|TELEGRAM|WEBHOOK|HUGGINGFACE|HF|REPLICATE|SENTRY|STRIPE)_?TOKEN$/i;
+
 /**
- * Detect the Discord token env var name (PLAN 3.5 scan order)
+ * From source-scanned env names, pick the one most likely to be the Discord token
+ * when no strictly-named token var exists (e.g. MUSICBOT_TOKEN). Excludes known
+ * non-Discord service tokens and prefers a bot/discord-flavored name.
  */
-function detectTokenVarName(repoPath: string): string {
+function pickLooseTokenVar(keys: string[]): string | null {
+  const candidates = keys.filter(k => /token/i.test(k) && !NON_DISCORD_TOKEN_RE.test(k));
+  if (candidates.length === 0) return null;
+  return candidates.find(k => /bot|discord/i.test(k)) || candidates[0];
+}
+
+/**
+ * Detect the Discord token env var name (PLAN 3.5 scan order).
+ * Returns detected=false when nothing matched and the name is just the fallback
+ * guess, so callers can avoid surfacing a token field the bot never reads.
+ */
+function detectTokenVarName(repoPath: string): { name: string; detected: boolean } {
   const TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
 
   for (const f of ['.env.example', '.env.sample', 'example.env']) {
@@ -287,7 +307,7 @@ function detectTokenVarName(repoPath: string): string {
     if (!text) continue;
     for (const line of text.split('\n')) {
       const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=/i);
-      if (m && TOKEN_RE.test(m[1])) return m[1];
+      if (m && TOKEN_RE.test(m[1])) return { name: m[1], detected: true };
     }
   }
 
@@ -295,7 +315,7 @@ function detectTokenVarName(repoPath: string): string {
     const text = readFileSafe(path.join(repoPath, f));
     if (!text) continue;
     const m = text.match(/\b((?:DISCORD_)?(?:BOT_|CLIENT_)?TOKEN)\b/);
-    if (m) return m[1];
+    if (m) return { name: m[1], detected: true };
     break;
   }
 
@@ -305,18 +325,23 @@ function detectTokenVarName(repoPath: string): string {
     try {
       const cfg = JSON.parse(text);
       const key = Object.keys(cfg).find(k => /token/i.test(k));
-      if (key) return key;
+      if (key) return { name: key, detected: true };
     } catch {
       // ignore
     }
     break;
   }
 
-  for (const key of scanSourceForEnvVars(repoPath)) {
-    if (TOKEN_RE.test(key)) return key;
+  // Source scan: a strictly-named token var wins; otherwise fall back to a loosely
+  // named one the code actually reads (e.g. MUSICBOT_TOKEN) before defaulting.
+  const scanned = scanSourceForEnvVars(repoPath);
+  for (const key of scanned) {
+    if (TOKEN_RE.test(key)) return { name: key, detected: true };
   }
+  const loose = pickLooseTokenVar(scanned);
+  if (loose) return { name: loose, detected: true };
 
-  return 'DISCORD_TOKEN';
+  return { name: 'DISCORD_TOKEN', detected: false };
 }
 
 /**

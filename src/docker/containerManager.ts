@@ -247,7 +247,7 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     databases: detection?.databases,
     needsLavalink: detection?.needsLavalink,
     hasWebDashboard: detection?.hasWebDashboard,
-    tokenVarName: detection?.tokenVarName,
+    tokenVarName: detection?.tokenVarDetected ? detection.tokenVarName : undefined,
     lastBuiltCommit: null,
     createdAt: now,
     updatedAt: now,
@@ -669,7 +669,7 @@ function updateInstanceDetection(botId: string, detection: DetectionResult): voi
     instance.databases = detection.databases;
     instance.needsLavalink = detection.needsLavalink;
     instance.hasWebDashboard = detection.hasWebDashboard;
-    instance.tokenVarName = detection.tokenVarName;
+    instance.tokenVarName = detection.tokenVarDetected ? detection.tokenVarName : undefined;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);

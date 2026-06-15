@@ -166,6 +166,7 @@ export interface DetectionResult {
   hasWebDashboard: boolean;
   systemDeps: SystemDep[];
   tokenVarName: string;
+  tokenVarDetected: boolean;    // true when a real token var was found; false when tokenVarName is just the fallback guess
   isTypeScript: boolean;
   packageName?: string;         // Rust binary name / C# assembly name
   webPort?: number;             // detected web dashboard port, if any

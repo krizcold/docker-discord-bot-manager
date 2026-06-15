@@ -70,9 +70,13 @@ export function buildWizardEnvList(
     }
   }
 
-  // Always surface the bot's token var as a required field.
+  // Surface the bot's token var as a required field, but only when it was actually
+  // detected. A bot configured by a file (or via a non-env mechanism) reads no env
+  // token, so a fabricated DISCORD_TOKEN field would be inert and misleading - the
+  // user would set it and the bot would still start tokenless. Config-file tokens
+  // are surfaced above via the configFiles loop instead.
   const tokenVar = detection.tokenVarName;
-  if (tokenVar && !vars.some(v => v.key === tokenVar)) {
+  if (tokenVar && detection.tokenVarDetected && !vars.some(v => v.key === tokenVar)) {
     vars.unshift({
       key: tokenVar,
       displayLabel: normalizeEnvLabel(tokenVar),

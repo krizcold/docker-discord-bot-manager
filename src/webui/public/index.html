@@ -778,6 +778,7 @@
     </div>
   </div>
 
+  <script src="guidedConfig.js"></script>
   <script>
     let bots = [];
     let sources = [];
@@ -2070,7 +2071,7 @@
 
       // Auto-render an editable block per detected config template (prefilled).
       const configBlocksHtml = installConfigHints
-        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true, true))
+        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true, true, cf.manifest, cf.format, cf.parsed))
         .join('');
 
       el.innerHTML = `
@@ -2118,6 +2119,7 @@
         </div>
       `;
       onNameInput();
+      if (window.guidedInitAll) guidedInitAll();
     }
 
     function addInstallEnvRow(key, value) {
@@ -2182,27 +2184,71 @@
       }
     }
 
-    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled) {
+    function toggleCfCollapse(btn) {
+      const block = btn.closest('.config-file-block');
+      const body = block && block.querySelector('.cf-collapse');
+      if (!body) return;
+      const hidden = body.classList.toggle('hidden');
+      btn.innerHTML = hidden ? '&#9654;' : '&#9660;';   // ▶ / ▼
+    }
+
+    // One config-file card: a collapsible header (the in-container path) over the
+    // body. With a manifest the body is a Form/Raw tabbed guided editor; without,
+    // a plain raw textarea. The raw .cf-body stays canonical (collectors read it).
+    // Manifest cards and new/empty cards start expanded; existing raw files start
+    // collapsed so a multi-file bot shows a tidy list of filenames.
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed) {
       const writable = readOnly === false;
       const isEnabled = enabled !== false;
-      const dim = isEnabled ? '1' : '0.45';
-      return `<div class="config-file-block" style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
+      const hasManifest = !!(manifest && window.guidedNextId);
+      const expanded = hasManifest || !(body && body.trim());
+      const caret = expanded ? '&#9660;' : '&#9654;';
+
+      let blockId = '';
+      let inner = '';
+      if (hasManifest) {
+        blockId = window.guidedNextId();
+        window.guidedRegister(blockId, manifest, manifest.format || format || 'json', parsed || {});
+        const formHtml = window.buildGuidedFormHtml(blockId);
+        inner = `
+          <div class="gc-tabs">
+            <button type="button" class="gc-tab active" data-tab="form" onclick="guidedTab('${blockId}','form')">Form</button>
+            <button type="button" class="gc-tab" data-tab="raw" onclick="guidedTab('${blockId}','raw')">Raw</button>
+            <span class="gc-badge" id="${blockId}-badge"></span>
+          </div>
+          <div class="gc-form" id="${blockId}-form">${formHtml}</div>
+          <textarea class="cf-body hidden" spellcheck="false" oninput="guidedRawEdit('${blockId}')"
+            style="width: 100%; min-height: 200px; font-family: monospace; font-size: 0.75rem; resize: vertical;">${escapeHtml(body || '')}</textarea>`;
+      } else {
+        const dim = isEnabled ? '1' : '0.45';
+        inner = `<textarea class="cf-body" placeholder="File contents" spellcheck="false"
+            style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical; opacity: ${dim};">${escapeHtml(body || '')}</textarea>`;
+      }
+
+      const idAttr = blockId ? ` id="${blockId}"` : '';
+      const guidedAttr = hasManifest ? ' data-guided="1"' : '';
+      const pathDim = (!hasManifest && !isEnabled) ? ' opacity: 0.45;' : '';
+
+      return `<div class="config-file-block"${idAttr}${guidedAttr} style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
         <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 6px;">
+          <button type="button" class="cf-caret" onclick="toggleCfCollapse(this)" title="Collapse / expand"
+            style="background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 0.8rem; padding: 0 2px; line-height: 1;">${caret}</button>
           <input type="text" class="cf-path" placeholder="/app/config.json" value="${escapeHtml(containerPath || '')}"
-            title="In-container path the bot reads" style="flex: 1; opacity: ${dim};">
+            title="In-container path the bot reads" style="flex: 1;${pathDim}">
           <button class="btn-remove" onclick="this.closest('.config-file-block').remove()" title="Remove">&times;</button>
         </div>
-        <textarea class="cf-body" placeholder="File contents" spellcheck="false"
-          style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical; opacity: ${dim};">${escapeHtml(body || '')}</textarea>
-        <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
-          <label class="toggle-row" title="When off, the manager does not apply your edits to this file - the bot keeps its default configuration.">
-            <span class="toggle-switch"><input type="checkbox" class="cf-enabled" ${isEnabled ? 'checked' : ''} onchange="onConfigEnabledToggle(this)"><span class="toggle-slider"></span></span>
-            Enabled
-          </label>
-          <label class="toggle-row" title="Let the bot modify this file at runtime; default is read-only.">
-            <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}><span class="toggle-slider"></span></span>
-            Writable
-          </label>
+        <div class="cf-collapse${expanded ? '' : ' hidden'}">
+          ${inner}
+          <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
+            <label class="toggle-row" title="When off, the manager does not apply your edits to this file - the bot keeps its default configuration.">
+              <span class="toggle-switch"><input type="checkbox" class="cf-enabled" ${isEnabled ? 'checked' : ''} onchange="onConfigEnabledToggle(this)"><span class="toggle-slider"></span></span>
+              Enabled
+            </label>
+            <label class="toggle-row" title="Let the bot modify this file at runtime; default is read-only.">
+              <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}><span class="toggle-slider"></span></span>
+              Writable
+            </label>
+          </div>
         </div>
       </div>`;
     }
@@ -2240,7 +2286,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -2255,6 +2301,7 @@
             <button class="btn btn-primary" onclick="saveConfigEditor()">Save</button>
           </div>
         `;
+        if (window.guidedInitAll) guidedInitAll();
       } catch (err) {
         content.innerHTML = `<h3>Config Files</h3><div class="error-message">Failed to load config files</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideConfigEditor()">Close</button></div>`;
@@ -2266,6 +2313,7 @@
     }
 
     async function saveConfigEditor() {
+      if (window.guidedFlushAll) await guidedFlushAll();
       const files = [];
       document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();
@@ -2630,6 +2678,9 @@
         if (valueInput.dataset.sensitive === 'true' && value === '') return;
         vars[key] = value;
       });
+
+      // Flush any pending guided-form edits into the raw bodies before collecting.
+      if (window.guidedFlushAll) await guidedFlushAll();
 
       // Collect config files (path + verbatim body)
       const configFiles = [];

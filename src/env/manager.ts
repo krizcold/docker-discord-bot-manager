@@ -300,7 +300,7 @@ export type ConfigFileFormat = 'json' | 'yaml' | 'raw';
  */
 export function configFileFormat(fileName: string): ConfigFileFormat {
   const lower = fileName.toLowerCase();
-  if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.json') || lower.endsWith('.jsonc') || lower.endsWith('.json5')) return 'json';
   if (lower.endsWith('.yml') || lower.endsWith('.yaml')) return 'yaml';
   return 'raw';
 }

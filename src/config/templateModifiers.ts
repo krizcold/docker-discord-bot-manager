@@ -8,7 +8,8 @@
  * wizard; a modifier only changes the prefilled default, it never locks anything.
  * Adding a new bot is purely appending one record - no code branches.
  */
-import { parseDocument } from 'yaml';
+import { applyYamlOps } from './yamlOps';
+import { matchesSource } from './sourceMatch';
 
 export type TemplateEdit =
   | { kind: 'replace'; find: string | RegExp; replace: string }
@@ -51,42 +52,25 @@ export const TEMPLATE_MODIFIERS: TemplateModifier[] = [
 
 function modifierMatches(m: TemplateModifier, url: string, targetName: string): boolean {
   if (m.target && m.target.toLowerCase() !== (targetName || '').toLowerCase()) return false;
-  const u = (url || '').toLowerCase();
-  if (m.match.url) return u === m.match.url.toLowerCase();
-  if (m.match.urlContains) return !!u && u.includes(m.match.urlContains.toLowerCase());
-  return false;
+  return matchesSource(m.match, url);
 }
 
 function applyEdit(edit: TemplateEdit, format: string, body: string): string {
   if (edit.kind === 'replace') {
     return body.replace(edit.find as RegExp, edit.replace);
   }
-  const keys = edit.path.split('.');
   // deleteYamlKey: drop an existing key/block (e.g. an integration pointed at a
   // companion service we never deploy). Yaml-only; comments on the node go with it.
   if (edit.kind === 'deleteYamlKey') {
     if (format !== 'yaml') return body;
-    try {
-      const doc = parseDocument(body);
-      if (!doc.hasIn(keys)) return body;
-      doc.deleteIn(keys);
-      return doc.toString();
-    } catch {
-      return body;
-    }
+    return applyYamlOps(body, [{ path: edit.path, remove: true }], { createMissing: false });
   }
   // setYamlKey: only touch an EXISTING key (never create spurious keys).
   if (format === 'yaml') {
-    try {
-      const doc = parseDocument(body);
-      if (!doc.hasIn(keys)) return body;
-      doc.setIn(keys, edit.value);
-      return doc.toString();
-    } catch {
-      return body;
-    }
+    return applyYamlOps(body, [{ path: edit.path, value: edit.value }], { createMissing: false });
   }
   // Non-yaml fallback: line-anchored set of `lastKey: value`.
+  const keys = edit.path.split('.');
   const last = keys[keys.length - 1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!last) return body;
   const re = new RegExp(`(^[^\\S\\n]*${last}[^\\S\\n]*:[^\\S\\n]*).*$`, 'mi');

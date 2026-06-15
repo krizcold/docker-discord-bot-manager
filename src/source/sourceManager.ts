@@ -464,7 +464,6 @@ const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string;
   { url: 'https://github.com/bongodevs/lavamusic', branch: '' },
   { url: 'https://github.com/Zero6992/chatGPT-discord-bot', branch: '' },
   { url: 'https://github.com/open-discord-bots/open-ticket', branch: '' },
-  { url: 'https://github.com/disbored/egglord', branch: '' },
   { url: 'https://github.com/ZeppelinBot/Zeppelin', branch: '' },
   // Tier 2: Have Dockerfile, no compose
   { url: 'https://github.com/Androz2091/AtlantaBot', branch: '' },
@@ -474,7 +473,6 @@ const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string;
   { url: 'https://github.com/jagrosh/MusicBot', branch: '' },
   { url: 'https://github.com/Just-Some-Bots/MusicBot', branch: '' },
   { url: 'https://github.com/kkrypt0nn/Python-Discord-Bot-Template', branch: '' },
-  { url: 'https://github.com/botlabs-gg/yagpdb', branch: '' },
   // Prebuilt-image sources: bots whose only unattended path is a published image
   // (e.g. an interactive first-run setup that cannot be automated from source).
   { imageRef: 'phasecorex/red-discordbot', displayName: 'Red-DiscordBot' },

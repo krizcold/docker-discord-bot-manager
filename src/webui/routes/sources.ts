@@ -163,7 +163,7 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
 
       const scanSource = req.query.scan === 'true';
       const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
-      const { vars, detection } = buildWizardEnvList(repoPath, { scanSource });
+      const { vars, detection } = buildWizardEnvList(repoPath, { scanSource, sourceUrl: source.url });
 
       // Apply any per-source template modifier to the prefilled config defaults
       // (data-driven; the user can still tweak/revert in the wizard). When a

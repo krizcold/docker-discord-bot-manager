@@ -9,6 +9,7 @@ import { detectBotType } from '../detection';
 import { DetectionResult } from '../types';
 import * as configFileManager from '../config/configFileManager';
 import { applyTemplateModifiers } from '../config/templateModifiers';
+import { manifestDeclaredConfigFiles } from '../config/installManifests';
 import {
   detectEnvVars,
   normalizeEnvLabel,
@@ -25,7 +26,7 @@ import {
  */
 export function buildWizardEnvList(
   repoPath: string,
-  options?: { scanSource?: boolean }
+  options?: { scanSource?: boolean; sourceUrl?: string }
 ): { vars: DetectedEnvVar[]; detection: DetectionResult } {
   const scanSource = !!options?.scanSource;
   const detection = detectBotType(repoPath);
@@ -87,6 +88,15 @@ export function buildWizardEnvList(
       sensitive: true,
       autoWired: false,
     });
+  }
+
+  // Append config files a manifest declares but detection misses (deep path, no
+  // compose bind, named-volume delivery), so the wizard surfaces them as guided
+  // forms. Done AFTER the env-first loop above on purpose: these are guided-form
+  // config, not env-configured, so their keys must not become env-var rows.
+  if (options?.sourceUrl) {
+    const extra = manifestDeclaredConfigFiles(options.sourceUrl, repoPath, detection.configFiles || []);
+    if (extra.length) detection.configFiles = [...(detection.configFiles || []), ...extra];
   }
 
   return { vars, detection };
@@ -184,7 +194,9 @@ export function buildBotConfigList(
   const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean }> = [];
 
   const detected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
-  for (const cf of detected) {
+  const declared = (repoPath && fs.existsSync(repoPath) && sourceUrl)
+    ? manifestDeclaredConfigFiles(sourceUrl, repoPath, detected) : [];
+  for (const cf of [...detected, ...declared]) {
     seen.add(cf.inContainerPath);
     const s = storedByPath.get(cf.inContainerPath);
     result.push({

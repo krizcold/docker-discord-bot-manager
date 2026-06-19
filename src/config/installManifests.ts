@@ -10,9 +10,14 @@
  * The manifest carries STRUCTURE only. The actual values live in the config
  * body, which stays the single source of truth (see configSerializer).
  */
+import * as fs from 'fs';
+import * as path from 'path';
 import { matchesSource, SourceMatch } from './sourceMatch';
 import { parseConfig, serializeConfig, ConfigOp } from './configSerializer';
 import { splitPath } from './configPath';
+import { findConfigTemplate } from './configTemplates';
+import { DetectedConfigFile } from '../types';
+import { extractConfigKeys } from '../env/manager';
 
 // ─── Field targets: where a value reads/writes in the underlying config ───
 
@@ -55,6 +60,16 @@ export interface FieldDescriptorBase {
   required?: boolean;
   default?: string | number | boolean | unknown[];   // arrays allowed (list field seed)
   sensitive?: boolean;               // mask in UI (e.g. token)
+  // This field carries the bot's own Discord token in the config body, so a
+  // detected env TOKEN can be demoted to optional. Set ONLY on the real bot
+  // token, never on incidental secrets (API keys, node passwords).
+  isBotToken?: boolean;
+  // This field may be sourced from the config body (its target.path) OR an env
+  // var. The form shows an "In file / From env" switch; the env VALUE is entered
+  // in the existing Environment Variables section (single source of env truth),
+  // and only the switch + optional body flag live here. flagPath is the body
+  // boolean the bot reads as "use env" (e.g. open-ticket's 'tokenFromENV').
+  envAlt?: { var: string; flagPath?: string };
   options?: SelectOption[];          // for type 'select'
   element?: ListElement;             // for type 'list'
   // For type 'grid': a matrix of booleans, each cell at
@@ -136,6 +151,11 @@ export interface ConfigManifest {
   match: SourceMatch;                // same matcher as TEMPLATE_MODIFIERS
   target: string;                    // config file basename, e.g. "general.json"
   format: 'json' | 'yaml';
+  // Declare where this config lives in the repo and where the bot reads it
+  // in-container, so the manager surfaces it even when detection's dir/depth/compose
+  // rules miss it. repoPath is repo-root-relative; if absent, findConfigTemplate
+  // resolves an example sibling (creds.yml -> creds_example.yml).
+  source?: { repoPath: string; inContainerPath: string };
   sections?: SectionDescriptor[];    // object-root config (sections of fields)
   root?: FieldDescriptor;            // array-root config: a single 'list' field over the whole file (target.path '')
 }
@@ -145,11 +165,17 @@ export interface ConfigManifest {
 function j(path: string): FieldTarget {
   return { kind: 'json', path };
 }
+function y(path: string): FieldTarget {
+  return { kind: 'yaml', path };
+}
 function opts(values: string[]): SelectOption[] {
   return values.map(value => ({ value }));
 }
 function boolField(path: string, label: string, def: boolean): FieldDescriptor {
   return { type: 'boolean', label, default: def, target: j(path) };
+}
+function yBool(path: string, label: string, def: boolean): FieldDescriptor {
+  return { type: 'boolean', label, default: def, target: y(path) };
 }
 
 // ─── open-ticket: config/general.jsonc ───
@@ -246,8 +272,7 @@ const openTicketGeneral: ConfigManifest = {
       id: 'identity',
       title: 'Identity & Connection',
       fields: [
-        { type: 'password', label: 'Bot Token', required: true, sensitive: true, placeholders: ['INSERT_BOT_TOKEN'], help: 'Your Discord bot token. Or enable "Read token from .env" below to use the TOKEN env var instead.', target: j('token') },
-        { type: 'boolean', label: 'Read token from .env (TOKEN)', default: false, target: j('tokenFromENV') },
+        { type: 'password', label: 'Bot Token', required: true, sensitive: true, isBotToken: true, placeholders: ['INSERT_BOT_TOKEN'], envAlt: { var: 'TOKEN', flagPath: 'tokenFromENV' }, help: 'Your Discord bot token, or switch to "From env" to read the TOKEN env var instead.', target: j('token') },
         { type: 'guild-id', label: 'Server (Guild) ID', required: true, placeholders: ['DISCORD_SERVER_ID'], help: 'The Discord server this bot runs in.', target: j('serverId') },
         { type: 'list', label: 'Global Admins', help: 'Roles or users with access to all commands.', default: [], target: j('globalAdmins'), element: { field: { type: 'role-or-user-id', label: 'Role or User', placeholders: ['DISCORD_ROLE_ID'], serverIdRef: { kind: 'json', path: 'serverId' } } } },
         { type: 'color', label: 'Main Color', default: '#f8ba00', target: j('mainColor') },
@@ -625,12 +650,299 @@ const openTicketOptions: ConfigManifest = {
   },
 };
 
+// ─── lavamusic: Lavalink/application.yml (audio server config) ───
+//
+// The bot itself is env-configured (TOKEN, PREFIX, ...); this YAML is the bundled
+// Lavalink audio server, surfaced because lavamusic's compose bind-mounts it. The
+// form covers the parts users actually touch (node password, sources + their
+// credentials, lyrics, logging), not every Lavalink tuning knob.
+
+const LAVA_LOG_LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR', 'OFF'];
+
+const LAVASRC_SOURCES: Array<[string, string]> = [
+  ['spotify', 'Spotify'], ['applemusic', 'Apple Music'], ['deezer', 'Deezer'],
+  ['tidal', 'Tidal'], ['qobuz', 'Qobuz'], ['yandexmusic', 'Yandex Music'],
+  ['vkmusic', 'VK Music'], ['jiosaavn', 'JioSaavn'], ['pandora', 'Pandora'],
+  ['flowerytts', 'FloweryTTS'], ['youtube', 'YouTube (LavaSrc)'], ['ytdlp', 'yt-dlp'],
+];
+const lavaSrcSourceFields = LAVASRC_SOURCES.map(([k, l]) => yBool(`plugins.lavasrc.sources.${k}`, l, true));
+
+const lavamusicLavalink: ConfigManifest = {
+  match: { urlContains: 'lavamusic' },
+  target: 'application.yml',
+  format: 'yaml',
+  sections: [
+    {
+      id: 'node',
+      title: 'Lavalink Node',
+      help: 'The bundled Lavalink audio server. The password must match the node authorization the bot connects with (its NODES env var, default "youshallnotpass").',
+      fields: [
+        { type: 'text', label: 'Node Password', default: 'youshallnotpass', help: 'Shared secret between the bot and Lavalink. If you change it here, update the NODES authorization to match or playback breaks.', target: y('lavalink.server.password') },
+        { type: 'number', label: 'Port', default: 2333, help: 'Leave at 2333 unless you also change the bot\'s NODES port.', target: y('server.port') },
+        { type: 'text', label: 'Bind Address', default: '0.0.0.0', target: y('server.address') },
+      ],
+    },
+    {
+      id: 'builtinSources',
+      title: 'Built-in Sources',
+      help: 'Lavalink\'s native sources and search. Lavamusic plays YouTube through the YouTube plugin below, so the built-in YouTube source is usually left off.',
+      columns: 2,
+      fields: [
+        yBool('lavalink.server.sources.youtube', 'Built-in YouTube source', false),
+        yBool('lavalink.server.youtubeSearchEnabled', 'YouTube search', true),
+        yBool('lavalink.server.soundcloudSearchEnabled', 'SoundCloud search', true),
+      ],
+    },
+    {
+      id: 'quality',
+      title: 'Audio Quality',
+      columns: 2,
+      fields: [
+        { type: 'number', label: 'Opus Encoding Quality (0-10)', default: 5, target: y('lavalink.server.opusEncodingQuality') },
+        { type: 'select', label: 'Resampling Quality', default: 'MEDIUM', options: opts(['HIGH', 'MEDIUM', 'LOW', 'NONE']), target: y('lavalink.server.resamplingQuality') },
+      ],
+    },
+    {
+      id: 'youtubePlugin',
+      title: 'YouTube Plugin',
+      help: 'The YouTube source plugin lavamusic uses for playback and search.',
+      toggle: { target: y('plugins.youtube.enabled'), default: true, disabledBehavior: 'set-false' },
+      columns: 2,
+      fields: [
+        yBool('plugins.youtube.allowSearch', 'Allow search', true),
+        yBool('plugins.youtube.allowDirectVideoIds', 'Allow direct video IDs', true),
+        yBool('plugins.youtube.allowDirectPlaylistIds', 'Allow direct playlist IDs', true),
+      ],
+    },
+    {
+      id: 'extraSources',
+      title: 'Extra Sources (LavaSrc)',
+      help: 'Enable extra music sources. Most need the credentials in their sub-section to actually resolve tracks.',
+      sections: [
+        { id: 'lavasrcEnabled', title: 'Enabled Sources', columns: 2, fields: lavaSrcSourceFields },
+        {
+          id: 'lavasrcSpotify', title: 'Spotify',
+          help: 'Spotify resolves via a custom token endpoint.',
+          fields: [
+            { type: 'text', label: 'Country Code', default: 'US', target: y('plugins.lavasrc.spotify.countryCode') },
+            { type: 'text', label: 'Custom Token Endpoint', default: '', target: y('plugins.lavasrc.spotify.customTokenEndpoint') },
+            { type: 'number', label: 'Playlist Load Limit', default: 6, target: y('plugins.lavasrc.spotify.playlistLoadLimit') },
+            { type: 'number', label: 'Album Load Limit', default: 6, target: y('plugins.lavasrc.spotify.albumLoadLimit') },
+          ],
+        },
+        {
+          id: 'lavasrcApple', title: 'Apple Music',
+          fields: [
+            { type: 'text', label: 'Country Code', default: 'US', target: y('plugins.lavasrc.applemusic.countryCode') },
+            { type: 'password', label: 'Media API Token', sensitive: true, target: y('plugins.lavasrc.applemusic.mediaAPIToken') },
+          ],
+        },
+        {
+          id: 'lavasrcDeezer', title: 'Deezer',
+          fields: [
+            { type: 'password', label: 'Master Decryption Key', sensitive: true, target: y('plugins.lavasrc.deezer.masterDecryptionKey') },
+            { type: 'password', label: 'ARL', sensitive: true, target: y('plugins.lavasrc.deezer.arl') },
+          ],
+        },
+        {
+          id: 'lavasrcTidal', title: 'Tidal',
+          fields: [
+            { type: 'text', label: 'Country Code', default: 'US', target: y('plugins.lavasrc.tidal.countryCode') },
+            { type: 'password', label: 'Token', sensitive: true, target: y('plugins.lavasrc.tidal.token') },
+            { type: 'number', label: 'Search Limit', default: 6, target: y('plugins.lavasrc.tidal.searchLimit') },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'lyrics',
+      title: 'Lyrics',
+      help: 'Lyrics sources and the Genius API key (Genius improves match quality).',
+      fields: [
+        { type: 'text', label: 'Country Code', default: 'en-AU', target: y('plugins.lyrics.countryCode') },
+        { type: 'password', label: 'Genius API Key', sensitive: true, target: y('plugins.lyrics.geniusApiKey') },
+        {
+          type: 'list', label: 'Lyrics Sources (in order)', default: [], target: y('plugins.lavalyrics.sources'),
+          element: { field: { type: 'select', label: 'Source', options: opts(['genius', 'spotify', 'youtube', 'deezer', 'yandexMusic']) } },
+        },
+      ],
+    },
+    {
+      id: 'logging',
+      title: 'Logging',
+      columns: 2,
+      fields: [
+        { type: 'select', label: 'Root Log Level', default: 'INFO', options: opts(LAVA_LOG_LEVELS), target: y('logging.level.root') },
+        { type: 'select', label: 'Lavalink Log Level', default: 'INFO', options: opts(LAVA_LOG_LEVELS), target: y('logging.level.lavalink') },
+      ],
+    },
+  ],
+};
+
+// ─── nadeko: src/NadekoBot/data/creds_example.yml -> /app/data/creds.yml ───
+//
+// File-configured bot (reads creds.yml, not env). Surfaced via the manifest's
+// `source` declaration; the example sibling uses an underscore infix so repoPath
+// points at it directly. Token lives in-file (isBotToken). `version` is
+// deliberately not surfaced (the file marks it "DO NOT CHANGE").
+
+const nadekoCreds: ConfigManifest = {
+  match: { urlContains: 'nadeko' },
+  target: 'creds.yml',
+  format: 'yaml',
+  source: { repoPath: 'src/NadekoBot/data/creds_example.yml', inContainerPath: '/app/data/creds.yml' },
+  sections: [
+    {
+      id: 'identity', title: 'Identity & Connection',
+      fields: [
+        { type: 'password', label: 'Bot Token', required: true, sensitive: true, isBotToken: true, help: 'Your Discord bot token from the Developer Portal.', target: y('token') },
+        { type: 'list', label: 'Owner IDs', help: 'Users with full bot-owner permissions. Do not add people you do not trust.', default: [], target: y('ownerIds'), element: { field: { type: 'user-id', label: 'Owner' } } },
+        yBool('usePrivilegedIntents', 'Use privileged intents', true),
+        { type: 'number', label: 'Total Shards', default: 1, target: y('totalShards') },
+      ],
+    },
+    {
+      id: 'database', title: 'Database',
+      fields: [
+        { type: 'select', label: 'Type', default: 'sqlite', options: opts(['sqlite']), help: 'Only sqlite is supported.', target: y('db.type') },
+        { type: 'text', label: 'Connection String', default: 'Data Source=data/NadekoBot.db', target: y('db.connectionString') },
+      ],
+    },
+    {
+      id: 'cache', title: 'Caching',
+      fields: [
+        { type: 'select', label: 'Bot Cache', default: 'Memory', options: opts(['Memory', 'Redis']), help: 'Memory = in-process (resets on restart). Redis = persistent (set the connection below).', target: y('botCache') },
+        { type: 'text', label: 'Redis Connection', default: 'localhost:6379,syncTimeout=30000,responseTimeout=30000,allowAdmin=true,password=', help: 'Only used when Bot Cache is Redis.', target: y('redisOptions') },
+      ],
+    },
+    {
+      id: 'google', title: 'Google APIs',
+      fields: [
+        { type: 'password', label: 'Google API Key', sensitive: true, help: 'YouTube Data API key.', target: y('googleApiKey') },
+        { type: 'text', label: 'Search Engine ID', target: y('google.searchId') },
+        { type: 'text', label: 'Image Search Engine ID', target: y('google.imageSearchId') },
+      ],
+    },
+    {
+      id: 'ai', title: 'AI',
+      fields: [
+        { type: 'password', label: 'Nadeko AI Token', sensitive: true, target: y('nadekoAiToken') },
+        { type: 'password', label: 'AI API Key', sensitive: true, help: 'OpenAI-compatible API key for the AI agent.', target: y('aiApiKey') },
+      ],
+    },
+    {
+      id: 'votes', title: 'Bot Lists & Votes',
+      fields: [
+        { type: 'password', label: 'DiscordBotList Token', sensitive: true, target: y('botListToken') },
+        { type: 'text', label: 'Top.gg Service URL', target: y('votes.topggServiceUrl') },
+        { type: 'password', label: 'Top.gg Key', sensitive: true, target: y('votes.topggKey') },
+        { type: 'text', label: 'Discords Service URL', target: y('votes.discordsServiceUrl') },
+        { type: 'password', label: 'Discords Key', sensitive: true, target: y('votes.discordsKey') },
+      ],
+    },
+    {
+      id: 'patreon', title: 'Patreon',
+      fields: [
+        { type: 'text', label: 'Client ID', target: y('patreon.clientId') },
+        { type: 'password', label: 'Access Token', sensitive: true, target: y('patreon.accessToken') },
+        { type: 'password', label: 'Refresh Token', sensitive: true, target: y('patreon.refreshToken') },
+        { type: 'password', label: 'Client Secret', sensitive: true, target: y('patreon.clientSecret') },
+        { type: 'text', label: 'Campaign ID', target: y('patreon.campaignId') },
+      ],
+    },
+    {
+      id: 'apikeys', title: 'Other API Keys',
+      columns: 2,
+      fields: [
+        { type: 'password', label: 'RapidAPI Key', sensitive: true, target: y('rapidApiKey') },
+        { type: 'password', label: 'osu! API Key', sensitive: true, target: y('osuApiKey') },
+        { type: 'password', label: 'Steam API Key', sensitive: true, target: y('steamApiKey') },
+        { type: 'text', label: 'Trovo Client ID', target: y('trovoClientId') },
+        { type: 'text', label: 'Twitch Client ID', target: y('twitchClientId') },
+        { type: 'password', label: 'Twitch Client Secret', sensitive: true, target: y('twitchClientSecret') },
+        { type: 'password', label: 'LocationIQ API Key', sensitive: true, target: y('locationIqApiKey') },
+        { type: 'password', label: 'TimezoneDB API Key', sensitive: true, target: y('timezoneDbApiKey') },
+        { type: 'password', label: 'CoinMarketCap API Key', sensitive: true, target: y('coinmarketcapApiKey') },
+      ],
+    },
+    {
+      id: 'advanced', title: 'Advanced',
+      fields: [
+        { type: 'text', label: 'Coordinator URL', default: 'http://localhost:3442', target: y('coordinatorUrl') },
+        { type: 'text', label: 'Restart Command', target: y('restartCommand.cmd') },
+        { type: 'text', label: 'Restart Args', target: y('restartCommand.args') },
+        { type: 'text', label: 'Seq URL', target: y('seq.url') },
+        { type: 'password', label: 'Seq API Key', sensitive: true, target: y('seq.apiKey') },
+      ],
+    },
+  ],
+};
+
+// ─── discord-tickets: src/user/config.yml -> /home/container/user/config.yml ───
+//
+// The bot token + DB + secrets are ENV vars (DISCORD_TOKEN, ...), surfaced by the
+// env rows, so this file's manifest has NO in-file token (no isBotToken).
+
+const discordTicketsConfig: ConfigManifest = {
+  match: { urlContains: 'discord-tickets' },
+  target: 'config.yml',
+  format: 'yaml',
+  source: { repoPath: 'src/user/config.yml', inContainerPath: '/home/container/user/config.yml' },
+  sections: [
+    {
+      id: 'logging', title: 'Logging',
+      fields: [
+        { type: 'select', label: 'Log Level', default: 'info', options: opts(['debug', 'info', 'notice', 'warn', 'error']), target: y('logs.level') },
+      ],
+      sections: [
+        {
+          id: 'logFiles', title: 'Log Files',
+          toggle: { target: y('logs.files.enabled'), default: true, disabledBehavior: 'set-false' },
+          fields: [
+            { type: 'text', label: 'Directory', default: './logs', target: y('logs.files.directory') },
+            { type: 'number', label: 'Keep For (days)', default: 30, target: y('logs.files.keepFor') },
+          ],
+        },
+      ],
+    },
+    {
+      id: 'presence', title: 'Presence',
+      help: 'Bot status and rotating activities. Activity text supports {totalTickets}, {openTickets}, {avgResponseTime}, {avgRating}.',
+      fields: [
+        { type: 'select', label: 'Status', default: 'online', options: opts(['online', 'idle', 'dnd', 'invisible']), target: y('presence.status') },
+        { type: 'number', label: 'Rotation Interval (seconds)', default: 20, target: y('presence.interval') },
+        {
+          type: 'list', label: 'Activities', default: [], target: y('presence.activities'),
+          element: {
+            itemLabel: '{name}',
+            objectFields: [
+              ofield('name', 'text', 'Text', { required: true }),
+              ofield('type', 'number', 'Type', { help: '0 Playing, 1 Streaming, 2 Listening, 3 Watching, 5 Competing' }),
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: 'general', title: 'General',
+      fields: [
+        { type: 'text', label: 'Transcript Template', default: 'transcript.md', target: y('templates.transcript') },
+        yBool('stats', 'Send anonymous stats', true),
+        yBool('updates', 'Check for updates', true),
+      ],
+    },
+  ],
+};
+
 export const INSTALL_MANIFESTS: ConfigManifest[] = [
   openTicketGeneral,
   openTicketTranscripts,
   openTicketPanels,
   openTicketQuestions,
   openTicketOptions,
+  lavamusicLavalink,
+  nadekoCreds,
+  discordTicketsConfig,
 ];
 
 /**
@@ -641,6 +953,54 @@ export function findManifest(url: string, targetName: string): ConfigManifest | 
   return INSTALL_MANIFESTS.find(
     m => matchesSource(m.match, url) && m.target.toLowerCase() === target,
   );
+}
+
+function readFileSafe(p: string): string {
+  try { return fs.existsSync(p) ? fs.readFileSync(p, 'utf-8') : ''; } catch { return ''; }
+}
+
+/**
+ * Config files a manifest explicitly declares via `source` (repoPath +
+ * in-container path), for a given source URL + cloned repo. Surfaces a bot's
+ * config the detector misses (too deep, no compose bind, or named-volume
+ * delivery) with ZERO noise: only declared files appear. The repo file is read
+ * directly, or via findConfigTemplate when shipped as an example sibling. Any
+ * file the detector already surfaced is skipped (dedupe by in-container path or
+ * target name) so detection output always wins.
+ */
+export function manifestDeclaredConfigFiles(
+  url: string,
+  repoPath: string,
+  existing: DetectedConfigFile[],
+): DetectedConfigFile[] {
+  const out: DetectedConfigFile[] = [];
+  const taken = (p: string, t: string) =>
+    existing.some(e => e.inContainerPath === p || e.targetName.toLowerCase() === t.toLowerCase()) ||
+    out.some(e => e.inContainerPath === p || e.targetName.toLowerCase() === t.toLowerCase());
+  for (const m of INSTALL_MANIFESTS) {
+    if (!m.source || !matchesSource(m.match, url)) continue;
+    const direct = path.join(repoPath, m.source.repoPath);
+    let repoFile: string | null = null;
+    try {
+      if (fs.existsSync(direct) && fs.statSync(direct).isFile()) repoFile = direct;
+      else repoFile = findConfigTemplate(direct);
+    } catch {
+      repoFile = null;
+    }
+    if (!repoFile) continue;
+    const rawBody = readFileSafe(repoFile).slice(0, 65536);
+    if (!rawBody.trim()) continue;
+    if (taken(m.source.inContainerPath, m.target)) continue;
+    out.push({
+      exampleName: path.relative(repoPath, repoFile).split(path.sep).join('/'),
+      targetName: m.target,
+      format: m.format,
+      inContainerPath: m.source.inContainerPath,
+      keys: extractConfigKeys(rawBody, m.format),
+      rawBody,
+    });
+  }
+  return out;
 }
 
 // ─── body helpers used by the install/config routes ───
@@ -693,10 +1053,13 @@ export function sanitizeSeedRows(manifest: ConfigManifest, body: string): string
   return ops.length ? serializeConfig(manifest.format, body, ops) : body;
 }
 
-/** True when the manifest configures the bot token via an in-file field (a
- * password field), so callers can avoid also demanding it as a required env var. */
+/** True when the manifest configures the BOT token via an in-file field (marked
+ * isBotToken), so callers can avoid also demanding it as a required env var.
+ * Incidental secrets (API keys, node passwords) are NOT bot tokens and must not
+ * trip this, or a bot whose real token IS an env var would lose its required
+ * field. */
 export function manifestHasInFileToken(manifest: ConfigManifest): boolean {
   let has = false;
-  eachField(manifest.sections || [], f => { if (f.type === 'password') has = true; });
+  eachField(manifest.sections || [], f => { if (f.isBotToken) has = true; });
   return has;
 }

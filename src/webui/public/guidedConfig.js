@@ -177,6 +177,20 @@
     guidedRefresh(id);
   };
 
+  // Switch an envAlt field between In file and From env. Writes the body flag
+  // (so it round-trips) and, when moving to env, clears the in-file value with
+  // value:'' (not remove) to keep the key + comments intact. The env VALUE is
+  // entered separately in the env-vars section.
+  window.guidedEnvAltMode = function (id, path, mode) {
+    const s = st(id); if (!s) return;
+    const f = findField(s.manifest, path); if (!f || !f.envAlt) return;
+    const toEnv = mode === 'env';
+    if (f.envAlt.flagPath) { setAt(s.parsed, f.envAlt.flagPath, toEnv); pushOp(s, { path: f.envAlt.flagPath, value: toEnv }); }
+    if (toEnv) { setAt(s.parsed, path, ''); pushOp(s, { path, value: '' }); }
+    flushSerialize(id);
+    guidedRefresh(id);
+  };
+
   // ─── lists ───
 
   // listPath '' means the config root itself is the array. elemPath builds the
@@ -307,40 +321,72 @@
     return `data-gc-kind="${kind}" data-gc-chip="${chipId}" data-gc-server="${esc(server)}" data-gc-literals="${esc(literals)}" data-gc-ph="${esc(phs)}"`;
   }
 
+  // Build the input control for a scalar field (everything except list/grid/
+  // boolean). Shared by renderField and the in-file mode of an envAlt field.
+  function renderScalarControl(id, f, path, val, dis) {
+    if (f.type === 'select') {
+      const o = (f.options || []).map(op => `<option value="${esc(op.value)}" ${String(op.value) === String(val) ? 'selected' : ''}>${esc(op.label || op.value)}</option>`).join('');
+      return `<select ${dis} onchange="guidedEdit('${id}','${esc(path)}','select',this)">${o}</select>`;
+    }
+    if (f.type === 'number') {
+      return `<input type="number" value="${esc(val)}" ${dis} oninput="guidedEdit('${id}','${esc(path)}','number',this)">`;
+    }
+    if (f.type === 'color') {
+      const sv = String(val || '');
+      const safe = (/^#[0-9a-fA-F]{3,8}$/.test(sv) || /^[a-zA-Z]{1,24}$/.test(sv)) ? sv : '#000';
+      return `<div class="gc-color"><span class="gc-swatch" style="background:${safe}"></span><input type="text" value="${esc(val)}" ${dis} oninput="this.previousElementSibling.style.background=this.value; guidedEdit('${id}','${esc(path)}','text',this)"></div>`;
+    }
+    if (KIND[f.type]) {
+      const chipId = id + '-chip-' + esc(path).replace(/[^a-z0-9]/gi, '_');
+      const type = f.type === 'password' ? 'password' : 'text';
+      return `<div class="gc-idrow"><span class="gc-chip" id="${chipId}"></span>
+        <input type="${type}" value="${esc(val)}" ${dis} ${idAttrs(f, chipId)}
+          oninput="guidedEdit('${id}','${esc(path)}','text',this); guidedValidateField('${id}',this)"></div>`;
+    }
+    const type = f.type === 'password' ? 'password' : 'text';
+    return `<input type="${type}" value="${esc(val)}" ${dis} oninput="guidedEdit('${id}','${esc(path)}','text',this)">`;
+  }
+
+  // A field that can be sourced In file or From env (manifest envAlt). The mode
+  // lives in the body flag (flagPath) so it round-trips through serialize/parse;
+  // the env VALUE is entered in the Environment Variables section, so env mode
+  // shows a hint rather than an input.
+  function envAltMode(s, f) {
+    if (f.envAlt && f.envAlt.flagPath) return getAt(s.parsed, f.envAlt.flagPath) ? 'env' : 'file';
+    return 'file';
+  }
+
+  function renderEnvAltField(id, s, f, path, dis) {
+    const mode = envAltMode(s, f);
+    const label = `<div class="gc-label">${esc(f.label)}${(f.required && mode === 'file') ? reqStar : ''}</div>`;
+    const help = f.help ? `<div class="gc-help">${esc(f.help)}</div>` : '';
+    const sw = `<div class="gc-srcswitch">`
+      + `<button type="button" class="${mode === 'file' ? 'active' : ''}" onclick="guidedEnvAltMode('${id}','${esc(path)}','file')">In file</button>`
+      + `<button type="button" class="${mode === 'env' ? 'active' : ''}" onclick="guidedEnvAltMode('${id}','${esc(path)}','env')">From env</button>`
+      + `</div>`;
+    const body = (mode === 'file')
+      ? renderScalarControl(id, f, path, curVal(s, path, f.default), dis)
+      : `<div class="gc-help gc-envalt-hint">Set <code>${esc(f.envAlt.var)}</code> as an environment variable for this bot.</div>`;
+    return `<div class="gc-field gc-envalt">${label}${sw}${body}${help}</div>`;
+  }
+
   // Render one field bound to an absolute path (top-level fields).
   function renderField(id, f, disabled) {
     const path = f.target.path;
     if (f.type === 'list') return renderList(id, f.target.path, f);
     if (f.type === 'grid') return renderGrid(id, f);
     const s = st(id);
-    const val = curVal(s, path, f.default);
     const dis = disabled ? 'disabled' : '';
-    const label = `<div class="gc-label">${esc(f.label)}${f.required ? reqStar : ''}</div>`;
-    const help = f.help ? `<div class="gc-help">${esc(f.help)}</div>` : '';
-    let control = '';
     if (f.type === 'boolean') {
-      control = `<label class="gc-bool"><span class="toggle-switch"><input type="checkbox" ${val ? 'checked' : ''} ${dis} onchange="guidedEdit('${id}','${esc(path)}','boolean',this)"><span class="toggle-slider"></span></span></label>`;
+      const val = curVal(s, path, f.default);
+      const control = `<label class="gc-bool"><span class="toggle-switch"><input type="checkbox" ${val ? 'checked' : ''} ${dis} onchange="guidedEdit('${id}','${esc(path)}','boolean',this)"><span class="toggle-slider"></span></span></label>`;
+      const label = `<div class="gc-label">${esc(f.label)}${f.required ? reqStar : ''}</div>`;
       return `<div class="gc-field gc-field-inline">${control}${label}</div>`;
     }
-    if (f.type === 'select') {
-      const o = (f.options || []).map(op => `<option value="${esc(op.value)}" ${String(op.value) === String(val) ? 'selected' : ''}>${esc(op.label || op.value)}</option>`).join('');
-      control = `<select ${dis} onchange="guidedEdit('${id}','${esc(path)}','select',this)">${o}</select>`;
-    } else if (f.type === 'number') {
-      control = `<input type="number" value="${esc(val)}" ${dis} oninput="guidedEdit('${id}','${esc(path)}','number',this)">`;
-    } else if (f.type === 'color') {
-      const sv = String(val || '');
-      const safe = (/^#[0-9a-fA-F]{3,8}$/.test(sv) || /^[a-zA-Z]{1,24}$/.test(sv)) ? sv : '#000';
-      control = `<div class="gc-color"><span class="gc-swatch" style="background:${safe}"></span><input type="text" value="${esc(val)}" ${dis} oninput="this.previousElementSibling.style.background=this.value; guidedEdit('${id}','${esc(path)}','text',this)"></div>`;
-    } else if (KIND[f.type]) {
-      const chipId = id + '-chip-' + esc(path).replace(/[^a-z0-9]/gi, '_');
-      const type = f.type === 'password' ? 'password' : 'text';
-      control = `<div class="gc-idrow"><span class="gc-chip" id="${chipId}"></span>
-        <input type="${type}" value="${esc(val)}" ${dis} ${idAttrs(f, chipId)}
-          oninput="guidedEdit('${id}','${esc(path)}','text',this); guidedValidateField('${id}',this)"></div>`;
-    } else { // text / password
-      const type = f.type === 'password' ? 'password' : 'text';
-      control = `<input type="${type}" value="${esc(val)}" ${dis} oninput="guidedEdit('${id}','${esc(path)}','text',this)">`;
-    }
+    if (f.envAlt) return renderEnvAltField(id, s, f, path, dis);
+    const label = `<div class="gc-label">${esc(f.label)}${f.required ? reqStar : ''}</div>`;
+    const help = f.help ? `<div class="gc-help">${esc(f.help)}</div>` : '';
+    const control = renderScalarControl(id, f, path, curVal(s, path, f.default), dis);
     return `<div class="gc-field">${label}${control}${help}</div>`;
   }
 
@@ -519,6 +565,10 @@
     .gc-tab.active{background:var(--accent,#5865f2);color:#fff;border-color:var(--accent,#5865f2)}
     .gc-badge{font-size:.68rem;color:var(--text-muted,#999)}
     .gc-badge-warn{color:#e0a106}
+    .gc-srcswitch{display:inline-flex;gap:4px;margin-bottom:4px}
+    .gc-srcswitch button{background:var(--bg-alt,#222);border:1px solid var(--border,#444);color:var(--text-muted,#aaa);border-radius:5px;padding:2px 9px;font-size:.68rem;cursor:pointer}
+    .gc-srcswitch button.active{background:var(--accent,#5865f2);color:#fff;border-color:var(--accent,#5865f2)}
+    .gc-envalt-hint code{background:var(--bg,#1a1a1a);border:1px solid var(--border,#444);border-radius:4px;padding:1px 5px}
     /* the shared .toggle-switch only gets its box as a flex item; it is also used
        in non-flex wrappers (guided form, Enabled/Writable row), so give it an
        explicit inline-block box. Harmless for flex-item toggles. */

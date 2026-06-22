@@ -129,7 +129,9 @@ export function generateCompose(
 
   botService.volumes = [{
     type: 'bind',
-    source: path.join(botDir, 'data'),
+    // Relative source; processComposeForCasaOS rewrites it to
+    // /DATA/AppData/<app>/data so the bot's data is browsable + CasaOS-managed.
+    source: './data',
     target: '/app/data'
   }];
 
@@ -604,7 +606,9 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
         },
         volumes: [{
           type: 'bind',
-          source: path.join(botDir, 'data'),
+          // Relative source; processComposeForCasaOS rewrites it to
+          // /DATA/AppData/<app>/data so the bot's data is browsable + CasaOS-managed.
+          source: './data',
           target: dataTarget
         }],
         'x-casaos': {

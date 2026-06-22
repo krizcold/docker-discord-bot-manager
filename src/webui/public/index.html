@@ -372,6 +372,9 @@
       padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: default;
     }
     .source-card:hover { background: var(--bg-tertiary); }
+    .source-card.featured { background: #1a2832; }
+    .source-card.featured:hover { background: #203440; }
+    .source-featured-star { color: var(--accent); font-size: 0.78rem; flex-shrink: 0; cursor: help; }
     .source-card-name { font-size: 0.85rem; font-weight: 600; color: var(--text-primary); }
     .source-card-url { font-size: 0.7rem; color: var(--text-muted); word-break: break-all; margin-bottom: 6px; }
     .source-card-meta { font-size: 0.7rem; color: var(--text-muted); margin-bottom: 8px; }
@@ -1188,6 +1191,44 @@
       return match ? match[1] : url;
     }
 
+    // Curated presentation for well-known default sources, matched by repo path
+    // (git) or image ref (docker-image). Featured sources sort first (by order) and
+    // get a star + highlight. name overrides the auto-humanized label where needed.
+    const SOURCE_PRESENTATION = [
+      { match: 'krizcold/fully-modular-discord-bot', name: 'Fully Modular Discord Bot', featured: true, order: 0 },
+      { match: 'phasecorex/red-discordbot',          name: 'Red-DiscordBot',           featured: true, order: 1 },
+      { match: 'open-discord-bots/open-ticket',      name: 'Open Ticket',              featured: true, order: 2 },
+      // Not featured, just labels for repo names that humanize poorly.
+      { match: 'discord-tickets/bot', name: 'Discord Tickets' },
+      { match: 'nadeko-bot/nadekobot', name: 'NadekoBot' },
+      { match: 'jagrosh/musicbot', name: 'JMusicBot' },
+    ];
+
+    function humanizeName(raw) {
+      if (!raw) return '';
+      return raw.replace(/[-_]+/g, ' ').trim().split(/\s+/)
+        .map(w => w ? w.charAt(0).toUpperCase() + w.slice(1) : w).join(' ');
+    }
+
+    function sourcePresentation(s) {
+      const ident = (s.sourceType === 'docker-image' ? (s.imageRef || '') : (s.url || '')).toLowerCase();
+      const hit = SOURCE_PRESENTATION.find(p => ident.includes(p.match));
+      if (hit) return { name: hit.name, featured: !!hit.featured, order: hit.order };
+      const raw = s.sourceType === 'docker-image'
+        ? ((s.imageRef || '').split('/').pop() || 'Image').split(':')[0]
+        : (getRepoName(s.url) || 'Unknown');
+      return { name: humanizeName(raw) || raw, featured: false, order: 999 };
+    }
+
+    function sortSources(list) {
+      return list.slice().sort((a, b) => {
+        const pa = sourcePresentation(a), pb = sourcePresentation(b);
+        if (pa.featured !== pb.featured) return pa.featured ? -1 : 1;
+        if (pa.featured && pb.featured) return pa.order - pb.order;
+        return (b.createdAt || '').localeCompare(a.createdAt || '');
+      });
+    }
+
     async function updateBot(id) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
@@ -1761,7 +1802,7 @@
     async function loadSources() {
       try {
         const res = await api('GET', '/sources');
-        sources = res.success ? (res.sources || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
+        sources = res.success ? sortSources(res.sources || []) : [];
       } catch (err) {
         sources = [];
       }
@@ -1783,9 +1824,10 @@
 
       list.innerHTML = sources.map(s => {
         const isImage = s.sourceType === 'docker-image';
-        const repoName = isImage
-          ? ((s.imageRef || '').split('/').pop() || 'Image').split(':')[0]
-          : (getRepoName(s.url) || 'Unknown');
+        const pres = sourcePresentation(s);
+        const repoName = pres.name;
+        const star = pres.featured ? ' <span class="source-featured-star" title="Featured">&#9733;</span>' : '';
+        const cardClass = pres.featured ? 'source-card featured' : 'source-card';
         const collapsed = collapsedSources.has(s.id);
         const isCloned = !!s.lastChecked;
         const isCloning = cloningSources.has(s.id);
@@ -1802,10 +1844,10 @@
 
         if (collapsed) {
           return `
-          <div class="source-card">
+          <div class="${cardClass}">
             <div class="source-card-header">
               <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Expand">&#9660;</button>
-              <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)}</span>
+              <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)}${star}</span>
               <div class="source-header-actions">
                 ${headerAction}
               </div>
@@ -1843,10 +1885,10 @@
             </div>`;
 
         return `
-        <div class="source-card">
+        <div class="${cardClass}">
           <div class="source-card-header">
             <button class="source-toggle-btn" onclick="toggleSourceCollapse('${s.id}')" title="Collapse">&#9650;</button>
-            <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)} ${updateBadge}</span>
+            <span class="source-card-name" style="margin:0;flex:1;font-size:0.82rem;">${escapeHtml(repoName)}${star} ${updateBadge}</span>
             <div class="source-header-actions">
               ${headerAction}
             </div>
@@ -2477,11 +2519,12 @@
 
       const res = await api('GET', `/bots/${botId}/containers`);
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
-      const opts = running.map(c => `<option value="${escapeHtml(c.name)}">Container: ${escapeHtml(c.name)}</option>`).join('')
-        + `<option value="host">Persistent data (host)</option>`;
+      // Persistent data first (the point of the Files view); containers at the end.
+      const opts = `<option value="host">Persistent data (host)</option>`
+        + running.map(c => `<option value="${escapeHtml(c.name)}">Container: ${escapeHtml(c.name)}</option>`).join('');
       const sel = document.getElementById('files-scope');
       sel.innerHTML = opts;
-      filesScope = running.length > 0 ? running[0].name : 'host';
+      filesScope = 'host';
       sel.value = filesScope;
       filesCwd = '';
       await filesList();

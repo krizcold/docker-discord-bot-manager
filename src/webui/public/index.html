@@ -2064,6 +2064,10 @@
       installIsImage = !!(source && source.sourceType === 'docker-image');
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
 
+      // Reset the modal body before showing so it never flashes the previously
+      // opened source's details while this source's envs load.
+      document.getElementById('install-modal-content').innerHTML =
+        '<h3>Install from Source</h3><div style="color:var(--text-muted);font-size:0.8rem;padding:10px 2px;">Loading source details...</div>';
       document.getElementById('install-modal').classList.remove('hidden');
 
       // Detect env vars from the source repo (Tier 1; Tier 2 auto-runs when no .env.example)

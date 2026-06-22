@@ -13,6 +13,9 @@ import { buildWizardEnvList } from '../../env/envList';
 import { applyTemplateModifiers } from '../../config/templateModifiers';
 import { findManifest, sanitizeSeedRows, manifestHasInFileToken } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
+import { envVarsFromImageConfig, DetectedEnvVar } from '../../env/manager';
+import { findImageEnvHints } from '../../source/imageEnvHints';
+import * as dockerClient from '../../docker/dockerClient';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 
 export function createSourceRoutes(wss: WebSocketServer): Router {
@@ -149,9 +152,33 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // Prebuilt-image source: no repo to scan; the user supplies the image's envs.
+      // Prebuilt-image source: cannot scan a repo. Surface curated hints for known
+      // images, plus any env vars the image itself declares (Config.Env). Inspecting
+      // needs the image locally, so it auto-runs when the image is already pulled and
+      // otherwise pulls on demand only when explicitly requested (?inspect=true),
+      // since images can be large.
       if (source.sourceType === 'docker-image') {
-        res.json({ success: true, vars: [], configFiles: [], interactiveSetup: null, isImage: true });
+        const imageRef = source.imageRef || '';
+        const curated = findImageEnvHints(imageRef);
+        let imageReady = !!imageRef && dockerClient.imageExists(imageRef);
+        if (imageRef && !imageReady && req.query.inspect === 'true') {
+          try {
+            await dockerClient.pullImage(imageRef);
+            imageReady = dockerClient.imageExists(imageRef);
+          } catch { /* pull failed; curated hints are still returned */ }
+        }
+        let inspected: DetectedEnvVar[] = [];
+        if (imageReady) {
+          const env = dockerClient.inspectImageEnv(imageRef);
+          if (env) inspected = envVarsFromImageConfig(env);
+        }
+        const seen = new Set(curated.map(v => v.key.toUpperCase()));
+        const vars = [...curated];
+        for (const v of inspected) {
+          const k = v.key.toUpperCase();
+          if (!seen.has(k)) { seen.add(k); vars.push(v); }
+        }
+        res.json({ success: true, vars, configFiles: [], interactiveSetup: null, isImage: true, imageReady });
         return;
       }
 

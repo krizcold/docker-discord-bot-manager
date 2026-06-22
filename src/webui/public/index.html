@@ -2008,6 +2008,7 @@
     let installConfigHints = [];
     let installInteractiveSetup = null;
     let installBotId = null;
+    let installIsImage = false;
 
     async function showInstallModal(sourceId) {
       installSourceId = sourceId;
@@ -2018,6 +2019,7 @@
       installBotId = null;
 
       const source = sources.find(s => s.id === sourceId);
+      installIsImage = !!(source && source.sourceType === 'docker-image');
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
 
       document.getElementById('install-modal').classList.remove('hidden');
@@ -2046,6 +2048,7 @@
       installEnvHints = [];
       installConfigHints = [];
       installInteractiveSetup = null;
+      installIsImage = false;
       loadBots();
     }
 
@@ -2056,10 +2059,18 @@
       let envRowsHtml = '';
       if (installEnvHints.length > 0) {
         envRowsHtml = renderEnvRows(installEnvHints);
+      } else if (installIsImage) {
+        // Prebuilt image with no known/declared vars: do NOT guess DISCORD_TOKEN
+        // (images often use a different name). Prompt to inspect or add manually.
+        envRowsHtml = '<div style="font-size:0.72rem;color:var(--text-muted);">Prebuilt image: add the environment variables it needs (see its docs), or click "Inspect image for env vars" below.</div>';
       } else {
-        // No detected envs: offer a generic token field as a last resort.
+        // No detected envs on a source repo: offer a generic token field as a last resort.
         envRowsHtml = buildEnvRowHtml('DISCORD_TOKEN', '', 'Discord Bot Token', true, '');
       }
+      // Image sources inspect the pulled image; repo sources scan the source code.
+      const envScanBtn = installIsImage
+        ? '<button class="btn btn-secondary btn-small" onclick="inspectInstallImage(this)">Inspect image for env vars</button>'
+        : '<button class="btn btn-secondary btn-small" onclick="scanInstallEnvs()">Scan source for envs</button>';
 
       // Interactive-setup guidance banner
       let interactiveSetupHtml = '';
@@ -2101,7 +2112,7 @@
           <div id="install-env-rows">${envRowsHtml}</div>
           <div style="margin-top: 4px; display: flex; gap: 6px;">
             <button class="btn btn-secondary btn-small" onclick="addInstallEnvRow()">+ Add Variable</button>
-            <button class="btn btn-secondary btn-small" onclick="scanInstallEnvs()">Scan source for envs</button>
+            ${envScanBtn}
           </div>
         </div>
         <div class="form-group">
@@ -2181,6 +2192,35 @@
         showMessage('success', added > 0 ? `Found ${added} additional variable(s)` : 'No new variables found');
       } catch (e) {
         showMessage('error', 'Scan failed');
+      }
+    }
+
+    // Docker-image sources: pull (if needed) + inspect the image's declared env vars
+    // and merge any new ones in. Curated hints already render on modal open.
+    async function inspectInstallImage(btn) {
+      if (!installSourceId) return;
+      const orig = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = 'Inspecting...'; }
+      try {
+        const res = await api('GET', `/sources/${installSourceId}/envs?inspect=true`);
+        if (!res.success || !Array.isArray(res.vars)) { showMessage('error', 'Image inspect failed'); return; }
+        const container = document.getElementById('install-env-rows');
+        if (container && !container.querySelector('.env-key')) container.innerHTML = '';   // drop the placeholder note
+        const existing = new Set(
+          Array.from(document.querySelectorAll('#install-env-rows .env-key')).map(i => i.value.trim()).filter(Boolean)
+        );
+        let added = 0;
+        for (const v of res.vars) {
+          if (v.autoWired || existing.has(v.key)) continue;
+          addInstallEnvRow(v.key, v.defaultValue || '');
+          existing.add(v.key);
+          added++;
+        }
+        showMessage('success', added > 0 ? `Found ${added} variable(s) from the image` : 'No new variables found in the image');
+      } catch (e) {
+        showMessage('error', 'Image inspect failed');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = orig; }
       }
     }
 

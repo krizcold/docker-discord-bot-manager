@@ -337,6 +337,20 @@ export function imageExists(imageName: string): boolean {
 }
 
 /**
+ * Read an image's declared environment variables (Config.Env) without running it.
+ * Returns the raw "KEY=value" lines, or null if the image is absent or inspect fails.
+ */
+export function inspectImageEnv(imageName: string): string[] | null {
+  try {
+    const out = execDocker(['inspect', '--format', '{{json .Config.Env}}', imageName]);
+    const parsed = JSON.parse(out);
+    return Array.isArray(parsed) ? parsed.filter((x: unknown): x is string => typeof x === 'string') : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Remove a Docker image
  */
 export function removeImage(imageName: string): boolean {

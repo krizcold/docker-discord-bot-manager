@@ -340,7 +340,7 @@ export function extractConfigKeys(
 
 // ─── Universal env var detection (install wizard) ───
 
-export type DetectedEnvSource = 'env-example' | 'compose' | 'config' | 'source';
+export type DetectedEnvSource = 'env-example' | 'compose' | 'config' | 'source' | 'image';
 
 export interface DetectedEnvVar {
   key: string;
@@ -382,6 +382,34 @@ const PLATFORM_ENV_DENYLIST = new Set([
 
 function isPlatformEnv(key: string): boolean {
   return PLATFORM_ENV_DENYLIST.has(key.toUpperCase()) || /^(BOT_MANAGER_|REF_|CADDY_)/i.test(key);
+}
+
+// Language/runtime env keys baked into base images that are never bot config.
+const IMAGE_NOISE_RE = /^(PYTHON_|PYTHONUNBUFFERED$|PYTHONDONTWRITEBYTECODE$|PIP_|NODE_VERSION$|NPM_|YARN_|GPG_KEY$|LC_|LANGUAGE$|DEBIAN_FRONTEND$|VIRTUAL_ENV$)/i;
+
+/**
+ * Map a prebuilt image's declared Config.Env ("KEY=value" lines) to detected env
+ * vars, dropping platform-managed and base-image runtime noise. Declared vars carry
+ * baked-in defaults, so they surface as optional (the user can override).
+ */
+export function envVarsFromImageConfig(envLines: string[]): DetectedEnvVar[] {
+  const out: DetectedEnvVar[] = [];
+  for (const line of envLines) {
+    const eq = line.indexOf('=');
+    const key = (eq >= 0 ? line.slice(0, eq) : line).trim();
+    if (!key || isPlatformEnv(key) || IMAGE_NOISE_RE.test(key)) continue;
+    out.push({
+      key,
+      displayLabel: normalizeEnvLabel(key),
+      description: '',
+      defaultValue: eq >= 0 ? line.slice(eq + 1) : '',
+      required: false,
+      source: 'image',
+      sensitive: isSensitive(key),
+      autoWired: false,
+    });
+  }
+  return out;
 }
 
 const REQUIRED_TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;

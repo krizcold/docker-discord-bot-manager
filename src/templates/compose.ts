@@ -569,7 +569,7 @@ export function adaptExistingCompose(
  * Generate docker-compose.yml for docker-image source type
  * Used when deploying pre-built images (no git clone)
  */
-export function generateImageCompose(bot: BotConfig, botDir: string): string {
+export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget: string = '/app/data'): string {
   if (!bot.imageRef) {
     throw new Error('imageRef is required for docker-image source type');
   }
@@ -605,11 +605,11 @@ export function generateImageCompose(bot: BotConfig, botDir: string): string {
         volumes: [{
           type: 'bind',
           source: path.join(botDir, 'data'),
-          target: '/app/data'
+          target: dataTarget
         }],
         'x-casaos': {
           volumes: [{
-            container: '/app/data',
+            container: dataTarget,
             description: { en_us: 'Persistent data directory for bot storage.' }
           }]
         }

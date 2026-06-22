@@ -14,7 +14,7 @@ import { applyTemplateModifiers } from '../../config/templateModifiers';
 import { findManifest, sanitizeSeedRows, manifestHasInFileToken } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
 import { envVarsFromImageConfig, DetectedEnvVar } from '../../env/manager';
-import { findImageEnvHints } from '../../source/imageEnvHints';
+import { findImageEnvHints } from '../../source/imageHints';
 import * as dockerClient from '../../docker/dockerClient';
 import { CreateSourceRequest, UpdateSourceRequest } from '../../types';
 

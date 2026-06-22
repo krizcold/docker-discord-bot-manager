@@ -131,6 +131,7 @@ export async function createBotContainer(
   imageName: string,
   envVars: Record<string, string> = {},
   dataPath?: string,
+  dataTarget: string = '/app/data',
   botName?: string
 ): Promise<string> {
   const args = [
@@ -149,9 +150,10 @@ export async function createBotContainer(
     args.push('-e', `${key}=${value}`);
   }
 
-  // Add volume binding
+  // Add volume binding (target defaults to /app/data; docker-image bots use the
+  // image's real data path, e.g. /data for Red-DiscordBot).
   if (dataPath) {
-    args.push('-v', `${dataPath}:/app/data`);
+    args.push('-v', `${dataPath}:${dataTarget}`);
   }
 
   args.push(imageName);
@@ -345,6 +347,21 @@ export function inspectImageEnv(imageName: string): string[] | null {
     const out = execDocker(['inspect', '--format', '{{json .Config.Env}}', imageName]);
     const parsed = JSON.parse(out);
     return Array.isArray(parsed) ? parsed.filter((x: unknown): x is string => typeof x === 'string') : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read an image's declared VOLUME mount points (Config.Volumes). Returns the
+ * volume paths (e.g. ['/data']), [] when none are declared, or null when the
+ * image is absent or inspect fails.
+ */
+export function inspectImageVolumes(imageName: string): string[] | null {
+  try {
+    const out = execDocker(['inspect', '--format', '{{json .Config.Volumes}}', imageName]);
+    const parsed = JSON.parse(out);
+    return parsed && typeof parsed === 'object' ? Object.keys(parsed) : [];
   } catch {
     return null;
   }

@@ -21,6 +21,7 @@ import {
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { getBotDir, getDataPath, getEnvPath } from '../git/repoManager';
+import { findImageDataPath } from '../source/imageHints';
 import { detectBotType } from '../detection';
 import { generateDockerfile } from '../templates/dockerfiles';
 import {
@@ -981,7 +982,8 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       };
 
       updateBotStatus(botId, 'starting');
-      const containerId = await dockerClient.createBotContainer(botId, instance.imageRef, envWithToken, dataPath);
+      const dataTarget = resolveImageDataTarget(instance.imageRef);
+      const containerId = await dockerClient.createBotContainer(botId, instance.imageRef, envWithToken, dataPath, dataTarget);
       await dockerClient.startContainer(containerId);
       updateBotStatus(botId, 'running', [containerId]);
     }
@@ -1106,6 +1108,19 @@ export function getBotLogCollector(botId: string): LogCollector {
   return logCollectors.get(botId);
 }
 
+/**
+ * In-container data path for a docker-image bot: a curated hint wins; else the
+ * image's single declared VOLUME (Config.Volumes); else the /app/data default.
+ * Curated hints work without the image present; inspection needs it pulled.
+ */
+function resolveImageDataTarget(imageRef: string): string {
+  const curated = findImageDataPath(imageRef);
+  if (curated) return curated;
+  const vols = dockerClient.inspectImageVolumes(imageRef);
+  if (vols && vols.length === 1) return vols[0];
+  return '/app/data';
+}
+
 export async function buildBot(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
@@ -1168,7 +1183,8 @@ async function buildDockerImageInstance(
 
   // Use displayName for the compose bot config (BotConfig compat)
   const botForCompose: any = { ...instance, envVars: envWithToken };
-  let composeContent = generateImageCompose(botForCompose, botDir);
+  const dataTarget = resolveImageDataTarget(instance.imageRef);
+  let composeContent = generateImageCompose(botForCompose, botDir, dataTarget);
   const appName = instance.sanitizedName;
   const processed = processComposeForCasaOS(composeContent, appName, botForCompose);
   composeContent = processed.content;

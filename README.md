@@ -1,54 +1,176 @@
 # Discord Bot Manager
 
-> **WORK IN PROGRESS** -- This project is under active development and is NOT ready for production use. APIs, configuration, file structure, and behavior may change without notice. Future updates will likely introduce breaking changes.
+> **WORK IN PROGRESS** -- under active development and NOT production-ready. APIs, configuration, file structure, and behavior may change without notice.
 
-A Docker-based platform for deploying and managing multiple Discord bots from any GitHub repository or Docker image. Bots are organized as **sources** (a repo or image) and **instances** (a deployed bot built from a source); one source can back many instances.
+A Docker-based platform for deploying and managing multiple Discord bots from any GitHub repository or Docker image. It runs as a Yundera/CasaOS app, or **standalone** on a plain Windows or Linux machine with Docker. Bots are organized as **sources** (a repo or image) and **instances** (a deployed bot built from a source).
 
-## Features
+It auto-detects how it is running: `casaos` when a CasaOS host is present, otherwise `docker` (standalone). Set `DEPLOYMENT_MODE=docker` to force standalone.
 
-- **Universal bot importer**: Import virtually any Discord bot repository. The manager detects the language, package manager, entry point, required backing services, and environment variables, and generates a Dockerfile and Docker Compose file when the repo ships none.
-- **Multi-language support**: Node.js (npm/yarn/pnpm/bun), Python (pip/poetry/uv/pipenv/setuptools), Go, Java/Kotlin (Maven/Gradle/prebuilt JAR), Rust, and C# (.NET).
-- **Source / instance model**: A cloned source repo can back multiple bot instances. Fetch a source once, rebuild its instances on demand.
-- **Guided config builder**: For supported bots, a validated form is rendered over the bot's config file with live two-way Form/Raw sync. Bots without a manifest fall back to a raw editor.
-- **Multi-service stacks**: Auto-wires backing services (PostgreSQL, MongoDB, MariaDB/MySQL, Redis) and Lavalink for music bots, plus a status-page sidecar for bots with no web UI.
-- **Environment management**: Encrypted environment storage with an in-UI editor and a reusable Credentials Vault shared across instances.
-- **Per-bot Console and Files**: An interactive shell and a file browser/editor scoped to each bot's container or its persistent data folder.
-- **Live logs**: SSE log streaming and live build logs.
-- **Lifecycle control**: Start, stop, restart, update (pull and rebuild), and uninstall, with non-blocking APIs and real-time WebSocket status.
-- **Automatic updates**: Opt-in per-source update checking and per-instance scheduled rebuilds.
-- **CasaOS / PCS integration**: Deploys bots as managed CasaOS apps on the Yundera platform, with Caddy routing, platform variable substitution, and metadata placement.
+---
 
-## Deployment
+## Install & run
 
-The manager auto-detects its deployment mode:
-
-- **CasaOS / PCS** (Yundera platform): the primary target. Bots are deployed as managed CasaOS apps and their compose files are processed for the platform (`cpu_shares`, Caddy labels, the `pcs` network, platform variables, and `x-casaos` metadata).
-- **Docker**: when no CasaOS environment is detected, bots are deployed with plain Docker Compose.
-
-The provided `docker-compose.yml` deploys the manager itself behind the platform's `nginx-hash-lock` gateway. See `Documentation/BotManager/` for the full architecture.
-
-## Requirements
-
-- Docker and Docker Compose
-- Access to the Docker socket (the manager controls containers through the host Docker daemon)
-
-## Quick Start
-
-The manager runs as a container with the host Docker socket mounted. On the Yundera platform it installs as a CasaOS app. To run it directly:
+First, clone the repository -- every scenario below runs from inside it:
 
 ```bash
-docker compose up -d
+git clone https://github.com/krizcold/docker-discord-bot-manager.git
+cd docker-discord-bot-manager
 ```
 
-The app listens on port `8080` inside the container (`PORT`). On the platform it is reached through the gateway rather than a published host port.
+(The compose files build the manager image from this source. To skip the local build, edit the compose file to use the prebuilt image instead - the `image:` line is commented next to `build: .`.)
 
-Then, in the Web UI:
+| Scenario | Section |
+|----------|---------|
+| Windows desktop | **Standalone on Windows** |
+| Local Linux machine | **Standalone on Linux** |
+| Public Linux server (VPS / Contabo) | **Server on Linux** -- *partially pending* |
+| Working on the manager's own code | **Development** |
 
-1. Pick a bot from the source sidebar, or add a repository URL or Docker image
-2. Click **Install**, set a name, and fill in the detected environment variables and config
-3. Click **Install & Run**
+<details>
+<summary><b>Standalone on Windows (Docker Desktop)</b></summary>
 
-## Architecture
+The manager runs as a container under Docker Desktop and manages your bots as sibling containers. It binds to `127.0.0.1` only and has no login - keep it on your own machine.
+
+**Prerequisites:** Docker Desktop installed and running in **Linux-container mode**.
+
+1. Pick a host folder for data (e.g. `C:\dbm\data`) and set it, **using forward slashes**:
+   ```powershell
+   $env:HOST_DATA_DIR = "C:/dbm/data"
+   ```
+2. Start it:
+   ```powershell
+   docker compose -f docker-compose.standalone.yml up -d --build
+   ```
+3. Open <http://127.0.0.1:8090> and install a bot (add a repo URL or Docker image -> set env/config -> Install & Run).
+
+`HOST_DATA_DIR` must be set: the host Docker daemon resolves a bot's bind-mounts as **host** paths, so the manager rewrites them to live under this shared folder. It must be an absolute host path that matches the data bind in the compose file.
+
+> **Test status:** the containerized Windows path is implemented; the core deploy lifecycle is verified, the full functional pass is in progress. See [../Documentation/BotManager/StandaloneMode.md](../Documentation/BotManager/StandaloneMode.md) for the checklist.
+
+</details>
+
+<details>
+<summary><b>Standalone on Linux</b></summary>
+
+Identical to Windows - the same `/var/run/docker.sock` mount works on both.
+
+**Prerequisites:** Docker Engine + the Compose plugin.
+
+1. Set a data folder and start:
+   ```bash
+   export HOST_DATA_DIR=/opt/dbm/data
+   docker compose -f docker-compose.standalone.yml up -d --build
+   ```
+2. Open <http://127.0.0.1:8090>. (To reach it from another machine securely, see **Server on Linux** below.)
+
+</details>
+
+<details>
+<summary><b>Server on Linux (public, behind MFA) -- Contabo [partially pending]</b></summary>
+
+Runs the manager UI on a public VPS behind **Caddy** (automatic TLS) + **Authelia** (login + TOTP/WebAuthn MFA). The manager mounts the Docker socket (root-equivalent), so it is never exposed bare - only Caddy listens on 80/443, and every request passes a 2FA login. TLS works **without a domain** via sslip.io, or with your own domain.
+
+> **Status: implemented and config-reviewed against Authelia 4.39 / caddy-docker-proxy / sslip.io, but NOT yet live-tested** (sslip.io TLS needs a public IP). Treat as ready-to-try, not proven. Production can stay on Yundera in the meantime.
+>
+> **sslip.io caveat:** it works today but is a Public-Suffix-List *candidate*; if it ever lands on the PSL, browsers + Authelia will reject the session cookie. **Use a real domain for anything you intend to keep.**
+
+**Setup** (sslip.io example for VPS IP `203.0.113.5`):
+
+1. **Firewall:** open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled). Don't publish the manager/Authelia ports.
+2. **Authelia secrets:**
+   ```bash
+   mkdir -p ./authelia/secrets
+   for f in JWT_SECRET SESSION_SECRET STORAGE_ENCRYPTION_KEY; do \
+     docker run --rm authelia/authelia:4.39 authelia crypto rand --length 64 --charset alphanumeric \
+     | tr -d '\n' > ./authelia/secrets/$f; done
+   chmod 600 ./authelia/secrets/*
+   ```
+3. **Admin password** -> generate an argon2id hash, then edit `authelia/users_database.yml`: replace the `$argon2id$...REPLACE...` placeholder on the `password:` line with the generated hash, and set a real `email:` (kept for future SMTP; the MFA-enrollment link is read from a file in step 5):
+   ```bash
+   docker run --rm -it authelia/authelia:4.39 authelia crypto hash generate argon2
+   ```
+4. **Create a file named `.env`** in the same folder as `docker-compose.remote.yml` (Compose auto-loads it; a different name needs `--env-file`):
+   ```env
+   HOST_DATA_DIR=/opt/dbm/data
+   PUBLIC_HOST=bot.203-0-113-5.sslip.io
+   AUTHELIA_HOST=auth.203-0-113-5.sslip.io
+   COOKIE_DOMAIN=203-0-113-5.sslip.io
+   ACME_EMAIL=you@example.com
+   TZ=Europe/Madrid
+   BOT_DOMAIN_BASE=203-0-113-5.sslip.io   # optional: per-bot HTTPS subdomains
+   ```
+   **Critical:** `PUBLIC_HOST` and `AUTHELIA_HOST` MUST be subdomains of `COOKIE_DOMAIN` - note the **dots** (`bot.203-0-113-5.sslip.io`, NOT `bot-203-0-113-5...`). sslip.io resolves either, but a hyphen makes them *siblings* of `COOKIE_DOMAIN`, so the browser won't share the Authelia session cookie and login loops forever. (sslip.io maps any `<label>.203-0-113-5.sslip.io` to `203.0.113.5`.)
+   For a real domain: `PUBLIC_HOST=bot.example.com`, `AUTHELIA_HOST=auth.example.com`, `COOKIE_DOMAIN=example.com`, `BOT_DOMAIN_BASE=example.com`, and point `bot.`/`auth.` (and a wildcard `*.`) A records at the VPS. You do not edit `authelia/configuration.yml` - it reads these from the env.
+5. **Run** and enroll MFA:
+   ```bash
+   docker compose -f docker-compose.remote.yml up -d
+   # browse https://$PUBLIC_HOST -> log in -> enroll TOTP/WebAuthn.
+   # no SMTP, so read the enrollment link from:
+   docker exec authelia cat /data/notification.txt
+   ```
+
+With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. Bot vhosts are not behind Authelia (each bot self-auths).
+
+**Prefer no public surface?** Keep the manager private and reach it over a tunnel/VPN instead:
+- **Tailscale** (recommended): `tailscale up` on the VPS + your devices; reach the UI over the tailnet, optionally with a real `*.ts.net` cert via `tailscale serve`. No open ports, no domain.
+- **SSH tunnel:** the remote compose above publishes no host port, so for a tunnel run the **standalone** compose instead (`docker-compose.standalone.yml` - localhost-only, no auth), then `ssh -N -L 8080:127.0.0.1:8090 user@vps` and open <http://localhost:8080>.
+
+</details>
+
+<details>
+<summary><b>Development (run from source)</b></summary>
+
+For working on the manager's own code - **not a production install**.
+
+```bash
+npm install
+
+# Native run in standalone docker mode (fast edit loop):
+# PowerShell: $env:DEPLOYMENT_MODE="docker"; $env:DATA_DIR=".localrun/data"; npm run dev
+# bash:       DEPLOYMENT_MODE=docker DATA_DIR=.localrun/data npm run dev
+
+npm run build   # tsc compile (+ copy web assets)
+npm start       # run the compiled output
+```
+
+Open <http://127.0.0.1:8080>. In a native run `HOST_DATA_DIR` auto-resolves from `DATA_DIR`, so bind-mounts line up without extra config.
+
+</details>
+
+---
+
+## How bots are reached
+
+When a bot exposes a web UI, the manager publishes it on a host port (auto-assigned from `20000-29999`, override with `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE`) and shows an **Open** link. Ports bind to `127.0.0.1` by default - a published port bypasses host firewalls, so this avoids exposing bots on a server; set `BOT_PORT_BIND=0.0.0.0` for trusted-LAN access. On a server with the remote stack, bots are instead reached via their HTTPS subdomain (see **Server on Linux**).
+
+### Bot web-UI access (AppShield)
+
+Bots that ship Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) guard their web UI, and the manager wires two ways in:
+
+- **Access hash - your private shortcut.** Every bot gets an `AUTH_HASH`. The **Open** link carries it (`.../?hash=<hash>`), so opening a bot from the manager drops you straight in with no login. Keep the hash private (don't share the Open URL). Rotate it with **Regenerate** next to `AUTH_HASH` in the bot's **Env** editor, then rebuild the bot to apply - older Open links stop working.
+- **Username / password - for sharing.** To give other people access, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and rebuild. Anyone who opens the bot's URL without the hash then gets a login form. Both are empty by default (login off, hash-only), and they appear in the Env editor for any bot whose compose uses them.
+
+AppShield needs no CasaOS or platform - it runs as a plain sidecar in front of the bot. It does not terminate TLS, so on a public server it sits behind the remote stack's Caddy (see **Server on Linux**) for HTTPS; locally it is plain HTTP on `127.0.0.1`.
+
+---
+
+<details>
+<summary><b>Features</b></summary>
+
+- **Universal bot importer** - detects language, package manager, entry point, services, and env vars; generates a Dockerfile + Compose when the repo ships none.
+- **Multi-language** - Node.js (npm/yarn/pnpm/bun), Python (pip/poetry/uv/pipenv/setuptools), Go, Java/Kotlin (Maven/Gradle/prebuilt JAR), Rust, C# (.NET).
+- **Source / instance model** - one cloned source backs many instances.
+- **Guided config builder** - a validated form over a bot's config file with live two-way Form/Raw sync (raw editor fallback).
+- **Multi-service stacks** - auto-wires PostgreSQL/MongoDB/MariaDB/Redis + Lavalink; status-page sidecar for port-less bots (CasaOS).
+- **Environment management** - encrypted env storage + an in-UI editor + a reusable Credentials Vault.
+- **Per-bot Console & Files** - interactive shell + a file browser/editor.
+- **Live logs**, **non-blocking lifecycle** (start/stop/restart/update/delete) with WebSocket status, and **opt-in auto-updates**.
+- **CasaOS / PCS integration** and **standalone Docker** (this README).
+
+</details>
+
+<details>
+<summary><b>Architecture</b></summary>
 
 ```
 docker-discord-bot-manager/
@@ -56,88 +178,85 @@ docker-discord-bot-manager/
 │   ├── index.ts          # Entry point
 │   ├── types/            # TypeScript types
 │   ├── detection/        # Language / framework / service detection
-│   ├── templates/        # Dockerfile + compose generation, PCS processing, variable substitution
+│   ├── templates/        # Dockerfile + compose generation, processing, variable substitution
 │   ├── compose/          # Compose parsing / processing
-│   ├── config/           # Guided config builder (manifests, serializer, surfacing)
+│   ├── config/           # Guided config builder
 │   ├── env/              # Encrypted env storage + detection
 │   ├── source/           # Source repository management
 │   ├── instance/         # Bot instance management + scheduled updates
 │   ├── naming/           # App naming + collision detection
 │   ├── git/              # Git operations
-│   ├── docker/           # Docker client + container lifecycle
+│   ├── docker/           # Docker client, container lifecycle, host-port allocation
 │   ├── casaos/           # CasaOS / PCS integration + deployment-mode detection
 │   ├── discord/          # Discord API (ID validation for guided config)
-│   └── webui/
-│       ├── server.ts     # Express + WebSocket server
-│       ├── routes/       # API routes
-│       └── public/       # Web UI
-├── Dockerfile
-├── docker-compose.yml
+│   └── webui/            # Express + WebSocket server, routes, public UI, terminal
+├── docker-compose.yml             # CasaOS / Yundera app
+├── docker-compose.standalone.yml  # standalone (Windows / Linux)
+├── docker-compose.remote.yml      # public server (Caddy + Authelia)
+├── authelia/                      # remote-access auth gateway config
 └── package.json
 ```
 
-## API
+</details>
 
-The Web UI is backed by a REST API plus a WebSocket channel at `/ws`. Endpoints cover sources, instances, environment variables, config files, the credentials vault, per-bot console and file operations, and logs. See `Documentation/BotManager/UpdateSystem/Endpoints.md` for the full reference.
+<details>
+<summary><b>API & WebSocket events</b></summary>
 
-## WebSocket Events
+The Web UI is backed by a REST API plus a WebSocket channel at `/ws`. Endpoints cover sources, instances, environment variables, config files, the credentials vault, per-bot console and file operations, and logs. See `../Documentation/BotManager/UpdateSystem/Endpoints.md` for the full reference.
 
-Connect to `/ws` for real-time updates. Events include:
+WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:started`/`stopped`/`restarted`, `bot:pulling`/`built`/`rebuilt`, and the matching `*-failed` events.
 
-- `bot:status` - incremental status change for an instance
-- `bot:created` / `bot:updated` / `bot:deleted`
-- `bot:started` / `bot:stopped` / `bot:restarted`
-- `bot:pulling` / `bot:built` / `bot:rebuilt` - build and update progress
-- `bot:start-failed` / `bot:restart-failed` / `bot:build-failed` / `bot:pull-failed`
+</details>
 
-## Environment Variables
+<details>
+<summary><b>Environment variables</b></summary>
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | Web server port (inside the container) |
-| `DATA_DIR` | `/data` | Base data directory (set in the provided compose) |
+| `DATA_DIR` | `/data/data` | Base data directory |
+| `DEPLOYMENT_MODE` | (auto) | `casaos` or `docker`; forces the mode |
+| `HOST_DATA_DIR` | = `DATA_DIR` | Host path the data dir is mounted from (containerized standalone) |
+| `BOT_PORT_BIND` | `127.0.0.1` | Interface bots' host ports bind to (`0.0.0.0` for LAN) |
+| `BOT_HOST_PORT_BASE` / `BOT_HOST_PORT_RANGE` | `20000` / `10000` | Host-port auto-assign range |
+| `BOT_DOMAIN_BASE` | (unset) | Base for per-bot HTTPS subdomains (remote mode) |
 | `NODE_ENV` | `production` | Node environment |
 
-On the Yundera platform the manager also receives platform variables (`PUID`, `PGID`, `TZ`, `APP_DOMAIN`, `APP_PUBLIC_IP_DASH`, `APP_DEFAULT_PASSWORD`, `DATA_ROOT`, and the `REF_*` set). These are supplied by the platform; you do not set them for a standalone Docker run.
+Remote mode adds `PUBLIC_HOST`, `AUTHELIA_HOST`, `COOKIE_DOMAIN`, `ACME_EMAIL`, `TZ` (see **Server on Linux**). On Yundera the platform supplies `PUID`/`PGID`/`TZ`/`APP_*`/`REF_*`/`DATA_ROOT`.
 
-## Bot Requirements
+</details>
 
-The importer targets unmodified upstream bots, so most public Discord bot repositories work with no changes. The smoothest path is a repo that already ships a `Dockerfile` or `docker-compose.yml`; when neither is present, the manager detects the language and generates them.
+<details>
+<summary><b>Bot requirements</b></summary>
 
-A bot should:
+Most public Discord bot repos work unmodified. The smoothest path is a repo that already ships a `Dockerfile` or `docker-compose.yml`; otherwise the manager detects the language and generates them. A bot should:
 
-1. Be a Discord bot in a supported language (see Features)
-2. Read its secrets (bot token, API keys) from environment variables or a config file
-3. Declare its dependencies (lock file, `requirements.txt`, `pom.xml`, etc.)
+1. Be a Discord bot in a supported language (see Features).
+2. Read its secrets (token, API keys) from environment variables or a config file.
+3. Declare its dependencies (lock file, `requirements.txt`, `pom.xml`, etc.).
 
-## Security Considerations
+</details>
 
-- The Docker socket is mounted, which grants the manager full control of the host Docker daemon
-- Secrets (bot tokens, API keys, config files) are stored encrypted on disk
-- The Web UI has no built-in per-route authentication. On the Yundera platform it is protected by the `nginx-hash-lock` gateway. For a standalone run, place it behind your own authenticating reverse proxy.
+<details>
+<summary><b>Security</b></summary>
 
-## Development
+- The Docker socket is mounted, which grants the manager full control of the host Docker daemon (root-equivalent). **Never expose the manager bare on the internet.**
+- Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
+- Each managed bot's own web UI is guarded by its AppShield gateway - a private access hash (used by the **Open** link) plus an optional shared username/password. See **How bots are reached**.
+- Secrets (bot tokens, API keys, config files) are stored encrypted on disk.
 
-```bash
-# Install dependencies
-npm install
+</details>
 
-# Run in development mode
-npm run dev
+<details>
+<summary><b>Future enhancements</b></summary>
 
-# Build TypeScript
-npm run build
-
-# Run production
-npm start
-```
-
-## Future Enhancements
-
-- [ ] Built-in Web UI authentication for standalone runs
+- [ ] Live-test + harden the remote (Contabo) stack
+- [ ] Grey out OAuth-callback fields in the wizard when no public base is set
 - [ ] Resource usage graphs
 - [ ] Multiple Docker hosts support
 - [ ] Bot templates / presets
+
+</details>
 
 ## License
 

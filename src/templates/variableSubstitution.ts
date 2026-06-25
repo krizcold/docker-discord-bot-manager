@@ -41,6 +41,11 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
     APP_ID: `bot-${bot.id}`,
     AUTH_HASH: bot.authHash || generateHash(),
     API_HASH: bot.updateToken || generateHash(),
+
+    // AppShield optional login credentials (distinct from the OS `USER` var below).
+    // Empty by default -> AppShield credentials disabled, hash-only auth.
+    WEBUI_USER: bot.envVars?.['WEBUI_USER'] || '',
+    WEBUI_PASSWORD: bot.envVars?.['WEBUI_PASSWORD'] || '',
     BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,
     BOT_MANAGER_INTERNAL_URL: env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${env.PORT || '8080'}`,
 

@@ -2,7 +2,7 @@ name: discordbotmanager
 
 services:
   discordbotmanager:
-    image: ghcr.io/yundera/nginx-hash-lock:latest
+    image: ghcr.io/yundera/appshield:latest
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:

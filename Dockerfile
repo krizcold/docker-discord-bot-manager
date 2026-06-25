@@ -19,11 +19,8 @@ RUN npm install
 # Copy source code
 COPY . .
 
-# Build TypeScript (output is platform-independent JS)
+# Build TypeScript + copy static assets (the build script handles both)
 RUN npm run build
-
-# Copy static assets that tsc doesn't handle
-RUN cp -r src/webui/public dist/webui/public
 
 # Stage 2: Runtime (built for each target platform)
 FROM node:20-alpine

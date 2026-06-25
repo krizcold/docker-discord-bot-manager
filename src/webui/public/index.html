@@ -798,7 +798,7 @@
     const collapsedSources = new Set(); // Track collapsed source cards
     const cloningSources = new Set();   // Track sources being cloned
 
-    // Establish session cookie from URL hash (nginx-hash-lock)
+    // Establish session cookie from URL hash (AppShield)
     const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
     if (urlHash) {
       fetch(`/nhl-auth/establish-session?hash=${urlHash}`);
@@ -1149,6 +1149,7 @@
               ${isGit ? `<div class="bot-card-meta">${autoUpdateToggle}</div>` : ''}
               <div class="bot-card-actions">
                 ${isRunning ? `
+                  ${(bot.publicUrl || bot.hostPort) ? `<a class="btn btn-primary btn-small" href="${(bot.publicUrl ? escapeHtml(bot.publicUrl) : `http://${location.hostname}:${bot.hostPort}`) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
@@ -1462,9 +1463,10 @@
       }
     }
 
-    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive) {
+    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive, isAuthHash) {
       const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${required ? ' (required)' : ''}</div>` : '';
       const tipHtml = description ? `<div class="env-tip">${escapeHtml(description)}</div>` : '';
+      const regenBtn = isAuthHash ? `<button class="btn btn-secondary btn-small" onclick="regenerateAuthHash(this)" title="Generate a new access hash" type="button">Regenerate</button>` : '';
       return `<div>
         ${labelHtml}
         <div class="env-row">
@@ -1473,10 +1475,32 @@
             <input type="text" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
             <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, '${escapeHtml(key)}')" title="Pick from vault" type="button">&#9660;</button>
           </div>
+          ${regenBtn}
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
         </div>
         ${tipHtml}
       </div>`;
+    }
+
+    async function regenerateAuthHash(btn) {
+      if (!confirm('Generate a new access hash? Existing Open links and ?hash= URLs stop working once you rebuild the bot.')) return;
+      const input = btn.closest('.env-row').querySelector('.env-value');
+      const prev = btn.textContent;
+      btn.disabled = true; btn.textContent = '...';
+      try {
+        const res = await api('POST', `/bots/${envEditorBotId}/regenerate-auth-hash`);
+        if (res && res.success) {
+          if (input) input.value = res.authHash;
+          btn.textContent = 'Regenerated';
+          setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 1500);
+        } else {
+          btn.textContent = prev; btn.disabled = false;
+          showMessage('error', (res && res.error) || 'Failed to regenerate hash');
+        }
+      } catch (err) {
+        btn.textContent = prev; btn.disabled = false;
+        showMessage('error', 'Failed to regenerate hash');
+      }
     }
 
     function addEnvEditorRow() {
@@ -2212,7 +2236,7 @@
       const placeholder = e.sensitive
         ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
         : (current || 'Value');
-      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive);
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e.key === 'AUTH_HASH');
     }
 
     function renderEnvRows(entries) {

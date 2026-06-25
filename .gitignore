@@ -12,6 +12,9 @@ data/
 .env.local
 .env.*.local
 
+# Authelia secrets + runtime (remote-access gateway); never commit
+authelia/secrets/
+
 # Logs
 *.log
 npm-debug.log*

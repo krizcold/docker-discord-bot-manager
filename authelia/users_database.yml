@@ -1,0 +1,17 @@
+# Single admin user for the Bot Manager remote gateway.
+# `password` is an argon2id HASH (not plaintext). Generate it with the SAME image
+# version as the authelia service:
+#
+#   docker run --rm -it authelia/authelia:4.39 authelia crypto hash generate argon2
+#
+# Paste the full "$argon2id$v=19$..." line below, single-quoted so the $ are literal.
+# Keep the user in group 'admins' to satisfy the access_control rule. Set a real email.
+
+users:
+  admin:
+    disabled: false
+    displayname: 'Administrator'
+    password: '$argon2id$v=19$m=65536,t=3,p=4$REPLACE_WITH_GENERATED_HASH'
+    email: 'admin@example.com'
+    groups:
+      - 'admins'

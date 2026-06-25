@@ -1,0 +1,103 @@
+# Remote-access deployment (Linux VPS, e.g. Contabo): the manager UI on the public
+# internet, behind TLS (caddy-docker-proxy) + an MFA auth gateway (Authelia).
+#
+# The manager mounts the docker socket (root-equivalent on the host), so it is
+# reachable ONLY through Caddy + a completed Authelia login. It publishes no host
+# port; only Caddy listens on 80/443.
+#
+# Setup (see README "Standalone > Remote access on a VPS"):
+#   1. create ./authelia/secrets/{JWT_SECRET,SESSION_SECRET,STORAGE_ENCRYPTION_KEY}
+#   2. put an argon2id hash in ./authelia/users_database.yml
+#   3. create a .env with HOST_DATA_DIR, PUBLIC_HOST, AUTHELIA_HOST, COOKIE_DOMAIN, ACME_EMAIL, TZ
+#   4. open inbound TCP 80 + 443 (and Contabo's external firewall if enabled)
+#   5. docker compose -f docker-compose.remote.yml up -d
+
+name: discordbotmanager-remote
+
+services:
+  discordbotmanagerapp:
+    build: .
+    # Or: image: ghcr.io/krizcold/docker-discord-bot-manager:latest
+    container_name: discordbotmanagerapp
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data/data
+      PORT: "8080"
+      DEPLOYMENT_MODE: docker
+      HOST_DATA_DIR: ${HOST_DATA_DIR:?set HOST_DATA_DIR to an absolute host path, e.g. /opt/dbm/data}
+      # Optional: base for per-bot HTTPS subdomains (<botname>.<base>) via the same
+      # Caddy. Usually the same value as COOKIE_DOMAIN. Unset = bots stay localhost-only.
+      BOT_DOMAIN_BASE: ${BOT_DOMAIN_BASE:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_DATA_DIR}:/data/data
+    networks:
+      - dbm_remote
+    # Reachable only through Caddy (no host port published). Caddy serves it at
+    # PUBLIC_HOST over TLS and forwards every request through Authelia first.
+    labels:
+      caddy: ${PUBLIC_HOST}
+      caddy.reverse_proxy: "{{upstreams 8080}}"
+      caddy.forward_auth: "authelia:9091"
+      caddy.forward_auth.uri: /api/authz/forward-auth
+      caddy.forward_auth.copy_headers: Remote-User Remote-Groups Remote-Email Remote-Name
+
+  # Ingress reverse proxy with automatic Let's Encrypt TLS (sslip.io or your domain).
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:2.12-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"        # ACME HTTP-01 + HTTP->HTTPS redirect
+      - "443:443"      # public HTTPS
+      - "443:443/udp"  # HTTP/3 (optional)
+    environment:
+      CADDY_INGRESS_NETWORKS: dbm_remote
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - caddy_data:/data        # persists issued certs + ACME account - DO NOT lose
+      - caddy_config:/config
+    networks:
+      - dbm_remote
+
+  # Auth gateway: login + TOTP/WebAuthn MFA, enforced via Caddy forward_auth.
+  authelia:
+    image: authelia/authelia:4.39
+    container_name: authelia
+    restart: unless-stopped
+    environment:
+      X_AUTHELIA_CONFIG: /config/configuration.yml
+      X_AUTHELIA_CONFIG_FILTERS: template          # render {{ env "..." }} in configuration.yml
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      AUTHELIA_HOST: ${AUTHELIA_HOST}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN}
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/JWT_SECRET
+      AUTHELIA_SESSION_SECRET_FILE: /secrets/SESSION_SECRET
+      AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/STORAGE_ENCRYPTION_KEY
+      TZ: ${TZ}
+    volumes:
+      - ./authelia:/config                # configuration.yml + users_database.yml
+      - ./authelia/secrets:/secrets:ro    # the three secret files
+      - authelia_data:/data               # sqlite db + notification.txt
+    networks:
+      - dbm_remote
+    # This (real ingress) container carries its own site block AND the Caddy global
+    # options - putting global options on the caddy controller itself can yield an
+    # empty Caddyfile (caddy-docker-proxy#632), so they live here.
+    labels:
+      caddy_0: ${AUTHELIA_HOST}
+      caddy_0.reverse_proxy: "{{upstreams 9091}}"
+      caddy_1.email: ${ACME_EMAIL}
+      # Optional: let Authelia see the real client IP for its rate-limiter. If Caddy
+      # fails to render the global block, this one label can be removed safely.
+      caddy_1.servers.trusted_proxies: "static private_ranges"
+
+networks:
+  dbm_remote:
+    name: dbm_remote
+
+volumes:
+  caddy_data:
+  caddy_config:
+  authelia_data:

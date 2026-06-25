@@ -5,6 +5,7 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { detectBotType } from '../detection';
 import { DetectionResult } from '../types';
 import * as configFileManager from '../config/configFileManager';
@@ -99,7 +100,45 @@ export function buildWizardEnvList(
     if (extra.length) detection.configFiles = [...(detection.configFiles || []), ...extra];
   }
 
+  // AppShield optional login: show Web UI Username/Password as editable, empty-by-
+  // default fields when the bot's gateway uses them. They can't be named USER/
+  // PASSWORD directly (USER is a reserved/hidden platform var), and detection skips
+  // them because their compose value is a $-substitution.
+  if (composeReferencesCredentials(repoPath)) {
+    for (const key of ['WEBUI_USER', 'WEBUI_PASSWORD']) {
+      if (vars.some(v => v.key === key)) continue;
+      vars.push({
+        key,
+        displayLabel: key === 'WEBUI_USER' ? 'Web UI Username' : 'Web UI Password',
+        description: "Optional login for this bot's web UI (leave blank for hash-only access).",
+        defaultValue: '',
+        required: false,
+        source: 'compose',
+        sensitive: isSensitive(key),
+        autoWired: false,
+      });
+    }
+  }
+
   return { vars, detection };
+}
+
+/**
+ * Whether the bot's source compose opts into AppShield login credentials by
+ * referencing WEBUI_USER / WEBUI_PASSWORD. Keeps the credential fields general
+ * (any bot using the convention) rather than tied to a specific bot.
+ */
+function composeReferencesCredentials(repoPath: string | null): boolean {
+  if (!repoPath) return false;
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    try {
+      const p = path.join(repoPath, name);
+      if (fs.existsSync(p) && /WEBUI_USER|WEBUI_PASSWORD/.test(fs.readFileSync(p, 'utf-8'))) return true;
+    } catch {
+      // ignore unreadable compose
+    }
+  }
+  return false;
 }
 
 export interface EditorEnvVar {
@@ -121,12 +160,31 @@ export interface EditorEnvVar {
 export function buildBotEnvList(
   repoPath: string | null,
   botId: string,
-  tokenVarName?: string
+  tokenVarName?: string,
+  authHash?: string
 ): EditorEnvVar[] {
   const stored = getEnvVars(botId);
   const result: EditorEnvVar[] = [];
   const seen = new Set<string>();
 
+  // AUTH_HASH lives on the instance (single source of truth) and its compose value
+  // is a $-substitution, so detection never surfaces it. Surface it explicitly,
+  // visible (not masked), so the user can read/copy/regenerate it.
+  if (authHash !== undefined) {
+    seen.add('AUTH_HASH');
+    result.push({
+      key: 'AUTH_HASH',
+      displayLabel: 'Auth Hash',
+      description: 'Web UI access hash, used by the Open link and the ?hash= login. Regenerate to revoke existing links.',
+      required: false,
+      sensitive: false,
+      value: authHash,
+      isSet: true,
+    });
+  }
+
+  // WEBUI_USER/WEBUI_PASSWORD are surfaced via buildWizardEnvList (below) so they
+  // appear in both the wizard and the editor without duplication.
   const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath).vars : [];
   for (const d of detected) {
     if (d.autoWired) continue;   // deploy-injected, not user-editable

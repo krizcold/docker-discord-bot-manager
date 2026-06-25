@@ -9,6 +9,7 @@ import { spawn, execSync } from 'child_process';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
+import { generateHash } from '../../templates/variableSubstitution';
 import * as configFileManager from '../../config/configFileManager';
 import { findManifest, sanitizeSeedRows } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
@@ -684,7 +685,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
 
-      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName);
+      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.authHash);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
 
       res.json({
@@ -716,12 +717,42 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      envManager.setEnvVars(req.params.id, vars);
-      await containerManager.updateBot(req.params.id, { envVars: vars });
+      // AUTH_HASH is surfaced in the editor but persists on the instance (single
+      // source of truth), never in envVars - keep it out of the env storage.
+      const envVars = { ...vars };
+      const editedHash = envVars['AUTH_HASH'];
+      delete envVars['AUTH_HASH'];
+      if (typeof editedHash === 'string' && editedHash.trim() && editedHash !== bot.authHash) {
+        await containerManager.updateBot(req.params.id, { authHash: editedHash.trim() });
+      }
+
+      envManager.setEnvVars(req.params.id, envVars);
+      await containerManager.updateBot(req.params.id, { envVars });
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/regenerate-auth-hash - Issue a fresh AUTH_HASH and persist it
+   * on the instance. Takes effect on the next build/start (the hash is substituted
+   * into the compose then). Returns the new hash so the editor can show it.
+   */
+  router.post('/:id/regenerate-auth-hash', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const authHash = generateHash();
+      await containerManager.updateBot(req.params.id, { authHash });
+      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json({ success: true, authHash });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

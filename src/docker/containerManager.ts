@@ -15,11 +15,12 @@ import { v4 as uuidv4 } from 'uuid';
 
 const execAsync = promisify(exec);
 import {
-  InstanceConfig, InstanceRegistry, BotStatus, BotSourceType,
+  InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult,
 } from '../types';
 import * as dockerClient from './dockerClient';
+import { allocateHostPort } from './portAllocator';
 import { getBotDir, getDataPath, getEnvPath } from '../git/repoManager';
 import { findImageDataPath } from '../source/imageHints';
 import { detectBotType } from '../detection';
@@ -39,6 +40,13 @@ import {
 import { generateHash, applyVariableSubstitution } from '../templates/variableSubstitution';
 import {
   processComposeForCasaOS,
+  getMainServiceWebPort,
+  getWebUiIndexPath,
+  publishHostPort,
+  attachBotToProxy,
+  prepareDockerBotFiles,
+  redeliverDockerConfigFiles,
+  getAppServiceName,
   extractAppName,
   createVolumeDirectories,
   saveToCasaOSMetadata,
@@ -64,31 +72,23 @@ import YAML from 'yaml';
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
 
+/**
+ * The bot's data dir as the HOST daemon sees it (for docker-mode bind sources).
+ * Must be an absolute, forward-slash path: when HOST_DATA_DIR is set (containerized
+ * manager) it is used verbatim; otherwise DATA_DIR is resolved to an absolute host
+ * path (native run / same-path bind). A relative path would make the daemon resolve
+ * the bind against the bot's compose dir instead of the shared data root.
+ */
+function hostBotDirFor(botId: string): string {
+  const root = (process.env.HOST_DATA_DIR || path.resolve(DATA_DIR)).replace(/\\/g, '/').replace(/\/+$/, '');
+  return `${root}/bots/${botId}`;
+}
+
 type BroadcastFn = (type: string, data: any) => void;
 let broadcastFn: BroadcastFn | null = null;
 
 export function setContainerBroadcast(fn: BroadcastFn): void {
   broadcastFn = fn;
-}
-
-// Simple write queue to prevent concurrent registry writes
-let writeQueue: Promise<void> = Promise.resolve();
-
-function queueRegistryWrite(operation: () => void): Promise<void> {
-  writeQueue = writeQueue.then(() => {
-    return new Promise<void>((resolve, reject) => {
-      try {
-        operation();
-        resolve();
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }).catch((error) => {
-    console.error('[ContainerManager] Queued write failed:', error);
-    throw error;
-  });
-  return writeQueue;
 }
 
 /**
@@ -102,6 +102,11 @@ function loadRegistry(): InstanceRegistry {
     }
   } catch (error) {
     console.error('[ContainerManager] Failed to load registry:', error);
+    // Preserve a corrupt registry instead of letting the next save overwrite it with
+    // an empty one - keeps the bots recoverable rather than silently lost.
+    try {
+      if (fs.existsSync(REGISTRY_FILE)) fs.copyFileSync(REGISTRY_FILE, `${REGISTRY_FILE}.corrupt`);
+    } catch { /* best effort */ }
   }
   return { instances: {} };
 }
@@ -109,15 +114,23 @@ function loadRegistry(): InstanceRegistry {
 function saveRegistrySync(registry: InstanceRegistry): void {
   try {
     fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
-    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
+    // Atomic write: a truncated/interrupted write (e.g. the container killed mid-save
+    // during a rebuild) would otherwise corrupt the file, and the next load would
+    // silently fall back to an empty registry and then persist it - losing every bot.
+    const tmp = `${REGISTRY_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
+    fs.renameSync(tmp, REGISTRY_FILE);
   } catch (error) {
     console.error('[ContainerManager] Failed to save registry:', error);
     throw error;
   }
 }
 
+// Synchronous so that each mutator's load -> modify -> save is atomic on the single
+// JS thread. A deferred (queued) write let a concurrent mutator load a stale snapshot
+// and then revert another's field (e.g. the reconciler clobbering lastBuiltCommit).
 function saveRegistry(registry: InstanceRegistry): void {
-  queueRegistryWrite(() => saveRegistrySync(registry));
+  saveRegistrySync(registry);
 }
 
 // ─── Registry Accessors ───
@@ -343,6 +356,7 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     instance.titleName = names.titleName;
   }
   if (update.envVars) instance.envVars = { ...instance.envVars, ...update.envVars };
+  if (update.authHash !== undefined) instance.authHash = update.authHash;
   instance.updatedAt = new Date().toISOString();
 
   registry.instances[botId] = instance;
@@ -495,6 +509,49 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
   return { failures };
 }
 
+/**
+ * Tear down a docker-mode bot: `compose down` then a label-scoped force-remove of
+ * any lingering containers and the project's networks. No CasaOS metadata steps.
+ */
+async function performDockerCleanup(appName: string, composePath: string): Promise<{ failures: string[] }> {
+  const failures: string[] = [];
+
+  if (fs.existsSync(composePath)) {
+    try {
+      await dockerClient.composeDown(composePath, appName);
+    } catch (err) {
+      failures.push(`compose down ${appName}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Force-remove any lingering containers / networks for this compose project.
+  // Done in JS (list, then remove) - no shell pipe / `xargs`, so it works on
+  // Windows too (compose down above already handles the normal case).
+  try {
+    const { stdout } = await execAsync(
+      `docker ps -aq --filter "label=com.docker.compose.project=${appName}"`,
+      { timeout: 15000 }
+    );
+    const ids = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+    if (ids.length) await execAsync(`docker rm -f ${ids.join(' ')}`, { timeout: 30000 });
+  } catch (err) {
+    failures.push(`force-remove containers ${appName}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    const { stdout } = await execAsync(
+      `docker network ls --filter "label=com.docker.compose.project=${appName}" --format "{{.Name}}"`,
+      { timeout: 10000 }
+    );
+    const nets = stdout.split('\n').map(s => s.trim()).filter(Boolean);
+    if (nets.length) await execAsync(`docker network rm ${nets.join(' ')}`, { timeout: 10000 });
+  } catch (err) {
+    failures.push(`networks ${appName}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  return { failures };
+}
+
 export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -536,16 +593,9 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
         }
       }
     } else {
-      const containerIds = instance.containerIds || [];
-      for (const containerId of containerIds) {
-        try {
-          await dockerClient.stopContainer(containerId);
-          await dockerClient.removeContainer(containerId);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          failures.push(`container ${containerId}: ${msg}`);
-        }
-      }
+      const composePath = path.join(botDir, 'docker-compose.yml');
+      const cleanup = await performDockerCleanup(appName, composePath);
+      failures.push(...cleanup.failures);
     }
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -661,6 +711,97 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   }
 }
 
+// Base domain for per-bot subdomains in remote mode (e.g. the sslip.io IP host or
+// your registrable domain). When set, a web bot is routed through the bundled Caddy
+// at <sanitizedName>.<base> over TLS, in addition to its localhost host-port.
+const BOT_DOMAIN_BASE = process.env.BOT_DOMAIN_BASE || '';
+
+function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (instance) {
+    instance.hostPort = hostPort;
+    instance.webContainerPort = webContainerPort;
+    instance.publicUrl = publicUrl;
+    instance.webUiPath = webUiPath;
+    instance.updatedAt = new Date().toISOString();
+    registry.instances[botId] = instance;
+    saveRegistry(registry);
+  }
+}
+
+/**
+ * Docker mode: publish the bot's web UI on a host port (no Caddy gateway) and
+ * persist it on the instance. A bot keeps its port across rebuilds. Headless bots
+ * (no detectable web port) get no host port. Returns the updated compose content.
+ */
+function applyDockerHostPort(composeContent: string, instance: InstanceConfig): string {
+  const info = getMainServiceWebPort(composeContent);
+  if (!info) {
+    updateInstanceWebAccess(instance.id, undefined, undefined, undefined, undefined);
+    return composeContent;
+  }
+
+  // Web entry path the bot declares (x-casaos.index, hash already substituted).
+  const webUiPath = getWebUiIndexPath(composeContent) || undefined;
+
+  let content = composeContent;
+
+  // Remote mode: a public base is configured -> route the bot through the bundled
+  // Caddy at <name>.<base> with automatic TLS (in addition to a localhost port).
+  let publicUrl: string | undefined;
+  if (BOT_DOMAIN_BASE) {
+    const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
+    content = attachBotToProxy(content, host, info.containerPort);
+    publicUrl = `https://${host}`;
+  }
+
+  // Localhost host-port (tunnel fallback + the Open link when not proxied).
+  let hostPort: number | undefined;
+  if (info.existingHostPort !== null) {
+    hostPort = info.existingHostPort;   // compose already publishes it; keep that mapping
+  } else {
+    const used = new Set<number>();
+    for (const b of getAllBots()) {
+      if (b.id !== instance.id && typeof b.hostPort === 'number') used.add(b.hostPort);
+    }
+    const allocated = allocateHostPort({
+      botId: instance.id,
+      reuse: instance.hostPort,
+      used,
+      hostBound: dockerClient.listPublishedHostPorts(),
+    });
+    if (allocated !== null) {
+      hostPort = allocated;
+      content = publishHostPort(content, allocated, info.containerPort);
+    }
+  }
+
+  updateInstanceWebAccess(instance.id, hostPort, info.containerPort, publicUrl, webUiPath);
+  return content;
+}
+
+/**
+ * Write a .env next to the bot's compose so `${VAR}` interpolation and `env_file:`
+ * services resolve in docker mode. Mirrors writeComposeEnvFile but uses plain fs
+ * (no /DATA, no docker-exec-into-casaos).
+ */
+function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
+  try {
+    const lines = Object.entries(env)
+      .filter(([k]) => k)
+      .map(([k, v]) => {
+        const s = (v == null ? '' : String(v)).replace(/[\r\n]+/g, ' ');
+        const needsQuote = s === '' || /[\s#"'$=]/.test(s);
+        const val = needsQuote ? '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"' : s;
+        return `${k}=${val}`;
+      });
+    fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n');
+  } catch (err) {
+    console.warn(`[ContainerManager] Failed to write .env file: ${err}`);
+  }
+}
+
 function updateInstanceDetection(botId: string, detection: DetectionResult): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -684,9 +825,12 @@ function updateInstanceDetection(botId: string, detection: DetectionResult): voi
  *
  * Location: /DATA/AppData/{appName}/.botmanager
  */
-function writeBotManagerMarker(instance: InstanceConfig, appName: string): void {
-  const dataRoot = process.env.DATA_ROOT || '/DATA';
-  const appDataPath = path.join(dataRoot, 'AppData', appName);
+function writeBotManagerMarker(instance: InstanceConfig, appName: string, isCasaOS: boolean): void {
+  // CasaOS: marker lives in the platform AppData folder (folder-reuse detection).
+  // Docker: no /DATA; keep the marker inside the bot's own data dir.
+  const appDataPath = isCasaOS
+    ? path.join(process.env.DATA_ROOT || '/DATA', 'AppData', appName)
+    : getBotDir(instance.id);
 
   try {
     fs.mkdirSync(appDataPath, { recursive: true });
@@ -748,10 +892,39 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
   };
 }
 
+// Env vars that are inputs to compose $-substitution (e.g. the AppShield gateway
+// login) rather than configuration for the bot's app container. They feed the
+// gateway via $WEBUI_USER/$WEBUI_PASSWORD and must never reach a container as
+// literal app env.
+const SUBSTITUTION_ONLY_ENV = ['WEBUI_USER', 'WEBUI_PASSWORD'];
+
+/** Update an existing env KEY's value in a compose service (array or object form); no-op if absent. */
+function setComposeEnvIfPresent(env: any, key: string, value: string): void {
+  if (Array.isArray(env)) {
+    for (let i = 0; i < env.length; i++) {
+      if (typeof env[i] === 'string' && env[i].split('=')[0] === key) env[i] = `${key}=${value}`;
+    }
+  } else if (env && typeof env === 'object' && Object.prototype.hasOwnProperty.call(env, key)) {
+    env[key] = value;
+  }
+}
+
+/** Remove an env KEY from a compose service (array or object form). */
+function deleteComposeEnv(env: any, key: string): void {
+  if (Array.isArray(env)) {
+    for (let i = env.length - 1; i >= 0; i--) {
+      if (typeof env[i] === 'string' && env[i].split('=')[0] === key) env.splice(i, 1);
+    }
+  } else if (env && typeof env === 'object') {
+    delete env[key];
+  }
+}
+
 /**
- * Sync current instance env vars into the on-disk compose file.
- * CasaOS deploys from the compose file, so env changes after build
- * must be written back before start.
+ * Sync current instance env vars into the on-disk compose file before start, so
+ * edits made while the bot was stopped take effect without a rebuild. The app
+ * service gets the bot's env; any service that already declares USER/PASSWORD (the
+ * AppShield gateway) has them refreshed from the current WEBUI_USER/WEBUI_PASSWORD.
  */
 function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void {
   if (!fs.existsSync(composePath)) return;
@@ -764,40 +937,46 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
     const services = compose?.services;
     if (!services || typeof services !== 'object') return;
 
-    // Determine target service (x-casaos.build target or first service)
-    const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
-    const serviceNames = Object.keys(services);
-    const targetName = (typeof xcBuild === 'string' && services[xcBuild])
-      ? xcBuild
-      : serviceNames[0];
-    if (!targetName) return;
+    // App service (x-casaos.build, else first non-infra) gets the bot's env, MINUS
+    // substitution-only inputs - a repo compose whose first service is a database
+    // does not receive the bot's env.
+    const targetName = getAppServiceName(compose);
+    if (targetName && services[targetName]) {
+      const allEnv = buildEffectiveEnv(instance);
+      for (const k of SUBSTITUTION_ONLY_ENV) delete allEnv[k];
 
-    const allEnv = buildEffectiveEnv(instance);
+      const service = services[targetName];
+      const env = service.environment;
 
-    const service = services[targetName];
-    const env = service.environment;
-
-    if (Array.isArray(env)) {
-      // Array format: ["KEY=value", ...]
-      // Remove existing keys we're about to set, then add all
-      const existingKeys = new Set(Object.keys(allEnv));
-      const filtered = env.filter((e: string) => {
-        const key = typeof e === 'string' ? e.split('=')[0] : '';
-        return !existingKeys.has(key);
-      });
-      for (const [key, value] of Object.entries(allEnv)) {
-        filtered.push(`${key}=${value}`);
+      if (Array.isArray(env)) {
+        const existingKeys = new Set(Object.keys(allEnv));
+        const filtered = env.filter((e: string) => {
+          const key = typeof e === 'string' ? e.split('=')[0] : '';
+          return !existingKeys.has(key);
+        });
+        for (const [key, value] of Object.entries(allEnv)) filtered.push(`${key}=${value}`);
+        service.environment = filtered;
+      } else if (typeof env === 'object' && env !== null) {
+        Object.assign(env, allEnv);
+      } else {
+        service.environment = { ...allEnv };
       }
-      service.environment = filtered;
-    } else if (typeof env === 'object' && env !== null) {
-      // Object format: { KEY: "value", ... }
-      Object.assign(env, allEnv);
-    } else {
-      // No environment section, create one
-      service.environment = { ...allEnv };
+      compose.services[targetName] = service;
     }
 
-    compose.services[targetName] = service;
+    // AppShield gateway login: refresh any service's EXISTING USER/PASSWORD from the
+    // current credentials (so a change while stopped applies on start), and strip the
+    // substitution-only inputs from every service. Structural - keyed on the env that
+    // exists, never on a bot/image name.
+    const webUser = instance.envVars?.['WEBUI_USER'] || '';
+    const webPass = instance.envVars?.['WEBUI_PASSWORD'] || '';
+    for (const svc of Object.values(services) as any[]) {
+      if (!svc || !svc.environment) continue;
+      setComposeEnvIfPresent(svc.environment, 'USER', webUser);
+      setComposeEnvIfPresent(svc.environment, 'PASSWORD', webPass);
+      for (const k of SUBSTITUTION_ONLY_ENV) deleteComposeEnv(svc.environment, k);
+    }
+
     fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
   } catch (err) {
     console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
@@ -892,25 +1071,35 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       updateBotStatus(botId, 'running', containerIds);
       emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     } else {
-      const imageName = getImageName(instance);
-      const dataPath = getDataPath(botId);
-      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
-      const envWithToken = {
-        ...instance.envVars,
-        BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
-        BOT_ID: instance.id,
-        BOT_MANAGER_INTERNAL_URL: internalUrl
-      };
+      const composePath = path.join(botDir, 'docker-compose.yml');
 
-      emit('[Start] Creating container...', 'info');
+      // Sync env into the compose (covers post-build env edits) + a .env file for
+      // ${VAR} / env_file services, then deploy the full compose (multi-service).
+      syncComposeEnvVars(latestInstance, composePath);
+      writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
+
+      // Re-apply edited config files so changes made while stopped take effect.
+      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
+        try {
+          redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
+        } catch (err) {
+          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+        }
+      }
+
+      emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
-      const containerId = await dockerClient.createBotContainer(botId, imageName, envWithToken, dataPath);
-      emit('[Start] Starting container...', 'info');
-      await dockerClient.startContainer(containerId);
+      await dockerClient.composeUp(composePath, appName, (msg) => emit(`[Compose] ${msg}`, 'info'));
+      const verify = await dockerClient.verifyComposeProjectRunning(appName, 15000);
+      if (!verify.allRunning) {
+        throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
+      }
 
-      updateBotStatus(botId, 'running', [containerId]);
-      emit('[Done] Bot started successfully', 'success');
+      const containerIds = await getContainerIdsForBot(botId);
+      updateBotStatus(botId, 'running', containerIds);
+      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
@@ -972,20 +1161,27 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       const containerIds = await getContainerIdsForBot(botId);
       updateBotStatus(botId, 'running', containerIds);
     } else {
-      const dataPath = getDataPath(botId);
-      const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
-      const envWithToken = {
-        ...instance.envVars,
-        BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
-        BOT_ID: instance.id,
-        BOT_MANAGER_INTERNAL_URL: internalUrl
-      };
+      const composePath = path.join(botDir, 'docker-compose.yml');
+      syncComposeEnvVars(instance, composePath);
+      writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
+
+      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
+        try {
+          redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
+        } catch (err) {
+          console.warn(`[ContainerManager] Could not re-apply config files for ${appName}:`, err);
+        }
+      }
 
       updateBotStatus(botId, 'starting');
-      const dataTarget = resolveImageDataTarget(instance.imageRef);
-      const containerId = await dockerClient.createBotContainer(botId, instance.imageRef, envWithToken, dataPath, dataTarget);
-      await dockerClient.startContainer(containerId);
-      updateBotStatus(botId, 'running', [containerId]);
+      await dockerClient.composeUp(composePath, appName, (msg) => console.log(`[Compose ${botId}] ${msg}`));
+      const verify = await dockerClient.verifyComposeProjectRunning(appName, 15000);
+      if (!verify.allRunning) {
+        throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
+      }
+      const containerIds = await getContainerIdsForBot(botId);
+      updateBotStatus(botId, 'running', containerIds);
     }
 
     return { success: true };
@@ -1027,13 +1223,22 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
         console.warn(`[ContainerManager] Compose down failed for ${appName}: ${downResult.error}`);
       }
     } else {
-      const containerIds = instance.containerIds || [];
-      for (const containerId of containerIds) {
+      const composePath = path.join(getBotDir(botId), 'docker-compose.yml');
+      if (fs.existsSync(composePath)) {
         try {
-          await dockerClient.stopContainer(containerId);
-          await dockerClient.removeContainer(containerId);
+          await dockerClient.composeDown(composePath, appName);
         } catch (err) {
-          console.warn(`[ContainerManager] Failed to stop container ${containerId}:`, err);
+          console.warn(`[ContainerManager] compose down failed for ${appName}:`, err);
+        }
+      } else {
+        // Fallback: stop tracked containers if the compose file is gone.
+        for (const containerId of instance.containerIds || []) {
+          try {
+            await dockerClient.stopContainer(containerId);
+            await dockerClient.removeContainer(containerId);
+          } catch (err) {
+            console.warn(`[ContainerManager] Failed to stop container ${containerId}:`, err);
+          }
         }
       }
     }
@@ -1186,21 +1391,29 @@ async function buildDockerImageInstance(
   const dataTarget = resolveImageDataTarget(instance.imageRef);
   let composeContent = generateImageCompose(botForCompose, botDir, dataTarget);
   const appName = instance.sanitizedName;
-  const processed = processComposeForCasaOS(composeContent, appName, botForCompose);
+  const processed = processComposeForCasaOS(composeContent, appName, botForCompose, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
   composeContent = processed.content;
 
-  // Config files: bind user-supplied config files into the bot service.
-  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false) : [];
-  if (configFiles.length > 0) {
-    emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
-    composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+  // Config files: deliver/bind user-supplied config files (mode-aware).
+  const configFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+  if (isCasaOS) {
+    if (configFiles.length > 0) {
+      emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
+      composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+    }
+  } else {
+    // Docker mode: align the ./data bind + deliver/bind config files locally.
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), null, configFiles, (msg) => emit(msg, 'info'));
   }
+
+  // Docker mode: publish the bot's web UI on a host port (no gateway).
+  if (!isCasaOS) composeContent = applyDockerHostPort(composeContent, instance);
 
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
-  // Write .botmanager marker inside AppData (identifies folder as ours)
-  writeBotManagerMarker(instance, appName);
+  // Write .botmanager marker (CasaOS AppData folder, or the bot dir in docker mode)
+  writeBotManagerMarker(instance, appName, isCasaOS);
 
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
@@ -1369,9 +1582,9 @@ async function buildGitInstance(
     // Apply variable substitution
     rawCompose = applyVariableSubstitution(rawCompose, botWithEnv);
 
-    // Apply CasaOS processing
+    // Apply deployment processing (mode-aware: casaos vs plain docker)
     {
-      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv);
+      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
     }
@@ -1423,16 +1636,16 @@ async function buildGitInstance(
     composeContent = generateCompose(botWithEnv, detection, botDir, imageName);
     appName = instance.sanitizedName;
     {
-      const processed = processComposeForCasaOS(composeContent, appName, botWithEnv);
+      const processed = processComposeForCasaOS(composeContent, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
     }
     buildTarget = 'bot';
   }
 
-  // CasaOS: create volume directories + deliver user-edited config files
-  const configFiles = isCasaOS ? configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false) : [];
-  let bindOnlyConfigs = configFiles;
+  // Deliver volume dirs + user-edited config files (mode-aware).
+  const configFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+  let bindOnlyConfigs: typeof configFiles = [];
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');
     await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'));
@@ -1440,22 +1653,29 @@ async function buildGitInstance(
     // over that existing bind (no second bind). The rest fall through to a fresh bind.
     const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'));
     bindOnlyConfigs = configFiles.filter(c => !handled.has(c.path));
+    // Config files the compose does NOT already mount: bind them in. Injected AFTER
+    // createVolumeDirectories so the file path is not created as a directory.
+    if (bindOnlyConfigs.length > 0) {
+      emit(`[Config] Delivering ${bindOnlyConfigs.length} config file(s)`, 'info');
+      composeContent = addConfigFileBinds(composeContent, appName, bindOnlyConfigs);
+    }
+  } else if (repoPath || configFiles.length > 0) {
+    // Docker mode: create bind dirs, deliver repo files, and deliver/bind config
+    // files directly to the bot's local data dir (no /DATA, no casaos container).
+    emit('[Docker] Preparing volumes and config files...', 'info');
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'));
   }
 
-  // Config files the compose does NOT already mount: bind them in. Injected AFTER
-  // createVolumeDirectories so the file path is not created as a directory.
-  if (bindOnlyConfigs.length > 0) {
-    emit(`[Config] Delivering ${bindOnlyConfigs.length} config file(s)`, 'info');
-    composeContent = addConfigFileBinds(composeContent, appName, bindOnlyConfigs);
-  }
-
-  // Write .botmanager marker inside AppData (identifies folder as ours)
-  writeBotManagerMarker(instance, appName);
+  // Write .botmanager marker (CasaOS AppData folder, or the bot dir in docker mode)
+  writeBotManagerMarker(instance, appName, isCasaOS);
 
   // CasaOS: execute pre-install command
   if (isCasaOS) {
     await executeInstallCommand('pre', composeContent, (msg) => emit(msg, 'info'));
   }
+
+  // Docker mode: publish the bot's web UI on a host port (no gateway).
+  if (!isCasaOS) composeContent = applyDockerHostPort(composeContent, instance);
 
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');

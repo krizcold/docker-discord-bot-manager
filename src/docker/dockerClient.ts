@@ -124,6 +124,25 @@ export async function listContainersByBotId(botId: string): Promise<ContainerInf
 }
 
 /**
+ * Host ports currently published by any container (`0.0.0.0:18080->...`,
+ * `127.0.0.1:18080->...`, `:::18080->...`). Used to avoid colliding when
+ * auto-assigning a bot's host port in docker mode.
+ */
+export function listPublishedHostPorts(): Set<number> {
+  const ports = new Set<number>();
+  try {
+    const output = execDocker(['ps', '-a', '--format', '{{.Ports}}'], { timeout: 10000 });
+    for (const m of output.matchAll(/:(\d+)->/g)) {
+      const n = parseInt(m[1], 10);
+      if (!isNaN(n)) ports.add(n);
+    }
+  } catch {
+    // Best effort; an empty set just means no collision avoidance this round.
+  }
+  return ports;
+}
+
+/**
  * Create a new container for a bot
  */
 export async function createBotContainer(
@@ -563,20 +582,24 @@ export function listProjectVolumes(projectName: string): string[] {
 }
 
 /**
- * Run docker compose up
+ * Run docker compose up. Defaults to deploying pre-built images (no --build); the
+ * manager pre-builds images and rewrites build: -> image: before deploy, and a
+ * --build here would mis-resolve relative build contexts against the compose dir.
  */
 export async function composeUp(
   composePath: string,
   projectName: string,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  opts: { build?: boolean } = {}
 ): Promise<void> {
-  const args = ['compose', '-f', composePath, '-p', projectName, 'up', '-d', '--build'];
+  const args = ['compose', '-f', composePath, '-p', projectName, 'up', '-d', '--remove-orphans'];
+  if (opts.build) args.push('--build');
 
   console.log(`[Docker] Running: docker ${args.join(' ')}`);
 
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
-    if (isBuildxAvailable()) {
+    if (opts.build && isBuildxAvailable()) {
       env.DOCKER_BUILDKIT = '1';
     }
 

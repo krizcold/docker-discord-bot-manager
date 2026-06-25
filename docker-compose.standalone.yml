@@ -1,0 +1,40 @@
+# Standalone deployment (no Yundera / CasaOS).
+#
+# Runs the Bot Manager on a plain machine with Docker. It binds to localhost only
+# and has NO authentication - keep it on a trusted machine (a secure remote-access
+# design is in progress). Do NOT expose it on 0.0.0.0 without your own auth proxy.
+#
+# REQUIRED: set HOST_DATA_DIR to an ABSOLUTE host path (forward slashes), matching
+# the data bind below. The manager controls a sibling-container daemon, which
+# resolves a bot's bind-mounts as HOST paths; HOST_DATA_DIR lets the manager rewrite
+# those to live under the shared data folder so manager and bots see the same files.
+#
+#   Windows (PowerShell):  $env:HOST_DATA_DIR = "C:/dbm/data"
+#   Linux:                 export HOST_DATA_DIR=/opt/dbm/data
+#
+#   docker compose -f docker-compose.standalone.yml up -d --build
+#   open http://127.0.0.1:8090
+
+name: discordbotmanager-standalone
+
+services:
+  discordbotmanagerapp:
+    build: .
+    # Or pin a published image instead of building locally:
+    # image: ghcr.io/krizcold/docker-discord-bot-manager:latest
+    container_name: discordbotmanagerapp
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /data/data
+      PORT: "8080"
+      DEPLOYMENT_MODE: docker        # force standalone docker mode (no CasaOS)
+      HOST_DATA_DIR: ${HOST_DATA_DIR:?set HOST_DATA_DIR to an absolute host path (e.g. C:/dbm/data or /opt/dbm/data)}
+    ports:
+      - "127.0.0.1:8090:8080"        # localhost only; no gateway, no auth
+    volumes:
+      # Docker daemon socket. The manager is a Linux container, so it talks to the
+      # daemon over the unix socket - this same line works on Linux AND on Windows
+      # Docker Desktop (which exposes the daemon at this path for Linux containers).
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_DATA_DIR}:/data/data

@@ -20,6 +20,21 @@ interface ManagerConfig {
 
 let cachedMode: DeploymentMode | null = null;
 
+const VALID_MODES: readonly DeploymentMode[] = ['casaos', 'docker'];
+
+/**
+ * Read an explicit DEPLOYMENT_MODE override from the environment (highest
+ * precedence; never persisted). An invalid value warns and is ignored so a typo
+ * does not break startup.
+ */
+function parseEnvMode(): DeploymentMode | null {
+  const raw = (process.env.DEPLOYMENT_MODE || '').trim().toLowerCase();
+  if (!raw) return null;
+  if ((VALID_MODES as readonly string[]).includes(raw)) return raw as DeploymentMode;
+  console.warn(`[CasaOS] Ignoring invalid DEPLOYMENT_MODE="${process.env.DEPLOYMENT_MODE}" (expected casaos|docker)`);
+  return null;
+}
+
 /**
  * Check if CasaOS container is running
  */
@@ -64,6 +79,15 @@ function saveConfig(config: ManagerConfig): void {
  * Get current deployment mode (auto-detect if not set)
  */
 export async function getDeploymentMode(): Promise<DeploymentMode> {
+  const envMode = parseEnvMode();
+  if (envMode) {
+    if (cachedMode !== envMode) {
+      console.log(`[CasaOS] Deployment mode: ${envMode} (forced via DEPLOYMENT_MODE)`);
+    }
+    cachedMode = envMode;
+    return cachedMode;
+  }
+
   if (cachedMode) {
     return cachedMode;
   }
@@ -116,14 +140,17 @@ export async function getDeploymentInfo(): Promise<{
   mode: DeploymentMode;
   casaosAvailable: boolean;
   autoDetected: boolean;
+  forcedByEnv: boolean;
 }> {
   const config = loadConfig();
   const casaosAvailable = await isCasaOSAvailable();
   const mode = await getDeploymentMode();
+  const forcedByEnv = parseEnvMode() !== null;
 
   return {
     mode,
     casaosAvailable,
-    autoDetected: config?.autoDetected ?? true
+    autoDetected: forcedByEnv ? false : (config?.autoDetected ?? true),
+    forcedByEnv,
   };
 }

@@ -44,7 +44,8 @@ async function main(): Promise<void> {
 
   if (!dockerConnected) {
     console.error('[Init] ERROR: Cannot connect to Docker daemon!');
-    console.error('[Init] Make sure Docker socket is mounted at /var/run/docker.sock');
+    console.error('[Init] Mount the Docker socket: -v /var/run/docker.sock:/var/run/docker.sock');
+    console.error('[Init] (Docker Desktop exposes the daemon at that path on Windows too).');
     process.exit(1);
   }
 

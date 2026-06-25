@@ -1,99 +1,34 @@
 /**
  * Per-bot Console + Files backend.
  *
- * Interactive terminal: talks to the Docker Engine API over the unix socket to
- * create a TTY exec inside a bot's container and bridges the raw stream to the
- * browser over the existing /ws WebSocket (multiplexed as terminal:* messages).
+ * Interactive terminal: spawns `docker exec -it <container> <shell>` via the docker
+ * CLI and bridges its stdio to the browser over the existing /ws WebSocket
+ * (multiplexed as terminal:* messages). Using the CLI (not the raw Engine socket)
+ * keeps it cross-platform - it works on the Windows Docker Desktop named pipe too.
  *
- * File operations: run scoped `docker exec` commands (argv arrays, never a shell
- * string, so paths cannot inject) against either the bot's running container or,
- * when the bot is stopped, its persistent host folder /DATA/AppData/<app> via the
- * casaos container (the same mechanism saveToCasaOSMetadata/writeStatusPage use).
+ * File operations: against the bot's running container they run scoped `docker exec`
+ * commands (argv arrays, never a shell string, so paths cannot inject). For the
+ * "persistent data (host)" scope: in CasaOS mode they go through the casaos
+ * container at /DATA/AppData/<app>; in plain docker mode they operate directly on
+ * the bot's local data dir with Node fs (no casaos container exists).
  *
  * Everything is scoped per bot: the target container is validated to belong to the
- * bot's compose project, and host-folder access is jailed to that bot's AppData dir.
+ * bot's compose project, and host-folder access is jailed to that bot's data dir.
  */
 
-import * as http from 'http';
+import * as fs from 'fs';
 import * as path from 'path';
-import { spawn } from 'child_process';
-import { Socket } from 'net';
+import { spawn, ChildProcess } from 'child_process';
 import { WebSocket } from 'ws';
 import { getBot } from '../docker/containerManager';
+import { getDataPath } from '../git/repoManager';
+import { getDeploymentMode } from '../casaos/detector';
 
-const DOCKER_SOCK = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const CASAOS_CONTAINER = 'casaos';
 
 const MAX_FILE_BYTES = 1024 * 1024;        // 1 MB read/edit cap
 const EXEC_TIMEOUT_MS = 15000;
-
-// ─── Docker Engine API over the unix socket ────────────────────────────────
-
-function dockerApi(method: string, urlPath: string, body?: unknown): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const payload = body === undefined ? '' : JSON.stringify(body);
-    const req = http.request(
-      {
-        socketPath: DOCKER_SOCK,
-        path: urlPath,
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
-        },
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(c as Buffer));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf8');
-          if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`Docker API ${method} ${urlPath} -> ${res.statusCode}: ${text}`));
-            return;
-          }
-          try {
-            resolve(text ? JSON.parse(text) : {});
-          } catch {
-            resolve({});
-          }
-        });
-      }
-    );
-    req.on('error', reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-// POST /exec/{id}/start with a hijacked bidirectional stream (Tty mode).
-function dockerHijack(urlPath: string, body: unknown): Promise<Socket> {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const req = http.request({
-      socketPath: DOCKER_SOCK,
-      path: urlPath,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        Connection: 'Upgrade',
-        Upgrade: 'tcp',
-      },
-    });
-    let settled = false;
-    req.on('upgrade', (_res, socket) => {
-      if (!settled) { settled = true; resolve(socket as Socket); }
-    });
-    // Fallback: some daemons reply 200 and stream over the response socket.
-    req.on('response', (res) => {
-      if (!settled) { settled = true; resolve(res.socket as Socket); }
-    });
-    req.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
-    req.write(payload);
-    req.end();
-  });
-}
 
 // ─── Container resolution / validation ──────────────────────────────────────
 
@@ -133,13 +68,17 @@ export async function getBotContainers(appName: string): Promise<BotContainer[]>
 
 // ─── Filesystem scope resolution ────────────────────────────────────────────
 
-interface FsTarget { container: string; user?: string; base: string; jail: boolean }
+type FsTarget =
+  | { kind: 'container'; container: string; user?: string; base: string; jail: boolean }
+  | { kind: 'local'; base: string; jail: boolean };
+
+type ContainerTarget = Extract<FsTarget, { kind: 'container' }>;
 
 /**
- * Resolve which container the file/exec ops run against.
- * target === 'host' -> the bot's persistent /DATA/AppData/<app> via the casaos
- * container (jailed). Otherwise target is a container name validated to belong
- * to the bot.
+ * Resolve where file/exec ops run.
+ * target === 'host' -> the bot's persistent data: the casaos container's
+ * /DATA/AppData/<app> in CasaOS mode, or the bot's local data dir (Node fs) in
+ * docker mode. Otherwise target is a container name validated to belong to the bot.
  */
 async function resolveTarget(botId: string, target: string): Promise<FsTarget | { error: string }> {
   const bot = getBot(botId);
@@ -147,14 +86,18 @@ async function resolveTarget(botId: string, target: string): Promise<FsTarget | 
   const appName = bot.sanitizedName;
 
   if (target === 'host') {
-    return { container: CASAOS_CONTAINER, user: 'ubuntu', base: `${DATA_ROOT}/AppData/${appName}`, jail: true };
+    const mode = await getDeploymentMode();
+    if (mode === 'casaos') {
+      return { kind: 'container', container: CASAOS_CONTAINER, user: 'ubuntu', base: `${DATA_ROOT}/AppData/${appName}`, jail: true };
+    }
+    return { kind: 'local', base: getDataPath(botId), jail: true };
   }
 
   const containers = await getBotContainers(appName);
   if (!containers.some((c) => c.name === target)) {
     return { error: 'Container does not belong to this bot' };
   }
-  return { container: target, base: '/', jail: false };
+  return { kind: 'container', container: target, base: '/', jail: false };
 }
 
 // Resolve a user path against the target, enforcing the jail for host scope.
@@ -176,11 +119,59 @@ function resolveAbs(t: FsTarget, reqPath: string): string | null {
   return abs;
 }
 
-function execArgs(t: FsTarget, argv: string[]): string[] {
+function execArgs(t: ContainerTarget, argv: string[]): string[] {
   const base = ['exec'];
   if (t.user) base.push('--user', t.user);
   base.push(t.container, ...argv);
   return base;
+}
+
+// ─── Local (Node fs) file operations for the docker-mode host scope ─────────
+
+function localList(abs: string): any {
+  try {
+    const entries = fs.readdirSync(abs, { withFileTypes: true })
+      .map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+    return { success: true, path: abs, entries };
+  } catch (e) {
+    return { success: false, error: (e as Error).message || 'Failed to list directory', path: abs };
+  }
+}
+
+function localRead(abs: string): any {
+  try {
+    if (fs.statSync(abs).size > MAX_FILE_BYTES) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
+    const buf = fs.readFileSync(abs);
+    if (buf.includes(0)) return { success: false, error: 'Binary file (not editable here)', path: abs, binary: true };
+    return { success: true, path: abs, body: buf.toString('utf8') };
+  } catch (e) {
+    return { success: false, error: (e as Error).message || 'Failed to read file', path: abs };
+  }
+}
+
+function localWrite(abs: string, body: string): any {
+  try {
+    fs.mkdirSync(path.posix.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return { success: true, path: abs };
+  } catch (e) {
+    return { success: false, error: (e as Error).message || 'Failed to write file' };
+  }
+}
+
+function localMkdir(abs: string): any {
+  try { fs.mkdirSync(abs, { recursive: true }); return { success: true, path: abs }; }
+  catch (e) { return { success: false, error: (e as Error).message || 'Failed to create directory' }; }
+}
+
+function localDelete(abs: string): any {
+  try { fs.rmSync(abs, { recursive: true, force: true }); return { success: true, path: abs }; }
+  catch (e) { return { success: false, error: (e as Error).message || 'Failed to delete' }; }
+}
+
+function localRename(absFrom: string, absTo: string): any {
+  try { fs.renameSync(absFrom, absTo); return { success: true, from: absFrom, to: absTo }; }
+  catch (e) { return { success: false, error: (e as Error).message || 'Failed to rename' }; }
 }
 
 // ─── File operations ────────────────────────────────────────────────────────
@@ -190,6 +181,8 @@ export async function fsList(botId: string, target: string, reqPath: string): Pr
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
+
+  if (t.kind === 'local') return localList(abs);
 
   const { stdout, stderr, code } = await spawnCapture('docker', execArgs(t, ['ls', '-Ap1', '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to list directory', path: abs };
@@ -206,6 +199,8 @@ export async function fsRead(botId: string, target: string, reqPath: string): Pr
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
+
+  if (t.kind === 'local') return localRead(abs);
 
   const { stdout, stderr, code } = await spawnCapture('docker', execArgs(t, ['head', '-c', String(MAX_FILE_BYTES + 1), '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to read file', path: abs };
@@ -226,6 +221,8 @@ export async function fsWrite(botId: string, target: string, reqPath: string, bo
     return { success: false, error: 'Refusing to save an empty file (this would erase its contents). Use delete if you mean to remove it.' };
   }
 
+  if (t.kind === 'local') return localWrite(abs, body);
+
   // Pass the path as $1 (argv), never interpolated into the shell.
   const { stderr, code } = await spawnCapture(
     'docker',
@@ -241,6 +238,7 @@ export async function fsMkdir(botId: string, target: string, reqPath: string): P
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
+  if (t.kind === 'local') return localMkdir(abs);
   const { stderr, code } = await spawnCapture('docker', execArgs(t, ['mkdir', '-p', '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to create directory' };
   return { success: true, path: abs };
@@ -251,6 +249,7 @@ export async function fsDelete(botId: string, target: string, reqPath: string): 
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
   if (!abs || (t.jail && abs === t.base)) return { success: false, error: 'Path outside allowed scope' };
+  if (t.kind === 'local') return localDelete(abs);
   const { stderr, code } = await spawnCapture('docker', execArgs(t, ['rm', '-rf', '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to delete' };
   return { success: true, path: abs };
@@ -262,6 +261,7 @@ export async function fsRename(botId: string, target: string, fromPath: string, 
   const absFrom = resolveAbs(t, fromPath);
   const absTo = resolveAbs(t, toPath);
   if (!absFrom || !absTo) return { success: false, error: 'Path outside allowed scope' };
+  if (t.kind === 'local') return localRename(absFrom, absTo);
   const { stderr, code } = await spawnCapture('docker', execArgs(t, ['mv', '--', absFrom, absTo]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to rename' };
   return { success: true, from: absFrom, to: absTo };
@@ -269,7 +269,7 @@ export async function fsRename(botId: string, target: string, fromPath: string, 
 
 // ─── Interactive terminal (multiplexed over the /ws connection) ─────────────
 
-interface TermSession { socket: Socket; execId: string }
+interface TermSession { child: ChildProcess }
 
 function send(ws: WebSocket, type: string, extra: Record<string, unknown> = {}): void {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, ...extra }));
@@ -277,8 +277,18 @@ function send(ws: WebSocket, type: string, extra: Record<string, unknown> = {}):
 
 export function closeTerminal(ws: WebSocket): void {
   const sess = (ws as any).__term as TermSession | undefined;
-  if (sess?.socket) { try { sess.socket.destroy(); } catch { /* ignore */ } }
+  if (sess?.child) { try { sess.child.kill('SIGKILL'); } catch { /* ignore */ } }
   (ws as any).__term = undefined;
+}
+
+// `docker exec` args for an interactive shell. The wrapper sets the initial TTY
+// size, then execs bash if present else sh.
+function buildExecArgs(container: string, useTty: boolean, cols: number, rows: number): string[] {
+  const args = ['exec', '-i'];
+  if (useTty) args.push('-t');
+  const wrap = `stty rows ${rows} cols ${cols} 2>/dev/null; if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi`;
+  args.push(container, '/bin/sh', '-c', wrap);
+  return args;
 }
 
 async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
@@ -293,31 +303,40 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
 
   closeTerminal(ws);
 
-  try {
-    const created = await dockerApi('POST', `/containers/${target}/exec`, {
-      AttachStdin: true,
-      AttachStdout: true,
-      AttachStderr: true,
-      Tty: true,
-      Cmd: ['/bin/sh', '-c', 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi'],
+  const cols = Number(msg.cols) || 80;
+  const rows = Number(msg.rows) || 24;
+  let retried = false;
+
+  // Node's stdin is a pipe, so some daemons refuse `-t` ("the input device is not
+  // a TTY"). On that error, retry once without a TTY (line-buffered but usable).
+  const launch = (useTty: boolean): void => {
+    const child = spawn('docker', buildExecArgs(target, useTty, cols, rows), { windowsHide: true });
+    (ws as any).__term = { child } as TermSession;
+
+    const forward = (d: Buffer) => send(ws, 'terminal:data', { data: d.toString('base64') });
+    child.stdout?.on('data', forward);
+    child.stderr?.on('data', (d: Buffer) => {
+      if (useTty && !retried && /not a TTY/i.test(d.toString())) {
+        retried = true;
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        launch(false);
+        return;
+      }
+      forward(d);
     });
-    const execId = created.Id;
-    if (!execId) { send(ws, 'terminal:error', { message: 'Failed to create exec' }); return; }
+    child.on('exit', () => {
+      if (retried && useTty) return;   // this is the TTY attempt we replaced
+      if (((ws as any).__term as TermSession | undefined)?.child === child) (ws as any).__term = undefined;
+      send(ws, 'terminal:exit', {});
+    });
+    child.on('error', (err) => {
+      if (retried && useTty) return;
+      send(ws, 'terminal:error', { message: err instanceof Error ? err.message : String(err) });
+    });
+  };
 
-    const socket = await dockerHijack(`/exec/${execId}/start`, { Detach: false, Tty: true });
-    (ws as any).__term = { socket, execId } as TermSession;
-
-    socket.on('data', (d: Buffer) => send(ws, 'terminal:data', { data: d.toString('base64') }));
-    socket.on('close', () => { send(ws, 'terminal:exit', {}); (ws as any).__term = undefined; });
-    socket.on('error', () => { send(ws, 'terminal:exit', {}); (ws as any).__term = undefined; });
-
-    const cols = Number(msg.cols) || 80;
-    const rows = Number(msg.rows) || 24;
-    await dockerApi('POST', `/exec/${execId}/resize?h=${rows}&w=${cols}`).catch(() => { /* non-fatal */ });
-    send(ws, 'terminal:ready', { container: target });
-  } catch (err) {
-    send(ws, 'terminal:error', { message: `Failed to open terminal: ${err instanceof Error ? err.message : String(err)}` });
-  }
+  launch(true);
+  send(ws, 'terminal:ready', { container: target });
 }
 
 /**
@@ -335,14 +354,11 @@ export function handleTerminalMessage(ws: WebSocket, raw: string): boolean {
       void startTerminal(ws, msg);
       break;
     case 'terminal:input':
-      if (sess?.socket) sess.socket.write(Buffer.from(String(msg.data || ''), 'base64'));
+      if (sess?.child?.stdin) sess.child.stdin.write(Buffer.from(String(msg.data || ''), 'base64'));
       break;
     case 'terminal:resize':
-      if (sess?.execId) {
-        const cols = Number(msg.cols) || 80;
-        const rows = Number(msg.rows) || 24;
-        void dockerApi('POST', `/exec/${sess.execId}/resize?h=${rows}&w=${cols}`).catch(() => { /* ignore */ });
-      }
+      // Live resize needs a real PTY (node-pty follow-up); initial size is set by
+      // buildExecArgs. No-op here to keep the CLI path dependency-free.
       break;
     case 'terminal:stop':
       closeTerminal(ws);

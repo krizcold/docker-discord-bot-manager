@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { parseDocument, stringify } from 'yaml';
-import { BotConfig, DetectionResult } from '../types';
+import { BotConfig, DetectionResult, DeploymentMode } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
 import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
 export { extractAppName } from './pcsProcessing';
@@ -542,7 +542,8 @@ export function hasExistingCompose(repoPath: string): string | null {
 export function adaptExistingCompose(
   repoPath: string,
   botDir: string,
-  bot: BotConfig
+  bot: BotConfig,
+  mode: DeploymentMode = 'casaos'
 ): ComposeResult {
   const existingPath = hasExistingCompose(repoPath);
   if (!existingPath) {
@@ -559,10 +560,10 @@ export function adaptExistingCompose(
   // 1. Apply variable substitution (string-level $VAR replacement, must happen before YAML parse)
   content = applyVariableSubstitution(content, bot);
 
-  // 2. Single-pass CasaOS processing: parse YAML once, apply all modifications, stringify once.
-  //    Handles: version removal, name field, labels, x-casaos metadata, ports→expose,
-  //    hostname, icon label, is_uncontrolled, volume paths, networks, PUID/PGID
-  content = processComposeForCasaOS(content, appName, bot).content;
+  // 2. Single-pass processing: parse YAML once, apply all modifications, stringify once.
+  //    casaos mode handles ports->expose, Caddy/x-casaos, /DATA paths, networks, PUID/PGID;
+  //    docker mode keeps published ports, strips pcs/Caddy, injects PUID/PGID/TZ.
+  content = processComposeForCasaOS(content, appName, bot, { mode }).content;
 
   return { content, appName };
 }
@@ -655,7 +656,8 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
 export function processExistingCompose(
   repoPath: string,
   botDir: string,
-  bot: BotConfig
+  bot: BotConfig,
+  mode: DeploymentMode = 'casaos'
 ): ComposeResult {
   const composePath = hasExistingCompose(repoPath);
   if (!composePath) {
@@ -663,7 +665,7 @@ export function processExistingCompose(
   }
 
   console.log(`[Compose] Using existing compose file: ${composePath}`);
-  return adaptExistingCompose(repoPath, botDir, bot);
+  return adaptExistingCompose(repoPath, botDir, bot, mode);
 }
 
 /**

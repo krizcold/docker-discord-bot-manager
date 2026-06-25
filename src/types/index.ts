@@ -68,6 +68,10 @@ export interface InstanceConfig {
   // Runtime
   envVars?: Record<string, string>;
   port?: number;
+  hostPort?: number;                   // docker mode: published host port for the bot's web UI
+  webContainerPort?: number;           // docker mode: the container port hostPort maps to
+  publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
+  webUiPath?: string;                  // docker mode: web entry path from x-casaos.index (hash already substituted), e.g. "/?hash=<hash>"
 
   // Detection (for git source)
   botType?: BotType;
@@ -142,6 +146,7 @@ export interface CreateDockerImageInstanceRequest {
 export interface UpdateInstanceRequest {
   displayName?: string;
   envVars?: Record<string, string>;
+  authHash?: string;
 }
 
 export interface UpdateSourceRequest {

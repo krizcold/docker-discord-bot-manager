@@ -10,7 +10,7 @@ import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
-import { BotConfig } from '../types';
+import { BotConfig, DeploymentMode } from '../types';
 import { buildStatusPageService } from './statusPage';
 import { findConfigTemplate } from '../config/configTemplates';
 
@@ -101,7 +101,7 @@ function getMainServiceName(compose: Record<string, unknown>): string | null {
  * the first non-infra service, else the first service. Decoupled from the
  * web-facing main service.
  */
-function getAppServiceName(compose: Record<string, unknown>): string | null {
+export function getAppServiceName(compose: Record<string, unknown>): string | null {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
   if (xcasaos?.build && typeof xcasaos.build === 'string' && services?.[xcasaos.build]) {
@@ -222,8 +222,12 @@ function isBuildContextOverlay(volume: unknown): boolean {
 export function processComposeForCasaOS(
   composeContent: string,
   appName: string,
-  bot: BotConfig
+  bot: BotConfig,
+  opts: { mode?: DeploymentMode; hostBotDir?: string } = {}
 ): { content: string; sidecarInjected: boolean } {
+  if ((opts.mode ?? 'casaos') === 'docker') {
+    return processComposeForDocker(composeContent, appName, bot, opts.hostBotDir);
+  }
   const pcs = getPCSEnvironment();
   const doc = parseDocument(composeContent);
   const compose = doc.toJSON() as Record<string, unknown>;
@@ -542,6 +546,530 @@ export function processComposeForCasaOS(
 
   // ── Single stringify ──
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected };
+}
+
+// ─── Standalone (plain Docker) Compose Processing ──────────────────────────
+
+/** The container port from a single compose `ports`/`expose` entry, or null. */
+function containerPortOf(portMapping: unknown): number | null {
+  if (typeof portMapping === 'string') {
+    const parts = portMapping.split(':');
+    const raw = (parts.length > 1 ? parts[parts.length - 1] : parts[0]).split('/')[0];
+    const n = parseInt(raw, 10);
+    return isNaN(n) ? null : n;
+  }
+  if (portMapping && typeof portMapping === 'object') {
+    const obj = portMapping as Record<string, unknown>;
+    if (obj.target !== undefined) {
+      const n = parseInt(String(obj.target), 10);
+      return isNaN(n) ? null : n;
+    }
+  }
+  return null;
+}
+
+/** The host port from a single compose `ports` entry (`H:C`, `IP:H:C`, or
+ *  long-form `{published}`), or null when the entry publishes no fixed host port. */
+function hostPortOf(portMapping: unknown): number | null {
+  if (typeof portMapping === 'string') {
+    const parts = portMapping.split('/')[0].split(':');
+    if (parts.length < 2) return null;             // "C" - no host port
+    const n = parseInt(parts[parts.length - 2], 10);
+    return isNaN(n) ? null : n;
+  }
+  if (portMapping && typeof portMapping === 'object') {
+    const obj = portMapping as Record<string, unknown>;
+    if (obj.published !== undefined) {
+      const n = parseInt(String(obj.published), 10);
+      return isNaN(n) ? null : n;
+    }
+  }
+  return null;
+}
+
+/**
+ * Rewrite a relative bind source to an absolute host path under the bot's host dir,
+ * so the daemon (which resolves bind sources as HOST paths) and the manager share
+ * the same directory. Named volumes and absolute paths are left untouched.
+ */
+function rewriteDockerBindSource(source: string, hostBotDir: string, dataRoot: string): string {
+  const root = hostBotDir.replace(/\/+$/, '');
+  if (source.startsWith('./') || source.startsWith('../')) {
+    const rel = source.replace(/^(\.\.?\/)+/, '').replace(/\/+$/, '');
+    return rel ? `${root}/${rel}` : root;
+  }
+  // CasaOS AppData convention (after variable substitution): a bind source under
+  // <DATA_ROOT>/AppData/<app>/<rest> is that app's persistent data. In docker mode
+  // the app's data dir IS hostBotDir, so drop the <DATA_ROOT>/AppData/<app> prefix
+  // and re-root <rest> under hostBotDir. Done by path segment, so it works for any
+  // app name and any DATA_ROOT depth (never hardcodes a bot or path).
+  const appData = dataRoot.replace(/\/+$/, '') + '/AppData';
+  if (source === appData || source.startsWith(appData + '/')) {
+    const afterApp = source.slice(appData.length + 1).split('/').slice(1).join('/').replace(/\/+$/, '');
+    return afterApp ? `${root}/${afterApp}` : root;
+  }
+  return source;
+}
+
+function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: string): unknown {
+  if (typeof volume === 'string') {
+    const i = volume.indexOf(':');
+    if (i <= 0) return volume;
+    const src = volume.slice(0, i);
+    const rewritten = rewriteDockerBindSource(src, hostBotDir, dataRoot);
+    if (rewritten === src) return volume;
+    return rewritten + volume.slice(i);
+  }
+  if (volume && typeof volume === 'object') {
+    const v = volume as Record<string, unknown>;
+    if (typeof v.source === 'string' && v.type !== 'volume') {
+      v.source = rewriteDockerBindSource(v.source, hostBotDir, dataRoot);
+    }
+  }
+  return volume;
+}
+
+/**
+ * Process a compose for a plain-Docker (non-CasaOS) deployment. Unlike the CasaOS
+ * path it KEEPS published `ports` (host access is via host ports, not a gateway),
+ * strips the external `pcs` network + Caddy labels, and never rewrites paths to
+ * /DATA. When hostBotDir is given, relative bind sources are rewritten to absolute
+ * host paths under it so sibling-container bind mounts align with the manager.
+ * Host-port publishing is layered on separately by publishHostPort().
+ */
+export function processComposeForDocker(
+  composeContent: string,
+  appName: string,
+  bot: BotConfig,
+  hostBotDir?: string
+): { content: string; sidecarInjected: boolean } {
+  const pcs = getPCSEnvironment();
+  const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+
+  delete compose.version;
+  if (!compose.name) compose.name = appName;
+
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) {
+    return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
+  }
+
+  const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
+
+  for (const [serviceName, service] of Object.entries(services)) {
+    if (service.profiles !== undefined) delete service.profiles;
+
+    if (service.cpu_shares === undefined) {
+      service.cpu_shares = infraServiceNames.has(serviceName) ? 10 : 50;
+    }
+
+    if (!service.labels) service.labels = {};
+    if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+      const labels = service.labels as Record<string, string>;
+      labels['managed-by'] = 'discord-bot-manager';
+      labels['bot-id'] = bot.id;
+      labels['bot-name'] = bot.displayName;
+    }
+
+    // Keep `ports` as-is (host access is via published host ports). Drop only the
+    // dev build-context overlay for built services (it would hide baked-in code).
+    // Rewrite relative bind sources to absolute host paths so sibling-container
+    // mounts align with the manager (see processComposeForDocker docstring).
+    if (service.volumes && Array.isArray(service.volumes)) {
+      const builtService = service.build !== undefined;
+      let kept = (service.volumes as unknown[]).filter(
+        v => !(builtService && isBuildContextOverlay(v)),
+      );
+      if (hostBotDir) kept = kept.map(v => rewriteDockerVolume(v, hostBotDir, pcs.DATA_ROOT));
+      if (kept.length === 0) delete service.volumes;
+      else service.volumes = kept;
+    }
+
+    // Strip the external `pcs` network (CasaOS-only); keep project-local networks.
+    if (Array.isArray(service.networks)) {
+      service.networks = (service.networks as unknown[]).filter(n => n !== pcs.REF_NET);
+      if ((service.networks as unknown[]).length === 0) delete service.networks;
+    } else if (service.networks && typeof service.networks === 'object') {
+      delete (service.networks as Record<string, unknown>)[pcs.REF_NET];
+      if (Object.keys(service.networks as Record<string, unknown>).length === 0) delete service.networks;
+    }
+
+    // PUID/PGID/TZ injection (reaches containers; lost otherwise in docker mode).
+    if (!service.environment) service.environment = {};
+    if (!hasPUIDInEnv(service.environment)) {
+      if (Array.isArray(service.environment)) {
+        service.environment.push(`PUID=${pcs.PUID}`);
+        service.environment.push(`PGID=${pcs.PGID}`);
+      } else if (typeof service.environment === 'object') {
+        const env = service.environment as Record<string, string>;
+        env.PUID = pcs.PUID;
+        env.PGID = pcs.PGID;
+      }
+    }
+    if (Array.isArray(service.environment)) {
+      if (!service.environment.some((e: unknown) => typeof e === 'string' && /^TZ=/i.test(e))) {
+        service.environment.push(`TZ=${pcs.TZ}`);
+      }
+    } else if (typeof service.environment === 'object') {
+      const env = service.environment as Record<string, string>;
+      if (!Object.keys(env).some(k => k.toUpperCase() === 'TZ')) env.TZ = pcs.TZ;
+    }
+  }
+
+  // Merge user-configured env vars into the app (build-target / first non-infra)
+  // service, matching the CasaOS path.
+  if (bot.envVars && Object.keys(bot.envVars).length > 0) {
+    const targetServiceName = getAppServiceName(compose);
+    if (targetServiceName && services[targetServiceName]) {
+      const targetService = services[targetServiceName];
+      if (!targetService.environment) targetService.environment = {};
+      if (Array.isArray(targetService.environment)) {
+        const envArr = targetService.environment as string[];
+        for (const [key, value] of Object.entries(bot.envVars)) {
+          const idx = envArr.findIndex((e: string) => e.startsWith(`${key}=`));
+          if (idx >= 0) envArr[idx] = `${key}=${value}`;
+          else envArr.push(`${key}=${value}`);
+        }
+      } else if (typeof targetService.environment === 'object') {
+        const envObj = targetService.environment as Record<string, string>;
+        for (const [key, value] of Object.entries(bot.envVars)) envObj[key] = value;
+      }
+    }
+  }
+
+  // Drop the external `pcs` network definition (CasaOS-only).
+  if (compose.networks && typeof compose.networks === 'object') {
+    const networks = compose.networks as Record<string, unknown>;
+    delete networks[pcs.REF_NET];
+    if (Object.keys(networks).length === 0) delete compose.networks;
+  }
+
+  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
+}
+
+/**
+ * The bot's web UI port for host-port publishing in docker mode. Prefers the main
+ * service's first `ports` entry (reporting any host port the compose ALREADY
+ * publishes, so we reuse it instead of allocating a duplicate), else
+ * x-casaos.webui_port, else the first `expose` entry. Returns null for a headless
+ * bot (nothing to publish).
+ */
+export function getMainServiceWebPort(
+  composeContent: string
+): { containerPort: number; existingHostPort: number | null } | null {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return null;
+
+  const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
+  const webuiPort = (): number | null => {
+    if (xcasaos?.webui_port === undefined) return null;
+    const p = parseInt(String(xcasaos.webui_port), 10);
+    return isNaN(p) ? null : p;
+  };
+
+  const mainName = getMainServiceName(compose);
+  const svc = mainName ? services[mainName] : undefined;
+
+  if (svc && Array.isArray(svc.ports)) {
+    for (const pm of svc.ports as unknown[]) {
+      const cp = containerPortOf(pm);
+      if (cp !== null) return { containerPort: cp, existingHostPort: hostPortOf(pm) };
+    }
+  }
+
+  const wp = webuiPort();
+  if (wp !== null) return { containerPort: wp, existingHostPort: null };
+
+  if (svc && Array.isArray(svc.expose) && (svc.expose as unknown[]).length > 0) {
+    const p = parseInt(String((svc.expose as unknown[])[0]).split('/')[0], 10);
+    if (!isNaN(p)) return { containerPort: p, existingHostPort: null };
+  }
+  return null;
+}
+
+/**
+ * The web UI entry path the bot declares via x-casaos.index (e.g. "/?hash=<hash>").
+ * By the time docker-mode processing runs, variable substitution has already
+ * replaced $AUTH_HASH, so the returned path is ready to use. Returns null when no
+ * index is declared or it is just "/" (the caller then defaults to root).
+ */
+export function getWebUiIndexPath(composeContent: string): string | null {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
+  const index = xcasaos?.index;
+  if (typeof index !== 'string' || index.trim() === '' || index.trim() === '/') return null;
+  return index;
+}
+
+/**
+ * Ensure the main web service publishes containerPort on hostPort (docker mode).
+ * A mapping that already targets containerPort is left untouched.
+ */
+export function publishHostPort(
+  composeContent: string,
+  hostPort: number,
+  containerPort: number
+): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+  const mainName = getMainServiceName(compose);
+  if (!mainName || !services[mainName]) return composeContent;
+
+  const svc = services[mainName];
+  if (!Array.isArray(svc.ports)) svc.ports = svc.ports ? [svc.ports] : [];
+  const ports = svc.ports as unknown[];
+  if (!ports.some(pm => containerPortOf(pm) === containerPort)) {
+    // Bind to localhost by default: a published port BYPASSES host firewalls
+    // (Docker writes its own nat/FORWARD rules), so 0.0.0.0 would expose the bot
+    // to the internet on a VPS. Reach it via the bundled proxy or a tunnel.
+    // Set BOT_PORT_BIND=0.0.0.0 to opt into all-interfaces (trusted LAN only).
+    const bind = process.env.BOT_PORT_BIND || '127.0.0.1';
+    const mapping = (bind && bind !== '0.0.0.0') ? `${bind}:${hostPort}:${containerPort}` : `${hostPort}:${containerPort}`;
+    ports.push(mapping);
+  }
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/**
+ * Attach the bot's main web service to the shared ingress network and stamp
+ * caddy-docker-proxy labels so the bundled Caddy (remote-access stack) serves it at
+ * `host` over automatic TLS. Used in docker mode only when a public base domain is
+ * configured. The bot keeps its localhost host-port too (tunnel fallback).
+ */
+export function attachBotToProxy(
+  composeContent: string,
+  host: string,
+  containerPort: number,
+  network = 'dbm_remote'
+): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+  const mainName = getMainServiceName(compose);
+  if (!mainName || !services[mainName]) return composeContent;
+  const svc = services[mainName];
+
+  if (!svc.labels || Array.isArray(svc.labels) || typeof svc.labels !== 'object') svc.labels = {};
+  const labels = svc.labels as Record<string, string>;
+  labels['caddy'] = host;
+  labels['caddy.reverse_proxy'] = `{{upstreams ${containerPort}}}`;
+
+  if (Array.isArray(svc.networks)) {
+    if (!(svc.networks as unknown[]).includes(network)) (svc.networks as unknown[]).push(network);
+  } else if (svc.networks && typeof svc.networks === 'object') {
+    (svc.networks as Record<string, unknown>)[network] = {};
+  } else {
+    svc.networks = [network];
+  }
+
+  if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
+  const nets = compose.networks as Record<string, unknown>;
+  if (!nets[network]) nets[network] = { name: network, external: true };
+
+  return stringify(compose, { lineWidth: 0 });
+}
+
+// ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──
+
+function dockerEnsureDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  try { fs.chmodSync(dir, 0o777); } catch { /* windows / best effort */ }
+}
+
+function dockerDeliverFile(repoSrc: string, target: string): void {
+  if (fs.existsSync(target)) {
+    const st = fs.statSync(target);
+    if (st.isFile() && st.size > 0) return;   // seed: keep an already-delivered/mutated file
+    fs.rmSync(target, { recursive: true, force: true });
+  }
+  dockerEnsureDir(path.dirname(target));
+  fs.writeFileSync(target, fs.readFileSync(repoSrc));
+  try { fs.chmodSync(target, 0o644); } catch { /* best effort */ }
+}
+
+function dockerDeliverDir(repoSrc: string, target: string): void {
+  dockerEnsureDir(target);
+  for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
+    if (SKIP_DELIVER.has(entry.name)) continue;
+    const cs = path.join(repoSrc, entry.name);
+    const ct = path.join(target, entry.name);
+    if (entry.isDirectory()) dockerDeliverDir(cs, ct);
+    else if (entry.isFile()) dockerDeliverFile(cs, ct);
+  }
+}
+
+function writeDockerConfig(target: string, body: string): void {
+  dockerEnsureDir(path.dirname(target));
+  try { if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ }
+  fs.writeFileSync(target, body);
+  try { fs.chmodSync(target, 0o644); } catch { /* best effort */ }
+}
+
+/** Map a host bind source under hostBotDir back to the manager's local path. */
+function hostSrcToLocal(src: string, prefix: string, containerBotDir: string): string {
+  return path.join(containerBotDir, src.slice(prefix.length));
+}
+
+/**
+ * Split a compose volume string into source + dest. Tolerates a Windows
+ * drive-letter source (`C:\path` / `C:/path`) whose drive colon is NOT the
+ * source:dest separator - critical in docker mode on Windows, where bind sources
+ * are absolute host paths.
+ */
+function splitDockerVolume(vol: string): { source: string; dest: string } | null {
+  const drive = vol.match(/^([A-Za-z]:[\\/][^:]*):(.*)$/);
+  if (drive) return { source: drive[1], dest: drive[2].split(':')[0] };
+  const i = vol.indexOf(':');
+  if (i <= 0) return null;
+  return { source: vol.slice(0, i), dest: vol.slice(i + 1).split(':')[0] };
+}
+
+/** Collect declared bind {target -> hostSource} pairs whose source is under prefix. */
+function dockerDeclaredBinds(services: Record<string, Record<string, unknown>>, prefix: string): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const service of Object.values(services)) {
+    if (!Array.isArray(service.volumes)) continue;
+    for (const vol of service.volumes as unknown[]) {
+      let src: string | null = null;
+      let dest: string | null = null;
+      if (typeof vol === 'string') {
+        const s = splitDockerVolume(vol);
+        if (s) { src = s.source; dest = s.dest; }
+      } else if (vol && typeof vol === 'object') {
+        const v = vol as Record<string, unknown>;
+        if (typeof v.source === 'string' && typeof v.target === 'string' && v.type !== 'volume') { src = v.source; dest = v.target; }
+      }
+      if (src && dest && src.startsWith(prefix)) map.set(dest, src);
+    }
+  }
+  return map;
+}
+
+/**
+ * Docker-mode equivalent of createVolumeDirectories + applyUserConfigOverrides +
+ * addConfigFileBinds + writeConfigFiles, using Node fs against the bot's own data
+ * dir (no /DATA, no casaos container). Expects a compose whose relative binds were
+ * already rewritten to absolute host paths under hostBotDir (processComposeForDocker).
+ * Returns the (possibly modified) compose content with config-file binds added.
+ */
+export function prepareDockerBotFiles(
+  composeContent: string,
+  containerBotDir: string,
+  hostBotDir: string,
+  repoPath: string | null,
+  configFiles: Array<{ path: string; body: string; readOnly?: boolean }>,
+  logFn?: (msg: string) => void
+): string {
+  const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+
+  const prefix = hostBotDir.replace(/\/+$/, '') + '/';
+
+  // 1. Create (and deliver repo content for) every bind source under hostBotDir.
+  const seen = new Set<string>();
+  for (const service of Object.values(services)) {
+    if (!Array.isArray(service.volumes)) continue;
+    for (const vol of service.volumes as unknown[]) {
+      let src: string | null = null;
+      if (typeof vol === 'string') { const s = splitDockerVolume(vol); if (s) src = s.source; }
+      else if (vol && typeof vol === 'object') { const v = vol as Record<string, unknown>; if (typeof v.source === 'string' && v.type !== 'volume') src = v.source; }
+      if (!src || !src.startsWith(prefix) || seen.has(src)) continue;
+      seen.add(src);
+      const target = hostSrcToLocal(src, prefix, containerBotDir);
+      try {
+        const rel = src.slice(prefix.length);
+        let repoSrc: string | null = null;
+        if (repoPath && rel) {
+          const cand = path.join(repoPath, rel);
+          if (fs.existsSync(cand)) repoSrc = cand;
+          else repoSrc = findConfigTemplate(cand);
+        }
+        if (repoSrc && fs.statSync(repoSrc).isFile()) { dockerDeliverFile(repoSrc, target); log(`[Docker] Delivered file ${target}`); }
+        else if (repoSrc && fs.statSync(repoSrc).isDirectory()) { dockerDeliverDir(repoSrc, target); log(`[Docker] Delivered dir ${target}`); }
+        else dockerEnsureDir(target);
+      } catch (err) {
+        log(`[Docker] Warning: could not prepare ${target}: ${err}`);
+      }
+    }
+  }
+
+  // 2. Config files: overwrite an existing declared bind, else add a new bind.
+  if (configFiles.length) {
+    const declared = dockerDeclaredBinds(services, prefix);
+    const targetName = getAppServiceName(compose) || getMainServiceName(compose);
+    const targetSvc = targetName ? services[targetName] : undefined;
+    for (const cf of configFiles) {
+      const existing = declared.get(cf.path);
+      if (existing) {
+        try { writeDockerConfig(hostSrcToLocal(existing, prefix, containerBotDir), cf.body); log(`[Docker] Applied config ${cf.path}`); }
+        catch (err) { log(`[Docker] Warning: could not write config ${cf.path}: ${err}`); }
+      } else if (targetSvc) {
+        const base = path.basename(cf.path);
+        const hostSrc = `${prefix}config/${base}`;
+        try { writeDockerConfig(path.join(containerBotDir, 'config', base), cf.body); }
+        catch (err) { log(`[Docker] Warning: could not write config ${cf.path}: ${err}`); }
+        if (!Array.isArray(targetSvc.volumes)) targetSvc.volumes = targetSvc.volumes ? [targetSvc.volumes] : [];
+        (targetSvc.volumes as unknown[]).push({ type: 'bind', source: hostSrc, target: cf.path, read_only: cf.readOnly !== false });
+        log(`[Docker] Bound config ${cf.path}`);
+      }
+    }
+  }
+
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/**
+ * Re-write the bot's bind-mounted config files from current stored bodies on start
+ * (docker mode), WITHOUT touching the compose - mirrors redeliverConfigFiles. The
+ * binds already exist from the build; this only refreshes the host source files.
+ */
+export function redeliverDockerConfigFiles(
+  composeContent: string,
+  containerBotDir: string,
+  hostBotDir: string,
+  configFiles: Array<{ path: string; body: string }>
+): void {
+  if (!configFiles.length) return;
+  let compose: Record<string, unknown>;
+  try { compose = parseDocument(composeContent).toJSON() as Record<string, unknown>; } catch { return; }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return;
+  const prefix = hostBotDir.replace(/\/+$/, '') + '/';
+  const declared = dockerDeclaredBinds(services, prefix);
+  for (const cf of configFiles) {
+    const src = declared.get(cf.path);
+    if (!src) continue;
+    try { writeDockerConfig(hostSrcToLocal(src, prefix, containerBotDir), cf.body); } catch { /* best effort */ }
+  }
 }
 
 // ─── Volume Directory Creation ─────────────────────────────────────────────

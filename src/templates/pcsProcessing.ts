@@ -1044,6 +1044,7 @@ export function prepareDockerBotFiles(
     }
   }
 
+  fixDockerBotOwnership(containerBotDir, log);
   return stringify(compose, { lineWidth: 0 });
 }
 
@@ -1070,6 +1071,42 @@ export function redeliverDockerConfigFiles(
     if (!src) continue;
     try { writeDockerConfig(hostSrcToLocal(src, prefix, containerBotDir), cf.body); } catch { /* best effort */ }
   }
+}
+
+/**
+ * Docker-mode ownership fix. The root manager delivers bot files root-owned, but the
+ * bot service runs as the injected PUID:PGID, so without this it hits EACCES on the
+ * first in-place write to a delivered file. Reassigns ONLY root-owned paths (the Node
+ * equivalent of `chown -R --from=root`), so a service that took its own bind dir
+ * (e.g. Postgres -> uid 999) is left alone. On CasaOS this is handled by
+ * fixPostDeployOwnership via the casaos sidecar; docker mode has no sidecar, so the
+ * manager (which bind-mounts the data dir) chowns the host files directly.
+ */
+export function fixDockerBotOwnership(containerBotDir: string, logFn?: (msg: string) => void): void {
+  if (process.platform === 'win32') return;   // bind-mount ownership is virtualized on Docker Desktop
+  const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
+  const pcs = getPCSEnvironment();
+  const uid = parseInt(pcs.PUID, 10);
+  const gid = parseInt(pcs.PGID, 10);
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) return;
+  if (!fs.existsSync(containerBotDir)) return;
+
+  let fixed = 0;
+  const walk = (p: string): void => {
+    let st: fs.Stats;
+    try { st = fs.lstatSync(p); } catch { return; }
+    if (st.uid === 0) {
+      try { (st.isSymbolicLink() ? fs.lchownSync : fs.chownSync)(p, uid, gid); fixed++; }
+      catch { /* best effort */ }
+    }
+    if (st.isDirectory()) {
+      let entries: string[] = [];
+      try { entries = fs.readdirSync(p); } catch { return; }
+      for (const e of entries) walk(path.join(p, e));
+    }
+  };
+  walk(containerBotDir);
+  if (fixed) log(`[Docker] Fixed ownership of ${fixed} root-owned path(s) -> ${uid}:${gid}`);
 }
 
 // ─── Volume Directory Creation ─────────────────────────────────────────────

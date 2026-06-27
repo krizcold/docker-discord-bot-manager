@@ -46,6 +46,7 @@ import {
   attachBotToProxy,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
+  fixDockerBotOwnership,
   getAppServiceName,
   extractAppName,
   createVolumeDirectories,
@@ -1088,6 +1089,10 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
         }
       }
 
+      // Re-assert ownership of manager-delivered files (written root) to the bot's
+      // PUID:GID before the container starts; mirrors casaos fixPostDeployOwnership.
+      fixDockerBotOwnership(botDir, (msg) => emit(msg, 'info'));
+
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
@@ -1174,6 +1179,9 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
         }
       }
 
+      // Re-assert ownership of manager-delivered files (written root) to the bot's
+      // PUID:GID before the container starts; mirrors casaos fixPostDeployOwnership.
+      fixDockerBotOwnership(botDir, (msg) => console.log(`[Compose ${botId}] ${msg}`));
       updateBotStatus(botId, 'starting');
       await dockerClient.composeUp(composePath, appName, (msg) => console.log(`[Compose ${botId}] ${msg}`));
       const verify = await dockerClient.verifyComposeProjectRunning(appName, 15000);

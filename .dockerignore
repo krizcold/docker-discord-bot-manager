@@ -6,3 +6,8 @@ dist
 *.log
 npm-debug.log*
 .DS_Store
+
+# Runtime secrets - never send to the build context (mounted at runtime, not built in)
+.env
+.env.*
+authelia/secrets

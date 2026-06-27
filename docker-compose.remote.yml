@@ -5,7 +5,8 @@
 # reachable ONLY through Caddy + a completed Authelia login. It publishes no host
 # port; only Caddy listens on 80/443.
 #
-# Setup (see README "Standalone > Remote access on a VPS"):
+# Setup: run `sudo ./setup.sh` (automates all of the below; see README "Quick install").
+# To do it by hand instead (README "Server on Linux"):
 #   1. create ./authelia/secrets/{JWT_SECRET,SESSION_SECRET,STORAGE_ENCRYPTION_KEY}
 #   2. put an argon2id hash in ./authelia/users_database.yml
 #   3. create a .env with HOST_DATA_DIR, PUBLIC_HOST, AUTHELIA_HOST, COOKIE_DOMAIN, ACME_EMAIL, TZ
@@ -63,7 +64,7 @@ services:
 
   # Auth gateway: login + TOTP/WebAuthn MFA, enforced via Caddy forward_auth.
   authelia:
-    image: authelia/authelia:4.39
+    image: authelia/authelia:4.39.20
     container_name: authelia
     restart: unless-stopped
     environment:

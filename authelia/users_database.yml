@@ -2,7 +2,7 @@
 # `password` is an argon2id HASH (not plaintext). Generate it with the SAME image
 # version as the authelia service:
 #
-#   docker run --rm -it authelia/authelia:4.39 authelia crypto hash generate argon2
+#   docker run --rm -it authelia/authelia:4.39.20 authelia crypto hash generate argon2
 #
 # Paste the full "$argon2id$v=19$..." line below, single-quoted so the $ are literal.
 # Keep the user in group 'admins' to satisfy the access_control rule. Set a real email.

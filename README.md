@@ -23,7 +23,7 @@ cd docker-discord-bot-manager
 |----------|---------|
 | Windows desktop | **Standalone on Windows** |
 | Local Linux machine | **Standalone on Linux** |
-| Public Linux server (VPS / Contabo) | **Server on Linux** -- *partially pending* |
+| Public Linux server (VPS / Contabo) | **Server on Linux** |
 | Working on the manager's own code | **Development** |
 
 <details>
@@ -52,13 +52,14 @@ The manager runs as a container under Docker Desktop and manages your bots as si
 <details>
 <summary><b>Standalone on Linux</b></summary>
 
-Identical to Windows - the same `/var/run/docker.sock` mount works on both.
+The same `/var/run/docker.sock` mount works as on Windows. Unlike Docker Desktop, Linux enforces real file ownership, so create the data dir owned by the bots' UID (`1000`) first; the manager also chowns the files it delivers, but the bind root should exist with the right owner.
 
-**Prerequisites:** Docker Engine + the Compose plugin.
+**Prerequisites:** rootful Docker Engine + the Compose plugin.
 
-1. Set a data folder and start:
+1. Create the data folder and start:
    ```bash
    export HOST_DATA_DIR=/opt/dbm/data
+   sudo mkdir -p "$HOST_DATA_DIR" && sudo chown 1000:1000 "$HOST_DATA_DIR"
    docker compose -f docker-compose.standalone.yml up -d --build
    ```
 2. Open <http://127.0.0.1:8090>. (To reach it from another machine securely, see **Server on Linux** below.)
@@ -66,28 +67,46 @@ Identical to Windows - the same `/var/run/docker.sock` mount works on both.
 </details>
 
 <details>
-<summary><b>Server on Linux (public, behind MFA) -- Contabo [partially pending]</b></summary>
+<summary><b>Server on Linux (public, behind MFA) -- Contabo</b></summary>
 
 Runs the manager UI on a public VPS behind **Caddy** (automatic TLS) + **Authelia** (login + TOTP/WebAuthn MFA). The manager mounts the Docker socket (root-equivalent), so it is never exposed bare - only Caddy listens on 80/443, and every request passes a 2FA login. TLS works **without a domain** via sslip.io, or with your own domain.
 
-> **Status: implemented and config-reviewed against Authelia 4.39 / caddy-docker-proxy / sslip.io, but NOT yet live-tested** (sslip.io TLS needs a public IP). Treat as ready-to-try, not proven. Production can stay on Yundera in the meantime.
+### Semi-automated setup (recommended)
+
+```bash
+git clone https://github.com/krizcold/docker-discord-bot-manager.git
+cd docker-discord-bot-manager
+sudo ./setup.sh
+```
+
+Semi-automated: it still asks you the choices that matter - **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall, **generates the Authelia secrets and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack, and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain).
+
+> **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
 >
-> **sslip.io caveat:** it works today but is a Public-Suffix-List *candidate*; if it ever lands on the PSL, browsers + Authelia will reject the session cookie. **Use a real domain for anything you intend to keep.**
+> **sslip.io caveat:** it is a Public-Suffix-List *candidate*; if it ever lands on the PSL, browsers + Authelia reject the session cookie. **Use a real domain for anything you intend to keep.**
 
-**Setup** (sslip.io example for VPS IP `203.0.113.5`):
+### Fully manual setup (advanced)
 
-1. **Firewall:** open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled). Don't publish the manager/Authelia ports.
-2. **Authelia secrets:**
+You do **not** need any of this if you ran `setup.sh` above - these are the same steps it performs, by hand (sslip.io example for VPS IP `203.0.113.5`):
+
+1. **Host prep:** create the data dir owned by the bot UID (`1000`), and open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled; don't publish the manager/Authelia ports). Allow SSH **before** enabling the firewall so you are not locked out:
+   ```bash
+   sudo mkdir -p /opt/dbm/data && sudo chown 1000:1000 /opt/dbm/data
+   sudo ufw allow OpenSSH                      # or: sudo ufw allow <your-ssh-port>/tcp
+   sudo ufw allow 80,443/tcp && sudo ufw allow 443/udp
+   sudo ufw enable
+   ```
+2. **Authelia secrets** (`crypto rand` prints `Random Value: <string>`; the pipe keeps just the value):
    ```bash
    mkdir -p ./authelia/secrets
    for f in JWT_SECRET SESSION_SECRET STORAGE_ENCRYPTION_KEY; do \
-     docker run --rm authelia/authelia:4.39 authelia crypto rand --length 64 --charset alphanumeric \
-     | tr -d '\n' > ./authelia/secrets/$f; done
-   chmod 600 ./authelia/secrets/*
+     docker run --rm authelia/authelia:4.39.20 authelia crypto rand --length 64 --charset alphanumeric \
+     | sed -n 's/^Random Value: //p' | tr -d '\n' > ./authelia/secrets/$f; done
+   chmod 700 ./authelia/secrets && chmod 600 ./authelia/secrets/*
    ```
 3. **Admin password** -> generate an argon2id hash, then edit `authelia/users_database.yml`: replace the `$argon2id$...REPLACE...` placeholder on the `password:` line with the generated hash, and set a real `email:` (kept for future SMTP; the MFA-enrollment link is read from a file in step 5):
    ```bash
-   docker run --rm -it authelia/authelia:4.39 authelia crypto hash generate argon2
+   docker run --rm -it authelia/authelia:4.39.20 authelia crypto hash generate argon2
    ```
 4. **Create a file named `.env`** in the same folder as `docker-compose.remote.yml` (Compose auto-loads it; a different name needs `--env-file`):
    ```env
@@ -100,7 +119,7 @@ Runs the manager UI on a public VPS behind **Caddy** (automatic TLS) + **Autheli
    BOT_DOMAIN_BASE=203-0-113-5.sslip.io   # optional: per-bot HTTPS subdomains
    ```
    **Critical:** `PUBLIC_HOST` and `AUTHELIA_HOST` MUST be subdomains of `COOKIE_DOMAIN` - note the **dots** (`bot.203-0-113-5.sslip.io`, NOT `bot-203-0-113-5...`). sslip.io resolves either, but a hyphen makes them *siblings* of `COOKIE_DOMAIN`, so the browser won't share the Authelia session cookie and login loops forever. (sslip.io maps any `<label>.203-0-113-5.sslip.io` to `203.0.113.5`.)
-   For a real domain: `PUBLIC_HOST=bot.example.com`, `AUTHELIA_HOST=auth.example.com`, `COOKIE_DOMAIN=example.com`, `BOT_DOMAIN_BASE=example.com`, and point `bot.`/`auth.` (and a wildcard `*.`) A records at the VPS. You do not edit `authelia/configuration.yml` - it reads these from the env.
+   For a real domain: `PUBLIC_HOST=bot.example.com`, `AUTHELIA_HOST=auth.example.com`, `COOKIE_DOMAIN=example.com`, `BOT_DOMAIN_BASE=example.com`, and point `bot.` / `auth.` A records (plus a wildcard `*.` so per-bot subdomains resolve) at the VPS. You do not edit `authelia/configuration.yml` - it reads these from the env. Caddy issues a **separate** certificate per hostname on demand; there is no wildcard certificate (that would need a DNS-01 challenge, which this stack does not set up), so each bot subdomain triggers its own Let's Encrypt issuance.
 5. **Run** and enroll MFA:
    ```bash
    docker compose -f docker-compose.remote.yml up -d

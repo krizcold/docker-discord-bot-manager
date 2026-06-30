@@ -158,6 +158,23 @@ Open <http://127.0.0.1:8080>. In a native run `HOST_DATA_DIR` auto-resolves from
 
 ---
 
+## Updating the manager
+
+On Yundera/CasaOS the platform updates the manager. On a standalone (Windows or Linux) install you update it yourself - two ways, both of which `git pull` the latest code and rebuild + recreate the stack:
+
+- **From the UI** (standalone docker mode): the header shows the running version and, when the repo is behind, an **Update manager** button. It streams the pull + build, then restarts the manager; the page reconnects and shows the new version. (Hidden on Yundera, where the platform handles updates. On Windows the rebuild always works; if the auto-restart can't launch, the UI tells you the one-line command to finish it.)
+- **From the command line**, run from the cloned repo root:
+  ```bash
+  sudo ./update.sh          # Linux
+  ```
+  ```powershell
+  ./update.ps1              # Windows (set $env:HOST_DATA_DIR first for the standalone stack)
+  ```
+
+Both keep your local admin hash and `.env`; only the manager image is rebuilt, so managed bots keep running.
+
+---
+
 ## How bots are reached
 
 When a bot exposes a web UI, the manager publishes it on a host port (auto-assigned from `20000-29999`, override with `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE`) and shows an **Open** link. Ports bind to `127.0.0.1` by default - a published port bypasses host firewalls, so this avoids exposing bots on a server; set `BOT_PORT_BIND=0.0.0.0` for trusted-LAN access. On a server with the remote stack, bots are instead reached via their HTTPS subdomain (see **Server on Linux**).

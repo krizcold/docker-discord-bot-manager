@@ -226,6 +226,9 @@ else
   ok "Admin password already configured (use --reset-password to change it)."
 fi
 
+# Keep the locally-written admin hash from blocking future `git pull` updates.
+git -c safe.directory='*' update-index --skip-worktree authelia/users_database.yml 2>/dev/null || true
+
 # ── .env ──────────────────────────────────────────────────────────────────────
 if [ -n "$prev_cookie_domain" ] && [ "$prev_cookie_domain" != "$COOKIE_DOMAIN" ]; then
   warn "Cookie domain changed ($prev_cookie_domain -> $COOKIE_DOMAIN): existing logins are invalidated and Caddy issues fresh certificates for the new hostnames. Old certs stay cached in the caddy_data volume (harmless); to fully reset TLS, run 'docker compose -f $COMPOSE_FILE down' and re-run this script."

@@ -13,6 +13,7 @@ import { createSourceRoutes } from './routes/sources';
 import { createVaultRoutes } from './routes/vault';
 import { createConfigRoutes } from './routes/config';
 import { createDiscordRoutes } from './routes/discord';
+import { createManagerRoutes } from './routes/manager';
 import { setSourceBroadcast } from '../source/sourceUpdater';
 import { setInstanceBroadcast } from '../instance/instanceUpdater';
 import { setContainerBroadcast } from '../docker/containerManager';
@@ -43,6 +44,7 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
   app.use('/api/system', createSystemRoutes());
   app.use('/api/config', createConfigRoutes());
   app.use('/api/discord', createDiscordRoutes());
+  app.use('/api/manager', createManagerRoutes(wss));
 
   // Wire source updater broadcast to WebSocket
   setSourceBroadcast((type, data) => broadcastToClients(wss, type, data));

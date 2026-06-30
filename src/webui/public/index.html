@@ -565,8 +565,19 @@
   <div class="header">
     <h1>Discord Bot Manager</h1>
     <div class="status">
+      <div id="manager-version" style="display:flex;align-items:center;gap:8px;font-size:13px;margin-right:16px;"></div>
       <div class="dot"></div>
       <span>Docker Connected</span>
+    </div>
+  </div>
+
+  <div id="manager-update-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 720px; width: 92%;">
+      <h2 id="manager-update-title">Updating Bot Manager</h2>
+      <pre id="manager-update-log" style="background:#0d0d0d;color:#ddd;padding:12px;border-radius:6px;max-height:55vh;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;line-height:1.45;margin:12px 0;"></pre>
+      <div class="modal-actions">
+        <button class="btn btn-secondary btn-small" id="manager-update-close" onclick="closeManagerUpdateModal()">Close</button>
+      </div>
     </div>
   </div>
 
@@ -826,6 +837,63 @@
       if (sources.length > 0) renderSourceSidebar();
     }
 
+    // ─── Manager self-update ───
+    let managerUpdating = false;
+
+    async function loadManagerVersion() {
+      const el = document.getElementById('manager-version');
+      if (!el) return;
+      const set = (h) => { el.innerHTML = h; el.style.display = h ? 'flex' : 'none'; };
+      try {
+        const v = await api('GET', '/manager/version');
+        if (!v || !v.success) { set(''); return; }
+        if (!v.supported) {
+          set(v.currentCommit ? `<span style="opacity:0.6;">v${v.currentCommit}</span>` : '');
+          if (v.reason) el.title = v.reason;
+          return;
+        }
+        let html = `<span style="opacity:0.6;">v${v.currentCommit || '?'}</span>`;
+        if (v.updateAvailable) {
+          html += ` <span class="update-badge">${v.behindBy} behind</span>`
+                + ` <button class="btn btn-primary btn-small" onclick="updateManager()">Update manager</button>`;
+        }
+        set(html);
+      } catch { set(''); }
+    }
+
+    function appendManagerLog(line) {
+      const log = document.getElementById('manager-update-log');
+      if (!log) return;
+      log.textContent += line + '\n';
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function closeManagerUpdateModal() {
+      document.getElementById('manager-update-modal').classList.add('hidden');
+    }
+
+    async function updateManager() {
+      if (managerUpdating) return;
+      if (!confirm('Update the Bot Manager now? It will rebuild and restart - the UI will briefly disconnect and reconnect.')) return;
+      managerUpdating = true;
+      const title = document.getElementById('manager-update-title');
+      document.getElementById('manager-update-log').textContent = '';
+      title.textContent = 'Updating Bot Manager';
+      document.getElementById('manager-update-modal').classList.remove('hidden');
+      appendManagerLog('Starting update...');
+      try {
+        const res = await api('POST', '/manager/update');
+        if (!res || !res.success) {
+          appendManagerLog('Error: ' + ((res && res.error) || 'could not start update'));
+          title.textContent = 'Update failed';
+          managerUpdating = false;
+        }
+      } catch (err) {
+        appendManagerLog('Error: ' + err);
+        managerUpdating = false;
+      }
+    }
+
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -836,7 +904,15 @@
           // Reconnect: resync in case events were missed during the gap.
           loadBots();
           loadSources();
+          if (managerUpdating) {
+            appendManagerLog('Reconnected - Bot Manager is back up.');
+            document.getElementById('manager-update-title').textContent = 'Bot Manager updated';
+            document.getElementById('manager-update-close').disabled = false;
+            managerUpdating = false;
+            showMessage('success', 'Bot Manager updated');
+          }
         }
+        loadManagerVersion();
         hasConnectedBefore = true;
       };
 
@@ -946,6 +1022,24 @@
             break;
           case 'terminal:error':
             if (window.__termError) window.__termError(data.message);
+            break;
+
+          // Manager self-update progress (streamed to the update modal)
+          case 'manager:update-started':
+            break;
+          case 'manager:log':
+            appendManagerLog(payload?.line || '');
+            break;
+          case 'manager:restarting':
+            appendManagerLog('Manager restarting - waiting for it to come back...');
+            document.getElementById('manager-update-title').textContent = 'Restarting Bot Manager...';
+            break;
+          case 'manager:update-failed':
+            appendManagerLog('Update failed: ' + (payload?.error || 'unknown error'));
+            document.getElementById('manager-update-title').textContent = 'Update failed';
+            document.getElementById('manager-update-close').disabled = false;
+            managerUpdating = false;
+            showMessage('error', 'Manager update failed');
             break;
 
           default:

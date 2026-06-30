@@ -33,6 +33,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOST_DATA_DIR}:/data/data
+      - .:/repo                                  # source repo, so the manager can self-update (git pull + rebuild)
     networks:
       - dbm_remote
     # Reachable only through Caddy (no host port published). Caddy serves it at

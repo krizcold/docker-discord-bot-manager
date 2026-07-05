@@ -39,10 +39,10 @@ export function createManagerRoutes(wss: WebSocketServer): Router {
     };
 
     broadcastToClients(wss, 'manager:update-started', {});
-    runManagerUpdate(emit)
-      // Success path replaces this process (a detached one-shot recreates the
-      // container), so `updating` is left set; the new process starts fresh.
-      .then(() => broadcastToClients(wss, 'manager:restarting', {}))
+    runManagerUpdate(emit, () => broadcastToClients(wss, 'manager:restarting', {}))
+      // The success path replaces this process (a detached one-shot recreates the
+      // container), so runManagerUpdate only ever rejects here (on failure); the
+      // restart signal is sent via the onRestarting callback above instead.
       .catch((err) => {
         updating = false;
         const error = String(err?.message || err);

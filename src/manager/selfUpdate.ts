@@ -103,11 +103,13 @@ export async function getManagerVersion(): Promise<ManagerVersion> {
 }
 
 /**
- * Pull + rebuild + recreate. Streams progress via emit(); the actual restart is
- * done by a detached one-shot container, so this resolves once that is launched
- * (the manager process is then replaced). Throws on pull/build failure.
+ * Pull + rebuild + recreate. Streams progress via emit(); the actual restart is done
+ * by a detached one-shot container. On success this process is replaced before the
+ * promise settles, so it only ever REJECTS here: on pull/build failure, a recreate
+ * that could not launch, or (via the watchdog) a recreate that launched but never took
+ * effect. onRestarting() fires once the recreate has been launched.
  */
-export async function runManagerUpdate(emit: Emit): Promise<void> {
+export async function runManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<void> {
   if (await getDeploymentMode() !== 'docker') throw new Error('Self-update is only available in standalone docker mode.');
   if (!isGitRepo()) throw new Error('Repo not mounted at /repo; cannot self-update.');
   const self = inspectSelf();
@@ -145,6 +147,7 @@ export async function runManagerUpdate(emit: Emit): Promise<void> {
     );
   }
   emit('[Update] Recreate launched - waiting for the manager to restart...', 'info');
+  onRestarting?.();
 
   // `docker run -d` reports only the LAUNCH, not the inner `compose up` result. But a
   // successful recreate replaces THIS process, so if we are still alive after a grace

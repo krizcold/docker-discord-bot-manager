@@ -121,7 +121,7 @@ export const RESERVED_NAMES: readonly string[] = [
   'casaos', 'portainer', 'caddy', 'discordbotmanager',
   'discordbotmanagerapp', 'nginx', 'redis', 'postgres',
   'mongodb', 'mariadb', 'traefik', 'watchtower',
-  'homeassistant', 'pcs',
+  'homeassistant', 'pcs', 'bot', 'auth',
 ] as const;
 
 // ─── API DTOs ───

@@ -158,15 +158,31 @@ fi
 
 # ── Host firewall ─────────────────────────────────────────────────────────────
 if command -v ufw >/dev/null 2>&1; then
-  # Keep the CURRENT SSH session reachable (its server port) before flipping to default-deny.
-  ssh_port="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $4}')"; case "$ssh_port" in ''|*[!0-9]*) ssh_port=22 ;; esac
-  ufw allow "$ssh_port/tcp" >/dev/null 2>&1 || true
-  ufw allow OpenSSH         >/dev/null 2>&1 || true
+  # Keep SSH reachable before flipping to default-deny. sudo strips SSH_CONNECTION,
+  # so fall back to live sshd sockets, then sshd_config.
+  ssh_ports=""
+  sp="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $4}')"
+  case "$sp" in ''|*[!0-9]*) : ;; *) ssh_ports="$sp" ;; esac
+  if [ -z "$ssh_ports" ]; then
+    ssh_ports="$(ss -tlnpH 2>/dev/null | awk '/"sshd"/ {n=split($4,a,":"); print a[n]}' | grep -E '^[0-9]+$' | sort -un | xargs)"
+  fi
+  if [ -z "$ssh_ports" ]; then
+    ssh_ports="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2}' /etc/ssh/sshd_config 2>/dev/null | sort -un | xargs)"
+  fi
+  if [ -z "$ssh_ports" ]; then
+    warn "Could not detect the SSH port (no SSH_CONNECTION, no sshd socket, no sshd_config Port) - assuming 22."
+    ssh_ports="22"
+  fi
+  info "ufw will allow SSH on port(s): $ssh_ports (Ctrl-C now if that is wrong - the firewall enables next)."
+  for sp in $ssh_ports; do
+    ufw allow "$sp/tcp" >/dev/null 2>&1 || true
+  done
+  ufw allow OpenSSH >/dev/null 2>&1 || true
   ufw allow 80/tcp  >/dev/null 2>&1 || true
   ufw allow 443/tcp >/dev/null 2>&1 || true
   ufw allow 443/udp >/dev/null 2>&1 || true
   ufw --force enable >/dev/null 2>&1 || true
-  ok "Host firewall (ufw): SSH ($ssh_port) preserved; 80/tcp, 443/tcp, 443/udp open."
+  ok "Host firewall (ufw): SSH ($ssh_ports) preserved; 80/tcp, 443/tcp, 443/udp open."
 else
   warn "ufw not found - make sure inbound 80 + 443 are open by other means."
 fi
@@ -247,6 +263,17 @@ ok "Wrote $ENV_FILE"
 # ── Deploy ────────────────────────────────────────────────────────────────────
 info "Starting the stack (the first build can take a few minutes) ..."
 docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."
+
+if [ "$need_password" -eq 1 ]; then
+  # Authelia runs with watch: false and the users file is a bind mount, so a content
+  # change does not alter the compose config hash - a running container keeps the old password.
+  info "Restarting Authelia to load the new admin password ..."
+  if docker compose -f "$COMPOSE_FILE" restart authelia >/dev/null 2>&1; then
+    ok "Authelia restarted with the new password."
+  else
+    warn "Could not restart Authelia - run 'docker compose -f $COMPOSE_FILE restart authelia' so the new password takes effect."
+  fi
+fi
 
 info "Waiting for containers to settle ..."
 sleep 6

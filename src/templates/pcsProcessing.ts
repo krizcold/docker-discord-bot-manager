@@ -629,13 +629,42 @@ function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: stri
   return volume;
 }
 
+/** Platform ingress labels (Yundera Caddy / caddy-docker-proxy): `caddy`, `caddy.*`, `caddy_N`, `caddy_N.*`. */
+function isCaddyLabel(key: string): boolean {
+  return key === 'caddy' || key.startsWith('caddy.') || key.startsWith('caddy_');
+}
+
+/**
+ * Bind a published port to 127.0.0.1 unless the compose pins an explicit host IP.
+ * Docker publishes to 0.0.0.0 by default and bypasses host firewalls (ufw), so a
+ * repo-declared port must never go public on its own; public access is layered on
+ * via the gateway/host-port path.
+ */
+function bindPortToLocalhost(port: unknown): unknown {
+  if (typeof port === 'string' || typeof port === 'number') {
+    const s = String(port);
+    if (s.includes('[')) return s;                       // bracketed IPv6 host: explicit bind, respect it
+    const parts = s.split(':');
+    if (parts.length >= 3) return s;                     // IP:HOST:CONTAINER: explicit bind, respect it
+    if (parts.length === 2) return `127.0.0.1:${s}`;     // HOST:CONTAINER
+    return `127.0.0.1::${s}`;                            // CONTAINER only (random localhost host port)
+  }
+  if (port && typeof port === 'object') {
+    const p = port as Record<string, unknown>;
+    if (!p.host_ip) p.host_ip = '127.0.0.1';
+    return p;
+  }
+  return port;
+}
+
 /**
  * Process a compose for a plain-Docker (non-CasaOS) deployment. Unlike the CasaOS
- * path it KEEPS published `ports` (host access is via host ports, not a gateway),
- * strips the external `pcs` network + Caddy labels, and never rewrites paths to
- * /DATA. When hostBotDir is given, relative bind sources are rewritten to absolute
- * host paths under it so sibling-container bind mounts align with the manager.
- * Host-port publishing is layered on separately by publishHostPort().
+ * path it KEEPS published `ports` (host access is via host ports, not a gateway)
+ * but rebinds them to 127.0.0.1 unless the compose pins an explicit host IP,
+ * strips the external `pcs` network + platform Caddy labels, and never rewrites
+ * paths to /DATA. When hostBotDir is given, relative bind sources are rewritten to
+ * absolute host paths under it so sibling-container bind mounts align with the
+ * manager. Host-port publishing is layered on separately by publishHostPort().
  */
 export function processComposeForDocker(
   composeContent: string,
@@ -663,18 +692,42 @@ export function processComposeForDocker(
       service.cpu_shares = infraServiceNames.has(serviceName) ? 10 : 50;
     }
 
-    if (!service.labels) service.labels = {};
-    if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+    // Strip platform Caddy labels a repo compose may ship: on the remote stack
+    // caddy-docker-proxy would ingest them (an undefined `import gateway_tls`
+    // wedges the Caddyfile). attachBotToProxy re-adds bundled-Caddy labels later.
+    if (Array.isArray(service.labels)) {
+      service.labels = (service.labels as unknown[]).filter(
+        l => !(typeof l === 'string' && isCaddyLabel(l.split('=')[0].trim()))
+      );
+    }
+    if (!service.labels || Array.isArray(service.labels)) {
+      // Normalize to map form so the manager markers below always apply.
+      const asMap: Record<string, string> = {};
+      for (const l of (Array.isArray(service.labels) ? service.labels : []) as unknown[]) {
+        if (typeof l !== 'string') continue;
+        const eq = l.indexOf('=');
+        if (eq > 0) asMap[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      service.labels = asMap;
+    }
+    {
       const labels = service.labels as Record<string, string>;
+      for (const key of Object.keys(labels)) {
+        if (isCaddyLabel(key)) delete labels[key];
+      }
       labels['managed-by'] = 'discord-bot-manager';
       labels['bot-id'] = bot.id;
       labels['bot-name'] = bot.displayName;
     }
 
-    // Keep `ports` as-is (host access is via published host ports). Drop only the
-    // dev build-context overlay for built services (it would hide baked-in code).
-    // Rewrite relative bind sources to absolute host paths so sibling-container
-    // mounts align with the manager (see processComposeForDocker docstring).
+    // Published ports stay usable but bind to localhost (see bindPortToLocalhost).
+    if (Array.isArray(service.ports)) {
+      service.ports = (service.ports as unknown[]).map(bindPortToLocalhost);
+    }
+
+    // Drop the dev build-context overlay for built services (it would hide
+    // baked-in code). Rewrite relative bind sources to absolute host paths so
+    // sibling-container mounts align with the manager (see docstring).
     if (service.volumes && Array.isArray(service.volumes)) {
       const builtService = service.build !== undefined;
       let kept = (service.volumes as unknown[]).filter(
@@ -742,6 +795,29 @@ export function processComposeForDocker(
     const networks = compose.networks as Record<string, unknown>;
     delete networks[pcs.REF_NET];
     if (Object.keys(networks).length === 0) delete compose.networks;
+  }
+
+  // Attach the app service to the shared dbm_internal network so it can reach the
+  // manager API (BOT_MANAGER_INTERNAL_URL) across compose projects. External here:
+  // the manager's own stack owns/creates the network.
+  const appServiceName = getAppServiceName(compose);
+  if (appServiceName && services[appServiceName]) {
+    const appSvc = services[appServiceName];
+    if (Array.isArray(appSvc.networks)) {
+      if (!(appSvc.networks as unknown[]).includes('dbm_internal')) {
+        (appSvc.networks as unknown[]).push('dbm_internal');
+      }
+    } else if (appSvc.networks && typeof appSvc.networks === 'object') {
+      const nets = appSvc.networks as Record<string, unknown>;
+      if (!('dbm_internal' in nets)) nets['dbm_internal'] = {};
+    } else {
+      // No explicit networks: keep the implicit project network too, or the app
+      // would leave `default` and lose its own infra services (db, lavalink).
+      appSvc.networks = ['default', 'dbm_internal'];
+    }
+    if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
+    const topNets = compose.networks as Record<string, unknown>;
+    if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };

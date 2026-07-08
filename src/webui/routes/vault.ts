@@ -2,7 +2,8 @@
  * Credentials Vault API Routes
  *
  * Provides a unified view of all env vars across bot instances + standalone vault entries.
- * Standalone entries stored in /data/data/vault.json.
+ * Standalone entries stored encrypted at rest in /data/data/vault.json as
+ * { v: 1, data: "<iv>:<ciphertext>" } using the env manager's AES-256-CBC helpers.
  * Bot instance envs read from their existing encrypted storage.
  */
 
@@ -15,13 +16,13 @@ import * as envManager from '../../env/manager';
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const VAULT_FILE = path.join(DATA_DIR, 'vault.json');
 
-interface VaultEntry {
+export interface VaultEntry {
   key: string;
   value: string;
   hidden: boolean;  // true = value masked in UI, false = shown in plain
 }
 
-interface DeletedVaultEntry {
+export interface DeletedVaultEntry {
   key: string;
   value: string;
   botName: string;
@@ -29,27 +30,36 @@ interface DeletedVaultEntry {
   deletedAt: number;
 }
 
-interface VaultConfig {
+export interface VaultConfig {
   standalone: VaultEntry[];
   deleted: DeletedVaultEntry[];
 }
 
-function loadVault(): VaultConfig {
+let warnedUnreadableVault = false;
+
+export function loadVault(): VaultConfig {
   try {
-    if (fs.existsSync(VAULT_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
-      return {
-        standalone: raw.standalone || [],
-        deleted: raw.deleted || [],
-      };
+    if (!fs.existsSync(VAULT_FILE)) return { standalone: [], deleted: [] };
+    const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
+    if (!wrapper || typeof wrapper.data !== 'string') throw new Error('unrecognized vault format');
+    const raw = JSON.parse(envManager.decrypt(wrapper.data));
+    return {
+      standalone: raw.standalone || [],
+      deleted: raw.deleted || [],
+    };
+  } catch {
+    if (!warnedUnreadableVault) {
+      warnedUnreadableVault = true;
+      console.warn('[Vault] vault.json is unreadable or cannot be decrypted; starting with an empty vault');
     }
-  } catch { /* ignore */ }
-  return { standalone: [], deleted: [] };
+    return { standalone: [], deleted: [] };
+  }
 }
 
-function saveVault(config: VaultConfig): void {
+export function saveVault(config: VaultConfig): void {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(VAULT_FILE, JSON.stringify(config, null, 2));
+  const wrapper = { v: 1, data: envManager.encrypt(JSON.stringify(config)) };
+  fs.writeFileSync(VAULT_FILE, JSON.stringify(wrapper, null, 2));
 }
 
 function maskValue(value: string): string {

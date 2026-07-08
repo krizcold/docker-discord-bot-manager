@@ -1890,7 +1890,9 @@ export async function syncContainerStates(): Promise<void> {
     }
 
     const appName = resolveAppName(instance.id);
-    const botContainers = containers.filter(c => c.name.startsWith(appName));
+    // Same matching as getContainerIdsForBot: generated composes (docker-image /
+    // no-compose git bots) name containers bot-<id>-*, not <sanitizedName>*.
+    const botContainers = containers.filter(c => c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`));
     const runningContainers = botContainers.filter(c => c.state === 'running');
     const runningIds = runningContainers.map(c => c.id);
 

@@ -36,6 +36,7 @@ services:
       - .:/repo                                  # source repo, so the manager can self-update (git pull + rebuild)
     networks:
       - dbm_remote
+      - dbm_internal
     # Reachable only through Caddy (no host port published). Caddy serves it at
     # PUBLIC_HOST over TLS and forwards every request through Authelia first.
     labels:
@@ -98,6 +99,10 @@ services:
 networks:
   dbm_remote:
     name: dbm_remote
+  # Shared manager<->bot API network (manager only, NOT ingress). Bot composes join
+  # it as external so they can reach the manager at BOT_MANAGER_INTERNAL_URL.
+  dbm_internal:
+    name: dbm_internal
 
 volumes:
   caddy_data:

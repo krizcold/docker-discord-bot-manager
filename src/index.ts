@@ -13,6 +13,7 @@ import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
+import { getDeploymentMode } from './casaos/detector';
 
 /**
  * Tell git to trust repositories under the bot manager's bind-mounted data dirs.
@@ -27,6 +28,35 @@ function configureGitSafeDirectories(): void {
     console.log('[Init] Git safe.directory configured');
   } catch (err: any) {
     console.warn(`[Init] Failed to configure git safe.directory: ${err?.message || err}`);
+  }
+}
+
+/**
+ * Docker mode: bots run in their own compose projects, so manager<->bot API traffic
+ * (BOT_MANAGER_INTERNAL_URL) goes over the shared dbm_internal network, which bot
+ * composes join as external. The manager's compose declares it too, but ensure it
+ * here as well so a manager still running from an older compose gets connected
+ * without a recreate. Never runs in casaos mode.
+ */
+async function ensureInternalNetwork(): Promise<void> {
+  if (await getDeploymentMode() !== 'docker') return;
+  const self = process.env.HOSTNAME || 'discordbotmanagerapp';
+  try {
+    try {
+      execSync('docker network create dbm_internal', { stdio: 'pipe' });
+    } catch (err: any) {
+      const msg = String(err?.stderr || err?.message || err);
+      if (!/already exists/i.test(msg)) throw err;
+    }
+    try {
+      execSync(`docker network connect dbm_internal ${self}`, { stdio: 'pipe' });
+    } catch (err: any) {
+      const msg = String(err?.stderr || err?.message || err);
+      if (!/already exists|already connected/i.test(msg)) throw err;
+    }
+    console.log('[Init] dbm_internal network ready (manager connected)');
+  } catch (err: any) {
+    console.warn(`[Init] Could not ensure dbm_internal network: ${String(err?.stderr || err?.message || err).trim()}`);
   }
 }
 
@@ -50,6 +80,9 @@ async function main(): Promise<void> {
   }
 
   console.log('[Init] Docker connection OK');
+
+  // Shared manager<->bot network (docker mode only; no-op on CasaOS/Yundera)
+  await ensureInternalNetwork();
 
   // Seed default sources on first run
   seedDefaultSources();

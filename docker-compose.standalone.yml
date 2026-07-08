@@ -39,3 +39,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOST_DATA_DIR}:/data/data
       - .:/repo                          # source repo, so the manager can self-update (git pull + rebuild)
+    networks:
+      - dbm_internal
+
+# Shared manager<->bot API network. Bot composes join it as external so they can
+# reach the manager at BOT_MANAGER_INTERNAL_URL across compose projects.
+networks:
+  dbm_internal:
+    name: dbm_internal

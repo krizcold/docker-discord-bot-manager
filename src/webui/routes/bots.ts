@@ -15,6 +15,7 @@ import { findManifest, sanitizeSeedRows } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
+import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
@@ -211,16 +212,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
           if (envVars && Object.keys(envVars).length > 0) {
-            const vaultPath = require('path').join(process.env.DATA_DIR || '/data/data', 'vault.json');
-            const fs = require('fs');
-            let vault: { standalone: Array<{ key: string; value: string; hidden: boolean }>; deleted: Array<{ key: string; value: string; botName: string; sanitizedName?: string; deletedAt: number }> } = { standalone: [], deleted: [] };
-            try {
-              if (fs.existsSync(vaultPath)) {
-                const raw = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
-                vault = { standalone: raw.standalone || [], deleted: raw.deleted || [] };
-              }
-            } catch { /* ignore */ }
-
+            const vault = loadVault();
             const botName = bot.displayName;
             const sanitizedName = bot.sanitizedName;
             const now = Date.now();
@@ -234,8 +226,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
                 vault.deleted.push(entry);
               }
             }
-            fs.mkdirSync(require('path').dirname(vaultPath), { recursive: true });
-            fs.writeFileSync(vaultPath, JSON.stringify(vault, null, 2));
+            saveVault(vault);
           }
         } catch (err) {
           console.warn(`[API] Failed to preserve env vars in vault: ${err}`);
@@ -631,6 +622,14 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      // Bot-originated checks carry X-Bot-Token; validate it when present.
+      // UI calls come through the gateway and send no token.
+      const givenToken = req.headers['x-bot-token'];
+      if (givenToken !== undefined && givenToken !== bot.updateToken) {
+        res.status(403).json({ success: false, error: 'Invalid bot token' });
+        return;
+      }
+
       if (bot.sourceType === 'docker-image') {
         res.json({ success: true, hasUpdates: false, message: 'Cannot check updates for docker-image source type' });
         return;
@@ -963,6 +962,32 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /**
+   * PUT /api/bots/:id/web-auth - Set the public URL auth mode on the INSTANCE.
+   * Applies on the bot's next start.
+   */
+  router.put('/:id/web-auth', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const { mode } = req.body as { mode?: string };
+      if (mode !== 'auto' && mode !== 'authelia' && mode !== 'public') {
+        res.status(400).json({ success: false, error: "mode must be 'auto', 'authelia' or 'public'" });
+        return;
+      }
+
+      const updated = containerManager.updateInstanceWebAuth(req.params.id, mode);
+      broadcastToClients(wss, 'bot:updated', updated);
+      res.json({ success: true, bot: updated });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   return router;
 }
 
@@ -1025,20 +1050,11 @@ export function createValidationRoutes(): Router {
       const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
 
       // Source 1: vault.deleted entries matching this name
-      const vaultPath = path.join(process.env.DATA_DIR || '/data/data', 'vault.json');
       const fromVault: Record<string, string> = {};
-      try {
-        if (fs.existsSync(vaultPath)) {
-          const vault = JSON.parse(fs.readFileSync(vaultPath, 'utf-8'));
-          const deleted = Array.isArray(vault.deleted) ? vault.deleted : [];
-          for (const entry of deleted) {
-            if (entry.sanitizedName !== targetSanitized) continue;
-            if (BOT_MANAGER_KEYS.has(entry.key)) continue;
-            fromVault[entry.key] = entry.value;
-          }
-        }
-      } catch (err) {
-        console.warn(`[RecoverEnvs] Failed to read vault: ${err}`);
+      for (const entry of loadVault().deleted) {
+        if (entry.sanitizedName !== targetSanitized) continue;
+        if (BOT_MANAGER_KEYS.has(entry.key)) continue;
+        fromVault[entry.key] = entry.value;
       }
 
       // Source 2: surviving compose file at CasaOS metadata path

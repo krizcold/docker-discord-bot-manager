@@ -38,11 +38,16 @@ authentication_backend:
         key_length: 32
         salt_length: 16
 
-# Default deny; the only allowed access requires full 2FA on the manager host.
+# Default deny; allowed access requires full 2FA by an admin, on the manager host
+# and on bot subdomains (<name>.<COOKIE_DOMAIN>) gated via Caddy forward_auth.
 access_control:
   default_policy: 'deny'
   rules:
     - domain: '{{ env "PUBLIC_HOST" }}'
+      policy: 'two_factor'
+      subject:
+        - 'group:admins'
+    - domain: '*.{{ env "COOKIE_DOMAIN" }}'
       policy: 'two_factor'
       subject:
         - 'group:admins'

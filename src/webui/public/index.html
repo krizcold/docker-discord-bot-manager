@@ -1230,6 +1230,15 @@
                 ${hourOptions}
               </select>` : '';
 
+            // Public URL auth mode (only when the bot has a public https URL)
+            const webAuthMode = bot.webAuth || 'auto';
+            const webAuthControl = bot.publicUrl ? `
+              <select class="auto-update-interval" title="Public URL access: Auto detects self-authenticating bots, MFA requires the Authelia login, Public disables auth. Applies on the bot's next start." onchange="setBotWebAuth('${bot.id}', this.value)">
+                <option value="auto" ${webAuthMode === 'auto' ? 'selected' : ''}>Auth: Auto</option>
+                <option value="authelia" ${webAuthMode === 'authelia' ? 'selected' : ''}>Auth: MFA</option>
+                <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
+              </select>` : '';
+
             return `
             <div class="bot-card">
               <div class="bot-card-header">
@@ -1240,7 +1249,7 @@
                 </div>
                 <span class="status-badge status-${bot.status}">${busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status}</span>
               </div>
-              ${isGit ? `<div class="bot-card-meta">${autoUpdateToggle}</div>` : ''}
+              ${(isGit || webAuthControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}</div>` : ''}
               <div class="bot-card-actions">
                 ${isRunning ? `
                   ${(bot.publicUrl || bot.hostPort) ? `<a class="btn btn-primary btn-small" href="${(bot.publicUrl ? escapeHtml(bot.publicUrl) : `http://${location.hostname}:${bot.hostPort}`) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>` : ''}
@@ -1433,6 +1442,17 @@
       } catch (err) {
         showMessage('error', 'Failed to set auto-update hour');
       }
+    }
+
+    async function setBotWebAuth(id, mode) {
+      try {
+        const res = await api('PUT', `/bots/${id}/web-auth`, { mode });
+        if (!res.success) showMessage('error', res.error || 'Failed to set web auth mode');
+        else showMessage('success', 'Web auth mode saved: applies on next start');
+      } catch (err) {
+        showMessage('error', 'Failed to set web auth mode');
+      }
+      loadBots();
     }
 
     // ─── Update Checking ───

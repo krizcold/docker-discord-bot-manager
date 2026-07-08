@@ -44,6 +44,7 @@ import {
   getWebUiIndexPath,
   publishHostPort,
   attachBotToProxy,
+  mainServiceSelfAuths,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
   fixDockerBotOwnership,
@@ -337,6 +338,21 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
   if (autoUpdateHour !== undefined) {
     instance.autoUpdateHour = Math.max(0, Math.min(23, autoUpdateHour));
   }
+  instance.updatedAt = new Date().toISOString();
+  registry.instances[botId] = instance;
+  saveRegistry(registry);
+  return instance;
+}
+
+/**
+ * Update the instance's public URL auth mode (applies on next start).
+ */
+export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'authelia' | 'public'): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+
+  instance.webAuth = mode;
   instance.updatedAt = new Date().toISOString();
   registry.instances[botId] = instance;
   saveRegistry(registry);
@@ -753,7 +769,14 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   let publicUrl: string | undefined;
   if (BOT_DOMAIN_BASE) {
     const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
-    content = attachBotToProxy(content, host, info.containerPort);
+    // Auth in front of the public vhost: explicit instance setting wins; in auto
+    // mode a self-authenticating main service (AUTH_HASH gateway) is left to
+    // protect itself, everything else goes behind Authelia MFA.
+    const forwardAuth =
+      instance.webAuth === 'public' ? false :
+      instance.webAuth === 'authelia' ? true :
+      !mainServiceSelfAuths(content);
+    content = attachBotToProxy(content, host, info.containerPort, { forwardAuth });
     publicUrl = `https://${host}`;
   }
 

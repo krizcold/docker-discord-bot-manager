@@ -928,13 +928,16 @@ export function publishHostPort(
  * caddy-docker-proxy labels so the bundled Caddy (remote-access stack) serves it at
  * `host` over automatic TLS. Used in docker mode only when a public base domain is
  * configured. The bot keeps its localhost host-port too (tunnel fallback).
+ * `forwardAuth` gates the vhost behind the stack's Authelia (same labels as the
+ * manager's own vhost in docker-compose.remote.yml).
  */
 export function attachBotToProxy(
   composeContent: string,
   host: string,
   containerPort: number,
-  network = 'dbm_remote'
+  opts: { network?: string; forwardAuth?: boolean } = {}
 ): string {
+  const network = opts.network || 'dbm_remote';
   let compose: Record<string, unknown>;
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
@@ -951,6 +954,11 @@ export function attachBotToProxy(
   const labels = svc.labels as Record<string, string>;
   labels['caddy'] = host;
   labels['caddy.reverse_proxy'] = `{{upstreams ${containerPort}}}`;
+  if (opts.forwardAuth) {
+    labels['caddy.forward_auth'] = 'authelia:9091';
+    labels['caddy.forward_auth.uri'] = '/api/authz/forward-auth';
+    labels['caddy.forward_auth.copy_headers'] = 'Remote-User Remote-Groups Remote-Email Remote-Name';
+  }
 
   if (Array.isArray(svc.networks)) {
     if (!(svc.networks as unknown[]).includes(network)) (svc.networks as unknown[]).push(network);
@@ -965,6 +973,32 @@ export function attachBotToProxy(
   if (!nets[network]) nets[network] = { name: network, external: true };
 
   return stringify(compose, { lineWidth: 0 });
+}
+
+/**
+ * True when the main web service declares an AUTH_HASH env key - the structural
+ * marker of a self-authenticating gateway/app (AppShield / hash-lock style), which
+ * needs no forward_auth in front of it. Purely structural, never tied to a
+ * specific bot or image.
+ */
+export function mainServiceSelfAuths(composeContent: string): boolean {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return false;
+  const mainName = getMainServiceName(compose);
+  const env = mainName ? services[mainName]?.environment : undefined;
+  if (Array.isArray(env)) {
+    return env.some((e: unknown) => typeof e === 'string' && /^AUTH_HASH=/.test(e));
+  }
+  if (env && typeof env === 'object') {
+    return 'AUTH_HASH' in (env as Record<string, unknown>);
+  }
+  return false;
 }
 
 // ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──

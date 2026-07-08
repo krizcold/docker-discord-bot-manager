@@ -72,6 +72,7 @@ export interface InstanceConfig {
   webContainerPort?: number;           // docker mode: the container port hostPort maps to
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index (hash already substituted), e.g. "/?hash=<hash>"
+  webAuth?: 'auto' | 'authelia' | 'public';  // public URL auth mode, applies on next start
 
   // Detection (for git source)
   botType?: BotType;

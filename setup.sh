@@ -201,6 +201,16 @@ for name in $SECRET_NAMES; do
 done
 ok "Authelia secrets present and non-empty (3)."
 
+# Shared secret Caddy injects as X-DBM-Gateway so the manager can reject direct
+# (non-Caddy) traffic from bot containers on the shared Docker networks.
+MANAGER_GATEWAY_SECRET="$(env_get MANAGER_GATEWAY_SECRET)"
+if [ -z "$MANAGER_GATEWAY_SECRET" ]; then
+  info "Generating MANAGER_GATEWAY_SECRET ..."
+  MANAGER_GATEWAY_SECRET="$(gen_secret)"
+  [ -n "$MANAGER_GATEWAY_SECRET" ] || die "MANAGER_GATEWAY_SECRET is empty - generation failed."
+fi
+ok "Manager gateway secret ready."
+
 # ── Contact email + timezone ──────────────────────────────────────────────────
 email_default="$(env_get ACME_EMAIL)"
 read -rp "Contact email (Let's Encrypt + admin)${email_default:+ [$email_default]}: " ACME_EMAIL
@@ -257,6 +267,7 @@ COOKIE_DOMAIN=$COOKIE_DOMAIN
 ACME_EMAIL=$ACME_EMAIL
 TZ=$TZ_VAL
 BOT_DOMAIN_BASE=$BOT_DOMAIN_BASE
+MANAGER_GATEWAY_SECRET=$MANAGER_GATEWAY_SECRET
 EOF
 ok "Wrote $ENV_FILE"
 

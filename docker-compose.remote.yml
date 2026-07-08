@@ -30,6 +30,9 @@ services:
       # Optional: base for per-bot HTTPS subdomains (<botname>.<base>) via the same
       # Caddy. Usually the same value as COOKIE_DOMAIN. Unset = bots stay localhost-only.
       BOT_DOMAIN_BASE: ${BOT_DOMAIN_BASE:-}
+      # Shared secret only Caddy knows; blocks direct manager access from bot containers
+      # on the shared Docker networks. Unset = gate disabled.
+      MANAGER_GATEWAY_SECRET: ${MANAGER_GATEWAY_SECRET:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOST_DATA_DIR}:/data/data
@@ -42,6 +45,7 @@ services:
     labels:
       caddy: ${PUBLIC_HOST}
       caddy.reverse_proxy: "{{upstreams 8080}}"
+      caddy.reverse_proxy.header_up: "X-DBM-Gateway ${MANAGER_GATEWAY_SECRET:-}"
       caddy.forward_auth: "authelia:9091"
       caddy.forward_auth.uri: /api/authz/forward-auth
       caddy.forward_auth.copy_headers: Remote-User Remote-Groups Remote-Email Remote-Name

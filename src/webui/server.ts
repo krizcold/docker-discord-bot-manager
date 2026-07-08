@@ -5,6 +5,7 @@
 
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import path from 'path';
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
@@ -22,12 +23,50 @@ import { handleTerminalMessage, closeTerminal } from './terminal';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
+// Remote stack only: the manager shares Docker networks with bot containers, which
+// could otherwise reach it directly and bypass the Authelia edge. Caddy injects
+// X-DBM-Gateway on every proxied request (header_up applies to ws upgrades too);
+// loopback stays open for the in-container healthcheck. Unset secret = gate off.
+const GATEWAY_SECRET = process.env.MANAGER_GATEWAY_SECRET || '';
+const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+const BOT_TOKEN_PATHS = /^\/api\/bots\/[^/]+\/(updates|request-update)$/;
+
+function gatewaySecretMatches(header: string | string[] | undefined): boolean {
+  if (typeof header !== 'string') return false;
+  const given = Buffer.from(header);
+  const expected = Buffer.from(GATEWAY_SECRET);
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function gatewayAllows(req: http.IncomingMessage): boolean {
+  return gatewaySecretMatches(req.headers['x-dbm-gateway'])
+    || LOOPBACK_ADDRS.has(req.socket.remoteAddress || '');
+}
+
 export function createServer(): { app: Express; server: http.Server; wss: WebSocketServer } {
   const app = express();
   const server = http.createServer(app);
 
   // WebSocket server for real-time updates
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname !== '/ws' || (GATEWAY_SECRET && !gatewayAllows(req))) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  });
+
+  if (GATEWAY_SECRET) {
+    app.use((req: Request, res: Response, next: NextFunction) => {
+      if (gatewayAllows(req)) return next();
+      // Bot-facing endpoints validate x-bot-token themselves; the gate only requires its presence.
+      if (BOT_TOKEN_PATHS.test(req.path) && req.headers['x-bot-token']) return next();
+      res.status(403).json({ success: false, error: 'Forbidden' });
+    });
+  }
 
   // Middleware
   app.use(cors());

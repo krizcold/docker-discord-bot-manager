@@ -7,12 +7,17 @@
  * build` (streamed live) -> a detached one-shot container (the manager's OWN image,
  * which bundles docker-cli-compose) runs `docker compose up -d` to recreate it.
  */
-import { spawn, execSync, spawnSync } from 'child_process';
+import { spawn, execFile, execSync, spawnSync } from 'child_process';
+import { randomUUID } from 'crypto';
+import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDeploymentMode } from '../casaos/detector';
 
 const REPO = '/repo';
+// Regenerated on every process start; lets the UI tell "server restarted" apart
+// from "same server, transient ws drop".
+const BOOT_ID = randomUUID();
 type Emit = (msg: string, level?: 'info' | 'warning' | 'error' | 'success') => void;
 
 interface SelfInfo {
@@ -25,6 +30,7 @@ interface SelfInfo {
 
 export interface ManagerVersion {
   supported: boolean;
+  bootId: string;
   reason?: string;
   branch?: string;
   currentCommit?: string;
@@ -32,19 +38,40 @@ export interface ManagerVersion {
   behindBy?: number;
 }
 
+let updateInProgress = false;
+export function isUpdateInProgress(): boolean {
+  return updateInProgress;
+}
+
+const execFileAsync = promisify(execFile);
+
+async function gitAsync(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', timeout: 30000 });
+  return stdout.trim();
+}
+
 function gitOut(args: string[]): string {
   return execSync(`git -c safe.directory='*' -C "${REPO}" ${args.join(' ')}`, { encoding: 'utf-8', timeout: 30000 }).trim();
+}
+
+function dockerOut(args: string[]): string {
+  const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 10000 });
+  if (r.status !== 0) throw new Error((r.stderr || '').trim() || `docker ${args[0]} failed`);
+  return (r.stdout || '').trim();
 }
 
 function isGitRepo(): boolean {
   try { return fs.existsSync(path.join(REPO, '.git')); } catch { return false; }
 }
 
+function selfContainerId(): string {
+  return process.env.HOSTNAME || 'discordbotmanagerapp';
+}
+
 /** Read this container's compose deployment from its own labels (no host config needed). */
 function inspectSelf(): SelfInfo | null {
   try {
-    const id = process.env.HOSTNAME || 'discordbotmanagerapp';
-    const raw = execSync(`docker inspect ${id}`, { encoding: 'utf-8', timeout: 10000 });
+    const raw = execSync(`docker inspect ${selfContainerId()}`, { encoding: 'utf-8', timeout: 10000 });
     const c = JSON.parse(raw)[0];
     const labels = (c?.Config?.Labels || {}) as Record<string, string>;
     const project = labels['com.docker.compose.project'];
@@ -79,37 +106,66 @@ function streamProc(cmd: string, args: string[], emit: Emit, cwd?: string): Prom
   });
 }
 
+const VERSION_TTL_MS = 60000;
+let versionCache: ManagerVersion | null = null;
+let versionCacheAt = 0;
+let versionInFlight: Promise<ManagerVersion> | null = null;
+
 export async function getManagerVersion(): Promise<ManagerVersion> {
+  // Never run git while an update is pulling/mutating the repo.
+  if (updateInProgress) return versionCache || { supported: true, bootId: BOOT_ID };
+  if (versionCache && Date.now() - versionCacheAt < VERSION_TTL_MS) return versionCache;
+  if (!versionInFlight) {
+    versionInFlight = readManagerVersion()
+      .then((v) => { versionCache = v; versionCacheAt = Date.now(); return v; })
+      .finally(() => { versionInFlight = null; });
+  }
+  return versionInFlight;
+}
+
+async function readManagerVersion(): Promise<ManagerVersion> {
   if (await getDeploymentMode() !== 'docker') {
-    return { supported: false, reason: 'Updates are managed by the platform (Yundera/CasaOS).' };
+    return { supported: false, bootId: BOOT_ID, reason: 'Updates are managed by the platform (Yundera/CasaOS).' };
   }
   if (!isGitRepo()) {
-    return { supported: false, reason: 'Self-update needs the repo mounted at /repo (rebuild from docker-compose).' };
+    return { supported: false, bootId: BOOT_ID, reason: 'Self-update needs the repo mounted at /repo (rebuild from docker-compose).' };
   }
   try {
-    const branch = gitOut(['rev-parse', '--abbrev-ref', 'HEAD']);
-    const currentCommit = gitOut(['rev-parse', '--short', 'HEAD']);
+    const branch = await gitAsync(['rev-parse', '--abbrev-ref', 'HEAD']);
+    const currentCommit = await gitAsync(['rev-parse', '--short', 'HEAD']);
     let updateAvailable = false;
     let behindBy = 0;
     try {
-      gitOut(['fetch', '--quiet']);
-      behindBy = parseInt(gitOut(['rev-list', '--count', 'HEAD..@{u}']) || '0', 10) || 0;
+      await gitAsync(['fetch', '--quiet']);
+      behindBy = parseInt(await gitAsync(['rev-list', '--count', 'HEAD..@{u}']) || '0', 10) || 0;
       updateAvailable = behindBy > 0;
     } catch { /* offline / no upstream: report current commit, no update info */ }
-    return { supported: true, branch, currentCommit, updateAvailable, behindBy };
+    return { supported: true, bootId: BOOT_ID, branch, currentCommit, updateAvailable, behindBy };
   } catch (err) {
-    return { supported: false, reason: `Could not read git state: ${err}` };
+    return { supported: false, bootId: BOOT_ID, reason: `Could not read git state: ${err}` };
   }
 }
 
 /**
- * Pull + rebuild + recreate. Streams progress via emit(); the actual restart is done
- * by a detached one-shot container. On success this process is replaced before the
- * promise settles, so it only ever REJECTS here: on pull/build failure, a recreate
- * that could not launch, or (via the watchdog) a recreate that launched but never took
- * effect. onRestarting() fires once the recreate has been launched.
+ * Pull + rebuild + recreate. Streams progress via emit(). RESOLVES when nothing
+ * needed applying (image and compose config unchanged) or when the recreate applied
+ * without replacing this process; on a real restart this process is replaced before
+ * the promise settles. REJECTS on pull/build failure, a recreate that could not
+ * launch, or a recreate that did not take effect. onRestarting() fires once the
+ * recreate has been launched.
  */
 export async function runManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<void> {
+  updateInProgress = true;
+  try {
+    await doManagerUpdate(emit, onRestarting);
+  } finally {
+    // Never runs when the recreate replaces this process, which is fine.
+    updateInProgress = false;
+    versionCache = null;
+  }
+}
+
+async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<void> {
   if (await getDeploymentMode() !== 'docker') throw new Error('Self-update is only available in standalone docker mode.');
   if (!isGitRepo()) throw new Error('Repo not mounted at /repo; cannot self-update.');
   const self = inspectSelf();
@@ -117,10 +173,27 @@ export async function runManagerUpdate(emit: Emit, onRestarting?: () => void): P
 
   emit('[Update] Fetching latest code...', 'info');
   preserveLocalUsersDb();
+  const oldHead = gitOut(['rev-parse', 'HEAD']);
   await streamProc('git', ['-c', 'safe.directory=*', '-C', REPO, 'pull', '--ff-only'], emit);
+  const newHead = gitOut(['rev-parse', 'HEAD']);
 
   emit(`[Update] Rebuilding the manager image (${self.service})...`, 'info');
   await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build', self.service], emit, REPO);
+
+  // A pull that changed neither the manager image nor its compose config makes
+  // `compose up -d` a no-op: the process would survive and a blind watchdog would
+  // falsely report failure. Detect that and finish here instead.
+  const newImageId = dockerOut(['image', 'inspect', self.image, '--format', '{{.Id}}']);
+  const runningImageId = () => dockerOut(['inspect', selfContainerId(), '--format', '{{.Image}}']);
+  const changedFiles = oldHead === newHead
+    ? []
+    : gitOut(['diff', '--name-only', oldHead, newHead]).split('\n').map((l) => l.trim()).filter(Boolean);
+  // The compose files live at the repo root, so the repo-relative path is the basename.
+  const needsApply = newImageId !== runningImageId() || changedFiles.includes(self.composeFile);
+  if (!needsApply) {
+    emit(`[Update] Already up to date - nothing to apply (HEAD ${newHead.slice(0, 7)}).`, 'success');
+    return;
+  }
 
   emit('[Update] Recreating the manager - the UI will drop and reconnect in a few seconds...', 'info');
   // A container can't recreate itself in-process, so launch a detached one-shot that
@@ -149,18 +222,36 @@ export async function runManagerUpdate(emit: Emit, onRestarting?: () => void): P
   emit('[Update] Recreate launched - waiting for the manager to restart...', 'info');
   onRestarting?.();
 
-  // `docker run -d` reports only the LAUNCH, not the inner `compose up` result. But a
-  // successful recreate replaces THIS process, so if we are still alive after a grace
-  // period the recreate must have failed - surface the helper's output instead of
-  // silently "succeeding". (On success this process is gone before the timer fires.)
-  await new Promise<void>((_resolve, reject) => {
-    setTimeout(() => {
-      let logs = '';
-      try { logs = execSync('docker logs dbm-self-update', { encoding: 'utf-8', timeout: 10000 }).trim(); } catch { /* gone / unreadable */ }
-      reject(new Error(
-        `The manager was rebuilt but the auto-recreate did not take effect.\n${logs || '(no recreate output)'}\n` +
-        `Finish it from the host with:  docker compose -f ${self.composeFile} up -d ${self.service}`,
-      ));
-    }, 45000);
-  });
+  // `docker run -d` reports only the LAUNCH, not the inner `compose up` result. Poll
+  // the helper until it exits: a real recreate replaces THIS process mid-poll, so if
+  // we survive the helper's success we compare image ids to tell "compose recreated
+  // only other services" apart from "recreate did not take effect".
+  const helperLogs = (): string => {
+    try { return execSync('docker logs dbm-self-update', { encoding: 'utf-8', timeout: 10000 }).trim(); } catch { return ''; }
+  };
+  const failMsg = (logs: string) =>
+    `The manager was rebuilt but the auto-recreate did not take effect.\n${logs || '(no recreate output)'}\n` +
+    `Finish it from the host with:  docker compose -f ${self.composeFile} up -d ${self.service}`;
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    await sleep(3000);
+    let status = '';
+    let exitCode = NaN;
+    try {
+      const parts = dockerOut(['inspect', 'dbm-self-update', '--format', '{{.State.Status}} {{.State.ExitCode}}']).split(' ');
+      status = parts[0];
+      exitCode = Number(parts[1]);
+    } catch { continue; }
+    if (status !== 'exited') continue;
+    if (exitCode !== 0) throw new Error(failMsg(helperLogs()));
+    await sleep(6000);   // grace tick: a real recreate kills this process during it
+    if (runningImageId() === newImageId) {
+      emit('[Update] Applied without a manager restart.', 'success');
+      return;
+    }
+    throw new Error(failMsg(helperLogs()));
+  }
+  throw new Error(failMsg(helperLogs()));
 }

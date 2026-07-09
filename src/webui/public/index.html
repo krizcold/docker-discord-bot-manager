@@ -839,6 +839,8 @@
 
     // ─── Manager self-update ───
     let managerUpdating = false;
+    let lastManagerVersion = null;
+    let managerUpdateBaseline = null;
 
     async function loadManagerVersion() {
       const el = document.getElementById('manager-version');
@@ -847,6 +849,7 @@
       try {
         const v = await api('GET', '/manager/version');
         if (!v || !v.success) { set(''); return; }
+        lastManagerVersion = v;
         if (!v.supported) {
           set(v.currentCommit ? `<span style="opacity:0.6;">v${v.currentCommit}</span>` : '');
           if (v.reason) el.title = v.reason;
@@ -872,10 +875,40 @@
       document.getElementById('manager-update-modal').classList.add('hidden');
     }
 
+    function finishManagerUpdate(ok, logLine, title, toast) {
+      appendManagerLog(logLine);
+      document.getElementById('manager-update-title').textContent = title;
+      document.getElementById('manager-update-close').disabled = false;
+      managerUpdating = false;
+      showMessage(ok ? 'success' : 'error', toast);
+    }
+
+    // A ws reconnect during an update can mean three things; the server's bootId
+    // (new per process) and commit tell them apart.
+    async function resolveManagerReconnect() {
+      let v = null;
+      try { v = await api('GET', '/manager/version'); } catch { /* fall through */ }
+      const base = managerUpdateBaseline;
+      if (v && v.success && base && v.bootId === base.bootId) {
+        appendManagerLog('Reconnected - update still in progress...');
+        return;
+      }
+      if (v && v.success && base && v.currentCommit === base.commit) {
+        finishManagerUpdate(false,
+          'Manager restarted but the version did not change - the update may not have applied',
+          'Update failed', 'Manager update failed');
+        return;
+      }
+      finishManagerUpdate(true, 'Reconnected - Bot Manager is back up.', 'Bot Manager updated', 'Bot Manager updated');
+    }
+
     async function updateManager() {
       if (managerUpdating) return;
       if (!confirm('Update the Bot Manager now? It will rebuild and restart - the UI will briefly disconnect and reconnect.')) return;
       managerUpdating = true;
+      managerUpdateBaseline = lastManagerVersion
+        ? { commit: lastManagerVersion.currentCommit, bootId: lastManagerVersion.bootId }
+        : null;
       const title = document.getElementById('manager-update-title');
       document.getElementById('manager-update-log').textContent = '';
       title.textContent = 'Updating Bot Manager';
@@ -904,13 +937,7 @@
           // Reconnect: resync in case events were missed during the gap.
           loadBots();
           loadSources();
-          if (managerUpdating) {
-            appendManagerLog('Reconnected - Bot Manager is back up.');
-            document.getElementById('manager-update-title').textContent = 'Bot Manager updated';
-            document.getElementById('manager-update-close').disabled = false;
-            managerUpdating = false;
-            showMessage('success', 'Bot Manager updated');
-          }
+          if (managerUpdating) resolveManagerReconnect();
         }
         loadManagerVersion();
         hasConnectedBefore = true;
@@ -1034,12 +1061,12 @@
             appendManagerLog('Manager restarting - waiting for it to come back...');
             document.getElementById('manager-update-title').textContent = 'Restarting Bot Manager...';
             break;
+          case 'manager:update-complete':
+            finishManagerUpdate(true, payload?.message || 'Update complete.', 'Up to date', 'Bot Manager is up to date');
+            loadManagerVersion();
+            break;
           case 'manager:update-failed':
-            appendManagerLog('Update failed: ' + (payload?.error || 'unknown error'));
-            document.getElementById('manager-update-title').textContent = 'Update failed';
-            document.getElementById('manager-update-close').disabled = false;
-            managerUpdating = false;
-            showMessage('error', 'Manager update failed');
+            finishManagerUpdate(false, 'Update failed: ' + (payload?.error || 'unknown error'), 'Update failed', 'Manager update failed');
             break;
 
           default:

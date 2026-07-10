@@ -45,7 +45,7 @@ The manager runs as a container under Docker Desktop and manages your bots as si
 
 `HOST_DATA_DIR` must be set: the host Docker daemon resolves a bot's bind-mounts as **host** paths, so the manager rewrites them to live under this shared folder. It must be an absolute host path that matches the data bind in the compose file.
 
-> **Test status:** the containerized Windows path is implemented; the core deploy lifecycle is verified, the full functional pass is in progress. See [../Documentation/BotManager/StandaloneMode.md](../Documentation/BotManager/StandaloneMode.md) for the checklist.
+> **Test status:** verified end-to-end on Windows Docker Desktop with a real multi-service bot (install, build, deploy, web-UI login, env edits, update).
 
 </details>
 
@@ -79,7 +79,7 @@ cd docker-discord-bot-manager
 sudo ./setup.sh
 ```
 
-Semi-automated: it still asks you the choices that matter - **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall, **generates the Authelia secrets and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack, and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain).
+Semi-automated: it still asks you the choices that matter - **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password`).
 
 > **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
 >
@@ -117,7 +117,9 @@ You do **not** need any of this if you ran `setup.sh` above - these are the same
    ACME_EMAIL=you@example.com
    TZ=Europe/Madrid
    BOT_DOMAIN_BASE=203-0-113-5.sslip.io   # optional: per-bot HTTPS subdomains
+   MANAGER_GATEWAY_SECRET=<long random string>   # recommended: gates direct manager access
    ```
+   `MANAGER_GATEWAY_SECRET` is a shared secret only Caddy knows: when set, the manager rejects any HTTP or WebSocket request that lacks the matching `X-DBM-Gateway` header Caddy injects, so a bot container sharing a Docker network with the manager cannot bypass Authelia. Loopback requests and the bot update endpoints (authenticated by `X-Bot-Token`) are exempt; unset disables the gate. `setup.sh` generates it and keeps it across re-runs.
    **Critical:** `PUBLIC_HOST` and `AUTHELIA_HOST` MUST be subdomains of `COOKIE_DOMAIN` - note the **dots** (`bot.203-0-113-5.sslip.io`, NOT `bot-203-0-113-5...`). sslip.io resolves either, but a hyphen makes them *siblings* of `COOKIE_DOMAIN`, so the browser won't share the Authelia session cookie and login loops forever. (sslip.io maps any `<label>.203-0-113-5.sslip.io` to `203.0.113.5`.)
    For a real domain: `PUBLIC_HOST=bot.example.com`, `AUTHELIA_HOST=auth.example.com`, `COOKIE_DOMAIN=example.com`, `BOT_DOMAIN_BASE=example.com`, and point `bot.` / `auth.` A records (plus a wildcard `*.` so per-bot subdomains resolve) at the VPS. You do not edit `authelia/configuration.yml` - it reads these from the env. Caddy issues a **separate** certificate per hostname on demand; there is no wildcard certificate (that would need a DNS-01 challenge, which this stack does not set up), so each bot subdomain triggers its own Let's Encrypt issuance.
 5. **Run** and enroll MFA:
@@ -128,7 +130,7 @@ You do **not** need any of this if you ran `setup.sh` above - these are the same
    docker exec authelia cat /data/notification.txt
    ```
 
-With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. Bot vhosts are not behind Authelia (each bot self-auths).
+With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. By default each bot vhost sits behind the same Authelia MFA login as the manager; a bot whose main web service ships its own auth gateway (it declares `AUTH_HASH`, e.g. AppShield) is detected automatically and left to protect itself. Override per bot with the card's **Auth** selector (Auto / MFA / Public) or `PUT /api/bots/:id/web-auth`; the change applies on the bot's next start.
 
 **Prefer no public surface?** Keep the manager private and reach it over a tunnel/VPN instead:
 - **Tailscale** (recommended): `tailscale up` on the VPS + your devices; reach the UI over the tailnet, optionally with a real `*.ts.net` cert via `tailscale serve`. No open ports, no domain.
@@ -162,7 +164,7 @@ Open <http://127.0.0.1:8080>. In a native run `HOST_DATA_DIR` auto-resolves from
 
 On Yundera/CasaOS the platform updates the manager. On a standalone (Windows or Linux) install you update it yourself - two ways, both of which `git pull` the latest code and rebuild + recreate the stack:
 
-- **From the UI** (standalone docker mode): the header shows the running version and, when the repo is behind, an **Update manager** button. It streams the pull + build, then restarts the manager; the page reconnects and shows the new version. (Hidden on Yundera, where the platform handles updates. On Windows the rebuild always works; if the auto-restart can't launch, the UI tells you the one-line command to finish it.)
+- **From the UI** (standalone docker mode): the header shows the running version (checked in the background, cached for 60s) and, when the repo is behind, an **Update manager** button. It streams the pull + build; when the pulled commits change neither the manager image nor its compose file it reports already up to date without restarting, otherwise it recreates the manager and verifies the restart actually took effect; the page reconnects and shows the new version. (Hidden on Yundera, where the platform handles updates. On Windows the rebuild always works; if the auto-restart can't launch, the UI tells you the one-line command to finish it.)
 - **From the command line**, run from the cloned repo root:
   ```bash
   sudo ./update.sh          # Linux
@@ -184,7 +186,7 @@ When a bot exposes a web UI, the manager publishes it on a host port (auto-assig
 Bots that ship Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) guard their web UI, and the manager wires two ways in:
 
 - **Access hash - your private shortcut.** Every bot gets an `AUTH_HASH`. The **Open** link carries it (`.../?hash=<hash>`), so opening a bot from the manager drops you straight in with no login. Keep the hash private (don't share the Open URL). Rotate it with **Regenerate** next to `AUTH_HASH` in the bot's **Env** editor, then rebuild the bot to apply - older Open links stop working.
-- **Username / password - for sharing.** To give other people access, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and rebuild. Anyone who opens the bot's URL without the hash then gets a login form. Both are empty by default (login off, hash-only), and they appear in the Env editor for any bot whose compose uses them.
+- **Username / password - for sharing.** To give other people access, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and restart the bot (credential edits apply on start, no rebuild needed). Anyone who opens the bot's URL without the hash then gets a login form. Both are empty by default (login off, hash-only), and they appear in the Env editor for any bot whose compose uses them.
 
 AppShield needs no CasaOS or platform - it runs as a plain sidecar in front of the bot. It does not terminate TLS, so on a public server it sits behind the remote stack's Caddy (see **Server on Linux**) for HTTPS; locally it is plain HTTP on `127.0.0.1`.
 
@@ -238,9 +240,9 @@ docker-discord-bot-manager/
 <details>
 <summary><b>API & WebSocket events</b></summary>
 
-The Web UI is backed by a REST API plus a WebSocket channel at `/ws`. Endpoints cover sources, instances, environment variables, config files, the credentials vault, per-bot console and file operations, and logs. See `../Documentation/BotManager/UpdateSystem/Endpoints.md` for the full reference.
+The Web UI is backed by a REST API plus a WebSocket channel at `/ws`. Endpoints cover sources, instances, environment variables, config files, the credentials vault, per-bot console and file operations, logs, and the manager self-update.
 
-WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:started`/`stopped`/`restarted`, `bot:pulling`/`built`/`rebuilt`, and the matching `*-failed` events.
+WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:started`/`stopped`/`restarted`, `bot:pulling`/`built`/`rebuilt`, the matching `*-failed` events, and `manager:*` self-update events.
 
 </details>
 
@@ -256,9 +258,10 @@ WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:
 | `BOT_PORT_BIND` | `127.0.0.1` | Interface bots' host ports bind to (`0.0.0.0` for LAN) |
 | `BOT_HOST_PORT_BASE` / `BOT_HOST_PORT_RANGE` | `20000` / `10000` | Host-port auto-assign range |
 | `BOT_DOMAIN_BASE` | (unset) | Base for per-bot HTTPS subdomains (remote mode) |
+| `ENV_ENCRYPTION_KEY` | (generated) | Key for the AES-256-CBC secret storage; when unset, a key file is generated under the data dir on first run |
 | `NODE_ENV` | `production` | Node environment |
 
-Remote mode adds `PUBLIC_HOST`, `AUTHELIA_HOST`, `COOKIE_DOMAIN`, `ACME_EMAIL`, `TZ` (see **Server on Linux**). On Yundera the platform supplies `PUID`/`PGID`/`TZ`/`APP_*`/`REF_*`/`DATA_ROOT`.
+Remote mode adds `PUBLIC_HOST`, `AUTHELIA_HOST`, `COOKIE_DOMAIN`, `ACME_EMAIL`, `TZ`, `MANAGER_GATEWAY_SECRET` (see **Server on Linux**). On Yundera the platform supplies `PUID`/`PGID`/`TZ`/`APP_*`/`REF_*`/`DATA_ROOT`.
 
 </details>
 
@@ -278,8 +281,9 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 
 - The Docker socket is mounted, which grants the manager full control of the host Docker daemon (root-equivalent). **Never expose the manager bare on the internet.**
 - Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
-- Each managed bot's own web UI is guarded by its AppShield gateway - a private access hash (used by the **Open** link) plus an optional shared username/password. See **How bots are reached**.
-- Secrets (bot tokens, API keys, config files) are stored encrypted on disk.
+- Each managed bot's own web UI is guarded by its AppShield gateway - a private access hash (used by the **Open** link) plus an optional shared username/password. See **How bots are reached**. On the remote stack, public bot vhosts additionally sit behind Authelia MFA by default (self-authenticating gateways are detected and skip it; per-bot override on the card).
+- On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
+- Secrets are encrypted at rest with AES-256-CBC: sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault. The key comes from `ENV_ENCRYPTION_KEY`, or a key file generated under the data dir on first run.
 
 </details>
 

@@ -35,16 +35,29 @@ function parseEnvMode(): DeploymentMode | null {
   return null;
 }
 
+const DETECT_RETRIES = 3;
+const DETECT_RETRY_DELAY_MS = 2000;
+
 /**
- * Check if CasaOS container is running
+ * Check if a container named exactly "casaos" exists (any state).
+ * A stopped/restarting casaos container still means a CasaOS platform, so
+ * `-a` is used; this also covers the reboot race where both containers start
+ * in parallel. Only actual docker command failures (e.g. daemon still coming
+ * up) are retried; a clean "no casaos container" result returns immediately.
  */
 export async function isCasaOSAvailable(): Promise<boolean> {
-  try {
-    const { stdout } = await execAsync('docker ps --filter "name=casaos" --format "{{.Names}}"');
-    return stdout.trim().includes('casaos');
-  } catch (error) {
-    console.log('[CasaOS] Detection failed, assuming not available');
-    return false;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { stdout } = await execAsync('docker ps -a --filter "name=^casaos$" --format "{{.Names}}"');
+      return stdout.split('\n').some(line => line.trim() === 'casaos');
+    } catch (error) {
+      if (attempt >= DETECT_RETRIES) {
+        console.log('[CasaOS] Detection failed after retries, assuming not available');
+        return false;
+      }
+      console.log(`[CasaOS] Detection failed (attempt ${attempt + 1}/${DETECT_RETRIES + 1}), retrying in 2s...`);
+      await new Promise(resolve => setTimeout(resolve, DETECT_RETRY_DELAY_MS));
+    }
   }
 }
 

@@ -1107,6 +1107,12 @@
         .replace(/'/g, '&#39;');
     }
 
+    // Safe interpolation of a value into a JS context inside an inline on* attribute:
+    // JSON.stringify builds a valid JS string literal, escapeHtml makes it attribute-safe.
+    function jsArg(v) {
+      return escapeHtml(JSON.stringify(String(v)));
+    }
+
     function getDisplayUrl(url) {
       if (!url) return '';
       return url.replace(/\/\/([^@]+)@/, '//***@');
@@ -1282,11 +1288,11 @@
                   ${(bot.publicUrl || bot.hostPort) ? `<a class="btn btn-primary btn-small" href="${(bot.publicUrl ? escapeHtml(bot.publicUrl) : `http://${location.hostname}:${bot.hostPort}`) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
-                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
                   <button class="btn btn-secondary btn-small" onclick="showConfigEditor('${bot.id}')" disabled title="Stop the bot to edit config files">Config</button>
-                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', '${escapeHtml(botName)}')" title="Open an interactive shell inside the bot's container">Console</button>
-                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', '${escapeHtml(botName)}')" title="Browse and edit the bot's files">Files</button>
+                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', ${jsArg(botName)})" title="Open an interactive shell inside the bot's container">Console</button>
+                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', ${jsArg(botName)})" title="Browse and edit the bot's files">Files</button>
                   ${isGit ? (showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
@@ -1295,16 +1301,16 @@
                   ${showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`}
-                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', '${escapeHtml(botName)}')">Logs</button>
-                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', ${jsArg(botName)})">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
-                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', '${escapeHtml(botName)}')" disabled title="Start the bot to open a console">Console</button>
-                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', '${escapeHtml(botName)}')" title="Browse and edit the bot's persistent files">Files</button>
+                  <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', ${jsArg(botName)})" disabled title="Start the bot to open a console">Console</button>
+                  <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', ${jsArg(botName)})" title="Browse and edit the bot's persistent files">Files</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
-                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', '${escapeHtml(botName)}')">Build Logs</button>
+                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', ${jsArg(botName)})">Build Logs</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
@@ -1590,7 +1596,7 @@
 
         content.innerHTML = `
           <h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3>
-          ${!res.valid ? `<div class="error-message">Missing required: ${res.missing.join(', ')}</div>` : ''}
+          ${!res.valid ? `<div class="error-message">Missing required: ${escapeHtml(res.missing.join(', '))}</div>` : ''}
           <div id="env-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
           <div class="modal-actions">
@@ -1614,7 +1620,7 @@
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
           <div class="env-vault-wrapper">
             <input type="text" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
-            <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, '${escapeHtml(key)}')" title="Pick from vault" type="button">&#9660;</button>
+            <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, ${jsArg(key)})" title="Pick from vault" type="button">&#9660;</button>
           </div>
           ${regenBtn}
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
@@ -1868,7 +1874,7 @@
     function renderServiceSidebar() {
       const list = document.getElementById('slp-service-list');
       list.innerHTML = logsState.containers.map(c => `
-        <div class="slp-svc ${c.name === logsState.selectedContainer ? 'active' : ''}" onclick="selectContainer('${escapeHtml(c.name)}')">
+        <div class="slp-svc ${c.name === logsState.selectedContainer ? 'active' : ''}" onclick="selectContainer(${jsArg(c.name)})">
           <div class="slp-svc-name">${escapeHtml(c.name)}</div>
           <div class="slp-svc-status">${escapeHtml(c.state)} - ${escapeHtml(c.status)}</div>
         </div>
@@ -2302,7 +2308,7 @@
         <div class="form-group">
           <label>Bot Name</label>
           <div class="name-input-group">
-            ${!installNameLocked ? `<button class="name-reset-btn" onclick="resetInstallName('${escapeHtml(defaultName)}')" title="Reset to default">&#128260;</button>` : ''}
+            ${!installNameLocked ? `<button class="name-reset-btn" onclick="resetInstallName(${jsArg(defaultName)})" title="Reset to default">&#128260;</button>` : ''}
             <input type="text" id="install-name" value="${escapeHtml(defaultName)}" ${installNameLocked ? 'disabled' : ''} oninput="onNameInput()">
             <button class="name-edit-btn" onclick="toggleNameLock()" title="${installNameLocked ? 'Edit name' : 'Lock name'}">
               ${installNameLocked ? '&#9998;' : '&#128274;'}
@@ -3020,8 +3026,8 @@
               <button class="vault-entry-btn save" onclick="saveVaultRow(this.closest('.vault-entry'))" title="Save">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
               </button>
-              ${g.type === 'standalone' ? `<button class="vault-entry-btn delete" onclick="deleteVaultEntry('${escapeHtml(e.key)}')" title="Delete">&times;</button>` : ''}
-              ${g.type === 'deleted' ? `<button class="vault-entry-btn delete" onclick="deleteDeletedVaultEntry('${escapeHtml(e.key)}', '${escapeHtml(e.botName)}')" title="Delete">&times;</button>` : ''}
+              ${g.type === 'standalone' ? `<button class="vault-entry-btn delete" onclick="deleteVaultEntry(${jsArg(e.key)})" title="Delete">&times;</button>` : ''}
+              ${g.type === 'deleted' ? `<button class="vault-entry-btn delete" onclick="deleteDeletedVaultEntry(${jsArg(e.key)}, ${jsArg(e.botName)})" title="Delete">&times;</button>` : ''}
             </div>`;
           }).join('');
 

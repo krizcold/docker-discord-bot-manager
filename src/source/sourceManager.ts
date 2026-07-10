@@ -17,50 +17,34 @@ const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
 const REGISTRY_FILE = path.join(DATA_DIR, 'sources.json');
 
-// ─── Write Queue (same pattern as containerManager) ───
-
-let writeInProgress = false;
-const writeQueue: Array<() => void> = [];
-
-function queueRegistryWrite(fn: () => void): void {
-  writeQueue.push(fn);
-  if (!writeInProgress) {
-    processWriteQueue();
-  }
-}
-
-function processWriteQueue(): void {
-  if (writeQueue.length === 0) {
-    writeInProgress = false;
-    return;
-  }
-  writeInProgress = true;
-  const fn = writeQueue.shift()!;
-  try {
-    fn();
-  } catch (err) {
-    console.error('[SourceManager] Registry write error:', err);
-  }
-  processWriteQueue();
-}
-
 // ─── Registry Operations ───
 
 export function loadSourceRegistry(): SourceRegistry {
-  if (!fs.existsSync(REGISTRY_FILE)) {
-    return { sources: {} };
+  try {
+    if (fs.existsSync(REGISTRY_FILE)) {
+      const data = fs.readFileSync(REGISTRY_FILE, 'utf-8');
+      return JSON.parse(data) as SourceRegistry;
+    }
+  } catch (err) {
+    console.warn('[SourceManager] sources.json is unreadable, continuing with an empty registry:', err);
+    // Preserve the corrupt file (first copy wins) so the sources stay recoverable
+    // instead of the next save overwriting them with an empty registry.
+    try {
+      const corruptFile = `${REGISTRY_FILE}.corrupt`;
+      if (!fs.existsSync(corruptFile)) fs.copyFileSync(REGISTRY_FILE, corruptFile);
+    } catch { /* best effort */ }
   }
-  const data = fs.readFileSync(REGISTRY_FILE, 'utf-8');
-  return JSON.parse(data) as SourceRegistry;
+  return { sources: {} };
 }
 
-function saveRegistrySync(registry: SourceRegistry): void {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(REGISTRY_FILE, JSON.stringify(registry, null, 2));
-}
-
+// Synchronous atomic write: each mutator's load -> mutate -> save runs to completion
+// on the single JS thread (a deferred/queued write let a stale snapshot revert another
+// writer's change), and temp+rename means a crash mid-write cannot truncate the file.
 function saveSourceRegistry(registry: SourceRegistry): void {
-  queueRegistryWrite(() => saveRegistrySync(registry));
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${REGISTRY_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
+  fs.renameSync(tmp, REGISTRY_FILE);
 }
 
 // ─── Path Helpers ───
@@ -435,7 +419,9 @@ function reAssociateInstances(sourceId: string, sourceUrl: string): void {
     }
 
     if (changed) {
-      fs.writeFileSync(instancesFile, JSON.stringify(data, null, 2));
+      const tmp = `${instancesFile}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, instancesFile);
     }
   } catch (err) {
     console.warn('[SourceManager] Failed to re-associate instances:', err);

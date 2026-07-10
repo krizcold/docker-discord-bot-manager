@@ -206,6 +206,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
+        return;
+      }
+
       // When keepEnv=true (default), preserve env vars in vault for recovery.
       // When keepEnv=false, user explicitly wants them gone; don't save.
       if (keepEnv) {
@@ -257,6 +263,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
+        return;
+      }
+
       res.json({ success: true, message: 'Starting bot' });
 
       const botId = req.params.id;
@@ -280,6 +292,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    */
   router.post('/:id/stop', async (req: Request, res: Response) => {
     try {
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
+        return;
+      }
+
       const result = await containerManager.stopBot(req.params.id);
       if (!result.success) {
         res.status(400).json(result);
@@ -302,6 +320,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
         return;
       }
 
@@ -337,6 +361,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       if (bot.sourceType === 'docker-image') {
         res.status(400).json({ success: false, error: 'Cannot update docker-image instances this way' });
+        return;
+      }
+
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
         return;
       }
 
@@ -376,6 +406,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const busyOp = containerManager.isBotBusy(req.params.id);
+      if (busyOp) {
+        res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
         return;
       }
 

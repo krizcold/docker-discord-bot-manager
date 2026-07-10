@@ -437,6 +437,32 @@ function getImageName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-${instance.id}:latest`;
 }
 
+// ─── Per-Bot Operation Lock ───
+
+// Server-side guard: the UI's busy tracking is client-only, so two tabs or a
+// user racing a scheduler could run conflicting lifecycle ops on the same bot.
+// The lock is held for the whole top-level operation; composite ops (restart,
+// update, start's build safety net) call the unguarded *Impl functions
+// internally so an op chain never blocks itself.
+const activeOps = new Map<string, string>();
+
+export function isBotBusy(botId: string): string | null {
+  return activeOps.get(botId) || null;
+}
+
+async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Promise<T> {
+  const current = activeOps.get(botId);
+  if (current) {
+    throw new Error(`Operation '${current}' is already in progress for this bot`);
+  }
+  activeOps.set(botId, op);
+  try {
+    return await fn();
+  } finally {
+    activeOps.delete(botId);
+  }
+}
+
 // ─── Delete ───
 
 async function performManualCleanup(appName: string, removeData: boolean): Promise<{ failures: string[] }> {
@@ -570,13 +596,20 @@ async function performDockerCleanup(appName: string, composePath: string): Promi
 }
 
 export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
+  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData));
+}
+
+async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean> {
+  const instance = getBot(botId);
   if (!instance) return false;
 
   const deploymentMode = await getDeploymentMode();
   const appName = resolveAppName(botId);
   const botDir = getBotDir(botId);
+
+  // Transient status: the reconciler only touches terminal states, so the bot
+  // can't be flipped back to running/stopped while containers go down.
+  updateBotStatus(botId, 'stopping');
 
   // Track per-step failures so the function reports an honest result. We
   // still attempt every cleanup step (a stuck container shouldn't prevent
@@ -674,19 +707,24 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
     }
   }
 
-  delete registry.instances[botId];
-  saveRegistry(registry);
-  logCollectors.remove(botId);
-
   if (failures.length > 0) {
-    // Throw rather than return false: callers (API routes) translate
-    // exceptions into HTTP errors with the full message, so the user sees
-    // exactly which step(s) didn't complete. Returning false would hide
-    // the detail.
+    // Keep the registry entry: removing it would orphan whatever the failed
+    // step(s) left behind (stuck containers, in-use image, locked volume)
+    // with no UI handle left to retry Delete. Throw rather than return false:
+    // callers (API routes) translate exceptions into HTTP errors with the
+    // full message, so the user sees exactly which step(s) didn't complete.
+    updateBotStatus(botId, 'error');
     const summary = `Bot ${botId} uninstall completed with ${failures.length} failure(s):\n  - ${failures.join('\n  - ')}`;
     console.error(`[ContainerManager] ${summary}`);
     throw new Error(summary);
   }
+
+  // Cleanup succeeded: remove the registry entry LAST. Fresh load - the
+  // snapshot from function entry is stale after the status updates above.
+  const registry = loadRegistry();
+  delete registry.instances[botId];
+  saveRegistry(registry);
+  logCollectors.remove(botId);
 
   console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData})`);
   return true;
@@ -1010,6 +1048,10 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
 // ─── Start ───
 
 export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
+  return withBotOp(botId, 'start', () => startBotImpl(botId));
+}
+
+async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   if (instance.status === 'running') return { success: false, error: 'Bot is already running' };
@@ -1041,7 +1083,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
     // Build if compose doesn't exist
     if (!fs.existsSync(localComposePath)) {
       emit('[Build] No compose file found, running build first...', 'info');
-      const buildResult = await buildBot(botId);
+      const buildResult = await buildBotImpl(botId);
       if (!buildResult.success) {
         throw new Error(`Build failed: ${buildResult.error || 'unknown error'}`);
       }
@@ -1154,7 +1196,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
     const localComposePath = path.join(botDir, 'docker-compose.yml');
 
     if (!fs.existsSync(localComposePath)) {
-      const buildResult = await buildBot(botId);
+      const buildResult = await buildBotImpl(botId);
       if (!buildResult.success) {
         return { success: false, error: `Build failed: ${buildResult.error || 'unknown error'}` };
       }
@@ -1237,6 +1279,10 @@ async function getContainerIdsForBot(botId: string): Promise<string[]> {
 // ─── Stop ───
 
 export async function stopBot(botId: string): Promise<{ success: boolean; error?: string }> {
+  return withBotOp(botId, 'stop', () => stopBotImpl(botId));
+}
+
+async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   if (instance.status !== 'running') return { success: false, error: 'Bot is not running' };
@@ -1286,16 +1332,22 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
 // ─── Restart ───
 
 export async function restartBot(botId: string): Promise<{ success: boolean; error?: string }> {
-  const stopResult = await stopBot(botId);
-  if (!stopResult.success && stopResult.error !== 'Bot is not running') {
-    return stopResult;
-  }
-  return startBot(botId);
+  return withBotOp(botId, 'restart', async () => {
+    const stopResult = await stopBotImpl(botId);
+    if (!stopResult.success && stopResult.error !== 'Bot is not running') {
+      return stopResult;
+    }
+    return startBotImpl(botId);
+  });
 }
 
 // ─── Pull & Rebuild (Instance Update) ───
 
 export async function pullAndRebuild(botId: string): Promise<{ success: boolean; error?: string }> {
+  return withBotOp(botId, 'update', () => pullAndRebuildImpl(botId));
+}
+
+async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 
@@ -1303,7 +1355,7 @@ export async function pullAndRebuild(botId: string): Promise<{ success: boolean;
 
   try {
     if (wasRunning) {
-      await stopBot(botId);
+      await stopBotImpl(botId);
     }
 
     // For source-backed instances, the source repo is already up to date
@@ -1322,13 +1374,13 @@ export async function pullAndRebuild(botId: string): Promise<{ success: boolean;
     }
 
     // Rebuild
-    const buildResult = await buildBot(botId);
+    const buildResult = await buildBotImpl(botId);
     if (!buildResult.success) {
       return { success: false, error: `Rebuild failed: ${buildResult.error || 'unknown error'}` };
     }
 
     if (wasRunning) {
-      return startBot(botId);
+      return startBotImpl(botId);
     }
 
     return { success: true };
@@ -1358,6 +1410,10 @@ function resolveImageDataTarget(imageRef: string): string {
 }
 
 export async function buildBot(botId: string): Promise<{ success: boolean; error?: string }> {
+  return withBotOp(botId, 'build', () => buildBotImpl(botId));
+}
+
+async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 

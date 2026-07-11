@@ -236,10 +236,23 @@ export function updateSource(sourceId: string, update: UpdateSourceRequest): Sou
   const source = registry.sources[sourceId];
   if (!source) return null;
 
+  const urlChanged = update.url !== undefined && update.url !== source.url;
+  const branchChanged = update.branch !== undefined && update.branch !== source.branch;
+
   if (update.url !== undefined) source.url = update.url;
   if (update.autoUpdate !== undefined) source.autoUpdate = update.autoUpdate;
   if (update.branch !== undefined) source.branch = update.branch;
   source.updatedAt = new Date().toISOString();
+
+  if (urlChanged || branchChanged) {
+    // The clone is pinned to the old url/branch (--single-branch fetch refspec),
+    // so wipe it; the next fetch re-clones with the new settings and refreshes commit info.
+    fs.rmSync(getSourceDir(sourceId), { recursive: true, force: true });
+    source.lastCommitHash = null;
+    source.lastCommitMessage = null;
+    source.lastCommitDate = null;
+    console.log(`[SourceManager] Source ${sourceId} url/branch changed, clone wiped for re-clone`);
+  }
 
   registry.sources[sourceId] = source;
   saveSourceRegistry(registry);

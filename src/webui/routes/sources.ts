@@ -93,6 +93,17 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
 
       broadcastToClients(wss, 'source:updated', source);
       res.json({ success: true, source });
+
+      // A url/branch change wiped the clone (lastChecked set, commit info nulled);
+      // re-clone in the background and push the refreshed source to the UI when done.
+      if (source.sourceType !== 'docker-image' && source.lastChecked && !source.lastCommitHash) {
+        sourceManager.fetchSource(source.id)
+          .then(() => broadcastToClients(wss, 'source:updated', sourceManager.getSource(source.id)))
+          .catch(err => {
+            console.error(`[API] Re-clone after source edit failed for ${source.id}:`, err);
+            broadcastToClients(wss, 'source:fetch-failed', { id: source.id, error: String(err) });
+          });
+      }
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

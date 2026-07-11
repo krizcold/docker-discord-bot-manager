@@ -1036,6 +1036,10 @@
             loadSources();
             loadBots();
             break;
+          case 'source:fetch-failed':
+            showMessage('error', 'Source fetch failed: ' + (payload?.error || 'unknown error'));
+            loadSources();
+            break;
 
           // Interactive console (multiplexed on this socket)
           case 'terminal:data':
@@ -2068,7 +2072,9 @@
           ${isImage
             ? `<div class="source-card-url" style="margin-left:26px;">Image: <span style="font-family:monospace;">${escapeHtml(s.imageRef || '')}</span> ${instanceBadge}</div>`
             : `<div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
-          <div class="source-card-meta" style="margin-left:26px;">${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}</div>`}
+          <div class="source-card-meta" style="margin-left:26px;">${s.lastChecked && !s.lastCommitHash
+            ? `${escapeHtml(s.branch)} &middot; <span style="color:var(--warning);animation:pulse 2s infinite;">Fetching...</span>`
+            : `${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}`}</div>`}
           <div class="source-card-actions" style="margin-left:26px;">
             ${!isImage && isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
             <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>` : ''}

@@ -59,7 +59,13 @@ read_secret() { local __v; read -rsp "$2" __v; printf '\n' >&2; printf -v "$1" '
 authelia_cli() { docker run --rm "$AUTHELIA_IMAGE" authelia "$@"; }
 # Extract the value by shape, so a labelled or bare CLI output both parse.
 gen_secret() { authelia_cli crypto rand --length 64 --charset alphanumeric 2>/dev/null | grep -oE '[A-Za-z0-9]{64}' | head -n1; }
-gen_hash()   { authelia_cli crypto hash generate argon2 --password "$1" 2>/dev/null | grep -oE '\$argon2id\$[^[:space:]]+' | head -n1; }
+# The password travels via stdin (the image's CLI has no stdin mode itself), so it
+# never appears in the host docker argv or in docker inspect.
+gen_hash() {
+  printf '%s\n' "$1" | docker run -i --rm --entrypoint sh "$AUTHELIA_IMAGE" \
+    -c 'IFS= read -r pw; exec authelia crypto hash generate argon2 --password "$pw"' 2>/dev/null \
+    | grep -oE '\$argon2id\$[^[:space:]]+' | head -n1
+}
 
 detect_public_ip() {
   local ip
@@ -100,6 +106,18 @@ fi
 [ -S /var/run/docker.sock ] || die "No /var/run/docker.sock - this setup requires rootful Docker."
 docker info >/dev/null 2>&1 || die "Cannot reach the Docker daemon (is it running? 'systemctl status docker')."
 
+# ── Fresh-clone guard ─────────────────────────────────────────────────────────
+# The invariant is the storage encryption key itself: a leftover Authelia volume
+# is unreadable without the exact STORAGE_ENCRYPTION_KEY that wrote it, and a
+# missing key file gets silently regenerated further down.
+if [ ! -s "$SECRETS_DIR/STORAGE_ENCRYPTION_KEY" ]; then
+  compose_project="$(sed -n 's/^name:[[:space:]]*//p' "$COMPOSE_FILE" | head -n1)"
+  authelia_volume="${compose_project}_authelia_data"
+  if [ -n "$compose_project" ] && docker volume inspect "$authelia_volume" >/dev/null 2>&1; then
+    die "The Authelia data volume '$authelia_volume' exists from a previous install, but $SECRETS_DIR/STORAGE_ENCRYPTION_KEY is missing - a fresh key cannot read its database. Either restore the previous authelia/secrets/ directory (and .env) into this clone, or start fresh with: docker volume rm $authelia_volume"
+  fi
+fi
+
 AUTHELIA_IMAGE="$(grep -oE 'authelia/authelia:[^[:space:]"]+' "$COMPOSE_FILE" | head -n1)"
 [ -n "$AUTHELIA_IMAGE" ] || die "Could not read the Authelia image tag from $COMPOSE_FILE."
 info "Pulling $AUTHELIA_IMAGE ..."
@@ -118,13 +136,22 @@ ok "Data dir ready: $HOST_DATA_DIR (root owned $PUID:$PGID; per-bot files chowne
 
 # ── Hostname / domain ─────────────────────────────────────────────────────────
 prev_cookie_domain="$(env_get COOKIE_DOMAIN)"
+prev_domain_base="$(env_get BOT_DOMAIN_BASE)"; [ -n "$prev_domain_base" ] || prev_domain_base="$(env_get PUBLIC_HOST)"
+case "$prev_domain_base" in
+  ''|*.sslip.io) domain_default=1 ;;
+  *) domain_default=2 ;;
+esac
 info "How should the manager be reached over HTTPS?"
 say  "  1) sslip.io           - no domain, derived from this server's public IP (quick start)"
 say  "  2) your own domain    - sturdier certs/cookies (recommended for anything you keep)"
-read -rp "Choice [1]: " domain_choice; domain_choice="${domain_choice:-1}"
+read -rp "Choice [$domain_default]: " domain_choice; domain_choice="${domain_choice:-$domain_default}"
 
 if [ "$domain_choice" = "2" ]; then
-  read -rp "Base domain (e.g. example.com): " BASE_DOMAIN
+  # Re-runs default to the configured domain (never an sslip.io host).
+  domain_prev=""
+  case "$prev_cookie_domain" in *.sslip.io|'') : ;; *) domain_prev="$prev_cookie_domain" ;; esac
+  read -rp "Base domain (e.g. example.com)${domain_prev:+ [$domain_prev]}: " BASE_DOMAIN
+  BASE_DOMAIN="${BASE_DOMAIN:-$domain_prev}"
   [ -n "$BASE_DOMAIN" ] || die "A domain is required for option 2."
   COOKIE_DOMAIN="$BASE_DOMAIN"
   PUBLIC_HOST="bot.$BASE_DOMAIN"
@@ -273,6 +300,7 @@ ok "Wrote $ENV_FILE"
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
 info "Starting the stack (the first build can take a few minutes) ..."
+deploy_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."
 
 if [ "$need_password" -eq 1 ]; then
@@ -293,7 +321,7 @@ docker compose -f "$COMPOSE_FILE" ps || true
 info "Checking Caddy TLS issuance (up to 60s) ..."
 cert_state=0
 for _ in $(seq 1 12); do
-  logs="$(docker logs caddy 2>&1)"
+  logs="$(docker logs --since "$deploy_started_at" caddy 2>&1)"
   if printf '%s' "$logs" | grep -qiE 'certificate obtained successfully|obtaining certificate'; then cert_state=1; break; fi
   if printf '%s' "$logs" | grep -qiE 'could not get certificate|failed to obtain certificate|too many certificates already issued|no solvers available'; then cert_state=2; break; fi
   sleep 5

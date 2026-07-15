@@ -125,19 +125,28 @@ export async function listContainersByBotId(botId: string): Promise<ContainerInf
 
 /**
  * Host ports currently published by any container (`0.0.0.0:18080->...`,
- * `127.0.0.1:18080->...`, `:::18080->...`). Used to avoid colliding when
- * auto-assigning a bot's host port in docker mode.
+ * `127.0.0.1:18080->...`, `:::18080->...`), keyed to the publishing container
+ * names. Used to avoid colliding when auto-assigning a bot's host port in
+ * docker mode; the names let a bot's own published ports be excluded.
  */
-export function listPublishedHostPorts(): Set<number> {
-  const ports = new Set<number>();
+export function listPublishedHostPorts(): Map<number, string[]> {
+  const ports = new Map<number, string[]>();
   try {
-    const output = execDocker(['ps', '-a', '--format', '{{.Ports}}'], { timeout: 10000 });
-    for (const m of output.matchAll(/:(\d+)->/g)) {
-      const n = parseInt(m[1], 10);
-      if (!isNaN(n)) ports.add(n);
+    const output = execDocker(['ps', '-a', '--format', '{{.Names}}|{{.Ports}}'], { timeout: 10000 });
+    for (const line of output.split('\n')) {
+      const sep = line.indexOf('|');
+      if (sep < 0) continue;
+      const name = line.slice(0, sep);
+      for (const m of line.slice(sep + 1).matchAll(/:(\d+)->/g)) {
+        const n = parseInt(m[1], 10);
+        if (isNaN(n)) continue;
+        const names = ports.get(n);
+        if (names) names.push(name);
+        else ports.set(n, [name]);
+      }
     }
   } catch {
-    // Best effort; an empty set just means no collision avoidance this round.
+    // Best effort; an empty map just means no collision avoidance this round.
   }
   return ports;
 }

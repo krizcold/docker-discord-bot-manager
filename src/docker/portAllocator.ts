@@ -23,8 +23,8 @@ function seedOffset(botId: string): number {
  * Pick a free host port for a bot. Reuses the bot's previous port when still free
  * (stable URL); otherwise linear-probes from a deterministic offset. `used` are
  * ports claimed by other instances; `hostBound` are ports currently published on
- * the host (from dockerClient.listPublishedHostPorts). Returns null if the whole
- * range is taken.
+ * the host by other bots' containers (the bot's own published ports are excluded
+ * so a running bot can keep its port). Returns null if the whole range is taken.
  */
 export function allocateHostPort(opts: {
   botId: string;

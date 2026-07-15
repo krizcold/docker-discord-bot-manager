@@ -11,3 +11,6 @@ npm-debug.log*
 .env
 .env.*
 authelia/secrets
+
+# Runtime bot data - never send to the build context
+data/

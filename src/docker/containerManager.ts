@@ -885,11 +885,18 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
     for (const b of getAllBots()) {
       if (b.id !== instance.id && typeof b.hostPort === 'number') used.add(b.hostPort);
     }
+    // A running bot publishes its own port; that must not block reusing it on rebuild.
+    const isOwnContainer = (name: string) =>
+      name.startsWith(instance.sanitizedName) || name.includes(`-${instance.id}-`);
+    const hostBound = new Set<number>();
+    for (const [port, names] of dockerClient.listPublishedHostPorts()) {
+      if (!names.every(isOwnContainer)) hostBound.add(port);
+    }
     const allocated = allocateHostPort({
       botId: instance.id,
       reuse: instance.hostPort,
       used,
-      hostBound: dockerClient.listPublishedHostPorts(),
+      hostBound,
     });
     if (allocated !== null) {
       hostPort = allocated;

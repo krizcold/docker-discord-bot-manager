@@ -566,6 +566,7 @@
     <h1>Discord Bot Manager</h1>
     <div class="status">
       <div id="manager-version" style="display:flex;align-items:center;gap:8px;font-size:13px;margin-right:16px;"></div>
+      <button id="manager-updating-pill" class="update-badge hidden" style="border:none;cursor:pointer;margin-right:16px;" onclick="openManagerUpdateModal()" title="An update is in progress. Click to reopen the log.">Updating...</button>
       <div class="dot"></div>
       <span>Docker Connected</span>
     </div>
@@ -871,8 +872,14 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    function openManagerUpdateModal() {
+      document.getElementById('manager-update-modal').classList.remove('hidden');
+      document.getElementById('manager-updating-pill').classList.add('hidden');
+    }
+
     function closeManagerUpdateModal() {
       document.getElementById('manager-update-modal').classList.add('hidden');
+      if (managerUpdating) document.getElementById('manager-updating-pill').classList.remove('hidden');
     }
 
     function finishManagerUpdate(ok, logLine, title, toast) {
@@ -880,6 +887,7 @@
       document.getElementById('manager-update-title').textContent = title;
       document.getElementById('manager-update-close').disabled = false;
       managerUpdating = false;
+      document.getElementById('manager-updating-pill').classList.add('hidden');
       showMessage(ok ? 'success' : 'error', toast);
     }
 
@@ -912,7 +920,7 @@
       const title = document.getElementById('manager-update-title');
       document.getElementById('manager-update-log').textContent = '';
       title.textContent = 'Updating Bot Manager';
-      document.getElementById('manager-update-modal').classList.remove('hidden');
+      openManagerUpdateModal();
       appendManagerLog('Starting update...');
       try {
         const res = await api('POST', '/manager/update');
@@ -934,9 +942,8 @@
 
       ws.onopen = () => {
         if (hasConnectedBefore) {
-          // Reconnect: resync in case events were missed during the gap.
-          loadBots();
-          loadSources();
+          // Reconnect: resync in case events were missed during the gap (sources before bots, same as init)
+          loadSources().then(() => loadBots());
           if (managerUpdating) resolveManagerReconnect();
         }
         loadManagerVersion();
@@ -1036,10 +1043,12 @@
             loadSources();
             loadBots();
             break;
-          case 'source:fetch-failed':
-            showMessage('error', 'Source fetch failed: ' + (payload?.error || 'unknown error'));
-            loadSources();
+          case 'source:fetch-failed': {
+            const failedSource = sources.find(s => s.id === id);
+            const failedName = failedSource ? sourcePresentation(failedSource).name : (id || 'unknown source');
+            showMessage('error', `Source fetch failed for ${failedName}: ${payload?.error || 'unknown error'}`);
             break;
+          }
 
           // Interactive console (multiplexed on this socket)
           case 'terminal:data':
@@ -1057,6 +1066,16 @@
 
           // Manager self-update progress (streamed to the update modal)
           case 'manager:update-started':
+            // In the initiating tab managerUpdating is set before the POST, so this only fires elsewhere
+            if (managerUpdating) break;
+            managerUpdating = true;
+            managerUpdateBaseline = lastManagerVersion
+              ? { commit: lastManagerVersion.currentCommit, bootId: lastManagerVersion.bootId }
+              : null;
+            document.getElementById('manager-update-log').textContent = '';
+            document.getElementById('manager-update-title').textContent = 'Updating Bot Manager';
+            openManagerUpdateModal();
+            appendManagerLog('Update started from another session...');
             break;
           case 'manager:log':
             appendManagerLog(payload?.line || '');
@@ -1171,6 +1190,7 @@
 
     function renderBots() {
       const container = document.getElementById('bots-container');
+      const isLocalBrowser = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 
       if (bots.length === 0) {
         container.innerHTML = `
@@ -1289,7 +1309,11 @@
               ${(isGit || webAuthControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}</div>` : ''}
               <div class="bot-card-actions">
                 ${isRunning ? `
-                  ${(bot.publicUrl || bot.hostPort) ? `<a class="btn btn-primary btn-small" href="${(bot.publicUrl ? escapeHtml(bot.publicUrl) : `http://${location.hostname}:${bot.hostPort}`) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>` : ''}
+                  ${bot.publicUrl
+                    ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.publicUrl) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
+                    : bot.hostPort ? (isLocalBrowser
+                      ? `<a class="btn btn-primary btn-small" href="http://${location.hostname}:${bot.hostPort}${escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
+                      : `<button class="btn btn-primary btn-small" disabled title="The bot's web UI port is bound to 127.0.0.1 on the server, so it is only reachable from the server itself. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.">Open</button>`) : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>

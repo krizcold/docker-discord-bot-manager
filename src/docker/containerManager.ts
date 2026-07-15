@@ -599,6 +599,57 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
   return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData));
 }
 
+/**
+ * Everything a delete is responsible for removing that still exists. Empty
+ * means the delete achieved its goal regardless of what individual steps
+ * reported (an already-uninstalled app fails the API call but leaves nothing).
+ */
+async function listDeleteRemnants(
+  instance: InstanceConfig,
+  appName: string,
+  botDir: string,
+  keepData: boolean,
+  deploymentMode: DeploymentMode
+): Promise<string[]> {
+  const remnants: string[] = [];
+  try {
+    const containers = await dockerClient.listBotContainers();
+    for (const c of containers) {
+      if (c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`)) {
+        remnants.push(`container ${c.name}`);
+      }
+    }
+  } catch {
+    // Cannot see containers at all: do not deregister on blind faith.
+    remnants.push('unverified containers (docker unreachable)');
+  }
+
+  try {
+    const imageName = getImageName(instance);
+    if (dockerClient.imageExists(imageName)) remnants.push(`image ${imageName}`);
+  } catch { /* ignore */ }
+
+  if (!keepData) {
+    try {
+      for (const v of dockerClient.listProjectVolumes(appName)) remnants.push(`volume ${v}`);
+    } catch { /* ignore */ }
+    if (fs.existsSync(botDir)) remnants.push(`directory ${botDir}`);
+  } else if (fs.existsSync(path.join(botDir, 'docker-compose.yml'))) {
+    remnants.push(`compose file in ${botDir}`);
+  }
+
+  if (deploymentMode === 'casaos') {
+    const dataRoot = process.env.DATA_ROOT || '/DATA';
+    if (fs.existsSync(path.join(dataRoot, 'AppData', 'casaos', 'apps', appName))) {
+      remnants.push('CasaOS app metadata');
+    }
+    if (!keepData && fs.existsSync(path.join(dataRoot, 'AppData', appName))) {
+      remnants.push(`AppData/${appName}`);
+    }
+  }
+  return remnants;
+}
+
 async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean> {
   const instance = getBot(botId);
   if (!instance) return false;
@@ -708,15 +759,22 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   }
 
   if (failures.length > 0) {
-    // Keep the registry entry: removing it would orphan whatever the failed
-    // step(s) left behind (stuck containers, in-use image, locked volume)
-    // with no UI handle left to retry Delete. Throw rather than return false:
-    // callers (API routes) translate exceptions into HTTP errors with the
-    // full message, so the user sees exactly which step(s) didn't complete.
-    updateBotStatus(botId, 'error');
-    const summary = `Bot ${botId} uninstall completed with ${failures.length} failure(s):\n  - ${failures.join('\n  - ')}`;
-    console.error(`[ContainerManager] ${summary}`);
-    throw new Error(summary);
+    // Judge by the goal, not the step results: a retry after a partial delete
+    // (or an app someone already removed) hits step errors like "app not
+    // found" even though nothing is left to clean, and would otherwise stay
+    // stuck in error forever. Only keep the registry entry when something the
+    // delete owns actually remains; then the user retains a Delete button to
+    // retry against the listed remnants.
+    const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, deploymentMode);
+    if (remnants.length > 0) {
+      updateBotStatus(botId, 'error');
+      const summary =
+        `Bot ${botId} uninstall incomplete - still present: ${remnants.join(', ')}\n` +
+        `Step errors:\n  - ${failures.join('\n  - ')}`;
+      console.error(`[ContainerManager] ${summary}`);
+      throw new Error(summary);
+    }
+    console.warn(`[ContainerManager] Uninstall steps reported errors but nothing remains for ${appName}; treating as complete: ${failures.join('; ')}`);
   }
 
   // Cleanup succeeded: remove the registry entry LAST. Fresh load - the

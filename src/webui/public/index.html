@@ -212,6 +212,21 @@
       font-size: 0.72rem; color: var(--text-muted); padding: 0 2px; margin-bottom: 2px;
     }
     .env-label.required { color: var(--warning); }
+    .env-row select.env-value {
+      flex: 1; padding: 7px 10px; background: var(--bg-primary);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-primary); font-size: 0.82rem;
+    }
+    .env-row select.env-value:focus { outline: none; border-color: var(--border-focus); }
+    .env-group {
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 10px; margin: 8px 0;
+    }
+    .env-group-title { font-size: 0.8rem; font-weight: 600; color: var(--text-primary); margin-bottom: 2px; }
+    .env-advanced summary {
+      cursor: pointer; font-size: 0.72rem; color: var(--text-muted); margin: 4px 0 6px;
+    }
+    .env-advanced summary:hover { color: var(--text-primary); }
     .detection-info {
       background: var(--bg-tertiary); padding: 10px 14px; border-radius: var(--radius);
       margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary);
@@ -1632,29 +1647,90 @@
             <button class="btn btn-primary" onclick="saveEnvEditor()">Save</button>
           </div>
         `;
+        initEnvConditionals('env-editor-rows');
       } catch (err) {
         content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">Failed to load environment variables</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
       }
     }
 
-    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive, isAuthHash) {
-      const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${required ? ' (required)' : ''}</div>` : '';
+    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive, isAuthHash, meta) {
+      meta = meta || {};
+      const reqSpan = (required || meta.requiredWhen)
+        ? `<span class="env-req"${required ? '' : ' style="display:none"'}> (required)</span>` : '';
+      const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${reqSpan}</div>` : '';
       const tipHtml = description ? `<div class="env-tip">${escapeHtml(description)}</div>` : '';
       const regenBtn = isAuthHash ? `<button class="btn btn-secondary btn-small" onclick="regenerateAuthHash(this)" title="Generate a new access hash" type="button">Regenerate</button>` : '';
-      return `<div>
+      const genBtn = meta.generate ? `<button class="btn btn-secondary btn-small" onclick="generateEnvSecret(this)" title="Generate a random secret" type="button">Generate</button>` : '';
+      let valueHtml;
+      if (meta.options) {
+        const optionsHtml = meta.options.map(o => {
+          const v = String(o.value);
+          return `<option value="${escapeHtml(v)}"${v === String(value) ? ' selected' : ''}>${escapeHtml(o.label || v)}</option>`;
+        }).join('');
+        valueHtml = `<select class="env-value">${optionsHtml}</select>`;
+      } else {
+        valueHtml = `<div class="env-vault-wrapper">
+            <input type="${meta.inputType === 'number' ? 'number' : 'text'}" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
+            <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, ${jsArg(key)})" title="Pick from vault" type="button">&#9660;</button>
+          </div>`;
+      }
+      const condAttrs =
+        (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${escapeHtml(meta.showWhen.equals)}"` : '') +
+        (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${escapeHtml(meta.requiredWhen.equals)}"` : '');
+      return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row">
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
-          <div class="env-vault-wrapper">
-            <input type="text" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
-            <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, ${jsArg(key)})" title="Pick from vault" type="button">&#9660;</button>
-          </div>
+          ${valueHtml}
+          ${genBtn}
           ${regenBtn}
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
         </div>
         ${tipHtml}
       </div>`;
+    }
+
+    function generateEnvSecret(btn) {
+      const input = btn.closest('.env-row').querySelector('.env-value');
+      if (!input) return;
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      input.value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // ─── Metadata-driven env row conditionals (showWhen / requiredWhen) ───
+    function envRowValue(container, key) {
+      for (const row of container.querySelectorAll('.env-row')) {
+        const k = row.querySelector('.env-key');
+        if (k && k.value.trim() === key) {
+          const v = row.querySelector('.env-value');
+          return v ? v.value.trim() : '';
+        }
+      }
+      return '';
+    }
+
+    function updateEnvConditionals(container) {
+      container.querySelectorAll('[data-show-key]').forEach(w => {
+        w.style.display = envRowValue(container, w.dataset.showKey) === w.dataset.showEquals ? '' : 'none';
+      });
+      container.querySelectorAll('[data-req-key]').forEach(w => {
+        const on = envRowValue(container, w.dataset.reqKey) === w.dataset.reqEquals;
+        const label = w.querySelector('.env-label');
+        const span = w.querySelector('.env-req');
+        if (label) label.classList.toggle('required', on);
+        if (span) span.style.display = on ? '' : 'none';
+      });
+    }
+
+    function initEnvConditionals(containerId) {
+      const c = document.getElementById(containerId);
+      if (!c || !c.querySelector('[data-show-key], [data-req-key]')) return;
+      c.addEventListener('input', () => updateEnvConditionals(c));
+      c.addEventListener('change', () => updateEnvConditionals(c));
+      updateEnvConditionals(c);
     }
 
     async function regenerateAuthHash(btn) {
@@ -2377,6 +2453,7 @@
         </div>
       `;
       onNameInput();
+      initEnvConditionals('install-env-rows');
       if (window.guidedInitAll) guidedInitAll();
     }
 
@@ -2412,13 +2489,32 @@
       const value = e.sensitive ? '' : current;
       const placeholder = e.sensitive
         ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
-        : (current || 'Value');
-      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e.key === 'AUTH_HASH');
+        : (e.placeholder || current || 'Value');
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e.key === 'AUTH_HASH', e);
     }
 
+    // Consecutive entries sharing a `group` render inside a titled section; rows
+    // flagged `advanced` fold under a disclosure at the end of their section.
     function renderEnvRows(entries) {
       if (!entries || entries.length === 0) return buildEnvRowHtml('', '', null, false, '');
-      return entries.map(renderEnvRow).join('');
+      let html = '';
+      let i = 0;
+      while (i < entries.length) {
+        const group = entries[i].group;
+        if (!group) { html += renderEnvRow(entries[i]); i++; continue; }
+        const groupEntries = [];
+        while (i < entries.length && entries[i].group === group) { groupEntries.push(entries[i]); i++; }
+        const main = groupEntries.filter(e => !e.advanced).map(renderEnvRow).join('');
+        const adv = groupEntries.filter(e => e.advanced).map(renderEnvRow).join('');
+        const helpEntry = groupEntries.find(e => e.groupHelp);
+        html += `<div class="env-group">
+          <div class="env-group-title">${escapeHtml(group)}</div>
+          ${helpEntry ? `<div class="env-tip">${escapeHtml(helpEntry.groupHelp)}</div>` : ''}
+          ${main}
+          ${adv ? `<details class="env-advanced"><summary>Advanced</summary>${adv}</details>` : ''}
+        </div>`;
+      }
+      return html;
     }
 
     async function scanInstallEnvs() {

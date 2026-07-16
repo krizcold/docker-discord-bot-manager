@@ -20,6 +20,37 @@ import {
 } from './manager';
 
 /**
+ * General presentation metadata an env row may carry (any bot, any var). The
+ * wizard and editor renderers honor it; plain rows without it are unchanged.
+ */
+export interface EnvFieldMeta {
+  options?: Array<{ value: string; label?: string }>;   // render as a select
+  generate?: boolean;                                   // "Generate" button fills a random secret
+  showWhen?: { key: string; equals: string };           // show only when another row has this value
+  requiredWhen?: { key: string; equals: string };       // required only when another row has this value
+  advanced?: boolean;                                   // fold under an "Advanced" disclosure
+  group?: string;                                       // section heading shared by consecutive rows
+  groupHelp?: string;
+  placeholder?: string;
+  inputType?: 'number';
+}
+
+export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
+
+function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType };
+}
+
+// Fleet vars the manager injects at deploy time (the fleet contract's plumbing);
+// never user-editable, so they must not surface in the wizard or the editor.
+const MANAGER_INJECTED_FLEET_ENV = new Set(['CONTROL_PORT', 'FLEET_PUBLIC_URL']);
+
+function isManagerInjectedFleetEnv(key: string): boolean {
+  return MANAGER_INJECTED_FLEET_ENV.has(key.toUpperCase());
+}
+
+/**
  * Wizard view: every var a fresh install should offer, enriched with
  * label/description/required/sensitive plus DB/Lavalink auto-wiring and the
  * config-file-as-env surfacing. This is the single source the env wizard and the
@@ -28,7 +59,7 @@ import {
 export function buildWizardEnvList(
   repoPath: string,
   options?: { scanSource?: boolean; sourceUrl?: string }
-): { vars: DetectedEnvVar[]; detection: DetectionResult } {
+): { vars: WizardEnvVar[]; detection: DetectionResult } {
   const scanSource = !!options?.scanSource;
   const detection = detectBotType(repoPath);
 
@@ -46,7 +77,7 @@ export function buildWizardEnvList(
     }
   }
 
-  const vars = detectEnvVars(repoPath, { scanSource }).map(v =>
+  const vars: WizardEnvVar[] = detectEnvVars(repoPath, { scanSource }).map(v =>
     autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
   );
 
@@ -120,7 +151,19 @@ export function buildWizardEnvList(
     }
   }
 
-  return { vars, detection };
+  // Fleet section: any bot whose compose declares the fleet.control-port label
+  // (the fleet contract marker) gets the guided fleet fields. Guided rows replace
+  // same-key rows a raw scan may have found, so metadata always wins.
+  if (composeDeclaresFleet(repoPath)) {
+    const fleet = fleetEnvFields();
+    const fleetKeys = new Set(fleet.map(f => f.key));
+    for (let i = vars.length - 1; i >= 0; i--) {
+      if (fleetKeys.has(vars[i].key)) vars.splice(i, 1);
+    }
+    vars.push(...fleet);
+  }
+
+  return { vars: vars.filter(v => !isManagerInjectedFleetEnv(v.key)), detection };
 }
 
 /**
@@ -141,7 +184,86 @@ function composeReferencesCredentials(repoPath: string | null): boolean {
   return false;
 }
 
-export interface EditorEnvVar {
+/**
+ * Whether the bot's source compose declares the `fleet.control-port` label, the
+ * general marker a fleet-capable bot uses to opt into fleet plumbing. Any bot
+ * declaring it gets the guided Fleet env section; no bot is named in code.
+ */
+function composeDeclaresFleet(repoPath: string | null): boolean {
+  if (!repoPath) return false;
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    try {
+      const p = path.join(repoPath, name);
+      if (fs.existsSync(p) && /fleet\.control-port/.test(fs.readFileSync(p, 'utf-8'))) return true;
+    } catch {
+      // ignore unreadable compose
+    }
+  }
+  return false;
+}
+
+/**
+ * Guided env fields for the bot fleet contract (BOT_NODE_ROLE and friends, read
+ * by the bot instance). CONTROL_PORT / FLEET_PUBLIC_URL are deliberately absent:
+ * the manager injects those itself.
+ */
+function fleetEnvFields(): WizardEnvVar[] {
+  const base = { defaultValue: '', required: false, source: 'compose' as const, sensitive: false, autoWired: false, group: 'Fleet' };
+  const whenCoWorker = { key: 'BOT_NODE_ROLE', equals: 'co-worker' };
+  return [
+    {
+      ...base,
+      key: 'BOT_NODE_ROLE',
+      displayLabel: 'Fleet Role',
+      description: 'Master runs the control plane and assigns shards. Co-worker dials into a master. A single standalone bot is a master.',
+      defaultValue: 'master',
+      options: [{ value: 'master' }, { value: 'co-worker' }],
+      groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
+    },
+    {
+      ...base,
+      key: 'MASTER_URL',
+      displayLabel: 'Master URL',
+      description: "The master's connection URL. Copy it from the master bot's Usage tab > Fleet section (looks like wss://... or ws://host:3928).",
+      placeholder: 'wss://fleet.example.com or ws://203.0.113.5:3928',
+      showWhen: whenCoWorker,
+      requiredWhen: whenCoWorker,
+    },
+    {
+      ...base,
+      key: 'CONTROL_SECRET',
+      displayLabel: 'Control Secret',
+      description: 'Shared secret for the fleet. Generate it on the master, then paste the SAME value into every co-worker.',
+      sensitive: true,
+      generate: true,
+      requiredWhen: whenCoWorker,
+    },
+    {
+      ...base,
+      key: 'FLEET_SHARD_COUNT',
+      displayLabel: 'Fleet Shard Count',
+      description: 'Advanced: total shards across the fleet. Leave blank to let Discord decide (fine for small fleets; set higher, e.g. 8, only to spread a few test guilds across instances).',
+      inputType: 'number',
+      advanced: true,
+    },
+    {
+      ...base,
+      key: 'PIN_TEST_GUILD_SHARD',
+      displayLabel: 'Pin Test Guild Shard',
+      description: "Master only: keep the shard containing this bot's GUILD_ID on the master. Useful when testing.",
+      defaultValue: 'false',
+      options: [{ value: 'false' }, { value: 'true' }],
+    },
+    {
+      ...base,
+      key: 'NODE_NAME',
+      displayLabel: 'Node Name',
+      description: "A friendly name for this instance in the Fleet view (e.g. 'yundera', 'home-pc').",
+    },
+  ];
+}
+
+export interface EditorEnvVar extends EnvFieldMeta {
   key: string;
   displayLabel: string;
   description: string;
@@ -192,6 +314,7 @@ export function buildBotEnvList(
     const isSet = stored[d.key] !== undefined;
     const sensitive = d.sensitive || isSensitive(d.key);
     result.push({
+      ...envFieldMeta(d),
       key: d.key,
       displayLabel: d.displayLabel,
       description: d.description,
@@ -204,7 +327,7 @@ export function buildBotEnvList(
 
   // User-added vars not surfaced by detection.
   for (const [key, value] of Object.entries(stored)) {
-    if (seen.has(key)) continue;
+    if (seen.has(key) || isManagerInjectedFleetEnv(key)) continue;
     seen.add(key);
     const sensitive = isSensitive(key);
     result.push({

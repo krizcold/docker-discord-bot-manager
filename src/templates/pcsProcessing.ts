@@ -469,6 +469,39 @@ export function processComposeForCasaOS(
     }
   }
 
+  // ── Fleet control endpoint (marker-driven) ──
+  // The wss route targets the app container directly, NOT the AppShield gateway:
+  // the control plane authenticates via CONTROL_SECRET and must not sit behind
+  // the gateway's browser hash auth.
+  const fleetPort = fleetControlPortOfCompose(compose);
+  if (fleetPort !== null) {
+    const fleetSvcName = getAppServiceName(compose);
+    const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
+    if (fleetSvc) {
+      setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
+      if (isFleetMaster(bot.envVars) && pcs.APP_DOMAIN) {
+        const fleetHost = `${appName}-fleet-${pcs.APP_DOMAIN}`;
+        const idx = nextCaddySiteIndex(fleetSvc.labels);
+        setServiceLabel(fleetSvc, `caddy_${idx}`, fleetHost);
+        setServiceLabel(fleetSvc, `caddy_${idx}.import`, 'gateway_tls');
+        setServiceLabel(fleetSvc, `caddy_${idx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
+        // Caddy resolves {{upstreams}} over the ingress network, so the app
+        // container must join it; keep the project default network alongside.
+        if (pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
+          if (Array.isArray(fleetSvc.networks)) {
+            if (!fleetSvc.networks.includes(pcs.REF_NET)) fleetSvc.networks.push(pcs.REF_NET);
+          } else if (fleetSvc.networks && typeof fleetSvc.networks === 'object') {
+            const nets = fleetSvc.networks as Record<string, unknown>;
+            if (!(pcs.REF_NET in nets)) nets[pcs.REF_NET] = {};
+          } else {
+            fleetSvc.networks = ['default', pcs.REF_NET];
+          }
+        }
+        setServiceEnv(fleetSvc, 'FLEET_PUBLIC_URL', `wss://${fleetHost}`);
+      }
+    }
+  }
+
   // ── Compose-level network definition ──
   if (pcs.REF_NET) {
     if (!compose.networks) {
@@ -820,6 +853,16 @@ export function processComposeForDocker(
     if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
+  // CONTROL_PORT always follows the fleet marker; exposure (proxy route or
+  // localhost publish) is layered on by applyDockerHostPort.
+  const fleetPort = fleetControlPortOfCompose(compose);
+  if (fleetPort !== null) {
+    const fleetSvcName = getAppServiceName(compose);
+    if (fleetSvcName && services[fleetSvcName]) {
+      setServiceEnv(services[fleetSvcName], 'CONTROL_PORT', String(fleetPort));
+    }
+  }
+
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
 }
 
@@ -999,6 +1042,209 @@ export function mainServiceSelfAuths(composeContent: string): boolean {
     return 'AUTH_HASH' in (env as Record<string, unknown>);
   }
   return false;
+}
+
+// ─── Fleet Control Plane ───────────────────────────────────────────────────
+
+// Structural marker: a service label `fleet.control-port: <port>` declares that
+// the bot runs a fleet control plane (WS server) on that container port. All
+// fleet wiring keys off this label, never off a bot name or image.
+const FLEET_PORT_LABEL = 'fleet.control-port';
+
+function labelKeysOf(labels: unknown): string[] {
+  if (Array.isArray(labels)) {
+    return (labels as unknown[])
+      .filter((l): l is string => typeof l === 'string')
+      .map(l => l.split('=')[0].trim());
+  }
+  if (labels && typeof labels === 'object') return Object.keys(labels as Record<string, unknown>);
+  return [];
+}
+
+function labelValueOf(labels: unknown, key: string): string | null {
+  if (Array.isArray(labels)) {
+    for (const l of labels as unknown[]) {
+      if (typeof l !== 'string') continue;
+      const eq = l.indexOf('=');
+      if (eq > 0 && l.slice(0, eq).trim() === key) return l.slice(eq + 1).trim();
+    }
+    return null;
+  }
+  if (labels && typeof labels === 'object') {
+    const v = (labels as Record<string, unknown>)[key];
+    return v === undefined || v === null ? null : String(v);
+  }
+  return null;
+}
+
+function setServiceLabel(service: Record<string, unknown>, key: string, value: string): void {
+  if (!service.labels) service.labels = {};
+  if (Array.isArray(service.labels)) (service.labels as unknown[]).push(`${key}=${value}`);
+  else (service.labels as Record<string, string>)[key] = value;
+}
+
+function setServiceEnv(service: Record<string, unknown>, key: string, value: string): void {
+  if (!service.environment) service.environment = {};
+  if (Array.isArray(service.environment)) {
+    const arr = service.environment as unknown[];
+    const idx = arr.findIndex(e => typeof e === 'string' && (e as string).split('=')[0] === key);
+    if (idx >= 0) arr[idx] = `${key}=${value}`;
+    else arr.push(`${key}=${value}`);
+  } else if (typeof service.environment === 'object') {
+    (service.environment as Record<string, string>)[key] = value;
+  }
+}
+
+/** Next unused caddy site index on a service (a plain `caddy` label counts as 0). */
+function nextCaddySiteIndex(labels: unknown): number {
+  let next = 0;
+  for (const key of labelKeysOf(labels)) {
+    if (key === 'caddy' || key.startsWith('caddy.')) next = Math.max(next, 1);
+    const m = key.match(/^caddy_(\d+)($|\.)/);
+    if (m) next = Math.max(next, parseInt(m[1], 10) + 1);
+  }
+  return next;
+}
+
+function fleetControlPortOfCompose(compose: Record<string, unknown>): number | null {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return null;
+  const main = getMainServiceName(compose);
+  const ordered = main
+    ? [main, ...Object.keys(services).filter(n => n !== main)]
+    : Object.keys(services);
+  for (const name of ordered) {
+    const value = labelValueOf(services[name]?.labels, FLEET_PORT_LABEL);
+    if (value !== null) {
+      const port = parseInt(value, 10);
+      return isNaN(port) ? null : port;
+    }
+  }
+  return null;
+}
+
+/** The fleet control port declared by the compose's marker label, or null. */
+export function getFleetControlPort(composeContent: string): number | null {
+  try {
+    return fleetControlPortOfCompose(parseDocument(composeContent).toJSON() as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+}
+
+/** Absent/empty BOT_NODE_ROLE means master, matching the bot's own role resolution. */
+export function isFleetMaster(envVars?: Record<string, string>): boolean {
+  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim();
+  return role === '' || role === 'master';
+}
+
+/**
+ * Public hostname of this instance's fleet control endpoint, or null when no
+ * public base exists for the mode (e.g. standalone/Windows). Mirrors the web UI
+ * host construction: `<name>-fleet-<APP_DOMAIN>` on Yundera,
+ * `<name>-fleet.<BOT_DOMAIN_BASE>` on the remote docker stack.
+ */
+export function fleetPublicHost(sanitizedName: string): string | null {
+  const appDomain = process.env.APP_DOMAIN || '';
+  if (appDomain) return `${sanitizedName}-fleet-${appDomain}`;
+  const domainBase = process.env.BOT_DOMAIN_BASE || '';
+  if (domainBase) return `${sanitizedName}-fleet.${domainBase}`;
+  return null;
+}
+
+/**
+ * Remote-mode fleet route: caddy-docker-proxy labels on the APP service so the
+ * bundled Caddy serves the fleet control endpoint at `host` over automatic TLS,
+ * plus FLEET_PUBLIC_URL for the bot. Never forward_auth: workers are machine
+ * clients that authenticate with CONTROL_SECRET, not Authelia.
+ */
+export function attachFleetToProxy(
+  composeContent: string,
+  host: string,
+  controlPort: number,
+  opts: { network?: string } = {}
+): string {
+  const network = opts.network || 'dbm_remote';
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+  const appName = getAppServiceName(compose);
+  if (!appName || !services[appName]) return composeContent;
+  const svc = services[appName];
+
+  if (!svc.labels || Array.isArray(svc.labels) || typeof svc.labels !== 'object') svc.labels = {};
+  const labels = svc.labels as Record<string, string>;
+  const prefix = `caddy_${nextCaddySiteIndex(labels)}`;
+  labels[prefix] = host;
+  labels[`${prefix}.reverse_proxy`] = `{{upstreams ${controlPort}}}`;
+
+  if (Array.isArray(svc.networks)) {
+    if (!(svc.networks as unknown[]).includes(network)) (svc.networks as unknown[]).push(network);
+  } else if (svc.networks && typeof svc.networks === 'object') {
+    (svc.networks as Record<string, unknown>)[network] = {};
+  } else {
+    svc.networks = [network];
+  }
+  if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
+  const nets = compose.networks as Record<string, unknown>;
+  if (!nets[network]) nets[network] = { name: network, external: true };
+
+  setServiceEnv(svc, 'FLEET_PUBLIC_URL', `wss://${host}`);
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/** An already-published host port for the fleet control port on the app service, or null. */
+export function getPublishedFleetHostPort(composeContent: string, controlPort: number): number | null {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return null;
+  const appName = getAppServiceName(compose);
+  const svc = appName ? services[appName] : undefined;
+  if (!svc || !Array.isArray(svc.ports)) return null;
+  for (const pm of svc.ports as unknown[]) {
+    if (containerPortOf(pm) === controlPort) return hostPortOf(pm);
+  }
+  return null;
+}
+
+/**
+ * Publish the fleet control port on the host (docker mode) so a same-box worker
+ * can dial a local master via host.docker.internal. Always 127.0.0.1-bound: a
+ * published port bypasses host firewalls, and the control plane must never go
+ * public this way (public access is the Caddy wss route).
+ */
+export function publishFleetHostPort(
+  composeContent: string,
+  hostPort: number,
+  controlPort: number
+): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+  const appName = getAppServiceName(compose);
+  if (!appName || !services[appName]) return composeContent;
+  const svc = services[appName];
+  if (!Array.isArray(svc.ports)) svc.ports = svc.ports ? [svc.ports] : [];
+  const ports = svc.ports as unknown[];
+  if (!ports.some(pm => containerPortOf(pm) === controlPort)) {
+    ports.push(`127.0.0.1:${hostPort}:${controlPort}`);
+  }
+  return stringify(compose, { lineWidth: 0 });
 }
 
 // ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──

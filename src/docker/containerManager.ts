@@ -45,6 +45,12 @@ import {
   publishHostPort,
   attachBotToProxy,
   mainServiceSelfAuths,
+  getFleetControlPort,
+  isFleetMaster,
+  fleetPublicHost,
+  attachFleetToProxy,
+  getPublishedFleetHostPort,
+  publishFleetHostPort,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
   fixDockerBotOwnership,
@@ -829,7 +835,7 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
 // at <sanitizedName>.<base> over TLS, in addition to its localhost host-port.
 const BOT_DOMAIN_BASE = process.env.BOT_DOMAIN_BASE || '';
 
-function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string): void {
+function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string, fleetHostPort?: number): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (instance) {
@@ -837,6 +843,7 @@ function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerP
     instance.webContainerPort = webContainerPort;
     instance.publicUrl = publicUrl;
     instance.webUiPath = webUiPath;
+    instance.fleetHostPort = fleetHostPort;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
@@ -850,61 +857,99 @@ function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerP
  */
 function applyDockerHostPort(composeContent: string, instance: InstanceConfig): string {
   const info = getMainServiceWebPort(composeContent);
-  if (!info) {
-    updateInstanceWebAccess(instance.id, undefined, undefined, undefined, undefined);
-    return composeContent;
-  }
-
-  // Web entry path the bot declares (x-casaos.index, hash already substituted).
-  const webUiPath = getWebUiIndexPath(composeContent) || undefined;
-
   let content = composeContent;
-
-  // Remote mode: a public base is configured -> route the bot through the bundled
-  // Caddy at <name>.<base> with automatic TLS (in addition to a localhost port).
+  let webUiPath: string | undefined;
   let publicUrl: string | undefined;
-  if (BOT_DOMAIN_BASE) {
-    const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
-    // Auth in front of the public vhost: explicit instance setting wins; in auto
-    // mode a self-authenticating main service (AUTH_HASH gateway) is left to
-    // protect itself, everything else goes behind Authelia MFA.
-    const forwardAuth =
-      instance.webAuth === 'public' ? false :
-      instance.webAuth === 'authelia' ? true :
-      !mainServiceSelfAuths(content);
-    content = attachBotToProxy(content, host, info.containerPort, { forwardAuth });
-    publicUrl = `https://${host}`;
-  }
-
-  // Localhost host-port (tunnel fallback + the Open link when not proxied).
   let hostPort: number | undefined;
-  if (info.existingHostPort !== null) {
-    hostPort = info.existingHostPort;   // compose already publishes it; keep that mapping
-  } else {
+
+  // A running bot publishes its own port; that must not block reusing it on rebuild.
+  const isOwnContainer = (name: string) =>
+    name.startsWith(instance.sanitizedName) || name.includes(`-${instance.id}-`);
+  const portsClaimedByOthers = () => {
     const used = new Set<number>();
     for (const b of getAllBots()) {
-      if (b.id !== instance.id && typeof b.hostPort === 'number') used.add(b.hostPort);
+      if (b.id === instance.id) continue;
+      if (typeof b.hostPort === 'number') used.add(b.hostPort);
+      const bFleet = b.fleetHostPort;
+      if (typeof bFleet === 'number') used.add(bFleet);
     }
-    // A running bot publishes its own port; that must not block reusing it on rebuild.
-    const isOwnContainer = (name: string) =>
-      name.startsWith(instance.sanitizedName) || name.includes(`-${instance.id}-`);
+    return used;
+  };
+  const portsBoundOnHost = () => {
     const hostBound = new Set<number>();
     for (const [port, names] of dockerClient.listPublishedHostPorts()) {
       if (!names.every(isOwnContainer)) hostBound.add(port);
     }
-    const allocated = allocateHostPort({
-      botId: instance.id,
-      reuse: instance.hostPort,
-      used,
-      hostBound,
-    });
-    if (allocated !== null) {
-      hostPort = allocated;
-      content = publishHostPort(content, allocated, info.containerPort);
+    return hostBound;
+  };
+
+  if (info) {
+    // Web entry path the bot declares (x-casaos.index, hash already substituted).
+    webUiPath = getWebUiIndexPath(content) || undefined;
+
+    // Remote mode: a public base is configured -> route the bot through the bundled
+    // Caddy at <name>.<base> with automatic TLS (in addition to a localhost port).
+    if (BOT_DOMAIN_BASE) {
+      const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
+      // Auth in front of the public vhost: explicit instance setting wins; in auto
+      // mode a self-authenticating main service (AUTH_HASH gateway) is left to
+      // protect itself, everything else goes behind Authelia MFA.
+      const forwardAuth =
+        instance.webAuth === 'public' ? false :
+        instance.webAuth === 'authelia' ? true :
+        !mainServiceSelfAuths(content);
+      content = attachBotToProxy(content, host, info.containerPort, { forwardAuth });
+      publicUrl = `https://${host}`;
+    }
+
+    // Localhost host-port (tunnel fallback + the Open link when not proxied).
+    if (info.existingHostPort !== null) {
+      hostPort = info.existingHostPort;   // compose already publishes it; keep that mapping
+    } else {
+      const allocated = allocateHostPort({
+        botId: instance.id,
+        reuse: instance.hostPort,
+        used: portsClaimedByOthers(),
+        hostBound: portsBoundOnHost(),
+      });
+      if (allocated !== null) {
+        hostPort = allocated;
+        content = publishHostPort(content, allocated, info.containerPort);
+      }
     }
   }
 
-  updateInstanceWebAccess(instance.id, hostPort, info.containerPort, publicUrl, webUiPath);
+  // Fleet control endpoint (marker-driven): a master with a public base gets a wss
+  // route on the bundled Caddy (no forward_auth - CONTROL_SECRET is the auth), and
+  // every marker instance gets a localhost-bound control host-port so a same-box
+  // worker can dial a local master via host.docker.internal.
+  const controlPort = getFleetControlPort(content);
+  let fleetHostPort: number | undefined;
+  if (controlPort !== null) {
+    if (BOT_DOMAIN_BASE && isFleetMaster(instance.envVars)) {
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
+    }
+    const existing = getPublishedFleetHostPort(content, controlPort);
+    if (existing !== null) {
+      fleetHostPort = existing;   // compose already publishes it; keep that mapping
+    } else {
+      const used = portsClaimedByOthers();
+      if (hostPort !== undefined) used.add(hostPort);
+      const prevFleetPort = instance.fleetHostPort;
+      const allocated = allocateHostPort({
+        botId: instance.id,
+        reuse: typeof prevFleetPort === 'number' ? prevFleetPort : undefined,
+        used,
+        hostBound: portsBoundOnHost(),
+      });
+      if (allocated !== null) {
+        fleetHostPort = allocated;
+        content = publishFleetHostPort(content, allocated, controlPort);
+      }
+    }
+  }
+
+  updateInstanceWebAccess(instance.id, hostPort, info ? info.containerPort : undefined, publicUrl, webUiPath, fleetHostPort);
   return content;
 }
 
@@ -1013,10 +1058,34 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   return {
     ...instance.envVars,
+    ...fleetEnv(instance),
     BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
     BOT_ID: instance.id,
     BOT_MANAGER_INTERNAL_URL: internalUrl,
   };
+}
+
+/**
+ * Fleet wiring derived from the deployed compose's marker label: CONTROL_PORT
+ * whenever the marker is present; FLEET_PUBLIC_URL only for a master with a
+ * public base. Re-derived from the compose so start-time env syncs agree with
+ * what the build exposed.
+ */
+function fleetEnv(instance: InstanceConfig): Record<string, string> {
+  try {
+    const composePath = path.join(getBotDir(instance.id), 'docker-compose.yml');
+    if (!fs.existsSync(composePath)) return {};
+    const controlPort = getFleetControlPort(fs.readFileSync(composePath, 'utf-8'));
+    if (controlPort === null) return {};
+    const env: Record<string, string> = { CONTROL_PORT: String(controlPort) };
+    if (isFleetMaster(instance.envVars)) {
+      const host = fleetPublicHost(instance.sanitizedName);
+      if (host) env.FLEET_PUBLIC_URL = `wss://${host}`;
+    }
+    return env;
+  } catch {
+    return {};
+  }
 }
 
 // Env vars that are inputs to compose $-substitution (e.g. the AppShield gateway
@@ -1088,6 +1157,9 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       } else {
         service.environment = { ...allEnv };
       }
+      // Role or public base may have changed since build: a FLEET_PUBLIC_URL the
+      // build injected must not survive when it is no longer derivable.
+      if (!('FLEET_PUBLIC_URL' in allEnv)) deleteComposeEnv(service.environment, 'FLEET_PUBLIC_URL');
       compose.services[targetName] = service;
     }
 

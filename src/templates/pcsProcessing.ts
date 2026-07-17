@@ -479,11 +479,13 @@ export function processComposeForCasaOS(
     const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
     if (fleetSvc) {
       setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
-      if (isFleetMaster(bot.envVars) && pcs.APP_DOMAIN) {
-        const fleetHost = `${appName}-fleet-${pcs.APP_DOMAIN}`;
+      if (isFleetMaster(bot.envVars) && pcs.APP_PUBLIC_IP_DASH) {
+        // sslip.io + Let's Encrypt (no gateway_tls): the control plane is a
+        // machine client, so it needs a publicly-trusted cert, not the gateway's
+        // custom CA. Mirrors the web UI's caddy_2 sslip route.
+        const fleetHost = `${appName}-fleet-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`;
         const idx = nextCaddySiteIndex(fleetSvc.labels);
         setServiceLabel(fleetSvc, `caddy_${idx}`, fleetHost);
-        setServiceLabel(fleetSvc, `caddy_${idx}.import`, 'gateway_tls');
         setServiceLabel(fleetSvc, `caddy_${idx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
         // Caddy resolves {{upstreams}} over the ingress network, so the app
         // container must join it; keep the project default network alongside.
@@ -1150,13 +1152,15 @@ export function fleetPublicHost(sanitizedName: string): string | null {
 }
 
 /**
- * Mode-resolved part of the fleet host after the instance name
- * (`-fleet-<APP_DOMAIN>` or `-fleet.<BOT_DOMAIN_BASE>`), or null when no
- * public base exists. Lets clients preview a fleet URL before install.
+ * Mode-resolved part of the fleet host after the instance name, or null when no
+ * publicly-trusted base exists. The fleet endpoint is reached by machine clients
+ * (workers), so it must resolve to a publicly-trusted cert: sslip.io + Let's
+ * Encrypt on Yundera (never the custom-CA gateway domain), the ACME-issued
+ * `<base>` on the remote stack. Lets clients preview a fleet URL before install.
  */
 export function fleetHostSuffix(): string | null {
-  const appDomain = process.env.APP_DOMAIN || '';
-  if (appDomain) return `-fleet-${appDomain}`;
+  const ipDash = process.env.APP_PUBLIC_IP_DASH || '';
+  if (ipDash) return `-fleet-${ipDash}.sslip.io`;
   const domainBase = process.env.BOT_DOMAIN_BASE || '';
   if (domainBase) return `-fleet.${domainBase}`;
   return null;

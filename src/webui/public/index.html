@@ -1648,6 +1648,7 @@
           </div>
         `;
         initEnvConditionals('env-editor-rows');
+        attachFleetMasterPrefill('env-editor-rows', res.vars || []);
       } catch (err) {
         content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">Failed to load environment variables</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
@@ -1750,6 +1751,60 @@
       c.addEventListener('input', () => updateEnvConditionals(c));
       c.addEventListener('change', () => updateEnvConditionals(c));
       updateEnvConditionals(c);
+    }
+
+    // ─── Fleet master prefill (known masters on this manager) ───
+    function fleetEnvWrapper(container, key) {
+      for (const k of container.querySelectorAll('.env-row .env-key')) {
+        if (k.value.trim() === key) return k.closest('.env-row').parentElement;
+      }
+      return null;
+    }
+
+    function fleetSetEnvValue(container, key, value) {
+      const wrapper = fleetEnvWrapper(container, key);
+      const input = wrapper && wrapper.querySelector('.env-row .env-value');
+      if (!input) return;
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // Offers the connection info of a master hosted by this manager, inside the
+    // MASTER_URL row's conditional wrapper (so it only shows for co-workers).
+    // Never fills automatically: the operator may be joining a REMOTE master.
+    async function attachFleetMasterPrefill(containerId, vars) {
+      if (!Array.isArray(vars) || !vars.some(v => v.key === 'BOT_NODE_ROLE')) return;
+      let masters = [];
+      try {
+        const res = await api('GET', '/bots/fleet/masters');
+        if (res && res.success && Array.isArray(res.masters)) masters = res.masters;
+      } catch (e) { return; }
+      if (masters.length === 0) return;
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      const wrapper = fleetEnvWrapper(container, 'MASTER_URL');
+      if (!wrapper || wrapper.querySelector('.fleet-master-prefill')) return;
+
+      const options = masters.map((m, i) => {
+        const label = m.name + (m.secretSet ? '' : ' (no secret set)');
+        return `<option value="${i}"${m.secretSet ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
+      }).join('');
+      const block = document.createElement('div');
+      block.className = 'fleet-master-prefill';
+      block.innerHTML = `
+        <div class="env-tip">Use a master from this manager:</div>
+        <div style="display:flex;gap:6px;margin-bottom:6px;">
+          <select class="env-value" style="flex:1;"><option value="">Select a master...</option>${options}</select>
+          <button class="btn btn-secondary btn-small" type="button">Fill</button>
+        </div>`;
+      block.querySelector('button').addEventListener('click', () => {
+        const idx = block.querySelector('select').value;
+        const m = idx === '' ? null : masters[Number(idx)];
+        if (!m) return;
+        fleetSetEnvValue(container, 'MASTER_URL', m.masterUrl);
+        fleetSetEnvValue(container, 'CONTROL_SECRET', m.controlSecret);
+      });
+      wrapper.insertBefore(block, wrapper.firstChild);
     }
 
     async function regenerateAuthHash(btn) {
@@ -2475,6 +2530,7 @@
       initEnvConditionals('install-env-rows');
       const installRows = document.getElementById('install-env-rows');
       if (installRows) autofillGenerateSecrets(installRows);
+      attachFleetMasterPrefill('install-env-rows', installEnvHints);
       if (window.guidedInitAll) guidedInitAll();
     }
 

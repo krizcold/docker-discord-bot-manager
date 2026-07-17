@@ -24,6 +24,8 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost } from '../../templates/pcsProcessing';
+import { getBotDir } from '../../git/repoManager';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -112,6 +114,52 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       res.status(400).json({ success: false, error: 'Must provide sourceId or sourceType=docker-image' });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/fleet/masters - Fleet masters running on this manager, with the
+   * connection info a co-worker install needs. Returns CONTROL_SECRET in plaintext
+   * like /api/recover-envs does: the whole API sits behind the manager's auth edge
+   * and the value exists to be filled into a co-worker's secret field.
+   */
+  router.get('/fleet/masters', async (req: Request, res: Response) => {
+    try {
+      const dataRoot = process.env.DATA_ROOT || '/DATA';
+      const masters: Array<{ id: string; name: string; masterUrl: string; secretSet: boolean; controlSecret: string }> = [];
+      for (const bot of containerManager.getAllBots()) {
+        try {
+          // Deployed compose, resolved like containerManager's resolveComposePath:
+          // CasaOS metadata path when present, else the bot-dir copy.
+          const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
+          const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
+          if (!fs.existsSync(composePath)) continue;
+          if (getFleetControlPort(fs.readFileSync(composePath, 'utf-8')) === null) continue;
+
+          const env = envManager.getEnvVars(bot.id);
+          if (!isFleetMaster(env)) continue;
+
+          // Same public wss URL the injection path hands the master as FLEET_PUBLIC_URL.
+          const host = fleetPublicHost(bot.sanitizedName);
+          let masterUrl = host ? `wss://${host}` : null;
+          // Docker-mode fallback: the control port is published on the host's
+          // loopback only, which a sibling container cannot reach as 127.0.0.1;
+          // host.docker.internal is the container-side name for the host, so a
+          // same-box co-worker dials the master through it.
+          if (!masterUrl && typeof bot.fleetHostPort === 'number') {
+            masterUrl = `ws://host.docker.internal:${bot.fleetHostPort}`;
+          }
+          if (!masterUrl) continue;
+
+          const controlSecret = (env['CONTROL_SECRET'] || '').trim();
+          masters.push({ id: bot.id, name: bot.displayName, masterUrl, secretSet: controlSecret !== '', controlSecret });
+        } catch {
+          // an unreadable instance must not break the list
+        }
+      }
+      res.json({ success: true, masters });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

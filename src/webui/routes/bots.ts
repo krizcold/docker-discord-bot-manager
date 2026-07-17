@@ -16,7 +16,7 @@ import { parseConfig } from '../../config/configSerializer';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
 import { loadVault, saveVault } from './vault';
-import { getDeploymentInfo, setDeploymentMode } from '../../casaos/detector';
+import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
 import { logCollectors } from '../../build/logCollector';
@@ -24,8 +24,9 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix } from '../../templates/pcsProcessing';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, getAppServiceName } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
+import { parse as parseYaml } from 'yaml';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -124,13 +125,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * connection info a co-worker install needs. Returns CONTROL_SECRET in plaintext
    * like /api/recover-envs does: the whole API sits behind the manager's auth edge
    * and the value exists to be filled into a co-worker's secret field.
+   * Each master carries two addresses: localUrl for a same-manager worker (dials
+   * over the shared network, no public round-trip) and masterUrl for a genuinely
+   * cross-host worker (public wss). Either may be null when it cannot be derived.
    * Also returns fleetBase: the mode-resolved fleet host suffix, so the install
    * wizard can preview a new master's public URL; null when no public base exists.
    */
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
       const dataRoot = process.env.DATA_ROOT || '/DATA';
-      const masters: Array<{ id: string; name: string; masterUrl: string; secretSet: boolean; controlSecret: string }> = [];
+      const mode = await getDeploymentMode();
+      const masters: Array<{ id: string; name: string; masterUrl: string | null; localUrl: string | null; secretSet: boolean; controlSecret: string }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
           // Deployed compose, resolved like containerManager's resolveComposePath:
@@ -138,25 +143,40 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
           const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
           if (!fs.existsSync(composePath)) continue;
-          if (getFleetControlPort(fs.readFileSync(composePath, 'utf-8')) === null) continue;
+          const composeContent = fs.readFileSync(composePath, 'utf-8');
+          const controlPort = getFleetControlPort(composeContent);
+          if (controlPort === null) continue;
 
           const env = envManager.getEnvVars(bot.id);
           if (!isFleetMaster(env)) continue;
 
-          // Same public wss URL the injection path hands the master as FLEET_PUBLIC_URL.
+          // Public wss URL a genuinely cross-host worker uses. Same URL the
+          // injection path hands the master as FLEET_PUBLIC_URL; null when no
+          // publicly-trusted base exists for the mode (e.g. standalone/Windows).
           const host = fleetPublicHost(bot.sanitizedName);
-          let masterUrl = host ? `wss://${host}` : null;
-          // Docker-mode fallback: the control port is published on the host's
-          // loopback only, which a sibling container cannot reach as 127.0.0.1;
-          // host.docker.internal is the container-side name for the host, so a
-          // same-box co-worker dials the master through it.
-          if (!masterUrl && typeof bot.fleetHostPort === 'number') {
-            masterUrl = `ws://host.docker.internal:${bot.fleetHostPort}`;
+          const masterUrl = host ? `wss://${host}` : null;
+
+          // Local URL a same-host/same-manager worker should dial instead, so the
+          // handshake stays on the box rather than looping out through the public
+          // gateway.
+          //   CasaOS: master app container and sibling bot container share the pcs
+          //     network, so the worker resolves the master's app container directly.
+          //   Docker: the control port is published on the host loopback, reachable
+          //     from a sibling container as host.docker.internal.
+          let localUrl: string | null = null;
+          if (mode === 'docker') {
+            if (typeof bot.fleetHostPort === 'number') {
+              localUrl = `ws://host.docker.internal:${bot.fleetHostPort}`;
+            }
+          } else {
+            const cname = fleetAppContainerName(composeContent);
+            if (cname) localUrl = `ws://${cname}:${controlPort}`;
           }
-          if (!masterUrl) continue;
+
+          if (!masterUrl && !localUrl) continue;
 
           const controlSecret = (env['CONTROL_SECRET'] || '').trim();
-          masters.push({ id: bot.id, name: bot.displayName, masterUrl, secretSet: controlSecret !== '', controlSecret });
+          masters.push({ id: bot.id, name: bot.displayName, masterUrl, localUrl, secretSet: controlSecret !== '', controlSecret });
         } catch {
           // an unreadable instance must not break the list
         }
@@ -1211,6 +1231,29 @@ export function createSystemRoutes(): Router {
   });
 
   return router;
+}
+
+/**
+ * The name a same-network worker uses to reach the master's fleet control server
+ * (the app service that receives CONTROL_PORT). Prefers the app service's
+ * container_name: it is globally unique (Docker enforces uniqueness) and its
+ * embedded DNS resolves it for any container sharing the pcs network, so there is
+ * no cross-project ambiguity. Falls back to the service name, which Compose also
+ * registers as a network alias on pcs; the manager's name substitution keeps that
+ * unique too. Null when the compose cannot be parsed.
+ */
+function fleetAppContainerName(composeContent: string): string | null {
+  try {
+    const compose = parseYaml(composeContent) as Record<string, unknown>;
+    const svcName = getAppServiceName(compose);
+    if (!svcName) return null;
+    const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+    const cname = services?.[svcName]?.container_name;
+    if (typeof cname === 'string' && cname.trim()) return cname.trim();
+    return svcName;
+  } catch {
+    return null;
+  }
 }
 
 // Helper: list files in a directory (max 100)

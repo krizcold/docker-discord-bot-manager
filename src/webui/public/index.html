@@ -1809,14 +1809,43 @@
       block.innerHTML = `
         <div class="env-tip">Use a master from this manager:</div>
         <div style="display:flex;gap:6px;margin-bottom:6px;">
-          <select class="env-value" style="flex:1;"><option value="">Select a master...</option>${options}</select>
+          <select class="fleet-master-select env-value" style="flex:1;"><option value="">Select a master...</option>${options}</select>
           <button class="btn btn-secondary btn-small" type="button">Fill</button>
-        </div>`;
+        </div>
+        <div class="fleet-master-addr" style="display:none;margin-bottom:6px;">
+          <label style="display:block;"><input type="radio" class="fleet-addr-local" name="fleet-addr"> same server (recommended)</label>
+          <label style="display:block;"><input type="radio" class="fleet-addr-public" name="fleet-addr"> public URL (for instances on OTHER machines)</label>
+        </div>
+        <div class="env-tip">For co-workers installed on THIS manager. Workers on other machines: copy the connect info from the master bot's Usage tab instead.</div>`;
+
+      const select = block.querySelector('.fleet-master-select');
+      const addrBox = block.querySelector('.fleet-master-addr');
+      const radioLocal = block.querySelector('.fleet-addr-local');
+      const radioPublic = block.querySelector('.fleet-addr-public');
+      const selectedMaster = () => (select.value === '' ? null : masters[Number(select.value)]);
+
+      // Show the addressing choice for the picked master, defaulting to the local
+      // (same-server) address and hiding whichever address it cannot offer.
+      const syncAddr = () => {
+        const m = selectedMaster();
+        const hasLocal = !!(m && m.localUrl);
+        const hasPublic = !!(m && m.masterUrl);
+        radioLocal.disabled = !hasLocal;
+        radioPublic.disabled = !hasPublic;
+        radioLocal.closest('label').style.display = hasLocal ? '' : 'none';
+        radioPublic.closest('label').style.display = hasPublic ? '' : 'none';
+        if (hasLocal) radioLocal.checked = true;
+        else if (hasPublic) radioPublic.checked = true;
+        addrBox.style.display = (hasLocal || hasPublic) ? '' : 'none';
+      };
+      select.addEventListener('change', syncAddr);
+
       block.querySelector('button').addEventListener('click', () => {
-        const idx = block.querySelector('select').value;
-        const m = idx === '' ? null : masters[Number(idx)];
+        const m = selectedMaster();
         if (!m) return;
-        fleetSetEnvValue(container, 'MASTER_URL', m.masterUrl);
+        const url = (radioLocal.checked && m.localUrl) ? m.localUrl : (m.masterUrl || m.localUrl);
+        if (!url) return;
+        fleetSetEnvValue(container, 'MASTER_URL', url);
         fleetSetEnvValue(container, 'CONTROL_SECRET', m.controlSecret);
       });
       wrapper.insertBefore(block, wrapper.firstChild);

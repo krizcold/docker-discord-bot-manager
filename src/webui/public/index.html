@@ -1691,13 +1691,32 @@
       </div>`;
     }
 
+    function randomSecretHex() {
+      const bytes = new Uint8Array(32);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
     function generateEnvSecret(btn) {
       const input = btn.closest('.env-row').querySelector('.env-value');
       if (!input) return;
-      const bytes = new Uint8Array(32);
-      crypto.getRandomValues(bytes);
-      input.value = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      input.value = randomSecretHex();
       input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    // On a fresh install, pre-fill empty "generate" secrets (e.g. the fleet
+    // CONTROL_SECRET) so a master install has one ready. Skipped for a co-worker,
+    // which pastes the master's secret instead of minting its own.
+    function autofillGenerateSecrets(container) {
+      if (envRowValue(container, 'BOT_NODE_ROLE') === 'co-worker') return;
+      container.querySelectorAll('.env-row').forEach(row => {
+        const gen = row.querySelector('button[onclick^="generateEnvSecret"]');
+        const input = row.querySelector('.env-value');
+        if (gen && input && !input.value.trim()) {
+          input.value = randomSecretHex();
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      });
     }
 
     // ─── Metadata-driven env row conditionals (showWhen / requiredWhen) ───
@@ -2454,6 +2473,8 @@
       `;
       onNameInput();
       initEnvConditionals('install-env-rows');
+      const installRows = document.getElementById('install-env-rows');
+      if (installRows) autofillGenerateSecrets(installRows);
       if (window.guidedInitAll) guidedInitAll();
     }
 

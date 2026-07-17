@@ -227,6 +227,16 @@
       cursor: pointer; font-size: 0.72rem; color: var(--text-muted); margin: 4px 0 6px;
     }
     .env-advanced summary:hover { color: var(--text-primary); }
+    .fleet-url-preview {
+      background: var(--bg-tertiary); border-left: 3px solid var(--accent);
+      border-radius: var(--radius); padding: 8px 12px; margin: 6px 0 10px;
+    }
+    .fleet-url-preview .fleet-url-label { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 5px; }
+    .fleet-url-preview .fleet-url-line { display: flex; align-items: center; gap: 8px; }
+    .fleet-url-preview .fleet-url-value {
+      flex: 1; min-width: 0; font-family: monospace; font-size: 0.82rem;
+      color: var(--text-primary); word-break: break-all; user-select: all;
+    }
     .detection-info {
       background: var(--bg-tertiary); padding: 10px 14px; border-radius: var(--radius);
       margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary);
@@ -1827,12 +1837,12 @@
       el.dataset.showKey = 'BOT_NODE_ROLE';
       el.dataset.showEquals = 'master';
       el.innerHTML = `
-        <div class="env-tip" title="This URL becomes live once the bot is installed and started as master." style="display:flex;align-items:center;gap:6px;">
-          <span>Workers will connect at:</span>
-          <span class="fleet-url-preview-url" style="font-family:monospace;word-break:break-all;"></span>
+        <div class="fleet-url-label" title="This URL becomes live once the bot is installed and started as master.">Workers will connect at</div>
+        <div class="fleet-url-line">
+          <span class="fleet-url-value"></span>
           <button class="btn btn-secondary btn-small" type="button">Copy</button>
         </div>`;
-      const urlSpan = el.querySelector('.fleet-url-preview-url');
+      const urlSpan = el.querySelector('.fleet-url-value');
       const urlOf = () => `wss://${sanitizeNamePreview(nameInput.value.trim())}${fleetBase}`;
       const update = () => { urlSpan.textContent = urlOf(); };
       update();

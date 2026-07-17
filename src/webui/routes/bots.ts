@@ -24,7 +24,7 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost } from '../../templates/pcsProcessing';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
 
 export function createBotRoutes(wss: WebSocketServer): Router {
@@ -124,6 +124,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * connection info a co-worker install needs. Returns CONTROL_SECRET in plaintext
    * like /api/recover-envs does: the whole API sits behind the manager's auth edge
    * and the value exists to be filled into a co-worker's secret field.
+   * Also returns fleetBase: the mode-resolved fleet host suffix, so the install
+   * wizard can preview a new master's public URL; null when no public base exists.
    */
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
@@ -159,7 +161,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // an unreadable instance must not break the list
         }
       }
-      res.json({ success: true, masters });
+      res.json({ success: true, fleetBase: fleetHostSuffix(), masters });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

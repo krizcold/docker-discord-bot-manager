@@ -1145,10 +1145,20 @@ export function isFleetMaster(envVars?: Record<string, string>): boolean {
  * `<name>-fleet.<BOT_DOMAIN_BASE>` on the remote docker stack.
  */
 export function fleetPublicHost(sanitizedName: string): string | null {
+  const suffix = fleetHostSuffix();
+  return suffix === null ? null : `${sanitizedName}${suffix}`;
+}
+
+/**
+ * Mode-resolved part of the fleet host after the instance name
+ * (`-fleet-<APP_DOMAIN>` or `-fleet.<BOT_DOMAIN_BASE>`), or null when no
+ * public base exists. Lets clients preview a fleet URL before install.
+ */
+export function fleetHostSuffix(): string | null {
   const appDomain = process.env.APP_DOMAIN || '';
-  if (appDomain) return `${sanitizedName}-fleet-${appDomain}`;
+  if (appDomain) return `-fleet-${appDomain}`;
   const domainBase = process.env.BOT_DOMAIN_BASE || '';
-  if (domainBase) return `${sanitizedName}-fleet.${domainBase}`;
+  if (domainBase) return `-fleet.${domainBase}`;
   return null;
 }
 

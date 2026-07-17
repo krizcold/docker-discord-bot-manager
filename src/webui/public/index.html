@@ -1775,13 +1775,18 @@
     async function attachFleetMasterPrefill(containerId, vars) {
       if (!Array.isArray(vars) || !vars.some(v => v.key === 'BOT_NODE_ROLE')) return;
       let masters = [];
+      let fleetBase = null;
       try {
         const res = await api('GET', '/bots/fleet/masters');
-        if (res && res.success && Array.isArray(res.masters)) masters = res.masters;
+        if (res && res.success) {
+          if (Array.isArray(res.masters)) masters = res.masters;
+          if (typeof res.fleetBase === 'string') fleetBase = res.fleetBase;
+        }
       } catch (e) { return; }
-      if (masters.length === 0) return;
       const container = document.getElementById(containerId);
       if (!container) return;
+      if (containerId === 'install-env-rows') attachFleetMasterUrlPreview(container, fleetBase);
+      if (masters.length === 0) return;
       const wrapper = fleetEnvWrapper(container, 'MASTER_URL');
       if (!wrapper || wrapper.querySelector('.fleet-master-prefill')) return;
 
@@ -1805,6 +1810,41 @@
         fleetSetEnvValue(container, 'CONTROL_SECRET', m.controlSecret);
       });
       wrapper.insertBefore(block, wrapper.firstChild);
+    }
+
+    // Master-install preview of the public URL workers will use, below the
+    // BOT_NODE_ROLE row. Wizard-only (needs the name input); deliberately not
+    // an .env-row, so env collectors skip it.
+    function attachFleetMasterUrlPreview(container, fleetBase) {
+      if (!fleetBase) return;
+      const nameInput = document.getElementById('install-name');
+      if (!nameInput) return;
+      const roleWrapper = fleetEnvWrapper(container, 'BOT_NODE_ROLE');
+      if (!roleWrapper || container.querySelector('.fleet-url-preview')) return;
+
+      const el = document.createElement('div');
+      el.className = 'fleet-url-preview';
+      el.dataset.showKey = 'BOT_NODE_ROLE';
+      el.dataset.showEquals = 'master';
+      el.innerHTML = `
+        <div class="env-tip" title="This URL becomes live once the bot is installed and started as master." style="display:flex;align-items:center;gap:6px;">
+          <span>Workers will connect at:</span>
+          <span class="fleet-url-preview-url" style="font-family:monospace;word-break:break-all;"></span>
+          <button class="btn btn-secondary btn-small" type="button">Copy</button>
+        </div>`;
+      const urlSpan = el.querySelector('.fleet-url-preview-url');
+      const urlOf = () => `wss://${sanitizeNamePreview(nameInput.value.trim())}${fleetBase}`;
+      const update = () => { urlSpan.textContent = urlOf(); };
+      update();
+      nameInput.addEventListener('input', update);
+      const btn = el.querySelector('button');
+      btn.addEventListener('click', () => {
+        navigator.clipboard.writeText(urlOf());
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+      });
+      roleWrapper.insertAdjacentElement('afterend', el);
+      updateEnvConditionals(container);
     }
 
     async function regenerateAuthHash(btn) {
@@ -3019,6 +3059,11 @@
       onNameInput();
     }
 
+    // Client-side mirror of the server's sanitizeName (src/naming).
+    function sanitizeNamePreview(name) {
+      return name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
+    }
+
     async function onNameInput() {
       const name = document.getElementById('install-name').value.trim();
       const preview = document.getElementById('install-name-preview');
@@ -3029,7 +3074,7 @@
         return;
       }
 
-      const sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
+      const sanitized = sanitizeNamePreview(name);
       preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(sanitized)}</span>`;
 
       clearTimeout(nameValidationTimeout);

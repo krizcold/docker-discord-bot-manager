@@ -24,7 +24,7 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, getAppServiceName } from '../../templates/pcsProcessing';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, getAppServiceName, getWebUiIndexPath } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
 import { parse as parseYaml } from 'yaml';
 
@@ -38,6 +38,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/', async (req: Request, res: Response) => {
     try {
       const bots = containerManager.getAllBots();
+      const mode = await getDeploymentMode();
 
       // Join source info + compute commits-behind for bots that are behind
       const botsWithSource = await Promise.all(bots.map(async bot => {
@@ -55,6 +56,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           }
         }
 
+        // CasaOS Open link: docker mode already carries publicUrl/hostPort; on CasaOS
+        // neither exists, so derive the gateway URL from the bot's Caddy host here.
+        const webOpenUrl = (mode === 'casaos' && bot.status === 'running')
+          ? casaosWebOpenUrl(bot.sanitizedName, bot.id)
+          : null;
+
         return {
           ...bot,
           autoUpdate: bot.autoUpdate || false,
@@ -63,6 +70,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           behindBy,
+          webOpenUrl,
         };
       }));
 
@@ -1254,6 +1262,25 @@ function fleetAppContainerName(composeContent: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * CasaOS Open URL for a running web bot: the bot's Caddy route on the platform
+ * gateway (`https://<sanitizedName>-<APP_DOMAIN>`) plus the web-UI index path,
+ * which already carries the substituted ?hash=. Mirrors how pcsProcessing stamps
+ * caddy_0 = `${appName}-${APP_DOMAIN}` for the web service. Returns null when
+ * APP_DOMAIN is unavailable (not on Yundera) or the deployed compose declares no
+ * web UI, so the UI shows no button rather than a fabricated link.
+ */
+function casaosWebOpenUrl(sanitizedName: string, botId: string): string | null {
+  const appDomain = process.env.APP_DOMAIN || '';
+  if (!appDomain) return null;
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', sanitizedName, 'docker-compose.yml');
+  const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(botId), 'docker-compose.yml');
+  if (!fs.existsSync(composePath)) return null;
+  const webUiPath = getWebUiIndexPath(fs.readFileSync(composePath, 'utf-8')) || '/';
+  return `https://${sanitizedName}-${appDomain}${webUiPath}`;
 }
 
 // Helper: list files in a directory (max 100)

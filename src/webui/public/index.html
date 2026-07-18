@@ -1336,6 +1336,8 @@
                 ${isRunning ? `
                   ${bot.publicUrl
                     ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.publicUrl) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
+                    : bot.webOpenUrl
+                    ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.webOpenUrl)}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                     : bot.hostPort ? (isLocalBrowser
                       ? `<a class="btn btn-primary btn-small" href="http://${location.hostname}:${bot.hostPort}${escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                       : `<button class="btn btn-primary btn-small" disabled title="The bot's web UI port is bound to 127.0.0.1 on the server, so it is only reachable from the server itself. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.">Open</button>`) : ''}
@@ -2651,13 +2653,22 @@
 
     // Consecutive entries sharing a `group` render inside a titled section; rows
     // flagged `advanced` fold under a disclosure at the end of their section.
+    // Ungrouped advanced rows (prefilled low-touch vars like REDIS_URL or paths)
+    // collect into a single trailing Advanced disclosure so the top stays to the
+    // required/blank fields the operator actually needs to fill.
     function renderEnvRows(entries) {
       if (!entries || entries.length === 0) return buildEnvRowHtml('', '', null, false, '');
       let html = '';
+      let ungroupedAdvanced = '';
       let i = 0;
       while (i < entries.length) {
         const group = entries[i].group;
-        if (!group) { html += renderEnvRow(entries[i]); i++; continue; }
+        if (!group) {
+          if (entries[i].advanced) ungroupedAdvanced += renderEnvRow(entries[i]);
+          else html += renderEnvRow(entries[i]);
+          i++;
+          continue;
+        }
         const groupEntries = [];
         while (i < entries.length && entries[i].group === group) { groupEntries.push(entries[i]); i++; }
         const main = groupEntries.filter(e => !e.advanced).map(renderEnvRow).join('');
@@ -2669,6 +2680,9 @@
           ${main}
           ${adv ? `<details class="env-advanced"><summary>Advanced</summary>${adv}</details>` : ''}
         </div>`;
+      }
+      if (ungroupedAdvanced) {
+        html += `<details class="env-advanced"><summary>Advanced</summary>${ungroupedAdvanced}</details>`;
       }
       return html;
     }

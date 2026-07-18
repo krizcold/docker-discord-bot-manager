@@ -50,6 +50,29 @@ function isManagerInjectedFleetEnv(key: string): boolean {
   return MANAGER_INJECTED_FLEET_ENV.has(key.toUpperCase());
 }
 
+// Keys the operator is expected to set on a fresh install, so they always stay
+// visible up top even when prefilled - the bot identity and the web-UI access
+// credentials. Sensitive vars are already kept visible by the general rule; these
+// cover the non-sensitive identity fields (client/guild ids) as well.
+const ALWAYS_SHOW_ENV = new Set([
+  'CLIENT_ID', 'APPLICATION_ID', 'APP_ID', 'GUILD_ID', 'AUTH_HASH', 'WEBUI_USER', 'WEBUI_PASSWORD',
+]);
+
+/**
+ * Whether a row should fold into the collapsed Advanced disclosure. General rule
+ * (no bot names): a row is advanced when it arrives prefilled with a non-empty
+ * default the operator is unlikely to change, and is neither required, sensitive,
+ * nor one of the always-show identity/credential keys. An explicit advanced flag
+ * on the row (e.g. the fleet shard fields) always wins.
+ */
+function isAdvancedEnv(v: WizardEnvVar): boolean {
+  if (v.advanced) return true;
+  if (v.required) return false;
+  if (v.sensitive || isSensitive(v.key)) return false;
+  if (ALWAYS_SHOW_ENV.has(v.key.toUpperCase())) return false;
+  return (v.defaultValue || '').trim() !== '';
+}
+
 /**
  * Wizard view: every var a fresh install should offer, enriched with
  * label/description/required/sensitive plus DB/Lavalink auto-wiring and the
@@ -163,7 +186,13 @@ export function buildWizardEnvList(
     vars.push(...fleet);
   }
 
-  return { vars: vars.filter(v => !isManagerInjectedFleetEnv(v.key)), detection };
+  // Auto-fold low-touch prefilled rows into Advanced. Only ungrouped rows: a group
+  // (e.g. Fleet) curates its own advanced flags, and its primary controls must stay
+  // visible. Explicit flags already set on a row are left untouched.
+  const surfaced = vars
+    .filter(v => !isManagerInjectedFleetEnv(v.key))
+    .map(v => (!v.group && v.advanced === undefined && isAdvancedEnv(v)) ? { ...v, advanced: true } : v);
+  return { vars: surfaced, detection };
 }
 
 /**

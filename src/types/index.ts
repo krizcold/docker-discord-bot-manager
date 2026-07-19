@@ -85,6 +85,8 @@ export interface InstanceConfig {
 
   // Lifecycle
   hasBeenStarted?: boolean;
+  webUiReady?: boolean;                // true once the bot's web UI pinged back reachable after its last (re)start
+  lastStartAt?: number;                // epoch ms of the last (re)start; drives the Open-button grace fallback
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()

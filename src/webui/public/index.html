@@ -1348,7 +1348,9 @@
               ${(isGit || webAuthControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}</div>` : ''}
               <div class="bot-card-actions">
                 ${isRunning ? `
-                  ${bot.publicUrl
+                  ${(bot.publicUrl || bot.webOpenUrl || bot.hostPort) && !bot.webUiReady
+                    ? `<button class="btn btn-primary btn-small" disabled title="The bot's web UI is still starting up; this enables once it reports reachable">Starting...</button>`
+                    : bot.publicUrl
                     ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.publicUrl) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                     : bot.webOpenUrl
                     ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.webOpenUrl)}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`

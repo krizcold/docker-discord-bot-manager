@@ -71,6 +71,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           updateAvailable,
           behindBy,
           webOpenUrl,
+          // Effective readiness (ping or grace fallback) drives the Open button.
+          webUiReady: containerManager.isBotWebUiReady(bot),
         };
       }));
 
@@ -994,6 +996,32 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const { target, from, to } = req.body as { target?: string; from?: string; to?: string };
       if (typeof from !== 'string' || typeof to !== 'string') { res.status(400).json({ success: false, error: 'from and to are required' }); return; }
       res.json(await terminal.fsRename(req.params.id, target || 'host', from, to));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/webui-ready - Bot reports its web UI is serving.
+   * The bot pings this once its HTTP server is listening, so the Open button
+   * stays disabled until the web UI is actually reachable after a (re)start.
+   */
+  router.post('/:id/webui-ready', async (req: Request, res: Response) => {
+    try {
+      const botId = req.params.id;
+      const token = req.headers['x-bot-token'] as string;
+      const bot = containerManager.getBot(botId);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      if (!token || bot.updateToken !== token) {
+        res.status(403).json({ success: false, error: 'Invalid token' });
+        return;
+      }
+      containerManager.setWebUiReady(botId, true);
+      broadcastToClients(wss, 'bot:updated', containerManager.getBot(botId));
+      res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

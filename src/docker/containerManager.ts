@@ -143,6 +143,18 @@ function saveRegistry(registry: InstanceRegistry): void {
 
 // ─── Registry Accessors ───
 
+// Open button gating: a bot that implements the readiness ping (POST
+// /webui-ready) flips webUiReady precisely at boot; any other bot is treated
+// reachable once this grace period since its last start elapses, so the gate
+// never sticks on bots that do not ping.
+const WEBUI_READY_GRACE_MS = 90000;
+
+export function isBotWebUiReady(inst: InstanceConfig): boolean {
+  if (inst.webUiReady) return true;
+  if (typeof inst.lastStartAt === 'number') return Date.now() - inst.lastStartAt > WEBUI_READY_GRACE_MS;
+  return true; // never (re)started under readiness tracking: do not gate
+}
+
 export function getAllBots(): InstanceConfig[] {
   const registry = loadRegistry();
   return Object.values(registry.instances);
@@ -807,6 +819,12 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     if (status === 'running') {
       instance.hasBeenStarted = true;
     }
+    // A (re)start means the bot is booting again and its web UI is not reachable
+    // until it pings back ready (or the grace period elapses); gate Open on that.
+    if (status === 'starting') {
+      instance.webUiReady = false;
+      instance.lastStartAt = Date.now();
+    }
     if (containerIds !== undefined) {
       instance.containerIds = containerIds || [];
     }
@@ -816,6 +834,13 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     if (broadcastFn) {
       broadcastFn('bot:status', { id: botId, status });
     }
+    // A bot that does not implement the readiness ping never flips webUiReady;
+    // nudge the UI once the grace period elapses so its Open button un-gates.
+    if (status === 'starting') {
+      setTimeout(() => {
+        if (broadcastFn) broadcastFn('bot:updated', getBot(botId));
+      }, WEBUI_READY_GRACE_MS).unref();
+    }
   }
 }
 
@@ -824,6 +849,18 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   const instance = registry.instances[botId];
   if (instance) {
     instance.lastBuiltCommit = commitHash;
+    instance.updatedAt = new Date().toISOString();
+    registry.instances[botId] = instance;
+    saveRegistry(registry);
+  }
+}
+
+/** Bot -> manager readiness ping: the bot's web UI is serving. Gates the Open button. */
+export function setWebUiReady(botId: string, ready: boolean): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (instance && instance.webUiReady !== ready) {
+    instance.webUiReady = ready;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);

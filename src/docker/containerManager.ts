@@ -1906,6 +1906,11 @@ async function buildGitInstance(
 
   // Build Docker image BEFORE saving CasaOS metadata
   // (so a failed build doesn't leave a ghost app registered in CasaOS)
+  // Commit/branch this image is built from, resolved once and shared by the
+  // baked build badge (.build-meta.json) and the manager's own record so the
+  // two never disagree (which is what produced a "· null" badge).
+  let resolvedCommit: string | null = null;
+  let resolvedBranch: string | null = null;
   if (buildTarget) {
     emit(`[Build] Building Docker image (${imageName})...`, 'info');
 
@@ -1925,31 +1930,32 @@ async function buildGitInstance(
       emit(`[Build] Build args: ${Object.entries(relayed).map(([k, v]) => `${k}=${v}`).join(' ')}`, 'info');
     }
 
-    let metaCommit: string | null = null;
-    let metaBranch: string | null = null;
-    if (instance.sourceId) {
-      const source = sourceManager.getSource(instance.sourceId);
-      metaCommit = source?.lastCommitHash || null;
-      metaBranch = source?.branch || null;
-    }
-    if (!metaCommit && fs.existsSync(path.join(repoPath, '.git'))) {
+    // Resolve commit/branch once. Order: the repo's actual HEAD (authoritative
+    // after the fetch above), then the source registry, then the commit we last
+    // recorded for this bot - so a transient fetch/clone gap bakes the previous
+    // commit, never null.
+    if (fs.existsSync(path.join(repoPath, '.git'))) {
       try {
         const simpleGit = require('simple-git').simpleGit;
         const git = simpleGit(repoPath);
         const log = await git.log({ maxCount: 1 });
-        if (log.latest?.hash) metaCommit = log.latest.hash;
-        if (!metaBranch) {
-          const br = await git.revparse(['--abbrev-ref', 'HEAD']);
-          metaBranch = (br || '').trim() || null;
-        }
+        if (log.latest?.hash) resolvedCommit = log.latest.hash;
+        const br = await git.revparse(['--abbrev-ref', 'HEAD']);
+        resolvedBranch = (br || '').trim() || null;
       } catch {
-        // leave nulls; bot will fall back to BUILD_DATE for buildId
+        // fall through to the registry / prior-record fallbacks below
       }
     }
+    if (instance.sourceId) {
+      const source = sourceManager.getSource(instance.sourceId);
+      if (!resolvedCommit) resolvedCommit = source?.lastCommitHash || null;
+      if (!resolvedBranch) resolvedBranch = source?.branch || null;
+    }
+    if (!resolvedCommit) resolvedCommit = instance.lastBuiltCommit || null;
     try {
       fs.writeFileSync(
         path.join(repoPath, '.build-meta.json'),
-        JSON.stringify({ commit: metaCommit, branch: metaBranch, builtAt: buildArgs.BUILD_DATE }, null, 2)
+        JSON.stringify({ commit: resolvedCommit, branch: resolvedBranch, builtAt: buildArgs.BUILD_DATE }, null, 2)
       );
     } catch (err: any) {
       emit(`[Build] Could not write .build-meta.json: ${err?.message || err}`, 'warning');
@@ -1994,23 +2000,21 @@ async function buildGitInstance(
     }
   }
 
-  // Record the commit this was built from, read directly from the repo
-  // (source registry may not be up-to-date if clone just happened)
+  // Record the commit this was built from so the manager's record and the bot's
+  // baked badge agree. Prefer the value baked into the image; otherwise (no
+  // build target) read the repo, then the source registry.
   if (instance.sourceId) {
-    try {
-      const simpleGit = require('simple-git').simpleGit;
-      const git = simpleGit(repoPath);
-      const log = await git.log({ maxCount: 1 });
-      if (log.latest?.hash) {
-        updateLastBuiltCommit(botId, log.latest.hash);
-      }
-    } catch (err) {
-      // Fallback to source registry
-      const source = sourceManager.getSource(instance.sourceId);
-      if (source?.lastCommitHash) {
-        updateLastBuiltCommit(botId, source.lastCommitHash);
+    let recordCommit = resolvedCommit;
+    if (!recordCommit) {
+      try {
+        const simpleGit = require('simple-git').simpleGit;
+        const log = await simpleGit(repoPath).log({ maxCount: 1 });
+        recordCommit = log.latest?.hash || null;
+      } catch {
+        recordCommit = sourceManager.getSource(instance.sourceId)?.lastCommitHash || null;
       }
     }
+    if (recordCommit) updateLastBuiltCommit(botId, recordCommit);
   }
 
   updateBotStatus(botId, 'stopped');

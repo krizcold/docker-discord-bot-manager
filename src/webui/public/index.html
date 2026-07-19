@@ -237,6 +237,20 @@
       flex: 1; min-width: 0; font-family: monospace; font-size: 0.82rem;
       color: var(--text-primary); word-break: break-all; user-select: all;
     }
+    /* Source re-clone progress (indeterminate: clone gives no percentage) */
+    .source-fetching-label { color: var(--warning); }
+    .source-fetch-bar {
+      height: 4px; background: var(--bg-primary); border-radius: 3px;
+      overflow: hidden; margin-top: 5px;
+    }
+    .source-fetch-bar-fill {
+      height: 100%; width: 40%; border-radius: 3px; background: var(--warning);
+      animation: source-fetch-slide 1.2s ease-in-out infinite;
+    }
+    @keyframes source-fetch-slide {
+      0% { margin-left: -40%; }
+      100% { margin-left: 100%; }
+    }
     .detection-info {
       background: var(--bg-tertiary); padding: 10px 14px; border-radius: var(--radius);
       margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary);
@@ -2239,8 +2253,39 @@
       renderSourceSidebar();
     }
 
+    // A url/branch change wipes the clone and nulls the commit while the server
+    // re-clones in the background. The one-shot 'source:updated' WS event can be
+    // missed (the socket auto-reconnects on any drop mid-clone), so poll until
+    // the commit resolves rather than trusting a single event. Capped so a
+    // permanently-failed clone cannot poll forever.
+    let sourceFetchTimer = null;
+    let sourceFetchStart = 0;
+    const SOURCE_FETCH_POLL_MS = 2500;
+    const SOURCE_FETCH_MAX_MS = 120000;
+    function isSourceFetching(s) {
+      return !!(s && s.sourceType !== 'docker-image' && s.lastChecked && !s.lastCommitHash);
+    }
+    function ensureSourceFetchPolling() {
+      const anyFetching = sources.some(isSourceFetching);
+      if (anyFetching && !sourceFetchTimer) {
+        sourceFetchStart = Date.now();
+        sourceFetchTimer = setInterval(() => {
+          if (Date.now() - sourceFetchStart > SOURCE_FETCH_MAX_MS) {
+            clearInterval(sourceFetchTimer);
+            sourceFetchTimer = null;
+            return;
+          }
+          loadSources();
+        }, SOURCE_FETCH_POLL_MS);
+      } else if (!anyFetching && sourceFetchTimer) {
+        clearInterval(sourceFetchTimer);
+        sourceFetchTimer = null;
+      }
+    }
+
     function renderSourceSidebar() {
       const list = document.getElementById('source-list');
+      ensureSourceFetchPolling();
       if (sources.length === 0) {
         list.innerHTML = '<div class="source-empty">No sources yet.<br>Click + Add to import a repository.</div>';
         return;
@@ -2328,7 +2373,7 @@
             ? `<div class="source-card-url" style="margin-left:26px;">Image: <span style="font-family:monospace;">${escapeHtml(s.imageRef || '')}</span> ${instanceBadge}</div>`
             : `<div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
           <div class="source-card-meta" style="margin-left:26px;">${s.lastChecked && !s.lastCommitHash
-            ? `${escapeHtml(s.branch)} &middot; <span style="color:var(--warning);animation:pulse 2s infinite;">Fetching...</span>`
+            ? `${escapeHtml(s.branch)} &middot; <span class="source-fetching-label">Fetching...</span><div class="source-fetch-bar"><div class="source-fetch-bar-fill"></div></div>`
             : `${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}`}</div>`}
           <div class="source-card-actions" style="margin-left:26px;">
             ${!isImage && isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>

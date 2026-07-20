@@ -31,6 +31,7 @@ import {
   hasExistingCompose,
   generateImageCompose,
   getComposeBuildInfo,
+  extractBuildTarget,
   replaceServiceImageWithBuild,
   extractComposeBuildArgs,
   findBuildServices,
@@ -1838,6 +1839,14 @@ async function buildGitInstance(
     if (originalComposeName && originalComposeName !== appName) {
       emit(`[Info] Substituting compose name: ${originalComposeName} -> ${appName}`, 'info');
       rawCompose = substituteComposeNames(rawCompose, originalComposeName, appName, instance.titleName);
+      // Substitution renamed the build-target service (its key and x-casaos.build),
+      // so re-derive buildTarget from the substituted compose. Otherwise the image
+      // swap below matches the old service name, no-ops, and the container keeps the
+      // source's original (unbuilt) image - which is exactly how a 2nd instance ended
+      // up running the upstream GHCR image instead of its freshly built one.
+      if (buildTarget) {
+        buildTarget = extractBuildTarget(rawCompose) || buildTarget;
+      }
     }
 
     // Apply variable substitution

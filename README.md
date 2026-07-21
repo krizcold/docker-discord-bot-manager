@@ -93,7 +93,7 @@ sudo ./setup.sh
 
 A real `git clone` (not a ZIP download) is required: the manager's self-update pulls this checkout.
 
-Semi-automated: it still asks you the choices that matter - **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password`).
+Semi-automated: it still asks you the choices that matter - a **data directory** (Enter accepts `/opt/dbm/data`), **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password`).
 
 > **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
 >

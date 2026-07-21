@@ -61,7 +61,7 @@ session:
     # COOKIE_DOMAIN=203-0-113-5.sslip.io with PUBLIC_HOST=bot.203-0-113-5.sslip.io and
     # AUTHELIA_HOST=auth.203-0-113-5.sslip.io (dots, not hyphens). Real domain: example.com.
     - domain: '{{ env "COOKIE_DOMAIN" }}'
-      authelia_url: 'https://{{ env "AUTHELIA_HOST" }}'
+      authelia_url: 'https://{{ env "AUTH_HOST" }}'
       default_redirection_url: 'https://{{ env "PUBLIC_HOST" }}'
       name: 'authelia_session'
       same_site: 'lax'

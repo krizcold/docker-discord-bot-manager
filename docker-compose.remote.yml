@@ -77,7 +77,10 @@ services:
       X_AUTHELIA_CONFIG: /config/configuration.yml
       X_AUTHELIA_CONFIG_FILTERS: template          # render {{ env "..." }} in configuration.yml
       PUBLIC_HOST: ${PUBLIC_HOST}
-      AUTHELIA_HOST: ${AUTHELIA_HOST}
+      # Named AUTH_HOST inside the container: Authelia parses any AUTHELIA_*-prefixed
+      # env as its own config (AUTHELIA_HOST -> deprecated 'host' key -> fatal clash
+      # with server.address). The .env key stays AUTHELIA_HOST.
+      AUTH_HOST: ${AUTHELIA_HOST}
       COOKIE_DOMAIN: ${COOKIE_DOMAIN}
       AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/JWT_SECRET
       AUTHELIA_SESSION_SECRET_FILE: /secrets/SESSION_SECRET

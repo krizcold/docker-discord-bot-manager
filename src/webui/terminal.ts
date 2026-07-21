@@ -23,6 +23,7 @@ import { WebSocket } from 'ws';
 import { getBot } from '../docker/containerManager';
 import { getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
+import { fixDockerBotOwnership } from '../templates/pcsProcessing';
 
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const CASAOS_CONTAINER = 'casaos';
@@ -221,7 +222,13 @@ export async function fsWrite(botId: string, target: string, reqPath: string, bo
     return { success: false, error: 'Refusing to save an empty file (this would erase its contents). Use delete if you mean to remove it.' };
   }
 
-  if (t.kind === 'local') return localWrite(abs, body);
+  if (t.kind === 'local') {
+    const result = localWrite(abs, body);
+    // The manager runs as root: hand anything it just created to the bot's uid,
+    // or the running bot (PUID) gets EACCES on its own files.
+    if (result.success) fixDockerBotOwnership(t.base);
+    return result;
+  }
 
   // Pass the path as $1 (argv), never interpolated into the shell.
   const { stderr, code } = await spawnCapture(
@@ -238,7 +245,11 @@ export async function fsMkdir(botId: string, target: string, reqPath: string): P
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
-  if (t.kind === 'local') return localMkdir(abs);
+  if (t.kind === 'local') {
+    const result = localMkdir(abs);
+    if (result.success) fixDockerBotOwnership(t.base);
+    return result;
+  }
   const { stderr, code } = await spawnCapture('docker', execArgs(t, ['mkdir', '-p', '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to create directory' };
   return { success: true, path: abs };

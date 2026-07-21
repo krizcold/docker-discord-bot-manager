@@ -255,7 +255,7 @@ elif [ ! -f "$USERS_DB" ] || grep -q 'REPLACE_WITH_GENERATED_HASH' "$USERS_DB"; 
 
 if [ "$need_password" -eq 1 ]; then
   while :; do
-    read_secret ADMIN_PW  "Admin password: "
+    read_secret ADMIN_PW  "Set a NEW admin password (your web login will be admin / this password): "
     read_secret ADMIN_PW2 "Confirm password: "
     [ -n "$ADMIN_PW" ] || { warn "Password cannot be empty."; continue; }
     [ "$ADMIN_PW" = "$ADMIN_PW2" ] || { warn "Passwords do not match."; continue; }

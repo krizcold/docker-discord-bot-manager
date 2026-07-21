@@ -479,14 +479,22 @@ export function processComposeForCasaOS(
     const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
     if (fleetSvc) {
       setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
-      if (isFleetMaster(bot.envVars) && pcs.APP_PUBLIC_IP_DASH) {
-        // sslip.io + Let's Encrypt (no gateway_tls): the control plane is a
-        // machine client, so it needs a publicly-trusted cert, not the gateway's
-        // custom CA. Mirrors the web UI's caddy_2 sslip route.
-        const fleetHost = `${appName}-fleet-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`;
+      if (isFleetMaster(bot.envVars) && pcs.APP_DOMAIN) {
+        // Workers dial the app domain: TLS terminates at Cloudflare with the
+        // publicly-trusted wildcard cert, and the request reaches the box with
+        // the Host rewritten to the nip.io form. The site therefore needs BOTH
+        // names, same as the web tile's caddy_0/caddy_1 pair.
+        const fleetHost = `${appName}-fleet-${pcs.APP_DOMAIN}`;
         const idx = nextCaddySiteIndex(fleetSvc.labels);
         setServiceLabel(fleetSvc, `caddy_${idx}`, fleetHost);
+        setServiceLabel(fleetSvc, `caddy_${idx}.import`, 'gateway_tls');
         setServiceLabel(fleetSvc, `caddy_${idx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
+        if (pcs.APP_PUBLIC_IP_DASH) {
+          const nipIdx = idx + 1;
+          setServiceLabel(fleetSvc, `caddy_${nipIdx}`, `${appName}-fleet-${pcs.APP_PUBLIC_IP_DASH}.nip.io`);
+          setServiceLabel(fleetSvc, `caddy_${nipIdx}.import`, 'gateway_tls');
+          setServiceLabel(fleetSvc, `caddy_${nipIdx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
+        }
         // Caddy resolves {{upstreams}} over the ingress network, so the app
         // container must join it; keep the project default network alongside.
         if (pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
@@ -1154,13 +1162,14 @@ export function fleetPublicHost(sanitizedName: string): string | null {
 /**
  * Mode-resolved part of the fleet host after the instance name, or null when no
  * publicly-trusted base exists. The fleet endpoint is reached by machine clients
- * (workers), so it must resolve to a publicly-trusted cert: sslip.io + Let's
- * Encrypt on Yundera (never the custom-CA gateway domain), the ACME-issued
- * `<base>` on the remote stack. Lets clients preview a fleet URL before install.
+ * (workers), so the dialed host must present a publicly-trusted cert: the app
+ * domain on Yundera (TLS terminates at Cloudflare, so clients never see the
+ * custom-CA gateway cert), the ACME-issued `<base>` on the remote stack. Lets
+ * clients preview a fleet URL before install.
  */
 export function fleetHostSuffix(): string | null {
-  const ipDash = process.env.APP_PUBLIC_IP_DASH || '';
-  if (ipDash) return `-fleet-${ipDash}.sslip.io`;
+  const appDomain = process.env.APP_DOMAIN || '';
+  if (appDomain) return `-fleet-${appDomain}`;
   const domainBase = process.env.BOT_DOMAIN_BASE || '';
   if (domainBase) return `-fleet.${domainBase}`;
   return null;

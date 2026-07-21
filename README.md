@@ -73,6 +73,17 @@ Runs the manager UI on a public VPS behind **Caddy** (automatic TLS) + **Autheli
 
 ### Semi-automated setup (recommended)
 
+**Before you start - provider firewall.** setup.sh configures the on-box firewall (ufw) for you, but it cannot touch your hosting provider's external firewall (Contabo control panel, cloud security groups, etc.). If your VPS has one, add these inbound accept rules first:
+
+| Rule | Protocol | Port | Source |
+|---|---|---|---|
+| SSH | TCP | 22 (or your custom SSH port) | Any |
+| HTTP | TCP | 80 | Any |
+| HTTPS | TCP | 443 | Any |
+| HTTP/3 (optional) | UDP | 443 | Any |
+
+Add the SSH rule **before** applying the firewall to the VPS, or you will lock yourself out. 80/443 must stay open to the world: 80 serves the Let's Encrypt challenge, and nothing answers on either port except Caddy, with everything behind it gated by the Authelia MFA login. If the panel has IPv6 sources, mirror the same rules for `::/0`.
+
 ```bash
 sudo apt-get install -y git   # fresh Ubuntu server images ship without git
 git clone https://github.com/krizcold/docker-discord-bot-manager.git

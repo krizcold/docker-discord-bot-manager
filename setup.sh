@@ -54,7 +54,7 @@ done
 # Reads existing .env (KEY=value) so re-runs keep stable defaults.
 env_get() { [ -f "$ENV_FILE" ] || return 0; sed -n "s/^$1=//p" "$ENV_FILE" | head -n1; }
 
-read_secret() { local __v; read -rsp "$2" __v; printf '\n' >&2; printf -v "$1" '%s' "$__v"; }
+read_secret() { local __v; read -rsp "$2" __v || die "stdin closed (non-interactive run); run setup.sh from an interactive shell"; printf '\n' >&2; printf -v "$1" '%s' "$__v"; }
 
 authelia_cli() { docker run --rm "$AUTHELIA_IMAGE" authelia "$@"; }
 # Extract the value by shape, so a labelled or bare CLI output both parse.
@@ -97,7 +97,7 @@ if ! command -v docker >/dev/null 2>&1; then
   systemctl enable --now docker 2>/dev/null || true
 fi
 command -v docker >/dev/null 2>&1 || die "Docker is not installed."
-docker compose version >/dev/null 2>&1 || die "The Docker Compose plugin is missing (need 'docker compose')."
+docker compose version >/dev/null 2>&1 || die "The Docker Compose plugin is missing (need 'docker compose'). On Ubuntu: apt-get install -y docker-compose-v2 (or remove the pre-installed docker and re-run; this script installs Docker with all plugins)."
 
 # The manager and Caddy bind /var/run/docker.sock; rootless/remote Docker won't work.
 if [ -n "${DOCKER_HOST:-}" ] && [ "${DOCKER_HOST}" != "unix:///var/run/docker.sock" ]; then

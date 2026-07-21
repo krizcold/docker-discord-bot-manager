@@ -74,10 +74,13 @@ Runs the manager UI on a public VPS behind **Caddy** (automatic TLS) + **Autheli
 ### Semi-automated setup (recommended)
 
 ```bash
+sudo apt-get install -y git   # fresh Ubuntu server images ship without git
 git clone https://github.com/krizcold/docker-discord-bot-manager.git
 cd docker-discord-bot-manager
 sudo ./setup.sh
 ```
+
+A real `git clone` (not a ZIP download) is required: the manager's self-update pulls this checkout.
 
 Semi-automated: it still asks you the choices that matter - **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password`).
 

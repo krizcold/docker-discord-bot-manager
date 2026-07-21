@@ -1018,7 +1018,7 @@ export function attachBotToProxy(
   } else if (svc.networks && typeof svc.networks === 'object') {
     (svc.networks as Record<string, unknown>)[network] = {};
   } else {
-    svc.networks = [network];
+    svc.networks = ['default', network];
   }
 
   if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
@@ -1211,7 +1211,7 @@ export function attachFleetToProxy(
   } else if (svc.networks && typeof svc.networks === 'object') {
     (svc.networks as Record<string, unknown>)[network] = {};
   } else {
-    svc.networks = [network];
+    svc.networks = ['default', network];
   }
   if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
   const nets = compose.networks as Record<string, unknown>;

@@ -144,7 +144,10 @@ esac
 info "How should the manager be reached over HTTPS?"
 say  "  1) sslip.io           - no domain, derived from this server's public IP (quick start)"
 say  "  2) your own domain    - sturdier certs/cookies (recommended for anything you keep)"
-read -rp "Choice [$domain_default]: " domain_choice; domain_choice="${domain_choice:-$domain_default}"
+while :; do
+  read -rp "Choice [$domain_default]: " domain_choice; domain_choice="${domain_choice:-$domain_default}"
+  case "$domain_choice" in 1|2) break ;; *) warn "Enter 1 or 2." ;; esac
+done
 
 if [ "$domain_choice" = "2" ]; then
   # Re-runs default to the configured domain (never an sslip.io host).

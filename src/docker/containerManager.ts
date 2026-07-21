@@ -959,8 +959,8 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
 
   // Fleet control endpoint (marker-driven): a master with a public base gets a wss
   // route on the bundled Caddy (no forward_auth - CONTROL_SECRET is the auth), and
-  // every marker instance gets a localhost-bound control host-port so a same-box
-  // worker can dial a local master via host.docker.internal.
+  // every marker instance gets a localhost-bound control host-port for host-level
+  // tooling. Same-box workers dial the master's container name over dbm_internal.
   const controlPort = getFleetControlPort(content);
   let fleetHostPort: number | undefined;
   if (controlPort !== null) {

@@ -144,7 +144,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
       const dataRoot = process.env.DATA_ROOT || '/DATA';
-      const mode = await getDeploymentMode();
       const masters: Array<{ id: string; name: string; masterUrl: string | null; localUrl: string | null; secretSet: boolean; controlSecret: string }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
@@ -168,20 +167,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
           // Local URL a same-host/same-manager worker should dial instead, so the
           // handshake stays on the box rather than looping out through the public
-          // gateway.
-          //   CasaOS: master app container and sibling bot container share the pcs
-          //     network, so the worker resolves the master's app container directly.
-          //   Docker: the control port is published on the host loopback, reachable
-          //     from a sibling container as host.docker.internal.
-          let localUrl: string | null = null;
-          if (mode === 'docker') {
-            if (typeof bot.fleetHostPort === 'number') {
-              localUrl = `ws://host.docker.internal:${bot.fleetHostPort}`;
-            }
-          } else {
-            const cname = fleetAppContainerName(composeContent);
-            if (cname) localUrl = `ws://${cname}:${controlPort}`;
-          }
+          // gateway. Both modes dial the master's app container by name over the
+          // shared network (pcs on CasaOS, dbm_internal in docker mode):
+          // host.docker.internal is Docker Desktop-only and the fleet host port is
+          // loopback-bound, so on bare Linux a container-name dial is the only
+          // route that works.
+          const cname = fleetAppContainerName(composeContent);
+          const localUrl = cname ? `ws://${cname}:${controlPort}` : null;
 
           if (!masterUrl && !localUrl) continue;
 

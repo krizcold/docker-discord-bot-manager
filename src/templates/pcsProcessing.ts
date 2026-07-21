@@ -1241,10 +1241,11 @@ export function getPublishedFleetHostPort(composeContent: string, controlPort: n
 }
 
 /**
- * Publish the fleet control port on the host (docker mode) so a same-box worker
- * can dial a local master via host.docker.internal. Always 127.0.0.1-bound: a
- * published port bypasses host firewalls, and the control plane must never go
- * public this way (public access is the Caddy wss route).
+ * Publish the fleet control port on the host (docker mode) for host-level
+ * tooling; same-box workers dial the master's container name over the shared
+ * network instead. Always 127.0.0.1-bound: a published port bypasses host
+ * firewalls, and the control plane must never go public this way (public
+ * access is the Caddy wss route).
  */
 export function publishFleetHostPort(
   composeContent: string,

@@ -251,6 +251,20 @@ ACME_EMAIL="${ACME_EMAIL:-$email_default}"
 [ -n "$ACME_EMAIL" ] || die "An email is required."
 TZ_VAL="$(timedatectl show -p Timezone --value 2>/dev/null)"; [ -n "$TZ_VAL" ] || TZ_VAL="$(env_get TZ)"; [ -n "$TZ_VAL" ] || TZ_VAL="UTC"
 
+# ── Login policy: MFA (default) or password-only ─────────────────────────────
+prev_policy="$(env_get ACCESS_POLICY)"
+mfa_default="Y"; [ "$prev_policy" = "one_factor" ] && mfa_default="N"
+if [ "$mfa_default" = "Y" ]; then mfa_hint="[Y/n]"; else mfa_hint="[y/N]"; fi
+read -rp "Require an authenticator code at login (MFA)? $mfa_hint: " mfa_in
+mfa_in="${mfa_in:-$mfa_default}"
+case "$mfa_in" in
+  [Nn]*)
+    ACCESS_POLICY="one_factor"
+    warn "Password-only login: this UI controls the Docker socket (root on this host). Re-run setup.sh to turn MFA back on."
+    ;;
+  *) ACCESS_POLICY="two_factor" ;;
+esac
+
 # ── Admin password + users_database.yml ───────────────────────────────────────
 need_password=0
 if [ "$RESET_PASSWORD" -eq 1 ]; then need_password=1
@@ -301,6 +315,7 @@ ACME_EMAIL=$ACME_EMAIL
 TZ=$TZ_VAL
 BOT_DOMAIN_BASE=$BOT_DOMAIN_BASE
 MANAGER_GATEWAY_SECRET=$MANAGER_GATEWAY_SECRET
+ACCESS_POLICY=$ACCESS_POLICY
 EOF
 ok "Wrote $ENV_FILE"
 
@@ -346,42 +361,56 @@ esac
 # the QR printed here instead. The CLI runs inside the container, which already
 # carries X_AUTHELIA_CONFIG + the filter env, so no flags are needed. generate
 # wraps the URI in single quotes, hence the quote-excluding grep.
-info "Provisioning the admin TOTP device ..."
 totp_uri=""
-totp_force_pending=$RESET_MFA
-for _ in $(seq 1 6); do
-  if [ "$totp_force_pending" -eq 1 ]; then
-    # Force exactly once: if the write lands but parsing fails, the retries below
-    # must recover the SAME device via export, never mint another one.
-    totp_force_pending=0
-    totp_uri="$(docker exec authelia authelia storage user totp generate admin --force 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
-  else
-    totp_uri="$(docker exec authelia authelia storage user totp export uri 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | grep -E '(:|%3A)admin\?' | head -n1)"
+if [ "$ACCESS_POLICY" = "two_factor" ]; then
+  info "Provisioning the admin TOTP device ..."
+  totp_force_pending=$RESET_MFA
+  for _ in $(seq 1 6); do
+    if [ "$totp_force_pending" -eq 1 ]; then
+      # Force exactly once: if the write lands but parsing fails, the retries below
+      # must recover the SAME device via export, never mint another one.
+      totp_force_pending=0
+      totp_uri="$(docker exec authelia authelia storage user totp generate admin --force 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
+    else
+      totp_uri="$(docker exec authelia authelia storage user totp export uri 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | grep -E '(:|%3A)admin\?' | head -n1)"
+      [ -n "$totp_uri" ] && break
+      totp_uri="$(docker exec authelia authelia storage user totp generate admin 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
+    fi
     [ -n "$totp_uri" ] && break
-    totp_uri="$(docker exec authelia authelia storage user totp generate admin 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
-  fi
-  [ -n "$totp_uri" ] && break
-  sleep 5
-done
-if [ -n "$totp_uri" ]; then
-  totp_secret="$(printf '%s' "$totp_uri" | sed -n 's/.*[?&]secret=\([^&]*\).*/\1/p')"
-  if ! command -v qrencode >/dev/null 2>&1; then
-    apt-get -qq update >/dev/null 2>&1 || true
-    apt-get install -y -qq -o DPkg::Lock::Timeout=60 qrencode >/dev/null 2>&1 || true
-  fi
-  say ""
-  if command -v qrencode >/dev/null 2>&1; then
-    info "Scan this with your authenticator app (Google Authenticator, Aegis, ...):"
-    printf '%s' "$totp_uri" | qrencode -t ANSIUTF8 || true
-    say "  Can't scan? Add it manually with this secret: ${totp_secret:-$totp_uri}"
+    sleep 5
+  done
+  if [ -n "$totp_uri" ]; then
+    totp_secret="$(printf '%s' "$totp_uri" | sed -n 's/.*[?&]secret=\([^&]*\).*/\1/p')"
+    if ! command -v qrencode >/dev/null 2>&1; then
+      apt-get -qq update >/dev/null 2>&1 || true
+      apt-get install -y -qq -o DPkg::Lock::Timeout=60 qrencode >/dev/null 2>&1 || true
+    fi
+    say ""
+    if command -v qrencode >/dev/null 2>&1; then
+      info "Scan this with your authenticator app (Google Authenticator, Aegis, ...):"
+      printf '%s' "$totp_uri" | qrencode -t ANSIUTF8 || true
+      say "  Can't scan? Add it manually with this secret: ${totp_secret:-$totp_uri}"
+    else
+      info "Add this to your authenticator app (manual entry; qrencode was unavailable for a QR):"
+      say "  Account: admin    Secret: ${totp_secret:-$totp_uri}"
+    fi
+    ok "TOTP device registered for 'admin'. Re-run this script to re-show it; --reset-mfa for a new device."
   else
-    info "Add this to your authenticator app (manual entry; qrencode was unavailable for a QR):"
-    say "  Account: admin    Secret: ${totp_secret:-$totp_uri}"
+    totp_err="$(docker exec authelia authelia storage user totp export uri 2>&1 >/dev/null | tail -n2)"
+    warn "Could not register the TOTP device automatically${totp_err:+ ($totp_err)}. Re-run this script once the stack is healthy, or register in the web UI (the code Authelia 'emails' lands in: docker exec authelia cat /data/notification.txt)."
   fi
-  ok "TOTP device registered for 'admin'. Re-run this script to re-show it; --reset-mfa for a new device."
+fi
+
+if [ "$ACCESS_POLICY" = "two_factor" ]; then
+  login_line="admin  +  your password  +  the 6-digit code from your authenticator"
+  if [ -n "$totp_uri" ]; then
+    mfa_line="                (TOTP QR printed above - re-show: sudo ./setup.sh; new device: --reset-mfa)"
+  else
+    mfa_line="                (TOTP not provisioned yet - re-run sudo ./setup.sh once the stack is healthy)"
+  fi
 else
-  totp_err="$(docker exec authelia authelia storage user totp export uri 2>&1 >/dev/null | tail -n2)"
-  warn "Could not register the TOTP device automatically${totp_err:+ ($totp_err)}. Re-run this script once the stack is healthy, or register in the web UI (the code Authelia 'emails' lands in: docker exec authelia cat /data/notification.txt)."
+  login_line="admin  +  your password"
+  mfa_line="                (MFA is OFF: password-only login. Re-run sudo ./setup.sh to turn it on.)"
 fi
 
 cat <<EOF
@@ -389,8 +418,8 @@ cat <<EOF
 ${c_grn}${c_bold}Done.${c_off}
 
   Manager URL : https://$PUBLIC_HOST
-  Login       : admin  +  your password  +  the 6-digit code from your authenticator
-$( [ -n "$totp_uri" ] && printf '                (TOTP QR printed above - re-show: sudo ./setup.sh; new device: --reset-mfa)' || printf '                (TOTP not provisioned yet - re-run sudo ./setup.sh once the stack is healthy)' )
+  Login       : $login_line
+$mfa_line
 
   Reminders:
     - If TLS fails: open inbound 80 + 443 in Contabo's external firewall panel (separate from this host).

@@ -93,7 +93,9 @@ sudo ./setup.sh
 
 A real `git clone` (not a ZIP download) is required: the manager's self-update pulls this checkout.
 
-Semi-automated: it still asks you the choices that matter - a **data directory** (Enter accepts `/opt/dbm/data`), **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and prints how to enroll MFA. Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password`).
+Semi-automated: it still asks you the choices that matter - a **data directory** (Enter accepts `/opt/dbm/data`), **sslip.io or your own domain**, your **admin password**, and a **contact email** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and registers the admin TOTP device server-side, printing its QR code at the end (see **First login** below). Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password` / `--reset-mfa`).
+
+**First login:** setup.sh registers your authenticator (TOTP) device automatically and prints its QR code at the end of the run - scan it with any authenticator app (Google Authenticator, Aegis, ...). Then open `https://bot.<your-domain>` and sign in as **`admin`** with the password you set plus the current 6-digit code. Lost the QR? Re-run `sudo ./setup.sh` (it re-shows it). Lost the phone? `sudo ./setup.sh --reset-mfa` registers a fresh device; `--reset-password` does the same for the password.
 
 > **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
 >
@@ -101,7 +103,7 @@ Semi-automated: it still asks you the choices that matter - a **data directory**
 
 ### Fully manual setup (advanced)
 
-You do **not** need any of this if you ran `setup.sh` above - these are the same steps it performs, by hand (sslip.io example for VPS IP `203.0.113.5`):
+You do **not** need any of this if you ran `setup.sh` above - these are the equivalent steps, by hand (one difference: setup.sh registers the TOTP device server-side and prints a QR, while this path enrolls it in the web UI via the notification.txt link) (sslip.io example for VPS IP `203.0.113.5`):
 
 1. **Host prep:** create the data dir owned by the bot UID (`1000`), and open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled; don't publish the manager/Authelia ports). Allow SSH **before** enabling the firewall so you are not locked out:
    ```bash

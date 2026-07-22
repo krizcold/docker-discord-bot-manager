@@ -85,7 +85,7 @@ storage:
 notifier:
   disable_startup_check: false
   filesystem:
-    filename: '/data/notification.txt'   # the TOTP enrollment link is written here
+    filename: '/data/notification.txt'   # in-UI one-time codes land here (manual path / fallback only; setup.sh provisions TOTP server-side)
 
 totp:
   issuer: '{{ env "PUBLIC_HOST" }}'

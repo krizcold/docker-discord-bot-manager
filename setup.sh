@@ -21,6 +21,7 @@ PUID=1000
 PGID=1000
 SECRET_NAMES="JWT_SECRET SESSION_SECRET STORAGE_ENCRYPTION_KEY"
 RESET_PASSWORD=0
+RESET_MFA=0
 
 umask 077   # secrets, .env and users_database.yml are created 0600 from the first write
 
@@ -35,16 +36,18 @@ usage() {
   cat <<EOF
 Bot Manager public installer (Caddy auto-TLS + Authelia MFA).
 
-  Usage: sudo ./setup.sh [--reset-password] [-h|--help]
+  Usage: sudo ./setup.sh [--reset-password] [--reset-mfa] [-h|--help]
 
 Re-run any time to reconfigure (e.g. switch sslip.io <-> your own domain).
   --reset-password   Set a new admin password even if one is already configured.
+  --reset-mfa        Register a fresh TOTP device (invalidates the old one).
 EOF
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --reset-password) RESET_PASSWORD=1 ;;
+    --reset-mfa) RESET_MFA=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; die "Unknown argument: $1" ;;
   esac
@@ -335,19 +338,57 @@ case "$cert_state" in
   *) warn "No certificate result yet (issuance can take a little longer). Check later with 'docker logs caddy'." ;;
 esac
 
+# ── Admin TOTP device (registered server-side - no email round-trip) ─────────
+# Authelia gates in-UI device registration behind an emailed one-time code and this
+# stack has no SMTP, so the device is written straight into Authelia's storage and
+# the QR printed here instead. The CLI runs inside the container, which already
+# carries X_AUTHELIA_CONFIG + the filter env, so no flags are needed. generate
+# wraps the URI in single quotes, hence the quote-excluding grep.
+info "Provisioning the admin TOTP device ..."
+totp_uri=""
+totp_force_pending=$RESET_MFA
+for _ in $(seq 1 6); do
+  if [ "$totp_force_pending" -eq 1 ]; then
+    # Force exactly once: if the write lands but parsing fails, the retries below
+    # must recover the SAME device via export, never mint another one.
+    totp_force_pending=0
+    totp_uri="$(docker exec authelia authelia storage user totp generate admin --force 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
+  else
+    totp_uri="$(docker exec authelia authelia storage user totp export uri 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | grep -E '(:|%3A)admin\?' | head -n1)"
+    [ -n "$totp_uri" ] && break
+    totp_uri="$(docker exec authelia authelia storage user totp generate admin 2>/dev/null | grep -oE "otpauth://[^[:space:]']+" | head -n1)"
+  fi
+  [ -n "$totp_uri" ] && break
+  sleep 5
+done
+if [ -n "$totp_uri" ]; then
+  totp_secret="$(printf '%s' "$totp_uri" | sed -n 's/.*[?&]secret=\([^&]*\).*/\1/p')"
+  if ! command -v qrencode >/dev/null 2>&1; then
+    apt-get -qq update >/dev/null 2>&1 || true
+    apt-get install -y -qq -o DPkg::Lock::Timeout=60 qrencode >/dev/null 2>&1 || true
+  fi
+  say ""
+  if command -v qrencode >/dev/null 2>&1; then
+    info "Scan this with your authenticator app (Google Authenticator, Aegis, ...):"
+    printf '%s' "$totp_uri" | qrencode -t ANSIUTF8 || true
+    say "  Can't scan? Add it manually with this secret: ${totp_secret:-$totp_uri}"
+  else
+    info "Add this to your authenticator app (manual entry; qrencode was unavailable for a QR):"
+    say "  Account: admin    Secret: ${totp_secret:-$totp_uri}"
+  fi
+  ok "TOTP device registered for 'admin'. Re-run this script to re-show it; --reset-mfa for a new device."
+else
+  totp_err="$(docker exec authelia authelia storage user totp export uri 2>&1 >/dev/null | tail -n2)"
+  warn "Could not register the TOTP device automatically${totp_err:+ ($totp_err)}. Re-run this script once the stack is healthy, or register in the web UI (the code Authelia 'emails' lands in: docker exec authelia cat /data/notification.txt)."
+fi
+
 cat <<EOF
 
 ${c_grn}${c_bold}Done.${c_off}
 
   Manager URL : https://$PUBLIC_HOST
-  Login       : admin  /  (the password you set)
-
-  Enroll MFA:
-    1. Open  https://$PUBLIC_HOST  and log in.
-    2. Register a TOTP or WebAuthn device. Authelia would email a confirmation link,
-       but there is no SMTP here, so read it from the container:
-         docker exec authelia cat /data/notification.txt
-    3. Open that link, finish enrollment, and scan the QR into your authenticator.
+  Login       : admin  +  your password  +  the 6-digit code from your authenticator
+$( [ -n "$totp_uri" ] && printf '                (TOTP QR printed above - re-show: sudo ./setup.sh; new device: --reset-mfa)' || printf '                (TOTP not provisioned yet - re-run sudo ./setup.sh once the stack is healthy)' )
 
   Reminders:
     - If TLS fails: open inbound 80 + 443 in Contabo's external firewall panel (separate from this host).

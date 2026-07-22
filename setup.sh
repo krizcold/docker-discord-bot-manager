@@ -328,8 +328,10 @@ info "Checking Caddy TLS issuance (up to 60s) ..."
 cert_state=0
 for _ in $(seq 1 12); do
   logs="$(docker logs --since "$deploy_started_at" caddy 2>&1)"
-  if printf '%s' "$logs" | grep -qiE 'certificate obtained successfully|obtaining certificate'; then cert_state=1; break; fi
-  if printf '%s' "$logs" | grep -qiE 'could not get certificate|failed to obtain certificate|too many certificates already issued|no solvers available'; then cert_state=2; break; fi
+  # Herestrings, not printf|grep: grep -q exits at the first match and a large
+  # $logs would give printf EPIPE, failing the pipeline under pipefail.
+  if grep -qiE 'certificate obtained successfully|obtaining certificate' <<<"$logs"; then cert_state=1; break; fi
+  if grep -qiE 'could not get certificate|failed to obtain certificate|too many certificates already issued|no solvers available' <<<"$logs"; then cert_state=2; break; fi
   sleep 5
 done
 case "$cert_state" in

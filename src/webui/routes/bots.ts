@@ -344,7 +344,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       broadcastToClients(wss, 'bot:deleted', { id: req.params.id });
-      res.json({ success: true });
+      res.json({ success: true, vaulted: savedGroupId !== null });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

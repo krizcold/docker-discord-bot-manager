@@ -6,6 +6,7 @@
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
 import { spawn, execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
@@ -286,25 +287,25 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       // When keepEnv=true (default), preserve env vars in vault for recovery.
       // When keepEnv=false, user explicitly wants them gone; don't save.
+      // Every removal creates a new group so repeated removals of a same-named
+      // bot are kept as separate recoverable versions.
       if (keepEnv) {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
-          if (envVars && Object.keys(envVars).length > 0) {
-            const vault = loadVault();
-            const botName = bot.displayName;
-            const sanitizedName = bot.sanitizedName;
-            const now = Date.now();
-            for (const [key, value] of Object.entries(envVars)) {
-              // Upsert: latest wins by key+botName
-              const idx = vault.deleted.findIndex(d => d.key === key && d.botName === botName);
-              const entry = { key, value, botName, sanitizedName, deletedAt: now };
-              if (idx >= 0) {
-                vault.deleted[idx] = entry;
-              } else {
-                vault.deleted.push(entry);
-              }
+          if (envVars) {
+            const entries = Object.entries(envVars)
+              .map(([key, value]) => ({ key, value }));
+            if (entries.length > 0) {
+              const vault = loadVault();
+              vault.deletedBots.push({
+                id: randomUUID(),
+                botName: bot.displayName,
+                sanitizedName: bot.sanitizedName,
+                deletedAt: Date.now(),
+                entries,
+              });
+              saveVault(vault);
             }
-            saveVault(vault);
           }
         } catch (err) {
           console.warn(`[API] Failed to preserve env vars in vault: ${err}`);
@@ -1164,7 +1165,7 @@ export function createValidationRoutes(): Router {
   /**
    * GET /api/recover-envs?name=<displayName>
    * Returns recoverable plaintext env vars for a name, pulled from:
-   *   1. vault.deleted entries matching sanitizedName (or botName -> sanitize)
+   *   1. newest deleted-bot vault group matching sanitizedName
    *   2. CasaOS compose file at /DATA/AppData/casaos/apps/<sanitizedName>/docker-compose.yml
    * Vault entries win over compose when the same key exists in both.
    * Bot-manager-injected keys (BOT_ID, BOT_MANAGER_UPDATE_TOKEN, BOT_MANAGER_INTERNAL_URL) are stripped.
@@ -1183,11 +1184,12 @@ export function createValidationRoutes(): Router {
       const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
       const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
 
-      // Source 1: vault.deleted entries matching this name
+      // Source 1: newest deleted-bot vault group matching this name
       const fromVault: Record<string, string> = {};
-      for (const entry of loadVault().deleted) {
-        if (entry.sanitizedName !== targetSanitized) continue;
-        if (BOT_MANAGER_KEYS.has(entry.key)) continue;
+      const matchingGroup = loadVault().deletedBots
+        .filter(g => g.sanitizedName === targetSanitized)
+        .sort((a, b) => b.deletedAt - a.deletedAt)[0];
+      for (const entry of matchingGroup?.entries || []) {
         fromVault[entry.key] = entry.value;
       }
 

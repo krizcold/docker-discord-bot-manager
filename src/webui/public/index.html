@@ -3362,20 +3362,18 @@
           entriesHtml = g.entries.map(e => {
             const valueDisplay = e.hidden ? '' : e.value;
             const valuePlaceholder = e.hidden ? e.masked : 'Value';
-            const botNameAttr = e.botName ? ` data-bot-name="${escapeHtml(e.botName)}"` : '';
             return `
             <div class="vault-entry" data-group-id="${g.id}" data-group-type="${g.type}" data-original-key="${escapeHtml(e.key)}"
-              data-orig-value="${escapeHtml(valueDisplay)}"${botNameAttr} onfocusout="revertVaultIfClean(this, event)">
+              data-orig-value="${escapeHtml(valueDisplay)}" onfocusout="revertVaultIfClean(this, event)">
               <input class="vault-entry-key-input" value="${escapeHtml(e.key)}" autocomplete="off"
                 oninput="this.closest('.vault-entry').classList.add('dirty')">
               <input class="vault-entry-value-input ${e.hidden ? 'masked' : ''}" type="text" autocomplete="off" value="${escapeHtml(valueDisplay)}" placeholder="${escapeHtml(valuePlaceholder)}"
                 oninput="this.closest('.vault-entry').classList.add('dirty')">
-              ${e.botName ? `<span style="font-size:0.65rem;color:var(--text-muted);white-space:nowrap;" title="From deleted bot">${escapeHtml(e.botName)}</span>` : ''}
               <button class="vault-entry-btn save" onclick="saveVaultRow(this.closest('.vault-entry'))" title="Save">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
               </button>
               ${g.type === 'standalone' ? `<button class="vault-entry-btn delete" onclick="deleteVaultEntry(${jsArg(e.key)})" title="Delete">&times;</button>` : ''}
-              ${g.type === 'deleted' ? `<button class="vault-entry-btn delete" onclick="deleteDeletedVaultEntry(${jsArg(e.key)}, ${jsArg(e.botName)})" title="Delete">&times;</button>` : ''}
+              ${g.type === 'deleted' ? `<button class="vault-entry-btn delete" onclick="deleteDeletedVaultEntry(${jsArg(e.key)}, ${jsArg(g.id)})" title="Delete">&times;</button>` : ''}
             </div>`;
           }).join('');
 
@@ -3393,12 +3391,20 @@
           }
         }
 
+        const hasDupName = g.type === 'deleted' && vaultGroups.some(o => o !== g && o.type === 'deleted' && o.name === g.name);
+        const dateHtml = hasDupName ? `<span style="font-size:0.65rem;color:var(--text-muted);white-space:nowrap;">${new Date(g.deletedAt).toLocaleDateString()}</span>` : '';
+        const trashHtml = g.type === 'deleted' ? `
+            <button class="vault-entry-btn delete" onclick="event.stopPropagation(); deleteDeletedVaultGroup(${jsArg(g.id)}, ${jsArg(g.name)})" title="Remove this category and all its entries">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+            </button>` : '';
         return `
         <div class="vault-group">
           <div class="vault-group-header" onclick="toggleVaultGroup('${g.id}')">
             <span style="color:var(--text-muted);font-size:0.75rem;">${arrow}</span>
             <span class="vault-group-name">${escapeHtml(g.name)}</span>
+            ${dateHtml}
             <span class="vault-group-count">${g.entries.length}</span>
+            ${trashHtml}
           </div>
           ${entriesHtml}
         </div>`;
@@ -3457,11 +3463,10 @@
 
       try {
         if (groupType === 'deleted') {
-          const botName = row.dataset.botName;
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
-          await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?botName=${encodeURIComponent(botName)}`, body);
+          await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?groupId=${encodeURIComponent(groupId)}`, body);
         } else if (groupType === 'standalone') {
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
@@ -3500,14 +3505,28 @@
       }
     }
 
-    async function deleteDeletedVaultEntry(key, botName) {
+    async function deleteDeletedVaultEntry(key, groupId) {
       const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
-        await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?botName=${encodeURIComponent(botName)}`);
+        await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?groupId=${encodeURIComponent(groupId)}`);
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to delete entry');
+      } finally {
+        unlock();
+      }
+    }
+
+    async function deleteDeletedVaultGroup(id, name) {
+      if (!confirm(`Remove "${name}" and all its saved credentials? This cannot be undone.`)) return;
+      const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
+      try {
+        await api('DELETE', `/vault/deleted-group/${encodeURIComponent(id)}`);
+        vaultValuesCache = null;
+        loadVault();
+      } catch (err) {
+        showMessage('error', 'Failed to remove category');
       } finally {
         unlock();
       }

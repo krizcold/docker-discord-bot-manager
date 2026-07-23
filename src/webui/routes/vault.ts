@@ -2,7 +2,7 @@
  * Credentials Vault API Routes
  *
  * Provides a unified view of all env vars across bot instances + standalone vault entries.
- * Standalone entries stored encrypted at rest in /data/data/vault.json as
+ * Standalone entries and deleted-bot credential groups stored encrypted at rest in /data/data/vault.json as
  * { v: 1, data: "<iv>:<ciphertext>" } using the env manager's AES-256-CBC helpers.
  * Bot instance envs read from their existing encrypted storage.
  */
@@ -22,37 +22,37 @@ export interface VaultEntry {
   hidden: boolean;  // true = value masked in UI, false = shown in plain
 }
 
-export interface DeletedVaultEntry {
-  key: string;
-  value: string;
+export interface DeletedBotGroup {
+  id: string;
   botName: string;
   sanitizedName: string;
   deletedAt: number;
+  entries: Array<{ key: string; value: string }>;
 }
 
 export interface VaultConfig {
   standalone: VaultEntry[];
-  deleted: DeletedVaultEntry[];
+  deletedBots: DeletedBotGroup[];
 }
 
 let warnedUnreadableVault = false;
 
 export function loadVault(): VaultConfig {
   try {
-    if (!fs.existsSync(VAULT_FILE)) return { standalone: [], deleted: [] };
+    if (!fs.existsSync(VAULT_FILE)) return { standalone: [], deletedBots: [] };
     const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
     if (!wrapper || typeof wrapper.data !== 'string') throw new Error('unrecognized vault format');
     const raw = JSON.parse(envManager.decrypt(wrapper.data));
     return {
       standalone: raw.standalone || [],
-      deleted: raw.deleted || [],
+      deletedBots: raw.deletedBots || [],
     };
   } catch {
     if (!warnedUnreadableVault) {
       warnedUnreadableVault = true;
       console.warn('[Vault] vault.json is unreadable or cannot be decrypted; starting with an empty vault');
     }
-    return { standalone: [], deleted: [] };
+    return { standalone: [], deletedBots: [] };
   }
 }
 
@@ -79,12 +79,13 @@ export function createVaultRoutes(): Router {
       const instances = containerManager.getAllBots();
       const vault = loadVault();
 
-      // Build groups: one per bot instance + standalone + deleted
+      // Build groups: one per bot instance + standalone + one per deleted bot
       const groups: Array<{
         id: string;
         name: string;
         type: 'instance' | 'standalone' | 'deleted';
-        entries: Array<{ key: string; value: string; masked: string; hidden?: boolean; botName?: string }>;
+        deletedAt?: number;
+        entries: Array<{ key: string; value: string; masked: string; hidden?: boolean }>;
       }> = [];
 
       // Standalone group first
@@ -100,18 +101,19 @@ export function createVaultRoutes(): Router {
         }))
       });
 
-      // Deleted group
-      if (vault.deleted && vault.deleted.length > 0) {
+      // Deleted bot groups, newest first
+      const deletedGroups = [...vault.deletedBots].sort((a, b) => b.deletedAt - a.deletedAt);
+      for (const g of deletedGroups) {
         groups.push({
-          id: 'deleted',
-          name: 'Deleted / Recoverable',
+          id: g.id,
+          name: `[Deleted] ${g.botName}`,
           type: 'deleted',
-          entries: vault.deleted.map(e => ({
+          deletedAt: g.deletedAt,
+          entries: g.entries.map(e => ({
             key: e.key,
             value: '',
             masked: maskValue(e.value),
-            hidden: true,
-            botName: e.botName
+            hidden: true
           }))
         });
       }
@@ -164,8 +166,10 @@ export function createVaultRoutes(): Router {
       }
 
       // Deleted (preserved from uninstalled bots)
-      for (const e of (vault.deleted || [])) {
-        values.push({ key: e.key, value: e.value, source: `Deleted: ${e.botName}` });
+      for (const g of vault.deletedBots) {
+        for (const e of g.entries) {
+          values.push({ key: e.key, value: e.value, source: `Deleted: ${g.botName}` });
+        }
       }
 
       // Bot instances
@@ -250,13 +254,21 @@ export function createVaultRoutes(): Router {
   });
 
   /**
-   * DELETE /api/vault/deleted/:key - Delete a deleted vault entry by key+botName
+   * DELETE /api/vault/deleted/:key - Delete an entry from a deleted-bot group by key+groupId
    */
   router.delete('/deleted/:key', (req: Request, res: Response) => {
     try {
-      const botName = req.query.botName as string;
+      const groupId = req.query.groupId as string;
       const vault = loadVault();
-      vault.deleted = vault.deleted.filter(e => !(e.key === req.params.key && e.botName === botName));
+      const group = vault.deletedBots.find(g => g.id === groupId);
+      if (!group) {
+        res.status(404).json({ success: false, error: 'Group not found' });
+        return;
+      }
+      group.entries = group.entries.filter(e => e.key !== req.params.key);
+      if (group.entries.length === 0) {
+        vault.deletedBots = vault.deletedBots.filter(g => g.id !== groupId);
+      }
       saveVault(vault);
       res.json({ success: true });
     } catch (error) {
@@ -265,20 +277,40 @@ export function createVaultRoutes(): Router {
   });
 
   /**
-   * PUT /api/vault/deleted/:key - Update a deleted vault entry (value or key rename)
+   * PUT /api/vault/deleted/:key - Update an entry in a deleted-bot group (value or key rename)
    */
   router.put('/deleted/:key', (req: Request, res: Response) => {
     try {
-      const botName = req.query.botName as string;
+      const groupId = req.query.groupId as string;
       const { value, newKey } = req.body;
       const vault = loadVault();
-      const entry = vault.deleted.find(e => e.key === req.params.key && e.botName === botName);
+      const group = vault.deletedBots.find(g => g.id === groupId);
+      const entry = group?.entries.find(e => e.key === req.params.key);
       if (!entry) {
         res.status(404).json({ success: false, error: 'Entry not found' });
         return;
       }
       if (value !== undefined) entry.value = value;
       if (newKey !== undefined && newKey !== entry.key) entry.key = newKey;
+      saveVault(vault);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * DELETE /api/vault/deleted-group/:id - Remove an entire deleted-bot group
+   */
+  router.delete('/deleted-group/:id', (req: Request, res: Response) => {
+    try {
+      const vault = loadVault();
+      const before = vault.deletedBots.length;
+      vault.deletedBots = vault.deletedBots.filter(g => g.id !== req.params.id);
+      if (vault.deletedBots.length === before) {
+        res.status(404).json({ success: false, error: 'Group not found' });
+        return;
+      }
       saveVault(vault);
       res.json({ success: true });
     } catch (error) {

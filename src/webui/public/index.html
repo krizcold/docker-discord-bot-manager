@@ -3579,9 +3579,16 @@
       const input = wrapper.querySelector('.env-value');
 
       const values = await getVaultValues();
-      // Filter: show entries matching this key, or all if no match
+      // Filter: show entries matching this key, or all if no match.
+      // Dedupe identical key+value pairs (repeated removals of a bot produce copies).
       const matching = values.filter(v => v.key.toUpperCase() === envKey.toUpperCase());
-      const toShow = matching.length > 0 ? matching : values.filter(v => v.value);
+      const seen = new Set();
+      const toShow = (matching.length > 0 ? matching : values.filter(v => v.value)).filter(v => {
+        const dedupeKey = v.key + '=' + v.value;
+        if (seen.has(dedupeKey)) return false;
+        seen.add(dedupeKey);
+        return true;
+      });
 
       if (toShow.length === 0) return;
 

@@ -290,7 +290,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // When keepEnv=true (default), preserve env vars in vault for recovery.
       // When keepEnv=false, user explicitly wants them gone; don't save.
       // Every removal creates a new group so repeated removals of a same-named
-      // bot are kept as separate recoverable versions.
+      // bot are kept as separate recoverable versions. Saved before deleteBot
+      // for crash-safety, rolled back if the deletion fails.
+      let savedGroupId: string | null = null;
       if (keepEnv) {
         try {
           const envVars = envManager.getEnvVars(req.params.id);
@@ -300,14 +302,16 @@ export function createBotRoutes(wss: WebSocketServer): Router {
               .map(([key, value]) => ({ key, value }));
             if (entries.length > 0) {
               const vault = loadVault();
+              const groupId = randomUUID();
               vault.deletedBots.push({
-                id: randomUUID(),
+                id: groupId,
                 botName: bot.displayName,
                 sanitizedName: bot.sanitizedName,
                 deletedAt: Date.now(),
                 entries,
               });
               saveVault(vault);
+              savedGroupId = groupId;
             }
           }
         } catch (err) {
@@ -315,8 +319,26 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
       }
 
-      const success = await containerManager.deleteBot(req.params.id, keepData);
+      const rollbackVaultGroup = () => {
+        if (!savedGroupId) return;
+        try {
+          const vault = loadVault();
+          vault.deletedBots = vault.deletedBots.filter(g => g.id !== savedGroupId);
+          saveVault(vault);
+        } catch (err) {
+          console.warn(`[API] Failed to roll back vault group: ${err}`);
+        }
+      };
+
+      let success: boolean;
+      try {
+        success = await containerManager.deleteBot(req.params.id, keepData);
+      } catch (err) {
+        rollbackVaultGroup();
+        throw err;
+      }
       if (!success) {
+        rollbackVaultGroup();
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }

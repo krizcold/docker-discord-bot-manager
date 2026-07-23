@@ -3466,7 +3466,11 @@
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
-          await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?groupId=${encodeURIComponent(groupId)}`, body);
+          const res = await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?groupId=${encodeURIComponent(groupId)}`, body);
+          if (!res.success) {
+            showMessage('error', res.error || 'Failed to save');
+            return;
+          }
         } else if (groupType === 'standalone') {
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
@@ -3508,7 +3512,8 @@
     async function deleteDeletedVaultEntry(key, groupId) {
       const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
-        await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?groupId=${encodeURIComponent(groupId)}`);
+        const res = await api('DELETE', `/vault/deleted/${encodeURIComponent(key)}?groupId=${encodeURIComponent(groupId)}`);
+        if (!res.success) showMessage('error', res.error || 'Failed to delete entry');
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
@@ -3522,7 +3527,8 @@
       if (!confirm(`Remove "${name}" and all its saved credentials? This cannot be undone.`)) return;
       const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
-        await api('DELETE', `/vault/deleted-group/${encodeURIComponent(id)}`);
+        const res = await api('DELETE', `/vault/deleted-group/${encodeURIComponent(id)}`);
+        if (!res.success) showMessage('error', res.error || 'Failed to remove category');
         vaultValuesCache = null;
         loadVault();
       } catch (err) {

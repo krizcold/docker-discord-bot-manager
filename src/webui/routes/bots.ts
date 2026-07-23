@@ -29,6 +29,8 @@ import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, g
 import { getBotDir } from '../../git/repoManager';
 import { parse as parseYaml } from 'yaml';
 
+const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
+
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
 
@@ -294,6 +296,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const envVars = envManager.getEnvVars(req.params.id);
           if (envVars) {
             const entries = Object.entries(envVars)
+              .filter(([key]) => !BOT_MANAGER_KEYS.has(key))
               .map(([key, value]) => ({ key, value }));
             if (entries.length > 0) {
               const vault = loadVault();
@@ -1180,7 +1183,6 @@ export function createValidationRoutes(): Router {
       }
 
       const targetSanitized = sanitizeName(name);
-      const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
       const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
       const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
 

@@ -1640,7 +1640,7 @@
       try {
         const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`);
         const msg = preserveData ? 'Bot removed (data preserved)' : 'Bot removed';
-        res.success ? showMessage('success', !keepEnv ? msg + ' (env vars moved to vault)' : msg) : showMessage('error', res.error || 'Failed to remove bot');
+        res.success ? showMessage('success', keepEnv ? msg + ' (env vars moved to vault)' : msg) : showMessage('error', res.error || 'Failed to remove bot');
       } finally { busyBots.delete(id); loadBots(); }
     }
 

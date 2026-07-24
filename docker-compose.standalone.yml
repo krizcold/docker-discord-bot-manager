@@ -1,8 +1,9 @@
 # Standalone deployment (no Yundera / CasaOS).
 #
 # Runs the Bot Manager on a plain machine with Docker. It binds to localhost only
-# and has NO authentication - keep it on a trusted machine (a secure remote-access
-# design is in progress). Do NOT expose it on 0.0.0.0 without your own auth proxy.
+# and has NO authentication - keep it on a trusted machine. For secure remote
+# access use the remote stack instead (docker-compose.remote.yml; see "Server on
+# Linux" in README.md). Do NOT expose it on 0.0.0.0 without your own auth proxy.
 #
 # REQUIRED: set HOST_DATA_DIR to an ABSOLUTE host path (forward slashes), matching
 # the data bind below. The manager controls a sibling-container daemon, which

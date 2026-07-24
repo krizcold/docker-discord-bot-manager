@@ -254,7 +254,7 @@ function fleetEnvFields(): WizardEnvVar[] {
       key: 'MASTER_URL',
       displayLabel: 'Master URL',
       description: "The master's control URL. For a co-worker on THIS manager, use the same-server address the installer offers below. For a worker on another machine, copy the public URL from the master bot's Usage tab > Fleet section (wss://...).",
-      placeholder: 'ws://master-app:3928 (same server) or wss://fleet.example.com',
+      placeholder: 'ws://master-app:3928 (same server) or wss://mybot-fleet.dbot.example.com',
       showWhen: whenCoWorker,
       requiredWhen: whenCoWorker,
     },

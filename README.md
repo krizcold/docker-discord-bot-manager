@@ -306,7 +306,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 <details>
 <summary><b>Future enhancements</b></summary>
 
-- [ ] Live-test + harden the remote (Contabo) stack
+- [ ] Full-stack self-update (apply Caddy/Authelia/compose changes, not just the manager image)
 - [ ] Grey out OAuth-callback fields in the wizard when no public base is set
 - [ ] Resource usage graphs
 - [ ] Multiple Docker hosts support

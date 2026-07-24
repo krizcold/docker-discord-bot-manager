@@ -159,15 +159,16 @@ if [ "$domain_choice" = "2" ]; then
   read -rp "Base domain (e.g. example.com)${domain_prev:+ [$domain_prev]}: " BASE_DOMAIN
   BASE_DOMAIN="${BASE_DOMAIN:-$domain_prev}"
   [ -n "$BASE_DOMAIN" ] || die "A domain is required for option 2."
-  COOKIE_DOMAIN="$BASE_DOMAIN"
-  PUBLIC_HOST="bot.$BASE_DOMAIN"
-  AUTHELIA_HOST="auth.$BASE_DOMAIN"
-  BOT_DOMAIN_BASE="$BASE_DOMAIN"
+  # Everything the system uses lives under a dedicated dbot. sub-level: the manager,
+  # the auth portal, and every bot. One wildcard covers them all, and the rest of
+  # <domain> - apex, other subdomains, AND the session cookie - stays entirely free.
+  BOT_DOMAIN_BASE="dbot.$BASE_DOMAIN"
+  COOKIE_DOMAIN="$BOT_DOMAIN_BASE"
+  PUBLIC_HOST="manager.$BOT_DOMAIN_BASE"
+  AUTHELIA_HOST="auth.$BOT_DOMAIN_BASE"
   vps_ip="$(detect_public_ip)" || vps_ip=""
-  info "Point these DNS records at this server${vps_ip:+ ($vps_ip)}:"
-  say  "    A   $PUBLIC_HOST    -> ${vps_ip:-<server IP>}"
-  say  "    A   $AUTHELIA_HOST   -> ${vps_ip:-<server IP>}"
-  say  "    A   *.$BASE_DOMAIN   -> ${vps_ip:-<server IP>}   (wildcard, for per-bot subdomains)"
+  info "Point ONE DNS record at this server${vps_ip:+ ($vps_ip)}:"
+  say  "    A   *.$BOT_DOMAIN_BASE   -> ${vps_ip:-<server IP>}   (covers manager, auth, and every bot; leaves $BASE_DOMAIN free)"
   read -rp "Press Enter once DNS is set (or to continue and set it later) ... " _
   if [ -n "$vps_ip" ]; then
     resolved="$(getent ahostsv4 "$PUBLIC_HOST" 2>/dev/null | awk '{print $1; exit}')"
@@ -181,10 +182,11 @@ else
   read -rp "Public IP [$vps_ip]: " ip_in; vps_ip="${ip_in:-$vps_ip}"
   case "$vps_ip" in *.*.*.*) : ;; *) die "Invalid IPv4: $vps_ip" ;; esac
   dash_ip="$(printf '%s' "$vps_ip" | tr '.' '-')"
-  COOKIE_DOMAIN="$dash_ip.sslip.io"
-  PUBLIC_HOST="bot.$dash_ip.sslip.io"
-  AUTHELIA_HOST="auth.$dash_ip.sslip.io"
-  BOT_DOMAIN_BASE="$dash_ip.sslip.io"
+  # sslip.io resolves any label chain, so the whole dbot. sub-level needs no record.
+  BOT_DOMAIN_BASE="dbot.$dash_ip.sslip.io"
+  COOKIE_DOMAIN="$BOT_DOMAIN_BASE"
+  PUBLIC_HOST="manager.$BOT_DOMAIN_BASE"
+  AUTHELIA_HOST="auth.$BOT_DOMAIN_BASE"
   ok "sslip.io hosts derived from $vps_ip (dotted subdomains of $COOKIE_DOMAIN)."
   warn "sslip.io shares a global Let's Encrypt budget and is a Public-Suffix-List candidate - use a real domain for anything you keep."
 fi
@@ -423,6 +425,6 @@ $mfa_line
 
   Reminders:
     - If TLS fails: open inbound 80 + 443 in Contabo's external firewall panel (separate from this host).
-$( [ "$domain_choice" = "2" ] && printf '    - Make sure DNS A records for bot. / auth. / *  point at this server.\n' )
+$( [ "$domain_choice" = "2" ] && printf '    - One DNS A record covers it all: the wildcard *.dbot. -> this server (manager, auth, and every bot live under it). No apex *. record, no other records.\n' )
     - Reconfigure any time (including switching domain mode): sudo ./setup.sh
 EOF

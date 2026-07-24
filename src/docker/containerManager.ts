@@ -925,8 +925,11 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
     // Web entry path the bot declares (x-casaos.index, hash already substituted).
     webUiPath = getWebUiIndexPath(content) || undefined;
 
-    // Remote mode: a public base is configured -> route the bot through the bundled
-    // Caddy at <name>.<base> with automatic TLS (in addition to a localhost port).
+    // Remote mode: a public base (its own sub-level, e.g. dbot.<domain>) is
+    // configured -> route the bot through the bundled Caddy at <name>.<base> with
+    // automatic TLS (in addition to a localhost port). The base is a dedicated
+    // sub-level so per-bot names live under *.<base> and never touch the apex
+    // domain, its other subdomains, or the manager/auth hosts.
     if (BOT_DOMAIN_BASE) {
       const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
       // Auth in front of the public vhost: explicit instance setting wins; in auto

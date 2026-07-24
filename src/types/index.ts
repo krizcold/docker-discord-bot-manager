@@ -125,7 +125,9 @@ export const RESERVED_NAMES: readonly string[] = [
   'casaos', 'portainer', 'caddy', 'discordbotmanager',
   'discordbotmanagerapp', 'nginx', 'redis', 'postgres',
   'mongodb', 'mariadb', 'traefik', 'watchtower',
-  'homeassistant', 'pcs', 'bot', 'auth',
+  // 'manager' and 'auth' are the manager/portal labels under the dbot. sub-level;
+  // a bot must not take those names or it would shadow manager.dbot / auth.dbot.
+  'homeassistant', 'pcs', 'bot', 'auth', 'manager',
 ] as const;
 
 // ─── API DTOs ───

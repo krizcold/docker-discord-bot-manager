@@ -39,9 +39,11 @@ authentication_backend:
         salt_length: 16
 
 # Default deny; allowed access requires an admin login, on the manager host and on
-# bot subdomains (<name>.<COOKIE_DOMAIN>) gated via Caddy forward_auth. The factor
-# count comes from setup.sh's MFA question: ACCESS_POLICY=two_factor|one_factor
-# (compose defaults it to two_factor).
+# bot web UIs (<name>.<BOT_DOMAIN_BASE>, e.g. <name>.dbot.<domain>) gated via Caddy
+# forward_auth. The factor count comes from setup.sh's MFA question:
+# ACCESS_POLICY=two_factor|one_factor (compose defaults it to two_factor). The bot
+# rule is emitted only when BOT_DOMAIN_BASE is set (env returns '' when unset, so
+# the `if` is false and no `*.` rule - which Authelia would reject - is produced).
 access_control:
   default_policy: 'deny'
   rules:
@@ -49,19 +51,22 @@ access_control:
       policy: '{{ env "ACCESS_POLICY" }}'
       subject:
         - 'group:admins'
-    - domain: '*.{{ env "COOKIE_DOMAIN" }}'
+    {{- if env "BOT_DOMAIN_BASE" }}
+    - domain: '*.{{ env "BOT_DOMAIN_BASE" }}'
       policy: '{{ env "ACCESS_POLICY" }}'
       subject:
         - 'group:admins'
+    {{- end }}
 
 session:
   # session.secret comes from AUTHELIA_SESSION_SECRET_FILE.
   cookies:
     # COOKIE_DOMAIN must: (1) contain a dot and not be a public suffix, and (2) be the
-    # registrable PARENT of BOTH PUBLIC_HOST and AUTHELIA_HOST (they must be subdomains
-    # of it, or the browser won't share this cookie and login loops). sslip.io example:
-    # COOKIE_DOMAIN=203-0-113-5.sslip.io with PUBLIC_HOST=bot.203-0-113-5.sslip.io and
-    # AUTHELIA_HOST=auth.203-0-113-5.sslip.io (dots, not hyphens). Real domain: example.com.
+    # registrable PARENT of PUBLIC_HOST, AUTHELIA_HOST and the bot hosts (all sit under
+    # it, or the browser won't share this cookie and login loops). It is the dbot.
+    # sub-level, so the cookie never leaves that branch. sslip.io example:
+    # COOKIE_DOMAIN=dbot.203-0-113-5.sslip.io with PUBLIC_HOST=manager.dbot.203-0-113-5.sslip.io
+    # and AUTHELIA_HOST=auth.dbot.203-0-113-5.sslip.io. Real domain: dbot.example.com.
     - domain: '{{ env "COOKIE_DOMAIN" }}'
       authelia_url: 'https://{{ env "AUTH_HOST" }}'
       default_redirection_url: 'https://{{ env "PUBLIC_HOST" }}'

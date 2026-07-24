@@ -95,7 +95,7 @@ A real `git clone` (not a ZIP download) is required: the manager's self-update p
 
 Semi-automated: it still asks you the choices that matter - a **data directory** (Enter accepts `/opt/dbm/data`), **sslip.io or your own domain**, a **contact email**, **whether login requires MFA** (default yes; `n` = password-only, handy for prototyping), and your **admin password** - but automates the tedious/error-prone parts: it installs Docker if missing, opens the firewall (detecting your SSH port first so enabling it cannot lock you out), **generates the Authelia secrets, the manager gateway secret, and the argon2 password hash**, writes `.env` and `users_database.yml`, starts the stack (restarting Authelia whenever it writes a new admin hash, so the password takes effect), and registers the admin TOTP device server-side, printing its QR code at the end (see **First login** below). Re-run it any time to reconfigure (including switching sslip.io <-> a domain, or `--reset-password` / `--reset-mfa`).
 
-**First login:** setup.sh registers your authenticator (TOTP) device automatically and prints its QR code at the end of the run - scan it with any authenticator app (Google Authenticator, Aegis, ...). Then open `https://bot.<your-domain>` and sign in as **`admin`** with the password you set plus the current 6-digit code. Lost the QR? Re-run `sudo ./setup.sh` (it re-shows it). Lost the phone? `sudo ./setup.sh --reset-mfa` registers a fresh device; `--reset-password` does the same for the password. If you answered `n` to the MFA question, login is just `admin` + password (no QR is printed) - re-run setup.sh any time to switch.
+**First login:** setup.sh registers your authenticator (TOTP) device automatically and prints its QR code at the end of the run - scan it with any authenticator app (Google Authenticator, Aegis, ...). Then open `https://manager.dbot.<your-domain>` and sign in as **`admin`** with the password you set plus the current 6-digit code. Lost the QR? Re-run `sudo ./setup.sh` (it re-shows it). Lost the phone? `sudo ./setup.sh --reset-mfa` registers a fresh device; `--reset-password` does the same for the password. If you answered `n` to the MFA question, login is just `admin` + password (no QR is printed) - re-run setup.sh any time to switch.
 
 > **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
 >
@@ -127,17 +127,17 @@ You do **not** need any of this if you ran `setup.sh` above - these are the equi
 4. **Create a file named `.env`** in the same folder as `docker-compose.remote.yml` (Compose auto-loads it; a different name needs `--env-file`):
    ```env
    HOST_DATA_DIR=/opt/dbm/data
-   PUBLIC_HOST=bot.203-0-113-5.sslip.io
-   AUTHELIA_HOST=auth.203-0-113-5.sslip.io
-   COOKIE_DOMAIN=203-0-113-5.sslip.io
+   PUBLIC_HOST=manager.dbot.203-0-113-5.sslip.io
+   AUTHELIA_HOST=auth.dbot.203-0-113-5.sslip.io
+   COOKIE_DOMAIN=dbot.203-0-113-5.sslip.io
    ACME_EMAIL=you@example.com
    TZ=Europe/Madrid
-   BOT_DOMAIN_BASE=203-0-113-5.sslip.io   # optional: per-bot HTTPS subdomains
+   BOT_DOMAIN_BASE=dbot.203-0-113-5.sslip.io   # per-bot HTTPS hosts (<name>.<base>); same dbot. sub-level as the manager
    MANAGER_GATEWAY_SECRET=<long random string>   # recommended: gates direct manager access
    ```
    `MANAGER_GATEWAY_SECRET` is a shared secret only Caddy knows: when set, the manager rejects any HTTP or WebSocket request that lacks the matching `X-DBM-Gateway` header Caddy injects, so a bot container sharing a Docker network with the manager cannot bypass Authelia. Loopback requests and the bot update endpoints (authenticated by `X-Bot-Token`) are exempt; unset disables the gate. `setup.sh` generates it and keeps it across re-runs.
-   **Critical:** `PUBLIC_HOST` and `AUTHELIA_HOST` MUST be subdomains of `COOKIE_DOMAIN` - note the **dots** (`bot.203-0-113-5.sslip.io`, NOT `bot-203-0-113-5...`). sslip.io resolves either, but a hyphen makes them *siblings* of `COOKIE_DOMAIN`, so the browser won't share the Authelia session cookie and login loops forever. (sslip.io maps any `<label>.203-0-113-5.sslip.io` to `203.0.113.5`.)
-   For a real domain: `PUBLIC_HOST=bot.example.com`, `AUTHELIA_HOST=auth.example.com`, `COOKIE_DOMAIN=example.com`, `BOT_DOMAIN_BASE=example.com`, and point `bot.` / `auth.` A records (plus a wildcard `*.` so per-bot subdomains resolve) at the VPS. You do not edit `authelia/configuration.yml` - it reads these from the env. Caddy issues a **separate** certificate per hostname on demand; there is no wildcard certificate (that would need a DNS-01 challenge, which this stack does not set up), so each bot subdomain triggers its own Let's Encrypt issuance.
+   **Critical:** `PUBLIC_HOST` and `AUTHELIA_HOST` MUST be subdomains of `COOKIE_DOMAIN` - note the **dots** (`manager.dbot.203-0-113-5.sslip.io`, NOT `manager-dbot-203-0-113-5...`). A label glued on with a hyphen makes them *siblings* of `COOKIE_DOMAIN`, so the browser won't share the Authelia session cookie and login loops forever. (sslip.io maps any `<labels>.203-0-113-5.sslip.io` to `203.0.113.5`.)
+   For a real domain: `PUBLIC_HOST=manager.dbot.example.com`, `AUTHELIA_HOST=auth.dbot.example.com`, `COOKIE_DOMAIN=dbot.example.com`, `BOT_DOMAIN_BASE=dbot.example.com`, and a single wildcard A record `*.dbot.example.com` at the VPS - it covers the manager, the auth portal, and every bot. The whole system lives under the dedicated `dbot.` sub-level, so `example.com`, all its other subdomains, AND the session cookie stay entirely separate from the rest of your domain (`manager` and `auth` are reserved bot names so a bot can never shadow them). You do not edit `authelia/configuration.yml` - it reads these from the env. Caddy issues a **separate** certificate per hostname on demand; there is no wildcard certificate (that would need a DNS-01 challenge, which this stack does not set up), so each bot subdomain triggers its own Let's Encrypt issuance.
 5. **Run** and enroll MFA:
    ```bash
    docker compose -f docker-compose.remote.yml up -d

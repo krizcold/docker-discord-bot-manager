@@ -27,7 +27,7 @@ services:
       PORT: "8080"
       DEPLOYMENT_MODE: docker
       HOST_DATA_DIR: ${HOST_DATA_DIR:?set HOST_DATA_DIR to an absolute host path, e.g. /opt/dbm/data}
-      # Optional: base for per-bot HTTPS subdomains (<botname>.<base>) via the same
+      # Optional: base for per-bot HTTPS hosts (<botname>.<base>, a dedicated sub-level like dbot.<domain>) via the same
       # Caddy. Usually the same value as COOKIE_DOMAIN. Unset = bots stay localhost-only.
       BOT_DOMAIN_BASE: ${BOT_DOMAIN_BASE:-}
       # Shared secret only Caddy knows; blocks direct manager access from bot containers
@@ -84,6 +84,9 @@ services:
       COOKIE_DOMAIN: ${COOKIE_DOMAIN}
       # two_factor (default) or one_factor (password-only; setup.sh's MFA question)
       ACCESS_POLICY: ${ACCESS_POLICY:-two_factor}
+      # Bot web UIs live under this base (<name>.<BOT_DOMAIN_BASE>); the *. access
+      # rule in configuration.yml is emitted only when it is set.
+      BOT_DOMAIN_BASE: ${BOT_DOMAIN_BASE:-}
       AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE: /secrets/JWT_SECRET
       AUTHELIA_SESSION_SECRET_FILE: /secrets/SESSION_SECRET
       AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE: /secrets/STORAGE_ENCRYPTION_KEY

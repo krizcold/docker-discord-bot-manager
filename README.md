@@ -97,7 +97,7 @@ Semi-automated: it still asks you the choices that matter - a **data directory**
 
 **First login:** setup.sh registers your authenticator (TOTP) device automatically and prints its QR code at the end of the run - scan it with any authenticator app (Google Authenticator, Aegis, ...). Then open `https://manager.dbot.<your-domain>` and sign in as **`admin`** with the password you set plus the current 6-digit code. Lost the QR? Re-run `sudo ./setup.sh` (it re-shows it). Lost the phone? `sudo ./setup.sh --reset-mfa` registers a fresh device; `--reset-password` does the same for the password. If you answered `n` to the MFA question, login is just `admin` + password (no QR is printed) - re-run setup.sh any time to switch.
 
-> **Not yet live-tested** on a real VPS (sslip.io TLS needs a public IP); config-reviewed against Authelia 4.39.20 / caddy-docker-proxy / sslip.io. Ready to try, not proven.
+> **Live-validated on a real VPS** (Contabo, Ubuntu 24.04, own-domain mode): TLS issuance, Authelia login with the terminal TOTP QR, bot installs on bare Linux, per-bot subdomains, and self-update. sslip.io mode remains config-reviewed only.
 >
 > **sslip.io caveat:** it is a Public-Suffix-List *candidate*; if it ever lands on the PSL, browsers + Authelia reject the session cookie. **Use a real domain for anything you intend to keep.**
 

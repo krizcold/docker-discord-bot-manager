@@ -72,8 +72,15 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
   app.use(cors());
   app.use(express.json());
 
-  // Static files
-  app.use(express.static(path.join(__dirname, 'public')));
+  // Static files. HTML is served no-cache so a post-update reload always fetches the
+  // new SPA; other assets keep ETag/Last-Modified revalidation (304 when unchanged).
+  app.use(express.static(path.join(__dirname, 'public'), {
+    etag: true,
+    lastModified: true,
+    setHeaders: (res: Response, filePath: string) => {
+      if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    },
+  }));
 
   // API Routes
   app.use('/api/sources', createSourceRoutes(wss));
@@ -99,8 +106,10 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // Serve index.html for all other routes (SPA support)
+  // Serve index.html for all other routes (SPA support). No-cache so the browser
+  // revalidates the shell every load and picks up a new build after an update.
   app.get('*', (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
   });
 

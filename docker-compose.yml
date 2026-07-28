@@ -3,6 +3,7 @@ name: discordbotmanager
 services:
   discordbotmanager:
     image: ghcr.io/yundera/appshield:latest
+    container_name: discordbotmanager
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
@@ -15,7 +16,9 @@ services:
       - "80"
     user: "root"
     environment:
-      AUTH_HASH: $AUTH_HASH
+      # OIDC/SSO via the CasaOS auth registrar (no URL hash). AppShield self-registers
+      # its OIDC client on first login; sign in once at CasaOS and every app is authed.
+      OIDC_REGISTRAR_URL: ${OIDC_REGISTRAR_URL:-http://auth-registrar:9092}
       BACKEND_HOST: "discordbotmanagerapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
@@ -35,10 +38,6 @@ services:
     networks:
       - internal
       - pcs
-    privileged: true
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
 
   discordbotmanagerapp:
     image: ghcr.io/krizcold/docker-discord-bot-manager:latest
@@ -49,7 +48,6 @@ services:
       NODE_ENV: production
       DATA_DIR: /data
       PORT: 8080
-      API_HASH: $API_HASH
 
       # Platform variables
       PUID: $PUID
@@ -88,11 +86,6 @@ services:
       - pcs
     expose:
       - 8080
-
-    privileged: true
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
 
     cpu_shares: 50
     deploy:
@@ -136,6 +129,6 @@ x-casaos:
     en_us: "Discord Bot Manager"
   store_app_id: discordbotmanager
   is_uncontrolled: false
-  index: /?hash=$AUTH_HASH
+  index: /
   port_map: "80"
   webui_port: 80

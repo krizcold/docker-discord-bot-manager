@@ -10,7 +10,6 @@ import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
-import { generateHash } from '../../templates/variableSubstitution';
 import * as configFileManager from '../../config/configFileManager';
 import { findManifest, sanitizeSeedRows } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
@@ -818,7 +817,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
 
-      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.authHash);
+      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
 
       res.json({
@@ -850,42 +849,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      // AUTH_HASH is surfaced in the editor but persists on the instance (single
-      // source of truth), never in envVars - keep it out of the env storage.
       const envVars = { ...vars };
-      const editedHash = envVars['AUTH_HASH'];
-      delete envVars['AUTH_HASH'];
-      if (typeof editedHash === 'string' && editedHash.trim() && editedHash !== bot.authHash) {
-        await containerManager.updateBot(req.params.id, { authHash: editedHash.trim() });
-      }
-
       envManager.setEnvVars(req.params.id, envVars);
       await containerManager.updateBot(req.params.id, { envVars });
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * POST /api/bots/:id/regenerate-auth-hash - Issue a fresh AUTH_HASH and persist it
-   * on the instance. Takes effect on the next build/start (the hash is substituted
-   * into the compose then). Returns the new hash so the editor can show it.
-   */
-  router.post('/:id/regenerate-auth-hash', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const authHash = generateHash();
-      await containerManager.updateBot(req.params.id, { authHash });
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
-      res.json({ success: true, authHash });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1135,8 +1105,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const { mode } = req.body as { mode?: string };
-      if (mode !== 'auto' && mode !== 'authelia' && mode !== 'public') {
-        res.status(400).json({ success: false, error: "mode must be 'auto', 'authelia' or 'public'" });
+      if (mode !== 'auto' && mode !== 'managed' && mode !== 'public') {
+        res.status(400).json({ success: false, error: "mode must be 'auto', 'managed' or 'public'" });
         return;
       }
 
@@ -1312,9 +1282,9 @@ function fleetAppContainerName(composeContent: string): string | null {
 
 /**
  * CasaOS Open URL for a running web bot: the bot's Caddy route on the platform
- * gateway (`https://<sanitizedName>-<APP_DOMAIN>`) plus the web-UI index path,
- * which already carries the substituted ?hash=. Mirrors how pcsProcessing stamps
- * caddy_0 = `${appName}-${APP_DOMAIN}` for the web service. Returns null when
+ * gateway (`https://<sanitizedName>-<APP_DOMAIN>`) plus the web-UI index path. Auth
+ * is the gateway's job (AppShield OIDC), not a URL param. Mirrors how pcsProcessing
+ * stamps caddy_0 = `${appName}-${APP_DOMAIN}` for the web service. Returns null when
  * APP_DOMAIN is unavailable (not on Yundera) or the deployed compose declares no
  * web UI, so the UI shows no button rather than a fabricated link.
  */

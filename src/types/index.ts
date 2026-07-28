@@ -63,7 +63,6 @@ export interface InstanceConfig {
 
   // Authentication tokens
   updateToken?: string;
-  authHash?: string;
 
   // Runtime
   envVars?: Record<string, string>;
@@ -72,8 +71,8 @@ export interface InstanceConfig {
   fleetHostPort?: number;              // docker mode: published 127.0.0.1 host port for the fleet control plane
   webContainerPort?: number;           // docker mode: the container port hostPort maps to
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
-  webUiPath?: string;                  // docker mode: web entry path from x-casaos.index (hash already substituted), e.g. "/?hash=<hash>"
-  webAuth?: 'auto' | 'authelia' | 'public';  // public URL auth mode, applies on next start
+  webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"
+  webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
 
   // Detection (for git source)
   botType?: BotType;
@@ -152,7 +151,6 @@ export interface CreateDockerImageInstanceRequest {
 export interface UpdateInstanceRequest {
   displayName?: string;
   envVars?: Record<string, string>;
-  authHash?: string;
 }
 
 export interface UpdateSourceRequest {

@@ -3,7 +3,7 @@
  * Generates docker-compose.yml files for bots (CasaOS compatible)
  *
  * - Uses repo's docker-compose.yml when it exists
- * - Applies variable substitution ($APP_ID, $API_HASH, etc.)
+ * - Applies variable substitution ($APP_ID, etc.)
  * - Generates compose only when repo doesn't have one
  */
 

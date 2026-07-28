@@ -849,12 +849,6 @@
     const collapsedSources = new Set(); // Track collapsed source cards
     const cloningSources = new Set();   // Track sources being cloned
 
-    // Establish session cookie from URL hash (AppShield)
-    const urlHash = new URLSearchParams(window.location.search).get('hash') || '';
-    if (urlHash) {
-      fetch(`/nhl-auth/establish-session?hash=${urlHash}`);
-    }
-
     // ─── WebSocket ───
     // State-update strategy: keep bots[] as single source of truth for rendering.
     // Bot lifecycle events merge the incoming bot into bots[] by id (preserving
@@ -1355,9 +1349,9 @@
             // Public URL auth mode (only when the bot has a public https URL)
             const webAuthMode = bot.webAuth || 'auto';
             const webAuthControl = bot.publicUrl ? `
-              <select class="auto-update-interval" title="Public URL access: Auto detects self-authenticating bots, MFA requires the Authelia login, Public disables auth. Applies on the bot's next start." onchange="setBotWebAuth('${bot.id}', this.value)">
+              <select class="auto-update-interval" title="Public URL access: Auto detects self-authenticating bots, Managed puts the bot behind the stack's Authelia SSO login (optional MFA), Public disables auth. Applies on the bot's next start." onchange="setBotWebAuth('${bot.id}', this.value)">
                 <option value="auto" ${webAuthMode === 'auto' ? 'selected' : ''}>Auth: Auto</option>
-                <option value="authelia" ${webAuthMode === 'authelia' ? 'selected' : ''}>Auth: MFA</option>
+                <option value="managed" ${webAuthMode === 'managed' ? 'selected' : ''}>Auth: Managed</option>
                 <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
               </select>` : '';
 
@@ -1709,13 +1703,12 @@
       }
     }
 
-    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive, isAuthHash, meta) {
+    function buildEnvRowHtml(key, value, label, required, placeholder, description, sensitive, meta) {
       meta = meta || {};
       const reqSpan = (required || meta.requiredWhen)
         ? `<span class="env-req"${required ? '' : ' style="display:none"'}> (required)</span>` : '';
       const labelHtml = label ? `<div class="env-label ${required ? 'required' : ''}">${escapeHtml(label)}${reqSpan}</div>` : '';
       const tipHtml = description ? `<div class="env-tip">${escapeHtml(description)}</div>` : '';
-      const regenBtn = isAuthHash ? `<button class="btn btn-secondary btn-small" onclick="regenerateAuthHash(this)" title="Generate a new access hash" type="button">Regenerate</button>` : '';
       const genBtn = meta.generate ? `<button class="btn btn-secondary btn-small" onclick="generateEnvSecret(this)" title="Generate a random secret" type="button">Generate</button>` : '';
       let valueHtml;
       if (meta.options) {
@@ -1739,7 +1732,6 @@
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
           ${valueHtml}
           ${genBtn}
-          ${regenBtn}
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
         </div>
         ${tipHtml}
@@ -1928,27 +1920,6 @@
       });
       roleWrapper.insertAdjacentElement('afterend', el);
       updateEnvConditionals(container);
-    }
-
-    async function regenerateAuthHash(btn) {
-      if (!confirm('Generate a new access hash? Existing Open links and ?hash= URLs stop working once you rebuild the bot.')) return;
-      const input = btn.closest('.env-row').querySelector('.env-value');
-      const prev = btn.textContent;
-      btn.disabled = true; btn.textContent = '...';
-      try {
-        const res = await api('POST', `/bots/${envEditorBotId}/regenerate-auth-hash`);
-        if (res && res.success) {
-          if (input) input.value = res.authHash;
-          btn.textContent = 'Regenerated';
-          setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 1500);
-        } else {
-          btn.textContent = prev; btn.disabled = false;
-          showMessage('error', (res && res.error) || 'Failed to regenerate hash');
-        }
-      } catch (err) {
-        btn.textContent = prev; btn.disabled = false;
-        showMessage('error', 'Failed to regenerate hash');
-      }
     }
 
     function addEnvEditorRow() {
@@ -2721,7 +2692,7 @@
       const placeholder = e.sensitive
         ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
         : (e.placeholder || current || 'Value');
-      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e.key === 'AUTH_HASH', e);
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e);
     }
 
     // Consecutive entries sharing a `group` render inside a titled section; rows

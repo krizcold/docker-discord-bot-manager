@@ -55,7 +55,7 @@ function isManagerInjectedFleetEnv(key: string): boolean {
 // credentials. Sensitive vars are already kept visible by the general rule; these
 // cover the non-sensitive identity fields (client/guild ids) as well.
 const ALWAYS_SHOW_ENV = new Set([
-  'CLIENT_ID', 'APPLICATION_ID', 'APP_ID', 'GUILD_ID', 'AUTH_HASH', 'WEBUI_USER', 'WEBUI_PASSWORD',
+  'CLIENT_ID', 'APPLICATION_ID', 'APP_ID', 'GUILD_ID', 'WEBUI_USER', 'WEBUI_PASSWORD',
 ]);
 
 /**
@@ -164,7 +164,7 @@ export function buildWizardEnvList(
       vars.push({
         key,
         displayLabel: key === 'WEBUI_USER' ? 'Web UI Username' : 'Web UI Password',
-        description: "Optional login for this bot's web UI (leave blank for hash-only access).",
+        description: "Optional login for this bot's web UI (leave blank to use the gateway's SSO login).",
         defaultValue: '',
         required: false,
         source: 'compose',
@@ -319,28 +319,11 @@ export interface EditorEnvVar extends EnvFieldMeta {
 export function buildBotEnvList(
   repoPath: string | null,
   botId: string,
-  tokenVarName?: string,
-  authHash?: string
+  tokenVarName?: string
 ): EditorEnvVar[] {
   const stored = getEnvVars(botId);
   const result: EditorEnvVar[] = [];
   const seen = new Set<string>();
-
-  // AUTH_HASH lives on the instance (single source of truth) and its compose value
-  // is a $-substitution, so detection never surfaces it. Surface it explicitly,
-  // visible (not masked), so the user can read/copy/regenerate it.
-  if (authHash !== undefined) {
-    seen.add('AUTH_HASH');
-    result.push({
-      key: 'AUTH_HASH',
-      displayLabel: 'Auth Hash',
-      description: 'Web UI access hash, used by the Open link and the ?hash= login. Regenerate to revoke existing links.',
-      required: false,
-      sensitive: false,
-      value: authHash,
-      isSet: true,
-    });
-  }
 
   // WEBUI_USER/WEBUI_PASSWORD are surfaced via buildWizardEnvList (below) so they
   // appear in both the wizard and the editor without duplication.

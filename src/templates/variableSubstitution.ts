@@ -4,15 +4,7 @@
  * Replaces placeholder variables in docker-compose.yml files with actual values.
  */
 
-import crypto from 'crypto';
 import { BotConfig } from '../types';
-
-/**
- * Generates a random hash for tokens
- */
-export function generateHash(): string {
-  return crypto.randomBytes(32).toString('hex');
-}
 
 /**
  * Standard variables that can be substituted in compose files.
@@ -39,11 +31,9 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
   const vars: SubstitutionVariables = {
     // Bot-specific variables
     APP_ID: `bot-${bot.id}`,
-    AUTH_HASH: bot.authHash || generateHash(),
-    API_HASH: bot.updateToken || generateHash(),
 
     // AppShield optional login credentials (distinct from the OS `USER` var below).
-    // Empty by default -> AppShield credentials disabled, hash-only auth.
+    // Empty by default -> AppShield credential login disabled; auth falls back to the gateway (OIDC/SSO).
     WEBUI_USER: bot.envVars?.['WEBUI_USER'] || '',
     WEBUI_PASSWORD: bot.envVars?.['WEBUI_PASSWORD'] || '',
     BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,

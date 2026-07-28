@@ -318,9 +318,12 @@ export function processComposeForCasaOS(
       delete service.ports;
     }
 
-    // Hostname on main service
+    // Hostname + container name on main service. The container name must equal the
+    // app's subdomain label so AppShield's OIDC redirect-URI validation (the registrar
+    // matches the caller by container name on pcs) accepts <appName>-<APP_DOMAIN>.
     if (serviceName === mainServiceName) {
       service.hostname = appName;
+      service.container_name = appName;
     }
 
     // Caddy reverse proxy labels on main service (only when web port detected)
@@ -472,7 +475,7 @@ export function processComposeForCasaOS(
   // ── Fleet control endpoint (marker-driven) ──
   // The wss route targets the app container directly, NOT the AppShield gateway:
   // the control plane authenticates via CONTROL_SECRET and must not sit behind
-  // the gateway's browser hash auth.
+  // the gateway's browser (OIDC/SSO) auth.
   const fleetPort = fleetControlPortOfCompose(compose);
   if (fleetPort !== null) {
     const fleetSvcName = getAppServiceName(compose);
@@ -923,10 +926,9 @@ export function getMainServiceWebPort(
 }
 
 /**
- * The web UI entry path the bot declares via x-casaos.index (e.g. "/?hash=<hash>").
- * By the time docker-mode processing runs, variable substitution has already
- * replaced $AUTH_HASH, so the returned path is ready to use. Returns null when no
- * index is declared or it is just "/" (the caller then defaults to root).
+ * The web UI entry path the bot declares via x-casaos.index (e.g. "/dashboard").
+ * Returns null when no index is declared or it is just "/" (the caller then defaults
+ * to root). Auth is the gateway's job (AppShield OIDC / Authelia), not a URL param.
  */
 export function getWebUiIndexPath(composeContent: string): string | null {
   let compose: Record<string, unknown>;
@@ -1029,10 +1031,10 @@ export function attachBotToProxy(
 }
 
 /**
- * True when the main web service declares an AUTH_HASH env key - the structural
- * marker of a self-authenticating gateway/app (AppShield / hash-lock style), which
- * needs no forward_auth in front of it. Purely structural, never tied to a
- * specific bot or image.
+ * True when the main web service declares an auth-gateway env key - `OIDC_REGISTRAR_URL`
+ * (AppShield OIDC) or `AUTH_HASH` (hash-lock) - the structural marker of a self-
+ * authenticating gateway/app that needs no forward_auth in front of it. Purely
+ * structural, never tied to a specific bot or image.
  */
 export function mainServiceSelfAuths(composeContent: string): boolean {
   let compose: Record<string, unknown>;
@@ -1045,11 +1047,12 @@ export function mainServiceSelfAuths(composeContent: string): boolean {
   if (!services) return false;
   const mainName = getMainServiceName(compose);
   const env = mainName ? services[mainName]?.environment : undefined;
+  const MARKERS = ['OIDC_REGISTRAR_URL', 'AUTH_HASH'];
   if (Array.isArray(env)) {
-    return env.some((e: unknown) => typeof e === 'string' && /^AUTH_HASH=/.test(e));
+    return env.some((e: unknown) => typeof e === 'string' && MARKERS.some((m) => e === m || e.startsWith(`${m}=`)));
   }
   if (env && typeof env === 'object') {
-    return 'AUTH_HASH' in (env as Record<string, unknown>);
+    return MARKERS.some((m) => m in (env as Record<string, unknown>));
   }
   return false;
 }

@@ -376,7 +376,7 @@ export function normalizeEnvLabel(key: string): string {
 // values (e.g. BACKEND_HOST) is intentionally NOT hidden.
 const PLATFORM_ENV_DENYLIST = new Set([
   'TZ', 'PUID', 'PGID', 'PORT', 'NODE_ENV', 'HOSTNAME', 'LANG', 'TERM', 'HOME', 'PATH', 'PWD', 'SHELL', 'USER',
-  'APP_ID', 'APP_DOMAIN', 'APP_PUBLIC_IP_DASH', 'APP_DEFAULT_PASSWORD', 'API_HASH', 'AUTH_HASH', 'APP_TOKEN',
+  'APP_ID', 'APP_DOMAIN', 'APP_PUBLIC_IP_DASH', 'APP_DEFAULT_PASSWORD',
   'DATA_ROOT', 'BOT_ID', 'UPDATE_TOKEN', 'DOCKER_IMAGE_NAME', 'BUILD_MODE', 'BUILD_DATE',
 ]);
 

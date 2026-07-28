@@ -38,7 +38,7 @@ import {
   replaceBuildsWithImages,
   ComposeResult
 } from '../templates/compose';
-import { generateHash, applyVariableSubstitution } from '../templates/variableSubstitution';
+import { applyVariableSubstitution } from '../templates/variableSubstitution';
 import {
   processComposeForCasaOS,
   getMainServiceWebPort,
@@ -248,7 +248,6 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
   const instanceId = uuidv4();
   const now = new Date().toISOString();
   const updateToken = uuidv4();
-  const authHash = generateHash();
 
   // Create instance directory
   const botDir = getBotDir(instanceId);
@@ -275,7 +274,6 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     status: 'stopped',
     containerIds: [],
     updateToken,
-    authHash,
     envVars: request.envVars || {},
     botType: detection?.type,
     hasDatabase: detection?.hasDatabase,
@@ -308,7 +306,6 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
   const instanceId = uuidv4();
   const now = new Date().toISOString();
   const updateToken = uuidv4();
-  const authHash = generateHash();
 
   // Create instance directory
   const botDir = getBotDir(instanceId);
@@ -328,7 +325,6 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
     status: 'stopped',
     containerIds: [],
     updateToken,
-    authHash,
     envVars: request.envVars || {},
     lastBuiltCommit: null,
     createdAt: now,
@@ -366,7 +362,7 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
 /**
  * Update the instance's public URL auth mode (applies on next start).
  */
-export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'authelia' | 'public'): InstanceConfig | null {
+export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'managed' | 'public'): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
@@ -392,7 +388,6 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     instance.titleName = names.titleName;
   }
   if (update.envVars) instance.envVars = { ...instance.envVars, ...update.envVars };
-  if (update.authHash !== undefined) instance.authHash = update.authHash;
   instance.updatedAt = new Date().toISOString();
 
   registry.instances[botId] = instance;
@@ -933,11 +928,11 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
     if (BOT_DOMAIN_BASE) {
       const host = `${instance.sanitizedName}.${BOT_DOMAIN_BASE}`;
       // Auth in front of the public vhost: explicit instance setting wins; in auto
-      // mode a self-authenticating main service (AUTH_HASH gateway) is left to
-      // protect itself, everything else goes behind Authelia MFA.
+      // mode a self-authenticating main service is left to protect itself, everything
+      // else goes behind our managed gate (Authelia MFA on this stack).
       const forwardAuth =
         instance.webAuth === 'public' ? false :
-        instance.webAuth === 'authelia' ? true :
+        instance.webAuth === 'managed' ? true :
         !mainServiceSelfAuths(content);
       content = attachBotToProxy(content, host, info.containerPort, { forwardAuth });
       publicUrl = `https://${host}`;

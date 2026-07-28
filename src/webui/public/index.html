@@ -934,19 +934,37 @@
     // (new per process) and commit tell them apart.
     async function resolveManagerReconnect() {
       let v = null;
-      try { v = await api('GET', '/manager/version'); } catch { /* fall through */ }
+      try { v = await api('GET', '/manager/version'); } catch { /* gateway may still be bouncing */ }
       const base = managerUpdateBaseline;
-      if (v && v.success && base && v.bootId === base.bootId) {
+      // A full-stack update recreates Caddy/Authelia too, so the version probe can
+      // hit a 502 before the gateway is back. Don't conclude anything yet - the ws
+      // onclose backoff keeps retrying and will call us again once it answers.
+      if (!v || !v.success) {
+        appendManagerLog('Reconnected - waiting for the gateway to come back...');
+        return;
+      }
+      if (base && v.bootId === base.bootId) {
         appendManagerLog('Reconnected - update still in progress...');
         return;
       }
-      if (v && v.success && base && v.currentCommit === base.commit) {
+      if (base && v.currentCommit === base.commit) {
         finishManagerUpdate(false,
           'Manager restarted but the version did not change - the update may not have applied',
           'Update failed', 'Manager update failed');
         return;
       }
-      finishManagerUpdate(true, 'Reconnected - Bot Manager is back up.', 'Bot Manager updated', 'Bot Manager updated');
+      // No baseline captured (the version probe never succeeded before the update), so
+      // we cannot confirm the bootId/commit actually changed - don't claim success;
+      // just reload once the gateway is back to resync against the running manager.
+      if (!base) {
+        appendManagerLog('Reconnected - reloading to resync (no update baseline captured)...');
+        setTimeout(() => window.location.reload(), 800);
+        return;
+      }
+      // New process + new commit: the update took. Reload so the browser fetches the
+      // freshly-built SPA (assets may have changed) instead of running stale code.
+      finishManagerUpdate(true, 'Updated - reloading...', 'Bot Manager updated', 'Bot Manager updated');
+      setTimeout(() => window.location.reload(), 800);
     }
 
     async function updateManager() {
@@ -974,12 +992,14 @@
       }
     }
 
+    let wsReconnectDelay = 1000;
     function connectWebSocket() {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        wsReconnectDelay = 1000;
         if (hasConnectedBefore) {
           // Reconnect: resync in case events were missed during the gap (sources before bots, same as init)
           loadSources().then(() => loadBots());
@@ -1136,7 +1156,13 @@
         }
       };
 
-      ws.onclose = () => setTimeout(connectWebSocket, 3000);
+      // Exponential backoff with jitter so a bouncing gateway (Caddy/Authelia
+      // recreating during a full-stack update) doesn't trigger a reconnect storm.
+      ws.onclose = () => {
+        const delay = Math.min(wsReconnectDelay, 15000) + Math.random() * 500;
+        setTimeout(connectWebSocket, delay);
+        wsReconnectDelay = Math.min(wsReconnectDelay * 2, 15000);
+      };
     }
     connectWebSocket();
 

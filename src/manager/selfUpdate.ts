@@ -5,7 +5,10 @@
  * In docker mode the manager is built from a git clone whose project dir is bind-
  * mounted at /repo. The manager rebuilds itself by: git pull -> `docker compose
  * build` (streamed live) -> a detached one-shot container (the manager's OWN image,
- * which bundles docker-cli-compose) runs `docker compose up -d` to recreate it.
+ * which bundles docker-cli-compose) runs `docker compose up -d` to recreate the
+ * whole stack (manager + Caddy/Authelia), so the auth layer is patched too.
+ * Authelia secrets (*_FILE / gitignored) and its named data volume survive the
+ * recreate untouched, so logins/MFA seeds/sessions are preserved.
  */
 import { spawn, execFile, execSync, spawnSync } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -177,25 +180,24 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   await streamProc('git', ['-c', 'safe.directory=*', '-C', REPO, 'pull', '--ff-only'], emit);
   const newHead = gitOut(['rev-parse', 'HEAD']);
 
-  emit(`[Update] Rebuilding the manager image (${self.service})...`, 'info');
-  await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build', self.service], emit, REPO);
+  emit('[Update] Rebuilding the stack images...', 'info');
+  await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build'], emit, REPO);
 
   // A pull that changed neither the manager image nor its compose config makes
   // `compose up -d` a no-op: the process would survive and a blind watchdog would
   // falsely report failure. Detect that and finish here instead.
   const newImageId = dockerOut(['image', 'inspect', self.image, '--format', '{{.Id}}']);
   const runningImageId = () => dockerOut(['inspect', selfContainerId(), '--format', '{{.Image}}']);
-  const changedFiles = oldHead === newHead
-    ? []
-    : gitOut(['diff', '--name-only', oldHead, newHead]).split('\n').map((l) => l.trim()).filter(Boolean);
-  // The compose files live at the repo root, so the repo-relative path is the basename.
-  const needsApply = newImageId !== runningImageId() || changedFiles.includes(self.composeFile);
+  // Full-stack recreate: any pulled change (HEAD advanced) or a rebuilt manager
+  // image means there is something to apply; `compose up -d` then reconciles the
+  // whole stack and only recreates the services whose image or config changed.
+  const needsApply = oldHead !== newHead || newImageId !== runningImageId();
   if (!needsApply) {
     emit(`[Update] Already up to date - nothing to apply (HEAD ${newHead.slice(0, 7)}).`, 'success');
     return;
   }
 
-  emit('[Update] Recreating the manager - the UI will drop and reconnect in a few seconds...', 'info');
+  emit('[Update] Recreating the stack - the UI will drop and reconnect in a few seconds...', 'info');
   // A container can't recreate itself in-process, so launch a detached one-shot that
   // runs `compose up -d` after we return. It uses the manager's own image (has compose).
   // The repo is mounted at its OWN host path so compose resolves the relative binds
@@ -203,7 +205,7 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   // case (no .env). The same-path trick is Linux-only - on Windows the host path is not
   // a valid Linux mount target, so `docker run` fails at launch and we fall back.
   spawnSync('docker', ['rm', '-f', 'dbm-self-update'], { encoding: 'utf-8' });   // free the name (keeps the previous run's logs until now)
-  const script = `sleep 2; docker compose -p '${self.project}' -f '${self.composeFile}' up -d '${self.service}'`;
+  const script = `sleep 2; docker compose -p '${self.project}' -f '${self.composeFile}' up -d --remove-orphans`;
   const r = spawnSync('docker', [
     'run', '-d', '--name', 'dbm-self-update',
     '-e', `HOST_DATA_DIR=${process.env.HOST_DATA_DIR || ''}`,

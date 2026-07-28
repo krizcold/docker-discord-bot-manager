@@ -146,7 +146,7 @@ You do **not** need any of this if you ran `setup.sh` above - these are the equi
    docker exec authelia cat /data/notification.txt
    ```
 
-With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. By default each bot vhost sits behind the same Authelia MFA login as the manager; a bot whose main web service ships its own auth gateway (it declares `AUTH_HASH`, e.g. AppShield) is detected automatically and left to protect itself. Override per bot with the card's **Auth** selector (Auto / MFA / Public) or `PUT /api/bots/:id/web-auth`; the change applies on the bot's next start.
+With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. By default each bot vhost sits behind the same Authelia MFA login as the manager; a bot whose main web service ships its own auth gateway (e.g. AppShield) is detected automatically and left to protect itself. Override per bot with the card's **Auth** selector (Auto / Managed / Public) or `PUT /api/bots/:id/web-auth`; the change applies on the bot's next start.
 
 **Prefer no public surface?** Keep the manager private and reach it over a tunnel/VPN instead:
 - **Tailscale** (recommended): `tailscale up` on the VPS + your devices; reach the UI over the tailnet, optionally with a real `*.ts.net` cert via `tailscale serve`. No open ports, no domain.
@@ -189,7 +189,7 @@ On Yundera/CasaOS the platform updates the manager. On a standalone (Windows or 
   ./update.ps1              # Windows (set $env:HOST_DATA_DIR first for the standalone stack)
   ```
 
-Both keep your local admin hash and `.env`; only the manager image is rebuilt, so managed bots keep running.
+Both keep your local admin hash and `.env` and recreate the whole stack, so the auth layer is patched too (the manager image is rebuilt; Caddy/Authelia are pinned images that `compose up -d` recreates only when their config changed). Managed bots are separate compose projects, so they keep running.
 
 ---
 
@@ -197,14 +197,21 @@ Both keep your local admin hash and `.env`; only the manager image is rebuilt, s
 
 When a bot exposes a web UI, the manager publishes it on a host port (auto-assigned from `20000-29999`, override with `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE`) and shows an **Open** link. Ports bind to `127.0.0.1` by default - a published port bypasses host firewalls, so this avoids exposing bots on a server; set `BOT_PORT_BIND=0.0.0.0` for trusted-LAN access. On a server with the remote stack, bots are instead reached via their HTTPS subdomain (see **Server on Linux**).
 
-### Bot web-UI access (AppShield)
+### Bot web-UI access
 
-Bots that ship Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) guard their web UI, and the manager wires two ways in:
+A bot never authenticates its own web UI. Authentication lives at the deployment boundary - a gateway in front of the bot, or a localhost-only bind - so the **Open** link just opens the app that the boundary already protects. Where that boundary is depends on how the manager is running:
 
-- **Access hash - your private shortcut.** Every bot gets an `AUTH_HASH`. The **Open** link carries it (`.../?hash=<hash>`), so opening a bot from the manager drops you straight in with no login. Keep the hash private (don't share the Open URL). Rotate it with **Regenerate** next to `AUTH_HASH` in the bot's **Env** editor, then rebuild the bot to apply - older Open links stop working.
-- **Username / password - for sharing.** To give other people access, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and restart the bot (credential edits apply on start, no rebuild needed). Anyone who opens the bot's URL without the hash then gets a login form. Both are empty by default (login off, hash-only), and they appear in the Env editor for any bot whose compose uses them.
+| Deployment | Boundary | What the Open link opens |
+|---|---|---|
+| Yundera (managed or standalone) | AppShield in OIDC mode - sign into CasaOS once, SSO into the app | The internet-facing HTTPS app, already authenticated by your CasaOS session |
+| Linux server (managed, remote stack) | The bundled Caddy + Authelia (SSO + optional MFA, default on) | The bot's HTTPS subdomain behind the same login as the manager |
+| Windows / Linux standalone | Localhost bind (`127.0.0.1`) - no gateway | The bot's local host port on your own machine |
 
-AppShield needs no CasaOS or platform - it runs as a plain sidecar in front of the bot. It does not terminate TLS, so on a public server it sits behind the remote stack's Caddy (see **Server on Linux**) for HTTPS; locally it is plain HTTP on `127.0.0.1`.
+On Yundera the bot is its own CasaOS app, published at `https://<name>-<APP_DOMAIN>`. Its web UI is guarded by Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) in OIDC mode: AppShield points at the CasaOS auth-registrar via `OIDC_REGISTRAR_URL`, self-registers its client on first login, and after that your CasaOS session single-signs you on. Nothing else to configure. AppShield does not terminate TLS - Yundera fronts it with HTTPS.
+
+The bot's Discord-OAuth member routes (`/guild`, `/auth`) are **public** paths that bypass the admin gateway (AppShield's `ALLOWED_PATHS = /guild,/auth`). That is the separate member-facing Discord login for the bot's own users, not the admin gate.
+
+To share admin access with additional people through AppShield's own credential mode, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and restart the bot (credential edits apply on start, no rebuild needed). They appear in the Env editor for any bot whose compose uses them.
 
 ---
 
@@ -297,7 +304,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 
 - The Docker socket is mounted, which grants the manager full control of the host Docker daemon (root-equivalent). **Never expose the manager bare on the internet.**
 - Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
-- Each managed bot's own web UI is guarded by its AppShield gateway - a private access hash (used by the **Open** link) plus an optional shared username/password. See **How bots are reached**. On the remote stack, public bot vhosts additionally sit behind Authelia MFA by default (self-authenticating gateways are detected and skip it; per-bot override on the card).
+- A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway in OIDC mode (SSO from your CasaOS session); on the remote stack, public bot vhosts sit behind Authelia MFA by default (self-authenticating gateways are detected and skip it; per-bot override on the card); standalone binds to `127.0.0.1` with no gateway. See **How bots are reached**.
 - On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
 - Secrets are encrypted at rest with AES-256-CBC: sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault. The key comes from `ENV_ENCRYPTION_KEY`, or a key file generated under the data dir on first run.
 
@@ -306,7 +313,6 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 <details>
 <summary><b>Future enhancements</b></summary>
 
-- [ ] Full-stack self-update (apply Caddy/Authelia/compose changes, not just the manager image)
 - [ ] Grey out OAuth-callback fields in the wizard when no public base is set
 - [ ] Resource usage graphs
 - [ ] Multiple Docker hosts support

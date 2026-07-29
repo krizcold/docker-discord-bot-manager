@@ -2,8 +2,9 @@ name: discordbotmanager
 
 services:
   discordbotmanager:
-    image: ghcr.io/yundera/appshield:latest
+    image: ghcr.io/yundera/appshield:2.0.7
     container_name: discordbotmanager
+    hostname: discordbotmanager
     restart: unless-stopped
     cpu_shares: 80
     healthcheck:
@@ -16,14 +17,21 @@ services:
       - "80"
     user: "root"
     environment:
-      # OIDC/SSO via the CasaOS auth registrar (no URL hash). AppShield self-registers
-      # its OIDC client on first login; sign in once at CasaOS and every app is authed.
-      OIDC_REGISTRAR_URL: ${OIDC_REGISTRAR_URL:-http://auth-registrar:9092}
+      # Login-form auth (AppShield credentials mode, the store-proven no-hash gate):
+      # the gateway serves its own login page and issues a session cookie. USER must
+      # stay a literal - $USER would substitute the deploy shell's user.
+      USER: "admin"
+      PASSWORD: $APP_DEFAULT_PASSWORD
       BACKEND_HOST: "discordbotmanagerapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
-      ALLOWED_EXTENSIONS: "js,jsx,css,png,ico,svg,jpg,jpeg,gif,woff,woff2,ttf,eot"
       TZ: $TZ
+    volumes:
+      # Persists AppShield sessions across restarts/updates (SESSIONS_FILE default
+      # /data/sessions.json); without it every recreate logs the admin out.
+      - type: bind
+        source: $DATA_ROOT/AppData/discordbotmanager/appshield
+        target: /data
     labels:
       caddy_0: discordbotmanager-${APP_DOMAIN}
       caddy_0.import: gateway_tls

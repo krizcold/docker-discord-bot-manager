@@ -703,6 +703,59 @@ function bindPortToLocalhost(port: unknown): unknown {
   return port;
 }
 
+function envValueOf(env: unknown, key: string): string | null {
+  if (Array.isArray(env)) {
+    for (const e of env) {
+      if (typeof e === 'string') {
+        const i = e.indexOf('=');
+        if (i > 0 && e.slice(0, i) === key) return e.slice(i + 1);
+      }
+    }
+    return null;
+  }
+  if (env && typeof env === 'object') {
+    const v = (env as Record<string, unknown>)[key];
+    return v === null || v === undefined ? null : String(v);
+  }
+  return null;
+}
+
+/**
+ * Remove a fronting auth-gateway main service and repoint the compose's web entry
+ * (x-casaos main + webui_port) at the backend service it proxied. Purely structural:
+ * the gateway contract is a main service whose env names another compose service via
+ * BACKEND_HOST/BACKEND_PORT. No-op when the shape doesn't match (no gateway, or the
+ * backend lives outside this compose).
+ */
+function stripFrontingGateway(compose: Record<string, unknown>): void {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return;
+  const mainName = getMainServiceName(compose);
+  if (!mainName || !services[mainName]) return;
+  const backendHost = envValueOf(services[mainName].environment, 'BACKEND_HOST');
+  const backendPort = parseInt(envValueOf(services[mainName].environment, 'BACKEND_PORT') || '', 10);
+  if (!backendHost || isNaN(backendPort)) return;
+  const backendName = services[backendHost]
+    ? backendHost
+    : Object.keys(services).find(n => services[n]?.container_name === backendHost);
+  if (!backendName) return;
+
+  delete services[mainName];
+  for (const svc of Object.values(services)) {
+    if (Array.isArray(svc.depends_on)) {
+      svc.depends_on = (svc.depends_on as unknown[]).filter(d => d !== mainName);
+      if ((svc.depends_on as unknown[]).length === 0) delete svc.depends_on;
+    } else if (svc.depends_on && typeof svc.depends_on === 'object') {
+      delete (svc.depends_on as Record<string, unknown>)[mainName];
+      if (Object.keys(svc.depends_on as Record<string, unknown>).length === 0) delete svc.depends_on;
+    }
+  }
+  if (!compose['x-casaos'] || typeof compose['x-casaos'] !== 'object') compose['x-casaos'] = {};
+  const xcasaos = compose['x-casaos'] as Record<string, unknown>;
+  xcasaos.main = backendName;
+  xcasaos.webui_port = backendPort;
+}
+
 /**
  * Process a compose for a plain-Docker (non-CasaOS) deployment. Unlike the CasaOS
  * path it KEEPS published `ports` (host access is via host ports, not a gateway)
@@ -710,7 +763,8 @@ function bindPortToLocalhost(port: unknown): unknown {
  * strips the external `pcs` network + platform Caddy labels, and never rewrites
  * paths to /DATA. When hostBotDir is given, relative bind sources are rewritten to
  * absolute host paths under it so sibling-container bind mounts align with the
- * manager. Host-port publishing is layered on separately by publishHostPort().
+ * manager. A fronting auth gateway is dropped here (see stripFrontingGateway);
+ * host-port publishing is layered on separately by publishHostPort().
  */
 export function processComposeForDocker(
   composeContent: string,
@@ -728,6 +782,13 @@ export function processComposeForDocker(
   if (!services) {
     return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
   }
+
+  // A fronting auth gateway (main service proxying a backend via BACKEND_HOST/
+  // BACKEND_PORT, e.g. AppShield) is the YUNDERA boundary. On this stack the
+  // boundary is the localhost bind or the bundled Authelia, so a shipped gateway
+  // would only double-gate the web UI - drop it and repoint the web entry at its
+  // backend. webAuth=public pins the bot to its own gate and keeps it.
+  if (bot.webAuth !== 'public') stripFrontingGateway(compose);
 
   const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
 

@@ -1202,13 +1202,14 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
     // AppShield gateway login: refresh any service's EXISTING USER/PASSWORD from the
     // current credentials (so a change while stopped applies on start), and strip the
     // substitution-only inputs from every service. Structural - keyed on the env that
-    // exists, never on a bot/image name.
+    // exists, never on a bot/image name. Blank credentials leave the compose's shipped
+    // login untouched: blanking USER/PASSWORD would disable the gateway's auth.
     const webUser = instance.envVars?.['WEBUI_USER'] || '';
     const webPass = instance.envVars?.['WEBUI_PASSWORD'] || '';
     for (const svc of Object.values(services) as any[]) {
       if (!svc || !svc.environment) continue;
-      setComposeEnvIfPresent(svc.environment, 'USER', webUser);
-      setComposeEnvIfPresent(svc.environment, 'PASSWORD', webPass);
+      if (webUser) setComposeEnvIfPresent(svc.environment, 'USER', webUser);
+      if (webPass) setComposeEnvIfPresent(svc.environment, 'PASSWORD', webPass);
       for (const k of SUBSTITUTION_ONLY_ENV) deleteComposeEnv(svc.environment, k);
     }
 

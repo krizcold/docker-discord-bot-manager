@@ -1032,8 +1032,9 @@ export function attachBotToProxy(
 
 /**
  * True when the main web service declares an auth-gateway env key - `OIDC_REGISTRAR_URL`
- * (AppShield OIDC) or `AUTH_HASH` (hash-lock) - the structural marker of a self-
- * authenticating gateway/app that needs no forward_auth in front of it. Purely
+ * (AppShield OIDC), `AUTH_HASH` (hash-lock), `CREDENTIAL_VALIDATE_URL` (credential
+ * bridge), or the `USER`+`PASSWORD` pair (login form) - the structural marker of a
+ * self-authenticating gateway/app that needs no forward_auth in front of it. Purely
  * structural, never tied to a specific bot or image.
  */
 export function mainServiceSelfAuths(composeContent: string): boolean {
@@ -1047,14 +1048,25 @@ export function mainServiceSelfAuths(composeContent: string): boolean {
   if (!services) return false;
   const mainName = getMainServiceName(compose);
   const env = mainName ? services[mainName]?.environment : undefined;
-  const MARKERS = ['OIDC_REGISTRAR_URL', 'AUTH_HASH'];
+  // Values must be non-empty: this runs on the substituted compose, and an empty
+  // auth env (e.g. blank $WEBUI_USER/$WEBUI_PASSWORD) disables the gateway's auth
+  // entirely, so it must NOT count as self-authenticating.
+  const vals = new Map<string, string>();
   if (Array.isArray(env)) {
-    return env.some((e: unknown) => typeof e === 'string' && MARKERS.some((m) => e === m || e.startsWith(`${m}=`)));
+    for (const e of env) {
+      if (typeof e === 'string') {
+        const i = e.indexOf('=');
+        vals.set(i === -1 ? e : e.slice(0, i), i === -1 ? '' : e.slice(i + 1));
+      }
+    }
+  } else if (env && typeof env === 'object') {
+    for (const [k, v] of Object.entries(env as Record<string, unknown>)) {
+      vals.set(k, v === null || v === undefined ? '' : String(v));
+    }
   }
-  if (env && typeof env === 'object') {
-    return MARKERS.some((m) => m in (env as Record<string, unknown>));
-  }
-  return false;
+  const set = (k: string) => (vals.get(k) || '').trim() !== '';
+  const MARKERS = ['OIDC_REGISTRAR_URL', 'AUTH_HASH', 'CREDENTIAL_VALIDATE_URL'];
+  return MARKERS.some(set) || (set('USER') && set('PASSWORD'));
 }
 
 // ─── Fleet Control Plane ───────────────────────────────────────────────────

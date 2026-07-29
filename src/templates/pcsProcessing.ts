@@ -319,8 +319,8 @@ export function processComposeForCasaOS(
     }
 
     // Hostname + container name on main service. The container name must equal the
-    // app's subdomain label so AppShield's OIDC redirect-URI validation (the registrar
-    // matches the caller by container name on pcs) accepts <appName>-<APP_DOMAIN>.
+    // app's subdomain label: the platform routes <appName>-<APP_DOMAIN> by container
+    // name, and AppShield gateways validate the caller against it too.
     if (serviceName === mainServiceName) {
       service.hostname = appName;
       service.container_name = appName;
@@ -475,7 +475,7 @@ export function processComposeForCasaOS(
   // ── Fleet control endpoint (marker-driven) ──
   // The wss route targets the app container directly, NOT the AppShield gateway:
   // the control plane authenticates via CONTROL_SECRET and must not sit behind
-  // the gateway's browser (OIDC/SSO) auth.
+  // the gateway's browser auth.
   const fleetPort = fleetControlPortOfCompose(compose);
   if (fleetPort !== null) {
     const fleetSvcName = getAppServiceName(compose);
@@ -928,7 +928,7 @@ export function getMainServiceWebPort(
 /**
  * The web UI entry path the bot declares via x-casaos.index (e.g. "/dashboard").
  * Returns null when no index is declared or it is just "/" (the caller then defaults
- * to root). Auth is the gateway's job (AppShield OIDC / Authelia), not a URL param.
+ * to root). Auth is the gateway's job (AppShield / Authelia), not a URL param.
  */
 export function getWebUiIndexPath(composeContent: string): string | null {
   let compose: Record<string, unknown>;

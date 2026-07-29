@@ -203,15 +203,15 @@ A bot never authenticates its own web UI. Authentication lives at the deployment
 
 | Deployment | Boundary | What the Open link opens |
 |---|---|---|
-| Yundera (managed or standalone) | AppShield in OIDC mode - sign into CasaOS once, SSO into the app | The internet-facing HTTPS app, already authenticated by your CasaOS session |
+| Yundera (managed or standalone) | AppShield login form - user `admin`, your platform default app password | The internet-facing HTTPS app, behind the gateway's login (session cookie) |
 | Linux server (managed, remote stack) | The bundled Caddy + Authelia (SSO + optional MFA, default on) | The bot's HTTPS subdomain behind the same login as the manager |
 | Windows / Linux standalone | Localhost bind (`127.0.0.1`) - no gateway | The bot's local host port on your own machine |
 
-On Yundera the bot is its own CasaOS app, published at `https://<name>-<APP_DOMAIN>`. Its web UI is guarded by Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) in OIDC mode: AppShield points at the CasaOS auth-registrar via `OIDC_REGISTRAR_URL`, self-registers its client on first login, and after that your CasaOS session single-signs you on. Nothing else to configure. AppShield does not terminate TLS - Yundera fronts it with HTTPS.
+On Yundera the bot is its own CasaOS app, published at `https://<name>-<APP_DOMAIN>`. Its web UI is guarded by Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) in credentials mode: the gateway serves its own login form (user `admin`, password `$APP_DEFAULT_PASSWORD` - the platform default app password) and keeps you signed in with a session cookie that persists across restarts. Nothing else to configure. AppShield does not terminate TLS - Yundera fronts it with HTTPS.
 
 The bot's Discord-OAuth member routes (`/guild`, `/auth`) are **public** paths that bypass the admin gateway (AppShield's `ALLOWED_PATHS = /guild,/auth`). That is the separate member-facing Discord login for the bot's own users, not the admin gate.
 
-To share admin access with additional people through AppShield's own credential mode, set `WEBUI_USER` and `WEBUI_PASSWORD` in the bot's **Env** editor and restart the bot (credential edits apply on start, no rebuild needed). They appear in the Env editor for any bot whose compose uses them.
+Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway expose both in the **Env** editor; credential edits apply on the bot's next start (no rebuild needed).
 
 ---
 
@@ -304,7 +304,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 
 - The Docker socket is mounted, which grants the manager full control of the host Docker daemon (root-equivalent). **Never expose the manager bare on the internet.**
 - Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
-- A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway in OIDC mode (SSO from your CasaOS session); on the remote stack, public bot vhosts sit behind Authelia MFA by default (self-authenticating gateways are detected and skip it; per-bot override on the card); standalone binds to `127.0.0.1` with no gateway. See **How bots are reached**.
+- A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway's login form; on the remote stack, public bot vhosts sit behind Authelia MFA by default (self-authenticating gateways are detected and skip it; per-bot override on the card); standalone binds to `127.0.0.1` with no gateway. See **How bots are reached**.
 - On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
 - Secrets are encrypted at rest with AES-256-CBC: sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault. The key comes from `ENV_ENCRYPTION_KEY`, or a key file generated under the data dir on first run.
 

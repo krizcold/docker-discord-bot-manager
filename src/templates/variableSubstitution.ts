@@ -33,7 +33,7 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
     APP_ID: `bot-${bot.id}`,
 
     // AppShield optional login credentials (distinct from the OS `USER` var below).
-    // Empty by default -> AppShield credential login disabled; auth falls back to the gateway (OIDC/SSO).
+    // Empty by default -> AppShield credential login disabled (the gateway falls back to its other configured auth, if any).
     WEBUI_USER: bot.envVars?.['WEBUI_USER'] || '',
     WEBUI_PASSWORD: bot.envVars?.['WEBUI_PASSWORD'] || '',
     BOT_MANAGER_API: `${refScheme}://${refDomain}:${refPort}`,

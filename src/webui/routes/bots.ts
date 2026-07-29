@@ -1283,7 +1283,7 @@ function fleetAppContainerName(composeContent: string): string | null {
 /**
  * CasaOS Open URL for a running web bot: the bot's Caddy route on the platform
  * gateway (`https://<sanitizedName>-<APP_DOMAIN>`) plus the web-UI index path. Auth
- * is the gateway's job (AppShield OIDC), not a URL param. Mirrors how pcsProcessing
+ * is the gateway's job (AppShield), not a URL param. Mirrors how pcsProcessing
  * stamps caddy_0 = `${appName}-${APP_DOMAIN}` for the web service. Returns null when
  * APP_DOMAIN is unavailable (not on Yundera) or the deployed compose declares no
  * web UI, so the UI shows no button rather than a fabricated link.

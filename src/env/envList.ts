@@ -164,7 +164,7 @@ export function buildWizardEnvList(
       vars.push({
         key,
         displayLabel: key === 'WEBUI_USER' ? 'Web UI Username' : 'Web UI Password',
-        description: "Optional login for this bot's web UI (leave blank to use the gateway's SSO login).",
+        description: "Login for this bot's web UI gateway (blank disables the login form).",
         defaultValue: '',
         required: false,
         source: 'compose',

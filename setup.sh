@@ -153,9 +153,12 @@ while :; do
 done
 
 if [ "$domain_choice" = "2" ]; then
-  # Re-runs default to the configured domain (never an sslip.io host).
+  # Re-runs default to the configured domain (never an sslip.io host). The stored
+  # COOKIE_DOMAIN carries the dbot. sub-level, so strip it (repeatedly, healing a
+  # value a pre-fix re-run doubled) - else pressing Enter yields dbot.dbot.<domain>.
   domain_prev=""
   case "$prev_cookie_domain" in *.sslip.io|'') : ;; *) domain_prev="$prev_cookie_domain" ;; esac
+  while :; do case "$domain_prev" in dbot.*) domain_prev="${domain_prev#dbot.}" ;; *) break ;; esac; done
   read -rp "Base domain (e.g. example.com)${domain_prev:+ [$domain_prev]}: " BASE_DOMAIN
   BASE_DOMAIN="${BASE_DOMAIN:-$domain_prev}"
   [ -n "$BASE_DOMAIN" ] || die "A domain is required for option 2."

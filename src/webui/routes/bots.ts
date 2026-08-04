@@ -5,9 +5,10 @@
 
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
-import { spawn, execSync } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
+import * as dockerClient from '../../docker/dockerClient';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
 import * as configFileManager from '../../config/configFileManager';
@@ -29,6 +30,13 @@ import { getBotDir } from '../../git/repoManager';
 import { parse as parseYaml } from 'yaml';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
+
+// Full-bot WS payloads carry activeOp so cards can clear/set busy state
+// without waiting for the next GET /api/bots refresh.
+function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | (T & { activeOp: string | null }) {
+  if (!bot) return bot;
+  return { ...bot, activeOp: containerManager.isBotBusy(bot.id) };
+}
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -75,6 +83,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           webOpenUrl,
           // Effective readiness (ping or grace fallback) drives the Open button.
           webUiReady: containerManager.isBotWebUiReady(bot),
+          activeOp: containerManager.isBotBusy(bot.id),
         };
       }));
 
@@ -370,7 +379,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.startBot(botId).then((result) => {
-        const updatedBot = containerManager.getBot(botId);
+        const updatedBot = withActiveOp(containerManager.getBot(botId));
         if (result.success) {
           broadcastToClients(wss, 'bot:started', updatedBot);
         } else {
@@ -401,7 +410,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const bot = containerManager.getBot(req.params.id);
+      const bot = withActiveOp(containerManager.getBot(req.params.id));
       broadcastToClients(wss, 'bot:stopped', bot);
       res.json({ success: true, bot });
     } catch (error) {
@@ -430,7 +439,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.restartBot(botId).then((result) => {
-        const updatedBot = containerManager.getBot(botId);
+        const updatedBot = withActiveOp(containerManager.getBot(botId));
         if (result.success) {
           broadcastToClients(wss, 'bot:restarted', updatedBot);
         } else {
@@ -472,18 +481,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
 
-      // Fetch source first to ensure we have the latest code
-      if (bot.sourceId) {
-        try {
-          await sourceManager.fetchSource(bot.sourceId);
-        } catch (err) {
-          console.warn(`[API] Failed to fetch source before update: ${err}`);
-        }
-      }
-
+      // Invoked synchronously after res.json so the op lock and log session
+      // exist before the client's POST resolves (the frontend connects its SSE
+      // stream only after this response). buildGitInstance re-fetches the
+      // source itself, so no pre-fetch is needed here.
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
+          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(containerManager.getBot(botId)));
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
@@ -516,7 +520,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.buildBot(botId).then((result) => {
-        const updatedBot = containerManager.getBot(botId);
+        const updatedBot = withActiveOp(containerManager.getBot(botId));
         if (result.success) {
           broadcastToClients(wss, 'bot:built', updatedBot);
         } else {
@@ -531,10 +535,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * GET /api/bots/:id/build-logs - Stream build logs via SSE
+   * GET /api/bots/:id/build-logs - Stream operation logs via SSE (protocol v2).
+   * Replays the collector's session history, then: while an op runs, live-tails
+   * with a 15s liveness status heartbeat and closes after the terminal frame;
+   * otherwise sends the terminal/idle frame and closes immediately. Streams
+   * never idle open - the frontend relies on this to avoid reset frames.
    */
   router.get('/:id/build-logs', (req: Request, res: Response) => {
-    const bot = containerManager.getBot(req.params.id);
+    const botId = req.params.id;
+    const bot = containerManager.getBot(botId);
     if (!bot) {
       res.status(404).json({ success: false, error: 'Bot not found' });
       return;
@@ -546,39 +555,74 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       'Connection': 'keep-alive',
       'Access-Control-Allow-Origin': '*'
     });
+    res.write('retry: 15000\n\n');
 
-    res.write(`data: ${JSON.stringify({ message: `Connected to build logs for ${bot.displayName}`, type: 'system' })}\n\n`);
-
-    const logCollector = logCollectors.get(req.params.id);
-
-    if (req.query.fresh === 'true') {
-      logCollector.clear();
-    }
-
-    const existingLogs = logCollector.getLogs();
-    for (const log of existingLogs) {
-      res.write(`data: ${JSON.stringify(log)}\n\n`);
-    }
-
-    const onLog = (log: unknown) => {
+    const writeFrame = (frame: object) => {
       if (res.writable) {
-        res.write(`data: ${JSON.stringify(log)}\n\n`);
+        res.write(`data: ${JSON.stringify(frame)}\n\n`);
+      }
+    };
+    const currentStatus = () => containerManager.getBot(botId)?.status || 'unknown';
+
+    const collector = logCollectors.getIfExists(botId);
+
+    if (!collector || collector.opState === 'idle') {
+      if (collector) {
+        for (const log of collector.getLogs()) writeFrame(log);
+      }
+      writeFrame({ type: 'idle', status: currentStatus(), timestamp: Date.now() });
+      res.end();
+      return;
+    }
+
+    for (const log of collector.getLogs()) writeFrame(log);
+
+    const writeTerminalFrame = () => {
+      const durationMs = (collector.opEndedAt || Date.now()) - collector.opStartedAt;
+      if (collector.opState === 'done') {
+        writeFrame({ type: 'done', op: collector.opName, durationMs, finalStatus: currentStatus(), timestamp: Date.now() });
+      } else {
+        writeFrame({
+          type: 'failed', op: collector.opName, durationMs,
+          error: collector.opError || 'unknown error', finalStatus: currentStatus(), timestamp: Date.now()
+        });
+      }
+      res.end();
+    };
+
+    if (collector.opState !== 'running') {
+      writeTerminalFrame();
+      return;
+    }
+
+    const statusFrame = () => ({
+      type: 'status',
+      op: collector.opName,
+      startedAt: collector.opStartedAt,
+      sinceLastLogMs: Math.max(0, Date.now() - collector.lastActivityAt),
+      timestamp: Date.now()
+    });
+    writeFrame(statusFrame());
+
+    const onLog = (log: unknown) => writeFrame(log as object);
+    const heartbeat = setInterval(() => writeFrame(statusFrame()), 15000);
+    const cleanup = () => {
+      clearInterval(heartbeat);
+      collector.removeListener('log', onLog);
+      collector.removeListener('op', onOp);
+    };
+    const onOp = () => {
+      if (collector.opState === 'done' || collector.opState === 'failed') {
+        cleanup();
+        writeTerminalFrame();
       }
     };
 
-    logCollector.on('log', onLog);
-
-    const keepAlive = setInterval(() => {
-      if (res.writable) {
-        res.write(`data: ${JSON.stringify({ message: '', type: 'ping' })}\n\n`);
-      } else {
-        clearInterval(keepAlive);
-      }
-    }, 15000);
+    collector.on('log', onLog);
+    collector.on('op', onOp);
 
     req.on('close', () => {
-      clearInterval(keepAlive);
-      logCollector.removeListener('log', onLog);
+      cleanup();
       res.end();
     });
   });
@@ -612,21 +656,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const appName = bot.sanitizedName;
-
-      const output = execSync(
-        `docker ps -a --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null || ` +
-        `docker ps -a --filter "name=${appName}" --format "{{.Names}}\\t{{.State}}\\t{{.Status}}" 2>/dev/null`,
-        { encoding: 'utf8', timeout: 10000 }
-      ).trim();
-
-      const containers = output
-        .split('\n')
-        .filter(line => line.trim())
-        .map(line => {
-          const [name, state, status] = line.split('\t');
-          return { name, state: state || 'unknown', status: status || '' };
-        });
-
+      const containers = await dockerClient.listProjectContainers(appName);
       res.json({ success: true, containers, appName });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -651,22 +681,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     res.write(`event: connected\ndata: ${JSON.stringify({ message: `Connected to ${containerName} logs` })}\n\n`);
 
-    try {
-      const result = execSync(`docker logs --tail ${lines} ${containerName} 2>&1`, {
-        encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 * 5
-      });
-      const logLines = result.split('\n').filter(line => line.trim().length > 0);
-      for (const logLine of logLines) {
-        res.write(`event: log\ndata: ${JSON.stringify({ log: logLine, timestamp: new Date().toISOString() })}\n\n`);
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('No such container')) {
-        res.write(`event: log\ndata: ${JSON.stringify({ log: `Container '${containerName}' not found or not running`, timestamp: new Date().toISOString() })}\n\n`);
-      }
-    }
-
-    const logsProcess = spawn('docker', ['logs', '-f', '--tail', '0', containerName]);
+    // One follow process serves both history (--tail N) and live tail, so no
+    // synchronous history fetch blocks the event loop.
+    const logsProcess = spawn('docker', ['logs', '-f', '--tail', String(lines), containerName]);
 
     const handleData = (data: Buffer) => {
       if (!res.writable) return;
@@ -1054,7 +1071,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', containerManager.getBot(botId));
+          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(containerManager.getBot(botId)));
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }

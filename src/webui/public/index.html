@@ -302,6 +302,7 @@
     .terminal-body .log-line.success { color: var(--success); }
     .terminal-body .log-line.error { color: var(--danger); }
     .terminal-body .log-line.warning { color: var(--warning); }
+    .terminal-body .log-line.progress { color: var(--text-muted); }
     .terminal-footer {
       background: var(--bg-secondary); padding: 8px 16px; border-top: 1px solid var(--border);
       display: flex; justify-content: space-between; align-items: center;
@@ -862,9 +863,16 @@
       const idx = bots.findIndex(b => b.id === incoming.id);
       if (idx >= 0) bots[idx] = { ...bots[idx], ...incoming };
     }
-    function setBotStatus(id, status) {
+    function setBotStatus(id, status, activeOp) {
       const bot = bots.find(b => b.id === id);
-      if (bot) bot.status = status;
+      if (bot) {
+        bot.status = status;
+        if (activeOp !== undefined) bot.activeOp = activeOp;
+      }
+    }
+    function clearActiveOp(id) {
+      const bot = bots.find(b => b.id === id);
+      if (bot) bot.activeOp = null;
     }
     function redraw() {
       renderBots();
@@ -1011,13 +1019,13 @@
         switch (data.type) {
           // Real-time status transitions during operations - in-memory patch only
           case 'bot:status':
-            setBotStatus(payload.id, payload.status);
+            setBotStatus(payload.id, payload.status, payload.activeOp);
             redraw();
             break;
 
-          // Operation success - payload is the full bot object
+          // Operation success - payload is the full bot object (with activeOp).
+          // The terminal popup is SSE-driven now; these only refresh card state.
           case 'bot:started':
-            if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
             mergeBotState(payload);
             busyBots.delete(id);
             redraw();
@@ -1043,35 +1051,33 @@
             loadBots();
             break;
           case 'bot:built':
-            if (terminalBotId && id === terminalBotId) markTerminalComplete(true);
             busyBots.delete(id);
             loadBots();
             break;
 
-          // Failures - no state change, just clear busy + surface error
+          // Failures - clear busy/op + surface error (the popup, if open,
+          // shows the failure via its own SSE failed frame)
           case 'bot:start-failed':
-            if (terminalBotId && id === terminalBotId) {
-              addTerminalLog(`Start failed: ${payload?.error || 'Unknown error'}`, 'error');
-              markTerminalComplete(false);
-            }
+            showMessage('error', payload?.error || 'Start failed');
+            clearActiveOp(id);
             busyBots.delete(id);
             redraw();
             break;
           case 'bot:build-failed':
-            if (terminalBotId && id === terminalBotId) {
-              addTerminalLog(`Build failed: ${payload?.error || 'Unknown error'}`, 'error');
-              markTerminalComplete(false);
-            }
+            showMessage('error', payload?.error || 'Build failed');
+            clearActiveOp(id);
             busyBots.delete(id);
             redraw();
             break;
           case 'bot:restart-failed':
             showMessage('error', payload?.error || 'Restart failed');
+            clearActiveOp(id);
             busyBots.delete(id);
             redraw();
             break;
           case 'bot:pull-failed':
             showMessage('error', payload?.error || 'Pull failed');
+            clearActiveOp(id);
             busyBots.delete(id);
             redraw();
             break;
@@ -1266,9 +1272,13 @@
           ${bots.map(bot => {
             const botName = bot.displayName || 'Unnamed';
             const isRunning = bot.status === 'running';
-            const busy = busyBots.has(bot.id) || isTransientStatus(bot.status);
+            const busy = busyBots.has(bot.id) || isTransientStatus(bot.status) || !!bot.activeOp;
             const d = busy ? ' disabled' : '';
             const isGit = bot.sourceType !== 'docker-image';
+            // Always reachable, even (especially) while an op is in flight.
+            const buildLogsBtn = bot.activeOp
+              ? `<button class="btn btn-primary btn-small" onclick="viewBuildLogs('${bot.id}', ${jsArg(botName)})">View Progress</button>`
+              : `<button class="btn btn-secondary btn-small" onclick="viewBuildLogs('${bot.id}', ${jsArg(botName)})">Build Logs</button>`;
 
             // Source dropdown (git) or image tag (docker-image)
             let sourceTag = '';
@@ -1363,7 +1373,7 @@
                   ${sourceTag}
                   ${commitInfo}
                 </div>
-                <span class="status-badge status-${bot.status}">${busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status}</span>
+                <span class="status-badge status-${bot.status}">${bot.activeOp ? escapeHtml(bot.activeOp) : (busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status)}</span>
               </div>
               ${(isGit || webAuthControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}</div>` : ''}
               <div class="bot-card-actions">
@@ -1380,6 +1390,7 @@
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
+                  ${buildLogsBtn}
                   <button class="btn btn-secondary btn-small" onclick="showEnvEditor('${bot.id}')" disabled title="Stop the bot to edit environment variables">Env</button>
                   <button class="btn btn-secondary btn-small" onclick="showConfigEditor('${bot.id}')" disabled title="Stop the bot to edit config files">Config</button>
                   <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', ${jsArg(botName)})" title="Open an interactive shell inside the bot's container">Console</button>
@@ -1393,7 +1404,7 @@
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn btn-primary btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`}
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
-                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', ${jsArg(botName)})">Build Logs</button>
+                  ${buildLogsBtn}
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
                   <button class="btn btn-secondary btn-small" onclick="showConsole('${bot.id}', ${jsArg(botName)})" disabled title="Start the bot to open a console">Console</button>
@@ -1401,7 +1412,7 @@
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
-                  <button class="btn btn-secondary btn-small" onclick="showBuildLogs('${bot.id}', ${jsArg(botName)})">Build Logs</button>
+                  ${buildLogsBtn}
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
@@ -1459,11 +1470,31 @@
 
     async function updateBot(id) {
       const bot = bots.find(b => b.id === id);
-      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status)) || bot?.activeOp) return;
       busyBots.add(id); renderBots();
-      openTerminalPopup(bot ? bot.displayName : id, id, 'Updating');
-      try { await api('POST', `/bots/${id}/update`); }
-      catch (err) { showMessage('error', 'Update failed'); busyBots.delete(id); renderBots(); }
+      openTerminalPopup(id, bot ? bot.displayName : id, 'Updating');
+      try {
+        const res = await api('POST', `/bots/${id}/update`);
+        if (!res.success) {
+          if (terminalBotId === id) {
+            addTerminalLog(`Error: ${res.error || 'Failed to update bot'}`, 'error');
+            markTerminalComplete(false);
+          } else {
+            showMessage('error', res.error || 'Failed to update bot');
+          }
+          busyBots.delete(id); loadBots();
+          return;
+        }
+        if (terminalBotId === id) streamBuildLogs(id);
+      } catch (err) {
+        if (terminalBotId === id) {
+          addTerminalLog('Error: Failed to update bot', 'error');
+          markTerminalComplete(false);
+        } else {
+          showMessage('error', 'Failed to update bot');
+        }
+        busyBots.delete(id); loadBots();
+      }
     }
 
     async function changeSource(botId, newSourceId) {
@@ -1486,21 +1517,33 @@
     // ─── Bot Actions (all guarded by busyBots to prevent double-clicks) ───
     async function startBot(id) {
       const bot = bots.find(b => b.id === id);
-      if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      if (busyBots.has(id) || (bot && isTransientStatus(bot.status)) || bot?.activeOp) return;
       busyBots.add(id); renderBots();
-      openTerminalPopup(bot ? bot.displayName : id, id, 'Installing');
+      openTerminalPopup(id, bot ? bot.displayName : id, 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
+        // terminalBotId guards: the user may have closed this popup (or opened
+        // another bot's) during the POST round-trip; never touch a popup that
+        // is no longer ours. Busy cleanup stays unconditional (POST-level
+        // failures fire no WS event to clear it).
         if (!res.success) {
-          addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error');
-          markTerminalComplete(false);
+          if (terminalBotId === id) {
+            addTerminalLog(`Error: ${res.error || 'Failed to start bot'}`, 'error');
+            markTerminalComplete(false);
+          } else {
+            showMessage('error', res.error || 'Failed to start bot');
+          }
           busyBots.delete(id); loadBots();
+          return;
         }
-        // Success case: don't mark complete here; WebSocket 'bot:started' or
-        // 'bot:start-failed' event will handle it (build runs in background)
+        if (terminalBotId === id) streamBuildLogs(id);
       } catch (err) {
-        addTerminalLog('Error: Failed to start bot', 'error');
-        markTerminalComplete(false);
+        if (terminalBotId === id) {
+          addTerminalLog('Error: Failed to start bot', 'error');
+          markTerminalComplete(false);
+        } else {
+          showMessage('error', 'Failed to start bot');
+        }
         busyBots.delete(id); loadBots();
       }
     }
@@ -1976,11 +2019,24 @@
     // Terminal popup state
     let terminalEventSource = null;
     let terminalBotId = null;
+    let terminalTickTimer = null;
+    let terminalSilenceBase = 0;
+    let terminalSilenceAt = 0;
+    let terminalOp = null;
+    let terminalFinished = false;
+    const TERMINAL_SILENCE_WARN_MS = 30000;
 
     // ─── Terminal Popup ───
-    function openTerminalPopup(botName, botId, action) {
+    // Opens the popup only; callers own the connect. Install/update connect
+    // AFTER their POST resolves (the op lock and log session exist by then, so
+    // the stream can never see a stale idle state and close on them); manual
+    // reopen connects immediately via viewBuildLogs.
+    function openTerminalPopup(botId, botName, title) {
       closeTerminalPopup();
       terminalBotId = botId;
+      terminalFinished = false;
+      terminalOp = null;
+      resetTerminalSilence();
 
       const overlay = document.createElement('div');
       overlay.className = 'terminal-overlay';
@@ -1988,7 +2044,7 @@
       overlay.innerHTML = `
         <div class="terminal-box">
           <div class="terminal-header">
-            <span class="terminal-title">${escapeHtml(action)}: ${escapeHtml(botName)}</span>
+            <span class="terminal-title">${escapeHtml(title)}: ${escapeHtml(botName)}</span>
             <button class="terminal-close" onclick="closeTerminalPopup()">&times;</button>
           </div>
           <div class="terminal-body" id="terminal-body"></div>
@@ -2002,11 +2058,12 @@
         </div>
       `;
       document.body.appendChild(overlay);
-      streamBuildLogs(botId, true);
+      terminalTickTimer = setInterval(updateTerminalSilence, 1000);
     }
 
     function closeTerminalPopup() {
       if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
+      if (terminalTickTimer) { clearInterval(terminalTickTimer); terminalTickTimer = null; }
       terminalBotId = null;
       const popup = document.getElementById('terminal-popup');
       if (!popup) return;
@@ -2014,56 +2071,117 @@
       loadBots();
     }
 
-    function showBuildLogs(botId, botName) {
-      closeTerminalPopup();
-      terminalBotId = botId;
-
-      const overlay = document.createElement('div');
-      overlay.className = 'terminal-overlay';
-      overlay.id = 'terminal-popup';
-      overlay.innerHTML = `
-        <div class="terminal-box">
-          <div class="terminal-header">
-            <span class="terminal-title">Build Logs: ${escapeHtml(botName)}</span>
-            <button class="terminal-close" onclick="closeTerminalPopup()">&times;</button>
-          </div>
-          <div class="terminal-body" id="terminal-body"></div>
-          <div class="terminal-footer">
-            <div class="terminal-status">
-              <div class="dot-done" id="terminal-dot" style="background:var(--text-muted);"></div>
-              <span id="terminal-status-text">History</span>
-            </div>
-            <button class="btn btn-secondary btn-small" onclick="closeTerminalPopup()">Close</button>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-      // Stream WITHOUT fresh=true to get existing log history
-      streamBuildLogs(botId, false);
+    function viewBuildLogs(botId, botName) {
+      openTerminalPopup(botId, botName, 'Build Logs');
+      streamBuildLogs(botId);
     }
 
-    function streamBuildLogs(botId, fresh) {
-      const freshParam = fresh !== false ? '?fresh=true' : '';
-      terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs${freshParam}`);
+    function setTerminalStatus(text, dotClass, dotColor) {
+      const st = document.getElementById('terminal-status-text');
+      const dot = document.getElementById('terminal-dot');
+      if (st) st.textContent = text;
+      if (dot) { dot.className = dotClass; dot.style.background = dotColor || ''; }
+    }
+
+    function resetTerminalSilence() {
+      terminalSilenceBase = 0;
+      terminalSilenceAt = Date.now();
+    }
+
+    function formatSilence(ms) {
+      const s = Math.floor(ms / 1000);
+      return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+    }
+
+    function updateTerminalSilence() {
+      if (terminalFinished || !terminalEventSource || terminalEventSource.readyState !== EventSource.OPEN) return;
+      const silence = terminalSilenceBase + (Date.now() - terminalSilenceAt);
+      if (silence > TERMINAL_SILENCE_WARN_MS) {
+        const opLabel = terminalOp ? ` (${terminalOp})` : '';
+        setTerminalStatus(`Still working${opLabel} - no output for ${formatSilence(silence)}`, 'dot-live', 'var(--warning)');
+      } else {
+        setTerminalStatus('Streaming', 'dot-live', '');
+      }
+    }
+
+    function streamBuildLogs(botId) {
+      if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
+      terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs`);
+      terminalEventSource.onopen = () => {
+        // Every connection replays full history, so clearing on open is the
+        // dedup mechanism for browser auto-reconnect (also resets progress
+        // keys, which live only as data-key attributes).
+        const body = document.getElementById('terminal-body');
+        if (body) body.innerHTML = '';
+        terminalFinished = false;
+        resetTerminalSilence();
+        setTerminalStatus('Streaming', 'dot-live', '');
+      };
       terminalEventSource.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data.type === 'ping') return;
-          addTerminalLog(data.message, data.type || 'info');
+          switch (data.type) {
+            case 'status':
+              terminalOp = data.op || null;
+              terminalSilenceBase = data.sinceLastLogMs || 0;
+              terminalSilenceAt = Date.now();
+              updateTerminalSilence();
+              break;
+            case 'progress':
+              renderProgressLine(data);
+              resetTerminalSilence();
+              break;
+            case 'done':
+              if (data.finalStatus && data.finalStatus !== 'running') {
+                addTerminalLog(`Bot remains ${data.finalStatus}`, 'info');
+              }
+              markTerminalComplete(true);
+              break;
+            case 'failed':
+              if (data.error) addTerminalLog(`Error: ${data.error}`, 'error');
+              markTerminalComplete(false);
+              break;
+            case 'idle':
+              terminalFinished = true;
+              if (terminalTickTimer) { clearInterval(terminalTickTimer); terminalTickTimer = null; }
+              setTerminalStatus(data.status && data.status !== 'unknown' ? `Idle - bot is ${data.status}` : 'Idle', 'dot-done', '');
+              if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
+              break;
+            default:
+              addTerminalLog(data.message, data.type || 'info');
+              resetTerminalSilence();
+          }
         } catch (e) { addTerminalLog(event.data, 'info'); }
       };
-      terminalEventSource.onopen = () => {
-        const st = document.getElementById('terminal-status-text');
-        if (st) st.textContent = 'Streaming...';
-      };
       terminalEventSource.onerror = () => {
+        if (terminalFinished) return;
         if (terminalEventSource?.readyState === EventSource.CLOSED) {
-          const st = document.getElementById('terminal-status-text');
-          if (st) st.textContent = 'Disconnected';
-          const dot = document.getElementById('terminal-dot');
-          if (dot) dot.className = 'dot-done';
+          setTerminalStatus('Disconnected', 'dot-done', '');
+          addTerminalLog('Stream closed - reopen from the bot card', 'system');
+        } else {
+          setTerminalStatus('Reconnecting...', 'dot-done', '');
         }
       };
+    }
+
+    function appendWithHousekeeping(body, line) {
+      const stick = body.scrollTop + body.clientHeight >= body.scrollHeight - 40;
+      body.appendChild(line);
+      while (body.children.length > 1000) body.removeChild(body.firstChild);
+      if (stick) body.scrollTop = body.scrollHeight;
+    }
+
+    function renderProgressLine(data) {
+      const body = document.getElementById('terminal-body');
+      if (!body || !data.message) return;
+      if (!data.key) { addTerminalLog(data.message, 'info'); return; }
+      const existing = body.querySelector(`.log-line[data-key="${CSS.escape(data.key)}"]`);
+      if (existing) { existing.textContent = data.message; return; }
+      const line = document.createElement('div');
+      line.className = 'log-line progress';
+      line.setAttribute('data-key', data.key);
+      line.textContent = data.message;
+      appendWithHousekeeping(body, line);
     }
 
     function addTerminalLog(message, type) {
@@ -2072,16 +2190,14 @@
       const line = document.createElement('div');
       line.className = `log-line ${type || 'info'}`;
       line.textContent = message;
-      body.appendChild(line);
-      body.scrollTop = body.scrollHeight;
+      appendWithHousekeeping(body, line);
     }
 
     function markTerminalComplete(success) {
+      terminalFinished = true;
+      if (terminalTickTimer) { clearInterval(terminalTickTimer); terminalTickTimer = null; }
       addTerminalLog(success ? '--- Process completed successfully ---' : '--- Process failed ---', success ? 'success' : 'error');
-      const dot = document.getElementById('terminal-dot');
-      const st = document.getElementById('terminal-status-text');
-      if (dot) { dot.className = 'dot-done'; dot.style.background = success ? 'var(--success)' : 'var(--danger)'; }
-      if (st) st.textContent = success ? 'Complete' : 'Failed';
+      setTerminalStatus(success ? 'Complete' : 'Failed', 'dot-done', success ? 'var(--success)' : 'var(--danger)');
       if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
     }
 

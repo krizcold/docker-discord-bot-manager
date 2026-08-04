@@ -171,11 +171,11 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       if (source.sourceType === 'docker-image') {
         const imageRef = source.imageRef || '';
         const curated = findImageEnvHints(imageRef);
-        let imageReady = !!imageRef && dockerClient.imageExists(imageRef);
+        let imageReady = !!imageRef && await dockerClient.imageExists(imageRef);
         if (imageRef && !imageReady && req.query.inspect === 'true') {
           try {
             await dockerClient.pullImage(imageRef);
-            imageReady = dockerClient.imageExists(imageRef);
+            imageReady = await dockerClient.imageExists(imageRef);
           } catch { /* pull failed; curated hints are still returned */ }
         }
         let inspected: DetectedEnvVar[] = [];

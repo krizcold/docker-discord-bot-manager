@@ -3,8 +3,12 @@
  * Uses Docker CLI for cross-platform compatibility
  */
 
-import { execFileSync, execSync, spawn } from 'child_process';
+import { execFile, execFileSync, execSync, spawn } from 'child_process';
+import { promisify } from 'util';
 import { ContainerInfo, LogEntry } from '../types';
+import { createLineHandler, DockerLogFn } from './outputStream';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Execute a docker command and return stdout
@@ -17,6 +21,24 @@ function execDocker(args: string[], options: { timeout?: number } = {}): string 
       stdio: 'pipe',
       timeout: options.timeout || 30000
     }).trim();
+  } catch (error: any) {
+    if (error.stderr) {
+      throw new Error(`Docker command failed: ${error.stderr.toString()}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Async variant of execDocker; keeps op paths from blocking the event loop.
+ */
+async function execDockerAsync(args: string[], options: { timeout?: number } = {}): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('docker', args, {
+      encoding: 'utf8',
+      timeout: options.timeout || 30000
+    });
+    return stdout.trim();
   } catch (error: any) {
     if (error.stderr) {
       throw new Error(`Docker command failed: ${error.stderr.toString()}`);
@@ -362,8 +384,13 @@ export async function streamContainerLogs(
 /**
  * Check if a Docker image exists locally
  */
-export function imageExists(imageName: string): boolean {
-  return execDockerSafe(['image', 'inspect', imageName]);
+export async function imageExists(imageName: string): Promise<boolean> {
+  try {
+    await execDockerAsync(['image', 'inspect', imageName]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -398,8 +425,13 @@ export function inspectImageVolumes(imageName: string): string[] | null {
 /**
  * Remove a Docker image
  */
-export function removeImage(imageName: string): boolean {
-  return execDockerSafe(['rmi', imageName]);
+export async function removeImage(imageName: string): Promise<boolean> {
+  try {
+    await execDockerAsync(['rmi', imageName]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -408,7 +440,7 @@ export function removeImage(imageName: string): boolean {
 export async function buildImage(
   contextPath: string,
   imageName: string,
-  onProgress?: (message: string) => void,
+  onProgress?: DockerLogFn,
   buildArgs?: Record<string, string>,
   dockerfilePath?: string
 ): Promise<void> {
@@ -436,20 +468,14 @@ export async function buildImage(
 
     const child = spawn('docker', args, { env });
 
-    const processLog = (data: Buffer) => {
-      const lines = data.toString().split(/[\r\n]+/);
-      lines.forEach(line => {
-        if (!line.trim()) return;
-        if (onProgress) {
-          onProgress(line);
-        }
-      });
-    };
-
-    child.stdout.on('data', processLog);
-    child.stderr.on('data', processLog);
+    const out = createLineHandler((line, key) => onProgress?.(line, key));
+    const err = createLineHandler((line, key) => onProgress?.(line, key));
+    child.stdout.on('data', out.data);
+    child.stderr.on('data', err.data);
 
     child.on('close', (code) => {
+      out.flush();
+      err.flush();
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
@@ -462,11 +488,11 @@ export async function buildImage(
       }
     });
 
-    child.on('error', (err) => {
+    child.on('error', (err2) => {
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
-      reject(err);
+      reject(err2);
     });
   });
 }
@@ -476,7 +502,7 @@ export async function buildImage(
  */
 export async function pullImage(
   imageName: string,
-  onProgress?: (message: string) => void
+  onProgress?: DockerLogFn
 ): Promise<void> {
   const args = ['pull', imageName];
 
@@ -485,20 +511,14 @@ export async function pullImage(
   return new Promise((resolve, reject) => {
     const child = spawn('docker', args);
 
-    const processLog = (data: Buffer) => {
-      const lines = data.toString().split(/[\r\n]+/);
-      lines.forEach(line => {
-        if (!line.trim()) return;
-        if (onProgress) {
-          onProgress(line);
-        }
-      });
-    };
-
-    child.stdout.on('data', processLog);
-    child.stderr.on('data', processLog);
+    const out = createLineHandler((line, key) => onProgress?.(line, key));
+    const err = createLineHandler((line, key) => onProgress?.(line, key));
+    child.stdout.on('data', out.data);
+    child.stderr.on('data', err.data);
 
     child.on('close', (code) => {
+      out.flush();
+      err.flush();
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
@@ -511,11 +531,11 @@ export async function pullImage(
       }
     });
 
-    child.on('error', (err) => {
+    child.on('error', (err2) => {
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
-      reject(err);
+      reject(err2);
     });
   });
 }
@@ -598,7 +618,7 @@ export function listProjectVolumes(projectName: string): string[] {
 export async function composeUp(
   composePath: string,
   projectName: string,
-  onProgress?: (message: string) => void,
+  onProgress?: DockerLogFn,
   opts: { build?: boolean } = {}
 ): Promise<void> {
   const args = ['compose', '-f', composePath, '-p', projectName, 'up', '-d', '--remove-orphans'];
@@ -614,21 +634,18 @@ export async function composeUp(
 
     const child = spawn('docker', args, { env });
 
-    const processLog = (data: Buffer) => {
-      const lines = data.toString().split(/[\r\n]+/);
-      lines.forEach(line => {
-        if (!line.trim()) return;
-        console.log(`[Compose] ${line}`);
-        if (onProgress) {
-          onProgress(line);
-        }
-      });
+    const onLine: DockerLogFn = (line, key) => {
+      console.log(`[Compose] ${line}`);
+      onProgress?.(line, key);
     };
-
-    child.stdout.on('data', processLog);
-    child.stderr.on('data', processLog);
+    const out = createLineHandler(onLine);
+    const err = createLineHandler(onLine);
+    child.stdout.on('data', out.data);
+    child.stderr.on('data', err.data);
 
     child.on('close', (code) => {
+      out.flush();
+      err.flush();
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
@@ -641,11 +658,11 @@ export async function composeUp(
       }
     });
 
-    child.on('error', (err) => {
+    child.on('error', (err2) => {
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
-      reject(err);
+      reject(err2);
     });
   });
 }
@@ -658,5 +675,41 @@ export async function composeDown(
   projectName: string
 ): Promise<void> {
   const args = ['compose', '-f', composePath, '-p', projectName, 'down'];
-  execDocker(args, { timeout: 60000 });
+  await execDockerAsync(args, { timeout: 60000 });
+}
+
+/**
+ * List all containers of a compose project without blocking the event loop.
+ * The label filter is authoritative; the name substring fallback runs only when
+ * the label query itself fails (docker's name= filter matches substrings, so an
+ * empty label result must NOT trigger it or stopped bots would list foreign
+ * containers).
+ */
+export async function listProjectContainers(
+  projectName: string
+): Promise<Array<{ name: string; state: string; status: string }>> {
+  const format = '{{.Names}}\t{{.State}}\t{{.Status}}';
+  let output = '';
+  try {
+    output = await execDockerAsync(
+      ['ps', '-a', '--filter', `label=com.docker.compose.project=${projectName}`, '--format', format],
+      { timeout: 10000 }
+    );
+  } catch {
+    try {
+      output = await execDockerAsync(
+        ['ps', '-a', '--filter', `name=${projectName}`, '--format', format],
+        { timeout: 10000 }
+      );
+    } catch {
+      output = '';
+    }
+  }
+  return output
+    .split('\n')
+    .filter(line => line.trim())
+    .map(line => {
+      const [name, state, status] = line.split('\t');
+      return { name, state: state || 'unknown', status: status || '' };
+    });
 }

@@ -6,6 +6,7 @@
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { verifyComposeProjectRunning } from '../docker/dockerClient';
+import { createLineHandler, DockerLogFn } from '../docker/outputStream';
 
 const execAsync = promisify(exec);
 
@@ -146,7 +147,7 @@ export async function uninstallApp(appName: string): Promise<boolean> {
 export async function deployApp(
   appName: string,
   composePath: string,
-  onLog?: (message: string) => void,
+  onLog?: DockerLogFn,
   timeoutMs: number = 300000
 ): Promise<{ success: boolean; error?: string }> {
   return new Promise((resolve) => {
@@ -162,21 +163,20 @@ export async function deployApp(
       resolve({ success: false, error: `Deploy timed out after ${Math.round(timeoutMs / 1000)}s` });
     }, timeoutMs);
 
-    const processLog = (data: Buffer) => {
-      const lines = data.toString().split(/[\r\n]+/);
-      lines.forEach(line => {
-        if (!line.trim()) return;
-        outputLines.push(line);
-        console.log(`[Compose ${appName}] ${line}`);
-        if (onLog) onLog(line);
-      });
+    const onLine: DockerLogFn = (line, key) => {
+      outputLines.push(line);
+      console.log(`[Compose ${appName}] ${line}`);
+      onLog?.(line, key);
     };
-
-    child.stdout.on('data', processLog);
-    child.stderr.on('data', processLog);
+    const out = createLineHandler(onLine);
+    const err = createLineHandler(onLine);
+    child.stdout.on('data', out.data);
+    child.stderr.on('data', err.data);
 
     child.on('close', async (code) => {
       clearTimeout(timeout);
+      out.flush();
+      err.flush();
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();
@@ -225,7 +225,7 @@ export async function deployApp(
 export async function composeDown(
   appName: string,
   composePath: string,
-  onLog?: (message: string) => void,
+  onLog?: DockerLogFn,
   timeoutMs: number = 120000
 ): Promise<{ success: boolean; error?: string }> {
   return new Promise((resolve) => {
@@ -241,21 +241,20 @@ export async function composeDown(
       resolve({ success: false, error: `Compose down timed out after ${Math.round(timeoutMs / 1000)}s` });
     }, timeoutMs);
 
-    const processLog = (data: Buffer) => {
-      const lines = data.toString().split(/[\r\n]+/);
-      lines.forEach(line => {
-        if (!line.trim()) return;
-        outputLines.push(line);
-        console.log(`[Compose down ${appName}] ${line}`);
-        if (onLog) onLog(line);
-      });
+    const onLine: DockerLogFn = (line, key) => {
+      outputLines.push(line);
+      console.log(`[Compose down ${appName}] ${line}`);
+      onLog?.(line, key);
     };
-
-    child.stdout.on('data', processLog);
-    child.stderr.on('data', processLog);
+    const out = createLineHandler(onLine);
+    const err = createLineHandler(onLine);
+    child.stdout.on('data', out.data);
+    child.stderr.on('data', err.data);
 
     child.on('close', (code) => {
       clearTimeout(timeout);
+      out.flush();
+      err.flush();
       child.stdout.removeAllListeners();
       child.stderr.removeAllListeners();
       child.removeAllListeners();

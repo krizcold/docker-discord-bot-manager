@@ -8,7 +8,7 @@
 import { execSync } from 'child_process';
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
-import { syncContainerStates } from './docker/containerManager';
+import { syncContainerStates, resetTransientStatuses } from './docker/containerManager';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
@@ -87,8 +87,9 @@ async function main(): Promise<void> {
   // Seed default sources on first run
   seedDefaultSources();
 
-  // Sync container states on startup
+  // Sync container states on startup (ops interrupted by a restart first)
   console.log('[Init] Syncing container states...');
+  resetTransientStatuses();
   await syncContainerStates();
 
   // Start web server

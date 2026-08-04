@@ -20,6 +20,7 @@ import {
   DetectionResult,
 } from '../types';
 import * as dockerClient from './dockerClient';
+import { DockerLogFn } from './outputStream';
 import { allocateHostPort } from './portAllocator';
 import { getBotDir, getDataPath, getEnvPath } from '../git/repoManager';
 import { findImageDataPath } from '../source/imageHints';
@@ -72,7 +73,7 @@ import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
-import { logCollectors, LogCollector } from '../build/logCollector';
+import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
 import { sanitizeName, titleizeName, resolveNames, makeUniqueName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
@@ -477,6 +478,36 @@ async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Pr
   }
 }
 
+type EmitFn = (msg: string, type?: BuildLogEntry['type'], key?: string) => void;
+
+// Logged variant for session ops (start/build/update/restart): the lock and the
+// collector's beginOp both run synchronously before any await, so a client that
+// connects after the trigger POST resolves always sees the running session.
+async function withLoggedBotOp(
+  botId: string,
+  op: string,
+  fn: () => Promise<{ success: boolean; error?: string }>
+): Promise<{ success: boolean; error?: string }> {
+  const current = activeOps.get(botId);
+  if (current) {
+    throw new Error(`Operation '${current}' is already in progress for this bot`);
+  }
+  activeOps.set(botId, op);
+  const log = logCollectors.get(botId);
+  log.beginOp(op);
+  try {
+    const result = await fn();
+    if (result.success) log.endOp('done');
+    else log.endOp('failed', result.error || 'unknown error');
+    return result;
+  } catch (err) {
+    log.endOp('failed', String(err));
+    throw err;
+  } finally {
+    activeOps.delete(botId);
+  }
+}
+
 // ─── Delete ───
 
 async function performManualCleanup(appName: string, removeData: boolean): Promise<{ failures: string[] }> {
@@ -640,7 +671,7 @@ async function listDeleteRemnants(
 
   try {
     const imageName = getImageName(instance);
-    if (dockerClient.imageExists(imageName)) remnants.push(`image ${imageName}`);
+    if (await dockerClient.imageExists(imageName)) remnants.push(`image ${imageName}`);
   } catch { /* ignore */ }
 
   if (!keepData) {
@@ -720,14 +751,14 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   // 2. Remove Docker image
   const imageName = getImageName(instance);
   try {
-    if (dockerClient.imageExists(imageName)) {
+    if (await dockerClient.imageExists(imageName)) {
       console.log(`[ContainerManager] Removing image ${imageName}...`);
-      const ok = dockerClient.removeImage(imageName);
+      const ok = await dockerClient.removeImage(imageName);
       if (!ok) failures.push(`image ${imageName}: docker rmi reported failure`);
       // Verify the image is actually gone - rmi can return success in some
       // edge cases (force-removed dangling tag) while another tag of the
       // same image keeps it present. Treat lingering image as a failure.
-      else if (dockerClient.imageExists(imageName)) {
+      else if (await dockerClient.imageExists(imageName)) {
         failures.push(`image ${imageName}: still present after rmi`);
       }
     }
@@ -828,7 +859,7 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     registry.instances[botId] = instance;
     saveRegistry(registry);
     if (broadcastFn) {
-      broadcastFn('bot:status', { id: botId, status });
+      broadcastFn('bot:status', { id: botId, status, activeOp: isBotBusy(botId) });
     }
     // A bot that does not implement the readiness ping never flips webUiReady;
     // nudge the UI once the grace period elapses so its Open button un-gates.
@@ -1222,7 +1253,7 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
 // ─── Start ───
 
 export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
-  return withBotOp(botId, 'start', () => startBotImpl(botId));
+  return withLoggedBotOp(botId, 'start', () => startBotImpl(botId));
 }
 
 async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
@@ -1240,11 +1271,10 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
 async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
-  log.clear();
 
-  const emit = (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success' = 'info') => {
+  const emit: EmitFn = (msg, type = 'info', key) => {
     console.log(`[Start ${botId}] ${msg}`);
-    log.addLog(msg, type);
+    log.addLog(msg, type, key);
   };
 
   try {
@@ -1290,8 +1320,8 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
-      const deployResult = await casaosApi.deployApp(appName, composePath, (msg) => {
-        emit(`[Compose] ${msg}`, 'info');
+      const deployResult = await casaosApi.deployApp(appName, composePath, (msg, key) => {
+        emit(`[Compose] ${msg}`, 'info', key);
       });
       if (!deployResult.success) {
         throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
@@ -1335,7 +1365,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
-      await dockerClient.composeUp(composePath, appName, (msg) => emit(`[Compose] ${msg}`, 'info'));
+      await dockerClient.composeUp(composePath, appName, (msg, key) => emit(`[Compose] ${msg}`, 'info', key));
       const verify = await dockerClient.verifyComposeProjectRunning(appName, 15000);
       if (!verify.allRunning) {
         throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
@@ -1360,16 +1390,24 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
 
 async function startDockerImageBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
+  const log = logCollectors.get(botId);
+
+  const emit: EmitFn = (msg, type = 'info', key) => {
+    console.log(`[Start ${botId}] ${msg}`);
+    log.addLog(msg, type, key);
+  };
 
   if (!instance.imageRef) {
     return { success: false, error: 'imageRef is required for docker-image source type' };
   }
 
   try {
+    emit(`[Start] Starting ${instance.displayName}...`, 'system');
     const botDir = getBotDir(botId);
     const localComposePath = path.join(botDir, 'docker-compose.yml');
 
     if (!fs.existsSync(localComposePath)) {
+      emit('[Build] No compose file found, running build first...', 'info');
       const buildResult = await buildBotImpl(botId);
       if (!buildResult.success) {
         return { success: false, error: `Build failed: ${buildResult.error || 'unknown error'}` };
@@ -1381,29 +1419,35 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
 
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
+      emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
       // Re-apply edited config files so config changes take effect on start.
       const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
       if (cfgFiles.length > 0) {
         try {
+          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
           const composeForCfg = fs.readFileSync(composePath, 'utf-8');
-          await redeliverConfigFiles(composeForCfg, appName, cfgFiles);
+          await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
         } catch (err) {
-          console.warn(`[ContainerManager] Could not re-apply config files for ${appName}:`, err);
+          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
         }
       }
 
-      const deployResult = await casaosApi.deployApp(appName, composePath);
+      const deployResult = await casaosApi.deployApp(appName, composePath, (msg, key) => {
+        emit(`[Compose] ${msg}`, 'info', key);
+      });
       if (!deployResult.success) {
         throw new Error(`Failed to deploy via docker compose: ${deployResult.error || 'unknown error'}`);
       }
 
       await new Promise(resolve => setTimeout(resolve, 3000));
-      await fixPostDeployOwnership(appName);
+      emit('[PCS] Fixing post-deploy ownership...', 'info');
+      await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
       const containerIds = await getContainerIdsForBot(botId);
       updateBotStatus(botId, 'running', containerIds);
+      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
       syncComposeEnvVars(instance, composePath);
@@ -1412,30 +1456,37 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
       if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
         try {
+          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
           redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
         } catch (err) {
-          console.warn(`[ContainerManager] Could not re-apply config files for ${appName}:`, err);
+          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
         }
       }
 
       // Re-assert ownership of manager-delivered files (written root) to the bot's
       // PUID:GID before the container starts; mirrors casaos fixPostDeployOwnership.
-      fixDockerBotOwnership(botDir, (msg) => console.log(`[Compose ${botId}] ${msg}`));
+      fixDockerBotOwnership(botDir, (msg) => emit(msg, 'info'));
+      emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
-      await dockerClient.composeUp(composePath, appName, (msg) => console.log(`[Compose ${botId}] ${msg}`));
+      await dockerClient.composeUp(composePath, appName, (msg, key) => emit(`[Compose] ${msg}`, 'info', key));
       const verify = await dockerClient.verifyComposeProjectRunning(appName, 15000);
       if (!verify.allRunning) {
         throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
       }
       const containerIds = await getContainerIdsForBot(botId);
       updateBotStatus(botId, 'running', containerIds);
+      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     }
 
+    emit(`[Success] ${instance.displayName} is now running!`, 'success');
     return { success: true };
   } catch (error) {
+    const msg = String(error);
+    emit(`[Error] Start failed: ${msg}`, 'error');
+    emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start docker-image instance ${botId}:`, error);
     updateBotStatus(botId, 'error');
-    return { success: false, error: String(error) };
+    return { success: false, error: msg };
   }
 }
 
@@ -1456,7 +1507,7 @@ export async function stopBot(botId: string): Promise<{ success: boolean; error?
   return withBotOp(botId, 'stop', () => stopBotImpl(botId));
 }
 
-async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
+async function stopBotImpl(botId: string, emit?: EmitFn): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   if (instance.status !== 'running') return { success: false, error: 'Bot is not running' };
@@ -1466,12 +1517,18 @@ async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: s
 
     const deploymentMode = await getDeploymentMode();
     const appName = resolveAppName(botId);
+    emit?.(`[Stop] Stopping containers (${appName})...`, 'info');
 
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
-      const downResult = await casaosApi.composeDown(appName, composePath);
+      const downResult = await casaosApi.composeDown(
+        appName,
+        composePath,
+        emit ? (msg, key) => emit(`[Compose] ${msg}`, 'info', key) : undefined
+      );
       if (!downResult.success) {
         console.warn(`[ContainerManager] Compose down failed for ${appName}: ${downResult.error}`);
+        emit?.(`[Stop] Warning: compose down failed: ${downResult.error}`, 'warning');
       }
     } else {
       const composePath = path.join(getBotDir(botId), 'docker-compose.yml');
@@ -1480,6 +1537,7 @@ async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: s
           await dockerClient.composeDown(composePath, appName);
         } catch (err) {
           console.warn(`[ContainerManager] compose down failed for ${appName}:`, err);
+          emit?.(`[Stop] Warning: compose down failed: ${err}`, 'warning');
         }
       } else {
         // Fallback: stop tracked containers if the compose file is gone.
@@ -1495,6 +1553,7 @@ async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: s
     }
 
     updateBotStatus(botId, 'stopped', []);
+    emit?.('[Stop] Containers stopped', 'info');
     return { success: true };
   } catch (error) {
     console.error(`[ContainerManager] Failed to stop instance ${botId}:`, error);
@@ -1506,8 +1565,13 @@ async function stopBotImpl(botId: string): Promise<{ success: boolean; error?: s
 // ─── Restart ───
 
 export async function restartBot(botId: string): Promise<{ success: boolean; error?: string }> {
-  return withBotOp(botId, 'restart', async () => {
-    const stopResult = await stopBotImpl(botId);
+  return withLoggedBotOp(botId, 'restart', async () => {
+    const log = logCollectors.get(botId);
+    const emit: EmitFn = (msg, type = 'info', key) => {
+      console.log(`[Restart ${botId}] ${msg}`);
+      log.addLog(msg, type, key);
+    };
+    const stopResult = await stopBotImpl(botId, emit);
     if (!stopResult.success && stopResult.error !== 'Bot is not running') {
       return stopResult;
     }
@@ -1518,7 +1582,7 @@ export async function restartBot(botId: string): Promise<{ success: boolean; err
 // ─── Pull & Rebuild (Instance Update) ───
 
 export async function pullAndRebuild(botId: string): Promise<{ success: boolean; error?: string }> {
-  return withBotOp(botId, 'update', () => pullAndRebuildImpl(botId));
+  return withLoggedBotOp(botId, 'update', () => pullAndRebuildImpl(botId));
 }
 
 async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; error?: string }> {
@@ -1526,10 +1590,16 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
   if (!instance) return { success: false, error: 'Bot not found' };
 
   const wasRunning = instance.status === 'running';
+  const log = logCollectors.get(botId);
+  const emit: EmitFn = (msg, type = 'info', key) => {
+    console.log(`[Update ${botId}] ${msg}`);
+    log.addLog(msg, type, key);
+  };
 
   try {
+    emit(`[Update] Updating ${instance.displayName}...`, 'system');
     if (wasRunning) {
-      await stopBotImpl(botId);
+      await stopBotImpl(botId, emit);
     }
 
     // For source-backed instances, the source repo is already up to date
@@ -1543,8 +1613,9 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
 
     // Remove old image
     const imageName = getImageName(instance);
-    if (dockerClient.imageExists(imageName)) {
-      dockerClient.removeImage(imageName);
+    if (await dockerClient.imageExists(imageName)) {
+      emit('[Update] Removing old image...', 'info');
+      await dockerClient.removeImage(imageName);
     }
 
     // Rebuild
@@ -1584,7 +1655,7 @@ function resolveImageDataTarget(imageRef: string): string {
 }
 
 export async function buildBot(botId: string): Promise<{ success: boolean; error?: string }> {
-  return withBotOp(botId, 'build', () => buildBotImpl(botId));
+  return withLoggedBotOp(botId, 'build', () => buildBotImpl(botId));
 }
 
 async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
@@ -1593,11 +1664,10 @@ async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: 
 
   const sourceType = instance.sourceType || 'git';
   const log = logCollectors.get(botId);
-  log.clear();
 
-  const emit = (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success' = 'info') => {
+  const emit: EmitFn = (msg, type = 'info', key) => {
     console.log(`[Build ${botId}] ${msg}`);
-    log.addLog(msg, type);
+    log.addLog(msg, type, key);
   };
 
   try {
@@ -1624,7 +1694,7 @@ async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: 
 
 async function buildDockerImageInstance(
   instance: InstanceConfig,
-  emit: (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success') => void,
+  emit: EmitFn,
   isCasaOS: boolean,
 ): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
@@ -1636,7 +1706,7 @@ async function buildDockerImageInstance(
   }
 
   emit(`[Pull] Pulling image ${instance.imageRef}...`, 'info');
-  await dockerClient.pullImage(instance.imageRef, (msg) => emit(`[Docker] ${msg}`, 'info'));
+  await dockerClient.pullImage(instance.imageRef, (msg, key) => emit(`[Docker] ${msg}`, 'info', key));
 
   emit('[Info] Generating compose file...', 'info');
   const botDir = getBotDir(botId);
@@ -1743,7 +1813,7 @@ function fillKnownDockerfileArgs(dockerfilePath: string, provided: Record<string
 
 async function buildGitInstance(
   instance: InstanceConfig,
-  emit: (msg: string, type: 'system' | 'info' | 'warning' | 'error' | 'success') => void,
+  emit: EmitFn,
   isCasaOS: boolean,
 ): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
@@ -1886,7 +1956,7 @@ async function buildGitInstance(
           BUILD_MODE: 'managed',
           BUILD_DATE: stamp,
         };
-        await dockerClient.buildImage(bs.context, tag, (m) => emit(`[Docker] ${m}`, 'info'), svcArgs, bs.dockerfile);
+        await dockerClient.buildImage(bs.context, tag, (m, key) => emit(`[Docker] ${m}`, 'info', key), svcArgs, bs.dockerfile);
         imageMap[bs.serviceName] = tag;
       }
       composeContent = replaceBuildsWithImages(composeContent, imageMap);
@@ -2006,7 +2076,7 @@ async function buildGitInstance(
       emit(`[Build] Could not write .build-meta.json: ${err?.message || err}`, 'warning');
     }
 
-    const onBuildLog = (msg: string) => emit(`[Docker] ${msg}`, 'info');
+    const onBuildLog: DockerLogFn = (msg, key) => emit(`[Docker] ${msg}`, 'info', key);
     try {
       await dockerClient.buildImage(repoPath, imageName, onBuildLog, buildArgs);
       emit('[Done] Docker image build completed', 'success');
@@ -2131,6 +2201,21 @@ export async function getBotStats(botId: string): Promise<{ success: boolean; st
 }
 
 // ─── Container State Sync ───
+
+/**
+ * Boot-time pass: an in-flight op dies with the manager, but its transient
+ * status was persisted. Reset to error so cards are not stuck disabled;
+ * syncContainerStates then corrects bots whose containers are actually up.
+ */
+export function resetTransientStatuses(): void {
+  const registry = loadRegistry();
+  for (const instance of Object.values(registry.instances)) {
+    if (instance.status === 'building' || instance.status === 'starting' || instance.status === 'stopping') {
+      console.log(`[Init] ${instance.id} was '${instance.status}' when the manager stopped - marking error`);
+      updateBotStatus(instance.id, 'error');
+    }
+  }
+}
 
 /**
  * Reconcile registry state with actual Docker container state.

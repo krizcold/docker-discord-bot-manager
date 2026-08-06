@@ -49,7 +49,11 @@ import {
   mainServiceSelfAuths,
   getFleetControlPort,
   isFleetMaster,
+  isFleetNode,
+  fleetIsSameBox,
   fleetPublicHost,
+  transferPublicHost,
+  fleetAppContainerName,
   attachFleetToProxy,
   getPublishedFleetHostPort,
   publishFleetHostPort,
@@ -899,7 +903,7 @@ export function setWebUiReady(botId: string, ready: boolean): void {
 // at <sanitizedName>.<base> over TLS, in addition to its localhost host-port.
 const BOT_DOMAIN_BASE = process.env.BOT_DOMAIN_BASE || '';
 
-function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string, fleetHostPort?: number): void {
+function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string, fleetHostPort?: number, transferHostPort?: number): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (instance) {
@@ -908,6 +912,7 @@ function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerP
     instance.publicUrl = publicUrl;
     instance.webUiPath = webUiPath;
     instance.fleetHostPort = fleetHostPort;
+    instance.transferHostPort = transferHostPort;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
@@ -936,6 +941,8 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
       if (typeof b.hostPort === 'number') used.add(b.hostPort);
       const bFleet = b.fleetHostPort;
       if (typeof bFleet === 'number') used.add(bFleet);
+      const bTransfer = b.transferHostPort;
+      if (typeof bTransfer === 'number') used.add(bTransfer);
     }
     return used;
   };
@@ -992,9 +999,16 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   // tooling. Same-box workers dial the master's container name over dbm_internal.
   const controlPort = getFleetControlPort(content);
   let fleetHostPort: number | undefined;
+  let transferHostPort: number | undefined;
   if (controlPort !== null) {
+    const transferPort = controlPort + 1;
     if (BOT_DOMAIN_BASE && isFleetMaster(instance.envVars)) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
+    }
+    // Transfer route: EVERY fleet node advertises one (migration legs dial in
+    // either direction), unlike the master-only control route.
+    if (BOT_DOMAIN_BASE && isFleetNode(instance.envVars)) {
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort, { envKey: 'TRANSFER_URL' });
     }
     const existing = getPublishedFleetHostPort(content, controlPort);
     if (existing !== null) {
@@ -1014,9 +1028,28 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
         content = publishFleetHostPort(content, allocated, controlPort);
       }
     }
+    const existingTransfer = getPublishedFleetHostPort(content, transferPort);
+    if (existingTransfer !== null) {
+      transferHostPort = existingTransfer;
+    } else {
+      const used = portsClaimedByOthers();
+      if (hostPort !== undefined) used.add(hostPort);
+      if (fleetHostPort !== undefined) used.add(fleetHostPort);
+      const prevTransferPort = instance.transferHostPort;
+      const allocated = allocateHostPort({
+        botId: instance.id,
+        reuse: typeof prevTransferPort === 'number' ? prevTransferPort : undefined,
+        used,
+        hostBound: portsBoundOnHost(),
+      });
+      if (allocated !== null) {
+        transferHostPort = allocated;
+        content = publishFleetHostPort(content, allocated, transferPort);
+      }
+    }
   }
 
-  updateInstanceWebAccess(instance.id, hostPort, info ? info.containerPort : undefined, publicUrl, webUiPath, fleetHostPort);
+  updateInstanceWebAccess(instance.id, hostPort, info ? info.containerPort : undefined, publicUrl, webUiPath, fleetHostPort, transferHostPort);
   return content;
 }
 
@@ -1135,19 +1168,34 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
 /**
  * Fleet wiring derived from the deployed compose's marker label: CONTROL_PORT
  * whenever the marker is present; FLEET_PUBLIC_URL only for a master with a
- * public base. Re-derived from the compose so start-time env syncs agree with
- * what the build exposed.
+ * public base; TRANSFER_URL for every fleet node (public wss route when a base
+ * exists, else the app container name over the shared network - transfer port
+ * is CONTROL_PORT + 1, the bot's default). Re-derived from the compose so
+ * start-time env syncs agree with what the build exposed.
  */
 function fleetEnv(instance: InstanceConfig): Record<string, string> {
   try {
     const composePath = path.join(getBotDir(instance.id), 'docker-compose.yml');
     if (!fs.existsSync(composePath)) return {};
-    const controlPort = getFleetControlPort(fs.readFileSync(composePath, 'utf-8'));
+    const composeContent = fs.readFileSync(composePath, 'utf-8');
+    const controlPort = getFleetControlPort(composeContent);
     if (controlPort === null) return {};
-    const env: Record<string, string> = { CONTROL_PORT: String(controlPort) };
+    const env: Record<string, string> = { CONTROL_PORT: String(controlPort), TRANSFER_PORT: String(controlPort + 1) };
     if (isFleetMaster(instance.envVars)) {
       const host = fleetPublicHost(instance.sanitizedName);
       if (host) env.FLEET_PUBLIC_URL = `wss://${host}`;
+    }
+    if (isFleetNode(instance.envVars)) {
+      const transferHost = transferPublicHost(instance.sanitizedName);
+      if (transferHost) {
+        // Advertise the public route only once the built compose actually
+        // serves it: a pre-transfer build restarted after a manager update
+        // must not advertise a route no proxy label backs until its rebuild.
+        if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
+      } else if (fleetIsSameBox(instance.envVars)) {
+        const cname = fleetAppContainerName(composeContent);
+        if (cname) env.TRANSFER_URL = `ws://${cname}:${controlPort + 1}`;
+      }
     }
     return env;
   } catch {
@@ -1224,9 +1272,12 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       } else {
         service.environment = { ...allEnv };
       }
-      // Role or public base may have changed since build: a FLEET_PUBLIC_URL the
-      // build injected must not survive when it is no longer derivable.
+      // Role or public base may have changed since build: a FLEET_PUBLIC_URL or
+      // TRANSFER_URL the build injected must not survive when no longer derivable.
+      // TRANSFER_URL is a generic enough name that a non-fleet bot's compose may
+      // legitimately ship one, so its cleanup is gated on the fleet marker.
       if (!('FLEET_PUBLIC_URL' in allEnv)) deleteComposeEnv(service.environment, 'FLEET_PUBLIC_URL');
+      if (!('TRANSFER_URL' in allEnv) && getFleetControlPort(raw) !== null) deleteComposeEnv(service.environment, 'TRANSFER_URL');
       compose.services[targetName] = service;
     }
 

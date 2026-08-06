@@ -44,7 +44,7 @@ function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
 
 // Fleet vars the manager injects at deploy time (the fleet contract's plumbing);
 // never user-editable, so they must not surface in the wizard or the editor.
-const MANAGER_INJECTED_FLEET_ENV = new Set(['CONTROL_PORT', 'FLEET_PUBLIC_URL']);
+const MANAGER_INJECTED_FLEET_ENV = new Set(['CONTROL_PORT', 'TRANSFER_PORT', 'FLEET_PUBLIC_URL', 'TRANSFER_URL']);
 
 function isManagerInjectedFleetEnv(key: string): boolean {
   return MANAGER_INJECTED_FLEET_ENV.has(key.toUpperCase());

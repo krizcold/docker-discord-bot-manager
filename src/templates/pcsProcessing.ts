@@ -482,6 +482,9 @@ export function processComposeForCasaOS(
     const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
     if (fleetSvc) {
       setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
+      // The bot's TRANSFER_PORT default is the static 3929, NOT control + 1, so
+      // a non-default marker needs the explicit injection to match the routes.
+      setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(fleetPort + 1));
       if (isFleetMaster(bot.envVars) && pcs.APP_DOMAIN) {
         // Workers dial the app domain: TLS terminates at Cloudflare with the
         // publicly-trusted wildcard cert, and the request reaches the box with
@@ -498,19 +501,40 @@ export function processComposeForCasaOS(
           setServiceLabel(fleetSvc, `caddy_${nipIdx}.import`, 'gateway_tls');
           setServiceLabel(fleetSvc, `caddy_${nipIdx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
         }
-        // Caddy resolves {{upstreams}} over the ingress network, so the app
-        // container must join it; keep the project default network alongside.
-        if (pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
-          if (Array.isArray(fleetSvc.networks)) {
-            if (!fleetSvc.networks.includes(pcs.REF_NET)) fleetSvc.networks.push(pcs.REF_NET);
-          } else if (fleetSvc.networks && typeof fleetSvc.networks === 'object') {
-            const nets = fleetSvc.networks as Record<string, unknown>;
-            if (!(pcs.REF_NET in nets)) nets[pcs.REF_NET] = {};
-          } else {
-            fleetSvc.networks = ['default', pcs.REF_NET];
-          }
-        }
         setServiceEnv(fleetSvc, 'FLEET_PUBLIC_URL', `wss://${fleetHost}`);
+      }
+      if (isFleetNode(bot.envVars) && pcs.APP_DOMAIN) {
+        // Transfer route (container port CONTROL_PORT + 1, the bot's default):
+        // EVERY fleet node advertises one, unlike the master-only control
+        // route, because migration legs dial in either direction. Same
+        // dual-name pair as the fleet site.
+        const transferPort = fleetPort + 1;
+        const transferHost = `${appName}-transfer-${pcs.APP_DOMAIN}`;
+        const tIdx = nextCaddySiteIndex(fleetSvc.labels);
+        setServiceLabel(fleetSvc, `caddy_${tIdx}`, transferHost);
+        setServiceLabel(fleetSvc, `caddy_${tIdx}.import`, 'gateway_tls');
+        setServiceLabel(fleetSvc, `caddy_${tIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
+        if (pcs.APP_PUBLIC_IP_DASH) {
+          const tNipIdx = tIdx + 1;
+          setServiceLabel(fleetSvc, `caddy_${tNipIdx}`, `${appName}-transfer-${pcs.APP_PUBLIC_IP_DASH}.nip.io`);
+          setServiceLabel(fleetSvc, `caddy_${tNipIdx}.import`, 'gateway_tls');
+          setServiceLabel(fleetSvc, `caddy_${tNipIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
+        }
+        setServiceEnv(fleetSvc, 'TRANSFER_URL', `wss://${transferHost}`);
+      }
+      // Caddy resolves {{upstreams}} over the ingress network, so a fleet
+      // node's app container must join it (co-workers too: their transfer
+      // route and same-box container-name dials ride it); keep the project
+      // default network alongside.
+      if (isFleetNode(bot.envVars) && pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
+        if (Array.isArray(fleetSvc.networks)) {
+          if (!fleetSvc.networks.includes(pcs.REF_NET)) fleetSvc.networks.push(pcs.REF_NET);
+        } else if (fleetSvc.networks && typeof fleetSvc.networks === 'object') {
+          const nets = fleetSvc.networks as Record<string, unknown>;
+          if (!(pcs.REF_NET in nets)) nets[pcs.REF_NET] = {};
+        } else {
+          fleetSvc.networks = ['default', pcs.REF_NET];
+        }
       }
     }
   }
@@ -927,13 +951,14 @@ export function processComposeForDocker(
     if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
-  // CONTROL_PORT always follows the fleet marker; exposure (proxy route or
-  // localhost publish) is layered on by applyDockerHostPort.
+  // CONTROL_PORT/TRANSFER_PORT always follow the fleet marker; exposure (proxy
+  // route or localhost publish) is layered on by applyDockerHostPort.
   const fleetPort = fleetControlPortOfCompose(compose);
   if (fleetPort !== null) {
     const fleetSvcName = getAppServiceName(compose);
     if (fleetSvcName && services[fleetSvcName]) {
       setServiceEnv(services[fleetSvcName], 'CONTROL_PORT', String(fleetPort));
+      setServiceEnv(services[fleetSvcName], 'TRANSFER_PORT', String(fleetPort + 1));
     }
   }
 
@@ -1224,6 +1249,32 @@ export function isFleetMaster(envVars?: Record<string, string>): boolean {
   return role === '' || role === 'master';
 }
 
+/** Any fleet participant: a master, or a co-worker dialing out to MASTER_URL. */
+export function isFleetNode(envVars?: Record<string, string>): boolean {
+  return isFleetMaster(envVars) || (envVars?.['MASTER_URL'] || '').trim() !== '';
+}
+
+/**
+ * Whether a container-name dial URL is reachable by this node's fleet peers.
+ * A no-base master's workers are same-box by construction (no public control
+ * route exists either); a co-worker is same-box when its MASTER_URL is a plain
+ * ws:// local dial. A wss:// master is cross-host: advertising a container name
+ * there would steer migration legs at an unresolvable endpoint, while
+ * advertising nothing lets the direction resolution fall back to dialing the
+ * peer's public transfer route.
+ */
+export function fleetIsSameBox(envVars?: Record<string, string>): boolean {
+  // Mirrors the bot's resolveNodeRole exactly: explicit BOT_NODE_ROLE wins,
+  // else MASTER_URL present means co-worker. isFleetMaster alone would
+  // misclassify a role-implicit co-worker (MASTER_URL set, role unset) as a
+  // master and resurrect the unreachable container-name advertise.
+  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
+  const masterUrl = (envVars?.['MASTER_URL'] || '').trim().toLowerCase();
+  const isCoWorker = role === 'co-worker' || (role !== 'master' && masterUrl !== '');
+  if (!isCoWorker) return true;
+  return masterUrl.startsWith('ws://');
+}
+
 /**
  * Public hostname of this instance's fleet control endpoint, or null when no
  * public base exists for the mode (e.g. standalone/Windows). Mirrors the web UI
@@ -1252,16 +1303,56 @@ export function fleetHostSuffix(): string | null {
 }
 
 /**
+ * Public hostname of this instance's transfer endpoint (shard-migration data
+ * channel), or null when no public base exists. Same bases and trust rules as
+ * the fleet host; the transfer port is CONTROL_PORT + 1 (the bot's default).
+ */
+export function transferPublicHost(sanitizedName: string): string | null {
+  const suffix = transferHostSuffix();
+  return suffix === null ? null : `${sanitizedName}${suffix}`;
+}
+
+export function transferHostSuffix(): string | null {
+  const appDomain = process.env.APP_DOMAIN || '';
+  if (appDomain) return `-transfer-${appDomain}`;
+  const domainBase = process.env.BOT_DOMAIN_BASE || '';
+  if (domainBase) return `-transfer.${domainBase}`;
+  return null;
+}
+
+/**
+ * App-service container name for same-box dials: it is globally unique (Docker
+ * enforces uniqueness) and embedded DNS resolves it for any container sharing
+ * the network. Falls back to the service name, which Compose also registers as
+ * a network alias; the manager's name substitution keeps that unique too. Null
+ * when the compose cannot be parsed.
+ */
+export function fleetAppContainerName(composeContent: string): string | null {
+  try {
+    const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+    const svcName = getAppServiceName(compose);
+    if (!svcName) return null;
+    const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+    const cname = services?.[svcName]?.container_name;
+    if (typeof cname === 'string' && cname.trim()) return cname.trim();
+    return svcName;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Remote-mode fleet route: caddy-docker-proxy labels on the APP service so the
  * bundled Caddy serves the fleet control endpoint at `host` over automatic TLS,
- * plus FLEET_PUBLIC_URL for the bot. Never forward_auth: workers are machine
- * clients that authenticate with CONTROL_SECRET, not Authelia.
+ * plus FLEET_PUBLIC_URL for the bot (or `opts.envKey`, e.g. TRANSFER_URL for
+ * the transfer route). Never forward_auth: workers are machine clients that
+ * authenticate with CONTROL_SECRET (transfer: single-use tokens), not Authelia.
  */
 export function attachFleetToProxy(
   composeContent: string,
   host: string,
   controlPort: number,
-  opts: { network?: string } = {}
+  opts: { network?: string; envKey?: string } = {}
 ): string {
   const network = opts.network || 'dbm_remote';
   let compose: Record<string, unknown>;
@@ -1293,7 +1384,7 @@ export function attachFleetToProxy(
   const nets = compose.networks as Record<string, unknown>;
   if (!nets[network]) nets[network] = { name: network, external: true };
 
-  setServiceEnv(svc, 'FLEET_PUBLIC_URL', `wss://${host}`);
+  setServiceEnv(svc, opts.envKey || 'FLEET_PUBLIC_URL', `wss://${host}`);
   return stringify(compose, { lineWidth: 0 });
 }
 

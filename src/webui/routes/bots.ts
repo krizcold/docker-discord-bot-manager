@@ -25,9 +25,8 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, getAppServiceName, getWebUiIndexPath } from '../../templates/pcsProcessing';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
-import { parse as parseYaml } from 'yaml';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
@@ -1272,29 +1271,6 @@ export function createSystemRoutes(): Router {
   });
 
   return router;
-}
-
-/**
- * The name a same-network worker uses to reach the master's fleet control server
- * (the app service that receives CONTROL_PORT). Prefers the app service's
- * container_name: it is globally unique (Docker enforces uniqueness) and its
- * embedded DNS resolves it for any container sharing the pcs network, so there is
- * no cross-project ambiguity. Falls back to the service name, which Compose also
- * registers as a network alias on pcs; the manager's name substitution keeps that
- * unique too. Null when the compose cannot be parsed.
- */
-function fleetAppContainerName(composeContent: string): string | null {
-  try {
-    const compose = parseYaml(composeContent) as Record<string, unknown>;
-    const svcName = getAppServiceName(compose);
-    if (!svcName) return null;
-    const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-    const cname = services?.[svcName]?.container_name;
-    if (typeof cname === 'string' && cname.trim()) return cname.trim();
-    return svcName;
-  } catch {
-    return null;
-  }
 }
 
 /**

@@ -225,6 +225,7 @@ Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway ex
 - **Multi-service stacks** - auto-wires PostgreSQL/MongoDB/MariaDB/Redis + Lavalink; status-page sidecar for port-less bots (CasaOS).
 - **Environment management** - encrypted env storage + an in-UI editor + a reusable Credentials Vault.
 - **Per-bot Console & Files** - interactive shell + a file browser/editor.
+- **`dbm` console** - a loopback CLI with full parity to the web-UI API (see [Documentation/BotManager/Console.md](../Documentation/BotManager/Console.md)).
 - **Live logs**, **non-blocking lifecycle** (start/stop/restart/update/delete) with WebSocket status, and **opt-in auto-updates**.
 - **CasaOS / PCS integration** and **standalone Docker** (this README).
 

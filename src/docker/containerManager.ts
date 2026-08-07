@@ -1348,6 +1348,30 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
 
 // ─── Start ───
 
+/**
+ * True when the instance's APP service container is running. Sidecars (redis,
+ * a fronting gateway) outlive a killed app container, so a project-wide check
+ * would refuse Start in exactly the crashed case this reconcile exists for.
+ * Falls back to any-project-container when the app service cannot be resolved.
+ */
+async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
+  let filters = `--filter "label=com.docker.compose.project=${appName}"`;
+  try {
+    const composePath = resolveComposePath(botId, appName);
+    if (fs.existsSync(composePath)) {
+      const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+      const appService = getAppServiceName(compose);
+      if (appService) filters += ` --filter "label=com.docker.compose.service=${appService}"`;
+    }
+  } catch { /* fall back to the project-wide check */ }
+  try {
+    const { stdout } = await execAsync(`docker ps -q ${filters}`);
+    return stdout.trim().length > 0;
+  } catch {
+    return true; // docker query failed: keep the conservative refusal
+  }
+}
+
 export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
   return withLoggedBotOp(botId, 'start', () => startBotImpl(botId));
 }
@@ -1355,7 +1379,16 @@ export async function startBot(botId: string): Promise<{ success: boolean; error
 async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  if (instance.status === 'running') return { success: false, error: 'Bot is already running' };
+  if (instance.status === 'running') {
+    // Reconcile against live container state: an externally-stopped bot
+    // (docker kill, OOM) leaves the registry claiming running, and Start
+    // would refuse forever while the container sits Exited.
+    if (await hasRunningContainer(botId, instance.sanitizedName)) {
+      return { success: false, error: 'Bot is already running' };
+    }
+    console.warn(`[ContainerManager] ${botId} marked running but no container is up; correcting to stopped`);
+    updateBotStatus(botId, 'stopped');
+  }
 
   const sourceType = instance.sourceType || 'git';
   if (sourceType === 'docker-image') {

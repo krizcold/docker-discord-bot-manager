@@ -388,6 +388,16 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
 
   if (update.displayName) {
     const names = resolveNames(update.displayName);
+    // sanitizedName is the compose project of the deployed containers; changing
+    // it while they may exist orphans the live project (stop, start and the
+    // state reconciler all key off the new name). Cosmetic display changes
+    // that resolve to the same sanitizedName stay allowed.
+    if (
+      names.sanitizedName !== instance.sanitizedName &&
+      instance.status !== 'stopped' && instance.status !== 'error'
+    ) {
+      throw new Error('Cannot rename a bot that is not stopped; stop it first');
+    }
     instance.displayName = names.displayName;
     instance.sanitizedName = names.sanitizedName;
     instance.titleName = names.titleName;

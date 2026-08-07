@@ -18,7 +18,7 @@ Bots:     bots list | info <id> | create (--source <id>|--image <ref> --name N) 
           bots stop <id> | delete <id> [--keep-data] [--no-keep-env] | check-updates <id> | containers <id> | stats <id>
           bots logs <id> [--tail N] | build-logs <id> [--follow] | container-logs <id> <name> [--lines N] [--follow]
           bots web-auth <id> <auto|managed|public> | port <id|name>
-Env:      env get <id> | set <id> KEY=VAL [KEY=VAL ...]
+Env:      env get <id> | set <id> KEY=VAL [KEY=VAL ...] | unset <id> KEY
 Config:   config get <id> | set <id> --body '{"files":[...]}'
 Vault:    vault list | values | set <key> <value> | update <key> <value> | rm <key>
 Manager:  manager version | manager update | deployment | health

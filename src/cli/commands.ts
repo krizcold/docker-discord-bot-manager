@@ -172,6 +172,11 @@ const HANDLERS: Record<string, Handler> = {
     if (Object.keys(vars).length === 0) fail('provide at least one KEY=VALUE', EXIT_USAGE);
     return simple(c, 'PUT', `/api/bots/${id}/env`, { vars });
   },
+  'env unset': (c) => {
+    const id = need(c, 0, 'id');
+    const key = need(c, 1, 'KEY');
+    return simple(c, 'DELETE', `/api/bots/${id}/env/${encodeURIComponent(key)}`);
+  },
 
   // --- config files ---
   'config get': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/config`),

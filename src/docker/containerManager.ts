@@ -402,6 +402,51 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
 }
 
 /**
+ * Remove env keys from an instance. updateBot only merges, so key removal
+ * needs its own path.
+ */
+export function removeBotEnvVars(botId: string, keys: string[]): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+  if (instance.envVars) for (const key of keys) delete instance.envVars[key];
+  instance.updatedAt = new Date().toISOString();
+  registry.instances[botId] = instance;
+  saveRegistry(registry);
+  return instance;
+}
+
+/**
+ * Strip a deleted env key from the DEPLOYED compose copies. syncComposeEnvVars
+ * deliberately keeps keys it does not manage, so without this the baked
+ * literal keeps flowing to the container until the next full rebuild.
+ */
+export function removeEnvKeyFromDeployedCompose(botId: string, key: string): void {
+  const instance = getBot(botId);
+  if (!instance) return;
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const candidates = [
+    path.join(getBotDir(botId), 'docker-compose.yml'),
+    path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName, 'docker-compose.yml'),
+  ];
+  for (const composePath of candidates) {
+    if (!fs.existsSync(composePath)) continue;
+    try {
+      const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+      const services = compose?.services;
+      if (!services || typeof services !== 'object') continue;
+      const appName = getAppServiceName(compose);
+      const svc = appName ? services[appName] : undefined;
+      if (!svc?.environment) continue;
+      deleteComposeEnv(svc.environment, key);
+      fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+    } catch (err) {
+      console.warn(`[ContainerManager] Failed to strip env key ${key} from ${composePath}: ${err}`);
+    }
+  }
+}
+
+/**
  * Reassign an instance to a different source.
  */
 export function reassignSource(botId: string, newSourceId: string): InstanceConfig | null {

@@ -878,6 +878,34 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * DELETE /api/bots/:id/env/:key - Remove an environment variable
+   */
+  router.delete('/:id/env/:key', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      // An in-flight start would re-bake the key into the compose from its
+      // stale instance snapshot, and nothing would ever strip it again.
+      const activeOp = containerManager.isBotBusy(req.params.id);
+      if (activeOp) {
+        res.status(409).json({ success: false, error: `Bot operation in progress (${activeOp}); retry when it completes` });
+        return;
+      }
+      envManager.deleteEnvVar(req.params.id, req.params.key);
+      containerManager.removeBotEnvVars(req.params.id, [req.params.key]);
+      containerManager.removeEnvKeyFromDeployedCompose(req.params.id, req.params.key);
+      const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
+      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json({ success: true, valid: validation.valid, missing: validation.missing });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * GET /api/bots/:id/config - Get config files for a bot
    */
   router.get('/:id/config', async (req: Request, res: Response) => {

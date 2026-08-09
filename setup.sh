@@ -109,6 +109,15 @@ fi
 [ -S /var/run/docker.sock ] || die "No /var/run/docker.sock - this setup requires rootful Docker."
 docker info >/dev/null 2>&1 || die "Cannot reach the Docker daemon (is it running? 'systemctl status docker')."
 
+# Redis runs with --save "" (no snapshots), but vm.overcommit_memory=0 still
+# triggers its boot warning and can fail forks under pressure.
+if [ "$(sysctl -n vm.overcommit_memory 2>/dev/null || echo 0)" != "1" ]; then
+  info "Enabling vm.overcommit_memory=1 (Redis) ..."
+  printf 'vm.overcommit_memory = 1\n' > /etc/sysctl.d/99-redis-overcommit.conf
+  sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || warn "Could not apply now; persisted for next boot."
+  ok "vm.overcommit_memory=1"
+fi
+
 # ── Fresh-clone guard ─────────────────────────────────────────────────────────
 # The invariant is the storage encryption key itself: a leftover Authelia volume
 # is unreadable without the exact STORAGE_ENCRYPTION_KEY that wrote it, and a

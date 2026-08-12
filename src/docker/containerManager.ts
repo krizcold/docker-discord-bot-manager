@@ -9,6 +9,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
@@ -17,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult,
+  DetectionResult, FleetDbRecord,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -57,6 +58,7 @@ import {
   attachFleetToProxy,
   getPublishedFleetHostPort,
   publishFleetHostPort,
+  addFleetPostgresService,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
   fixDockerBotOwnership,
@@ -75,6 +77,8 @@ import {
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
+import * as envManager from '../env/manager';
+import { composeDeclaresFleet } from '../env/envList';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
@@ -1950,6 +1954,69 @@ function fillKnownDockerfileArgs(dockerfilePath: string, provided: Record<string
   return out;
 }
 
+/**
+ * Managed fleet data backend (Postgres sidecar). Structural trigger, no bot
+ * names: the source compose declares the fleet marker AND the stored env has
+ * DATA_BACKEND=postgres. A blank DATA_BACKEND_URL is the managed lane: the
+ * first match generates the credentials, writes the URL into the encrypted env
+ * store and stamps instance.fleetDb; redeploys reuse the stored URL + record
+ * verbatim (never regenerated). A URL pointing anywhere else is the external
+ * lane (no sidecar). Flipping back to DATA_BACKEND=file stops the injection but
+ * KEEPS the volume and the record (data retention). Returns what the compose
+ * injection needs, or null when no sidecar applies.
+ */
+function ensureFleetDataBackend(instance: InstanceConfig): { containerName: string; volume: string; password: string } | null {
+  const repoPath = instance.sourceId ? sourceManager.getSourceRepoPath(instance.sourceId) : null;
+  if (!composeDeclaresFleet(repoPath)) return null;
+
+  // Env store first (the wizard writes through it); registry mirror as fallback.
+  const stored = { ...instance.envVars, ...envManager.getEnvVars(instance.id) };
+  if ((stored['DATA_BACKEND'] || '').trim() !== 'postgres') return null;
+
+  const containerName = instance.fleetDb?.containerName || `${instance.sanitizedName}-fleet-postgres`;
+  const volume = instance.fleetDb?.volume || `${instance.sanitizedName}-fleet-postgres-data`;
+  const url = (stored['DATA_BACKEND_URL'] || '').trim();
+
+  if (url === '') {
+    const password = crypto.randomBytes(24).toString('base64url');
+    const newUrl = `postgresql://smdb:${password}@${containerName}:5432/smdb`;
+    envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: newUrl });
+    stampFleetDb(instance, { containerName, user: 'smdb', db: 'smdb', volume }, newUrl);
+    return { containerName, volume, password };
+  }
+
+  let host: string;
+  let password: string;
+  try {
+    const parsed = new URL(url);
+    host = parsed.hostname;
+    password = decodeURIComponent(parsed.password);
+  } catch {
+    return null;
+  }
+  if (host !== containerName) return null;   // external lane
+
+  if (!instance.fleetDb) stampFleetDb(instance, { containerName, user: 'smdb', db: 'smdb', volume });
+  if ((instance.envVars?.['DATA_BACKEND_URL'] || '') !== url) {
+    instance.envVars = { ...instance.envVars, DATA_BACKEND_URL: url };
+  }
+  return { containerName, volume, password };
+}
+
+/** Persist the fleetDb record (and the generated URL) on the instance, in-memory and in the registry. */
+function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord, envUrl?: string): void {
+  const registry = loadRegistry();
+  const inst = registry.instances[instance.id];
+  if (inst) {
+    inst.fleetDb = record;
+    if (envUrl !== undefined) inst.envVars = { ...inst.envVars, DATA_BACKEND_URL: envUrl };
+    inst.updatedAt = new Date().toISOString();
+    saveRegistry(registry);
+  }
+  instance.fleetDb = record;
+  if (envUrl !== undefined) instance.envVars = { ...instance.envVars, DATA_BACKEND_URL: envUrl };
+}
+
 async function buildGitInstance(
   instance: InstanceConfig,
   emit: EmitFn,
@@ -2016,6 +2083,9 @@ async function buildGitInstance(
   emit(`[Info] Detected: ${detection.type} bot (compose: ${detection.hasCompose}, databases: [${detection.databases.join(', ')}], music: ${detection.hasMusic}, lavalink: ${detection.needsLavalink}, web: ${detection.hasWebDashboard})`, 'info');
   updateInstanceDetection(botId, detection);
 
+  // Before env assembly so a freshly provisioned DATA_BACKEND_URL rides this deploy.
+  const fleetDb = ensureFleetDataBackend(instance);
+
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
   const botWithEnv: any = { ...instance, envVars: envWithToken };
@@ -2065,6 +2135,11 @@ async function buildGitInstance(
       const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
+    }
+
+    if (fleetDb) {
+      composeContent = addFleetPostgresService(composeContent, botWithEnv, fleetDb, { mode: isCasaOS ? 'casaos' : 'docker' });
+      emit(`[Fleet] Managed Postgres sidecar attached (${fleetDb.containerName})`, 'info');
     }
 
     emit(`[Info] App name: ${appName}`, 'info');

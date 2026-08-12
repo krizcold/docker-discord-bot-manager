@@ -789,6 +789,13 @@
     </div>
   </div>
 
+  <!-- Fleet DB Backups Modal -->
+  <div id="fleet-backup-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 560px;">
+      <div id="fleet-backup-content"></div>
+    </div>
+  </div>
+
   <!-- Config File Editor Modal -->
   <div id="config-modal" class="modal-overlay hidden">
     <div class="modal" style="max-width: 640px;">
@@ -839,6 +846,7 @@
     let sources = [];
     let currentLogsBotId = null;
     let envEditorBotId = null;
+    let envEditorInitial = {};
     let configEditorBotId = null;
     const busyBots = new Set();
     function isTransientStatus(status) {
@@ -1302,6 +1310,12 @@
               ? '<span class="update-badge">Update available</span>'
               : '';
 
+            // Fleet DB backup warning (failed or stale sidecar dump)
+            const fb = bot.fleetBackup;
+            const fbWarnBadge = fb && (fb.lastError || fb.stale)
+              ? `<span class="update-badge" title="${escapeHtml(fb.lastError ? `Last database backup failed: ${fb.lastError}` : 'No database backup in over 36 hours')}">DB backup ${fb.lastError ? 'failed' : 'stale'}</span>`
+              : '';
+
             // Fetch vs Update: show Fetch when the bot is up to date and its source still exists
             const hasValidSource = isGit && bot.sourceId && sources.some(s => s.id === bot.sourceId);
             const showFetch = !bot.updateAvailable && hasValidSource;
@@ -1365,17 +1379,22 @@
                 <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
               </select>` : '';
 
+            // Managed fleet DB only: opens the backup list + schedule modal
+            const fleetBackupControl = fb
+              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="Daily dumps of this bot's managed database">DB Backups</button>`
+              : '';
+
             return `
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${fbWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
                 <span class="status-badge status-${bot.status}">${bot.activeOp ? escapeHtml(bot.activeOp) : (busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status)}</span>
               </div>
-              ${(isGit || webAuthControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}</div>` : ''}
+              ${(isGit || webAuthControl || fleetBackupControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}${fleetBackupControl}</div>` : ''}
               <div class="bot-card-actions">
                 ${isRunning ? `
                   ${(bot.publicUrl || bot.webOpenUrl || bot.hostPort) && !bot.webUiReady
@@ -1740,6 +1759,15 @@
         `;
         initEnvConditionals('env-editor-rows');
         attachFleetMasterPrefill('env-editor-rows', res.vars || []);
+
+        // Snapshot rendered values (sensitive fields render blank) so the save
+        // flow can detect changed values by key name.
+        envEditorInitial = {};
+        document.querySelectorAll('#env-editor-rows .env-row').forEach(row => {
+          const k = row.querySelector('.env-key');
+          const v = row.querySelector('.env-value');
+          if (k && v && k.value.trim()) envEditorInitial[k.value.trim()] = v.value;
+        });
       } catch (err) {
         content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">Failed to load environment variables</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
@@ -1996,6 +2024,21 @@
       saveBtn.textContent = 'Saving...';
 
       try {
+        // A new non-empty DATA_BACKEND_URL gets a connection test first (keyed
+        // on the env var name only). A failed test still saves if confirmed.
+        const dbUrl = (vars['DATA_BACKEND_URL'] || '').trim();
+        if (dbUrl && dbUrl !== (envEditorInitial['DATA_BACKEND_URL'] || '').trim()) {
+          saveBtn.textContent = 'Testing database...';
+          let check = null;
+          try { check = await api('POST', `/bots/${envEditorBotId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; }
+          if (!(check && check.success && check.ok)) {
+            const msg = (check && check.error) || 'connection test failed';
+            const hint = (check && check.hint) ? `\n\nHint: ${check.hint}` : '';
+            if (!confirm(`Database connection test failed:\n${msg}${hint}\n\nSave anyway?`)) return;
+          }
+          saveBtn.textContent = 'Saving...';
+        }
+
         const res = await api('PUT', `/bots/${envEditorBotId}/env`, { vars });
         if (res.success) {
           showMessage('success', 'Environment variables saved');
@@ -2014,6 +2057,105 @@
     function hideEnvEditor() {
       document.getElementById('env-modal').classList.add('hidden');
       envEditorBotId = null;
+    }
+
+    // ─── Fleet DB Backups ───
+    let fleetBackupBotId = null;
+
+    function formatBackupSize(bytes) {
+      if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+      if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return bytes + ' B';
+    }
+
+    async function showFleetBackups(botId) {
+      fleetBackupBotId = botId;
+      const bot = bots.find(b => b.id === botId);
+      const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+      const modal = document.getElementById('fleet-backup-modal');
+      const content = document.getElementById('fleet-backup-content');
+      content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
+      modal.classList.remove('hidden');
+
+      let listHtml = '';
+      try {
+        const res = await api('GET', `/bots/${botId}/fleet-backups`);
+        const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
+        listHtml = backups.length === 0
+          ? '<div class="env-tip">No backups yet. The first dump runs at the scheduled hour.</div>'
+          : backups.map(b => `
+            <div class="env-row" style="align-items:center;">
+              <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
+              <span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">${formatBackupSize(b.size)} - ${new Date(b.mtime).toLocaleString()}</span>
+              <button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>
+            </div>`).join('');
+      } catch (err) {
+        listHtml = '<div class="error-message">Failed to load backups</div>';
+      }
+
+      const hourOptions = Array.from({ length: 24 }, (_, h) =>
+        `<option value="${h}" ${h === fb.hour ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`
+      ).join('');
+
+      content.innerHTML = `
+        <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
+        ${fb.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : ''}
+        <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
+          <label class="toggle-switch">
+            <input type="checkbox" id="fleet-backup-enabled" ${fb.enabled ? 'checked' : ''} onchange="saveFleetBackupConfig()">
+            <span class="toggle-slider"></span>
+          </label>
+          <span>Daily backup</span>
+          <select class="auto-update-interval" id="fleet-backup-hour" title="Backup hour" onchange="saveFleetBackupConfig()">${hourOptions}</select>
+          <label style="font-size:0.8rem;color:var(--text-secondary);">Keep
+            <input type="number" id="fleet-backup-keep" min="1" max="365" value="${fb.keep}" onchange="saveFleetBackupConfig()" style="width:60px;">
+          </label>
+        </div>
+        <div id="fleet-backup-list">${listHtml}</div>
+        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. A fresh safety dump is always taken first.</div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
+        </div>`;
+    }
+
+    function hideFleetBackups() {
+      document.getElementById('fleet-backup-modal').classList.add('hidden');
+      fleetBackupBotId = null;
+    }
+
+    async function saveFleetBackupConfig() {
+      const enabled = document.getElementById('fleet-backup-enabled').checked;
+      const hour = Number(document.getElementById('fleet-backup-hour').value);
+      const keep = Number(document.getElementById('fleet-backup-keep').value) || 7;
+      try {
+        const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, { enabled, hour, keep });
+        if (!res.success) showMessage('error', res.error || 'Failed to save backup settings');
+        loadBots();
+      } catch (err) {
+        showMessage('error', 'Failed to save backup settings');
+      }
+    }
+
+    async function restoreFleetBackupFile(botId, file) {
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first, and every instance using this database is stopped and restarted.`;
+      if (!confirm(warning)) return;
+      const content = document.getElementById('fleet-backup-content');
+      content.querySelectorAll('button').forEach(b => b.disabled = true);
+      showMessage('success', 'Restore started; instances on this database are being stopped...');
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
+        if (res.success) {
+          const s = res.steps || {};
+          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, safety dump taken, restarted ${(s.restarted || []).length}`);
+        } else {
+          showMessage('error', res.error || 'Restore failed');
+        }
+      } catch (err) {
+        showMessage('error', 'Restore failed');
+      } finally {
+        await loadBots();
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
     }
 
     // Terminal popup state

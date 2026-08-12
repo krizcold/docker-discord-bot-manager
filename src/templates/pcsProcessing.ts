@@ -1438,6 +1438,86 @@ export function publishFleetHostPort(
   return stringify(compose, { lineWidth: 0 });
 }
 
+/**
+ * Inject the manager-provisioned fleet Postgres sidecar into a processed compose.
+ * Joins the project's default network AND the shared cross-project network (pcs
+ * on CasaOS, dbm_internal in docker mode) so same-host co-workers in other
+ * compose projects can dial it by container name, like the control port. Data
+ * lives on a NAMED volume (never a bind mount) and no host port is ever
+ * published. The app service's depends_on stays condition-free: the bot
+ * tolerates start-order races by design.
+ */
+export function addFleetPostgresService(
+  composeContent: string,
+  bot: BotConfig,
+  db: { containerName: string; volume: string; password: string },
+  opts: { mode?: DeploymentMode } = {}
+): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+
+  const sharedNet = (opts.mode ?? 'casaos') === 'docker' ? 'dbm_internal' : getPCSEnvironment().REF_NET;
+  const serviceName = 'fleet-postgres';
+  const volumeKey = 'fleet-postgres-data';
+  const appSvcName = getAppServiceName(compose);
+
+  services[serviceName] = {
+    image: 'postgres:16-alpine',
+    container_name: db.containerName,
+    restart: 'unless-stopped',
+    cpu_shares: 10,
+    environment: {
+      POSTGRES_USER: 'smdb',
+      POSTGRES_DB: 'smdb',
+      POSTGRES_PASSWORD: db.password,
+    },
+    volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
+    healthcheck: {
+      test: ['CMD-SHELL', 'pg_isready -U smdb -d smdb'],
+      interval: '10s',
+      timeout: '5s',
+      retries: 5,
+    },
+    networks: sharedNet ? ['default', sharedNet] : ['default'],
+    labels: {
+      'managed-by': 'discord-bot-manager',
+      'bot-id': bot.id,
+      'service-type': 'fleet-database',
+    },
+  };
+
+  if (!compose.volumes || typeof compose.volumes !== 'object') compose.volumes = {};
+  (compose.volumes as Record<string, unknown>)[volumeKey] = { name: db.volume };
+
+  if (sharedNet) {
+    if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
+    const nets = compose.networks as Record<string, unknown>;
+    if (!nets[sharedNet]) nets[sharedNet] = { name: sharedNet, external: true };
+  }
+
+  const appSvc = appSvcName && appSvcName !== serviceName ? services[appSvcName] : undefined;
+  if (appSvc) {
+    if (Array.isArray(appSvc.depends_on)) {
+      if (!(appSvc.depends_on as unknown[]).includes(serviceName)) {
+        (appSvc.depends_on as unknown[]).push(serviceName);
+      }
+    } else if (appSvc.depends_on && typeof appSvc.depends_on === 'object') {
+      const deps = appSvc.depends_on as Record<string, unknown>;
+      if (!(serviceName in deps)) deps[serviceName] = { condition: 'service_started' };
+    } else {
+      appSvc.depends_on = [serviceName];
+    }
+  }
+
+  return stringify(compose, { lineWidth: 0 });
+}
+
 // ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──
 
 function dockerEnsureDir(dir: string): void {

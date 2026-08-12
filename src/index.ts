@@ -12,6 +12,7 @@ import { syncContainerStates, resetTransientStatuses } from './docker/containerM
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
+import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 
@@ -102,6 +103,9 @@ async function main(): Promise<void> {
   // Start instance auto-update scheduler
   startInstanceUpdater();
 
+  // Start fleet Postgres sidecar backup scheduler
+  startFleetBackupScheduler();
+
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
   startStateReconciler(() => wss.clients.size);
 }
@@ -111,6 +115,7 @@ process.on('SIGTERM', () => {
   console.log('[Shutdown] Received SIGTERM, shutting down...');
   stopSourceUpdater();
   stopInstanceUpdater();
+  stopFleetBackupScheduler();
   stopStateReconciler();
   process.exit(0);
 });
@@ -119,6 +124,7 @@ process.on('SIGINT', () => {
   console.log('[Shutdown] Received SIGINT, shutting down...');
   stopSourceUpdater();
   stopInstanceUpdater();
+  stopFleetBackupScheduler();
   stopStateReconciler();
   process.exit(0);
 });

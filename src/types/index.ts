@@ -54,6 +54,14 @@ export interface FleetDbRecord {
   volume: string;
 }
 
+// Daily pg_dump schedule for the managed sidecar. Absent means the defaults
+// (enabled, 04:00, keep 7) for instances that have a fleetDb record.
+export interface FleetBackupConfig {
+  enabled: boolean;
+  hour: number;
+  keep: number;
+}
+
 export interface InstanceConfig {
   id: string;
   sourceId: string | null;             // FK to SourceMeta.id (null for docker-image)
@@ -84,6 +92,8 @@ export interface InstanceConfig {
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"
   webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
+  fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
+  lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 
   // Detection (for git source)
   botType?: BotType;

@@ -369,6 +369,38 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
 }
 
 /**
+ * Update the sidecar backup schedule (enabled / hour / keep).
+ */
+export function updateInstanceFleetBackup(botId: string, enabled: boolean, hour?: number, keep?: number): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+
+  const current = instance.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+  instance.fleetBackup = {
+    enabled,
+    hour: hour !== undefined ? Math.max(0, Math.min(23, hour)) : current.hour,
+    keep: keep !== undefined ? Math.max(1, Math.min(365, keep)) : current.keep,
+  };
+  instance.updatedAt = new Date().toISOString();
+  registry.instances[botId] = instance;
+  saveRegistry(registry);
+  return instance;
+}
+
+/**
+ * Persist the timestamp of the last successful sidecar dump (survives restarts,
+ * drives the stale-backup badge).
+ */
+export function setLastFleetBackupAt(botId: string, at: number): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  instance.lastFleetBackupAt = at;
+  saveRegistry(registry);
+}
+
+/**
  * Update the instance's public URL auth mode (applies on next start).
  */
 export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'managed' | 'public'): InstanceConfig | null {

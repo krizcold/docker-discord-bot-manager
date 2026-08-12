@@ -45,6 +45,15 @@ export interface SourceRegistry {
 
 // ─── Instance (Bot) ───
 
+// Manager-provisioned fleet Postgres sidecar. Once created it is never dropped:
+// flipping DATA_BACKEND back to file keeps the record and the volume (data retention).
+export interface FleetDbRecord {
+  containerName: string;
+  user: string;
+  db: string;
+  volume: string;
+}
+
 export interface InstanceConfig {
   id: string;
   sourceId: string | null;             // FK to SourceMeta.id (null for docker-image)
@@ -74,6 +83,7 @@ export interface InstanceConfig {
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"
   webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
+  fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
 
   // Detection (for git source)
   botType?: BotType;

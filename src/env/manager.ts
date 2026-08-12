@@ -47,7 +47,7 @@ function loadOrCreateEncryptionKey(): string {
 const ENCRYPTION_KEY = loadOrCreateEncryptionKey();
 
 // Sensitive env vars that should be encrypted
-const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN'];
+const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DATA_BACKEND_URL'];
 
 interface EnvStorage {
   vars: Record<string, string>;

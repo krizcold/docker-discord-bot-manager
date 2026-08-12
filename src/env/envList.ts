@@ -218,7 +218,7 @@ function composeReferencesCredentials(repoPath: string | null): boolean {
  * general marker a fleet-capable bot uses to opt into fleet plumbing. Any bot
  * declaring it gets the guided Fleet env section; no bot is named in code.
  */
-function composeDeclaresFleet(repoPath: string | null): boolean {
+export function composeDeclaresFleet(repoPath: string | null): boolean {
   if (!repoPath) return false;
   for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
     try {
@@ -296,6 +296,26 @@ function fleetEnvFields(): WizardEnvVar[] {
       key: 'NODE_NAME',
       displayLabel: 'Node Name',
       description: "A friendly name for this instance in the Fleet view (e.g. 'yundera', 'home-pc').",
+    },
+    {
+      ...base,
+      key: 'DATA_BACKEND',
+      displayLabel: 'Data Backend',
+      description: 'file keeps data in simple per-instance JSON files (the default). postgres uses a central database, for multi-machine fleets and big bots.',
+      defaultValue: 'file',
+      options: [{ value: 'file' }, { value: 'postgres' }],
+      showWhen: { key: 'BOT_NODE_ROLE', equals: 'master' },
+      advanced: true,
+    },
+    {
+      ...base,
+      key: 'DATA_BACKEND_URL',
+      displayLabel: 'Database URL',
+      description: 'Blank provisions a managed Postgres on this server. Paste a postgresql:// URL to use an external database instead.',
+      sensitive: true,
+      showWhen: { key: 'DATA_BACKEND', equals: 'postgres' },
+      placeholder: 'blank = managed Postgres on this server',
+      advanced: true,
     },
   ];
 }

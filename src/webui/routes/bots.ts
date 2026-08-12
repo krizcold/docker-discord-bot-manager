@@ -16,6 +16,7 @@ import { findManifest, sanitizeSeedRows } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
+import * as fleetBackup from '../../instance/fleetBackup';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -71,11 +72,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           ? casaosWebOpenUrl(bot.sanitizedName, bot.id)
           : null;
 
+        // Sidecar backup status: null for instances without a managed fleet DB.
+        const fleetBackupInfo = bot.fleetDb ? {
+          lastAt: bot.lastFleetBackupAt || null,
+          stale: fleetBackup.isFleetBackupStale(bot),
+          lastError: fleetBackup.getFleetBackupError(bot.id),
+          ...fleetBackup.effectiveFleetBackup(bot),
+        } : null;
+
         return {
           ...bot,
           autoUpdate: bot.autoUpdate || false,
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
+          fleetBackup: fleetBackupInfo,
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           behindBy,
@@ -906,6 +916,61 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * POST /api/bots/:id/validate-db - Test a database URL with a one-shot psql.
+   * The URL rides as an argv element (never a shell string, never logged) and
+   * the run is hard-killed after 10 seconds. Errors surface password-redacted.
+   */
+  router.post('/:id/validate-db', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const { url } = req.body as { url?: string };
+      if (!url || typeof url !== 'string' || !url.trim()) {
+        res.status(400).json({ success: false, error: 'url is required' });
+        return;
+      }
+      const target = url.trim();
+
+      const result = await new Promise<{ ok: boolean; error?: string }>(resolve => {
+        const child = spawn('docker', ['run', '--rm', 'postgres:16-alpine', 'psql', target, '-c', 'SELECT 1']);
+        let stderr = '';
+        let killed = false;
+        let settled = false;
+        const finish = (r: { ok: boolean; error?: string }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(r);
+        };
+        const timer = setTimeout(() => {
+          killed = true;
+          child.kill('SIGKILL');
+        }, 10000);
+        child.stderr.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
+        child.on('error', err => finish({ ok: false, error: `Failed to run docker: ${err.message}` }));
+        child.on('close', code => {
+          if (killed) return finish({ ok: false, error: 'Connection test timed out after 10 seconds' });
+          if (code === 0) return finish({ ok: true });
+          finish({ ok: false, error: redactDbError(stderr.trim() || `psql exited with code ${code}`, target) });
+        });
+      });
+
+      if (result.ok) {
+        res.json({ success: true, ok: true });
+        return;
+      }
+      const hint = sslModeHint(target);
+      res.json({ success: true, ok: false, error: result.error, ...(hint ? { hint } : {}) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * GET /api/bots/:id/config - Get config files for a bot
    */
   router.get('/:id/config', async (req: Request, res: Response) => {
@@ -1137,6 +1202,80 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * PUT /api/bots/:id/fleet-backup-config - Update the sidecar backup schedule
+   * on the INSTANCE (enabled / hour / keep). Mirrors /auto-update.
+   */
+  router.put('/:id/fleet-backup-config', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const { enabled, hour, keep } = req.body as { enabled: boolean; hour?: number; keep?: number };
+      if (typeof enabled !== 'boolean') {
+        res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+        return;
+      }
+
+      const updated = containerManager.updateInstanceFleetBackup(req.params.id, enabled, hour, keep);
+      broadcastToClients(wss, 'bot:updated', updated);
+      res.json({ success: true, fleetBackup: updated?.fleetBackup });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/fleet-backups - List sidecar dump files, newest first.
+   */
+  router.get('/:id/fleet-backups', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, backups: fleetBackup.listFleetBackups(req.params.id) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-backups/restore - Restore a dump into the sidecar.
+   * Stops every instance on the same URL, takes a pre-restore safety dump
+   * (refusing the restore if it fails), pg_restores, restarts the instances.
+   */
+  router.post('/:id/fleet-backups/restore', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+
+      const { file } = req.body as { file?: string };
+      if (!file || typeof file !== 'string') {
+        res.status(400).json({ success: false, error: 'file is required' });
+        return;
+      }
+      if (/[/\\]/.test(file)) {
+        res.status(400).json({ success: false, error: 'file must be a bare file name' });
+        return;
+      }
+
+      const result = await fleetBackup.restoreFleetBackup(req.params.id, file);
+      res.json(result.success
+        ? { success: true, steps: result.steps }
+        : { success: false, error: result.error, steps: result.steps });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * PUT /api/bots/:id/web-auth - Set the public URL auth mode on the INSTANCE.
    * Applies on the bot's next start.
    */
@@ -1299,6 +1438,54 @@ export function createSystemRoutes(): Router {
   });
 
   return router;
+}
+
+/**
+ * Redact the password portion of a database URL.
+ */
+function redactDbUrl(url: string): string {
+  return url.replace(/(:\/\/[^:@/]*):[^@]*@/, '$1:***@');
+}
+
+/**
+ * Scrub a psql error for the response: any occurrence of the full URL becomes
+ * its redacted form, and any occurrence of the password (raw or URI-decoded)
+ * becomes ***.
+ */
+function redactDbError(text: string, url: string): string {
+  let out = text.split(url).join(redactDbUrl(url));
+  const secrets = new Set<string>();
+  try {
+    const pw = new URL(url).password;
+    if (pw) {
+      secrets.add(pw);
+      try { secrets.add(decodeURIComponent(pw)); } catch { /* keep raw */ }
+    }
+  } catch {
+    const m = url.match(/:\/\/[^:@/]*:([^@]+)@/);
+    if (m) secrets.add(m[1]);
+  }
+  for (const pw of secrets) {
+    if (pw) out = out.split(pw).join('***');
+  }
+  return out;
+}
+
+/**
+ * TLS hint for remote databases: the host is not local (localhost/loopback and
+ * managed sidecars excluded) and the URL carries no sslmode parameter.
+ */
+function sslModeHint(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return null;
+    if (host.endsWith('-fleet-postgres')) return null;
+    if (u.searchParams.has('sslmode')) return null;
+    return 'consider sslmode=require for a remote database';
+  } catch {
+    return null;
+  }
 }
 
 /**

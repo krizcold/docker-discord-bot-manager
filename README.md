@@ -282,7 +282,7 @@ WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:
 | `BOT_PORT_BIND` | `127.0.0.1` | Interface bots' host ports bind to (`0.0.0.0` for LAN) |
 | `BOT_HOST_PORT_BASE` / `BOT_HOST_PORT_RANGE` | `20000` / `10000` | Host-port auto-assign range |
 | `BOT_DOMAIN_BASE` | (unset) | Base for per-bot HTTPS subdomains (remote mode) |
-| `ENV_ENCRYPTION_KEY` | (generated) | Key for the AES-256-CBC secret storage; when unset, a key file is generated under the data dir on first run |
+| `ENV_ENCRYPTION_KEY` | (generated) | Key material for the encrypted secret storage; use a long random value if set. When unset, a random key file is generated under the data dir on first run |
 | `NODE_ENV` | `production` | Node environment |
 
 Remote mode adds `PUBLIC_HOST`, `AUTHELIA_HOST`, `COOKIE_DOMAIN`, `ACME_EMAIL`, `TZ`, `MANAGER_GATEWAY_SECRET` (see **Server on Linux**). On Yundera the platform supplies `PUID`/`PGID`/`TZ`/`APP_*`/`REF_*`/`DATA_ROOT`.
@@ -307,7 +307,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 - Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
 - A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway's login form. On the remote stack, public bot vhosts sit behind Authelia MFA by default - a gateway the bot's compose ships is stripped there (the boundary is the auth, not a per-bot gateway); setting the bot's Auth to Public keeps its own gateway instead. Standalone binds to `127.0.0.1` with no gateway and no login. See **How bots are reached**.
 - On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
-- Secrets are encrypted at rest with AES-256-CBC: sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault. The key comes from `ENV_ENCRYPTION_KEY`, or a key file generated under the data dir on first run.
+- Stored secrets - sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault - are encrypted with AES-256-GCM under a scrypt-derived key (`ENV_ENCRYPTION_KEY`, or a random key file generated under the data dir on first run). Know what this layer does and does not cover: it protects against exposure of the stored files themselves (a leaked vault or storage file alone is useless without the key), but anyone with access to the host or the full data volume can read the key file beside it, and running containers necessarily receive their env in plain form (compose files, `docker inspect`). The real boundary is host access and the deployment's auth layer, same as the bots' unencrypted databases.
 
 </details>
 

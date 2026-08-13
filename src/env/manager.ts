@@ -46,6 +46,36 @@ function loadOrCreateEncryptionKey(): string {
 
 const ENCRYPTION_KEY = loadOrCreateEncryptionKey();
 
+/**
+ * KDF salt persisted beside the key file. Not secret; it exists so a
+ * user-supplied ENV_ENCRYPTION_KEY passphrase cannot be attacked with
+ * precomputed tables, and it must be stable for the same reason the key must.
+ */
+function loadOrCreateKdfSalt(): string {
+  const saltPath = path.join(getDataDir(), 'env-encryption.salt');
+  try {
+    if (fs.existsSync(saltPath)) {
+      const existing = fs.readFileSync(saltPath, 'utf-8').trim();
+      if (existing) return existing;
+    }
+  } catch (error) {
+    console.error('[EnvManager] Failed to read persisted KDF salt:', error);
+  }
+
+  const generated = crypto.randomBytes(16).toString('hex');
+  try {
+    fs.mkdirSync(getDataDir(), { recursive: true });
+    fs.writeFileSync(saltPath, generated, { mode: 0o600 });
+  } catch (error) {
+    console.error('[EnvManager] Could not persist KDF salt; stored secrets will NOT survive a restart:', error);
+  }
+  return generated;
+}
+
+// Derived once at boot: scrypt is deliberately slow, and getEnvVars decrypts on
+// every container start/status pass.
+const DERIVED_KEY = crypto.scryptSync(ENCRYPTION_KEY, loadOrCreateKdfSalt(), 32);
+
 // Sensitive env vars that should be encrypted
 const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DATA_BACKEND_URL'];
 
@@ -63,29 +93,31 @@ export function isSensitive(key: string): boolean {
 }
 
 /**
- * Encrypt a value
+ * Encrypt a value: AES-256-GCM under the scrypt-derived key,
+ * "v2:<iv>:<authTag>:<ciphertext>" hex fields.
  */
 export function encrypt(text: string): string {
-  const key = Buffer.from(ENCRYPTION_KEY.slice(0, 32).padEnd(32, '0'));
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-  let encrypted = cipher.update(text, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  return iv.toString('hex') + ':' + encrypted;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', DERIVED_KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  return `v2:${iv.toString('hex')}:${cipher.getAuthTag().toString('hex')}:${encrypted.toString('hex')}`;
 }
 
 /**
- * Decrypt a value
+ * Decrypt a value. Returns '' on failure (never throws) so the env editor can
+ * still render and let the user re-enter the value; the pre-v2 case gets its
+ * own message because the operator action is re-entry, not debugging.
  */
 export function decrypt(encrypted: string): string {
+  if (!encrypted.startsWith('v2:')) {
+    console.error('[EnvManager] Value is stored in the retired pre-v2 format and cannot be decrypted; re-enter it in the env editor');
+    return '';
+  }
   try {
-    const key = Buffer.from(ENCRYPTION_KEY.slice(0, 32).padEnd(32, '0'));
-    const [ivHex, encryptedText] = encrypted.split(':');
-    const iv = Buffer.from(ivHex, 'hex');
-    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
+    const [, ivHex, tagHex, dataHex] = encrypted.split(':');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', DERIVED_KEY, Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+    return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
   } catch (error) {
     console.error('[EnvManager] Decryption failed:', error);
     return '';

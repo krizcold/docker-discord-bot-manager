@@ -485,11 +485,13 @@ export function processComposeForCasaOS(
       // The bot's TRANSFER_PORT default is the static 3929, NOT control + 1, so
       // a non-default marker needs the explicit injection to match the routes.
       setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(fleetPort + 1));
-      if (isFleetMaster(bot.envVars) && pcs.APP_DOMAIN) {
-        // Workers dial the app domain: TLS terminates at Cloudflare with the
-        // publicly-trusted wildcard cert, and the request reaches the box with
-        // the Host rewritten to the nip.io form. The site therefore needs BOTH
-        // names, same as the web tile's caddy_0/caddy_1 pair.
+      if (isFleetNode(bot.envVars) && pcs.APP_DOMAIN) {
+        // EVERY fleet node gets the control route (PLAN_STANDBY 3.6): a
+        // promotable backup must be dialable in advance. Workers dial the app
+        // domain: TLS terminates at Cloudflare with the publicly-trusted
+        // wildcard cert, and the request reaches the box with the Host
+        // rewritten to the nip.io form. The site therefore needs BOTH names,
+        // same as the web tile's caddy_0/caddy_1 pair.
         const fleetHost = `${appName}-fleet-${pcs.APP_DOMAIN}`;
         const idx = nextCaddySiteIndex(fleetSvc.labels);
         setServiceLabel(fleetSvc, `caddy_${idx}`, fleetHost);
@@ -1249,9 +1251,11 @@ export function isFleetMaster(envVars?: Record<string, string>): boolean {
   return role === '' || role === 'master';
 }
 
-/** Any fleet participant: a master, or a co-worker dialing out to MASTER_URL. */
+/** Any fleet participant: a master, or a co-worker dialing out (MASTER_URLS or the single MASTER_URL). */
 export function isFleetNode(envVars?: Record<string, string>): boolean {
-  return isFleetMaster(envVars) || (envVars?.['MASTER_URL'] || '').trim() !== '';
+  return isFleetMaster(envVars)
+    || (envVars?.['MASTER_URL'] || '').trim() !== ''
+    || (envVars?.['MASTER_URLS'] || '').trim() !== '';
 }
 
 /**
@@ -1265,14 +1269,18 @@ export function isFleetNode(envVars?: Record<string, string>): boolean {
  */
 export function fleetIsSameBox(envVars?: Record<string, string>): boolean {
   // Mirrors the bot's resolveNodeRole exactly: explicit BOT_NODE_ROLE wins,
-  // else MASTER_URL present means co-worker. isFleetMaster alone would
-  // misclassify a role-implicit co-worker (MASTER_URL set, role unset) as a
-  // master and resurrect the unreachable container-name advertise.
+  // else a configured master candidate (MASTER_URLS first entry, or
+  // MASTER_URL) means co-worker. isFleetMaster alone would misclassify a
+  // role-implicit co-worker (dial URL set, role unset) as a master and
+  // resurrect the unreachable container-name advertise.
   const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-  const masterUrl = (envVars?.['MASTER_URL'] || '').trim().toLowerCase();
-  const isCoWorker = role === 'co-worker' || (role !== 'master' && masterUrl !== '');
+  const urlsRaw = (envVars?.['MASTER_URLS'] || '').trim().toLowerCase();
+  const firstCandidate = urlsRaw !== ''
+    ? (urlsRaw.split(',').map(s => s.trim()).find(s => s !== '') || '')
+    : (envVars?.['MASTER_URL'] || '').trim().toLowerCase();
+  const isCoWorker = role === 'co-worker' || (role !== 'master' && firstCandidate !== '');
   if (!isCoWorker) return true;
-  return masterUrl.startsWith('ws://');
+  return firstCandidate.startsWith('ws://');
 }
 
 /**

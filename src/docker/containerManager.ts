@@ -1084,16 +1084,19 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
     }
   }
 
-  // Fleet control endpoint (marker-driven): a master with a public base gets a wss
-  // route on the bundled Caddy (no forward_auth - CONTROL_SECRET is the auth), and
-  // every marker instance gets a localhost-bound control host-port for host-level
-  // tooling. Same-box workers dial the master's container name over dbm_internal.
+  // Fleet control endpoint (marker-driven): EVERY fleet node with a public base
+  // gets a wss control route on the bundled Caddy (no forward_auth -
+  // CONTROL_SECRET is the auth). Master-only before the warm-standby arc
+  // (PLAN_STANDBY 3.6): a promotable backup must be dialable in advance, so
+  // every node's route exists before any failover. Every marker instance also
+  // gets a localhost-bound control host-port for host-level tooling; same-box
+  // workers dial the master's container name over dbm_internal.
   const controlPort = getFleetControlPort(content);
   let fleetHostPort: number | undefined;
   let transferHostPort: number | undefined;
   if (controlPort !== null) {
     const transferPort = controlPort + 1;
-    if (BOT_DOMAIN_BASE && isFleetMaster(instance.envVars)) {
+    if (BOT_DOMAIN_BASE && isFleetNode(instance.envVars)) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
     }
     // Transfer route: EVERY fleet node advertises one (migration legs dial in
@@ -1272,9 +1275,13 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     const controlPort = getFleetControlPort(composeContent);
     if (controlPort === null) return {};
     const env: Record<string, string> = { CONTROL_PORT: String(controlPort), TRANSFER_PORT: String(controlPort + 1) };
-    if (isFleetMaster(instance.envVars)) {
+    if (isFleetNode(instance.envVars)) {
       const host = fleetPublicHost(instance.sanitizedName);
-      if (host) env.FLEET_PUBLIC_URL = `wss://${host}`;
+      // Advertise the control route only once the built compose actually
+      // serves it (same rule as TRANSFER_URL below): a pre-standby worker
+      // build restarted after a manager update must not advertise a route no
+      // proxy label backs until its rebuild.
+      if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
     }
     if (isFleetNode(instance.envVars)) {
       const transferHost = transferPublicHost(instance.sanitizedName);

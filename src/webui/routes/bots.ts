@@ -164,41 +164,75 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
       const dataRoot = process.env.DATA_ROOT || '/DATA';
-      const masters: Array<{ id: string; name: string; masterUrl: string | null; localUrl: string | null; secretSet: boolean; controlSecret: string }> = [];
+      // Deployed compose, resolved like containerManager's resolveComposePath:
+      // CasaOS metadata path when present, else the bot-dir copy.
+      const fleetAddrsOf = (bot: { id: string; sanitizedName: string }) => {
+        const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
+        const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
+        if (!fs.existsSync(composePath)) return null;
+        const composeContent = fs.readFileSync(composePath, 'utf-8');
+        const controlPort = getFleetControlPort(composeContent);
+        if (controlPort === null) return null;
+
+        // Public wss URL a genuinely cross-host worker uses. Same URL the
+        // injection path hands the node as FLEET_PUBLIC_URL; null when no
+        // publicly-trusted base exists for the mode (e.g. standalone/Windows).
+        const host = fleetPublicHost(bot.sanitizedName);
+        const publicUrl = host ? `wss://${host}` : null;
+
+        // Local URL a same-host/same-manager worker should dial instead, so the
+        // handshake stays on the box rather than looping out through the public
+        // gateway. Both modes dial the app container by name over the shared
+        // network (pcs on CasaOS, dbm_internal in docker mode):
+        // host.docker.internal is Docker Desktop-only and the fleet host port is
+        // loopback-bound, so on bare Linux a container-name dial is the only
+        // route that works.
+        const cname = fleetAppContainerName(composeContent);
+        const localUrl = cname ? `ws://${cname}:${controlPort}` : null;
+        return { publicUrl, localUrl };
+      };
+
+      // Designated backup masters, keyed by the fleet they belong to: one
+      // CONTROL_SECRET per fleet, so a backup joins the master whose secret it
+      // shares. They come second in a candidate list (the master leads).
+      const backups: Array<{ id: string; localUrl: string | null; publicUrl: string | null; secret: string }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
-          // Deployed compose, resolved like containerManager's resolveComposePath:
-          // CasaOS metadata path when present, else the bot-dir copy.
-          const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
-          const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
-          if (!fs.existsSync(composePath)) continue;
-          const composeContent = fs.readFileSync(composePath, 'utf-8');
-          const controlPort = getFleetControlPort(composeContent);
-          if (controlPort === null) continue;
+          const env = envManager.getEnvVars(bot.id);
+          const role = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
+          if (role !== 'backup-master' && (env['FLEET_BACKUP_MASTER'] || '').trim() !== '1') continue;
+          const secret = (env['CONTROL_SECRET'] || '').trim();
+          if (secret === '') continue;
+          const addrs = fleetAddrsOf(bot);
+          if (!addrs) continue;
+          backups.push({ id: bot.id, localUrl: addrs.localUrl, publicUrl: addrs.publicUrl, secret });
+        } catch {
+          // an unreadable instance must not break the list
+        }
+      }
 
+      const masters: Array<{
+        id: string; name: string; masterUrl: string | null; localUrl: string | null;
+        secretSet: boolean; controlSecret: string; localCandidates: string[]; publicCandidates: string[];
+      }> = [];
+      for (const bot of containerManager.getAllBots()) {
+        try {
           const env = envManager.getEnvVars(bot.id);
           if (!isFleetMaster(env)) continue;
-
-          // Public wss URL a genuinely cross-host worker uses. Same URL the
-          // injection path hands the master as FLEET_PUBLIC_URL; null when no
-          // publicly-trusted base exists for the mode (e.g. standalone/Windows).
-          const host = fleetPublicHost(bot.sanitizedName);
-          const masterUrl = host ? `wss://${host}` : null;
-
-          // Local URL a same-host/same-manager worker should dial instead, so the
-          // handshake stays on the box rather than looping out through the public
-          // gateway. Both modes dial the master's app container by name over the
-          // shared network (pcs on CasaOS, dbm_internal in docker mode):
-          // host.docker.internal is Docker Desktop-only and the fleet host port is
-          // loopback-bound, so on bare Linux a container-name dial is the only
-          // route that works.
-          const cname = fleetAppContainerName(composeContent);
-          const localUrl = cname ? `ws://${cname}:${controlPort}` : null;
-
-          if (!masterUrl && !localUrl) continue;
+          const addrs = fleetAddrsOf(bot);
+          if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
 
           const controlSecret = (env['CONTROL_SECRET'] || '').trim();
-          masters.push({ id: bot.id, name: bot.displayName, masterUrl, localUrl, secretSet: controlSecret !== '', controlSecret });
+          // Never list a node as its own backup: a promoted ex-backup can carry
+          // both the master role and a stale designation flag.
+          const peers = controlSecret === '' ? [] : backups.filter(b => b.secret === controlSecret && b.id !== bot.id);
+          const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
+          const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
+          const publicCandidates = dedupe([addrs.publicUrl, ...peers.map(p => p.publicUrl)]);
+          masters.push({
+            id: bot.id, name: bot.displayName, masterUrl: addrs.publicUrl, localUrl: addrs.localUrl,
+            secretSet: controlSecret !== '', controlSecret, localCandidates, publicCandidates,
+          });
         } catch {
           // an unreadable instance must not break the list
         }

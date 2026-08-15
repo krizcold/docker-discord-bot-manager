@@ -26,20 +26,21 @@ import {
 export interface EnvFieldMeta {
   options?: Array<{ value: string; label?: string }>;   // render as a select
   generate?: boolean;                                   // "Generate" button fills a random secret
-  showWhen?: { key: string; equals: string };           // show only when another row has this value
-  requiredWhen?: { key: string; equals: string };       // required only when another row has this value
+  showWhen?: { key: string; equals: string | string[] };     // show only when another row has this value (any of)
+  requiredWhen?: { key: string; equals: string | string[] }; // required only when another row has this value (any of)
   advanced?: boolean;                                   // fold under an "Advanced" disclosure
   group?: string;                                       // section heading shared by consecutive rows
   groupHelp?: string;
   placeholder?: string;
   inputType?: 'number';
+  list?: boolean;                                       // dynamic list editor; value = comma-joined entries
 }
 
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType };
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list };
 }
 
 // Fleet vars the manager injects at deploy time (the fleet contract's plumbing);
@@ -49,6 +50,15 @@ const MANAGER_INJECTED_FLEET_ENV = new Set(['CONTROL_PORT', 'TRANSFER_PORT', 'FL
 function isManagerInjectedFleetEnv(key: string): boolean {
   return MANAGER_INJECTED_FLEET_ENV.has(key.toUpperCase());
 }
+
+/**
+ * Fleet keys the guided schema retired: the designation now lives in
+ * BOT_NODE_ROLE=backup-master and the dial list in MASTER_URLS. An instance
+ * saved under the old schema is DISPLAYED in the new shape (below) and these
+ * raw rows are suppressed, so the operator never edits two sources of truth;
+ * setEnvVars drops the stored keys on the next save that carries a role.
+ */
+const LEGACY_FLEET_ENV = new Set(['MASTER_URL', 'FLEET_BACKUP_MASTER']);
 
 // Keys the operator is expected to set on a fresh install, so they always stay
 // visible up top even when prefilled - the bot identity and the web-UI access
@@ -238,63 +248,52 @@ export function composeDeclaresFleet(repoPath: string | null): boolean {
  */
 function fleetEnvFields(): WizardEnvVar[] {
   const base = { defaultValue: '', required: false, source: 'compose' as const, sensitive: false, autoWired: false, group: 'Fleet' };
-  const whenCoWorker = { key: 'BOT_NODE_ROLE', equals: 'co-worker' };
+  // backup-master is a designated co-worker: it dials a master like any worker
+  // and additionally gets the Promote surface. Every worker-role conditional
+  // must match both values.
+  const whenWorkerRole = { key: 'BOT_NODE_ROLE', equals: ['co-worker', 'backup-master'] };
   return [
     {
       ...base,
       key: 'BOT_NODE_ROLE',
       displayLabel: 'Fleet Role',
-      description: 'Master runs the control plane and assigns shards. Co-worker dials into a master. A single standalone bot is a master.',
+      description: 'Master runs the control plane and assigns shards. Co-worker dials into a master. Backup Master is a co-worker that can take over when the master dies (postgres data backend only). A single standalone bot is a master.',
       defaultValue: 'master',
-      options: [{ value: 'master' }, { value: 'co-worker' }],
+      options: [
+        { value: 'master', label: 'Master' },
+        { value: 'co-worker', label: 'Co-worker' },
+        { value: 'backup-master', label: 'Backup Master' },
+      ],
       groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
-    },
-    {
-      ...base,
-      key: 'MASTER_URL',
-      displayLabel: 'Master URL',
-      description: "The master's control URL. For a co-worker on THIS manager, use the same-server address the installer offers below. For a worker on another machine, copy the public URL from the master bot's Usage tab > Fleet section (wss://...).",
-      placeholder: 'ws://master-app:3928 (same server) or wss://mybot-fleet.dbot.example.com',
-      showWhen: whenCoWorker,
-      requiredWhen: whenCoWorker,
     },
     {
       ...base,
       key: 'MASTER_URLS',
       displayLabel: 'Master Candidates',
-      description: 'Advanced: ordered comma-separated list of every master-capable control URL (the master first, then the backup master). Workers cycle through it on reconnect, so a failover needs no reconfiguration. Overrides Master URL when set.',
-      placeholder: 'wss://mybot-fleet.dbot.example.com,wss://mybackup-fleet.dbot.example.com',
-      showWhen: whenCoWorker,
-      advanced: true,
-    },
-    {
-      ...base,
-      key: 'FLEET_BACKUP_MASTER',
-      displayLabel: 'Backup Master',
-      description: 'Advanced: 1 designates THIS co-worker as the fleet backup master. It gets the Promote button on its own web UI (postgres data backend only) and can take over when the master dies.',
-      defaultValue: '',
-      options: [{ value: '' }, { value: '1' }],
-      showWhen: whenCoWorker,
-      advanced: true,
+      description: 'Ordered list of every master-capable control URL: the master first, then the backup master. Workers cycle through it on reconnect, so a failover needs no reconfiguration. Same-server installs fill this automatically.',
+      placeholder: 'wss://mybot-fleet.dbot.example.com',
+      list: true,
+      showWhen: whenWorkerRole,
+      requiredWhen: whenWorkerRole,
     },
     {
       ...base,
       key: 'FLEET_AUTO_PROMOTE',
       displayLabel: 'Auto-Promote',
-      description: 'Advanced: 1 lets the designated backup master promote ITSELF when the master goes silent (about 2 minutes). Off = the backup only promotes when you press Promote.',
+      description: 'Advanced: 1 lets the backup master promote ITSELF when the master goes silent (about 2 minutes). Off = the backup only promotes when you press Promote on its web UI.',
       defaultValue: '',
-      options: [{ value: '' }, { value: '1' }],
-      showWhen: { key: 'FLEET_BACKUP_MASTER', equals: '1' },
+      options: [{ value: '', label: 'off (manual promotion)' }, { value: '1' }],
+      showWhen: { key: 'BOT_NODE_ROLE', equals: 'backup-master' },
       advanced: true,
     },
     {
       ...base,
       key: 'CONTROL_SECRET',
       displayLabel: 'Control Secret',
-      description: 'Shared secret for the fleet. Generate it on the master, then paste the SAME value into every co-worker.',
+      description: 'Shared secret for the whole fleet: every node, the backup master included, must carry the SAME value. Generated on the master; same-server installs fill it automatically, workers on other machines paste it from the master.',
       sensitive: true,
       generate: true,
-      requiredWhen: whenCoWorker,
+      requiredWhen: whenWorkerRole,
     },
     {
       ...base,
@@ -394,9 +393,37 @@ export function buildBotEnvList(
     });
   }
 
+  // Legacy fleet env, shown in the new shape: a stored FLEET_BACKUP_MASTER=1
+  // displays as the backup-master role, and a stored MASTER_URL fills the
+  // candidates list. Role also mirrors the bot's own resolution (a dial URL
+  // with no explicit role IS a co-worker), so confirming the form can never
+  // silently turn a worker into a master.
+  const guidedFleet = result.some(r => r.key === 'BOT_NODE_ROLE');
+  if (guidedFleet) {
+    const storedRole = (stored['BOT_NODE_ROLE'] || '').trim().toLowerCase();
+    const legacyUrl = (stored['MASTER_URL'] || '').trim();
+    const roleRow = result.find(r => r.key === 'BOT_NODE_ROLE');
+    const urlsRow = result.find(r => r.key === 'MASTER_URLS');
+    if (urlsRow && urlsRow.value.trim() === '' && legacyUrl !== '') {
+      urlsRow.value = legacyUrl;
+      urlsRow.isSet = true;
+    }
+    if (roleRow && storedRole !== 'master') {
+      const dials = legacyUrl !== '' || (stored['MASTER_URLS'] || '').trim() !== '';
+      if ((stored['FLEET_BACKUP_MASTER'] || '').trim() === '1') {
+        roleRow.value = 'backup-master';
+        roleRow.isSet = true;
+      } else if (storedRole === '' && dials) {
+        roleRow.value = 'co-worker';
+        roleRow.isSet = true;
+      }
+    }
+  }
+
   // User-added vars not surfaced by detection.
   for (const [key, value] of Object.entries(stored)) {
     if (seen.has(key) || isManagerInjectedFleetEnv(key)) continue;
+    if (guidedFleet && LEGACY_FLEET_ENV.has(key)) continue;   // folded into the guided rows above
     seen.add(key);
     const sensitive = isSensitive(key);
     result.push({

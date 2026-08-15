@@ -185,6 +185,23 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
     }
   }
 
+  // Fleet role is the single designation authority: a saved BOT_NODE_ROLE
+  // retires the legacy FLEET_BACKUP_MASTER flag (backup-master carries it),
+  // disarms auto-promotion on any other role, and a saved candidate list
+  // retires the legacy single MASTER_URL. Keys the caller set EXPLICITLY in
+  // this same patch are left alone, so low-level env edits still win.
+  const savedRole = (vars['BOT_NODE_ROLE'] || '').trim().toLowerCase();
+  const dropStored = (key: string) => {
+    if (vars[key] !== undefined) return;
+    delete storage.vars[key];
+    delete storage.encrypted[key];
+  };
+  if (savedRole !== '') {
+    dropStored('FLEET_BACKUP_MASTER');
+    if (savedRole !== 'backup-master') dropStored('FLEET_AUTO_PROMOTE');
+  }
+  if ((vars['MASTER_URLS'] || '').trim() !== '') dropStored('MASTER_URL');
+
   saveEnvStorage(botId, storage);
   console.log(`[EnvManager] Saved ${Object.keys(vars).length} env vars for bot ${botId}`);
 }

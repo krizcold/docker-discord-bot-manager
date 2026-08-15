@@ -218,6 +218,25 @@
       color: var(--text-primary); font-size: 0.82rem;
     }
     .env-row select.env-value:focus { outline: none; border-color: var(--border-focus); }
+    .env-list { flex: 1; }
+    .env-list-item { display: flex; gap: 6px; margin-bottom: 4px; align-items: center; }
+    .env-list-item input {
+      flex: 1; padding: 7px 10px; background: var(--bg-primary);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-primary); font-size: 0.82rem;
+    }
+    .env-list-item input:focus { outline: none; border-color: var(--border-focus); }
+    .env-list-item .btn-remove {
+      padding: 6px; background: none; border: none; color: var(--danger);
+      cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
+    }
+    .env-list-item .btn-remove:hover { opacity: 1; }
+    .fleet-master-prefill select {
+      padding: 7px 10px; background: var(--bg-primary);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text-primary); font-size: 0.82rem;
+    }
+    .fleet-master-prefill select:focus { outline: none; border-color: var(--border-focus); }
     .env-group {
       border: 1px solid var(--border); border-radius: 6px;
       padding: 8px 10px; margin: 8px 0;
@@ -1788,15 +1807,25 @@
           return `<option value="${escapeHtml(v)}"${v === String(value) ? ' selected' : ''}>${escapeHtml(o.label || v)}</option>`;
         }).join('');
         valueHtml = `<select class="env-value">${optionsHtml}</select>`;
+      } else if (meta.list) {
+        // Dynamic list editor: the visible item inputs join (comma) into a
+        // hidden .env-value so every collector keeps reading one value per row.
+        const items = String(value || '').split(',').map(s => s.trim()).filter(s => s !== '');
+        valueHtml = `<div class="env-list" data-placeholder="${escapeHtml(placeholder || 'Value')}">
+            <input type="hidden" value="${escapeHtml(value)}" class="env-value">
+            <div class="env-list-items">${(items.length ? items : ['']).map(v => envListItemHtml(v, placeholder || 'Value')).join('')}</div>
+            <button class="btn btn-secondary btn-small" type="button" onclick="envListAdd(this)">+ Add</button>
+          </div>`;
       } else {
         valueHtml = `<div class="env-vault-wrapper">
             <input type="${meta.inputType === 'number' ? 'number' : 'text'}" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
             <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, ${jsArg(key)})" title="Pick from vault" type="button">&#9660;</button>
           </div>`;
       }
+      const equalsAttr = (eq) => escapeHtml(Array.isArray(eq) ? eq.join(',') : eq);
       const condAttrs =
-        (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${escapeHtml(meta.showWhen.equals)}"` : '') +
-        (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${escapeHtml(meta.requiredWhen.equals)}"` : '');
+        (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${equalsAttr(meta.showWhen.equals)}"` : '') +
+        (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '');
       return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row">
@@ -1819,19 +1848,70 @@
       const input = btn.closest('.env-row').querySelector('.env-value');
       if (!input) return;
       input.value = randomSecretHex();
+      // Marks the value as machine-minted so a later role switch may clear it;
+      // any real keystroke in the field removes the mark (user-entered values
+      // survive role switches).
+      input.dataset.generated = '1';
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
+    // ─── Dynamic list rows (meta.list): visible items joined into the hidden .env-value ───
+    function envListItemHtml(value, placeholder) {
+      return `<div class="env-list-item">
+        <input type="text" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" oninput="envListSync(this)">
+        <button class="btn-remove" type="button" title="Remove" onclick="envListRemove(this)">&times;</button>
+      </div>`;
+    }
+
+    function envListRecompute(list) {
+      const hidden = list.querySelector('.env-value');
+      const vals = Array.from(list.querySelectorAll('.env-list-item input')).map(i => i.value.trim()).filter(v => v !== '');
+      hidden.value = vals.join(',');
+      hidden.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function envListSync(input) {
+      envListRecompute(input.closest('.env-list'));
+    }
+
+    function envListAdd(btn) {
+      const list = btn.closest('.env-list');
+      const holder = document.createElement('div');
+      holder.innerHTML = envListItemHtml('', list.dataset.placeholder || 'Value');
+      list.querySelector('.env-list-items').appendChild(holder.firstElementChild);
+    }
+
+    function envListRemove(btn) {
+      const list = btn.closest('.env-list');
+      btn.closest('.env-list-item').remove();
+      if (!list.querySelector('.env-list-item')) {
+        const holder = document.createElement('div');
+        holder.innerHTML = envListItemHtml('', list.dataset.placeholder || 'Value');
+        list.querySelector('.env-list-items').appendChild(holder.firstElementChild);
+      }
+      envListRecompute(list);
+    }
+
+    // Rebuild the visible items from the hidden value (programmatic fills).
+    function envListRender(list) {
+      const hidden = list.querySelector('.env-value');
+      const items = String(hidden.value || '').split(',').map(s => s.trim()).filter(s => s !== '');
+      list.querySelector('.env-list-items').innerHTML =
+        (items.length ? items : ['']).map(v => envListItemHtml(v, list.dataset.placeholder || 'Value')).join('');
+    }
+
     // On a fresh install, pre-fill empty "generate" secrets (e.g. the fleet
-    // CONTROL_SECRET) so a master install has one ready. Skipped for a co-worker,
-    // which pastes the master's secret instead of minting its own.
+    // CONTROL_SECRET) so a master install has one ready. Skipped for the worker
+    // roles, which carry the master's secret instead of minting their own.
     function autofillGenerateSecrets(container) {
-      if (envRowValue(container, 'BOT_NODE_ROLE') === 'co-worker') return;
+      const role = envRowValue(container, 'BOT_NODE_ROLE');
+      if (role === 'co-worker' || role === 'backup-master') return;
       container.querySelectorAll('.env-row').forEach(row => {
         const gen = row.querySelector('button[onclick^="generateEnvSecret"]');
         const input = row.querySelector('.env-value');
         if (gen && input && !input.value.trim()) {
           input.value = randomSecretHex();
+          input.dataset.generated = '1';
           input.dispatchEvent(new Event('input', { bubbles: true }));
         }
       });
@@ -1849,12 +1929,26 @@
       return '';
     }
 
+    // data-show-equals / data-req-equals hold one value or a comma list (any-of).
+    function envCondMatches(equalsAttr, value) {
+      return String(equalsAttr).split(',').includes(value);
+    }
+
     function updateEnvConditionals(container) {
       container.querySelectorAll('[data-show-key]').forEach(w => {
-        w.style.display = envRowValue(container, w.dataset.showKey) === w.dataset.showEquals ? '' : 'none';
+        // data-force-hide is the same-server chooser's channel: an auto-filled
+        // row stays in the DOM (collectors read it) but never shows.
+        const show = envCondMatches(w.dataset.showEquals, envRowValue(container, w.dataset.showKey))
+          && w.dataset.forceHide !== '1';
+        w.style.display = show ? '' : 'none';
+      });
+      // Rows force-hidden WITHOUT a showWhen of their own (CONTROL_SECRET is
+      // requiredWhen-only, since masters must always see it).
+      container.querySelectorAll('[data-force-hide]:not([data-show-key])').forEach(w => {
+        w.style.display = w.dataset.forceHide === '1' ? 'none' : '';
       });
       container.querySelectorAll('[data-req-key]').forEach(w => {
-        const on = envRowValue(container, w.dataset.reqKey) === w.dataset.reqEquals;
+        const on = envCondMatches(w.dataset.reqEquals, envRowValue(container, w.dataset.reqKey));
         const label = w.querySelector('.env-label');
         const span = w.querySelector('.env-req');
         if (label) label.classList.toggle('required', on);
@@ -1878,19 +1972,85 @@
       return null;
     }
 
-    function fleetSetEnvValue(container, key, value) {
-      const wrapper = fleetEnvWrapper(container, key);
-      const input = wrapper && wrapper.querySelector('.env-row .env-value');
+    // Every programmatic fill (prefill, vault pick, recovered envs) goes
+    // through here: a list row must re-render its visible items, the
+    // machine-minted mark must clear (the value is now deliberate), and the
+    // input event must fire so conditionals and dependents follow.
+    function setEnvInputValue(input, value) {
       if (!input) return;
       input.value = value;
+      delete input.dataset.generated;
+      const list = input.closest('.env-list');
+      if (list) envListRender(list);
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    // Offers the connection info of a master hosted by this manager, inside the
-    // MASTER_URL row's conditional wrapper (so it only shows for co-workers).
-    // Never fills automatically: the operator may be joining a REMOTE master.
+    function fleetSetEnvValue(container, key, value) {
+      const wrapper = fleetEnvWrapper(container, key);
+      setEnvInputValue(wrapper && wrapper.querySelector('.env-row .env-value'), value);
+    }
+
+    // CONTROL_SECRET across role switches: a machine-minted master secret must
+    // not linger in a worker-role form (nothing uses it there; the node needs
+    // the MASTER's secret instead). A user-entered value always survives
+    // switching; the minted master value is stashed and returns with the role.
+    function attachFleetSecretRoleCache(container) {
+      const wrapper = fleetEnvWrapper(container, 'CONTROL_SECRET');
+      const roleWrapper = fleetEnvWrapper(container, 'BOT_NODE_ROLE');
+      if (!wrapper || !roleWrapper || wrapper.dataset.secretCache === '1') return;
+      wrapper.dataset.secretCache = '1';
+      const isWorker = r => r === 'co-worker' || r === 'backup-master';
+      const isInstall = container.id === 'install-env-rows';
+      let lastRole = envRowValue(container, 'BOT_NODE_ROLE') || 'master';
+      let stashedMasterSecret = '';
+      const secretEl = wrapper.querySelector('.env-row .env-value');
+      const urlsEl = (fleetEnvWrapper(container, 'MASTER_URLS') || wrapper).querySelector('.env-list .env-value');
+      // Real typing makes a value user-owned: it then survives every switch.
+      for (const el of [secretEl, urlsEl]) {
+        if (el) el.addEventListener('input', e => {
+          if (!e.isTrusted) return;
+          delete el.dataset.generated;
+          delete el.dataset.autofilled;
+        });
+      }
+      container.addEventListener('change', () => {
+        const role = envRowValue(container, 'BOT_NODE_ROLE') || 'master';
+        const crossed = isWorker(role) !== isWorker(lastRole);
+        lastRole = role;
+        if (!crossed || !secretEl) return;
+        if (isWorker(role)) {
+          if (secretEl.dataset.generated === '1') {
+            stashedMasterSecret = secretEl.value;
+            setEnvInputValue(secretEl, '');
+          }
+          return;
+        }
+        // Leaving the worker roles: values auto-filled from ANOTHER fleet's
+        // master must not ride into this master install (two fleets would
+        // share one secret, and the hidden candidates row is still collected).
+        for (const el of [secretEl, urlsEl]) {
+          if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
+        }
+        if (!secretEl.value.trim() && (stashedMasterSecret || isInstall)) {
+          // Editor never mints a secret on its own: a blank sensitive field
+          // means "keep the stored value" and a silent mint would rotate it.
+          secretEl.value = stashedMasterSecret || randomSecretHex();
+          secretEl.dataset.generated = '1';
+          secretEl.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      });
+    }
+
+    // Same-server join for the worker roles: pick a master hosted by THIS
+    // manager and the form hides Master Candidates + Control Secret entirely,
+    // filling them from the master (candidates = the master first, then its
+    // backup masters; the rows stay in the DOM so save collectors read them).
+    // "Another machine" shows the rows for manual entry instead.
     async function attachFleetMasterPrefill(containerId, vars) {
       if (!Array.isArray(vars) || !vars.some(v => v.key === 'BOT_NODE_ROLE')) return;
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      attachFleetSecretRoleCache(container);
       let masters = [];
       let fleetBase = null;
       try {
@@ -1899,63 +2059,98 @@
           if (Array.isArray(res.masters)) masters = res.masters;
           if (typeof res.fleetBase === 'string') fleetBase = res.fleetBase;
         }
-      } catch (e) { return; }
-      const container = document.getElementById(containerId);
-      if (!container) return;
+      } catch (e) { /* unreachable list = manual entry only */ }
       if (containerId === 'install-env-rows') attachFleetMasterUrlPreview(container, fleetBase);
-      if (masters.length === 0) return;
-      const wrapper = fleetEnvWrapper(container, 'MASTER_URL');
-      if (!wrapper || wrapper.querySelector('.fleet-master-prefill')) return;
 
-      const options = masters.map((m, i) => {
-        const label = m.name + (m.secretSet ? '' : ' (no secret set)');
-        return `<option value="${i}"${m.secretSet ? '' : ' disabled'}>${escapeHtml(label)}</option>`;
-      }).join('');
+      // Never offer the instance being edited as its own master: a demoted
+      // master would be autoconfigured to dial itself.
+      const isEditor = containerId === 'env-editor-rows';
+      const joinable = masters.filter(m => m.secretSet
+        && !(isEditor && m.id === envEditorBotId)
+        && ((Array.isArray(m.localCandidates) && m.localCandidates.length) || m.localUrl));
+      const urlsWrapper = fleetEnvWrapper(container, 'MASTER_URLS');
+      const secretWrapper = fleetEnvWrapper(container, 'CONTROL_SECRET');
+      if (!urlsWrapper || joinable.length === 0 || container.querySelector('.fleet-master-prefill')) return;
+
+      const candidatesOf = m => (Array.isArray(m.localCandidates) && m.localCandidates.length)
+        ? m.localCandidates : [m.localUrl].filter(Boolean);
+      const options = joinable.map((m, i) => `<option value="${i}">${escapeHtml(m.name)}</option>`).join('');
       const block = document.createElement('div');
       block.className = 'fleet-master-prefill';
+      block.dataset.showKey = 'BOT_NODE_ROLE';
+      block.dataset.showEquals = 'co-worker,backup-master';
       block.innerHTML = `
-        <div class="env-tip">Use a master from this manager:</div>
-        <div style="display:flex;gap:6px;margin-bottom:6px;">
-          <select class="fleet-master-select env-value" style="flex:1;"><option value="">Select a master...</option>${options}</select>
-          <button class="btn btn-secondary btn-small" type="button">Fill</button>
+        <div class="env-label">Master Location</div>
+        <div style="display:flex;gap:6px;margin-bottom:2px;">
+          <select class="fleet-loc-select" style="flex:1;">
+            <option value="local">This server (autoconfigured)</option>
+            <option value="remote">Another machine (enter URLs)</option>
+          </select>
+          <select class="fleet-master-select" style="flex:1;${joinable.length === 1 ? 'display:none;' : ''}">${options}</select>
         </div>
-        <div class="fleet-master-addr" style="display:none;margin-bottom:6px;">
-          <label style="display:block;"><input type="radio" class="fleet-addr-local" name="fleet-addr"> same server (recommended)</label>
-          <label style="display:block;"><input type="radio" class="fleet-addr-public" name="fleet-addr"> public URL (for instances on OTHER machines)</label>
-        </div>
-        <div class="env-tip">For co-workers installed on THIS manager. Workers on other machines: copy the connect info from the master bot's Usage tab instead.</div>`;
+        <div class="env-tip fleet-loc-tip"></div>`;
 
-      const select = block.querySelector('.fleet-master-select');
-      const addrBox = block.querySelector('.fleet-master-addr');
-      const radioLocal = block.querySelector('.fleet-addr-local');
-      const radioPublic = block.querySelector('.fleet-addr-public');
-      const selectedMaster = () => (select.value === '' ? null : masters[Number(select.value)]);
-
-      // Show the addressing choice for the picked master, defaulting to the local
-      // (same-server) address and hiding whichever address it cannot offer.
-      const syncAddr = () => {
-        const m = selectedMaster();
-        const hasLocal = !!(m && m.localUrl);
-        const hasPublic = !!(m && m.masterUrl);
-        radioLocal.disabled = !hasLocal;
-        radioPublic.disabled = !hasPublic;
-        radioLocal.closest('label').style.display = hasLocal ? '' : 'none';
-        radioPublic.closest('label').style.display = hasPublic ? '' : 'none';
-        if (hasLocal) radioLocal.checked = true;
-        else if (hasPublic) radioPublic.checked = true;
-        addrBox.style.display = (hasLocal || hasPublic) ? '' : 'none';
+      const locSel = block.querySelector('.fleet-loc-select');
+      const masterSel = block.querySelector('.fleet-master-select');
+      const tip = block.querySelector('.fleet-loc-tip');
+      const chosen = () => joinable[Number(masterSel.value) || 0];
+      const workerRole = () => {
+        const r = envRowValue(container, 'BOT_NODE_ROLE');
+        return r === 'co-worker' || r === 'backup-master';
       };
-      select.addEventListener('change', syncAddr);
 
-      block.querySelector('button').addEventListener('click', () => {
-        const m = selectedMaster();
+      // Auto-filled values are machine-owned: marked so that leaving
+      // same-server mode (or the worker roles) can take them back out.
+      const fillFromMaster = () => {
+        const m = chosen();
         if (!m) return;
-        const url = (radioLocal.checked && m.localUrl) ? m.localUrl : (m.masterUrl || m.localUrl);
-        if (!url) return;
-        fleetSetEnvValue(container, 'MASTER_URL', url);
-        fleetSetEnvValue(container, 'CONTROL_SECRET', m.controlSecret);
-      });
-      wrapper.insertBefore(block, wrapper.firstChild);
+        for (const [key, value] of [['MASTER_URLS', candidatesOf(m).join(',')], ['CONTROL_SECRET', m.controlSecret]]) {
+          fleetSetEnvValue(container, key, value);
+          const el = (fleetEnvWrapper(container, key) || container).querySelector('.env-row .env-value');
+          if (el) el.dataset.autofilled = '1';
+        }
+      };
+
+      const sync = () => {
+        const local = locSel.value === 'local' && workerRole();
+        urlsWrapper.dataset.forceHide = local ? '1' : '';
+        if (secretWrapper) secretWrapper.dataset.forceHide = local ? '1' : '';
+        tip.textContent = locSel.value === 'local'
+          ? 'Connection and secret are filled automatically from the selected master.'
+          : "Enter every master-capable URL in order (the master first) and paste the master's Control Secret (its Usage tab > Connect a worker).";
+        if (local) {
+          fillFromMaster();
+        } else {
+          // Switched to manual entry: take back what same-server filled in, so
+          // the operator edits their own values rather than a hidden fleet's.
+          for (const key of ['MASTER_URLS', 'CONTROL_SECRET']) {
+            const el = (fleetEnvWrapper(container, key) || container).querySelector('.env-row .env-value');
+            if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
+          }
+        }
+        updateEnvConditionals(container);
+      };
+
+      locSel.addEventListener('change', sync);
+      masterSel.addEventListener('change', sync);
+      // Role switches re-run the mode: entering a worker role in local mode
+      // must (re)fill the hidden rows, leaving it must unhide the secret row.
+      container.addEventListener('change', sync);
+
+      // Initial mode. Same-server is assumed ONLY for a value that exactly
+      // matches a local master (or a blank fresh install form): an already
+      // configured node must never be silently re-pointed at another master
+      // just because its editor was opened.
+      const current = envRowValue(container, 'MASTER_URLS');
+      const matching = current === '' ? -1 : joinable.findIndex(m => candidatesOf(m).join(',') === current);
+      if (matching >= 0) {
+        masterSel.value = String(matching);
+        locSel.value = 'local';
+      } else if (current !== '' || isEditor) {
+        locSel.value = 'remote';
+      }
+      urlsWrapper.parentElement.insertBefore(block, urlsWrapper);
+      sync();
     }
 
     // Master-install preview of the public URL workers will use, below the
@@ -3497,7 +3692,7 @@
           if (!keyInput) continue;
           const key = keyInput.value.trim();
           if (key && Object.prototype.hasOwnProperty.call(loadedByKey, key)) {
-            valueInput.value = loadedByKey[key];
+            setEnvInputValue(valueInput, loadedByKey[key]);
             seen.add(key);
           }
         }
@@ -3864,7 +4059,7 @@
 
       dropdown.querySelectorAll('.env-vault-option').forEach(opt => {
         opt.addEventListener('click', () => {
-          input.value = opt.dataset.value;
+          setEnvInputValue(input, opt.dataset.value);
           dropdown.remove();
         });
       });

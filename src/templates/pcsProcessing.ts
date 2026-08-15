@@ -1251,9 +1251,11 @@ export function isFleetMaster(envVars?: Record<string, string>): boolean {
   return role === '' || role === 'master';
 }
 
-/** Any fleet participant: a master, or a co-worker dialing out (MASTER_URLS or the single MASTER_URL). */
+/** Any fleet participant: a master, an explicit worker role, or a node dialing out (MASTER_URLS or the single MASTER_URL). */
 export function isFleetNode(envVars?: Record<string, string>): boolean {
+  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
   return isFleetMaster(envVars)
+    || role === 'co-worker' || role === 'backup-master'
     || (envVars?.['MASTER_URL'] || '').trim() !== ''
     || (envVars?.['MASTER_URLS'] || '').trim() !== '';
 }
@@ -1278,7 +1280,8 @@ export function fleetIsSameBox(envVars?: Record<string, string>): boolean {
   const firstCandidate = urlsRaw !== ''
     ? (urlsRaw.split(',').map(s => s.trim()).find(s => s !== '') || '')
     : (envVars?.['MASTER_URL'] || '').trim().toLowerCase();
-  const isCoWorker = role === 'co-worker' || (role !== 'master' && firstCandidate !== '');
+  const isCoWorker = role === 'co-worker' || role === 'backup-master'
+    || (role !== 'master' && firstCandidate !== '');
   if (!isCoWorker) return true;
   return firstCandidate.startsWith('ws://');
 }

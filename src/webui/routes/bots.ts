@@ -910,8 +910,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const envVars = { ...vars };
-      envManager.setEnvVars(req.params.id, envVars);
+      const dropped = envManager.setEnvVars(req.params.id, envVars);
       await containerManager.updateBot(req.params.id, { envVars });
+      // Keys the save retired (legacy fleet designation/dial) must leave the
+      // instance record and the deployed compose too, or the start-time sync
+      // re-bakes them from the stale snapshot (same trio as DELETE /env/:key).
+      if (dropped.length > 0) {
+        containerManager.removeBotEnvVars(req.params.id, dropped);
+        for (const key of dropped) containerManager.removeEnvKeyFromDeployedCompose(req.params.id, key);
+      }
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));

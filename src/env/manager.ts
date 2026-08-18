@@ -172,7 +172,7 @@ export function getEnvVars(botId: string): Record<string, string> {
 /**
  * Set environment variables for a bot
  */
-export function setEnvVars(botId: string, vars: Record<string, string>): void {
+export function setEnvVars(botId: string, vars: Record<string, string>): string[] {
   const storage = loadEnvStorage(botId);
 
   for (const [key, value] of Object.entries(vars)) {
@@ -189,12 +189,19 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
   // retires the legacy FLEET_BACKUP_MASTER flag (backup-master carries it),
   // disarms auto-promotion on any other role, and a saved candidate list
   // retires the legacy single MASTER_URL. Keys the caller set EXPLICITLY in
-  // this same patch are left alone, so low-level env edits still win.
+  // this same patch are left alone, so low-level env edits still win. The
+  // retired keys are RETURNED: this storage is one of two copies, and the
+  // caller must retire them from the instance record + deployed compose too
+  // (the DELETE /env/:key trio), or they resurrect on the next start sync.
+  // Derived from the SAVE SHAPE, not from what storage held, so a re-save
+  // also heals an instance record poisoned before the trio existed.
+  const dropped: string[] = [];
   const savedRole = (vars['BOT_NODE_ROLE'] || '').trim().toLowerCase();
   const dropStored = (key: string) => {
     if (vars[key] !== undefined) return;
     delete storage.vars[key];
     delete storage.encrypted[key];
+    dropped.push(key);
   };
   if (savedRole !== '') {
     dropStored('FLEET_BACKUP_MASTER');
@@ -204,6 +211,7 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
 
   saveEnvStorage(botId, storage);
   console.log(`[EnvManager] Saved ${Object.keys(vars).length} env vars for bot ${botId}`);
+  return dropped;
 }
 
 /**

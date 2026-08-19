@@ -218,7 +218,14 @@
       color: var(--text-primary); font-size: 0.82rem;
     }
     .env-row select.env-value:focus { outline: none; border-color: var(--border-focus); }
-    .env-list { flex: 1; }
+    .env-list {
+      flex: 1; border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 6px; background: var(--bg-tertiary);
+    }
+    /* Rows whose value is a list grow downwards: the key column and the row's
+       own remove button stay level with the first item instead of centering. */
+    .env-row-list { align-items: flex-start; }
+    .env-row-list > .env-key, .env-row-list > .btn-remove { margin-top: 7px; }
     .env-list-item { display: flex; gap: 6px; margin-bottom: 4px; align-items: center; }
     .env-list-item input {
       flex: 1; padding: 7px 10px; background: var(--bg-primary);
@@ -721,7 +728,7 @@
 
   <!-- Install from Source Modal -->
   <div id="install-modal" class="modal-overlay hidden">
-    <div class="modal" style="max-width: 580px;">
+    <div class="modal" style="max-width: 725px;">
       <div id="install-modal-content"></div>
     </div>
   </div>
@@ -1828,7 +1835,7 @@
         (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '');
       return `<div${condAttrs}>
         ${labelHtml}
-        <div class="env-row">
+        <div class="env-row${meta.list ? ' env-row-list' : ''}">
           <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
           ${valueHtml}
           ${genBtn}
@@ -2153,9 +2160,22 @@
       sync();
     }
 
-    // Master-install preview of the public URL workers will use, below the
-    // BOT_NODE_ROLE row. Wizard-only (needs the name input); deliberately not
-    // an .env-row, so env collectors skip it.
+    // Preview of the public URL this node advertises, below the BOT_NODE_ROLE
+    // row. Shown for both promotable roles: workers dial the master here, and
+    // must carry a backup master's URL too so a failover needs no rewiring.
+    // Wizard-only (needs the name input); deliberately not an .env-row, so env
+    // collectors skip it.
+    const FLEET_URL_PREVIEW_TEXT = {
+      'master': {
+        label: 'Workers will connect at',
+        title: 'This URL becomes live once the bot is installed and started as master.',
+      },
+      'backup-master': {
+        label: 'Workers must also list this URL',
+        title: "Add this URL to every co-worker's Master Candidates, after the master's, so they follow the failover when this node takes over.",
+      },
+    };
+
     function attachFleetMasterUrlPreview(container, fleetBase) {
       if (!fleetBase) return;
       const nameInput = document.getElementById('install-name');
@@ -2166,18 +2186,27 @@
       const el = document.createElement('div');
       el.className = 'fleet-url-preview';
       el.dataset.showKey = 'BOT_NODE_ROLE';
-      el.dataset.showEquals = 'master';
+      el.dataset.showEquals = Object.keys(FLEET_URL_PREVIEW_TEXT).join(',');
       el.innerHTML = `
-        <div class="fleet-url-label" title="This URL becomes live once the bot is installed and started as master.">Workers will connect at</div>
+        <div class="fleet-url-label"></div>
         <div class="fleet-url-line">
           <span class="fleet-url-value"></span>
           <button class="btn btn-secondary btn-small" type="button">Copy</button>
         </div>`;
       const urlSpan = el.querySelector('.fleet-url-value');
+      const labelEl = el.querySelector('.fleet-url-label');
       const urlOf = () => `wss://${sanitizeNamePreview(nameInput.value.trim())}${fleetBase}`;
-      const update = () => { urlSpan.textContent = urlOf(); };
+      const update = () => {
+        urlSpan.textContent = urlOf();
+        const text = FLEET_URL_PREVIEW_TEXT[envRowValue(container, 'BOT_NODE_ROLE')];
+        if (text) {
+          labelEl.textContent = text.label;
+          labelEl.title = text.title;
+        }
+      };
       update();
       nameInput.addEventListener('input', update);
+      container.addEventListener('change', update);
       const btn = el.querySelector('button');
       btn.addEventListener('click', () => {
         navigator.clipboard.writeText(urlOf());

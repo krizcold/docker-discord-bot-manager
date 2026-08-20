@@ -18,6 +18,7 @@ import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
+import * as fleetReplica from '../../instance/fleetReplica';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -87,6 +88,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           fleetBackup: fleetBackupInfo,
+          // Fleet-worker marker: drives the Database button's replica surface.
+          // Explicit worker roles only - an absent role means master, and a
+          // plain bot has no use for a fleet standby (R7).
+          fleetWorker: ['co-worker', 'backup-master'].includes((bot.envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase()),
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           behindBy,
@@ -1369,6 +1374,70 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         result = await fleetReplication.disableFleetReplication(bot);
       }
       if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/fleet-replica - Standby status (record + provisioning
+   * phase + live streaming probe).
+   */
+  router.get('/:id/fleet-replica', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-replica - Provision a standby from a primary's
+   * copy block ({primaryDsn, cert, publicHost, hostPort?}). Async: poll the
+   * GET for the phase.
+   */
+  router.post('/:id/fleet-replica', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { primaryDsn, cert, publicHost, hostPort } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number };
+      if (!primaryDsn || !cert || !publicHost) {
+        res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
+        return;
+      }
+      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * DELETE /api/bots/:id/fleet-replica - Remove the standby service + record
+   * (volume retained). The primary's slot is orphaned by this: the response
+   * reminds the caller, and the UI confirm warns beforehand.
+   */
+  router.delete('/:id/fleet-replica', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetReplica.removeFleetReplica(bot);
+      if (result.success) {
+        broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+        res.json({ success: true, warning: "The primary's replication slot is now orphaned and retains WAL: disable replication on the primary, or provision a new replica soon" });
+        return;
+      }
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

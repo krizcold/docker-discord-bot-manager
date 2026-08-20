@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -59,6 +59,8 @@ import {
   getPublishedFleetHostPort,
   publishFleetHostPort,
   addFleetPostgresService,
+  addFleetPostgresReplicaService,
+  removeFleetPostgresReplicaService,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
   fixDockerBotOwnership,
@@ -97,7 +99,7 @@ const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
  * path (native run / same-path bind). A relative path would make the daemon resolve
  * the bind against the bot's compose dir instead of the shared data root.
  */
-function hostBotDirFor(botId: string): string {
+export function hostBotDirFor(botId: string): string {
   const root = (process.env.HOST_DATA_DIR || path.resolve(DATA_DIR)).replace(/\\/g, '/').replace(/\/+$/, '');
   return `${root}/bots/${botId}`;
 }
@@ -413,6 +415,71 @@ export function updateInstanceFleetDbReplication(
   return instance;
 }
 
+/** Persist (or clear) the standby record (PLAN_REPLICATION.md Stage 2). */
+export function updateInstanceFleetDbReplica(botId: string, replica: FleetDbReplicaRecord | null): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+  if (replica) instance.fleetDbReplica = replica;
+  else delete instance.fleetDbReplica;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return instance;
+}
+
+/**
+ * Write the standby service into the DEPLOYED compose and start it (targeted
+ * up; the running app service is untouched). Used by the provisioning flow;
+ * rebuilds re-inject via buildGitInstance.
+ */
+export async function applyFleetDbReplicaService(botId: string): Promise<{ success: boolean; error?: string }> {
+  const instance = getBot(botId);
+  if (!instance?.fleetDbReplica) return { success: false, error: 'No standby record' };
+  const appName = resolveAppName(botId);
+  const composePath = resolveComposePath(botId, appName);
+  if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found (install the instance first)' };
+  const mode = await getDeploymentMode();
+  const content = fs.readFileSync(composePath, 'utf-8');
+  const updated = addFleetPostgresReplicaService(content, instance as any, instance.fleetDbReplica, { mode });
+  fs.writeFileSync(composePath, updated);
+  try {
+    await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d fleet-postgres-replica`);
+    return { success: true };
+  } catch (err) {
+    // A ghost service in the deployed compose would break every later start
+    // (up runs --remove-orphans and fails on the same cause): revert the file
+    // so a failed apply leaves no trace.
+    try {
+      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
+    } catch { /* the original content write below the error is best effort */ }
+    return { success: false, error: String(err) };
+  }
+}
+
+/** True when the instance has a deployed compose to attach services to. */
+export function deployedComposeExists(botId: string): boolean {
+  try {
+    return fs.existsSync(resolveComposePath(botId, resolveAppName(botId)));
+  } catch {
+    return false;
+  }
+}
+
+/** Remove the standby service from the deployed compose and its container; the volume stays. */
+export async function removeFleetDbReplicaService(botId: string, containerName: string): Promise<{ success: boolean; error?: string }> {
+  const appName = resolveAppName(botId);
+  const composePath = resolveComposePath(botId, appName);
+  try {
+    if (fs.existsSync(composePath)) {
+      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
+    }
+    await execAsync(`docker rm -f "${containerName}"`).catch(() => { /* already gone */ });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: String(err) };
+  }
+}
+
 /**
  * Persist the timestamp of the last successful sidecar dump (survives restarts,
  * drives the stale-backup badge).
@@ -596,6 +663,12 @@ async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Pr
   } finally {
     activeOps.delete(botId);
   }
+}
+
+/** Op-lock for long-running work owned by other modules (e.g. replica seeding):
+ * start/rebuild/delete refuse while it holds the lock, and vice versa. */
+export function withExternalBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Promise<T> {
+  return withBotOp(botId, op, fn);
 }
 
 type EmitFn = (msg: string, type?: BuildLogEntry['type'], key?: string) => void;
@@ -900,6 +973,19 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
       const msg = error instanceof Error ? error.message : String(error);
       failures.push(`volumes for ${botId}: ${msg}`);
     }
+  }
+
+  // 3b. Standby replica leftovers: its volume is custom-named (never project-
+  // prefixed, so step 3 misses it) and a leftover would block any same-name
+  // reinstall from provisioning. Deleting the standby also orphans the
+  // PRIMARY's replication slot, which retains WAL over there - warn loudly.
+  if (instance.fleetDbReplica) {
+    await execAsync(`docker rm -f "${instance.fleetDbReplica.containerName}"`).catch(() => { /* project down got it */ });
+    await execAsync(`docker rm -f "${instance.sanitizedName}-fleet-replica-seed"`).catch(() => { /* no ghost seeder */ });
+    if (!keepData && !dockerClient.removeVolume(instance.fleetDbReplica.volume)) {
+      failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
+    }
+    console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps an orphaned replication slot that retains WAL - disable replication there or provision a new replica soon`);
   }
 
   // 4. Remove instance directory
@@ -1320,6 +1406,12 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
         if (cname) env.TRANSFER_URL = `ws://${cname}:${controlPort + 1}`;
       }
     }
+    // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
+    // bot's promote flow promotes this database first. Credentials are the
+    // fleet's own (same database, byte-copied auth); the bot splices them in.
+    if (instance.fleetDbReplica) {
+      env.FLEET_DB_REPLICA_URL = `postgresql://${instance.fleetDbReplica.containerName}:5432/smdb`;
+    }
     return env;
   } catch {
     return {};
@@ -1405,7 +1497,7 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       // from the registry, and a stale compose copy would keep a node silently
       // designated, armed, or dialing a legacy URL through every restart.
       if (getFleetControlPort(raw) !== null) {
-        for (const key of ['FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'MASTER_URL']) {
+        for (const key of ['FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'MASTER_URL', 'FLEET_DB_REPLICA_URL']) {
           if (!(key in allEnv)) deleteComposeEnv(service.environment, key);
         }
       }
@@ -1436,6 +1528,10 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       if (repl) ports.push(`${repl.hostPort}:5432`);
       if (ports.length > 0) dbSvc.ports = ports;
       else delete dbSvc.ports;
+    }
+    const replicaSvc = services['fleet-postgres-replica'];
+    if (replicaSvc && typeof replicaSvc === 'object' && instance.fleetDbReplica) {
+      replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
     }
 
     fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
@@ -1967,6 +2063,13 @@ async function buildDockerImageInstance(
   // Docker mode: publish the bot's web UI on a host port (no gateway).
   if (!isCasaOS) composeContent = applyDockerHostPort(composeContent, instance);
 
+  // Same rule as the git lanes: a rebuilt compose missing the standby service
+  // would destroy the replica on the next up --remove-orphans.
+  if (instance.fleetDbReplica) {
+    composeContent = addFleetPostgresReplicaService(composeContent, botForCompose, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
+    emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
+  }
+
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
@@ -2283,6 +2386,14 @@ async function buildGitInstance(
       sidecarInjected = processed.sidecarInjected;
     }
     buildTarget = 'bot';
+  }
+
+  // Re-inject the standby on every rebuild, in EVERY compose lane: compose up
+  // runs --remove-orphans, so a rebuilt compose missing this service would
+  // destroy the replica.
+  if (instance.fleetDbReplica) {
+    composeContent = addFleetPostgresReplicaService(composeContent, botWithEnv, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
+    emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
   }
 
   // Deliver volume dirs + user-edited config files (mode-aware).

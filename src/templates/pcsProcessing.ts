@@ -1529,6 +1529,81 @@ export function addFleetPostgresService(
   return stringify(compose, { lineWidth: 0 });
 }
 
+/**
+ * Inject the manager-provisioned STANDBY of another machine's fleet database
+ * (PLAN_REPLICATION.md Stage 2). PGDATA is pre-seeded by pg_basebackup before
+ * this service ever starts (standby.signal + primary_conninfo live in the
+ * volume), so the service needs no POSTGRES_* init env. Exposed like a
+ * replication primary: after a promotion this database serves the fleet.
+ */
+export function addFleetPostgresReplicaService(
+  composeContent: string,
+  bot: BotConfig,
+  replica: { containerName: string; volume: string; hostPort: number },
+  opts: { mode?: DeploymentMode } = {}
+): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+
+  const sharedNet = (opts.mode ?? 'casaos') === 'docker' ? 'dbm_internal' : getPCSEnvironment().REF_NET;
+  const serviceName = 'fleet-postgres-replica';
+  const volumeKey = 'fleet-postgres-replica-data';
+
+  services[serviceName] = {
+    image: 'postgres:16-alpine',
+    container_name: replica.containerName,
+    restart: 'unless-stopped',
+    cpu_shares: 10,
+    ports: [`${replica.hostPort}:5432`],
+    volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
+    healthcheck: {
+      test: ['CMD-SHELL', 'pg_isready -U smdb -d smdb'],
+      interval: '10s',
+      timeout: '5s',
+      retries: 5,
+    },
+    networks: sharedNet ? ['default', sharedNet] : ['default'],
+    labels: {
+      'managed-by': 'discord-bot-manager',
+      'bot-id': bot.id,
+      'service-type': 'fleet-database-replica',
+    },
+  };
+
+  if (!compose.volumes || typeof compose.volumes !== 'object') compose.volumes = {};
+  (compose.volumes as Record<string, unknown>)[volumeKey] = { name: replica.volume };
+
+  if (sharedNet) {
+    if (!compose.networks || typeof compose.networks !== 'object') compose.networks = {};
+    const nets = compose.networks as Record<string, unknown>;
+    if (!nets[sharedNet]) nets[sharedNet] = { name: sharedNet, external: true };
+  }
+
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/** Remove the standby service (record removal); the named volume stays declared-free (data retention). */
+export function removeFleetPostgresReplicaService(composeContent: string): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, unknown> | undefined;
+  if (!services || !services['fleet-postgres-replica']) return composeContent;
+  delete services['fleet-postgres-replica'];
+  const volumes = compose.volumes as Record<string, unknown> | undefined;
+  if (volumes) delete volumes['fleet-postgres-replica-data'];
+  return stringify(compose, { lineWidth: 0 });
+}
+
 // ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──
 
 function dockerEnsureDir(dir: string): void {

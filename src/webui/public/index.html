@@ -1405,9 +1405,10 @@
                 <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
               </select>` : '';
 
-            // Managed fleet DB only: opens the backup list + schedule modal
-            const fleetBackupControl = fb
-              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="Daily dumps of this bot's managed database">DB Backups</button>`
+            // Database modal: backups + replication on a managed-DB instance;
+            // the standby replica surface on fleet workers.
+            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetWorker)
+              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : 'Standby replica of the fleet database on this machine'}">Database</button>`
               : '';
 
             return `
@@ -2295,11 +2296,24 @@
     async function showFleetBackups(botId) {
       fleetBackupBotId = botId;
       const bot = bots.find(b => b.id === botId);
-      const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
       const modal = document.getElementById('fleet-backup-modal');
       const content = document.getElementById('fleet-backup-content');
-      content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
       modal.classList.remove('hidden');
+
+      // Worker instances (no managed DB of their own) get the standby surface.
+      if (!bot?.fleetDb) {
+        content.innerHTML = `
+          <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
+          <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
+          </div>`;
+        renderFleetReplica(botId);
+        return;
+      }
+
+      const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+      content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
       let listHtml = '';
       try {
@@ -2452,6 +2466,101 @@
       navigator.clipboard.writeText(el.value);
       btn.textContent = 'Copied';
       setTimeout(() => { btn.textContent = 'Copy certificate'; }, 1500);
+    }
+
+    // ─── Fleet DB standby replica (worker side, PLAN_REPLICATION.md Stage 2) ───
+    let replicaPollSeq = 0;
+
+    async function renderFleetReplica(botId) {
+      const body = document.getElementById('fleet-replica-body');
+      if (!body || fleetBackupBotId !== botId) return;
+      const seq = ++replicaPollSeq;
+      let res = null;
+      try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
+      if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
+      if (!res || !res.success) {
+        body.innerHTML = '<div class="error-message">Failed to load replica status</div>';
+        return;
+      }
+      const r = res.replica || { present: false };
+      const errHtml = r.lastError ? `<div class="error-message">Last attempt failed: ${escapeHtml(r.lastError)}</div>` : '';
+
+      if (r.provisioning) {
+        body.innerHTML = `
+          ${errHtml}
+          <div class="env-tip">Provisioning: <b>${escapeHtml(r.provisioning.phase)}</b> (${r.provisioning.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>`;
+        setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
+        return;
+      }
+
+      if (!r.record) {
+        body.innerHTML = `
+          ${errHtml}
+          <div class="env-tip">A live standby copy of the fleet database, streaming from the master's machine. If that machine dies, promoting this node's backup master also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
+          <div class="form-group"><label>Replication DSN</label>
+            <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/smdb?sslmode=verify-full"></div>
+          <div class="form-group"><label>Primary certificate (PEM)</label>
+            <textarea id="replica-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="replica-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="number" id="replica-port" placeholder="15432" min="1" max="65535" style="flex:1;">
+            <button class="btn btn-primary btn-small" onclick="provisionFleetReplica('${botId}')">Provision</button>
+          </div>`;
+        return;
+      }
+
+      const live = r.live || {};
+      const lagText = live.caughtUp === true ? ', caught up'
+        : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
+      const stateHtml = !live.running
+        ? '<div class="env-tip" style="color:var(--warning);">Standby container is not running</div>'
+        : live.inRecovery === false
+          ? '<div class="env-tip" style="color:var(--warning);">This database is NOT in recovery: it has been promoted and no longer follows the primary</div>'
+          : `<div class="env-tip" style="color:${live.receiverStatus === 'streaming' ? 'var(--success)' : 'var(--warning)'};">Receiver: ${escapeHtml(live.receiverStatus || 'not connected')}${lagText}</div>`;
+      body.innerHTML = `
+        ${errHtml}
+        <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
+        ${stateHtml}
+        <div class="env-tip">The bot on this instance picks the replica up (for promote-the-pair) on its next restart.</div>
+        <div style="margin-top:6px;">
+          <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
+        </div>`;
+    }
+
+    async function provisionFleetReplica(botId) {
+      const primaryDsn = (document.getElementById('replica-dsn')?.value || '').trim();
+      const cert = (document.getElementById('replica-cert')?.value || '').trim();
+      const host = (document.getElementById('replica-host')?.value || '').trim();
+      const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+      if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
+      const payload = { primaryDsn, cert, publicHost: host };
+      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replica`, payload);
+        // Failure keeps the form (and everything pasted into it) intact.
+        if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
+        showMessage('success', 'Provisioning started');
+      } catch (err) {
+        showMessage('error', 'Failed to start provisioning');
+        return;
+      }
+      renderFleetReplica(botId);
+    }
+
+    async function removeFleetReplica(botId) {
+      if (!confirm('Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps a replication slot for this standby that retains WAL until you disable replication there (or provision a new replica). Do that soon after removing.')) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/fleet-replica`);
+        if (res.success) {
+          showMessage('success', res.warning || 'Replica removed');
+        } else {
+          showMessage('error', res.error || 'Failed to remove replica');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to remove replica');
+      }
+      renderFleetReplica(botId);
+      loadBots();
     }
 
     function hideFleetBackups() {

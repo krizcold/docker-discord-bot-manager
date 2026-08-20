@@ -99,7 +99,7 @@ function sidecarUrl(instance: InstanceConfig, dbPassword: string): string {
   return `postgresql://${user}:${encodeURIComponent(dbPassword)}@${containerName}:5432/${db}`;
 }
 
-function opensslGenerate(dir: string, publicHost: string): Promise<{ ok: boolean; error?: string }> {
+export function generateCertPair(dir: string, publicHost: string): Promise<{ ok: boolean; error?: string }> {
   const san = isIpAddress(publicHost) ? `IP:${publicHost}` : `DNS:${publicHost}`;
   return new Promise(resolve => {
     execFile('openssl', [
@@ -125,7 +125,7 @@ async function ensureServerCert(containerName: string, publicHost: string, certH
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cert-'));
   try {
-    const gen = await opensslGenerate(dir, publicHost);
+    const gen = await generateCertPair(dir, publicHost);
     if (!gen.ok) return `certificate generation failed: ${gen.error}`;
     for (const file of ['server.key', 'server.crt']) {
       const content = fs.readFileSync(path.join(dir, file), 'utf-8');

@@ -67,6 +67,23 @@ export interface FleetDbReplication {
   certHost: string;                    // host the pinned cert names; differing publicHost forces regeneration
 }
 
+// Manager-provisioned streaming REPLICA of another machine's fleet database
+// (PLAN_REPLICATION.md Stage 2). Lives beside a worker/backup-master instance;
+// seeded with pg_basebackup, runs as a hot standby, exposed like the primary
+// so it can serve the whole fleet after a promotion. The replicator password
+// is deliberately NOT retained here - it lives only inside the standby's own
+// postgresql.auto.conf after provisioning.
+export interface FleetDbReplicaRecord {
+  containerName: string;
+  volume: string;
+  slot: string;                        // slot name on the PRIMARY this standby consumes
+  primaryHost: string;                 // primary endpoint (for display/diagnostics)
+  primaryPort: number;
+  publicHost: string;                  // this machine's advertised host (post-promotion serving)
+  hostPort: number;                    // published host port (container 5432)
+  certHost: string;                    // host THIS standby's own server cert names
+}
+
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults
 // (enabled, 04:00, keep 7) for instances that have a fleetDb record.
 export interface FleetBackupConfig {
@@ -105,6 +122,7 @@ export interface InstanceConfig {
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"
   webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
+  fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

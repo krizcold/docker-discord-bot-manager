@@ -57,7 +57,11 @@ export function isFleetBackupScoped(instance: InstanceConfig): boolean {
   const url = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
   if (!url) return false;
   try {
-    return new URL(url).hostname === instance.fleetDb.containerName;
+    const host = new URL(url).hostname;
+    // The replication posture's canonical URL points at the same sidecar
+    // through the published port; it stays in dump scope.
+    return host === instance.fleetDb.containerName
+      || (!!instance.fleetDb.replication && host === instance.fleetDb.replication.publicHost);
   } catch {
     return false;
   }

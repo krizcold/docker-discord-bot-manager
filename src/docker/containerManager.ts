@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord,
+  DetectionResult, FleetDbRecord, FleetDbReplication,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -384,6 +384,31 @@ export function updateInstanceFleetBackup(botId: string, enabled: boolean, hour?
   };
   instance.updatedAt = new Date().toISOString();
   registry.instances[botId] = instance;
+  saveRegistry(registry);
+  return instance;
+}
+
+/**
+ * Persist (or clear) the sidecar's replication posture; optionally mirrors a
+ * rewritten DATA_BACKEND_URL into the instance record alongside it (the env
+ * store copy is the caller's job). Applies to the compose on the next start.
+ */
+export function updateInstanceFleetDbReplication(
+  botId: string,
+  replication: FleetDbReplication | null,
+  envUrl?: string,
+): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance || !instance.fleetDb) return null;
+  if (replication) {
+    instance.fleetDb = { ...instance.fleetDb, replication };
+  } else {
+    const { replication: _drop, ...rest } = instance.fleetDb;
+    instance.fleetDb = rest;
+  }
+  if (envUrl !== undefined) instance.envVars = { ...instance.envVars, DATA_BACKEND_URL: envUrl };
+  instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
 }
@@ -1401,6 +1426,18 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       for (const k of SUBSTITUTION_ONLY_ENV) deleteComposeEnv(svc.environment, k);
     }
 
+    // Replication toggles between starts must not require a rebuild: keep the
+    // sidecar's published port in step with the record on every start.
+    const dbSvc = services['fleet-postgres'];
+    if (dbSvc && typeof dbSvc === 'object') {
+      const repl = instance.fleetDb?.replication;
+      const ports = Array.isArray(dbSvc.ports) ? dbSvc.ports.filter((p: unknown) =>
+        !(typeof p === 'string' && p.endsWith(':5432'))) : [];
+      if (repl) ports.push(`${repl.hostPort}:5432`);
+      if (ports.length > 0) dbSvc.ports = ports;
+      else delete dbSvc.ports;
+    }
+
     fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
   } catch (err) {
     console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
@@ -2041,7 +2078,12 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
   } catch {
     return null;
   }
-  if (host !== containerName) return null;   // external lane
+  // Managed = the sidecar's container name, OR the replication posture's public
+  // host (the canonical URL rewrite points at the same sidecar through the
+  // published port; treating it as external would drop the database service
+  // from the next rebuild's compose).
+  const replicationHost = instance.fleetDb?.replication?.publicHost;
+  if (host !== containerName && !(replicationHost && host === replicationHost)) return null;   // external lane
 
   if (!instance.fleetDb) stampFleetDb(instance, { containerName, user: 'smdb', db: 'smdb', volume });
   if ((instance.envVars?.['DATA_BACKEND_URL'] || '') !== url) {

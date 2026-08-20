@@ -2337,9 +2337,121 @@
         </div>
         <div id="fleet-backup-list">${listHtml}</div>
         <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. A fresh safety dump is always taken first.</div>
+        <div class="env-group" style="margin-top:14px;">
+          <div class="env-group-title">Replication</div>
+          <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
+        </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
         </div>`;
+      renderFleetReplication(botId);
+    }
+
+    // ─── Fleet DB Replication (PLAN_REPLICATION.md Stage 1) ───
+    async function renderFleetReplication(botId) {
+      const body = document.getElementById('fleet-replication-body');
+      if (!body || fleetBackupBotId !== botId) return;
+      let res = null;
+      try { res = await api('GET', `/bots/${botId}/fleet-replication?include=block`); } catch (err) { res = null; }
+      if (!body.isConnected || fleetBackupBotId !== botId) return;
+      if (!res || !res.success) {
+        body.innerHTML = '<div class="error-message">Failed to load replication status</div>';
+        return;
+      }
+      const r = res.replication || { enabled: false };
+      if (!r.enabled) {
+        body.innerHTML = `
+          <div class="env-tip">A standby copy of this database on the backup master's machine. Without one, this machine dying takes the database with it and the fleet cannot fail over.</div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
+            <button class="btn btn-primary btn-small" onclick="enableFleetReplication('${botId}')">Enable</button>
+          </div>`;
+        return;
+      }
+      const live = r.live;
+      const standbys = (live && live.standbys) || [];
+      const standbyHtml = standbys.length === 0
+        ? '<div class="env-tip">No standby attached yet. Use the block below on the backup master\'s machine.</div>'
+        : standbys.map(s => `<div class="env-tip">Standby ${escapeHtml(s.clientAddr || '?')}: ${escapeHtml(s.state || '?')}${s.replayLagSeconds != null ? `, replay lag ${s.replayLagSeconds.toFixed(1)}s` : ''}</div>`).join('');
+      const block = res.block;
+      const reach = r.reachability;
+      const reachHtml = !live ? ''
+        : reach && reach.ok ? '<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers</div>'
+        : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}</div>`
+        : '';
+      body.innerHTML = `
+        <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}</div>
+        ${reachHtml}
+        ${standbyHtml}
+        ${block ? `
+        <div style="margin-top:6px;">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span style="font-size:0.78rem;color:var(--text-secondary);">Replica setup block</span>
+            <button class="btn btn-secondary btn-small" onclick="copyFleetReplBlock(this)">Copy DSN</button>
+            <button class="btn btn-secondary btn-small" onclick="copyFleetReplCert(this)">Copy certificate</button>
+          </div>
+          <input type="hidden" id="fleet-repl-dsn" value="${escapeHtml(block.dsn)}">
+          <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
+          <div class="env-tip">Paste both into "Add a database replica" on the backup master machine's manager.</div>
+        </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
+        <div style="margin-top:6px;">
+          <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
+        </div>`;
+    }
+
+    async function enableFleetReplication(botId) {
+      const host = (document.getElementById('fleet-repl-host')?.value || '').trim();
+      const portRaw = (document.getElementById('fleet-repl-port')?.value || '').trim();
+      if (!host) { showMessage('error', 'Enter the public host or IP other machines will dial'); return; }
+      const payload = { enabled: true, publicHost: host };
+      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
+        if (res.success) {
+          showMessage('success', res.certRotated
+            ? 'Replication updated with a NEW certificate (the host changed) - existing standbys must be re-set-up with the new block. Restart the instance to apply.'
+            : 'Replication enabled. Restart the instance to publish the port and apply the new database URL.');
+        } else {
+          showMessage('error', res.error || 'Failed to enable replication');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to enable replication');
+      }
+      renderFleetReplication(botId);
+      loadBots();
+    }
+
+    async function disableFleetReplication(botId) {
+      if (!confirm('Disable replication?\n\nThe published port closes and the database URL reverts on the next restart. An attached standby will stop receiving changes.')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
+        if (res.success) {
+          showMessage('success', 'Replication disabled. Restart the instance to apply.');
+        } else {
+          showMessage('error', res.error || 'Failed to disable replication');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to disable replication');
+      }
+      renderFleetReplication(botId);
+      loadBots();
+    }
+
+    function copyFleetReplBlock(btn) {
+      const el = document.getElementById('fleet-repl-dsn');
+      if (!el) return;
+      navigator.clipboard.writeText(el.value);
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = 'Copy DSN'; }, 1500);
+    }
+
+    function copyFleetReplCert(btn) {
+      const el = document.getElementById('fleet-repl-cert');
+      if (!el) return;
+      navigator.clipboard.writeText(el.value);
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = 'Copy certificate'; }, 1500);
     }
 
     function hideFleetBackups() {

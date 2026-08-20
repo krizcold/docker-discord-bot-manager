@@ -17,6 +17,7 @@ import { parseConfig } from '../../config/configSerializer';
 import * as terminal from '../terminal';
 import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
+import * as fleetReplication from '../../instance/fleetReplication';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -1311,6 +1312,64 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json(result.success
         ? { success: true, steps: result.steps }
         : { success: false, error: result.error, steps: result.steps });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/fleet-replication - Replication posture + live probe.
+   * include=block adds the replica copy block (DSN + pinned cert; behind
+   * manager auth by design, like the env editor).
+   */
+  router.get('/:id/fleet-replication', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const status = await fleetReplication.getFleetReplicationStatus(bot);
+      if (status.enabled && req.query.include === 'block') {
+        const block = await fleetReplication.getReplicaCopyBlock(bot);
+        res.json({ success: true, replication: status, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
+        return;
+      }
+      res.json({ success: true, replication: status });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-replication - Enable/update ({enabled:true,
+   * publicHost, hostPort?}) or disable ({enabled:false}) the replication
+   * posture. Port publish and the rewritten URL apply on the next start.
+   */
+  router.post('/:id/fleet-replication', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { enabled, publicHost, hostPort } = req.body as { enabled?: boolean; publicHost?: string; hostPort?: number };
+      if (typeof enabled !== 'boolean') {
+        res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+        return;
+      }
+      let result;
+      if (enabled) {
+        if (!publicHost || typeof publicHost !== 'string') {
+          res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
+          return;
+        }
+        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort);
+      } else {
+        result = await fleetReplication.disableFleetReplication(bot);
+      }
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

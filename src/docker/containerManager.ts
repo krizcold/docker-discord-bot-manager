@@ -1410,7 +1410,12 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     // bot's promote flow promotes this database first. Credentials are the
     // fleet's own (same database, byte-copied auth); the bot splices them in.
     if (instance.fleetDbReplica) {
-      env.FLEET_DB_REPLICA_URL = `postgresql://${instance.fleetDbReplica.containerName}:5432/smdb`;
+      const replica = instance.fleetDbReplica;
+      env.FLEET_DB_REPLICA_URL = `postgresql://${replica.containerName}:5432/smdb`;
+      // What the FLEET dials once this pair is promoted: the same canonical
+      // shape the primary publishes, so cross-host workers keep working and
+      // the container-name URL above never escapes this machine.
+      env.FLEET_DB_REPLICA_PUBLIC_URL = `postgresql://${replica.publicHost}:${replica.hostPort}/smdb?sslmode=no-verify`;
     }
     return env;
   } catch {
@@ -1497,7 +1502,7 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       // from the registry, and a stale compose copy would keep a node silently
       // designated, armed, or dialing a legacy URL through every restart.
       if (getFleetControlPort(raw) !== null) {
-        for (const key of ['FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'MASTER_URL', 'FLEET_DB_REPLICA_URL']) {
+        for (const key of ['FLEET_BACKUP_MASTER', 'FLEET_AUTO_PROMOTE', 'MASTER_URL', 'FLEET_DB_REPLICA_URL', 'FLEET_DB_REPLICA_PUBLIC_URL']) {
           if (!(key in allEnv)) deleteComposeEnv(service.environment, key);
         }
       }

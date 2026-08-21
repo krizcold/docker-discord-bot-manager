@@ -270,10 +270,9 @@ function fleetEnvFields(): WizardEnvVar[] {
       ...base,
       key: 'MASTER_URLS',
       displayLabel: 'Master Candidates',
-      description: 'Ordered list of every master-capable control URL: the master first, then the backup master. Workers cycle through it on reconnect, so a failover needs no reconfiguration. Same-server installs fill this automatically.',
+      description: 'Ordered list of every master-capable control URL: the master first, then the backup master. Workers cycle through it on reconnect, so a failover needs no reconfiguration. A master lists the OTHER master-capable nodes: it checks them before claiming the fleet at startup, so a master that comes back after a failover parks itself instead of splitting the fleet in two, and can then be demoted from its web UI. Optional for a master, required for a worker. Same-server installs fill this automatically.',
       placeholder: 'wss://mybot-fleet.dbot.example.com',
       list: true,
-      showWhen: whenWorkerRole,
       requiredWhen: whenWorkerRole,
     },
     {

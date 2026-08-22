@@ -49,6 +49,14 @@ export function getPCSEnvironment(): PCSEnvironment {
   };
 }
 
+/**
+ * The network every managed sidecar joins alongside its own compose default,
+ * so container names resolve between compose projects and from the manager.
+ */
+export function sharedNetworkName(mode: DeploymentMode | undefined): string {
+  return (mode ?? 'casaos') === 'docker' ? 'dbm_internal' : getPCSEnvironment().REF_NET;
+}
+
 // ─── Internal Helpers ──────────────────────────────────────────────────────
 
 // Service names that are backing infrastructure, never the web tile.
@@ -1473,7 +1481,7 @@ export function addFleetPostgresService(
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return composeContent;
 
-  const sharedNet = (opts.mode ?? 'casaos') === 'docker' ? 'dbm_internal' : getPCSEnvironment().REF_NET;
+  const sharedNet = sharedNetworkName(opts.mode);
   const serviceName = 'fleet-postgres';
   const volumeKey = 'fleet-postgres-data';
   const appSvcName = getAppServiceName(compose);
@@ -1551,7 +1559,7 @@ export function addFleetPostgresReplicaService(
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return composeContent;
 
-  const sharedNet = (opts.mode ?? 'casaos') === 'docker' ? 'dbm_internal' : getPCSEnvironment().REF_NET;
+  const sharedNet = sharedNetworkName(opts.mode);
   const serviceName = 'fleet-postgres-replica';
   const volumeKey = 'fleet-postgres-replica-data';
 
@@ -1585,6 +1593,37 @@ export function addFleetPostgresReplicaService(
     if (!nets[sharedNet]) nets[sharedNet] = { name: sharedNet, external: true };
   }
 
+  return stringify(compose, { lineWidth: 0 });
+}
+
+/**
+ * Remove the managed PRIMARY sidecar (PLAN_REPLICATION.md Stage 5): the stale
+ * half of a failed-over pair stops hosting a database and follows the new
+ * primary instead. The app service's depends_on goes too, otherwise every
+ * later start fails on a dependency that no longer exists.
+ */
+export function removeFleetPostgresService(composeContent: string): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services || !services['fleet-postgres']) return composeContent;
+  delete services['fleet-postgres'];
+  const volumes = compose.volumes as Record<string, unknown> | undefined;
+  if (volumes) delete volumes['fleet-postgres-data'];
+  for (const svc of Object.values(services)) {
+    if (!svc || typeof svc !== 'object') continue;
+    if (Array.isArray(svc.depends_on)) {
+      svc.depends_on = (svc.depends_on as unknown[]).filter(d => d !== 'fleet-postgres');
+      if ((svc.depends_on as unknown[]).length === 0) delete svc.depends_on;
+    } else if (svc.depends_on && typeof svc.depends_on === 'object') {
+      delete (svc.depends_on as Record<string, unknown>)['fleet-postgres'];
+      if (Object.keys(svc.depends_on as Record<string, unknown>).length === 0) delete svc.depends_on;
+    }
+  }
   return stringify(compose, { lineWidth: 0 });
 }
 

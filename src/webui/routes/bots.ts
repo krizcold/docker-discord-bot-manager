@@ -19,6 +19,7 @@ import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
+import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -28,7 +29,7 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath } from '../../templates/pcsProcessing';
+import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
@@ -88,6 +89,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           fleetBackup: fleetBackupInfo,
+          // Cached verdict from the background sampler: null when this instance
+          // has no replication role. Never probed inline - the list is polled.
+          replicationHealth: getReplicationHealth(bot.id),
           // Fleet-worker marker: drives the Database button's replica surface.
           // Explicit worker roles only - an absent role means master, and a
           // plain bot has no use for a fleet standby (R7).
@@ -966,6 +970,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * POST /api/bots/:id/validate-db - Test a database URL with a one-shot psql.
    * The URL rides as an argv element (never a shell string, never logged) and
    * the run is hard-killed after 10 seconds. Errors surface password-redacted.
+   *
+   * The probe joins the shared sidecar network, so a managed database's
+   * container name resolves here exactly as it does from the bot; on the
+   * default bridge it never could. sslmode=no-verify is translated first:
+   * that spelling is node-postgres only and libpq rejects the URL outright,
+   * which used to fail every managed fleet URL the replication rewrite mints.
    */
   router.post('/:id/validate-db', async (req: Request, res: Response) => {
     try {
@@ -982,8 +992,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       const target = url.trim();
 
+      const network = sharedNetworkName(await getDeploymentMode());
+      const probeUrl = libpqUrl(target);
       const result = await new Promise<{ ok: boolean; error?: string }>(resolve => {
-        const child = spawn('docker', ['run', '--rm', 'postgres:16-alpine', 'psql', target, '-c', 'SELECT 1']);
+        const child = spawn('docker', ['run', '--rm', ...(network ? ['--network', network] : []),
+          'postgres:16-alpine', 'psql', probeUrl, '-c', 'SELECT 1']);
         let stderr = '';
         let killed = false;
         let settled = false;
@@ -1002,7 +1015,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         child.on('close', code => {
           if (killed) return finish({ ok: false, error: 'Connection test timed out after 10 seconds' });
           if (code === 0) return finish({ ok: true });
-          finish({ ok: false, error: redactDbError(stderr.trim() || `psql exited with code ${code}`, target) });
+          finish({ ok: false, error: redactDbError(stderr.trim() || `psql exited with code ${code}`, probeUrl) });
         });
       });
 
@@ -1421,6 +1434,50 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * POST /api/bots/:id/fleet-adopt-primary - File a promoted standby as this
+   * machine's fleet database and enable replication on it, so the machine that
+   * just took over can hand out the copy block the old one re-seeds from.
+   */
+  router.post('/:id/fleet-adopt-primary', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetReplica.adoptPromotedReplica(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-reseed - Heal a stale primary by making it a
+   * standby of the machine that now serves the fleet ({primaryDsn, cert,
+   * publicHost, hostPort?}). Destructive: the local database is dumped once
+   * and then deleted. Async: poll GET /fleet-replica for the phase.
+   */
+  router.post('/:id/fleet-reseed', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { primaryDsn, cert, publicHost, hostPort } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number };
+      if (!primaryDsn || !cert || !publicHost) {
+        res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
+        return;
+      }
+      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * DELETE /api/bots/:id/fleet-replica - Remove the standby service + record
    * (volume retained). The primary's slot is orphaned by this: the response
    * reminds the caller, and the UI confirm warns beforehand.
@@ -1621,6 +1678,22 @@ function redactDbUrl(url: string): string {
  * its redacted form, and any occurrence of the password (raw or URI-decoded)
  * becomes ***.
  */
+/**
+ * node-postgres accepts sslmode=no-verify for "encrypt, trust is pinned
+ * elsewhere"; libpq has no such value and refuses the whole URL. require is
+ * its equivalent (encrypt, no certificate verification).
+ */
+function libpqUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (u.searchParams.get('sslmode') !== 'no-verify') return url;
+    u.searchParams.set('sslmode', 'require');
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
 function redactDbError(text: string, url: string): string {
   let out = text.split(url).join(redactDbUrl(url));
   const secrets = new Set<string>();

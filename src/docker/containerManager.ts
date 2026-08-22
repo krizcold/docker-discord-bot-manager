@@ -75,7 +75,8 @@ import {
   applyUserConfigOverrides,
   redeliverConfigFiles,
   fixPostDeployOwnership,
-  executeInstallCommand
+  executeInstallCommand,
+  removeFleetPostgresService
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
@@ -462,6 +463,97 @@ export function deployedComposeExists(botId: string): boolean {
     return fs.existsSync(resolveComposePath(botId, resolveAppName(botId)));
   } catch {
     return false;
+  }
+}
+
+/**
+ * Record a promoted standby as THIS machine's fleet database
+ * (PLAN_REPLICATION.md Stage 5). After a pair promotion the bot serves its
+ * local copy, but the manager still files it as somebody else's standby, so
+ * the replication surface (and the copy block the old machine needs to be
+ * re-seeded from) is unreachable. Record only: the container and volume are
+ * the ones already running.
+ */
+export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean; error?: string } {
+  const registry = loadRegistry();
+  const stored = registry.instances[botId];
+  if (!stored) return { success: false, error: 'Bot not found' };
+  const replica = stored.fleetDbReplica;
+  if (!replica) return { success: false, error: 'This instance has no standby to adopt' };
+  if (stored.fleetDb) return { success: false, error: 'This instance already hosts a fleet database' };
+  stored.fleetDb = { containerName: replica.containerName, user: 'smdb', db: 'smdb', volume: replica.volume };
+  delete stored.fleetDbReplica;
+  stored.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  const live = getBot(botId);
+  if (live) {
+    live.fleetDb = { ...stored.fleetDb };
+    delete live.fleetDbReplica;
+  }
+  return { success: true };
+}
+
+/**
+ * Bring ONLY the managed database sidecar up and wait for it to accept
+ * connections. Stopping an instance takes its whole compose project down, so
+ * the stale-primary re-seed (PLAN_REPLICATION.md Stage 5) has no database to
+ * dump until this runs; the app service is deliberately left down.
+ */
+export async function startFleetDbSidecar(botId: string): Promise<{ success: boolean; error?: string }> {
+  const instance = getBot(botId);
+  const fleetDb = instance?.fleetDb;
+  if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  const appName = resolveAppName(botId);
+  const composePath = resolveComposePath(botId, appName);
+  if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
+  try {
+    await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d fleet-postgres`);
+  } catch (err) {
+    return { success: false, error: String(err) };
+  }
+  for (let attempt = 0; attempt < 30; attempt++) {
+    try {
+      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -U "${fleetDb.user}" -d "${fleetDb.db}"`);
+      return { success: true };
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  return { success: false, error: 'database did not become ready within 30 seconds' };
+}
+
+/**
+ * Retire the managed PRIMARY sidecar (PLAN_REPLICATION.md Stage 5): the stale
+ * half of a failed-over pair stops hosting the fleet database and follows the
+ * new primary instead. Service, container, volume and record all go, because
+ * a kept volume with no record naming it is debris no UI could ever clear.
+ * The caller has already dumped whatever it wanted to keep.
+ */
+export async function retireFleetDbSidecar(botId: string): Promise<{ success: boolean; error?: string }> {
+  const instance = getBot(botId);
+  const fleetDb = instance?.fleetDb;
+  if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  try {
+    const appName = resolveAppName(botId);
+    const composePath = resolveComposePath(botId, appName);
+    if (fs.existsSync(composePath)) {
+      fs.writeFileSync(composePath, removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8')));
+    }
+    await execAsync(`docker rm -f "${fleetDb.containerName}"`).catch(() => { /* already gone */ });
+    if (!dockerClient.removeVolume(fleetDb.volume)) {
+      return { success: false, error: `could not remove the old database volume ${fleetDb.volume}; the container may still be running` };
+    }
+    const registry = loadRegistry();
+    const stored = registry.instances[botId];
+    if (stored) {
+      delete stored.fleetDb;
+      stored.updatedAt = new Date().toISOString();
+      saveRegistry(registry);
+    }
+    delete instance.fleetDb;
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: String(err) };
   }
 }
 
@@ -1525,7 +1617,13 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
 
     // Replication toggles between starts must not require a rebuild: keep the
     // sidecar's published port in step with the record on every start.
-    const dbSvc = services['fleet-postgres'];
+    // Keyed on the container the record names, not the service key: an adopted
+    // standby keeps the replica service name until its next rebuild, and its
+    // published port must keep tracking the record meanwhile.
+    const dbSvc = instance.fleetDb
+      ? (Object.values(services) as any[]).find(svc =>
+        svc && typeof svc === 'object' && svc.container_name === instance.fleetDb!.containerName)
+      : undefined;
     if (dbSvc && typeof dbSvc === 'object') {
       const repl = instance.fleetDb?.replication;
       const ports = Array.isArray(dbSvc.ports) ? dbSvc.ports.filter((p: unknown) =>

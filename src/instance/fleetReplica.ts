@@ -16,8 +16,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as containerManager from '../docker/containerManager';
-import { getBotDir } from '../git/repoManager';
-import { generateCertPair } from './fleetReplication';
+import * as envManager from '../env/manager';
+import * as fleetBackup from './fleetBackup';
+import { getBotDir, getDataPath } from '../git/repoManager';
+import { generateCertPair, enableFleetReplication } from './fleetReplication';
 import { InstanceConfig, FleetDbReplicaRecord } from '../types';
 
 const REPLICATION_SLOT = 'fleet_standby';
@@ -153,6 +155,71 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
   return status;
 }
 
+interface ValidatedIntake {
+  dsn: ParsedDsn;
+  cert: string;
+  host: string;
+  port: number;
+}
+
+/** Shape checks shared by both intake paths, so the two cannot drift apart. */
+function validateIntake(
+  primaryDsn: string,
+  certPem: string,
+  publicHost: string,
+  hostPort: number | undefined,
+): { ok: true; intake: ValidatedIntake } | { ok: false; error: string } {
+  const dsn = parsePrimaryDsn(primaryDsn);
+  if (!dsn.ok) return { ok: false, error: dsn.error };
+  const cert = certPem.trim();
+  if (!/^-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----$/.test(cert)) {
+    return { ok: false, error: 'Certificate must be a PEM certificate block' };
+  }
+  const host = publicHost.trim();
+  if (!host || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(host)) {
+    return { ok: false, error: 'Public host must be a bare hostname or IPv4 address' };
+  }
+  const port = hostPort ?? DEFAULT_HOST_PORT;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'Invalid port' };
+  return { ok: true, intake: { dsn: dsn.parsed, cert, host, port } };
+}
+
+function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): FleetDbReplicaRecord {
+  return {
+    containerName: `${instance.sanitizedName}-fleet-postgres-replica`,
+    volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
+    slot: REPLICATION_SLOT,
+    primaryHost: intake.dsn.host,
+    primaryPort: intake.dsn.port,
+    publicHost: intake.host,
+    hostPort: intake.port,
+    certHost: intake.host,
+  };
+}
+
+/**
+ * Hand the seed to the op lock and return; callers poll status. `preflight`
+ * runs inside the lock before the seed, which is what lets a re-seed retire
+ * the stale primary without racing a start or a rebuild.
+ */
+function startProvisioning(
+  instance: InstanceConfig,
+  record: FleetDbReplicaRecord,
+  intake: ValidatedIntake,
+  preflight?: () => Promise<void>,
+): void {
+  provisioning.set(instance.id, { phase: 'preparing', startedAt: Date.now() });
+  lastErrors.delete(instance.id);
+  void containerManager.withExternalBotOp(instance.id, 'replica-seed', async () => {
+    if (preflight) await preflight();
+    await runProvisioning(instance, record, intake.dsn, intake.cert);
+  }).catch(err => {
+    lastErrors.set(instance.id, String(err instanceof Error ? err.message : err));
+  }).finally(() => {
+    provisioning.delete(instance.id);
+  });
+}
+
 /**
  * Kick off provisioning (async; poll status). Refuses when a record already
  * exists (remove first), when the target volume holds data, or when the host
@@ -181,18 +248,9 @@ export function provisionFleetReplica(
     return { success: false, error: 'Install/build the instance first - the standby joins its compose project' };
   }
 
-  const dsn = parsePrimaryDsn(primaryDsn);
-  if (!dsn.ok) return { success: false, error: dsn.error };
-  const cert = certPem.trim();
-  if (!/^-----BEGIN CERTIFICATE-----[\s\S]+-----END CERTIFICATE-----$/.test(cert)) {
-    return { success: false, error: 'Certificate must be a PEM certificate block' };
-  }
-  const host = publicHost.trim();
-  if (!host || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(host)) {
-    return { success: false, error: 'Public host must be a bare hostname or IPv4 address' };
-  }
-  const port = hostPort ?? DEFAULT_HOST_PORT;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return { success: false, error: 'Invalid port' };
+  const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
+  if (!validated.ok) return { success: false, error: validated.error };
+  const { dsn: parsedDsn, port } = validated.intake;
   const collision = containerManager.getAllBots().find(other =>
     other.fleetDb?.replication?.hostPort === port
     || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port));
@@ -204,34 +262,15 @@ export function provisionFleetReplica(
   // primary lives here.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
-    return repl && repl.publicHost === dsn.parsed.host && repl.hostPort === dsn.parsed.port;
+    return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
   });
   if (samehost) {
     return { success: false, error: `That primary ("${samehost.displayName}") lives on THIS machine - a replica here would die with it. Provision the replica on another machine's manager` };
   }
 
-  const record: FleetDbReplicaRecord = {
-    containerName: `${instance.sanitizedName}-fleet-postgres-replica`,
-    volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
-    slot: REPLICATION_SLOT,
-    primaryHost: dsn.parsed.host,
-    primaryPort: dsn.parsed.port,
-    publicHost: host,
-    hostPort: port,
-    certHost: host,
-  };
-
-  provisioning.set(instance.id, { phase: 'preparing', startedAt: Date.now() });
-  lastErrors.delete(instance.id);
   // The op lock keeps start/rebuild/delete away from the minutes-long seed
   // (and vice versa: the busy check above refuses while one of those runs).
-  void containerManager.withExternalBotOp(instance.id, 'replica-seed',
-    () => runProvisioning(instance, record, dsn.parsed, cert),
-  ).catch(err => {
-    lastErrors.set(instance.id, String(err instanceof Error ? err.message : err));
-  }).finally(() => {
-    provisioning.delete(instance.id);
-  });
+  startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake);
   return { success: true, started: true };
 }
 
@@ -334,4 +373,210 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   containerManager.updateInstanceFleetDbReplica(instance.id, null);
   lastErrors.delete(instance.id);
   return { success: true };
+}
+/**
+ * Stop pinning the fleet database on a node that no longer hosts it. A worker
+ * is not told its database by the manager at all: the master delivers it on
+ * register and the bot persists it in data/.env. Leaving the old values in the
+ * manager env would pin them into the container, where they outrank data/.env,
+ * so the master's delivery could never take effect and this node could never
+ * pair-promote later (its own promote refuses on exactly that pin). DATA_BACKEND
+ * goes too, otherwise the next rebuild reads it with no URL beside it and mints
+ * a fresh sidecar for a node that just stopped having one.
+ */
+function retireFleetDbEnvPins(botId: string): void {
+  for (const key of ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL']) {
+    envManager.deleteEnvVar(botId, key);
+    containerManager.removeBotEnvVars(botId, [key]);
+    containerManager.removeEnvKeyFromDeployedCompose(botId, key);
+  }
+}
+
+/**
+ * Heal a stale primary (PLAN_REPLICATION.md Stage 5): the machine that used to
+ * serve the fleet database comes back after the pair failed over to the other
+ * one, and its copy is a fork nobody may ever read again. This turns it into an
+ * ordinary standby of the new primary, so the whole fleet is back to one
+ * database with one copy and failback is the normal planned handover.
+ *
+ * Re-seed rather than pg_rewind: a rewind needs data checksums or
+ * wal_log_hints on the target, and a managed sidecar is initdb'd with neither,
+ * so the lane would be dead code. Both paths discard the diverged tail anyway
+ * (R6 calls the whole re-seed a convenience over the bot-side fence).
+ *
+ * The instance must be STOPPED: this deletes the database it is running on.
+ */
+export function reseedStalePrimary(
+  instance: InstanceConfig,
+  primaryDsn: string,
+  certPem: string,
+  publicHost: string,
+  hostPort?: number,
+): { success: boolean; error?: string; started?: boolean } {
+  if (!instance.fleetDb) {
+    return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
+  }
+  if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
+  if (provisioning.has(instance.id)) return { success: false, error: 'Provisioning is already running' };
+  const busyOp = containerManager.isBotBusy(instance.id);
+  if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  if (instance.status === 'running') {
+    return { success: false, error: 'Stop the instance first: re-seeding deletes the database it is currently running on' };
+  }
+  if (!containerManager.deployedComposeExists(instance.id)) {
+    return { success: false, error: 'Install/build the instance first - the standby joins its compose project' };
+  }
+
+  const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
+  if (!validated.ok) return { success: false, error: validated.error };
+  const { dsn: parsedDsn, port } = validated.intake;
+  // This instance's own primary record is exempt: its port frees up the moment
+  // the retire below runs, and reusing it is the normal outcome.
+  const collision = containerManager.getAllBots().find(other =>
+    other.id !== instance.id
+    && (other.fleetDb?.replication?.hostPort === port || other.fleetDbReplica?.hostPort === port));
+  if (collision) {
+    return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
+  }
+  // Includes this instance deliberately: pasting its OWN block would seed a
+  // standby from the very database that is about to be deleted.
+  const samehost = containerManager.getAllBots().find(other => {
+    const repl = other.fleetDb?.replication;
+    return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
+  });
+  if (samehost) {
+    return {
+      success: false,
+      error: samehost.id === instance.id
+        ? 'That block is this instance\'s OWN database, which is the stale one. Paste the block from the machine that now serves the fleet'
+        : `That primary ("${samehost.displayName}") lives on THIS machine - a replica here would die with it. Re-seed from the machine that now serves the fleet`,
+    };
+  }
+
+  startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, async () => {
+    // Stopping the instance took its whole compose project down, so the
+    // database has to come back up alone to be dumped at all. Best effort, and
+    // deliberately not fatal: a database that will not start cannot be dumped,
+    // and the operator has already accepted losing the diverged tail. The dump
+    // is a safety net, not a precondition.
+    const started = await containerManager.startFleetDbSidecar(instance.id);
+    const dump = started.success
+      ? await fleetBackup.runFleetDump(instance, 'pre-reseed-')
+      : { success: false, error: started.error };
+    if (!dump.success) {
+      console.warn(`[FleetReplica] Could not dump the stale primary before re-seeding ${instance.id}: ${dump.error}`);
+    }
+    const retired = await containerManager.retireFleetDbSidecar(instance.id);
+    if (!retired.success) throw new Error(`could not retire the stale database: ${retired.error}`);
+    // BEFORE the seed: if the seed then fails, this node is an ordinary worker
+    // that will take the live fleet database from the master's next delivery
+    // and merely lacks a standby, which beats staying pinned to a database
+    // that was just deleted.
+    retireFleetDbEnvPins(instance.id);
+  });
+  return { success: true, started: true };
+}
+
+/**
+ * The fleet database password, for an instance whose manager env store has
+ * none. A worker is never told the URL by the manager: the master delivers it
+ * on register and the bot persists it in its own data/.env, so that file is
+ * the only place this machine's copy of the fleet credentials exists.
+ */
+function fleetPasswordFromBotEnv(botId: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(getDataPath(botId), '.env'), 'utf-8');
+  } catch {
+    return null;
+  }
+  for (const line of raw.split('\n')) {
+    const match = /^\s*DATA_BACKEND_URL\s*=\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const value = match[1].trim().replace(/^["']|["']$/g, '');
+    try {
+      const password = decodeURIComponent(new URL(value).password);
+      if (password) return password;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Adopt a promoted standby as this machine's fleet database
+ * (PLAN_REPLICATION.md Stage 5). This is the other half of the stale-primary
+ * re-seed: after a pair promotion the bot serves its local copy, but the
+ * manager still files it as somebody else's standby, so the machine that just
+ * became the primary offers no replication surface and cannot hand out the
+ * copy block the old machine needs. Without this, the re-seed has no source.
+ *
+ * Enabling replication straight away is not an extra: it mints the slot a
+ * pg_basebackup needs, rewrites the stored URL to this machine's endpoint
+ * (the bot already repointed itself through /data/.env, so the manager's copy
+ * was the stale one), and is what keeps a rebuild recognising the sidecar as
+ * managed rather than external.
+ */
+export async function adoptPromotedReplica(
+  instance: InstanceConfig,
+): Promise<{ success: boolean; error?: string; restartRequired?: boolean }> {
+  const rec = instance.fleetDbReplica;
+  if (!rec) return { success: false, error: 'This instance has no standby to adopt' };
+  if (instance.fleetDb) return { success: false, error: 'This instance already hosts a fleet database' };
+  if (provisioning.has(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
+  const busyOp = containerManager.isBotBusy(instance.id);
+  if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+
+  const status = await getFleetReplicaStatus(instance);
+  if (!status.live?.running) {
+    return { success: false, error: 'The standby container is not running, so it cannot be adopted; start the instance first' };
+  }
+  // Adopting a copy that still follows somebody would file a standby as a
+  // primary and invite a second Enable to fork the pair.
+  if (status.live.inRecovery !== false) {
+    return { success: false, error: 'This copy is still following a primary, so it is not this machine\'s database yet. Promote this node first (its own web UI), then adopt' };
+  }
+
+  // A worker's manager env store carries no database URL, so the managed-lane
+  // checks (and the password enableFleetReplication needs) have nothing to read
+  // until this instance is filed like any other database host.
+  const password = (() => {
+    const current = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+    if (current !== '') {
+      try { return decodeURIComponent(new URL(current).password) || null; } catch { return null; }
+    }
+    return fleetPasswordFromBotEnv(instance.id);
+  })();
+  if (!password) {
+    return { success: false, error: 'Could not recover the fleet database credentials from this instance (neither the manager env nor the bot data/.env carries a usable DATA_BACKEND_URL), so the database cannot be adopted' };
+  }
+
+  const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id);
+  if (!adopted.success) return adopted;
+  const live = containerManager.getBot(instance.id);
+  if (!live) return { success: false, error: 'Bot not found after adopting the record' };
+
+  // The container-name form first, deliberately: it is what marks the sidecar
+  // MANAGED, so a rebuild landing between here and the enable below still keeps
+  // the database in the compose. The enable rewrites it to the public form.
+  envManager.setEnvVars(instance.id, {
+    DATA_BACKEND: 'postgres',
+    DATA_BACKEND_URL: `postgresql://smdb:${encodeURIComponent(password)}@${rec.containerName}:5432/smdb`,
+  });
+
+  const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort);
+  if (!enabled.success) {
+    // Leave the adopted record in place: the database IS this machine's now,
+    // and the operator can retry Enable from the replication section. Rolling
+    // the record back would hide a live primary behind a standby surface again.
+    return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
+  }
+  // enableFleetReplication repoints DATA_BACKEND_URL; the control store URL
+  // only exists when the topology splits them, and then it moves too.
+  const stored = envManager.getEnvVars(instance.id);
+  if ((stored['CONTROL_STORE_URL'] || '').trim() !== '') {
+    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: (stored['DATA_BACKEND_URL'] || '').trim() });
+  }
+  return { success: true, restartRequired: true };
 }

@@ -13,6 +13,7 @@ import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
+import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 
@@ -106,6 +107,9 @@ async function main(): Promise<void> {
   // Start fleet Postgres sidecar backup scheduler
   startFleetBackupScheduler();
 
+  // Start the replication health sampler (feeds the instance list's badges)
+  startFleetReplicationHealth();
+
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
   startStateReconciler(() => wss.clients.size);
 }
@@ -116,6 +120,7 @@ process.on('SIGTERM', () => {
   stopSourceUpdater();
   stopInstanceUpdater();
   stopFleetBackupScheduler();
+  stopFleetReplicationHealth();
   stopStateReconciler();
   process.exit(0);
 });

@@ -295,7 +295,14 @@ async function cachedReachability(instance: InstanceConfig): Promise<{ ok: boole
   return { ...result, ageSeconds: 0 };
 }
 
-export async function getFleetReplicationStatus(instance: InstanceConfig): Promise<FleetReplicationStatus> {
+/**
+ * opts.probeEndpoint false skips the reachability run: the background health
+ * sampler wants the database probe only and must not spawn a container per tick.
+ */
+export async function getFleetReplicationStatus(
+  instance: InstanceConfig,
+  opts: { probeEndpoint?: boolean } = {},
+): Promise<FleetReplicationStatus> {
   const repl = instance.fleetDb?.replication;
   if (!repl) return { enabled: false };
   const status: FleetReplicationStatus = {
@@ -330,7 +337,7 @@ export async function getFleetReplicationStatus(instance: InstanceConfig): Promi
     } catch { /* no standbys */ }
     status.live = { sslOn: sslOn === 'on', slotActive: slotActive === 't', standbys };
   }
-  status.reachability = await cachedReachability(instance);
+  if (opts.probeEndpoint !== false) status.reachability = await cachedReachability(instance);
   return status;
 }
 

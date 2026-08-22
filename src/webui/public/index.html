@@ -595,6 +595,7 @@
       padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600;
       background: var(--warning-bg); color: var(--warning);
     }
+    .update-badge.danger { background: var(--danger-bg); color: var(--danger); }
     .source-tag {
       font-size: 0.72rem; color: var(--text-muted); margin-top: 2px;
     }
@@ -1342,6 +1343,13 @@
               ? `<span class="update-badge" title="${escapeHtml(fb.lastError ? `Last database backup failed: ${fb.lastError}` : 'No database backup in over 36 hours')}">DB backup ${fb.lastError ? 'failed' : 'stale'}</span>`
               : '';
 
+            // Replication health: sampled in the background, so the badge is a
+            // cached verdict rather than a probe on every render.
+            const rh = bot.replicationHealth;
+            const replWarnBadge = rh && rh.severity !== 'ok'
+              ? `<span class="update-badge${rh.severity === 'error' ? ' danger' : ''}" title="${escapeHtml(rh.message)}">${rh.role === 'primary' ? 'Replication' : 'Standby'} ${rh.severity === 'error' ? 'broken' : 'warning'}</span>`
+              : '';
+
             // Fetch vs Update: show Fetch when the bot is up to date and its source still exists
             const hasValidSource = isGit && bot.sourceId && sources.some(s => s.id === bot.sourceId);
             const showFetch = !bot.updateAvailable && hasValidSource;
@@ -1415,7 +1423,7 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${fbWarnBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${fbWarnBadge}${replWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
@@ -2305,10 +2313,12 @@
         content.innerHTML = `
           <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
+          <div id="fleet-past-backups"></div>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
           </div>`;
         renderFleetReplica(botId);
+        renderPastFleetBackups(botId);
         return;
       }
 
@@ -2383,11 +2393,22 @@
           </div>`;
         return;
       }
+      const stopped = (bots.find(b => b.id === botId) || {}).status !== 'running';
       const live = r.live;
       const standbys = (live && live.standbys) || [];
+      // A standby that stopped streaming is a silent loss of the whole point of
+      // replication, so it reads as an error rather than a status line.
       const standbyHtml = standbys.length === 0
-        ? '<div class="env-tip">No standby attached yet. Use the block below on the backup master\'s machine.</div>'
-        : standbys.map(s => `<div class="env-tip">Standby ${escapeHtml(s.clientAddr || '?')}: ${escapeHtml(s.state || '?')}${s.replayLagSeconds != null ? `, replay lag ${s.replayLagSeconds.toFixed(1)}s` : ''}</div>`).join('');
+        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take the fleet database with it. Use the block below on the backup master's machine.</div>`
+        : standbys.map(s => {
+            const lag = s.replayLagSeconds;
+            const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
+            if (s.state !== 'streaming') {
+              return `<div class="error-message">Standby ${escapeHtml(s.clientAddr || '?')} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale. Re-seed it from the backup master's manager.</div>`;
+            }
+            const warn = lag != null && lag > 60;
+            return `<div class="env-tip" style="color:var(--${warn ? 'warning' : 'success'});">Standby ${escapeHtml(s.clientAddr || '?')}: streaming${lagText}${warn ? ' - a failover now would lose that much' : ''}</div>`;
+          }).join('');
       const block = res.block;
       const reach = r.reachability;
       const reachHtml = !live ? ''
@@ -2411,7 +2432,23 @@
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
-        </div>`;
+        </div>
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
+          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
+          ${stopped ? `
+          <div class="form-group"><label>New primary's replication DSN</label>
+            <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/smdb?sslmode=verify-full"></div>
+          <div class="form-group"><label>New primary's certificate (PEM)</label>
+            <textarea id="reseed-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="reseed-host" value="${escapeHtml(r.publicHost || '')}" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="number" id="reseed-port" value="${r.hostPort || ''}" placeholder="15432" min="1" max="65535" style="flex:1;">
+            <button class="btn btn-danger btn-small" onclick="reseedStalePrimary('${botId}')">Re-seed as standby</button>
+          </div>`
+          : '<div class="env-tip" style="color:var(--warning);">Stop the instance to re-seed: this deletes the database it is currently running on.</div>'}
+        </div>
+        `;
     }
 
     async function enableFleetReplication(botId) {
@@ -2471,6 +2508,29 @@
     // ─── Fleet DB standby replica (worker side, PLAN_REPLICATION.md Stage 2) ───
     let replicaPollSeq = 0;
 
+
+    // A healed stale primary keeps its old dumps (the pre-reseed one above all),
+    // but no longer has the backups surface that used to list them.
+    async function renderPastFleetBackups(botId) {
+      const body = document.getElementById('fleet-past-backups');
+      if (!body || fleetBackupBotId !== botId) return;
+      let backups = [];
+      try {
+        const res = await api('GET', `/bots/${botId}/fleet-backups`);
+        if (res.success && Array.isArray(res.backups)) backups = res.backups;
+      } catch (err) { return; }
+      if (!body.isConnected || fleetBackupBotId !== botId || backups.length === 0) return;
+      body.innerHTML = `
+        <div class="env-group" style="margin-top:14px;">
+          <div class="env-group-title">Earlier database backups</div>
+          <div class="env-tip">Dumps taken while this instance hosted the fleet database, including the one taken just before it was re-seeded. Kept for recovery; restoring them needs a machine that hosts the database.</div>
+          ${backups.map(b => `
+            <div class="env-row" style="align-items:center;">
+              <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
+              <span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">${formatBackupSize(b.size)} - ${new Date(b.mtime).toLocaleString()}</span>
+            </div>`).join('')}
+        </div>`;
+    }
     async function renderFleetReplica(botId) {
       const body = document.getElementById('fleet-replica-body');
       if (!body || fleetBackupBotId !== botId) return;
@@ -2512,11 +2572,17 @@
       const live = r.live || {};
       const lagText = live.caughtUp === true ? ', caught up'
         : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
+      // Every branch above the last means this copy has stopped protecting the
+      // fleet, which must not read as an ordinary status line.
+      const laggingBehind = live.caughtUp !== true && live.replayLagSeconds != null && live.replayLagSeconds > 60;
       const stateHtml = !live.running
-        ? '<div class="env-tip" style="color:var(--warning);">Standby container is not running</div>'
+        ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
         : live.inRecovery === false
-          ? '<div class="env-tip" style="color:var(--warning);">This database is NOT in recovery: it has been promoted and no longer follows the primary</div>'
-          : `<div class="env-tip" style="color:${live.receiverStatus === 'streaming' ? 'var(--success)' : 'var(--warning)'};">Receiver: ${escapeHtml(live.receiverStatus || 'not connected')}${lagText}</div>`;
+          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>
+             <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
+          : live.receiverStatus !== 'streaming'
+            ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
+            : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
       body.innerHTML = `
         ${errHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
@@ -2547,6 +2613,44 @@
       renderFleetReplica(botId);
     }
 
+
+    async function reseedStalePrimary(botId) {
+      const primaryDsn = (document.getElementById('reseed-dsn')?.value || '').trim();
+      const cert = (document.getElementById('reseed-cert')?.value || '').trim();
+      const host = (document.getElementById('reseed-host')?.value || '').trim();
+      const portRaw = (document.getElementById('reseed-port')?.value || '').trim();
+      if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, demote the bot from its own web UI so it rejoins the fleet as a worker instead of trying to claim it again.')) return;
+      const payload = { primaryDsn, cert, publicHost: host };
+      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-reseed`, payload);
+        // Failure keeps the form (and everything pasted into it) intact.
+        if (!res.success) { showMessage('error', res.error || 'Failed to start re-seeding'); return; }
+        showMessage('success', 'Re-seeding started');
+      } catch (err) {
+        showMessage('error', 'Failed to start re-seeding');
+        return;
+      }
+      hideFleetBackups();
+      loadBots();
+    }
+
+    async function adoptPromotedReplica(botId) {
+      if (!confirm('Adopt this database as this machine\'s fleet database?\n\nUse this after this node was promoted and now serves the fleet. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
+        if (res.success) {
+          showMessage('success', 'Adopted. Restart the instance to apply, then copy the replica block to the other machine.');
+        } else {
+          showMessage('error', res.error || 'Failed to adopt the database');
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to adopt the database');
+      }
+      hideFleetBackups();
+      loadBots();
+    }
     async function removeFleetReplica(botId) {
       if (!confirm('Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps a replication slot for this standby that retains WAL until you disable replication there (or provision a new replica). Do that soon after removing.')) return;
       try {

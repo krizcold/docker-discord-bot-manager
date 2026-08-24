@@ -1503,7 +1503,10 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     // fleet's own (same database, byte-copied auth); the bot splices them in.
     if (instance.fleetDbReplica) {
       const replica = instance.fleetDbReplica;
-      env.FLEET_DB_REPLICA_URL = `postgresql://${replica.containerName}:5432/smdb`;
+      // no-verify: the byte-copied PGDATA carries the primary's authored
+      // pg_hba (non-TLS only from 172.16/12) and ssl=on, so TLS keeps this
+      // dialable from any docker subnet (custom address pools included).
+      env.FLEET_DB_REPLICA_URL = `postgresql://${replica.containerName}:5432/smdb?sslmode=no-verify`;
       // What the FLEET dials once this pair is promoted: the same canonical
       // shape the primary publishes, so cross-host workers keep working and
       // the container-name URL above never escapes this machine.

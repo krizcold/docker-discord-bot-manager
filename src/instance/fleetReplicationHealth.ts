@@ -109,11 +109,15 @@ async function runTick(): Promise<void> {
     const isReplica = !!instance.fleetDbReplica;
     if (!isPrimary && !isReplica) continue;
     live.add(instance.id);
-    // A stopped instance is an operator decision, not a broken link: report the
-    // role without a warning rather than crying wolf over a deliberate stop.
-    if (instance.status !== 'running') {
+    // A stopped PRIMARY instance is an operator decision, not a broken link
+    // (compose down takes its sidecar with it): report the role without a
+    // warning rather than crying wolf. A REPLICA outlives its instance (it is
+    // provisioned before the first start and only compose down removes it), so
+    // its standby is sampled regardless - a dead standby must never hide
+    // behind a stopped instance (drill R-5, finding F2).
+    if (isPrimary && instance.status !== 'running') {
       cache.set(instance.id, {
-        role: isPrimary ? 'primary' : 'replica',
+        role: 'primary',
         severity: 'ok',
         message: 'Instance is stopped',
         lagSeconds: null,

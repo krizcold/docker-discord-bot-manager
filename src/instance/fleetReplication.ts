@@ -8,11 +8,14 @@
  * PGDATA via docker exec, so it survives container recreation and needs no
  * compose changes beyond the published port (synced on every start).
  *
- * The stored DATA_BACKEND_URL is rewritten to the host-reachable canonical form
- * so the same URL works for cross-host workers and after a failover. sslmode=
- * no-verify is the node-postgres spelling for "encrypt, pinned trust comes
- * later" (pg-connection-string treats bare `require` as verify-against-CAs,
- * which a self-signed cert fails); the replication DSN for libpq consumers uses
+ * The stored DATA_BACKEND_URL keeps the container-name form: the host-reachable
+ * canonical form cannot hairpin from containers sharing a docker network with
+ * the sidecar (F1), and that includes this instance's own bot. The canonical
+ * form rides DATA_BACKEND_PUBLIC_URL instead; the master delivers both and
+ * each worker picks the one it can resolve. sslmode=no-verify is the
+ * node-postgres spelling for "encrypt, pinned trust comes later"
+ * (pg-connection-string treats bare `require` as verify-against-CAs, which a
+ * self-signed cert fails); the replication DSN for libpq consumers uses
  * verify-full with the cert delivered alongside it.
  */
 
@@ -142,7 +145,7 @@ async function ensureServerCert(containerName: string, publicHost: string, certH
 /**
  * Enable (or update host/port of) the replication posture. Idempotent: the
  * replication password and slot survive re-enables; only the operator-provided
- * host/port move. The published port and the rewritten URL apply on the next
+ * host/port move. The published port and the public-URL env apply on the next
  * instance restart.
  */
 export async function enableFleetReplication(
@@ -205,9 +208,21 @@ export async function enableFleetReplication(
     publicHost: host,
     certHost: host,
   };
-  const newUrl = canonicalFleetUrl(instance, replication, dbPassword);
-  envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: newUrl });
-  containerManager.updateInstanceFleetDbReplication(instance.id, replication, newUrl);
+  // F1: the stored URL stays the container-name form (the public form cannot
+  // hairpin from containers sharing a docker network with the sidecar, which
+  // includes this instance's own bot). The public form rides a separate env
+  // var; the master delivers both and each worker picks by resolvability.
+  // TLS on the local form too (ssl=on just activated): the authored pg_hba
+  // accepts non-TLS only from 172.16/12, and a docker daemon with custom
+  // address pools allocates outside it; hostssl covers every subnet.
+  const localUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
+  const publicUrl = canonicalFleetUrl(instance, replication, dbPassword);
+  // Both stores, deliberately: the env store is what the editor reads, but the
+  // deployed compose env is built from the instance record, so a key missing
+  // there never reaches the container.
+  envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: localUrl, DATA_BACKEND_PUBLIC_URL: publicUrl });
+  await containerManager.updateBot(instance.id, { envVars: { DATA_BACKEND_PUBLIC_URL: publicUrl } });
+  containerManager.updateInstanceFleetDbReplication(instance.id, replication, localUrl);
   return { success: true, restartRequired: true, certRotated };
 }
 
@@ -245,8 +260,13 @@ export async function disableFleetReplication(
     return { success: false, error: `slot drop failed (nothing was disabled; retry after stopping the standby): ${drop.stderr.trim()}` };
   }
 
-  const revertUrl = sidecarUrl(instance, dbPassword);
+  // ssl=on and the authored pg_hba survive the disable, so the local form
+  // keeps TLS (see the enable-side note on custom address pools).
+  const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: revertUrl });
+  envManager.deleteEnvVar(instance.id, 'DATA_BACKEND_PUBLIC_URL');
+  containerManager.removeBotEnvVars(instance.id, ['DATA_BACKEND_PUBLIC_URL']);
+  containerManager.removeEnvKeyFromDeployedCompose(instance.id, 'DATA_BACKEND_PUBLIC_URL');
   containerManager.updateInstanceFleetDbReplication(instance.id, null, revertUrl);
   return { success: true, restartRequired: true };
 }
@@ -262,8 +282,8 @@ export interface FleetReplicationStatus {
     standbys: Array<{ clientAddr: string; state: string; replayLagSeconds: number | null }>;
   };
   /** Can a container on the default bridge reach the published endpoint (the
-   * same hairpin path the bot itself uses after the URL rewrite)? Catches
-   * firewall/hairpin traps BEFORE the operator restarts into them. */
+   * path a REMOTE worker's delivery hands out)? Catches firewall traps before
+   * a cross-host standby is pointed at a dead port. */
   reachability?: { ok: boolean; error?: string; ageSeconds: number };
 }
 

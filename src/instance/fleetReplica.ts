@@ -385,7 +385,7 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
  * a fresh sidecar for a node that just stopped having one.
  */
 function retireFleetDbEnvPins(botId: string): void {
-  for (const key of ['DATA_BACKEND', 'DATA_BACKEND_URL', 'CONTROL_STORE_URL']) {
+  for (const key of ['DATA_BACKEND', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'CONTROL_STORE_URL']) {
     envManager.deleteEnvVar(botId, key);
     containerManager.removeBotEnvVars(botId, [key]);
     containerManager.removeEnvKeyFromDeployedCompose(botId, key);
@@ -513,7 +513,7 @@ function fleetPasswordFromBotEnv(botId: string): string | null {
  * copy block the old machine needs. Without this, the re-seed has no source.
  *
  * Enabling replication straight away is not an extra: it mints the slot a
- * pg_basebackup needs, rewrites the stored URL to this machine's endpoint
+ * pg_basebackup needs, files this machine's endpoint as the public form
  * (the bot already repointed itself through /data/.env, so the manager's copy
  * was the stale one), and is what keeps a rebuild recognising the sidecar as
  * managed rather than external.
@@ -559,7 +559,8 @@ export async function adoptPromotedReplica(
 
   // The container-name form first, deliberately: it is what marks the sidecar
   // MANAGED, so a rebuild landing between here and the enable below still keeps
-  // the database in the compose. The enable rewrites it to the public form.
+  // the database in the compose. The enable keeps it and adds the public form
+  // beside it (F1: same-host consumers cannot dial the public form).
   envManager.setEnvVars(instance.id, {
     DATA_BACKEND: 'postgres',
     DATA_BACKEND_URL: `postgresql://smdb:${encodeURIComponent(password)}@${rec.containerName}:5432/smdb`,

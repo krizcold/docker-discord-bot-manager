@@ -24,6 +24,7 @@ import * as containerManager from '../docker/containerManager';
 import { generateCertPair } from './fleetReplication';
 import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
+import { ensureRsyncDaemon, RECOVERY_CONTROL_PORT } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 
 const DEFAULT_TUNNEL_PORT = 15433;
@@ -57,6 +58,13 @@ async function selfImage(): Promise<{ ok: boolean; image?: string; error?: strin
     return { ok: false, error: 'Could not resolve the manager image from its own container (set RECOVERY_RELAY_IMAGE when running the manager outside docker)' };
   }
   return { ok: true, image: inspect.stdout.trim() };
+}
+
+/** The manager's own container name: the dialer's control lane targets it over the shared network, so the receiver can drive the source-side sequencing (RC-3). */
+async function selfContainerName(): Promise<string | null> {
+  const inspect = await docker(['inspect', '--format', '{{.Name}}', os.hostname()]);
+  const name = inspect.ok ? inspect.stdout.trim().replace(/^\//, '') : '';
+  return name || null;
 }
 
 /**
@@ -105,21 +113,33 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
       '-e', `RELAY_TUNNEL_PORT=${TUNNEL_CONTAINER_PORT}`,
       '-e', `RELAY_TLS_KEY=${record.tlsKey}`,
       '-e', `RELAY_TLS_CERT=${record.tlsCert}`,
-      '-e', `RELAY_LANES=postgres:${LANE_POSTGRES_PORT},rsync:${LANE_RSYNC_PORT}`);
+      '-e', `RELAY_LANES=postgres:${LANE_POSTGRES_PORT},rsync:${LANE_RSYNC_PORT},control:${RECOVERY_CONTROL_PORT}`);
   } else {
+    const managerName = await selfContainerName();
+    if (!managerName) return { ok: false, error: 'Could not resolve the manager container name for the control lane' };
     args.push(
       '-e', 'RELAY_MODE=dial',
       '-e', 'RELAY_SELF_ROLE=source',
       '-e', `RELAY_ENDPOINT=${record.endpointHost}:${record.endpointPort}`,
       '-e', `RELAY_TLS_SERVERNAME=${record.endpointHost}`,
       '-e', `RELAY_PIN_CERT=${record.pinCert}`,
-      '-e', `RELAY_LANES=postgres:${fleetDb.containerName}:5432,rsync:${rsyncContainerName(instance)}:${LANE_RSYNC_PORT}`);
+      '-e', `RELAY_LANES=postgres:${fleetDb.containerName}:5432,rsync:${rsyncContainerName(instance)}:${LANE_RSYNC_PORT},control:${managerName}:${RECOVERY_CONTROL_PORT}`);
   }
   args.push(image.image!, 'node', '/app/dist/recovery/relay.js');
 
   await docker(['rm', '-f', record.containerName]);
   const run = await docker(args);
   if (!run.ok) return { ok: false, error: `could not start the relay container: ${run.stderr.trim().split('\n').pop()}` };
+  if (record.mode === 'source') {
+    // The seed daemon belongs to the armed state: arm = fully ready to serve
+    // the rescue, disarm/delete already remove it by name.
+    const daemon = await ensureRsyncDaemon(instance, image.image!, network.network!);
+    if (!daemon.ok) {
+      await docker(['rm', '-f', record.containerName]);
+      await docker(['rm', '-f', rsyncContainerName(instance)]);
+      return { ok: false, error: daemon.error };
+    }
+  }
   return { ok: true };
 }
 
@@ -326,6 +346,7 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
 export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const record = instance.recoveryChannel;
   if (!record) return { success: false, error: 'No recovery channel is armed on this instance' };
+  if (instance.recoveryRescue) return { success: false, error: 'A rescue is using this channel; cancel it first' };
   // Same gate as arming: a reconciler tick mid-flight would otherwise respawn
   // the helper right after the rm, leaving a live tunnel with no record.
   if (arming.has(instance.id)) return { success: false, error: 'An arm request is running for this instance; retry in a moment' };
@@ -338,6 +359,21 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       const rm = await docker(['rm', '-f', name]);
       if (!rm.ok && !/no such container/i.test(rm.stderr)) {
         return { success: false, error: `could not remove ${name}: ${rm.stderr.trim().split('\n').pop()}` };
+      }
+    }
+    // Source side: the rescue's reserved slot must not keep retaining WAL
+    // after consent is revoked. The walsender may outlive the relay rm by a
+    // moment, so terminate it first and retry the drop once - nothing ever
+    // drops this slot again after the record clears below.
+    if (record.mode === 'source' && instance.fleetDb) {
+      const fleetDb = instance.fleetDb;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+          "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"]);
+        const drop = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+          "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'recovery_channel'"]);
+        if (drop.ok) break;
+        await new Promise(resolve => setTimeout(resolve, 2_000));
       }
     }
     containerManager.updateInstanceRecoveryChannel(instance.id, null);

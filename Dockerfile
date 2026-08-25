@@ -29,8 +29,9 @@ FROM node:20-alpine
 # provides BuildKit support, required to build Dockerfiles that use
 # `RUN --mount=...`; without it those builds fall back to the legacy builder
 # and fail. openssl generates the fleet database's pinned replication certs
-# (the postgres:16-alpine sidecar has no openssl CLI of its own).
-RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git openssl
+# (the postgres:16-alpine sidecar has no openssl CLI of its own). rsync powers
+# the recovery channel's resumable seed (its helper containers run this image).
+RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git openssl rsync
 
 # Trust any repository we operate on (bind-mounted source repos may have
 # mismatched UIDs after CasaOS post-deploy chown). Scoped to this image only.

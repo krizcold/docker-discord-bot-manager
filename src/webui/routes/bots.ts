@@ -20,6 +20,7 @@ import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
 import * as recoveryChannel from '../../instance/recoveryChannel';
+import * as recoveryRescue from '../../instance/recoveryRescue';
 import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
@@ -1494,6 +1495,51 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await recoveryChannel.disarmRecoveryChannel(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET/POST/DELETE /api/bots/:id/recovery-rescue - The receiver-side rescue
+   * (RC-3). POST {confirm?} starts or continues it; without confirm it
+   * answers needsConfirm + fresh/outdated + the source identity so the UI can
+   * show the right sentence. DELETE cancels (the volume stays as-is).
+   */
+  router.get('/:id/recovery-rescue', (req: Request, res: Response) => {
+    const bot = containerManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+    res.json({ success: true, rescue: recoveryRescue.getRescueStatus(bot) });
+  });
+
+  router.post('/:id/recovery-rescue', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await recoveryRescue.startRescue(bot, req.body?.confirm === true);
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.delete('/:id/recovery-rescue', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await recoveryRescue.cancelRescue(bot);
       if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
       res.json(result);
     } catch (error) {

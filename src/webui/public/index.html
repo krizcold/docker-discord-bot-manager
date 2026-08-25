@@ -2564,6 +2564,11 @@
           </div>`;
         return;
       }
+      let rescue = null;
+      if (ch.mode === 'receiver') {
+        try { const rr = await api('GET', `/bots/${botId}/recovery-rescue`); rescue = rr && rr.rescue; } catch (err) { /* section renders without it */ }
+        if (!body.isConnected || fleetBackupBotId !== botId) return;
+      }
       const live = ch.live;
       const mb = n => (n / 1048576).toFixed(1);
       const stateHtml = ch.containerRunning === false
@@ -2582,9 +2587,69 @@
         </div>
         <input type="hidden" id="rc-arm-block" value="${escapeHtml(JSON.stringify(ch.block))}">
         <div class="env-tip">Paste it into "Arm sender" on the machine that holds the good database.</div>` : ''}
+        ${ch.mode === 'receiver' ? renderRescueBlock(botId, rescue) : ''}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disarmRecoveryChannel('${botId}')">Disarm this side</button>
         </div>`;
+    }
+
+    function renderRescueBlock(botId, rescue) {
+      if (!rescue) {
+        return `
+        <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
+          <div class="env-tip">Pulls the database from the sender machine through the tunnel: a resumable bulk copy while the sender keeps serving, then a short consistent pass, then this copy follows the sender as a live standby until you swap.</div>
+          <button class="btn btn-danger btn-small" onclick="startRecoveryRescue('${botId}')">Start rescue</button>
+        </div>`;
+      }
+      const phaseText = rescue.parked
+        ? `PARKED at ${rescue.phase} - fix the cause, then Continue to re-enter that phase`
+        : {
+          preflight: 'Preflight: dumping the stale copy before the overwrite',
+          bulk: 'Bulk copy: resumable rsync of the live database (the sender keeps serving)',
+          consistent: 'Consistent pass: short delta inside backup mode',
+          standby: 'Turning the copy into a live standby of the sender',
+          streaming: rescue.caughtUp ? 'Streaming: CAUGHT UP - ready to swap' : `Streaming: catching up${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB behind)` : ''}`,
+        }[rescue.phase] || rescue.phase;
+      return `
+        <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
+          <div class="env-tip" style="color:var(--${rescue.parked ? 'danger' : rescue.caughtUp ? 'success' : 'text-secondary'});">${escapeHtml(phaseText)}</div>
+          ${rescue.lastError ? `<div class="env-tip" style="color:var(--warning);">${escapeHtml(rescue.lastError)}</div>` : ''}
+          <div style="display:flex;gap:8px;">
+            ${rescue.parked ? `<button class="btn btn-primary btn-small" onclick="startRecoveryRescue('${botId}')">Continue</button>` : ''}
+            <button class="btn btn-danger btn-small" onclick="cancelRecoveryRescue('${botId}')">Cancel rescue</button>
+          </div>
+        </div>`;
+    }
+
+    async function startRecoveryRescue(botId) {
+      try {
+        let res = await api('POST', `/bots/${botId}/recovery-rescue`, {});
+        if (!res.success && res.needsConfirm) {
+          const src = res.sourceIdentity || {};
+          const sentence = res.state === 'outdated'
+            ? `Rescue INTO this machine?\n\nThis machine's database is treated as STALE: it is dumped once (kept with the backups) and then REPLACED by the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}). Anything written here after the failover is discarded.`
+            : `Rescue INTO this machine?\n\nThis machine has no fleet database yet; it will be seeded from the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}).`;
+          if (!confirm(sentence)) return;
+          res = await api('POST', `/bots/${botId}/recovery-rescue`, { confirm: true });
+        }
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue running; it survives restarts on both ends and resumes after interruptions.' : (res.error || 'Failed to start the rescue'));
+      } catch (err) {
+        showMessage('error', 'Failed to start the rescue');
+      }
+      renderRecoveryChannel(botId);
+    }
+
+    async function cancelRecoveryRescue(botId) {
+      if (!confirm('Cancel the rescue?\n\nThe copy stops where it is (a later rescue resumes incrementally). The database on this machine stays in whatever state the rescue left it.')) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/recovery-rescue`);
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue cancelled.' : (res.error || 'Failed to cancel'));
+      } catch (err) {
+        showMessage('error', 'Failed to cancel');
+      }
+      renderRecoveryChannel(botId);
     }
 
     function copyRecoveryArmBlock(btn) {

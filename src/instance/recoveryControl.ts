@@ -7,8 +7,9 @@
  * receiver) owns the whole rescue sequencing; this side only answers.
  *
  * Auth: every request carries the channel token of this instance's armed
- * source record. Narrow by construction: four routes, nothing else of the
- * manager is reachable through the lane.
+ * source record. Narrow by construction: six routes (the RC-4 swap adds
+ * quiesce + teardown), nothing else of the manager is reachable through the
+ * lane.
  *
  * The backup session is a live `docker exec -i psql` child: postgres 15+
  * aborts backup mode when the session that called pg_backup_start dies, which
@@ -152,7 +153,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     res.writeHead(code, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body));
   };
-  const match = /^\/control\/(prepare|backup-start|backup-stop|status)$/.exec(req.url || '');
+  const match = /^\/control\/(prepare|backup-start|backup-stop|status|quiesce|teardown)$/.exec(req.url || '');
   if (!match) { send(404, { success: false, error: 'unknown route' }); return; }
   const action = match[1];
   // The receiver cannot know this machine's instance ids; the channel token
@@ -247,6 +248,83 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         session.child.stdin!.end();
         setTimeout(() => session.child.kill(), 2_000).unref();
       }
+      return;
+    }
+    if (action === 'quiesce') {
+      // Swap phase 1 (RC-4): stop the SOURCE BOT so nothing writes anymore,
+      // but bring the database straight back up alone - it keeps serving the
+      // tunnel until the receiver has replayed everything and promoted.
+      // Container truth throughout: stopBot marks 'stopped' even when its
+      // compose down fails, and a stale registry status would skip the stop
+      // with the bot still writing - either way the captured LSN would fence
+      // nothing. So the stop is verified against live containers, leftovers
+      // are stopped by their exact names (label-scoped listing, never name
+      // filters), and quiesce refuses while anything survives. Idempotent:
+      // a re-entry finds everything down and just re-captures the LSN.
+      if (containerManager.getBot(instance.id)?.status === 'running') {
+        const stopped = await containerManager.stopBot(instance.id);
+        if (!stopped.success && stopped.error !== 'Bot is not running') {
+          send(500, { success: false, error: `could not stop the source instance: ${stopped.error}` });
+          return;
+        }
+      }
+      let leftovers = await containerManager.runningNonSidecarContainers(instance.id);
+      if (leftovers === null) { send(500, { success: false, error: 'could not verify the source containers stopped' }); return; }
+      if (leftovers.length > 0) {
+        for (const name of leftovers) await docker(['stop', name]);
+        leftovers = await containerManager.runningNonSidecarContainers(instance.id);
+        if (leftovers === null || leftovers.length > 0) {
+          send(500, { success: false, error: `source containers still running after the stop: ${(leftovers || ['unverifiable']).join(', ')}` });
+          return;
+        }
+      }
+      const up = await containerManager.startFleetDbSidecar(instance.id);
+      if (!up.success) { send(500, { success: false, error: `the source database did not come back up alone: ${up.error}` }); return; }
+      // Fence the DATABASE, not just this machine: fleet workers on other
+      // hosts write here directly through the published port, and a commit
+      // landing after the LSN capture would be silently discarded at promote.
+      // Read-only default (sighup applies it to every session's next
+      // transaction) plus a terminate sweep turns those writes into loud
+      // refusals; replication is untouched. Disarm resets it. The leading
+      // READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
+      // SYSTEM in read-only transactions.
+      // ON_ERROR_STOP: with a -c sequence psql otherwise keeps going and
+      // reports only the LAST command, so a failed ALTER SYSTEM under a
+      // succeeding terminate would read as a successful fence.
+      const fence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+        '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+        '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
+        '-c', 'SELECT pg_reload_conf()',
+        '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+      if (!fence.ok) { send(500, { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}` }); return; }
+      const lsn = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_current_wal_lsn()']);
+      const sourceLsn = lsn.ok ? lsn.stdout.trim() : '';
+      if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(sourceLsn)) {
+        send(500, { success: false, error: `could not capture the source end-of-WAL: ${lsn.stderr.trim().split('\n').pop() || 'empty output'}` });
+        return;
+      }
+      send(200, { success: true, sourceLsn });
+      return;
+    }
+    if (action === 'teardown') {
+      // Swap teardown (RC-4): the receiver has promoted and no longer needs
+      // this side. Answer FIRST - the response still rides the tunnel the
+      // disarm below tears down - then disarm this side exactly like the
+      // operator's button would (helpers removed, slot dropped, record
+      // cleared). Best effort by design: if it fails, the source operator
+      // disarms manually during the handback visit.
+      send(200, { success: true });
+      setTimeout(() => {
+        void (async () => {
+          const { disarmRecoveryChannel } = await import('./recoveryChannel');
+          const fresh = containerManager.getBot(instance.id);
+          if (!fresh?.recoveryChannel) return;
+          const disarmed = await disarmRecoveryChannel(fresh);
+          console.log(disarmed.success
+            ? `[RecoveryControl] Source side disarmed after the swap (${fresh.displayName})`
+            : `[RecoveryControl] Source-side disarm after the swap failed (${fresh.displayName}): ${disarmed.error}`);
+        })();
+      }, 2_000).unref();
       return;
     }
   } catch (err) {

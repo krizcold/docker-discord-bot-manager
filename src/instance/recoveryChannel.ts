@@ -161,6 +161,9 @@ export async function armReceiver(
 ): Promise<{ success: boolean; error?: string; block?: { host: string; port: number; cert: string; token: string } }> {
   if (!instance.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
   if (instance.recoveryChannel) return { success: false, error: `A recovery channel is already armed (${instance.recoveryChannel.mode}); disarm it first` };
+  // The swap's channel-less tail (teardown/flip) would otherwise accept a
+  // fresh arm that nothing could ever disarm or cancel.
+  if (instance.recoveryRescue) return { success: false, error: 'A rescue is running on this instance; let it finish (or cancel it) first' };
   if (arming.has(instance.id)) return { success: false, error: 'An arm request is already running for this instance' };
   arming.add(instance.id);
   try {
@@ -235,6 +238,7 @@ export async function armSource(
 ): Promise<{ success: boolean; error?: string }> {
   if (!instance.fleetDb) return { success: false, error: 'This instance has no managed fleet database to send (a promoted standby must be adopted first)' };
   if (instance.recoveryChannel) return { success: false, error: `A recovery channel is already armed (${instance.recoveryChannel.mode}); disarm it first` };
+  if (instance.recoveryRescue) return { success: false, error: 'A rescue is running on this instance; let it finish (or cancel it) first' };
   if (arming.has(instance.id)) return { success: false, error: 'An arm request is already running for this instance' };
   arming.add(instance.id);
   try {
@@ -346,7 +350,11 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
 export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const record = instance.recoveryChannel;
   if (!record) return { success: false, error: 'No recovery channel is armed on this instance' };
-  if (instance.recoveryRescue) return { success: false, error: 'A rescue is using this channel; cancel it first' };
+  // The swap's teardown phase is the one rescue state that disarms the
+  // channel itself (the copy is promoted and no longer streams through it).
+  if (instance.recoveryRescue && instance.recoveryRescue.phase !== 'teardown') {
+    return { success: false, error: 'A rescue is using this channel; cancel it first' };
+  }
   // Same gate as arming: a reconciler tick mid-flight would otherwise respawn
   // the helper right after the rm, leaving a live tunnel with no record.
   if (arming.has(instance.id)) return { success: false, error: 'An arm request is running for this instance; retry in a moment' };
@@ -367,6 +375,22 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
     // drops this slot again after the record clears below.
     if (record.mode === 'source' && instance.fleetDb) {
       const fleetDb = instance.fleetDb;
+      // Lift the quiesce write fence if a swap set it. The disarm button is
+      // the source's documented cleanup after a cancelled swap, so this is
+      // where the fence must reliably die: when the database container is
+      // down the exec fails and the fence is stripped from the volume file
+      // instead (auto.conf is a plain file; the next start comes up clean).
+      // The READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
+      // SYSTEM in read-only transactions.
+      const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+        '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+        '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
+        '-c', 'SELECT pg_reload_conf()']);
+      if (!unfence.ok) {
+        const strip = await docker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
+          "sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"]);
+        if (!strip.ok) console.warn(`[RecoveryChannel] Could not lift the write fence on ${fleetDb.containerName} while disarming: ${strip.stderr.trim().split('\n').pop()}`);
+      }
       for (let attempt = 0; attempt < 2; attempt++) {
         await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
           "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"]);

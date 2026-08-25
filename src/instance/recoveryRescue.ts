@@ -7,7 +7,17 @@
  * consistent (short delta pass inside pg_backup_start/stop) -> standby
  * (backup_label + standby.signal + primary_conninfo through the tunnel's
  * postgres lane on the dedicated recovery_channel slot) -> streaming (monitor
- * until caught up; RC-4's swap takes it from there).
+ * until caught up).
+ *
+ * The RC-4 swap continues on the same record when the operator triggers it:
+ * quiesce (the source bot stops; its database keeps serving the tunnel) ->
+ * catchup (replay to the source's end-of-WAL) -> promote (pg_promote, the
+ * timeline bumps) -> teardown (both channel helpers go, using the tunnel one
+ * last time to tell the source side) -> flip (this machine files the copy as
+ * its primary: credentials reconciled to the stored env, replication enabled,
+ * the fleet started). Teardown runs BEFORE the flip deliberately: the control
+ * call is the last thing that needs the tunnel, and enable's port-collision
+ * scan must not see this instance's own armed channel.
  *
  * Every phase is persisted before it runs and idempotently re-enterable: the
  * boot resume re-enters the recorded phase, the bulk rsync is delta by
@@ -19,7 +29,10 @@
 
 import { execFile } from 'child_process';
 import * as containerManager from '../docker/containerManager';
+import * as envManager from '../env/manager';
 import { runFleetDump } from './fleetBackup';
+import { enableFleetReplication } from './fleetReplication';
+import { disarmRecoveryChannel } from './recoveryChannel';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
 
 const PGDATA = '/var/lib/postgresql/data';
@@ -93,9 +106,12 @@ function saveRescue(botId: string, patch: Partial<RecoveryRescueRecord>): Recove
   return next;
 }
 
-/** Structural preconditions; failing any parks the rescue rather than retrying. */
+/** Structural preconditions; failing any parks the rescue rather than retrying. Teardown and flip run after promote and tolerate a half-gone (or gone) channel - teardown is what removes it. */
 function structurallySound(instance: InstanceConfig | null): instance is InstanceConfig {
-  return !!instance && !!instance.fleetDb && instance.recoveryChannel?.mode === 'receiver' && !!instance.recoveryRescue;
+  if (!instance || !instance.fleetDb || !instance.recoveryRescue) return false;
+  const phase = instance.recoveryRescue.phase;
+  if (phase === 'teardown' || phase === 'flip') return true;
+  return instance.recoveryChannel?.mode === 'receiver';
 }
 
 // ─── The driver ───
@@ -137,14 +153,56 @@ export async function startRescue(
   return { success: true };
 }
 
+/**
+ * Operator-triggered swap (RC-4): only from a caught-up streaming rescue.
+ * Sets the phase to quiesce; the driver takes it from there (the monitor
+ * loop notices the phase change on its next tick and hands over).
+ */
+export function startSwap(
+  instance: InstanceConfig,
+  confirm: boolean,
+): { success: boolean; error?: string; needsConfirm?: boolean } {
+  const rescue = instance.recoveryRescue;
+  if (!rescue) return { success: false, error: 'No rescue is running on this instance' };
+  if (rescue.parked) return { success: false, error: 'The rescue is parked; fix the cause and Continue it first' };
+  if (rescue.phase !== 'streaming') return { success: false, error: `The rescue is at phase ${rescue.phase}; the swap starts from a caught-up streaming standby` };
+  if (!rescue.caughtUp) return { success: false, error: 'The copy has not caught up yet; the swap starts from a caught-up standby to keep the downtime window short' };
+  if (!structurallySound(instance)) return { success: false, error: 'The channel or the database record is gone; the rescue will park' };
+  if (!confirm) return { success: false, needsConfirm: true };
+  saveRescue(instance.id, {
+    phase: 'quiesce',
+    swapPublicHost: instance.recoveryChannel!.publicHost,
+    swapTargetLsn: undefined,
+    lastError: undefined,
+  });
+  if (!running.has(instance.id)) void runRescue(instance.id);
+  return { success: true };
+}
+
 export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   if (!instance.recoveryRescue) return { success: false, error: 'No rescue is running on this instance' };
+  // Past promote there is no standby to fall back to: this copy IS the
+  // primary now, and the only way out is forward (Continue re-enters the
+  // recorded phase). Quiesce and catchup are still reversible - the copy is
+  // a standby and the source bot merely needs a manual start.
+  if (['promote', 'teardown', 'flip'].includes(instance.recoveryRescue.phase)) {
+    return { success: false, error: 'The swap is past promotion; finish it (Continue) instead of cancelling' };
+  }
   // The client must be PROVEN gone before the record clears: the start-guard
   // keys on the record, and an orphan rsync rewriting the volume under a
   // freshly started postgres is the corruption this ordering prevents.
   const rm = await docker(['rm', '-f', rsyncClientName(instance)]);
   if (!rm.ok && !/no such container/i.test(rm.stderr)) {
     return { success: false, error: `could not remove the rsync client: ${rm.stderr.trim().split('\n').pop()}` };
+  }
+  // Re-read AFTER the await: the driver can cross catchup -> promote during
+  // the docker round-trip, and clearing the record then would leave a
+  // promoted primary with no record, no guard and no teardown ever running.
+  // No await between this read and the clear, so the driver cannot interleave.
+  const fresh = containerManager.getBot(instance.id);
+  if (!fresh?.recoveryRescue) return { success: true };
+  if (['promote', 'teardown', 'flip'].includes(fresh.recoveryRescue.phase)) {
+    return { success: false, error: 'The swap advanced past promotion while cancelling; finish it (Continue) instead' };
   }
   containerManager.updateInstanceRecoveryRescue(instance.id, null);
   // A driver mid-rsyncPass may recreate the client in a narrow window; its
@@ -189,7 +247,14 @@ async function runRescue(botId: string): Promise<void> {
         else if (phase === 'bulk') await phaseBulk(instance);
         else if (phase === 'consistent') await phaseConsistent(instance);
         else if (phase === 'standby') await phaseStandby(instance);
-        else if (phase === 'streaming') { await phaseMonitor(instance); return; }
+        // continue, not return: the monitor also exits when startSwap moves
+        // the phase to quiesce, and the next iteration must dispatch it.
+        else if (phase === 'streaming') { await phaseMonitor(instance); continue; }
+        else if (phase === 'quiesce') await phaseQuiesce(instance);
+        else if (phase === 'catchup') await phaseCatchup(instance);
+        else if (phase === 'promote') await phasePromote(instance);
+        else if (phase === 'teardown') await phaseTeardown(instance);
+        else if (phase === 'flip') { await phaseFlip(instance); return; }
         else return;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -344,7 +409,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   const conninfo = `host=${channel.containerName} port=5432 user=${replicator.user} password=${replicator.password} application_name=recovery_rescue sslmode=require`;
   const config = `primary_conninfo = '${conninfo}'\nprimary_slot_name = '${prepared.body.slot}'\n`;
   const write = await volExec(fleetDb.volume,
-    `touch ${PGDATA}/standby.signal && rm -f ${PGDATA}/rescue.inprogress && sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
+    `touch ${PGDATA}/standby.signal && rm -f ${PGDATA}/rescue.inprogress && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
   const started = await containerManager.startFleetDbSidecar(instance.id);
@@ -396,5 +461,131 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
       saveRescue(instance.id, { caughtUp: false, lastError: status.error });
     }
     await sleep(MONITOR_INTERVAL_MS);
+  }
+}
+
+// ─── Swap phases (RC-4) ───
+
+const CATCHUP_POLL_MS = 5_000;
+
+/** The source bot stops (its database keeps serving the tunnel) and hands back its end-of-WAL: everything before that LSN is the database, everything after quiesce is nothing. Idempotent, so a re-entry just re-captures the LSN. */
+async function phaseQuiesce(instance: InstanceConfig): Promise<void> {
+  const quiesced = await control(instance, 'quiesce');
+  if (!quiesced.ok) throw new Error(quiesced.error);
+  const target = String(quiesced.body.sourceLsn || '');
+  if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(target)) throw new Error(`quiesce returned no end-of-WAL (${target || 'empty'})`);
+  saveRescue(instance.id, { phase: 'catchup', swapTargetLsn: target, lastError: undefined });
+}
+
+async function phaseCatchup(instance: InstanceConfig): Promise<void> {
+  const fleetDb = instance.fleetDb!;
+  const target = instance.recoveryRescue!.swapTargetLsn;
+  if (!target) { saveRescue(instance.id, { phase: 'quiesce', lastError: undefined }); return; }
+  for (;;) {
+    const fresh = containerManager.getBot(instance.id);
+    if (!structurallySound(fresh) || fresh.recoveryRescue!.phase !== 'catchup' || fresh.recoveryRescue!.parked) return;
+    const probe = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+      `SELECT pg_is_in_recovery(), GREATEST(pg_wal_lsn_diff('${target}', pg_last_wal_replay_lsn()), 0)`]);
+    if (!probe.ok) throw new Error(`standby unreachable during catchup: ${probe.stderr.trim().split('\n').pop()}`);
+    const [inRecovery, lag] = probe.stdout.trim().split('|');
+    if (inRecovery === 'f' || Number(lag) === 0) {
+      // Already out of recovery = a previous run promoted before the record
+      // advanced; the promote phase is idempotent about that.
+      saveRescue(instance.id, { phase: 'promote', lagBytes: 0, lastError: undefined });
+      return;
+    }
+    // Replay is short of the target: prove it still CAN get there. A lost
+    // slot parks (the WAL is gone, only a fresh seed recovers - and the
+    // source fleet is down, so a silent wait here is downtime forever); an
+    // unreachable source stays loud in lastError while replay retries.
+    const status = await control(fresh, 'status', 'GET');
+    if (status.ok && status.body.slotWalStatus === 'lost') {
+      saveRescue(instance.id, { parked: true, lastError: 'the recovery slot on the source was invalidated during catchup; cancel and re-run the rescue to seed fresh' });
+      return;
+    }
+    saveRescue(instance.id, { lagBytes: Number(lag) || 0, lastError: status.ok ? undefined : `replay waiting on the source: ${status.error}` });
+    await sleep(CATCHUP_POLL_MS);
+  }
+}
+
+async function phasePromote(instance: InstanceConfig): Promise<void> {
+  const fleetDb = instance.fleetDb!;
+  const state = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_is_in_recovery()']);
+  if (!state.ok) throw new Error(`standby unreachable at promote: ${state.stderr.trim().split('\n').pop()}`);
+  if (state.stdout.trim() === 't') {
+    const promoted = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_promote(true, 60)']);
+    if (!promoted.ok || promoted.stdout.trim() !== 't') {
+      throw new Error(`pg_promote failed: ${(promoted.stderr || promoted.stdout).trim().split('\n').pop() || 'timed out'}`);
+    }
+  }
+  saveRescue(instance.id, { phase: 'teardown', lastError: undefined });
+}
+
+/** Both channel helpers go. The control call is best effort (the source operator disarms manually during the handback visit if it never lands); the LOCAL disarm must succeed - a promoted primary with a listener still armed would accept a second rescue over it. */
+async function phaseTeardown(instance: InstanceConfig): Promise<void> {
+  if (instance.recoveryChannel) {
+    const bye = await control(instance, 'teardown');
+    if (!bye.ok) console.warn(`[RecoveryRescue] Source side unreachable for teardown (${instance.displayName}): ${bye.error}; disarm it manually on the source machine`);
+    const disarmed = await disarmRecoveryChannel(instance);
+    if (!disarmed.success && !/No recovery channel/i.test(disarmed.error || '')) {
+      throw new Error(`could not disarm the channel: ${disarmed.error}`);
+    }
+  }
+  saveRescue(instance.id, { phase: 'flip', lastError: undefined });
+}
+
+/**
+ * File the promoted copy as this machine's primary. The copied database
+ * carries the SOURCE's credentials; the app role's password is reconciled to
+ * this machine's stored env first (over the trust socket), so the fleet and
+ * the manager keep reading the URL they always had. Then the standby remnants
+ * go, replication is enabled (slot + copy block ready for the handback
+ * re-seed), and the fleet starts.
+ */
+async function phaseFlip(instance: InstanceConfig): Promise<void> {
+  const fleetDb = instance.fleetDb!;
+  const rescue = instance.recoveryRescue!;
+  const storedUrl = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+  let password = '';
+  try { password = decodeURIComponent(new URL(storedUrl).password); } catch { /* refused below */ }
+  if (!password) throw new Error('could not recover the database password from the stored DATA_BACKEND_URL');
+  // The leading RESET lifts a quiesce write fence the copy may have inherited
+  // (a re-rescue rsyncs a fenced source's auto.conf in): ALTER ROLE is a real
+  // catalog write and read-only refuses it, which would wedge the flip.
+  const alter = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+    '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
+    '-c', 'SELECT pg_reload_conf()',
+    '-c', `ALTER ROLE "${fleetDb.user}" WITH LOGIN PASSWORD '${password.replace(/'/g, "''")}'`]);
+  if (!alter.ok) throw new Error(`could not reconcile the database credentials: ${alter.stderr.trim().split('\n').pop()}`);
+  const clean = await docker(['exec', fleetDb.containerName, 'sh', '-c',
+    `sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf`]);
+  if (!clean.ok) throw new Error(`could not clean the standby settings: ${clean.stderr.trim().split('\n').pop()}`);
+
+  const fresh = containerManager.getBot(instance.id);
+  if (!fresh) throw new Error('instance disappeared mid-flip');
+  const host = fresh.fleetDb?.replication?.publicHost || rescue.swapPublicHost;
+  if (!host) throw new Error('no public host to enable replication with (no prior replication record and none captured at swap start)');
+  // rotateCert: the rsync passes delivered the SOURCE's server.crt/key, and a
+  // surviving certHost record would make enable keep them - then the copy
+  // block's verify-full DSN could never match and the handback re-seed dies.
+  const enabled = await enableFleetReplication(fresh, host, fresh.fleetDb?.replication?.hostPort, undefined, { rotateCert: true });
+  if (!enabled.success) throw new Error(`the copy is primary but enabling replication failed: ${enabled.error}`);
+  const stored = envManager.getEnvVars(instance.id);
+  if ((stored['CONTROL_STORE_URL'] || '').trim() !== '') {
+    // Both stores, like retireFleetDbEnvPins removes from both: the deployed
+    // compose env is built from the instance record, so an env-store-only
+    // mirror would start the fleet on the stale pinned value.
+    const controlUrl = (stored['DATA_BACKEND_URL'] || '').trim();
+    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: controlUrl });
+    await containerManager.updateBot(instance.id, { envVars: { CONTROL_STORE_URL: controlUrl } });
+  }
+
+  // The record clears BEFORE the start (the start-guard keys on it); from
+  // here the swap is complete and a failed start is an ordinary start problem.
+  containerManager.updateInstanceRecoveryRescue(instance.id, null);
+  const started = await containerManager.startBot(instance.id);
+  if (!started.success) {
+    console.warn(`[RecoveryRescue] Swap complete but the fleet did not start on ${instance.displayName}: ${started.error}; start it manually`);
   }
 }

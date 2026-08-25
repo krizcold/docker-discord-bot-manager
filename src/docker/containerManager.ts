@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, RecoveryChannelRecord,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -423,6 +423,17 @@ export function updateInstanceFleetDbReplica(botId: string, replica: FleetDbRepl
   if (!instance) return null;
   if (replica) instance.fleetDbReplica = replica;
   else delete instance.fleetDbReplica;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return instance;
+}
+
+export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryChannelRecord | null): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+  if (channel) instance.recoveryChannel = channel;
+  else delete instance.recoveryChannel;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
@@ -1078,6 +1089,13 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
       failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
     }
     console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps an orphaned replication slot that retains WAL - disable replication there or provision a new replica soon`);
+  }
+
+  // 3c. Recovery-channel helpers: never compose-managed, so nothing else
+  // removes them. The peer machine keeps redialing until disarmed there.
+  if (instance.recoveryChannel) {
+    await execAsync(`docker rm -f "${instance.recoveryChannel.containerName}"`).catch(() => { /* already gone */ });
+    await execAsync(`docker rm -f "${instance.sanitizedName}-recovery-rsyncd"`).catch(() => { /* RC-3 daemon absent */ });
   }
 
   // 4. Remove instance directory

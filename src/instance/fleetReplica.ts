@@ -253,7 +253,8 @@ export function provisionFleetReplica(
   const { dsn: parsedDsn, port } = validated.intake;
   const collision = containerManager.getAllBots().find(other =>
     other.fleetDb?.replication?.hostPort === port
-    || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port));
+    || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port)
+    || other.recoveryChannel?.tunnelPort === port);
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
@@ -433,8 +434,9 @@ export function reseedStalePrimary(
   // This instance's own primary record is exempt: its port frees up the moment
   // the retire below runs, and reusing it is the normal outcome.
   const collision = containerManager.getAllBots().find(other =>
-    other.id !== instance.id
-    && (other.fleetDb?.replication?.hostPort === port || other.fleetDbReplica?.hostPort === port));
+    (other.id !== instance.id
+      && (other.fleetDb?.replication?.hostPort === port || other.fleetDbReplica?.hostPort === port))
+    || other.recoveryChannel?.tunnelPort === port);
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }

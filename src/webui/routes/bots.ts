@@ -19,6 +19,7 @@ import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
+import * as recoveryChannel from '../../instance/recoveryChannel';
 import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, saveVault } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
@@ -1371,7 +1372,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { enabled, publicHost, hostPort } = req.body as { enabled?: boolean; publicHost?: string; hostPort?: number };
+      const { enabled, publicHost, hostPort, slotWalKeepMb } = req.body as { enabled?: boolean; publicHost?: string; hostPort?: number; slotWalKeepMb?: number };
       if (typeof enabled !== 'boolean') {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
@@ -1382,7 +1383,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
           return;
         }
-        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort);
+        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb);
       } else {
         result = await fleetReplication.disableFleetReplication(bot);
       }
@@ -1428,6 +1429,73 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET/POST/DELETE /api/bots/:id/recovery-channel - The cross-host recovery
+   * channel (PLAN_REPLICATION Section 18, RC-2). POST body picks the side:
+   * {mode:'receiver', publicHost, tunnelPort?} arms the listener and returns
+   * the arm block; {mode:'source', host, port, cert, token} arms the dialer
+   * with a block from the other machine. Arming is manual on BOTH ends by
+   * design: a channel that overwrites a database needs consent on each side.
+   */
+  router.get('/:id/recovery-channel', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, channel: await recoveryChannel.getRecoveryChannelStatus(bot) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.post('/:id/recovery-channel', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { mode, publicHost, tunnelPort, host, port, cert, token } = req.body as {
+        mode?: string; publicHost?: string; tunnelPort?: number;
+        host?: string; port?: number; cert?: string; token?: string;
+      };
+      let result;
+      if (mode === 'receiver') {
+        if (!publicHost || typeof publicHost !== 'string') {
+          res.status(400).json({ success: false, error: 'publicHost is required to arm the receiver' });
+          return;
+        }
+        result = await recoveryChannel.armReceiver(bot, publicHost, tunnelPort);
+      } else if (mode === 'source') {
+        result = await recoveryChannel.armSource(bot, { host, port, cert, token });
+      } else {
+        res.status(400).json({ success: false, error: "mode must be 'receiver' or 'source'" });
+        return;
+      }
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.delete('/:id/recovery-channel', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await recoveryChannel.disarmRecoveryChannel(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

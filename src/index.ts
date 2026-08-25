@@ -14,6 +14,7 @@ import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
 import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
+import { startRecoveryChannelReconciler, stopRecoveryChannelReconciler } from './instance/recoveryChannel';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 
@@ -110,6 +111,9 @@ async function main(): Promise<void> {
   // Start the replication health sampler (feeds the instance list's badges)
   startFleetReplicationHealth();
 
+  // Keep armed recovery-channel relays alive (the record survives; the helper must too)
+  startRecoveryChannelReconciler();
+
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
   startStateReconciler(() => wss.clients.size);
 }
@@ -121,6 +125,7 @@ process.on('SIGTERM', () => {
   stopInstanceUpdater();
   stopFleetBackupScheduler();
   stopFleetReplicationHealth();
+  stopRecoveryChannelReconciler();
   stopStateReconciler();
   process.exit(0);
 });

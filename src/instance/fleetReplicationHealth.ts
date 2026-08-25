@@ -43,6 +43,21 @@ function round(seconds: number | null | undefined): number | null {
   return seconds === null || seconds === undefined || !Number.isFinite(seconds) ? null : Math.round(seconds * 10) / 10;
 }
 
+/** Postgres size-GUC string ('4GB', '4096MB', '-1') to bytes; null = unbounded or unparsable. */
+function sizeSettingBytes(setting: string): number | null {
+  const match = /^(-?\d+)\s*(kB|MB|GB|TB)?$/.exec((setting || '').trim());
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (value < 0) return null;
+  const unit = match[2] || 'MB';
+  const factor = unit === 'kB' ? 1024 : unit === 'MB' ? 1024 ** 2 : unit === 'GB' ? 1024 ** 3 : 1024 ** 4;
+  return value * factor;
+}
+
+function mb(bytes: number): number {
+  return Math.round(bytes / (1024 ** 2));
+}
+
 async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealth> {
   const status = await getFleetReplicationStatus(instance, { probeEndpoint: false });
   const base = { role: 'primary' as const, checkedAt: Date.now() };
@@ -52,6 +67,24 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   if (!status.live.sslOn) {
     return { ...base, severity: 'warn', message: 'TLS is not active on the database yet; restart the instance to finish enabling replication', lagSeconds: null };
   }
+  // An invalidated slot outranks everything below: its standby can never
+  // resume from it, so the streaming picture is already lost (RC-1).
+  const lost = (status.live.slots || []).find(s => s.walStatus === 'lost');
+  if (lost) {
+    return { ...base, severity: 'error', message: `Replication slot ${lost.slot} was invalidated (retained WAL passed the bound); its standby cannot resume and must be re-seeded from the copy block`, lagSeconds: null };
+  }
+  // 'unreserved' = past the bound but not yet dropped; the standby can still
+  // make it if it reconnects before the next checkpoint takes the WAL.
+  const unreserved = (status.live.slots || []).find(s => s.walStatus === 'unreserved');
+  if (unreserved) {
+    return { ...base, severity: 'error', message: `Replication slot ${unreserved.slot} is past the WAL retention bound and about to be invalidated; reconnect its standby now or plan a re-seed`, lagSeconds: null };
+  }
+  const bound = sizeSettingBytes(status.live.slotWalKeep);
+  const fattest = (status.live.slots || []).reduce<{ slot: string; retainedBytes: number } | null>((max, s) =>
+    s.retainedBytes !== null && (max === null || s.retainedBytes > max.retainedBytes) ? { slot: s.slot, retainedBytes: s.retainedBytes } : max, null);
+  const retentionWarn = bound !== null && fattest !== null && fattest.retainedBytes > bound / 2
+    ? `Replication slot ${fattest.slot} retains ${mb(fattest.retainedBytes)} MB of WAL (bound ${mb(bound)} MB); past the bound the slot invalidates and its standby must be re-seeded`
+    : null;
   const standbys = status.live.standbys;
   if (standbys.length === 0) {
     // Indistinguishable from "never set up": the primary keeps no memory of a
@@ -60,15 +93,18 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
     return {
       ...base,
       severity: 'warn',
-      message: status.live.slotActive
+      message: retentionWarn ?? (status.live.slotActive
         ? 'A standby holds the replication slot but is not streaming; the copy is stale'
-        : 'No standby is attached: this machine dying would take the fleet database with it',
+        : 'No standby is attached: this machine dying would take the fleet database with it'),
       lagSeconds: null,
     };
   }
   const broken = standbys.find(s => s.state !== 'streaming');
   if (broken) {
     return { ...base, severity: 'error', message: `Standby ${broken.clientAddr || 'link'} is ${broken.state || 'not streaming'} rather than streaming`, lagSeconds: null };
+  }
+  if (retentionWarn) {
+    return { ...base, severity: 'warn', message: retentionWarn, lagSeconds: null };
   }
   const worst = standbys.reduce<number | null>((max, s) =>
     s.replayLagSeconds !== null && (max === null || s.replayLagSeconds > max) ? s.replayLagSeconds : max, null);

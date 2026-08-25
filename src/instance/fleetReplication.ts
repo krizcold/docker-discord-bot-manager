@@ -31,6 +31,10 @@ import { InstanceConfig, FleetDbReplication } from '../types';
 const REPLICATION_ROLE = 'replicator';
 const REPLICATION_SLOT = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;
+// Bounded slot retention (PLAN_REPLICATION.md RC-1): an absent standby must
+// fill the bound, not the disk - in the rescue direction the source is a
+// personal computer. Invalidation falls back to a fresh seed by design.
+const DEFAULT_SLOT_WAL_KEEP_MB = 4096;
 const PGDATA = '/var/lib/postgresql/data';
 const EXEC_TIMEOUT_MS = 30_000;
 
@@ -152,6 +156,7 @@ export async function enableFleetReplication(
   instance: InstanceConfig,
   publicHost: string,
   hostPort?: number,
+  slotWalKeepMb?: number,
 ): Promise<{ success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
@@ -161,8 +166,13 @@ export async function enableFleetReplication(
   }
   const port = hostPort ?? fleetDb.replication?.hostPort ?? DEFAULT_HOST_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { success: false, error: 'Invalid port' };
+  const keepMb = slotWalKeepMb ?? fleetDb.replication?.slotWalKeepMb ?? DEFAULT_SLOT_WAL_KEEP_MB;
+  if (!Number.isInteger(keepMb) || keepMb < 64 || keepMb > 1048576) {
+    return { success: false, error: 'WAL retention bound must be between 64 MB and 1 TB' };
+  }
   const collision = containerManager.getAllBots().find(other =>
-    other.id !== instance.id && other.fleetDb?.replication?.hostPort === port);
+    (other.id !== instance.id && other.fleetDb?.replication?.hostPort === port)
+    || other.recoveryChannel?.tunnelPort === port);
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
@@ -190,10 +200,16 @@ export async function enableFleetReplication(
       END IF;
     END $$;`);
   if (!setup.ok) return { success: false, error: `database setup failed: ${setup.stderr.trim()}` };
-  // Separate call: ALTER SYSTEM refuses to run inside the implicit transaction
+  // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
   const ssl = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
   if (!ssl.ok) return { success: false, error: `enabling ssl failed: ${ssl.stderr.trim()}` };
+  // Restart-only setting (no re-initdb): makes pg_rewind possible on every
+  // cluster that has ever run enable (reopened ruling R6).
+  const hints = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET wal_log_hints = on;');
+  if (!hints.ok) return { success: false, error: `enabling wal_log_hints failed: ${hints.stderr.trim()}` };
+  const keep = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
+  if (!keep.ok) return { success: false, error: `setting the WAL retention bound failed: ${keep.stderr.trim()}` };
 
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c', `cat > ${PGDATA}/pg_hba.conf && chown postgres:postgres ${PGDATA}/pg_hba.conf`], PG_HBA_CONTENT);
   if (!hba.ok) return { success: false, error: `pg_hba rewrite failed: ${hba.stderr.trim()}` };
@@ -207,6 +223,7 @@ export async function enableFleetReplication(
     hostPort: port,
     publicHost: host,
     certHost: host,
+    slotWalKeepMb: keepMb,
   };
   // F1: the stored URL stays the container-name form (the public form cannot
   // hairpin from containers sharing a docker network with the sidecar, which
@@ -280,6 +297,10 @@ export interface FleetReplicationStatus {
     sslOn: boolean;
     slotActive: boolean;
     standbys: Array<{ clientAddr: string; state: string; replayLagSeconds: number | null }>;
+    /** Every physical slot on this primary; an invalidated one means its standby must re-seed. */
+    slots: Array<{ slot: string; walStatus: string; retainedBytes: number | null }>;
+    /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */
+    slotWalKeep: string;
   };
   /** Can a container on the default bridge reach the published endpoint (the
    * path a REMOTE worker's delivery hands out)? Catches firewall traps before
@@ -341,9 +362,15 @@ export async function getFleetReplicationStatus(
                'clientAddr', client_addr::text,
                'state', state,
                'replayLagSeconds', EXTRACT(EPOCH FROM replay_lag)))
-             FROM pg_stat_replication);`);
+             FROM pg_stat_replication),
+            (SELECT json_agg(json_build_object(
+               'slot', slot_name,
+               'walStatus', wal_status,
+               'retainedBytes', GREATEST(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)))
+             FROM pg_replication_slots),
+            current_setting('max_slot_wal_keep_size');`);
   if (probe.ok) {
-    const [sslOn, slotActive, standbysJson] = probe.stdout.trim().split('|');
+    const [sslOn, slotActive, standbysJson, slotsJson, slotWalKeep] = probe.stdout.trim().split('|');
     let standbys: Array<{ clientAddr: string; state: string; replayLagSeconds: number | null }> = [];
     try {
       const parsed = JSON.parse(standbysJson || 'null');
@@ -355,7 +382,18 @@ export async function getFleetReplicationStatus(
         }));
       }
     } catch { /* no standbys */ }
-    status.live = { sslOn: sslOn === 'on', slotActive: slotActive === 't', standbys };
+    let slots: Array<{ slot: string; walStatus: string; retainedBytes: number | null }> = [];
+    try {
+      const parsed = JSON.parse(slotsJson || 'null');
+      if (Array.isArray(parsed)) {
+        slots = parsed.map((s: any) => ({
+          slot: String(s.slot || ''),
+          walStatus: String(s.walStatus || ''),
+          retainedBytes: s.retainedBytes === null || s.retainedBytes === undefined ? null : Number(s.retainedBytes),
+        }));
+      }
+    } catch { /* no slots */ }
+    status.live = { sslOn: sslOn === 'on', slotActive: slotActive === 't', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
   }
   if (opts.probeEndpoint !== false) status.reachability = await cachedReachability(instance);
   return status;

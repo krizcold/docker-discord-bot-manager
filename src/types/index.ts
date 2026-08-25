@@ -106,6 +106,24 @@ export interface RecoveryChannelRecord {
   pinCert?: string;                    // receiver's cert, pinned
 }
 
+// Receiver-side rescue state (PLAN_REPLICATION.md Section 18, RC-3). The
+// persisted phase model: a manager death mid-seed resumes the phase, every
+// phase is idempotently re-enterable. Lives beside the receiver channel
+// record and is cleared by cancel or the RC-4 swap.
+export interface RecoveryRescueRecord {
+  phase: 'preflight' | 'bulk' | 'consistent' | 'standby' | 'streaming';
+  startedAt: number;
+  updatedAt: number;
+  /** Structural halt (channel/database record gone): the phase is KEPT so Continue re-enters it, never restarts from scratch. */
+  parked?: boolean;
+  lastError?: string;
+  /** OUTDATED receivers only: the stale copy was dumped before the overwrite. */
+  dumpDone?: boolean;
+  /** Streaming phase telemetry, refreshed by the monitor loop. */
+  caughtUp?: boolean;
+  lagBytes?: number;
+}
+
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults
 // (enabled, 04:00, keep 7) for instances that have a fleetDb record.
 export interface FleetBackupConfig {
@@ -146,6 +164,7 @@ export interface InstanceConfig {
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
+  recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

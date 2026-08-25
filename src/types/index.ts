@@ -111,7 +111,8 @@ export interface RecoveryChannelRecord {
 // phase is idempotently re-enterable. Lives beside the receiver channel
 // record and is cleared by cancel or the RC-4 swap.
 export interface RecoveryRescueRecord {
-  phase: 'preflight' | 'bulk' | 'consistent' | 'standby' | 'streaming';
+  phase: 'preflight' | 'bulk' | 'consistent' | 'standby' | 'streaming'
+    | 'quiesce' | 'catchup' | 'promote' | 'teardown' | 'flip';
   startedAt: number;
   updatedAt: number;
   /** Structural halt (channel/database record gone): the phase is KEPT so Continue re-enters it, never restarts from scratch. */
@@ -122,6 +123,10 @@ export interface RecoveryRescueRecord {
   /** Streaming phase telemetry, refreshed by the monitor loop. */
   caughtUp?: boolean;
   lagBytes?: number;
+  /** Swap (RC-4): the source's end-of-WAL captured at quiesce; catchup replays to it. */
+  swapTargetLsn?: string;
+  /** Swap (RC-4): this machine's public host captured while the channel record still existed; flip enables replication with it when no prior replication record has one. */
+  swapPublicHost?: string;
 }
 
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults

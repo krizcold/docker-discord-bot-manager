@@ -2543,6 +2543,15 @@
       }
       const ch = res.channel || { armed: false };
       if (!ch.armed) {
+        // The swap's last phases outlive the channel (teardown removes it);
+        // a surviving rescue record still needs its progress shown.
+        let tailRescue = null;
+        try { const rr = await api('GET', `/bots/${botId}/recovery-rescue`); tailRescue = rr && rr.rescue; } catch (err) { /* section renders without it */ }
+        if (!body.isConnected || fleetBackupBotId !== botId) return;
+        if (tailRescue) {
+          body.innerHTML = renderRescueBlock(botId, tailRescue);
+          return;
+        }
         body.innerHTML = `
           <div class="env-tip">Hands the fleet database between machines when one of them cannot accept connections (NAT). The machine that has the GOOD database arms as sender and dials out; the machine being rescued arms as receiver and listens. Arming is manual on both ends, and the receiver's database is the one that gets overwritten.</div>
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-top:8px;">Receive INTO this machine (this database will be replaced)</div>
@@ -2610,7 +2619,14 @@
           consistent: 'Consistent pass: short delta inside backup mode',
           standby: 'Turning the copy into a live standby of the sender',
           streaming: rescue.caughtUp ? 'Streaming: CAUGHT UP - ready to swap' : `Streaming: catching up${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB behind)` : ''}`,
+          quiesce: 'Swap: stopping the sender fleet (the downtime window begins)',
+          catchup: `Swap: replaying the sender's last WAL${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB left)` : ''}`,
+          promote: 'Swap: promoting this copy to primary',
+          teardown: 'Swap: tearing the channel down on both ends',
+          flip: 'Swap: filing this database as the primary and starting the fleet',
         }[rescue.phase] || rescue.phase;
+      const pastPromote = ['promote', 'teardown', 'flip'].includes(rescue.phase);
+      const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && !rescue.parked;
       return `
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
@@ -2618,9 +2634,24 @@
           ${rescue.lastError ? `<div class="env-tip" style="color:var(--warning);">${escapeHtml(rescue.lastError)}</div>` : ''}
           <div style="display:flex;gap:8px;">
             ${rescue.parked ? `<button class="btn btn-primary btn-small" onclick="startRecoveryRescue('${botId}')">Continue</button>` : ''}
-            <button class="btn btn-danger btn-small" onclick="cancelRecoveryRescue('${botId}')">Cancel rescue</button>
+            ${swapReady ? `<button class="btn btn-danger btn-small" onclick="startRecoverySwap('${botId}')">Swap now</button>` : ''}
+            ${pastPromote ? '' : `<button class="btn btn-danger btn-small" onclick="cancelRecoveryRescue('${botId}')">Cancel rescue</button>`}
           </div>
         </div>`;
+    }
+
+    async function startRecoverySwap(botId) {
+      try {
+        let res = await api('POST', `/bots/${botId}/recovery-rescue/swap`, {});
+        if (!res.success && res.needsConfirm) {
+          if (!confirm('Swap now?\n\nThe SENDER fleet stops (downtime begins), this copy replays the last WAL and is promoted to primary, the channel is torn down, and the fleet starts HERE against the rescued database.\n\nAfterwards, re-seed the old machine as a standby of this one (its Database modal, with this machine\'s copy block) to restore the pair.')) return;
+          res = await api('POST', `/bots/${botId}/recovery-rescue/swap`, { confirm: true });
+        }
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Swap running; it finishes on its own and starts the fleet on this machine.' : (res.error || 'Failed to start the swap'));
+      } catch (err) {
+        showMessage('error', 'Failed to start the swap');
+      }
+      renderRecoveryChannel(botId);
     }
 
     async function startRecoveryRescue(botId) {

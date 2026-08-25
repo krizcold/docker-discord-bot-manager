@@ -1548,6 +1548,26 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * POST /api/bots/:id/recovery-rescue/swap - The RC-4 swap, from a caught-up
+   * streaming rescue. Without {confirm:true} it answers needsConfirm so the
+   * UI can show the downtime sentence.
+   */
+  router.post('/:id/recovery-rescue/swap', (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = recoveryRescue.startSwap(bot, req.body?.confirm === true);
+      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * POST /api/bots/:id/fleet-adopt-primary - File a promoted standby as this
    * machine's fleet database and enable replication on it, so the machine that
    * just took over can hand out the copy block the old one re-seeds from.

@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, RecoveryChannelRecord,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, RecoveryChannelRecord, RecoveryRescueRecord,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -434,6 +434,17 @@ export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryCh
   if (!instance) return null;
   if (channel) instance.recoveryChannel = channel;
   else delete instance.recoveryChannel;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return instance;
+}
+
+export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+  if (rescue) instance.recoveryRescue = rescue;
+  else delete instance.recoveryRescue;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
@@ -1096,6 +1107,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   if (instance.recoveryChannel) {
     await execAsync(`docker rm -f "${instance.recoveryChannel.containerName}"`).catch(() => { /* already gone */ });
     await execAsync(`docker rm -f "${instance.sanitizedName}-recovery-rsyncd"`).catch(() => { /* RC-3 daemon absent */ });
+    await execAsync(`docker rm -f "${instance.sanitizedName}-recovery-rsync"`).catch(() => { /* RC-3 client absent */ });
   }
 
   // 4. Remove instance directory
@@ -1697,6 +1709,9 @@ export async function startBot(botId: string): Promise<{ success: boolean; error
 async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
+  if (instance.recoveryRescue) {
+    return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
+  }
   if (instance.status === 'running') {
     // Reconcile against live container state: an externally-stopped bot
     // (docker kill, OOM) leaves the registry claiming running, and Start

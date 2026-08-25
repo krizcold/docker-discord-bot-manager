@@ -2365,10 +2365,15 @@
           <div class="env-group-title">Replication</div>
           <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
         </div>
+        <div class="env-group" style="margin-top:14px;">
+          <div class="env-group-title">Recovery channel</div>
+          <div id="recovery-channel-body"><div class="loading">Loading...</div></div>
+        </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
         </div>`;
       renderFleetReplication(botId);
+      renderRecoveryChannel(botId);
     }
 
     // ─── Fleet DB Replication (PLAN_REPLICATION.md Stage 1) ───
@@ -2389,6 +2394,7 @@
           <div class="env-row" style="align-items:center;">
             <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
             <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
+            <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached standby may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
             <button class="btn btn-primary btn-small" onclick="enableFleetReplication('${botId}')">Enable</button>
           </div>`;
         return;
@@ -2415,9 +2421,27 @@
         : reach && reach.ok ? '<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers</div>'
         : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}</div>`
         : '';
+      const keepBytes = (() => {
+        const m = /^(-?\d+)\s*(kB|MB|GB|TB)?$/.exec((live && live.slotWalKeep) || '');
+        if (!m || Number(m[1]) < 0) return null;
+        const f = { kB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 }[m[2] || 'MB'];
+        return Number(m[1]) * f;
+      })();
+      const slotsHtml = ((live && live.slots) || []).map(s => {
+        if (s.walStatus === 'lost') return `<div class="error-message">Slot <b>${escapeHtml(s.slot)}</b> was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below.</div>`;
+        if (s.walStatus === 'unreserved') return `<div class="error-message">Slot <b>${escapeHtml(s.slot)}</b> is past the WAL retention bound and about to be invalidated; reconnect its standby now.</div>`;
+        if (keepBytes !== null && s.retainedBytes !== null && s.retainedBytes > keepBytes / 2) {
+          return `<div class="env-tip" style="color:var(--warning);">Slot <b>${escapeHtml(s.slot)}</b> retains ${Math.round(s.retainedBytes / 1048576)} MB of WAL (bound ${Math.round(keepBytes / 1048576)} MB); its consumer is detached or falling behind.</div>`;
+        }
+        return '';
+      }).join('');
+      const keepTip = live && live.slotWalKeep === '-1'
+        ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span> <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`
+        : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
       body.innerHTML = `
-        <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}</div>
+        <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
         ${reachHtml}
+        ${slotsHtml}
         ${standbyHtml}
         ${block ? `
         <div style="margin-top:6px;">
@@ -2454,9 +2478,11 @@
     async function enableFleetReplication(botId) {
       const host = (document.getElementById('fleet-repl-host')?.value || '').trim();
       const portRaw = (document.getElementById('fleet-repl-port')?.value || '').trim();
+      const keepRaw = (document.getElementById('fleet-repl-keep')?.value || '').trim();
       if (!host) { showMessage('error', 'Enter the public host or IP other machines will dial'); return; }
       const payload = { enabled: true, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
+      if (keepRaw !== '') payload.slotWalKeepMb = Number(keepRaw);
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
         if (res.success) {
@@ -2473,6 +2499,21 @@
       loadBots();
     }
 
+    async function applyFleetReplBound(botId) {
+      try {
+        const res = await api('GET', `/bots/${botId}/fleet-replication`);
+        const r = res && res.replication;
+        if (!r || !r.enabled) { showMessage('error', 'Replication is not enabled'); return; }
+        const apply = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: true, publicHost: r.publicHost, hostPort: r.hostPort, slotWalKeepMb: 4096 });
+        showMessage(apply.success ? 'success' : 'error', apply.success
+          ? 'WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.'
+          : (apply.error || 'Failed to apply the bound'));
+      } catch (err) {
+        showMessage('error', 'Failed to apply the bound');
+      }
+      renderFleetReplication(botId);
+    }
+
     async function disableFleetReplication(botId) {
       if (!confirm('Disable replication?\n\nThe published port closes and the database URL reverts on the next restart. An attached standby will stop receiving changes.')) return;
       try {
@@ -2487,6 +2528,131 @@
       }
       renderFleetReplication(botId);
       loadBots();
+    }
+
+    // ─── Recovery channel (PLAN_REPLICATION.md Section 18, RC-2) ───
+    async function renderRecoveryChannel(botId) {
+      const body = document.getElementById('recovery-channel-body');
+      if (!body || fleetBackupBotId !== botId) return;
+      let res = null;
+      try { res = await api('GET', `/bots/${botId}/recovery-channel`); } catch (err) { res = null; }
+      if (!body.isConnected || fleetBackupBotId !== botId) return;
+      if (!res || !res.success) {
+        body.innerHTML = '<div class="error-message">Failed to load recovery channel status</div>';
+        return;
+      }
+      const ch = res.channel || { armed: false };
+      if (!ch.armed) {
+        body.innerHTML = `
+          <div class="env-tip">Hands the fleet database between machines when one of them cannot accept connections (NAT). The machine that has the GOOD database arms as sender and dials out; the machine being rescued arms as receiver and listens. Arming is manual on both ends, and the receiver's database is the one that gets overwritten.</div>
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-top:8px;">Receive INTO this machine (this database will be replaced)</div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="rc-recv-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="number" id="rc-recv-port" placeholder="15433" min="1" max="65535" style="flex:1;">
+            <button class="btn btn-danger btn-small" onclick="armRecoveryReceiver('${botId}')">Arm receiver</button>
+          </div>
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-top:10px;">Send FROM this machine (this database is the good copy)</div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="rc-src-host" placeholder="Receiver host" style="flex:2;">
+            <input type="number" id="rc-src-port" placeholder="15433" min="1" max="65535" style="flex:1;">
+          </div>
+          <div class="form-group"><label>Receiver certificate (PEM, from its arm block)</label>
+            <textarea id="rc-src-cert" rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          <div class="env-row" style="align-items:center;">
+            <input type="password" id="rc-src-token" placeholder="Channel token (from the arm block)" style="flex:2;">
+            <button class="btn btn-primary btn-small" onclick="armRecoverySource('${botId}')">Arm sender</button>
+          </div>`;
+        return;
+      }
+      const live = ch.live;
+      const mb = n => (n / 1048576).toFixed(1);
+      const stateHtml = ch.containerRunning === false
+        ? '<div class="error-message">Relay container is not running; the manager restarts it on its next boot, or disarm and re-arm.</div>'
+        : !live ? '<div class="env-tip" style="color:var(--text-muted);">Relay starting...</div>'
+        : live.tunnelUp
+          ? `<div class="env-tip" style="color:var(--success);">Tunnel UP${live.streams ? `, ${live.streams} active stream${live.streams === 1 ? '' : 's'}` : ''} - ${mb(live.bytesIn)} MB in / ${mb(live.bytesOut)} MB out${live.peerIdentity && live.peerIdentity.systemId ? ` - peer database ${escapeHtml(String(live.peerIdentity.systemId))} (timeline ${escapeHtml(String(live.peerIdentity.timeline || '?'))})` : ''}</div>`
+          : `<div class="env-tip" style="color:var(--warning);">Tunnel DOWN${live.lastError ? `: ${escapeHtml(live.lastError)}` : ''} - ${ch.mode === 'source' ? 'redialing until the receiver answers' : 'waiting for the sender to dial in'}</div>`;
+      body.innerHTML = `
+        <div class="env-tip">Armed as <b>${ch.mode === 'receiver' ? 'RECEIVER (this database gets replaced)' : 'SENDER (this database is the good copy)'}</b>${ch.mode === 'receiver' ? ` - listening on <b>${escapeHtml(ch.publicHost || '')}:${ch.tunnelPort}</b>` : ` - dialing <b>${escapeHtml(ch.endpoint || '')}</b>`}</div>
+        ${stateHtml}
+        ${ch.mode === 'receiver' && ch.block ? `
+        <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+          <span style="font-size:0.78rem;color:var(--text-secondary);">Arm block for the sender machine</span>
+          <button class="btn btn-secondary btn-small" onclick="copyRecoveryArmBlock(this)">Copy arm block</button>
+        </div>
+        <input type="hidden" id="rc-arm-block" value="${escapeHtml(JSON.stringify(ch.block))}">
+        <div class="env-tip">Paste it into "Arm sender" on the machine that holds the good database.</div>` : ''}
+        <div style="margin-top:6px;">
+          <button class="btn btn-danger btn-small" onclick="disarmRecoveryChannel('${botId}')">Disarm this side</button>
+        </div>`;
+    }
+
+    function copyRecoveryArmBlock(btn) {
+      const el = document.getElementById('rc-arm-block');
+      if (!el) return;
+      if (!navigator.clipboard) { showMessage('error', 'Clipboard unavailable over plain http - open the manager via https or localhost to copy the block'); return; }
+      navigator.clipboard.writeText(el.value).then(() => {
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = 'Copy arm block'; }, 1500);
+      }).catch(() => showMessage('error', 'Clipboard blocked by the browser - copy from the field with devtools, or re-open this modal over https/localhost'));
+    }
+
+    async function armRecoveryReceiver(botId) {
+      const host = (document.getElementById('rc-recv-host')?.value || '').trim();
+      const portRaw = (document.getElementById('rc-recv-port')?.value || '').trim();
+      if (!host) { showMessage('error', 'Enter the public host or IP the sender will dial'); return; }
+      if (!confirm('Arm the recovery channel RECEIVER?\n\nThis consents to the database on THIS machine being replaced by whatever the sender machine sends. Only continue if the other machine holds the good copy.')) return;
+      const payload = { mode: 'receiver', publicHost: host };
+      if (portRaw !== '') payload.tunnelPort = Number(portRaw);
+      try {
+        const res = await api('POST', `/bots/${botId}/recovery-channel`, payload);
+        showMessage(res.success ? 'success' : 'error', res.success
+          ? 'Receiver armed. Copy the arm block below and paste it into "Arm sender" on the other machine.'
+          : (res.error || 'Failed to arm the receiver'));
+      } catch (err) {
+        showMessage('error', 'Failed to arm the receiver');
+      }
+      renderRecoveryChannel(botId);
+    }
+
+    async function armRecoverySource(botId) {
+      const host = (document.getElementById('rc-src-host')?.value || '').trim();
+      const portRaw = (document.getElementById('rc-src-port')?.value || '').trim();
+      let cert = (document.getElementById('rc-src-cert')?.value || '').trim();
+      let token = (document.getElementById('rc-src-token')?.value || '').trim();
+      let hostVal = host, portVal = portRaw !== '' ? Number(portRaw) : undefined;
+      // The whole arm block may be pasted as JSON into any of the fields.
+      for (const raw of [host, cert, token]) {
+        if (raw.startsWith('{')) {
+          try {
+            const block = JSON.parse(raw);
+            hostVal = block.host || hostVal;
+            portVal = block.port || portVal;
+            cert = block.cert || cert;
+            token = block.token || token;
+          } catch (err) { /* not the block */ }
+        }
+      }
+      if (!hostVal || !cert || !token) { showMessage('error', 'Paste the receiver arm block (or fill host, certificate and token)'); return; }
+      if (!confirm('Arm the recovery channel SENDER?\n\nThis machine\'s database is treated as the good copy and will be sent to the receiver. The dialer keeps retrying until you disarm it.')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/recovery-channel`, { mode: 'source', host: hostVal, port: portVal, cert, token });
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Sender armed; dialing the receiver.' : (res.error || 'Failed to arm the sender'));
+      } catch (err) {
+        showMessage('error', 'Failed to arm the sender');
+      }
+      renderRecoveryChannel(botId);
+    }
+
+    async function disarmRecoveryChannel(botId) {
+      if (!confirm('Disarm the recovery channel on this side?\n\nAn in-flight transfer stops (a later re-arm resumes the copy incrementally). The other machine stays armed until disarmed there.')) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/recovery-channel`);
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Recovery channel disarmed on this side.' : (res.error || 'Failed to disarm'));
+      } catch (err) {
+        showMessage('error', 'Failed to disarm');
+      }
+      renderRecoveryChannel(botId);
     }
 
     function copyFleetReplBlock(btn) {

@@ -65,6 +65,7 @@ export interface FleetDbReplication {
   hostPort: number;                    // published host port (container 5432)
   publicHost: string;                  // operator-provided host workers/replicas dial
   certHost: string;                    // host the pinned cert names; differing publicHost forces regeneration
+  slotWalKeepMb?: number;              // max_slot_wal_keep_size bound; absent on old records = default applied on next enable
 }
 
 // Manager-provisioned streaming REPLICA of another machine's fleet database
@@ -82,6 +83,27 @@ export interface FleetDbReplicaRecord {
   publicHost: string;                  // this machine's advertised host (post-promotion serving)
   hostPort: number;                    // published host port (container 5432)
   certHost: string;                    // host THIS standby's own server cert names
+}
+
+// Recovery-channel arm state (PLAN_REPLICATION.md Section 18, RC-2). One
+// helper relay container per armed side; the record is the source of truth
+// the manager reconciles the container against on boot, so a manager restart
+// never kills a multi-hour transfer. Key/cert/token sit in the same trust
+// domain as FleetDbReplication.password (this registry file).
+export interface RecoveryChannelRecord {
+  mode: 'receiver' | 'source';
+  containerName: string;
+  token: string;
+  createdAt: number;
+  // receiver (the listening, reachable side)
+  tunnelPort?: number;                 // published host port the source dials
+  publicHost?: string;                 // host in the arm block; the cert names it
+  tlsKey?: string;                     // PEM pair the listener presents
+  tlsCert?: string;
+  // source (the dialing, NAT'd side)
+  endpointHost?: string;               // receiver's host:port from the arm block
+  endpointPort?: number;
+  pinCert?: string;                    // receiver's cert, pinned
 }
 
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults
@@ -123,6 +145,7 @@ export interface InstanceConfig {
   webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
+  recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

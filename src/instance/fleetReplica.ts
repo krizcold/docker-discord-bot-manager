@@ -576,10 +576,14 @@ export async function adoptPromotedReplica(
     return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
   }
   // enableFleetReplication repoints DATA_BACKEND_URL; the control store URL
-  // only exists when the topology splits them, and then it moves too.
+  // only exists when the topology splits them, and then it moves too. Both
+  // stores: the deployed compose env is built from the instance record, so
+  // an env-store-only move would bake the stale pin back in on next start.
   const stored = envManager.getEnvVars(instance.id);
   if ((stored['CONTROL_STORE_URL'] || '').trim() !== '') {
-    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: (stored['DATA_BACKEND_URL'] || '').trim() });
+    const controlUrl = (stored['DATA_BACKEND_URL'] || '').trim();
+    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: controlUrl });
+    await containerManager.updateBot(instance.id, { envVars: { CONTROL_STORE_URL: controlUrl } });
   }
   return { success: true, restartRequired: true };
 }

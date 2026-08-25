@@ -157,6 +157,7 @@ export async function enableFleetReplication(
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
+  opts: { rotateCert?: boolean } = {},
 ): Promise<{ success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
@@ -183,7 +184,10 @@ export async function enableFleetReplication(
   if (!dbPassword) return { success: false, error: 'Could not recover the database password from the stored URL' };
 
   const previousCertHost = fleetDb.replication?.certHost;
-  const certErr = await ensureServerCert(fleetDb.containerName, host, previousCertHost);
+  // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
+  // rescue rsyncs the SOURCE's pair in), so the certHost shortcut would keep
+  // a cert naming the other machine and the copy block could never verify.
+  const certErr = await ensureServerCert(fleetDb.containerName, host, opts.rotateCert ? undefined : previousCertHost);
   if (certErr) return { success: false, error: certErr };
   const certRotated = previousCertHost !== undefined && previousCertHost !== host;
 

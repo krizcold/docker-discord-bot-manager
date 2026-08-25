@@ -528,8 +528,19 @@ export async function startFleetDbSidecar(botId: string): Promise<{ success: boo
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
+  // Resolve the service key by container_name: an adopted standby keeps the
+  // replica service name until its next rebuild, so 'fleet-postgres' is not
+  // a given (same reason syncComposeEnvVars keys on container_name).
+  let service = 'fleet-postgres';
   try {
-    await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d fleet-postgres`);
+    const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+    for (const [key, svc] of Object.entries((compose?.services || {}) as Record<string, any>)) {
+      // The key rides a shell line below; a repo-authored key never gets there.
+      if (svc?.container_name === fleetDb.containerName && /^[A-Za-z0-9._-]+$/.test(key)) { service = key; break; }
+    }
+  } catch { /* default stands */ }
+  try {
+    await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d ${service}`);
   } catch (err) {
     return { success: false, error: String(err) };
   }
@@ -1684,6 +1695,30 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
  * would refuse Start in exactly the crashed case this reconcile exists for.
  * Falls back to any-project-container when the app service cannot be resolved.
  */
+/**
+ * Names of this instance's RUNNING compose containers other than the fleet
+ * sidecar. The recovery swap's quiesce (RC-4) works from container truth,
+ * not the registry status: the end-of-WAL it captures is only a fence if
+ * nothing can write to the database anymore. Null = docker query failed,
+ * so the caller must refuse rather than assume quiet.
+ */
+export async function runningNonSidecarContainers(botId: string): Promise<string[] | null> {
+  const appName = resolveAppName(botId);
+  // Exclusion by the record's exact container name, not by service key: an
+  // adopted standby's database keeps service 'fleet-postgres-replica' until
+  // its next rebuild, and misclassifying it as a leftover would stop it.
+  const sidecarName = getBot(botId)?.fleetDb?.containerName;
+  if (!sidecarName) return null;
+  try {
+    const { stdout } = await execAsync(
+      `docker ps --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}"`);
+    return stdout.split('\n').map(s => s.trim()).filter(Boolean)
+      .filter(name => name !== sidecarName);
+  } catch {
+    return null;
+  }
+}
+
 async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
   let filters = `--filter "label=com.docker.compose.project=${appName}"`;
   try {

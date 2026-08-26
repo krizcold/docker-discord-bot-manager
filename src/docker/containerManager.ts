@@ -2830,7 +2830,20 @@ export async function syncContainerStates(): Promise<void> {
     const appName = resolveAppName(instance.id);
     // Same matching as getContainerIdsForBot: generated composes (docker-image /
     // no-compose git bots) name containers bot-<id>-*, not <sanitizedName>*.
-    const botContainers = containers.filter(c => c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`));
+    // Standalone-capable service containers are excluded by exact name: the
+    // fleet sidecar, a replica, or a recovery helper routinely runs ALONE
+    // (dumps, re-seeds, rescues), and counting one as "the bot" flips the
+    // registry to running - which a later stop turns into a compose down that
+    // kills the very standby a rescue is streaming into.
+    const standalone = new Set<string>([
+      instance.fleetDb?.containerName || '',
+      instance.fleetDbReplica?.containerName || '',
+      `${instance.sanitizedName}-recovery-relay`,
+      `${instance.sanitizedName}-recovery-rsyncd`,
+      `${instance.sanitizedName}-recovery-rsync`,
+    ]);
+    const botContainers = containers.filter(c =>
+      (c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`)) && !standalone.has(c.name));
     const runningContainers = botContainers.filter(c => c.state === 'running');
     const runningIds = runningContainers.map(c => c.id);
 

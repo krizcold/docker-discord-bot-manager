@@ -75,6 +75,9 @@ services:
 
       # Data root
       DATA_ROOT: $DATA_ROOT
+      # Host truth of the container's DATA_DIR (/data here), so docker-run bind
+      # mounts computed by the manager resolve on the host daemon.
+      HOST_DATA_DIR: $DATA_ROOT/AppData/discordbotmanager/data
 
       # SMTP variables
       SMTP_HOST: $SMTP_HOST

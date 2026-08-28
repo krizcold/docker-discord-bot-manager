@@ -277,16 +277,6 @@ function fleetEnvFields(): WizardEnvVar[] {
     },
     {
       ...base,
-      key: 'FLEET_AUTO_PROMOTE',
-      displayLabel: 'Auto-Promote',
-      description: 'Advanced: 1 lets the backup master promote ITSELF when the master goes silent (about 2 minutes). Off = the backup only promotes when you press Promote on its web UI.',
-      defaultValue: '',
-      options: [{ value: '', label: 'off (manual promotion)' }, { value: '1' }],
-      showWhen: { key: 'BOT_NODE_ROLE', equals: 'backup-master' },
-      advanced: true,
-    },
-    {
-      ...base,
       key: 'CONTROL_SECRET',
       displayLabel: 'Control Secret',
       description: 'Shared secret for the whole fleet: every node, the backup master included, must carry the SAME value. Generated on the master; same-server installs fill it automatically, workers on other machines paste it from the master.',

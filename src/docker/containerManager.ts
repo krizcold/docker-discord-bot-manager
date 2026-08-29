@@ -758,6 +758,19 @@ function resolveComposePath(botId: string, appName: string): string {
 }
 
 /**
+ * The deployed compose body for a bot, or null when it has never been deployed.
+ */
+export function readDeployedCompose(botId: string): string | null {
+  try {
+    const composePath = resolveComposePath(botId, resolveAppName(botId));
+    if (!fs.existsSync(composePath)) return null;
+    return fs.readFileSync(composePath, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Docker image name: {sanitizedName}-{instanceId}:latest
  */
 function getImageName(instance: InstanceConfig): string {

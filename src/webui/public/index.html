@@ -2457,6 +2457,14 @@
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
         </div>
+        ${((bots.find(b => b.id === botId) || {}).appHooks === true) ? `
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Stand this machine down</div>
+          <div class="env-tip"><b>Demote</b> stops this instance being the master side and rejoins it as a worker; the database here stays untouched. <b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.</div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-small" onclick="appDemote('${botId}')">Demote</button>
+          </div>
+        </div>` : ''}
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
@@ -2475,6 +2483,26 @@
         `;
     }
 
+    /**
+     * Demote this master side. The bot owns the decision and answers
+     * needsConfirm with the 20.12a ordering warning when no successor is visible.
+     */
+    async function appDemote(botId) {
+      if (!confirm('Demote this instance from the master side?\n\nIt rejoins the fleet as a worker and restarts once. The database on this machine is left untouched.')) return;
+      try {
+        let res = await api('POST', `/bots/${botId}/app-demote`, {});
+        if (!res.success && res.needsConfirm) {
+          if (!confirm(`${res.error}\n\nDemote anyway?`)) return;
+          res = await api('POST', `/bots/${botId}/app-demote`, { confirm: true });
+        }
+        if (!res.success) { showMessage('error', res.error || 'Demote failed'); return; }
+        showMessage('success', 'Demoted; the bot restarts as a worker');
+        loadBots();
+      } catch (err) {
+        showMessage('error', 'Demote failed');
+      }
+    }
+
     async function enableFleetReplication(botId) {
       const host = (document.getElementById('fleet-repl-host')?.value || '').trim();
       const portRaw = (document.getElementById('fleet-repl-port')?.value || '').trim();
@@ -2486,9 +2514,16 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
         if (res.success) {
-          showMessage('success', res.certRotated
+          // Compose, never branch past one: a rotated certificate and a failed
+          // hand-off are independent facts and the operator needs both.
+          const base = res.certRotated
             ? 'Replication updated with a NEW certificate (the host changed) - existing standbys must be re-set-up with the new block. Restart the instance to apply.'
-            : 'Replication enabled. Restart the instance to publish the port and apply the new database URL.');
+            : 'Replication enabled. Restart the instance to publish the port and apply the new database URL.';
+          if (res.copyBlockError) {
+            showMessage('error', `${base} However, the copy block could not be handed to the bot (${res.copyBlockError}), so designated backups will not be seeded automatically; reopen this panel once the instance is running.`);
+          } else {
+            showMessage('success', base);
+          }
         } else {
           showMessage('error', res.error || 'Failed to enable replication');
         }
@@ -2845,6 +2880,21 @@
           : live.receiverStatus !== 'streaming'
             ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
             : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
+      // The transfer surface is offered only while this really is a copy: a
+      // promoted database is no longer a standby and its instance is the master
+      // side already.
+      const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
+      const isCopy = !!(r.live && r.live.inRecovery === true);
+      const transferHtml = (appHooks && isCopy) ? `
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the master side</div>
+          <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old master's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', false)">Transfer</button>
+            <button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', true)">Transfer and retire</button>
+          </div>
+        </div>` : '';
+
       body.innerHTML = `
         ${errHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
@@ -2852,7 +2902,38 @@
         <div class="env-tip">The bot on this instance picks the replica up (for promote-the-pair) on its next restart.</div>
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
-        </div>`;
+        </div>
+        ${transferHtml}`;
+    }
+
+    /**
+     * One-click whole-side promote (PLAN_REPLICATION 20.13). The bot owns the
+     * verdict; this only relays the click and re-asks once when it wants the
+     * replication lag acknowledged.
+     */
+    async function appTransfer(botId, retireOldMaster) {
+      const label = retireOldMaster ? 'Transfer and retire' : 'Transfer';
+      const extra = retireOldMaster
+        ? '\n\nThe old machine will also be told to stand down and stop serving as master.'
+        : '';
+      if (!confirm(`${label}: make this machine the master side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${extra}`)) return;
+      try {
+        let res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster });
+        if (!res.success && res.needsLagConfirm) {
+          // Show the app's OWN words: it knows things the manager does not,
+          // including that a master whose database recovered since its last
+          // beacon still reads as dead here.
+          const lag = typeof res.lagMs === 'number' ? `\n\nThis copy is behind by about ${Math.round(res.lagMs / 1000)}s.` : '';
+          if (!confirm(`${res.error || 'The old master cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
+          res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster, confirmLag: true });
+        }
+        if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
+        showMessage('success', `${label} started; the bot reports progress in its own Fleet view`);
+        renderFleetReplica(botId);
+        loadBots();
+      } catch (err) {
+        showMessage('error', `${label} failed`);
+      }
     }
 
     async function provisionFleetReplica(botId) {

@@ -102,7 +102,9 @@ export type AppHookAction =
   | 'promote/continue'
   | 'promote/cancel'
   | 'demote'
-  | 'confirm-fresh';
+  | 'confirm-fresh'
+  /** Hand the app the copy block for the database it hosts, so it can relay it. */
+  | 'copy-block';
 
 const superModularDiscordBot: AppCapabilityManifest = {
   match: { urlContains: 'modular-discord-bot' },

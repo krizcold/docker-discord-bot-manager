@@ -30,6 +30,7 @@
 import { execFile } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
+import * as appLifecycle from './appLifecycle';
 import { runFleetDump } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
@@ -587,5 +588,15 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   const started = await containerManager.startBot(instance.id);
   if (!started.success) {
     console.warn(`[RecoveryRescue] Swap complete but the fleet did not start on ${instance.displayName}: ${started.error}; start it manually`);
+  }
+  // AFTER the start: the certificate rotated behind an unchanged host and port,
+  // which the endpoint-keyed freshness check cannot see, so it must be pushed
+  // explicitly - and the app only serves its hook once it is running. Failure is
+  // survivable: opening the Database modal republishes.
+  if (started.success) {
+    const republished = await appLifecycle.deliverCopyBlock(containerManager.getBot(instance.id) || fresh);
+    if (!republished.success) {
+      console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);
+    }
   }
 }

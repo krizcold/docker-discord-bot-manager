@@ -20,6 +20,7 @@ import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
+import { findAppCapabilities } from '../config/appCapabilities';
 import { InstanceConfig, FleetDbReplicaRecord } from '../types';
 
 const REPLICATION_SLOT = 'fleet_standby';
@@ -386,11 +387,25 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
  * a fresh sidecar for a node that just stopped having one.
  */
 function retireFleetDbEnvPins(botId: string): void {
-  for (const key of ['DATA_BACKEND', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'CONTROL_STORE_URL']) {
+  for (const key of companionEnvKeys(botId)) {
     envManager.deleteEnvVar(botId, key);
     containerManager.removeBotEnvVars(botId, [key]);
     containerManager.removeEnvKeyFromDeployedCompose(botId, key);
   }
+}
+
+/**
+ * Every key the manager must stop pinning for this app's companion database.
+ * Driven by the app's capability record where it declares one; the literal list
+ * is the fallback for an app that declares none, so behaviour is unchanged there.
+ * appOwnedEnv is included deliberately: the manager never authors those, so a
+ * value in ITS stores is an anomaly that would outrank the app's own store.
+ */
+function companionEnvKeys(botId: string): string[] {
+  const db = findAppCapabilities(containerManager.getBot(botId)?.sourceUrl)?.companionDb;
+  if (!db) return ['DATA_BACKEND', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'CONTROL_STORE_URL'];
+  const keys = [db.env.url, db.env.publicUrl, db.env.mode?.key, ...(db.repointedEnv ?? []), ...(db.appOwnedEnv ?? [])];
+  return Array.from(new Set(keys.filter((k): k is string => !!k)));
 }
 
 /**

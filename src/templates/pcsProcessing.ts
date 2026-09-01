@@ -499,9 +499,10 @@ export function processComposeForCasaOS(
     const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
     if (fleetSvc) {
       setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
-      // The bot's TRANSFER_PORT default is the static 3929, NOT control + 1, so
-      // a non-default marker needs the explicit injection to match the routes.
-      setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(fleetPort + 1));
+      // The transfer channel has its own marker label; absent means the app
+      // declares one channel and gets no transfer wiring at all.
+      const transferPort = fleetTransferPortOfCompose(compose);
+      if (transferPort !== null) setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(transferPort));
       if (pcs.APP_DOMAIN) {
         // EVERY fleet node gets the control route (PLAN_STANDBY 3.6): a
         // promotable backup must be dialable in advance. Workers dial the app
@@ -522,12 +523,11 @@ export function processComposeForCasaOS(
         }
         setServiceEnv(fleetSvc, 'FLEET_PUBLIC_URL', `wss://${fleetHost}`);
       }
-      if (pcs.APP_DOMAIN) {
-        // Transfer route (container port CONTROL_PORT + 1, the bot's default):
+      if (pcs.APP_DOMAIN && transferPort !== null) {
+        // Transfer route (container port from the transfer marker label):
         // EVERY fleet node advertises one, unlike the master-only control
         // route, because migration legs dial in either direction. Same
         // dual-name pair as the fleet site.
-        const transferPort = fleetPort + 1;
         const transferHost = `${appName}-transfer-${pcs.APP_DOMAIN}`;
         const tIdx = nextCaddySiteIndex(fleetSvc.labels);
         setServiceLabel(fleetSvc, `caddy_${tIdx}`, transferHost);
@@ -970,14 +970,15 @@ export function processComposeForDocker(
     if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
-  // CONTROL_PORT/TRANSFER_PORT always follow the fleet marker; exposure (proxy
-  // route or localhost publish) is layered on by applyDockerHostPort.
+  // CONTROL_PORT/TRANSFER_PORT each follow their own marker label; exposure
+  // (proxy route or localhost publish) is layered on by applyDockerHostPort.
   const fleetPort = fleetControlPortOfCompose(compose);
   if (fleetPort !== null) {
     const fleetSvcName = getAppServiceName(compose);
     if (fleetSvcName && services[fleetSvcName]) {
       setServiceEnv(services[fleetSvcName], 'CONTROL_PORT', String(fleetPort));
-      setServiceEnv(services[fleetSvcName], 'TRANSFER_PORT', String(fleetPort + 1));
+      const transferPort = fleetTransferPortOfCompose(compose);
+      if (transferPort !== null) setServiceEnv(services[fleetSvcName], 'TRANSFER_PORT', String(transferPort));
     }
   }
 
@@ -1180,6 +1181,9 @@ export function mainServiceSelfAuths(composeContent: string): boolean {
 // the bot runs a fleet control plane (WS server) on that container port. All
 // fleet wiring keys off this label, never off a bot name or image.
 const FLEET_PORT_LABEL = 'fleet.control-port';
+// Second channel, same rule: an absent label is how an app says "I have one
+// channel" - no transfer wiring is authored for it.
+const FLEET_TRANSFER_PORT_LABEL = 'fleet.transfer-port';
 
 function labelKeysOf(labels: unknown): string[] {
   if (Array.isArray(labels)) {
@@ -1236,7 +1240,7 @@ function nextCaddySiteIndex(labels: unknown): number {
   return next;
 }
 
-function fleetControlPortOfCompose(compose: Record<string, unknown>): number | null {
+function fleetLabelPortOfCompose(compose: Record<string, unknown>, label: string): number | null {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return null;
   const main = getMainServiceName(compose);
@@ -1244,7 +1248,7 @@ function fleetControlPortOfCompose(compose: Record<string, unknown>): number | n
     ? [main, ...Object.keys(services).filter(n => n !== main)]
     : Object.keys(services);
   for (const name of ordered) {
-    const value = labelValueOf(services[name]?.labels, FLEET_PORT_LABEL);
+    const value = labelValueOf(services[name]?.labels, label);
     if (value !== null) {
       const port = parseInt(value, 10);
       return isNaN(port) ? null : port;
@@ -1253,10 +1257,27 @@ function fleetControlPortOfCompose(compose: Record<string, unknown>): number | n
   return null;
 }
 
+function fleetControlPortOfCompose(compose: Record<string, unknown>): number | null {
+  return fleetLabelPortOfCompose(compose, FLEET_PORT_LABEL);
+}
+
+function fleetTransferPortOfCompose(compose: Record<string, unknown>): number | null {
+  return fleetLabelPortOfCompose(compose, FLEET_TRANSFER_PORT_LABEL);
+}
+
 /** The fleet control port declared by the compose's marker label, or null. */
 export function getFleetControlPort(composeContent: string): number | null {
   try {
     return fleetControlPortOfCompose(parseDocument(composeContent).toJSON() as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+}
+
+/** The fleet transfer port declared by the compose's marker label, or null. */
+export function getFleetTransferPort(composeContent: string): number | null {
+  try {
+    return fleetTransferPortOfCompose(parseDocument(composeContent).toJSON() as Record<string, unknown>);
   } catch {
     return null;
   }
@@ -1327,7 +1348,7 @@ export function fleetHostSuffix(): string | null {
 /**
  * Public hostname of this instance's transfer endpoint (shard-migration data
  * channel), or null when no public base exists. Same bases and trust rules as
- * the fleet host; the transfer port is CONTROL_PORT + 1 (the bot's default).
+ * the fleet host; the transfer port comes from the fleet.transfer-port marker.
  */
 export function transferPublicHost(sanitizedName: string): string | null {
   const suffix = transferHostSuffix();

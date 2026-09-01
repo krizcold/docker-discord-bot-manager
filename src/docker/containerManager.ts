@@ -49,6 +49,7 @@ import {
   attachBotToProxy,
   mainServiceSelfAuths,
   getFleetControlPort,
+  getFleetTransferPort,
   fleetIsSameBox,
   fleetPublicHost,
   transferPublicHost,
@@ -1420,16 +1421,17 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   // gets a localhost-bound control host-port for host-level tooling; same-box
   // workers dial the master's container name over dbm_internal.
   const controlPort = getFleetControlPort(content);
+  const transferPort = getFleetTransferPort(content);
   let fleetHostPort: number | undefined;
   let transferHostPort: number | undefined;
   if (controlPort !== null) {
-    const transferPort = controlPort + 1;
     if (BOT_DOMAIN_BASE) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
     }
     // Transfer route: EVERY fleet node advertises one (migration legs dial in
-    // either direction), unlike the master-only control route.
-    if (BOT_DOMAIN_BASE) {
+    // either direction), unlike the master-only control route. Only for an app
+    // whose compose declares the transfer marker label.
+    if (BOT_DOMAIN_BASE && transferPort !== null) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort, { envKey: 'TRANSFER_URL' });
     }
     const existing = getPublishedFleetHostPort(content, controlPort);
@@ -1450,23 +1452,25 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
         content = publishFleetHostPort(content, allocated, controlPort);
       }
     }
-    const existingTransfer = getPublishedFleetHostPort(content, transferPort);
-    if (existingTransfer !== null) {
-      transferHostPort = existingTransfer;
-    } else {
-      const used = portsClaimedByOthers();
-      if (hostPort !== undefined) used.add(hostPort);
-      if (fleetHostPort !== undefined) used.add(fleetHostPort);
-      const prevTransferPort = instance.transferHostPort;
-      const allocated = allocateHostPort({
-        botId: instance.id,
-        reuse: typeof prevTransferPort === 'number' ? prevTransferPort : undefined,
-        used,
-        hostBound: portsBoundOnHost(),
-      });
-      if (allocated !== null) {
-        transferHostPort = allocated;
-        content = publishFleetHostPort(content, allocated, transferPort);
+    if (transferPort !== null) {
+      const existingTransfer = getPublishedFleetHostPort(content, transferPort);
+      if (existingTransfer !== null) {
+        transferHostPort = existingTransfer;
+      } else {
+        const used = portsClaimedByOthers();
+        if (hostPort !== undefined) used.add(hostPort);
+        if (fleetHostPort !== undefined) used.add(fleetHostPort);
+        const prevTransferPort = instance.transferHostPort;
+        const allocated = allocateHostPort({
+          botId: instance.id,
+          reuse: typeof prevTransferPort === 'number' ? prevTransferPort : undefined,
+          used,
+          hostBound: portsBoundOnHost(),
+        });
+        if (allocated !== null) {
+          transferHostPort = allocated;
+          content = publishFleetHostPort(content, allocated, transferPort);
+        }
       }
     }
   }
@@ -1588,12 +1592,12 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
 }
 
 /**
- * Fleet wiring derived from the deployed compose's marker label: CONTROL_PORT
- * whenever the marker is present; FLEET_PUBLIC_URL only for a master with a
- * public base; TRANSFER_URL for every fleet node (public wss route when a base
- * exists, else the app container name over the shared network - transfer port
- * is CONTROL_PORT + 1, the bot's default). Re-derived from the compose so
- * start-time env syncs agree with what the build exposed.
+ * Fleet wiring derived from the deployed compose's marker labels: CONTROL_PORT
+ * whenever the control marker is present; FLEET_PUBLIC_URL only for a master
+ * with a public base; TRANSFER_PORT/TRANSFER_URL only when the compose also
+ * declares the transfer marker (an absent label means the app has one
+ * channel). Re-derived from the compose so start-time env syncs agree with
+ * what the build exposed.
  */
 function fleetEnv(instance: InstanceConfig): Record<string, string> {
   try {
@@ -1602,22 +1606,26 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     const composeContent = fs.readFileSync(composePath, 'utf-8');
     const controlPort = getFleetControlPort(composeContent);
     if (controlPort === null) return {};
-    const env: Record<string, string> = { CONTROL_PORT: String(controlPort), TRANSFER_PORT: String(controlPort + 1) };
+    const env: Record<string, string> = { CONTROL_PORT: String(controlPort) };
+    const transferPort = getFleetTransferPort(composeContent);
+    if (transferPort !== null) env.TRANSFER_PORT = String(transferPort);
     const host = fleetPublicHost(instance.sanitizedName);
     // Advertise the control route only once the built compose actually
     // serves it (same rule as TRANSFER_URL below): a pre-standby worker
     // build restarted after a manager update must not advertise a route no
     // proxy label backs until its rebuild.
     if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
-    const transferHost = transferPublicHost(instance.sanitizedName);
-    if (transferHost) {
-      // Advertise the public route only once the built compose actually
-      // serves it: a pre-transfer build restarted after a manager update
-      // must not advertise a route no proxy label backs until its rebuild.
-      if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
-    } else if (fleetIsSameBox(instance.envVars)) {
-      const cname = fleetAppContainerName(composeContent);
-      if (cname) env.TRANSFER_URL = `ws://${cname}:${controlPort + 1}`;
+    if (transferPort !== null) {
+      const transferHost = transferPublicHost(instance.sanitizedName);
+      if (transferHost) {
+        // Advertise the public route only once the built compose actually
+        // serves it: a pre-transfer build restarted after a manager update
+        // must not advertise a route no proxy label backs until its rebuild.
+        if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
+      } else if (fleetIsSameBox(instance.envVars)) {
+        const cname = fleetAppContainerName(composeContent);
+        if (cname) env.TRANSFER_URL = `ws://${cname}:${transferPort}`;
+      }
     }
     // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
     // bot's promote flow promotes this database first. Credentials are the
@@ -1711,9 +1719,12 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       // Role or public base may have changed since build: a FLEET_PUBLIC_URL or
       // TRANSFER_URL the build injected must not survive when no longer derivable.
       // TRANSFER_URL is a generic enough name that a non-fleet bot's compose may
-      // legitimately ship one, so its cleanup is gated on the fleet marker.
+      // legitimately ship one, so its cleanup is gated on the transfer marker:
+      // the manager only ever authors it where that label exists, and a
+      // pre-label compose keeps its built pins (they still match the routes its
+      // own build created) until its rebuild.
       if (!('FLEET_PUBLIC_URL' in allEnv)) deleteComposeEnv(service.environment, 'FLEET_PUBLIC_URL');
-      if (!('TRANSFER_URL' in allEnv) && getFleetControlPort(raw) !== null) deleteComposeEnv(service.environment, 'TRANSFER_URL');
+      if (!('TRANSFER_URL' in allEnv) && getFleetTransferPort(raw) !== null) deleteComposeEnv(service.environment, 'TRANSFER_URL');
       // The local-replica keys must not survive in a compose once the standby
       // they described is gone: a stale copy would keep pointing the app at a
       // database this machine no longer hosts.

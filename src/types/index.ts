@@ -161,7 +161,7 @@ export interface InstanceConfig {
   port?: number;
   hostPort?: number;                   // docker mode: published host port for the bot's web UI
   fleetHostPort?: number;              // docker mode: published 127.0.0.1 host port for the fleet control plane
-  transferHostPort?: number;           // docker mode: published 127.0.0.1 host port for the transfer channel (control + 1)
+  transferHostPort?: number;           // docker mode: published 127.0.0.1 host port for the transfer channel (unset without its marker label)
   webContainerPort?: number;           // docker mode: the container port hostPort maps to
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"

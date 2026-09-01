@@ -586,6 +586,20 @@ export async function getContainerStats(containerId: string): Promise<{
 }
 
 /**
+ * Three-state volume probe: 'absent' only when docker itself says "no such
+ * volume"; any other failure is 'unknown', and callers must treat that as
+ * unverifiable, never as clean.
+ */
+export function volumeState(name: string): 'exists' | 'absent' | 'unknown' {
+  try {
+    execDocker(['volume', 'inspect', name]);
+    return 'exists';
+  } catch (err) {
+    return String((err as Error)?.message || err).toLowerCase().includes('no such volume') ? 'absent' : 'unknown';
+  }
+}
+
+/**
  * Remove a Docker volume by name. A volume PROVEN absent counts as removed
  * (a retry after a partial teardown must not fail on the step a previous
  * attempt completed), but absence must come from docker saying "no such
@@ -594,12 +608,7 @@ export async function getContainerStats(containerId: string): Promise<{
  */
 export function removeVolume(name: string): boolean {
   if (execDockerSafe(['volume', 'rm', name])) return true;
-  try {
-    execDocker(['volume', 'inspect', name]);
-    return false;
-  } catch (err) {
-    return String((err as Error)?.message || err).toLowerCase().includes('no such volume');
-  }
+  return volumeState(name) === 'absent';
 }
 
 /**
@@ -614,7 +623,12 @@ export function listProjectVolumes(projectName: string): string[] {
       '--format', '{{.Name}}'
     ]);
     if (!output) return [];
-    return output.split('\n').filter(line => line.trim());
+    // The name filter is a SUBSTRING match, so another project whose name
+    // merely contains this one ('musicbot_data' vs project 'bot') leaks into
+    // the list - and a caller removes what this returns. Keep exact-prefix
+    // matches only; sanitized project names cannot contain an underscore.
+    return output.split('\n').filter(line => line.trim())
+      .filter(name => name.startsWith(`${projectName}_`));
   } catch {
     return [];
   }

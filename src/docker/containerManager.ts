@@ -1000,16 +1000,37 @@ async function listDeleteRemnants(
   deploymentMode: DeploymentMode
 ): Promise<string[]> {
   const remnants: string[] = [];
+  // One reachability verdict up front: every probe below reads through docker
+  // and the helpers swallow daemon errors into EMPTY lists (listBotContainers,
+  // imageExists, listProjectVolumes all catch internally), so without this an
+  // unreachable daemon read as "nothing remains" and deregistered on blind
+  // faith, orphaning whatever survived with no Delete button left to retry.
+  if (!await dockerClient.checkDockerConnection()) {
+    return ['docker unreachable (nothing could be verified)'];
+  }
   try {
-    const containers = await dockerClient.listBotContainers();
-    for (const c of containers) {
-      if (c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`)) {
-        remnants.push(`container ${c.name}`);
-      }
+    // The bot-id label is the exact ownership key (every processed compose
+    // service carries it, injected sidecars included): name matching either
+    // claimed a sibling's containers (startsWith(appName) vs fmdbworker2app)
+    // or missed own containers with imported no-separator names.
+    for (const c of await dockerClient.listContainersByBotId(instance.id)) {
+      remnants.push(`container ${c.name}`);
     }
   } catch {
     // Cannot see containers at all: do not deregister on blind faith.
     remnants.push('unverified containers (docker unreachable)');
+  }
+  // The recovery and seed helpers are docker-run without labels, so the label
+  // scan cannot see them; their names are exactly enumerable, probed one by one.
+  for (const name of [
+    instance.recoveryChannel?.containerName,
+    `${instance.sanitizedName}-recovery-rsyncd`,
+    `${instance.sanitizedName}-recovery-rsync`,
+    `${instance.sanitizedName}-fleet-replica-seed`,
+  ]) {
+    if (!name) continue;
+    const present = await execAsync(`docker inspect "${name}"`).then(() => true).catch(() => false);
+    if (present) remnants.push(`container ${name}`);
   }
 
   try {
@@ -1021,6 +1042,15 @@ async function listDeleteRemnants(
     try {
       for (const v of dockerClient.listProjectVolumes(appName)) remnants.push(`volume ${v}`);
     } catch { /* ignore */ }
+    // Companion volumes carry explicit names without the {project}_ prefix,
+    // so the project listing above can never see them; probe each directly
+    // and treat an unanswerable probe as a remnant, not as clean.
+    for (const vol of [instance.fleetDb?.volume, instance.fleetDbReplica?.volume]) {
+      if (!vol) continue;
+      const state = dockerClient.volumeState(vol);
+      if (state === 'exists') remnants.push(`volume ${vol}`);
+      else if (state === 'unknown') remnants.push(`volume ${vol} (unverifiable, docker did not answer)`);
+    }
     if (fs.existsSync(botDir)) remnants.push(`directory ${botDir}`);
   } else if (fs.existsSync(path.join(botDir, 'docker-compose.yml'))) {
     remnants.push(`compose file in ${botDir}`);
@@ -1036,6 +1066,19 @@ async function listDeleteRemnants(
     }
   }
   return remnants;
+}
+
+/** rm -f that tolerates only PROVEN absence: an "is already gone" error is
+ * the normal case, but any other failure (daemon down, removal in progress)
+ * must land in the failure list, or the remnants gate is never consulted and
+ * a surviving helper container is orphaned with the registry entry gone. */
+async function rmContainerTolerant(name: string, failures: string[]): Promise<void> {
+  try {
+    await execAsync(`docker rm -f "${name}"`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.toLowerCase().includes('no such container')) failures.push(`container ${name}: ${msg}`);
+  }
 }
 
 async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean> {
@@ -1125,26 +1168,42 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
     }
   }
 
+  // 3a. The managed fleet database volume is custom-named too (never project-
+  // prefixed, so step 3 misses it - live-proven leak 2026-09-01); the sidecar
+  // container is compose-managed and went down with the project in step 1.
+  if (instance.fleetDb) {
+    await rmContainerTolerant(instance.fleetDb.containerName, failures);
+    if (!keepData && !dockerClient.removeVolume(instance.fleetDb.volume)) {
+      failures.push(`database volume ${instance.fleetDb.volume}: docker volume rm reported failure`);
+    }
+  }
+
   // 3b. Standby replica leftovers: its volume is custom-named (never project-
   // prefixed, so step 3 misses it) and a leftover would block any same-name
   // reinstall from provisioning. Deleting the standby also orphans the
   // PRIMARY's replication slot, which retains WAL over there - warn loudly.
   if (instance.fleetDbReplica) {
-    await execAsync(`docker rm -f "${instance.fleetDbReplica.containerName}"`).catch(() => { /* project down got it */ });
-    await execAsync(`docker rm -f "${instance.sanitizedName}-fleet-replica-seed"`).catch(() => { /* no ghost seeder */ });
+    await rmContainerTolerant(instance.fleetDbReplica.containerName, failures);
     if (!keepData && !dockerClient.removeVolume(instance.fleetDbReplica.volume)) {
       failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
     }
     console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps an orphaned replication slot that retains WAL - disable replication there or provision a new replica soon`);
   }
 
-  // 3c. Recovery-channel helpers: never compose-managed, so nothing else
-  // removes them. The peer machine keeps redialing until disarmed there.
+  // 3c. Recovery-channel relay: never compose-managed, so nothing else
+  // removes it. The peer machine keeps redialing until disarmed there.
   if (instance.recoveryChannel) {
-    await execAsync(`docker rm -f "${instance.recoveryChannel.containerName}"`).catch(() => { /* already gone */ });
-    await execAsync(`docker rm -f "${instance.sanitizedName}-recovery-rsyncd"`).catch(() => { /* RC-3 daemon absent */ });
-    await execAsync(`docker rm -f "${instance.sanitizedName}-recovery-rsync"`).catch(() => { /* RC-3 client absent */ });
+    await rmContainerTolerant(instance.recoveryChannel.containerName, failures);
   }
+
+  // 3d. Derived-name helpers run UNCONDITIONALLY: a helper can outlive its
+  // record (a disarm whose rm failed after the record cleared, a seed whose
+  // --rm was defeated by a daemon crash), and the remnants gate probes these
+  // same names unconditionally - a remnant the delete never retries removing
+  // would wedge the delete in error forever.
+  await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsyncd`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsync`, failures);
 
   // 4. Remove instance directory
   if (!keepData) {

@@ -288,11 +288,20 @@ export function processComposeForCasaOS(
       service.cpu_shares = infraServiceNames.has(serviceName) ? 10 : 50;
     }
 
-    // Bot Manager labels
-    if (!service.labels) {
-      service.labels = {};
+    // Bot Manager labels. List-form labels (labels: ["k=v"]) are normalized
+    // to map form first, like the docker path does: skipping them would
+    // deploy the container without the bot-id marker, and the delete
+    // remnants gate would then be blind to it.
+    if (!service.labels || Array.isArray(service.labels)) {
+      const asMap: Record<string, string> = {};
+      for (const l of (Array.isArray(service.labels) ? service.labels : []) as unknown[]) {
+        if (typeof l !== 'string') continue;
+        const eq = l.indexOf('=');
+        if (eq > 0) asMap[l.slice(0, eq)] = l.slice(eq + 1);
+      }
+      service.labels = asMap;
     }
-    if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
+    {
       const labels = service.labels as Record<string, string>;
       labels['managed-by'] = 'discord-bot-manager';
       labels['bot-id'] = bot.id;

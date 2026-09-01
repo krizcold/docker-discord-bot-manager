@@ -50,10 +50,8 @@ import {
   mainServiceSelfAuths,
   getFleetControlPort,
   getFleetTransferPort,
-  fleetIsSameBox,
   fleetPublicHost,
   transferPublicHost,
-  fleetAppContainerName,
   attachFleetToProxy,
   getPublishedFleetHostPort,
   publishFleetHostPort,
@@ -1617,15 +1615,15 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
     if (transferPort !== null) {
       const transferHost = transferPublicHost(instance.sanitizedName);
-      if (transferHost) {
-        // Advertise the public route only once the built compose actually
-        // serves it: a pre-transfer build restarted after a manager update
-        // must not advertise a route no proxy label backs until its rebuild.
-        if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
-      } else if (fleetIsSameBox(instance.envVars)) {
-        const cname = fleetAppContainerName(composeContent);
-        if (cname) env.TRANSFER_URL = `ws://${cname}:${transferPort}`;
-      }
+      // Advertise the public route only once the built compose actually
+      // serves it: a pre-transfer build restarted after a manager update
+      // must not advertise a route no proxy label backs until its rebuild.
+      // No same-box container-name fallback: whether a peer can reach a
+      // container name is app topology the manager cannot judge (the old
+      // guess read the dial list and diverged from the app's own role
+      // resolution). A no-base rig sets the transfer URL by hand; without
+      // one the app refuses a migration loudly and names the fix.
+      if (transferHost && composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
     }
     // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
     // bot's promote flow promotes this database first. Credentials are the

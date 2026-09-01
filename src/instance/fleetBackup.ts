@@ -13,8 +13,9 @@
  * courtesy stop of the managed instances this manager can see on the URL,
  * sidecar brought back alone, WRITE FENCE (read-only + terminate sessions -
  * the sweep cannot see a consumer whose DSN lives in the bot's own store, so
- * the fence is the actual protection), pg_restore --clean --if-exists with
- * the restoring session exempted, fence lifted, stopped instances restarted.
+ * the fence is the actual protection), database dropped and recreated,
+ * pg_restore --exit-on-error with the restoring session exempted, fence
+ * lifted, stopped instances restarted.
  */
 
 import * as fs from 'fs';
@@ -108,6 +109,14 @@ function execDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stde
   });
 }
 
+// stopBot/startBot THROW on an op-lock conflict; inside the restore lane a
+// throw would skip the restart obligations and turn a finished restore into
+// a 500, so any rejection from these container ops becomes an ordinary
+// failure here.
+function asResult(op: Promise<{ success: boolean; error?: string }>): Promise<{ success: boolean; error?: string }> {
+  return op.catch(err => ({ success: false, error: String((err as Error)?.message || err) }));
+}
+
 type RestoreFleetDb = { containerName: string; user: string; db: string; volume: string };
 
 /**
@@ -117,7 +126,9 @@ type RestoreFleetDb = { containerName: string; user: string; db: string; volume:
  * container restarts, which is why 'stripped' is not 'lifted'.
  */
 async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'stripped' | 'failed'> {
-  const unfence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+  // The maintenance db, not the target db: the fence is cluster-level, and
+  // the lift must work while the target db is dropped mid-restore.
+  const unfence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
     '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
     '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
     '-c', 'SELECT pg_reload_conf()']);
@@ -127,11 +138,14 @@ async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'st
   return strip.ok ? 'stripped' : 'failed';
 }
 
-/** Lift and keep the per-bot stuck-fence warning truthful. */
+/** Lift and keep the per-bot stuck-fence warning truthful. A restart only
+ * clears a STRIPPED fence; a 'failed' one survives in auto.conf and would be
+ * re-applied by the restart, so its remedy is a retried lift instead. */
 async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb): Promise<'lifted' | 'stripped' | 'failed'> {
   const result = await liftRestoreFence(fleetDb);
   if (result === 'lifted') fenceStuck.delete(botId);
-  else fenceStuck.set(botId, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+  else if (result === 'stripped') fenceStuck.set(botId, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+  else fenceStuck.set(botId, 'The database is READ-ONLY (a restore write fence could not be lifted or stripped); running the restore again retries the lift');
   return result;
 }
 
@@ -145,9 +159,9 @@ async function seedStuckFences(): Promise<void> {
     const db = instance.fleetDb;
     if (!db || fenceStuck.has(instance.id)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
-    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', db.db, '-tA', '-c', 'SHOW default_transaction_read_only']);
+    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
     if (probe.ok && probe.stdout.trim() === 'on') {
-      fenceStuck.set(instance.id, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it');
+      fenceStuck.set(instance.id, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it, or run a restore again to retry the lift');
     }
   }
 }
@@ -162,7 +176,7 @@ async function reprobeStuckFences(): Promise<void> {
     const db = containerManager.getBot(id)?.fleetDb;
     if (!db) { fenceStuck.delete(id); continue; }
     if (!await isContainerRunning(db.containerName)) continue;
-    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', db.db, '-tA', '-c', 'SHOW default_transaction_read_only']);
+    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
     if (probe.ok && probe.stdout.trim() === 'off') fenceStuck.delete(id);
   }
 }
@@ -316,8 +330,12 @@ async function runFleetBackupTick(): Promise<void> {
  * Restore a dump into the instance's sidecar. In order: pre-restore safety
  * dump (refusing the restore if it fails), courtesy stop of the managed
  * instances this manager can see on the URL, sidecar brought back alone,
- * write fence, pg_restore of the chosen file with the restoring session
- * exempted, fence lifted, stopped instances restarted.
+ * write fence, drop and recreate of the database (pg_restore --clean cannot
+ * restore this schema: the partition PK drops it emits are refused as
+ * inherited constraints and the run exits 1 even when everything applied; a
+ * fresh database makes any restore error a real failure), pg_restore
+ * --exit-on-error of the chosen file with the restoring session exempted,
+ * fence lifted, stopped instances restarted.
  */
 export async function restoreFleetBackup(
   botId: string,
@@ -349,7 +367,7 @@ export async function restoreFleetBackup(
     // needed, and starting the whole instance first would boot the bot
     // against the bad data. Bring the database up alone when it is not up.
     if (!await isContainerRunning(fleetDb.containerName)) {
-      const started = await containerManager.startFleetDbSidecar(botId);
+      const started = await asResult(containerManager.startFleetDbSidecar(botId));
       if (!started.success) {
         return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
       }
@@ -359,12 +377,22 @@ export async function restoreFleetBackup(
     // is a service of the instance's own compose project, so the stop below
     // takes it down with the host. The old stop-then-dump order refused
     // every healthy-fleet restore, and returned before the restart loop.
-    const safety = await runFleetDump(instance, 'pre-restore-');
-    if (!safety.success) {
-      lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
-      return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
+    // A MISSING database (a prior recreate failure) has no data to protect
+    // and dumping it would refuse every retry, so existence is probed first;
+    // an unanswerable probe still refuses.
+    const exists = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+      '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
+    if (!exists.ok) {
+      return { success: false, error: `Could not check the database before the restore: ${exists.stderr.trim().split('\n').pop()}`, steps };
     }
-    steps.preRestoreDump = safety.file || null;
+    if (exists.stdout.trim() !== '0') {
+      const safety = await runFleetDump(instance, 'pre-restore-');
+      if (!safety.success) {
+        lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
+        return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
+      }
+      steps.preRestoreDump = safety.file || null;
+    }
 
     // 2. Courtesy stop of every running managed instance this manager can see
     // on this exact URL. It cannot see them all (a worker's DSN lives in the
@@ -375,11 +403,11 @@ export async function restoreFleetBackup(
     );
     for (const b of sharing) {
       if (b.status !== 'running') continue;
-      const stop = await containerManager.stopBot(b.id);
+      const stop = await asResult(containerManager.stopBot(b.id));
       if (!stop.success) {
         // Nothing was restored yet: bring back what we already stopped and refuse.
         for (const id of steps.stopped) {
-          const start = await containerManager.startBot(id);
+          const start = await asResult(containerManager.startBot(id));
           if (start.success) steps.restarted.push(id);
         }
         return { success: false, error: `Could not stop instance ${b.displayName}: ${stop.error}`, steps };
@@ -390,10 +418,10 @@ export async function restoreFleetBackup(
     // 3. Stopping the host took its sidecar down with the compose project;
     // bring the database back alone.
     if (!await isContainerRunning(fleetDb.containerName)) {
-      const started = await containerManager.startFleetDbSidecar(botId);
+      const started = await asResult(containerManager.startFleetDbSidecar(botId));
       if (!started.success) {
         for (const id of steps.stopped) {
-          const start = await containerManager.startBot(id);
+          const start = await asResult(containerManager.startBot(id));
           if (start.success) steps.restarted.push(id);
         }
         return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
@@ -402,12 +430,12 @@ export async function restoreFleetBackup(
 
     // 4. Write fence, the same one the recovery quiesce uses: writes off
     // cluster-wide and every other session terminated, so a consumer the
-    // sweep could not see cannot write under pg_restore --clean.
+    // sweep could not see cannot write under the restore.
     // ON_ERROR_STOP so a failed ALTER SYSTEM under a succeeding terminate
     // cannot read as a successful fence. fenced is set BEFORE the attempt so
     // a throw mid-fence still reaches the finally lift.
     fenced = true;
-    const fence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+    const fence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
       '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
       '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
       '-c', 'SELECT pg_reload_conf()',
@@ -419,25 +447,49 @@ export async function restoreFleetBackup(
       const cleared = await liftAndTrack(botId, fleetDb);
       if (cleared === 'lifted') fenced = false;
       for (const id of steps.stopped) {
-        const start = await containerManager.startBot(id);
+        const start = await asResult(containerManager.startBot(id));
         if (start.success) steps.restarted.push(id);
       }
       const fenceWarning = cleared === 'lifted' ? '' : '; the database may be READ-ONLY until its container restarts';
       return { success: false, error: `Could not fence the database for the restore: ${fence.stderr.trim().split('\n').pop()}${fenceWarning}`, steps };
     }
 
-    // 5. pg_restore with the dump streamed to stdin. PGOPTIONS exempts this
+    // 5. Drop and recreate the database under the fence. pg_restore --clean
+    // cannot restore this schema (the partition PK drops it emits are refused
+    // as inherited constraints and the run exits 1 even when everything
+    // applied), and a fresh database makes any restore error a real failure.
+    // WITH (FORCE) also kills sessions the terminate sweep raced against.
+    // Physical walsenders are not connected to any database, so a streaming
+    // standby just replays the swap.
+    const dbIdent = `"${fleetDb.db.replace(/"/g, '""')}"`;
+    const recreate = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+      'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+      '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
+      '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
+    if (!recreate.ok) {
+      lastErrors.set(botId, `Restore failed: could not recreate the database: ${recreate.stderr.trim().split('\n').pop()}`);
+      const cleared = await liftAndTrack(botId, fleetDb);
+      fenced = cleared !== 'lifted';
+      for (const id of steps.stopped) {
+        const start = await asResult(containerManager.startBot(id));
+        if (start.success) steps.restarted.push(id);
+      }
+      const clearWarning = cleared === 'lifted' ? '' : '; additionally the write fence could not be lifted live, so the cluster is READ-ONLY until its container restarts';
+      return { success: false, error: `Could not recreate the database for the restore: ${recreate.stderr.trim().split('\n').pop()}${clearWarning}`, steps };
+    }
+
+    // 6. pg_restore with the dump streamed to stdin. PGOPTIONS exempts this
     // one session from the fence; everyone else stays read-only. The
     // IN-CONTAINER timeout is load-bearing: killing the docker exec CLIENT
-    // leaves the server-side pg_restore alive and fence-exempt, and it would
-    // execute its queued DROPs after the lift below - the timeout kills the
-    // actual process, and the Node timer is only the backstop behind it.
+    // leaves the server-side pg_restore alive and fence-exempt, still writing
+    // into the database after the lift below - the timeout kills the actual
+    // process, and the Node timer is only the backstop behind it.
     const inContainerTimeoutSec = Math.floor(DUMP_TIMEOUT_MS / 1000);
     const restoreStartedAt = Date.now();
     const restore = await new Promise<{ success: boolean; error?: string }>(resolve => {
       const child = spawn('docker', ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
         'timeout', '-s', 'KILL', String(inContainerTimeoutSec),
-        'pg_restore', '-U', fleetDb.user, '--clean', '--if-exists', '-d', fleetDb.db]);
+        'pg_restore', '-U', fleetDb.user, '--exit-on-error', '-d', fleetDb.db]);
       const input = fs.createReadStream(dumpPath);
       let stderr = '';
       let killed = false;
@@ -482,15 +534,15 @@ export async function restoreFleetBackup(
       lastErrors.set(botId, `Restore failed: ${restore.error}`);
     }
 
-    // 6. On a failed restore, terminate any surviving session BEFORE lifting:
+    // 7. On a failed restore, terminate any surviving session BEFORE lifting:
     // a timed-out pg_restore's server-side process is fence-exempt, and left
-    // alive it would execute its queued DROPs against the unfenced database.
+    // alive it would keep writing into the unfenced database.
     if (!restore.success) {
-      await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
+      await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA',
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
     }
 
-    // 7. Lift the fence BEFORE the restarts, so instances come back to a
+    // 8. Lift the fence BEFORE the restarts, so instances come back to a
     // writable database. 'stripped' cleans only the persisted copy: the LIVE
     // cluster stays read-only until its container restarts.
     const lift = await liftAndTrack(botId, fleetDb);
@@ -502,9 +554,9 @@ export async function restoreFleetBackup(
     }
     const liftWarning = lift === 'lifted' ? '' : '; additionally the write fence could not be lifted live, so the database is READ-ONLY until its container restarts';
 
-    // 8. Restart the instances stopped in step 2
+    // 9. Restart the instances stopped in step 2
     for (const id of steps.stopped) {
-      const start = await containerManager.startBot(id);
+      const start = await asResult(containerManager.startBot(id));
       if (start.success) steps.restarted.push(id);
       else console.error(`[FleetBackup] Failed to restart ${id} after restore: ${start.error}`);
     }

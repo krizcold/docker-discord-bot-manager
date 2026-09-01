@@ -382,7 +382,11 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       // instead (auto.conf is a plain file; the next start comes up clean).
       // The READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
       // SYSTEM in read-only transactions.
-      const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+      // The fence and the slot are cluster-level, so these sessions use the
+      // maintenance db: they must keep working when the fleet database itself
+      // is missing (a restore whose recreate failed), or the slot would leak
+      // and retain WAL forever once the record clears below.
+      const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
         '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
         '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
         '-c', 'SELECT pg_reload_conf()']);
@@ -392,9 +396,9 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
         if (!strip.ok) console.warn(`[RecoveryChannel] Could not lift the write fence on ${fleetDb.containerName} while disarming: ${strip.stderr.trim().split('\n').pop()}`);
       }
       for (let attempt = 0; attempt < 2; attempt++) {
-        await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+        await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
           "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"]);
-        const drop = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+        const drop = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
           "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'recovery_channel'"]);
         if (drop.ok) break;
         await new Promise(resolve => setTimeout(resolve, 2_000));

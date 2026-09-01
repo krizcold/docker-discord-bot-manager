@@ -2411,7 +2411,7 @@
           </label>
         </div>
         <div id="fleet-backup-list">${listHtml}</div>
-        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. A fresh safety dump is always taken first.</div>
+        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. A fresh safety dump is taken first (skipped only when the database itself is missing).</div>
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Replication</div>
           <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
@@ -3080,7 +3080,7 @@
     }
 
     async function restoreFleetBackupFile(botId, file) {
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first; the database is then fenced read-only with its sessions closed for the whole restore, and the instances on this manager that share it are stopped and restarted. Instances on other machines see the database go read-only until it finishes.`;
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first (skipped only when the database itself is missing); the database is then fenced read-only with its sessions closed, dropped and rebuilt from the chosen dump, and the instances on this manager that share it are stopped and restarted. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);
@@ -3089,7 +3089,7 @@
         const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
         if (res.success) {
           const s = res.steps || {};
-          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, safety dump taken, restarted ${(s.restarted || []).length}`);
+          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, restarted ${(s.restarted || []).length}`);
         } else {
           showMessage('error', res.error || 'Restore failed');
         }

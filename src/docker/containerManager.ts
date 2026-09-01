@@ -84,7 +84,7 @@ import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
-import { sanitizeName, titleizeName, resolveNames, makeUniqueName } from '../naming';
+import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 
@@ -639,6 +639,14 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
 
   if (update.displayName) {
     const names = resolveNames(update.displayName);
+    // Same constraints as create: without this, renaming B to A's name gives
+    // two instances one sanitizedName, colliding the compose project, the
+    // AppData folder and the primary vhost. Excluding this instance keeps
+    // cosmetic self-renames allowed.
+    const check = validateName(update.displayName, Object.values(registry.instances), botId);
+    if (!check.valid) {
+      throw new Error(`Cannot rename: ${check.errors.join('; ')}`);
+    }
     // sanitizedName is the compose project of the deployed containers; changing
     // it while they may exist orphans the live project (stop, start and the
     // state reconciler all key off the new name). Cosmetic display changes

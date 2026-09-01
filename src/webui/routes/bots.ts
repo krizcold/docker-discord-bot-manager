@@ -219,7 +219,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         try {
           const env = envManager.getEnvVars(bot.id);
           const role = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-          if (role !== 'backup-master' && (env['FLEET_BACKUP_MASTER'] || '').trim() !== '1') continue;
+          if (role !== 'backup-master') continue;
           const secret = (env['CONTROL_SECRET'] || '').trim();
           if (secret === '') continue;
           const addrs = fleetAddrsOf(bot);
@@ -237,19 +237,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       for (const bot of containerManager.getAllBots()) {
         try {
           const env = envManager.getEnvVars(bot.id);
-          // Mirror the bot's own role resolution: an explicit role wins, and a
-          // blank role with the LEGACY single MASTER_URL is a co-worker. Listing
-          // one would point a joining node at a peer that runs no control server.
-          // MASTER_URLS never implies a role - every node carries that list.
+          // An explicit role wins; a blank role reads as master, matching the
+          // bot. MASTER_URLS never implies a role - every node carries that
+          // list, the master included.
           const nodeRole = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-          const legacyDial = (env['MASTER_URL'] || '').trim() !== '';
-          if (!(nodeRole === 'master' || (nodeRole === '' && !legacyDial))) continue;
+          if (nodeRole !== 'master' && nodeRole !== '') continue;
           const addrs = fleetAddrsOf(bot);
           if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
 
           const controlSecret = (env['CONTROL_SECRET'] || '').trim();
-          // Never list a node as its own backup: a promoted ex-backup can carry
-          // both the master role and a stale designation flag.
+          // Roles are disjoint, so a node cannot match both lists any more;
+          // the id filter stays as a cheap invariant guard.
           const peers = controlSecret === '' ? [] : backups.filter(b => b.secret === controlSecret && b.id !== bot.id);
           const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
           const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
@@ -938,15 +936,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const envVars = { ...vars };
-      const dropped = envManager.setEnvVars(req.params.id, envVars);
+      envManager.setEnvVars(req.params.id, envVars);
       await containerManager.updateBot(req.params.id, { envVars });
-      // Keys the save retired (legacy fleet designation/dial) must leave the
-      // instance record and the deployed compose too, or the start-time sync
-      // re-bakes them from the stale snapshot (same trio as DELETE /env/:key).
-      if (dropped.length > 0) {
-        containerManager.removeBotEnvVars(req.params.id, dropped);
-        for (const key of dropped) containerManager.removeEnvKeyFromDeployedCompose(req.params.id, key);
-      }
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));

@@ -1262,23 +1262,26 @@ export function isFleetMaster(envVars?: Record<string, string>): boolean {
 /**
  * Whether a container-name dial URL is reachable by this node's fleet peers.
  * A no-base master's workers are same-box by construction (no public control
- * route exists either); a co-worker is same-box when its MASTER_URL is a plain
+ * route exists either); a co-worker is same-box when its first candidate is a plain
  * ws:// local dial. A wss:// master is cross-host: advertising a container name
  * there would steer migration legs at an unresolvable endpoint, while
  * advertising nothing lets the direction resolution fall back to dialing the
  * peer's public transfer route.
  */
 export function fleetIsSameBox(envVars?: Record<string, string>): boolean {
-  // Mirrors the bot's resolveNodeRole exactly: explicit BOT_NODE_ROLE wins,
-  // else a configured master candidate (MASTER_URLS first entry, or
-  // MASTER_URL) means co-worker. isFleetMaster alone would misclassify a
-  // role-implicit co-worker (dial URL set, role unset) as a master and
-  // resurrect the unreachable container-name advertise.
+  // Explicit BOT_NODE_ROLE wins, else a MASTER_URLS first entry reads as
+  // dialing out. That second inference is the MANAGER's own and diverges from
+  // the bot (which never infers a role from MASTER_URLS); reconciling it is
+  // the roleEnv migration's job. The manager no longer reads the retired
+  // MASTER_URL at all, so a HAND-SET one with a blank role classifies as a
+  // leader here and advertises the container name - out of the supported
+  // envelope, and the bot-side legacy arm that still honors that key is the
+  // open question, not this function.
   const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
   const urlsRaw = (envVars?.['MASTER_URLS'] || '').trim().toLowerCase();
   const firstCandidate = urlsRaw !== ''
     ? (urlsRaw.split(',').map(s => s.trim()).find(s => s !== '') || '')
-    : (envVars?.['MASTER_URL'] || '').trim().toLowerCase();
+    : '';
   const isCoWorker = role === 'co-worker' || role === 'backup-master'
     || (role !== 'master' && firstCandidate !== '');
   if (!isCoWorker) return true;

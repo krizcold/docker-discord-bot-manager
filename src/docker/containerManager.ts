@@ -1649,11 +1649,11 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       // legitimately ship one, so its cleanup is gated on the fleet marker.
       if (!('FLEET_PUBLIC_URL' in allEnv)) deleteComposeEnv(service.environment, 'FLEET_PUBLIC_URL');
       if (!('TRANSFER_URL' in allEnv) && getFleetControlPort(raw) !== null) deleteComposeEnv(service.environment, 'TRANSFER_URL');
-      // Retired designation/dial keys: the role-authoritative save drops them
-      // from the registry, and a stale compose copy would keep a node silently
-      // designated or dialing a legacy URL through every restart.
+      // The local-replica keys must not survive in a compose once the standby
+      // they described is gone: a stale copy would keep pointing the app at a
+      // database this machine no longer hosts.
       if (getFleetControlPort(raw) !== null) {
-        for (const key of ['FLEET_BACKUP_MASTER', 'MASTER_URL', 'FLEET_DB_REPLICA_URL', 'FLEET_DB_REPLICA_PUBLIC_URL']) {
+        for (const key of ['FLEET_DB_REPLICA_URL', 'FLEET_DB_REPLICA_PUBLIC_URL']) {
           if (!(key in allEnv)) deleteComposeEnv(service.environment, key);
         }
       }

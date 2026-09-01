@@ -3080,7 +3080,7 @@
     }
 
     async function restoreFleetBackupFile(botId, file) {
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first, and every instance using this database is stopped and restarted.`;
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first; the database is then fenced read-only with its sessions closed for the whole restore, and the instances on this manager that share it are stopped and restarted. Instances on other machines see the database go read-only until it finishes.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);

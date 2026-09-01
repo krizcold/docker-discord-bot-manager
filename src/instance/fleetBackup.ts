@@ -8,8 +8,13 @@
  *
  * Dumps stream to <DATA_DIR>/backups/<botId>/fleet-postgres/<ISO>.dump with a
  * keep-newest retention trim (pre-restore-*.dump files are exempt). Restore
- * stops every instance sharing the URL, takes a pre-restore safety dump, runs
- * pg_restore --clean --if-exists, then restarts the stopped instances.
+ * order: safety dump FIRST (the sidecar is a service of the instance's own
+ * compose project, so stopping the host takes the database down with it),
+ * courtesy stop of the managed instances this manager can see on the URL,
+ * sidecar brought back alone, WRITE FENCE (read-only + terminate sessions -
+ * the sweep cannot see a consumer whose DSN lives in the bot's own store, so
+ * the fence is the actual protection), pg_restore --clean --if-exists with
+ * the restoring session exempted, fence lifted, stopped instances restarted.
  */
 
 import * as fs from 'fs';
@@ -32,11 +37,15 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
 const lastAttempts: Map<string, number> = new Map();
 // Last dump/restore error per instance (in-memory, surfaced on the bot card)
 const lastErrors: Map<string, string> = new Map();
+// A stuck restore write fence, tracked apart from lastErrors: a read-only
+// database still DUMPS successfully, so the nightly dump's success would wipe
+// a warning parked in the shared slot while the fence still stands.
+const fenceStuck: Map<string, string> = new Map();
 // Instances with a dump or restore in flight
 const busy: Set<string> = new Set();
 
 export function getFleetBackupError(botId: string): string | null {
-  return lastErrors.get(botId) || null;
+  return fenceStuck.get(botId) || lastErrors.get(botId) || null;
 }
 
 /**
@@ -89,6 +98,73 @@ function isContainerRunning(containerName: string): Promise<boolean> {
       resolve(!err && String(stdout).trim() === 'true');
     });
   });
+}
+
+function execDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    execFile('docker', args, { maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+}
+
+type RestoreFleetDb = { containerName: string; user: string; db: string; volume: string };
+
+/**
+ * Lift the restore write fence. ALTER SYSTEM persists in the volume's
+ * auto.conf, so when the live lift fails the file is stripped instead (the
+ * recovery channel's fallback): the LIVE state then stays read-only until the
+ * container restarts, which is why 'stripped' is not 'lifted'.
+ */
+async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'stripped' | 'failed'> {
+  const unfence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+    '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
+    '-c', 'SELECT pg_reload_conf()']);
+  if (unfence.ok) return 'lifted';
+  const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine',
+    '-c', "sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"]);
+  return strip.ok ? 'stripped' : 'failed';
+}
+
+/** Lift and keep the per-bot stuck-fence warning truthful. */
+async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb): Promise<'lifted' | 'stripped' | 'failed'> {
+  const result = await liftRestoreFence(fleetDb);
+  if (result === 'lifted') fenceStuck.delete(botId);
+  else fenceStuck.set(botId, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+  return result;
+}
+
+/**
+ * Seed the stuck-fence warnings from OBSERVED live state at scheduler start,
+ * so a manager restart does not silently forget a database a failed lift left
+ * read-only. One probe per fleet-database host, once.
+ */
+async function seedStuckFences(): Promise<void> {
+  for (const instance of containerManager.getAllBots()) {
+    const db = instance.fleetDb;
+    if (!db || fenceStuck.has(instance.id)) continue;
+    if (!await isContainerRunning(db.containerName)) continue;
+    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', db.db, '-tA', '-c', 'SHOW default_transaction_read_only']);
+    if (probe.ok && probe.stdout.trim() === 'on') {
+      fenceStuck.set(instance.id, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it');
+    }
+  }
+}
+
+/**
+ * Self-heal the stuck-fence warning: once the operator restarts the container
+ * (the stripped auto.conf comes up clean) the live state is writable again and
+ * the warning must go. Cheap - runs only while an entry exists.
+ */
+async function reprobeStuckFences(): Promise<void> {
+  for (const id of Array.from(fenceStuck.keys())) {
+    const db = containerManager.getBot(id)?.fleetDb;
+    if (!db) { fenceStuck.delete(id); continue; }
+    if (!await isContainerRunning(db.containerName)) continue;
+    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', db.db, '-tA', '-c', 'SHOW default_transaction_read_only']);
+    if (probe.ok && probe.stdout.trim() === 'off') fenceStuck.delete(id);
+  }
 }
 
 /**
@@ -220,6 +296,7 @@ async function runScheduledDump(instance: InstanceConfig): Promise<void> {
 }
 
 async function runFleetBackupTick(): Promise<void> {
+  await reprobeStuckFences();
   const currentHour = new Date().getHours();
   for (const instance of containerManager.getAllBots()) {
     if (!instance.fleetDb || busy.has(instance.id)) continue;
@@ -236,10 +313,11 @@ async function runFleetBackupTick(): Promise<void> {
 }
 
 /**
- * Restore a dump into the instance's sidecar. In order: stop every managed
- * instance whose stored DATA_BACKEND_URL is exactly this URL, take a
- * pre-restore safety dump (refusing the restore if it fails), pg_restore the
- * chosen file, restart the stopped instances.
+ * Restore a dump into the instance's sidecar. In order: pre-restore safety
+ * dump (refusing the restore if it fails), courtesy stop of the managed
+ * instances this manager can see on the URL, sidecar brought back alone,
+ * write fence, pg_restore of the chosen file with the restoring session
+ * exempted, fence lifted, stopped instances restarted.
  */
 export async function restoreFleetBackup(
   botId: string,
@@ -265,8 +343,33 @@ export async function restoreFleetBackup(
 
   if (busy.has(botId)) return { success: false, error: 'A backup operation is already in progress', steps };
   busy.add(botId);
+  let fenced = false;
   try {
-    // 1. Stop every running managed instance on this exact URL
+    // 0. A restore must work on a DOWN fleet - that is exactly when it is
+    // needed, and starting the whole instance first would boot the bot
+    // against the bad data. Bring the database up alone when it is not up.
+    if (!await isContainerRunning(fleetDb.containerName)) {
+      const started = await containerManager.startFleetDbSidecar(botId);
+      if (!started.success) {
+        return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
+      }
+    }
+
+    // 1. Pre-restore safety dump FIRST, while the sidecar is up: the sidecar
+    // is a service of the instance's own compose project, so the stop below
+    // takes it down with the host. The old stop-then-dump order refused
+    // every healthy-fleet restore, and returned before the restart loop.
+    const safety = await runFleetDump(instance, 'pre-restore-');
+    if (!safety.success) {
+      lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
+      return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
+    }
+    steps.preRestoreDump = safety.file || null;
+
+    // 2. Courtesy stop of every running managed instance this manager can see
+    // on this exact URL. It cannot see them all (a worker's DSN lives in the
+    // bot's own data/.env, and other machines' instances are out of reach
+    // entirely), which is why the fence below is the actual protection.
     const sharing = containerManager.getAllBots().filter(b =>
       (envManager.getEnvVars(b.id)['DATA_BACKEND_URL'] || '').trim() === url
     );
@@ -284,17 +387,57 @@ export async function restoreFleetBackup(
       steps.stopped.push(b.id);
     }
 
-    // 2. Pre-restore safety dump; a failure refuses the whole restore
-    const safety = await runFleetDump(instance, 'pre-restore-');
-    if (!safety.success) {
-      lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
-      return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
+    // 3. Stopping the host took its sidecar down with the compose project;
+    // bring the database back alone.
+    if (!await isContainerRunning(fleetDb.containerName)) {
+      const started = await containerManager.startFleetDbSidecar(botId);
+      if (!started.success) {
+        for (const id of steps.stopped) {
+          const start = await containerManager.startBot(id);
+          if (start.success) steps.restarted.push(id);
+        }
+        return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
+      }
     }
-    steps.preRestoreDump = safety.file || null;
 
-    // 3. pg_restore with the dump streamed to stdin
+    // 4. Write fence, the same one the recovery quiesce uses: writes off
+    // cluster-wide and every other session terminated, so a consumer the
+    // sweep could not see cannot write under pg_restore --clean.
+    // ON_ERROR_STOP so a failed ALTER SYSTEM under a succeeding terminate
+    // cannot read as a successful fence. fenced is set BEFORE the attempt so
+    // a throw mid-fence still reaches the finally lift.
+    fenced = true;
+    const fence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+      '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+      '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
+      '-c', 'SELECT pg_reload_conf()',
+      '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+    if (!fence.ok) {
+      // A half-applied fence must not survive the refusal. Only a LIVE lift
+      // clears it; 'stripped' cleans the persisted copy alone, so the finally
+      // must keep retrying and the operator must hear about the read-only risk.
+      const cleared = await liftAndTrack(botId, fleetDb);
+      if (cleared === 'lifted') fenced = false;
+      for (const id of steps.stopped) {
+        const start = await containerManager.startBot(id);
+        if (start.success) steps.restarted.push(id);
+      }
+      const fenceWarning = cleared === 'lifted' ? '' : '; the database may be READ-ONLY until its container restarts';
+      return { success: false, error: `Could not fence the database for the restore: ${fence.stderr.trim().split('\n').pop()}${fenceWarning}`, steps };
+    }
+
+    // 5. pg_restore with the dump streamed to stdin. PGOPTIONS exempts this
+    // one session from the fence; everyone else stays read-only. The
+    // IN-CONTAINER timeout is load-bearing: killing the docker exec CLIENT
+    // leaves the server-side pg_restore alive and fence-exempt, and it would
+    // execute its queued DROPs after the lift below - the timeout kills the
+    // actual process, and the Node timer is only the backstop behind it.
+    const inContainerTimeoutSec = Math.floor(DUMP_TIMEOUT_MS / 1000);
+    const restoreStartedAt = Date.now();
     const restore = await new Promise<{ success: boolean; error?: string }>(resolve => {
-      const child = spawn('docker', ['exec', '-i', fleetDb.containerName, 'pg_restore', '-U', fleetDb.user, '--clean', '--if-exists', '-d', fleetDb.db]);
+      const child = spawn('docker', ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
+        'timeout', '-s', 'KILL', String(inContainerTimeoutSec),
+        'pg_restore', '-U', fleetDb.user, '--clean', '--if-exists', '-d', fleetDb.db]);
       const input = fs.createReadStream(dumpPath);
       let stderr = '';
       let killed = false;
@@ -303,7 +446,7 @@ export async function restoreFleetBackup(
       const timer = setTimeout(() => {
         killed = true;
         child.kill('SIGKILL');
-      }, DUMP_TIMEOUT_MS);
+      }, DUMP_TIMEOUT_MS + 30_000);
 
       const finish = (result: { success: boolean; error?: string }) => {
         if (settled) return;
@@ -322,7 +465,11 @@ export async function restoreFleetBackup(
       child.stderr.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
       child.on('error', err => finish({ success: false, error: `Failed to run docker exec: ${err.message}` }));
       child.on('close', code => {
-        if (killed) return finish({ success: false, error: `Restore timed out after ${DUMP_TIMEOUT_MS / 60000} minutes` });
+        // 137 = the in-container timeout's KILL; the elapsed guard keeps a
+        // genuine externally-killed pg_restore distinguishable.
+        if (killed || (code === 137 && Date.now() - restoreStartedAt >= DUMP_TIMEOUT_MS)) {
+          return finish({ success: false, error: `Restore timed out after ${DUMP_TIMEOUT_MS / 60000} minutes` });
+        }
         if (code !== 0) return finish({ success: false, error: `pg_restore exited with code ${code}: ${stderr.trim().slice(0, 500)}` });
         finish({ success: true });
       });
@@ -335,16 +482,40 @@ export async function restoreFleetBackup(
       lastErrors.set(botId, `Restore failed: ${restore.error}`);
     }
 
-    // 4. Restart the instances stopped in step 1
+    // 6. On a failed restore, terminate any surviving session BEFORE lifting:
+    // a timed-out pg_restore's server-side process is fence-exempt, and left
+    // alive it would execute its queued DROPs against the unfenced database.
+    if (!restore.success) {
+      await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
+        '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+    }
+
+    // 7. Lift the fence BEFORE the restarts, so instances come back to a
+    // writable database. 'stripped' cleans only the persisted copy: the LIVE
+    // cluster stays read-only until its container restarts.
+    const lift = await liftAndTrack(botId, fleetDb);
+    fenced = lift !== 'lifted';
+    if (lift !== 'lifted') {
+      console.error(`[FleetBackup] Restore fence on ${fleetDb.containerName}: ${lift === 'stripped'
+        ? 'live lift failed; auto.conf stripped, the database stays read-only until its container restarts'
+        : 'could not be lifted or stripped'}`);
+    }
+    const liftWarning = lift === 'lifted' ? '' : '; additionally the write fence could not be lifted live, so the database is READ-ONLY until its container restarts';
+
+    // 8. Restart the instances stopped in step 2
     for (const id of steps.stopped) {
       const start = await containerManager.startBot(id);
       if (start.success) steps.restarted.push(id);
       else console.error(`[FleetBackup] Failed to restart ${id} after restore: ${start.error}`);
     }
 
-    if (!restore.success) return { success: false, error: restore.error, steps };
+    if (!restore.success) return { success: false, error: `${restore.error}${liftWarning}`, steps };
+    if (lift !== 'lifted') return { success: false, error: 'Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)', steps };
     return { success: true, steps };
   } finally {
+    // The leftover-lift attempt must finish before the busy gate opens, or a
+    // retry's fresh fence could be dissolved by this stale lift mid-restore.
+    if (fenced) await liftAndTrack(botId, fleetDb);
     busy.delete(botId);
   }
 }
@@ -356,6 +527,10 @@ export function startFleetBackupScheduler(): void {
   if (intervalHandle) return;
 
   console.log(`[FleetBackup] Started (tick: ${TICK_INTERVAL_MS / 1000}s)`);
+
+  seedStuckFences().catch(err => {
+    console.error('[FleetBackup] Stuck-fence seed error:', err);
+  });
 
   intervalHandle = setInterval(() => {
     runFleetBackupTick().catch(err => {

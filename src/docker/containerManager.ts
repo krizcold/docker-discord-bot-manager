@@ -50,6 +50,8 @@ import {
   mainServiceSelfAuths,
   getFleetControlPort,
   getFleetTransferPort,
+  getFleetControlService,
+  getFleetTransferService,
   fleetPublicHost,
   transferPublicHost,
   attachFleetToProxy,
@@ -1419,24 +1421,24 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   // every node's route exists before any failover. Every marker instance also
   // gets a localhost-bound control host-port for host-level tooling; same-box
   // workers dial the master's container name over dbm_internal.
-  const controlPort = getFleetControlPort(content);
-  const transferPort = getFleetTransferPort(content);
+  const control = getFleetControlService(content);
+  const transfer = getFleetTransferService(content);
   let fleetHostPort: number | undefined;
   let transferHostPort: number | undefined;
-  if (controlPort !== null) {
+  if (control !== null) {
     const cp = findAppCapabilities(instance.sourceUrl)?.controlPlane;
     if (BOT_DOMAIN_BASE) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort,
-        { envAdvertise: cp ? { key: cp.env.publicUrl, scheme: cp.urlScheme.secure } : null });
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, control.port,
+        { envAdvertise: cp ? { key: cp.env.publicUrl, scheme: cp.urlScheme.secure } : null, service: control.service });
     }
     // Transfer route: EVERY fleet node advertises one (migration legs dial in
     // either direction), unlike the master-only control route. Only for an app
     // whose compose declares the transfer marker label.
-    if (BOT_DOMAIN_BASE && transferPort !== null) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort,
-        { envAdvertise: cp?.env.transferUrl ? { key: cp.env.transferUrl, scheme: cp.urlScheme.secure } : null });
+    if (BOT_DOMAIN_BASE && transfer !== null) {
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transfer.port,
+        { envAdvertise: cp?.env.transferUrl ? { key: cp.env.transferUrl, scheme: cp.urlScheme.secure } : null, service: transfer.service });
     }
-    const existing = getPublishedFleetHostPort(content, controlPort);
+    const existing = getPublishedFleetHostPort(content, control.port, control.service);
     if (existing !== null) {
       fleetHostPort = existing;   // compose already publishes it; keep that mapping
     } else {
@@ -1451,11 +1453,11 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
       });
       if (allocated !== null) {
         fleetHostPort = allocated;
-        content = publishFleetHostPort(content, allocated, controlPort);
+        content = publishFleetHostPort(content, allocated, control.port, control.service);
       }
     }
-    if (transferPort !== null) {
-      const existingTransfer = getPublishedFleetHostPort(content, transferPort);
+    if (transfer !== null) {
+      const existingTransfer = getPublishedFleetHostPort(content, transfer.port, transfer.service);
       if (existingTransfer !== null) {
         transferHostPort = existingTransfer;
       } else {
@@ -1471,7 +1473,7 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
         });
         if (allocated !== null) {
           transferHostPort = allocated;
-          content = publishFleetHostPort(content, allocated, transferPort);
+          content = publishFleetHostPort(content, allocated, transfer.port, transfer.service);
         }
       }
     }

@@ -494,21 +494,24 @@ export function processComposeForCasaOS(
   // The wss route targets the app container directly, NOT the AppShield gateway:
   // the control plane authenticates via CONTROL_SECRET and must not sit behind
   // the gateway's browser auth.
-  const fleetPort = fleetControlPortOfCompose(compose);
-  if (fleetPort !== null) {
-    const fleetSvcName = getAppServiceName(compose);
-    const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
-    if (fleetSvc) {
+  const fleetMark = fleetMarkOfCompose(compose, FLEET_PORT_LABEL);
+  if (fleetMark !== null && services[fleetMark.service]) {
+    const fleetPort = fleetMark.port;
+    const fleetSvc = services[fleetMark.service];
+    // The transfer channel has its own marker label and its own carrying
+    // service; absent means the app declares one channel and gets no transfer
+    // wiring at all.
+    const transferMark = fleetMarkOfCompose(compose, FLEET_TRANSFER_PORT_LABEL);
+    const transferPort = transferMark !== null && services[transferMark.service] ? transferMark.port : null;
+    const transferSvc = transferPort !== null ? services[transferMark!.service] : undefined;
+    {
       // Env key names and URL schemes come from the app's capability record;
       // the routes themselves stay label-driven. An app with the marker but no
       // record gets the structural wiring and NO authored env: the manager
       // never guesses another app's key spelling (PLAN_REPLICATION 20.18).
       const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
       if (cp) setServiceEnv(fleetSvc, cp.env.port, String(fleetPort));
-      // The transfer channel has its own marker label; absent means the app
-      // declares one channel and gets no transfer wiring at all.
-      const transferPort = fleetTransferPortOfCompose(compose);
-      if (transferPort !== null && cp?.env.transferPort) setServiceEnv(fleetSvc, cp.env.transferPort, String(transferPort));
+      if (transferSvc && transferPort !== null && cp?.env.transferPort) setServiceEnv(transferSvc, cp.env.transferPort, String(transferPort));
       if (pcs.APP_DOMAIN) {
         // EVERY fleet node gets the control route (PLAN_STANDBY 3.6): a
         // promotable backup must be dialable in advance. Workers dial the app
@@ -529,36 +532,38 @@ export function processComposeForCasaOS(
         }
         if (cp) setServiceEnv(fleetSvc, cp.env.publicUrl, `${cp.urlScheme.secure}://${fleetHost}`);
       }
-      if (pcs.APP_DOMAIN && transferPort !== null) {
+      if (pcs.APP_DOMAIN && transferSvc && transferPort !== null) {
         // Transfer route (container port from the transfer marker label):
         // EVERY fleet node advertises one, unlike the master-only control
         // route, because migration legs dial in either direction. Same
         // dual-name pair as the fleet site.
         const transferHost = `${appName}-transfer-${pcs.APP_DOMAIN}`;
-        const tIdx = nextCaddySiteIndex(fleetSvc.labels);
-        setServiceLabel(fleetSvc, `caddy_${tIdx}`, transferHost);
-        setServiceLabel(fleetSvc, `caddy_${tIdx}.import`, 'gateway_tls');
-        setServiceLabel(fleetSvc, `caddy_${tIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
+        const tIdx = nextCaddySiteIndex(transferSvc.labels);
+        setServiceLabel(transferSvc, `caddy_${tIdx}`, transferHost);
+        setServiceLabel(transferSvc, `caddy_${tIdx}.import`, 'gateway_tls');
+        setServiceLabel(transferSvc, `caddy_${tIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
         if (pcs.APP_PUBLIC_IP_DASH) {
           const tNipIdx = tIdx + 1;
-          setServiceLabel(fleetSvc, `caddy_${tNipIdx}`, `${appName}-transfer-${pcs.APP_PUBLIC_IP_DASH}.nip.io`);
-          setServiceLabel(fleetSvc, `caddy_${tNipIdx}.import`, 'gateway_tls');
-          setServiceLabel(fleetSvc, `caddy_${tNipIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
+          setServiceLabel(transferSvc, `caddy_${tNipIdx}`, `${appName}-transfer-${pcs.APP_PUBLIC_IP_DASH}.nip.io`);
+          setServiceLabel(transferSvc, `caddy_${tNipIdx}.import`, 'gateway_tls');
+          setServiceLabel(transferSvc, `caddy_${tNipIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
         }
-        if (cp?.env.transferUrl) setServiceEnv(fleetSvc, cp.env.transferUrl, `${cp.urlScheme.secure}://${transferHost}`);
+        if (cp?.env.transferUrl) setServiceEnv(transferSvc, cp.env.transferUrl, `${cp.urlScheme.secure}://${transferHost}`);
       }
-      // Caddy resolves {{upstreams}} over the ingress network, so a fleet
-      // node's app container must join it (co-workers too: their transfer
-      // route and same-box container-name dials ride it); keep the project
-      // default network alongside.
-      if (pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
-        if (Array.isArray(fleetSvc.networks)) {
-          if (!fleetSvc.networks.includes(pcs.REF_NET)) fleetSvc.networks.push(pcs.REF_NET);
-        } else if (fleetSvc.networks && typeof fleetSvc.networks === 'object') {
-          const nets = fleetSvc.networks as Record<string, unknown>;
-          if (!(pcs.REF_NET in nets)) nets[pcs.REF_NET] = {};
-        } else {
-          fleetSvc.networks = ['default', pcs.REF_NET];
+      // Caddy resolves {{upstreams}} over the ingress network, so every marked
+      // service must join it (co-workers too: their transfer route and
+      // same-box container-name dials ride it); keep the project default
+      // network alongside.
+      for (const svc of transferSvc && transferSvc !== fleetSvc ? [fleetSvc, transferSvc] : [fleetSvc]) {
+        if (pcs.REF_NET && (!svc.network_mode || svc.network_mode === 'bridge')) {
+          if (Array.isArray(svc.networks)) {
+            if (!svc.networks.includes(pcs.REF_NET)) svc.networks.push(pcs.REF_NET);
+          } else if (svc.networks && typeof svc.networks === 'object') {
+            const nets = svc.networks as Record<string, unknown>;
+            if (!(pcs.REF_NET in nets)) nets[pcs.REF_NET] = {};
+          } else {
+            svc.networks = ['default', pcs.REF_NET];
+          }
         }
       }
     }
@@ -976,17 +981,19 @@ export function processComposeForDocker(
     if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
-  // The control/transfer port env each follow their own marker label, spelled
-  // by the app's capability record (no record = no authored env); exposure
-  // (proxy route or localhost publish) is layered on by applyDockerHostPort.
-  const fleetPort = fleetControlPortOfCompose(compose);
-  if (fleetPort !== null) {
-    const fleetSvcName = getAppServiceName(compose);
+  // The control/transfer port env each follow their own marker label and land
+  // on the service CARRYING it, spelled by the app's capability record (no
+  // record = no authored env); exposure (proxy route or localhost publish) is
+  // layered on by applyDockerHostPort.
+  const fleetMark = fleetMarkOfCompose(compose, FLEET_PORT_LABEL);
+  if (fleetMark !== null) {
     const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
-    if (fleetSvcName && services[fleetSvcName] && cp) {
-      setServiceEnv(services[fleetSvcName], cp.env.port, String(fleetPort));
-      const transferPort = fleetTransferPortOfCompose(compose);
-      if (transferPort !== null && cp.env.transferPort) setServiceEnv(services[fleetSvcName], cp.env.transferPort, String(transferPort));
+    if (services[fleetMark.service] && cp) {
+      setServiceEnv(services[fleetMark.service], cp.env.port, String(fleetMark.port));
+      const transferMark = fleetMarkOfCompose(compose, FLEET_TRANSFER_PORT_LABEL);
+      if (transferMark !== null && services[transferMark.service] && cp.env.transferPort) {
+        setServiceEnv(services[transferMark.service], cp.env.transferPort, String(transferMark.port));
+      }
     }
   }
 
@@ -1248,7 +1255,13 @@ function nextCaddySiteIndex(labels: unknown): number {
   return next;
 }
 
-function fleetLabelPortOfCompose(compose: Record<string, unknown>, label: string): number | null {
+// Resolves a marker to the SERVICE CARRYING IT plus its port, so every fleet
+// consumer wires the marked service; getAppServiceName follows a different
+// rule and may disagree for an app whose marker sits on a non-main service.
+function fleetMarkOfCompose(
+  compose: Record<string, unknown>,
+  label: string
+): { service: string; port: number } | null {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return null;
   const main = getMainServiceName(compose);
@@ -1259,36 +1272,50 @@ function fleetLabelPortOfCompose(compose: Record<string, unknown>, label: string
     const value = labelValueOf(services[name]?.labels, label);
     if (value !== null) {
       const port = parseInt(value, 10);
-      return isNaN(port) ? null : port;
+      return isNaN(port) ? null : { service: name, port };
     }
   }
   return null;
 }
 
 function fleetControlPortOfCompose(compose: Record<string, unknown>): number | null {
-  return fleetLabelPortOfCompose(compose, FLEET_PORT_LABEL);
+  return fleetMarkOfCompose(compose, FLEET_PORT_LABEL)?.port ?? null;
 }
 
 function fleetTransferPortOfCompose(compose: Record<string, unknown>): number | null {
-  return fleetLabelPortOfCompose(compose, FLEET_TRANSFER_PORT_LABEL);
+  return fleetMarkOfCompose(compose, FLEET_TRANSFER_PORT_LABEL)?.port ?? null;
+}
+
+function parsedCompose(composeContent: string): Record<string, unknown> | null {
+  try {
+    return parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 /** The fleet control port declared by the compose's marker label, or null. */
 export function getFleetControlPort(composeContent: string): number | null {
-  try {
-    return fleetControlPortOfCompose(parseDocument(composeContent).toJSON() as Record<string, unknown>);
-  } catch {
-    return null;
-  }
+  const compose = parsedCompose(composeContent);
+  return compose ? fleetControlPortOfCompose(compose) : null;
 }
 
 /** The fleet transfer port declared by the compose's marker label, or null. */
 export function getFleetTransferPort(composeContent: string): number | null {
-  try {
-    return fleetTransferPortOfCompose(parseDocument(composeContent).toJSON() as Record<string, unknown>);
-  } catch {
-    return null;
-  }
+  const compose = parsedCompose(composeContent);
+  return compose ? fleetTransferPortOfCompose(compose) : null;
+}
+
+/** The service carrying the fleet control marker, with its declared port. */
+export function getFleetControlService(composeContent: string): { service: string; port: number } | null {
+  const compose = parsedCompose(composeContent);
+  return compose ? fleetMarkOfCompose(compose, FLEET_PORT_LABEL) : null;
+}
+
+/** The service carrying the fleet transfer marker, with its declared port. */
+export function getFleetTransferService(composeContent: string): { service: string; port: number } | null {
+  const compose = parsedCompose(composeContent);
+  return compose ? fleetMarkOfCompose(compose, FLEET_TRANSFER_PORT_LABEL) : null;
 }
 
 /** Absent/empty BOT_NODE_ROLE means master, matching the bot's own role resolution. */
@@ -1364,19 +1391,20 @@ export function fleetAppContainerName(composeContent: string): string | null {
 }
 
 /**
- * Remote-mode fleet route: caddy-docker-proxy labels on the APP service so the
- * bundled Caddy serves the fleet control endpoint at `host` over automatic TLS.
- * `envAdvertise` names the env key and URL scheme the app reads the finished
- * route through (both from the capability record); it is stated per call so two
- * routes can never silently write one key, and null (no record) attaches the
- * route without authoring any env. Never forward_auth: workers are machine
- * clients that authenticate with the app's own shared secret, not Authelia.
+ * Remote-mode fleet route: caddy-docker-proxy labels on `opts.service` (the
+ * service carrying the channel's marker label) so the bundled Caddy serves the
+ * fleet endpoint at `host` over automatic TLS. `envAdvertise` names the env
+ * key and URL scheme the app reads the finished route through (both from the
+ * capability record); it is stated per call so two routes can never silently
+ * write one key, and null (no record) attaches the route without authoring any
+ * env. Never forward_auth: workers are machine clients that authenticate with
+ * the app's own shared secret, not Authelia.
  */
 export function attachFleetToProxy(
   composeContent: string,
   host: string,
   controlPort: number,
-  opts: { network?: string; envAdvertise: { key: string; scheme: string } | null }
+  opts: { network?: string; envAdvertise: { key: string; scheme: string } | null; service: string }
 ): string {
   const network = opts.network || 'dbm_remote';
   let compose: Record<string, unknown>;
@@ -1387,9 +1415,8 @@ export function attachFleetToProxy(
   }
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return composeContent;
-  const appName = getAppServiceName(compose);
-  if (!appName || !services[appName]) return composeContent;
-  const svc = services[appName];
+  if (!services[opts.service]) return composeContent;
+  const svc = services[opts.service];
 
   if (!svc.labels || Array.isArray(svc.labels) || typeof svc.labels !== 'object') svc.labels = {};
   const labels = svc.labels as Record<string, string>;
@@ -1412,8 +1439,8 @@ export function attachFleetToProxy(
   return stringify(compose, { lineWidth: 0 });
 }
 
-/** An already-published host port for the fleet control port on the app service, or null. */
-export function getPublishedFleetHostPort(composeContent: string, controlPort: number): number | null {
+/** An already-published host port for a fleet channel port on its marked service, or null. */
+export function getPublishedFleetHostPort(composeContent: string, containerPort: number, service: string): number | null {
   let compose: Record<string, unknown>;
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
@@ -1422,11 +1449,10 @@ export function getPublishedFleetHostPort(composeContent: string, controlPort: n
   }
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return null;
-  const appName = getAppServiceName(compose);
-  const svc = appName ? services[appName] : undefined;
+  const svc = services[service];
   if (!svc || !Array.isArray(svc.ports)) return null;
   for (const pm of svc.ports as unknown[]) {
-    if (containerPortOf(pm) === controlPort) return hostPortOf(pm);
+    if (containerPortOf(pm) === containerPort) return hostPortOf(pm);
   }
   return null;
 }
@@ -1441,7 +1467,8 @@ export function getPublishedFleetHostPort(composeContent: string, controlPort: n
 export function publishFleetHostPort(
   composeContent: string,
   hostPort: number,
-  controlPort: number
+  containerPort: number,
+  service: string
 ): string {
   let compose: Record<string, unknown>;
   try {
@@ -1451,13 +1478,12 @@ export function publishFleetHostPort(
   }
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return composeContent;
-  const appName = getAppServiceName(compose);
-  if (!appName || !services[appName]) return composeContent;
-  const svc = services[appName];
+  if (!services[service]) return composeContent;
+  const svc = services[service];
   if (!Array.isArray(svc.ports)) svc.ports = svc.ports ? [svc.ports] : [];
   const ports = svc.ports as unknown[];
-  if (!ports.some(pm => containerPortOf(pm) === controlPort)) {
-    ports.push(`127.0.0.1:${hostPort}:${controlPort}`);
+  if (!ports.some(pm => containerPortOf(pm) === containerPort)) {
+    ports.push(`127.0.0.1:${hostPort}:${containerPort}`);
   }
   return stringify(compose, { lineWidth: 0 });
 }

@@ -493,7 +493,7 @@ export function processComposeForCasaOS(
       // The bot's TRANSFER_PORT default is the static 3929, NOT control + 1, so
       // a non-default marker needs the explicit injection to match the routes.
       setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(fleetPort + 1));
-      if (isFleetNode(bot.envVars) && pcs.APP_DOMAIN) {
+      if (pcs.APP_DOMAIN) {
         // EVERY fleet node gets the control route (PLAN_STANDBY 3.6): a
         // promotable backup must be dialable in advance. Workers dial the app
         // domain: TLS terminates at Cloudflare with the publicly-trusted
@@ -513,7 +513,7 @@ export function processComposeForCasaOS(
         }
         setServiceEnv(fleetSvc, 'FLEET_PUBLIC_URL', `wss://${fleetHost}`);
       }
-      if (isFleetNode(bot.envVars) && pcs.APP_DOMAIN) {
+      if (pcs.APP_DOMAIN) {
         // Transfer route (container port CONTROL_PORT + 1, the bot's default):
         // EVERY fleet node advertises one, unlike the master-only control
         // route, because migration legs dial in either direction. Same
@@ -536,7 +536,7 @@ export function processComposeForCasaOS(
       // node's app container must join it (co-workers too: their transfer
       // route and same-box container-name dials ride it); keep the project
       // default network alongside.
-      if (isFleetNode(bot.envVars) && pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
+      if (pcs.REF_NET && (!fleetSvc.network_mode || fleetSvc.network_mode === 'bridge')) {
         if (Array.isArray(fleetSvc.networks)) {
           if (!fleetSvc.networks.includes(pcs.REF_NET)) fleetSvc.networks.push(pcs.REF_NET);
         } else if (fleetSvc.networks && typeof fleetSvc.networks === 'object') {
@@ -1257,15 +1257,6 @@ export function getFleetControlPort(composeContent: string): number | null {
 export function isFleetMaster(envVars?: Record<string, string>): boolean {
   const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
   return role === '' || role === 'master';
-}
-
-/** Any fleet participant: a master, an explicit worker role, or a node dialing out (MASTER_URLS or the single MASTER_URL). */
-export function isFleetNode(envVars?: Record<string, string>): boolean {
-  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-  return isFleetMaster(envVars)
-    || role === 'co-worker' || role === 'backup-master'
-    || (envVars?.['MASTER_URL'] || '').trim() !== ''
-    || (envVars?.['MASTER_URLS'] || '').trim() !== '';
 }
 
 /**

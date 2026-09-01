@@ -49,8 +49,6 @@ import {
   attachBotToProxy,
   mainServiceSelfAuths,
   getFleetControlPort,
-  isFleetMaster,
-  isFleetNode,
   fleetIsSameBox,
   fleetPublicHost,
   transferPublicHost,
@@ -1353,12 +1351,12 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   let transferHostPort: number | undefined;
   if (controlPort !== null) {
     const transferPort = controlPort + 1;
-    if (BOT_DOMAIN_BASE && isFleetNode(instance.envVars)) {
+    if (BOT_DOMAIN_BASE) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
     }
     // Transfer route: EVERY fleet node advertises one (migration legs dial in
     // either direction), unlike the master-only control route.
-    if (BOT_DOMAIN_BASE && isFleetNode(instance.envVars)) {
+    if (BOT_DOMAIN_BASE) {
       content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort, { envKey: 'TRANSFER_URL' });
     }
     const existing = getPublishedFleetHostPort(content, controlPort);
@@ -1532,25 +1530,21 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     const controlPort = getFleetControlPort(composeContent);
     if (controlPort === null) return {};
     const env: Record<string, string> = { CONTROL_PORT: String(controlPort), TRANSFER_PORT: String(controlPort + 1) };
-    if (isFleetNode(instance.envVars)) {
-      const host = fleetPublicHost(instance.sanitizedName);
-      // Advertise the control route only once the built compose actually
-      // serves it (same rule as TRANSFER_URL below): a pre-standby worker
-      // build restarted after a manager update must not advertise a route no
-      // proxy label backs until its rebuild.
-      if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
-    }
-    if (isFleetNode(instance.envVars)) {
-      const transferHost = transferPublicHost(instance.sanitizedName);
-      if (transferHost) {
-        // Advertise the public route only once the built compose actually
-        // serves it: a pre-transfer build restarted after a manager update
-        // must not advertise a route no proxy label backs until its rebuild.
-        if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
-      } else if (fleetIsSameBox(instance.envVars)) {
-        const cname = fleetAppContainerName(composeContent);
-        if (cname) env.TRANSFER_URL = `ws://${cname}:${controlPort + 1}`;
-      }
+    const host = fleetPublicHost(instance.sanitizedName);
+    // Advertise the control route only once the built compose actually
+    // serves it (same rule as TRANSFER_URL below): a pre-standby worker
+    // build restarted after a manager update must not advertise a route no
+    // proxy label backs until its rebuild.
+    if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
+    const transferHost = transferPublicHost(instance.sanitizedName);
+    if (transferHost) {
+      // Advertise the public route only once the built compose actually
+      // serves it: a pre-transfer build restarted after a manager update
+      // must not advertise a route no proxy label backs until its rebuild.
+      if (composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
+    } else if (fleetIsSameBox(instance.envVars)) {
+      const cname = fleetAppContainerName(composeContent);
+      if (cname) env.TRANSFER_URL = `ws://${cname}:${controlPort + 1}`;
     }
     // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
     // bot's promote flow promotes this database first. Credentials are the

@@ -175,8 +175,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * Each master carries two addresses: localUrl for a same-manager worker (dials
    * over the shared network, no public round-trip) and masterUrl for a genuinely
    * cross-host worker (public wss). Either may be null when it cannot be derived.
-   * Also returns fleetBase: the mode-resolved fleet host suffix, so the install
-   * wizard can preview a new master's public URL; null when no public base exists.
+   * Also returns fleetUrlTemplate: a full URL template with a {name} placeholder
+   * for the sanitized instance name, so the install wizard can preview a new
+   * node's public URL without composing one itself; null when no public base
+   * exists.
    */
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
@@ -260,7 +262,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // an unreadable instance must not break the list
         }
       }
-      res.json({ success: true, fleetBase: fleetHostSuffix(), masters });
+      // A full template rather than a bare host suffix, so the browser never
+      // composes a URL (or assumes a scheme) itself.
+      const suffix = fleetHostSuffix();
+      res.json({ success: true, fleetUrlTemplate: suffix === null ? null : `wss://{name}${suffix}`, masters });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

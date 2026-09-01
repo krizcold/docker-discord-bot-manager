@@ -1416,7 +1416,7 @@
             // Database modal: backups + replication on a managed-DB instance;
             // the standby replica surface on fleet workers.
             const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetWorker)
-              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : 'Standby replica of the fleet database on this machine'}">Database</button>`
+              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : 'Standby replica of this bot\'s managed database on this machine'}">Database</button>`
               : '';
 
             return `
@@ -1850,7 +1850,9 @@
       const equalsAttr = (eq) => escapeHtml(Array.isArray(eq) ? eq.join(',') : eq);
       const condAttrs =
         (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${equalsAttr(meta.showWhen.equals)}"` : '') +
-        (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '');
+        (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '') +
+        (meta.semantic ? ` data-semantic="${escapeHtml(meta.semantic)}"` : '') +
+        (Array.isArray(meta.semanticValues) && meta.semanticValues.length ? ` data-semantic-values="${escapeHtml(meta.semanticValues.join(','))}"` : '');
       return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row${meta.list ? ' env-row-list' : ''}">
@@ -1925,12 +1927,11 @@
         (items.length ? items : ['']).map(v => envListItemHtml(v, list.dataset.placeholder || 'Value')).join('');
     }
 
-    // On a fresh install, pre-fill empty "generate" secrets (e.g. the fleet
-    // CONTROL_SECRET) so a master install has one ready. Skipped for the worker
-    // roles, which carry the master's secret instead of minting their own.
+    // On a fresh install, pre-fill empty "generate" secrets so the hosting
+    // install has one ready. Skipped for the dialing roles, which carry the
+    // joined fleet's secret instead of minting their own.
     function autofillGenerateSecrets(container) {
-      const role = envRowValue(container, 'BOT_NODE_ROLE');
-      if (role === 'co-worker' || role === 'backup-master') return;
+      if (dialsOutRole(container)) return;
       container.querySelectorAll('.env-row').forEach(row => {
         const gen = row.querySelector('button[onclick^="generateEnvSecret"]');
         const input = row.querySelector('.env-value');
@@ -1967,8 +1968,8 @@
           && w.dataset.forceHide !== '1';
         w.style.display = show ? '' : 'none';
       });
-      // Rows force-hidden WITHOUT a showWhen of their own (CONTROL_SECRET is
-      // requiredWhen-only, since masters must always see it).
+      // Rows force-hidden WITHOUT a showWhen of their own (the fleet secret
+      // row is requiredWhen-only, since a hosting node must always see it).
       container.querySelectorAll('[data-force-hide]:not([data-show-key])').forEach(w => {
         w.style.display = w.dataset.forceHide === '1' ? 'none' : '';
       });
@@ -1990,11 +1991,31 @@
     }
 
     // ─── Fleet master prefill (known masters on this manager) ───
-    function fleetEnvWrapper(container, key) {
-      for (const k of container.querySelectorAll('.env-row .env-key')) {
-        if (k.value.trim() === key) return k.closest('.env-row').parentElement;
-      }
-      return null;
+    // Semantic row lookup (PLAN_REPLICATION 20.18): guided rows arrive stamped
+    // with data-semantic from the app's capability record, so nothing below
+    // matches an env key by spelling.
+    function semanticWrapper(container, semantic) {
+      return container.querySelector(`[data-semantic="${semantic}"]`);
+    }
+    function semanticEnvKey(container, semantic) {
+      const w = semanticWrapper(container, semantic);
+      const k = w && w.querySelector('.env-row .env-key');
+      return k ? k.value.trim() : null;
+    }
+    function semanticEnvValue(container, semantic) {
+      const w = semanticWrapper(container, semantic);
+      const v = w && w.querySelector('.env-row .env-value');
+      return v ? v.value.trim() : '';
+    }
+    function semanticValuesOf(container, semantic) {
+      const w = semanticWrapper(container, semantic);
+      return (w && w.dataset.semanticValues) ? w.dataset.semanticValues.split(',') : [];
+    }
+    // "This node dials a peer": the role row's value is one of the dial-out
+    // values the record stamped onto the row itself.
+    function dialsOutRole(container) {
+      const value = semanticEnvValue(container, 'peer-role');
+      return value !== '' && semanticValuesOf(container, 'peer-role').includes(value);
     }
 
     // Every programmatic fill (prefill, vault pick, recovered envs) goes
@@ -2028,26 +2049,23 @@
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
-    function fleetSetEnvValue(container, key, value) {
-      const wrapper = fleetEnvWrapper(container, key);
-      setEnvInputValue(wrapper && wrapper.querySelector('.env-row .env-value'), value);
-    }
-
-    // CONTROL_SECRET across role switches: a machine-minted master secret must
-    // not linger in a worker-role form (nothing uses it there; the node needs
-    // the MASTER's secret instead). A user-entered value always survives
-    // switching; the minted master value is stashed and returns with the role.
+    // The fleet secret across role switches: a machine-minted value must not
+    // linger in a dialing-role form (nothing uses it there; the node needs the
+    // secret of the fleet it joins instead). A user-entered value always
+    // survives switching; the minted value is stashed and returns with the role.
     function attachFleetSecretRoleCache(container) {
-      const wrapper = fleetEnvWrapper(container, 'CONTROL_SECRET');
-      const roleWrapper = fleetEnvWrapper(container, 'BOT_NODE_ROLE');
+      const wrapper = semanticWrapper(container, 'peer-secret');
+      const roleWrapper = semanticWrapper(container, 'peer-role');
       if (!wrapper || !roleWrapper || wrapper.dataset.secretCache === '1') return;
       wrapper.dataset.secretCache = '1';
-      const isWorker = r => r === 'co-worker' || r === 'backup-master';
+      const dialsOut = semanticValuesOf(container, 'peer-role');
+      const isWorker = r => dialsOut.includes(r);
       const isInstall = container.id === 'install-env-rows';
-      let lastRole = envRowValue(container, 'BOT_NODE_ROLE') || 'master';
+      let lastRole = semanticEnvValue(container, 'peer-role');
       let stashedMasterSecret = '';
       const secretEl = wrapper.querySelector('.env-row .env-value');
-      const urlsEl = (fleetEnvWrapper(container, 'MASTER_URLS') || wrapper).querySelector('.env-list .env-value');
+      const urlsWrapperEl = semanticWrapper(container, 'peer-list');
+      const urlsEl = urlsWrapperEl ? urlsWrapperEl.querySelector('.env-list .env-value') : null;
       // Real typing makes a value user-owned: it then survives every switch.
       for (const el of [secretEl, urlsEl]) {
         if (el) el.addEventListener('input', e => {
@@ -2057,7 +2075,7 @@
         });
       }
       container.addEventListener('change', () => {
-        const role = envRowValue(container, 'BOT_NODE_ROLE') || 'master';
+        const role = semanticEnvValue(container, 'peer-role');
         const crossed = isWorker(role) !== isWorker(lastRole);
         lastRole = role;
         if (!crossed || !secretEl) return;
@@ -2090,20 +2108,22 @@
     // backup masters; the rows stay in the DOM so save collectors read them).
     // "Another machine" shows the rows for manual entry instead.
     async function attachFleetMasterPrefill(containerId, vars) {
-      if (!Array.isArray(vars) || !vars.some(v => v.key === 'BOT_NODE_ROLE')) return;
+      if (!Array.isArray(vars) || !vars.some(v => v.semantic === 'peer-role')) return;
       const container = document.getElementById(containerId);
       if (!container) return;
+      const roleKey = semanticEnvKey(container, 'peer-role');
+      if (!roleKey) return;
       attachFleetSecretRoleCache(container);
       let masters = [];
-      let fleetBase = null;
+      let fleetUrlTemplate = null;
       try {
         const res = await api('GET', '/bots/fleet/masters');
         if (res && res.success) {
           if (Array.isArray(res.masters)) masters = res.masters;
-          if (typeof res.fleetBase === 'string') fleetBase = res.fleetBase;
+          if (typeof res.fleetUrlTemplate === 'string') fleetUrlTemplate = res.fleetUrlTemplate;
         }
       } catch (e) { /* unreachable list = manual entry only */ }
-      if (containerId === 'install-env-rows') attachFleetMasterUrlPreview(container, fleetBase);
+      if (containerId === 'install-env-rows') attachFleetMasterUrlPreview(container, fleetUrlTemplate);
 
       // Never offer the instance being edited as its own master: a demoted
       // master would be autoconfigured to dial itself.
@@ -2111,8 +2131,8 @@
       const joinable = masters.filter(m => m.secretSet
         && !(isEditor && m.id === envEditorBotId)
         && ((Array.isArray(m.localCandidates) && m.localCandidates.length) || m.localUrl));
-      const urlsWrapper = fleetEnvWrapper(container, 'MASTER_URLS');
-      const secretWrapper = fleetEnvWrapper(container, 'CONTROL_SECRET');
+      const urlsWrapper = semanticWrapper(container, 'peer-list');
+      const secretWrapper = semanticWrapper(container, 'peer-secret');
       if (!urlsWrapper || joinable.length === 0 || container.querySelector('.fleet-master-prefill')) return;
 
       const candidatesOf = m => (Array.isArray(m.localCandidates) && m.localCandidates.length)
@@ -2120,10 +2140,10 @@
       const options = joinable.map((m, i) => `<option value="${i}">${escapeHtml(m.name)}</option>`).join('');
       const block = document.createElement('div');
       block.className = 'fleet-master-prefill';
-      block.dataset.showKey = 'BOT_NODE_ROLE';
-      block.dataset.showEquals = 'co-worker,backup-master';
+      block.dataset.showKey = roleKey;
+      block.dataset.showEquals = semanticValuesOf(container, 'peer-role').join(',');
       block.innerHTML = `
-        <div class="env-label">Master Location</div>
+        <div class="env-label">Fleet Location</div>
         <div style="display:flex;gap:6px;margin-bottom:2px;">
           <select class="fleet-loc-select" style="flex:1;">
             <option value="local">This server (autoconfigured)</option>
@@ -2137,24 +2157,21 @@
       const masterSel = block.querySelector('.fleet-master-select');
       const tip = block.querySelector('.fleet-loc-tip');
       const chosen = () => joinable[Number(masterSel.value) || 0];
-      const workerRole = () => {
-        const r = envRowValue(container, 'BOT_NODE_ROLE');
-        return r === 'co-worker' || r === 'backup-master';
-      };
+      const workerRole = () => dialsOutRole(container);
 
       // Auto-filled values are machine-owned: marked so that leaving
       // same-server mode (or the worker roles) can take them back out.
       const fillFromMaster = () => {
         const m = chosen();
         if (!m) return;
-        for (const [key, value] of [['MASTER_URLS', candidatesOf(m).join(',')], ['CONTROL_SECRET', m.controlSecret]]) {
-          fleetSetEnvValue(container, key, value);
-          // No falling back to the container: with the row absent this would
-          // mark the FIRST field in the form (the token) as machine-owned, and
-          // leaving same-server mode below wipes whatever carries that mark.
-          const wrapper = fleetEnvWrapper(container, key);
+        // Only the row itself, never a fallback element: marking anything else
+        // as machine-owned lets the mode switch below wipe an unrelated field.
+        for (const [sem, value] of [['peer-list', candidatesOf(m).join(',')], ['peer-secret', m.controlSecret]]) {
+          const wrapper = semanticWrapper(container, sem);
           const el = wrapper && wrapper.querySelector('.env-row .env-value');
-          if (el) el.dataset.autofilled = '1';
+          if (!el) continue;
+          setEnvInputValue(el, value);
+          el.dataset.autofilled = '1';
         }
       };
 
@@ -2163,15 +2180,15 @@
         urlsWrapper.dataset.forceHide = local ? '1' : '';
         if (secretWrapper) secretWrapper.dataset.forceHide = local ? '1' : '';
         tip.textContent = locSel.value === 'local'
-          ? 'Connection and secret are filled automatically from the selected master.'
-          : "Enter every master-capable URL in order (the master first) and paste the master's Control Secret (its Usage tab > Connect a worker).";
+          ? 'Connection and secret are filled automatically from the selected node.'
+          : "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker).";
         if (local) {
           fillFromMaster();
         } else {
           // Switched to manual entry: take back what same-server filled in, so
           // the operator edits their own values rather than a hidden fleet's.
-          for (const key of ['MASTER_URLS', 'CONTROL_SECRET']) {
-            const wrapper = fleetEnvWrapper(container, key);
+          for (const sem of ['peer-list', 'peer-secret']) {
+            const wrapper = semanticWrapper(container, sem);
             const el = wrapper && wrapper.querySelector('.env-row .env-value');
             if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
           }
@@ -2189,7 +2206,7 @@
       // matches a local master (or a blank fresh install form): an already
       // configured node must never be silently re-pointed at another master
       // just because its editor was opened.
-      const current = envRowValue(container, 'MASTER_URLS');
+      const current = semanticEnvValue(container, 'peer-list');
       const matching = current === '' ? -1 : joinable.findIndex(m => candidatesOf(m).join(',') === current);
       if (matching >= 0) {
         masterSel.value = String(matching);
@@ -2201,8 +2218,8 @@
       sync();
     }
 
-    // Preview of the public URL this node advertises, below the BOT_NODE_ROLE
-    // row. Shown for both promotable roles: workers dial the master here, and
+    // Preview of the public URL this node advertises, below the role row.
+    // Shown for both promotable roles: workers dial the master here, and
     // must carry a backup master's URL too so a failover needs no rewiring.
     // Wizard-only (needs the name input); deliberately not an .env-row, so env
     // collectors skip it.
@@ -2217,16 +2234,16 @@
       },
     };
 
-    function attachFleetMasterUrlPreview(container, fleetBase) {
-      if (!fleetBase) return;
+    function attachFleetMasterUrlPreview(container, fleetUrlTemplate) {
+      if (!fleetUrlTemplate) return;
       const nameInput = document.getElementById('install-name');
       if (!nameInput) return;
-      const roleWrapper = fleetEnvWrapper(container, 'BOT_NODE_ROLE');
+      const roleWrapper = semanticWrapper(container, 'peer-role');
       if (!roleWrapper || container.querySelector('.fleet-url-preview')) return;
 
       const el = document.createElement('div');
       el.className = 'fleet-url-preview';
-      el.dataset.showKey = 'BOT_NODE_ROLE';
+      el.dataset.showKey = semanticEnvKey(container, 'peer-role');
       el.dataset.showEquals = Object.keys(FLEET_URL_PREVIEW_TEXT).join(',');
       el.innerHTML = `
         <div class="fleet-url-label"></div>
@@ -2236,10 +2253,10 @@
         </div>`;
       const urlSpan = el.querySelector('.fleet-url-value');
       const labelEl = el.querySelector('.fleet-url-label');
-      const urlOf = () => `wss://${sanitizeNamePreview(nameInput.value.trim())}${fleetBase}`;
+      const urlOf = () => fleetUrlTemplate.replace('{name}', sanitizeNamePreview(nameInput.value.trim()));
       const update = () => {
         urlSpan.textContent = urlOf();
-        const text = FLEET_URL_PREVIEW_TEXT[envRowValue(container, 'BOT_NODE_ROLE')];
+        const text = FLEET_URL_PREVIEW_TEXT[semanticEnvValue(container, 'peer-role')];
         if (text) {
           labelEl.textContent = text.label;
           labelEl.title = text.title;
@@ -2289,10 +2306,12 @@
       saveBtn.textContent = 'Saving...';
 
       try {
-        // A new non-empty DATA_BACKEND_URL gets a connection test first (keyed
-        // on the env var name only). A failed test still saves if confirmed.
-        const dbUrl = (vars['DATA_BACKEND_URL'] || '').trim();
-        if (dbUrl && dbUrl !== (envEditorInitial['DATA_BACKEND_URL'] || '').trim()) {
+        // A new non-empty database DSN gets a connection test first (the row
+        // is found by its record-stamped semantic, never by key spelling). A
+        // failed test still saves if confirmed.
+        const dbKey = semanticEnvKey(document.getElementById('env-editor-rows'), 'db-dsn');
+        const dbUrl = dbKey ? (vars[dbKey] || '').trim() : '';
+        if (dbUrl && dbUrl !== ((dbKey && envEditorInitial[dbKey]) || '').trim()) {
           saveBtn.textContent = 'Testing database...';
           let check = null;
           try { check = await api('POST', `/bots/${envEditorBotId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; }
@@ -2422,7 +2441,7 @@
       const r = res.replication || { enabled: false };
       if (!r.enabled) {
         body.innerHTML = `
-          <div class="env-tip">A standby copy of this database on the backup master's machine. Without one, this machine dying takes the database with it and the fleet cannot fail over.</div>
+          <div class="env-tip">A standby copy of this database on another machine. Without one, this machine dying takes the database with it and the fleet cannot fail over.</div>
           <div class="env-row" style="align-items:center;">
             <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
             <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
@@ -2437,12 +2456,12 @@
       // A standby that stopped streaming is a silent loss of the whole point of
       // replication, so it reads as an error rather than a status line.
       const standbyHtml = standbys.length === 0
-        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take the fleet database with it. Use the block below on the backup master's machine.</div>`
+        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take this bot's managed database with it. Use the block below on the standby machine.</div>`
         : standbys.map(s => {
             const lag = s.replayLagSeconds;
             const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
             if (s.state !== 'streaming') {
-              return `<div class="error-message">Standby ${escapeHtml(s.clientAddr || '?')} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale. Re-seed it from the backup master's manager.</div>`;
+              return `<div class="error-message">Standby ${escapeHtml(s.clientAddr || '?')} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale. Re-seed it from the standby machine's manager.</div>`;
             }
             const warn = lag != null && lag > 60;
             return `<div class="env-tip" style="color:var(--${warn ? 'warning' : 'success'});">Standby ${escapeHtml(s.clientAddr || '?')}: streaming${lagText}${warn ? ' - a failover now would lose that much' : ''}</div>`;
@@ -2484,7 +2503,7 @@
           </div>
           <input type="hidden" id="fleet-repl-dsn" value="${escapeHtml(block.dsn)}">
           <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
-          <div class="env-tip">Paste both into "Add a database replica" on the backup master machine's manager.</div>
+          <div class="env-tip">Paste both into "Add a database replica" on the standby machine's manager.</div>
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
@@ -2492,7 +2511,7 @@
         ${((bots.find(b => b.id === botId) || {}).appHooks === true) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Stand this machine down</div>
-          <div class="env-tip"><b>Demote</b> stops this instance being the master side and rejoins it as a worker; the database here stays untouched. <b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.</div>
+          <div class="env-tip"><b>Demote</b> stops this instance being the primary side and rejoins it as a worker; the database here stays untouched. <b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-small" onclick="appDemote('${botId}')">Demote</button>
           </div>
@@ -2502,7 +2521,7 @@
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
           ${stopped ? `
           <div class="form-group"><label>New primary's replication DSN</label>
-            <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/smdb?sslmode=verify-full"></div>
+            <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
           <div class="form-group"><label>New primary's certificate (PEM)</label>
             <textarea id="reseed-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
           <div class="env-row" style="align-items:center;">
@@ -2516,11 +2535,11 @@
     }
 
     /**
-     * Demote this master side. The bot owns the decision and answers
+     * Demote this primary side. The bot owns the decision and answers
      * needsConfirm with the 20.12a ordering warning when no successor is visible.
      */
     async function appDemote(botId) {
-      if (!confirm('Demote this instance from the master side?\n\nIt rejoins the fleet as a worker and restarts once. The database on this machine is left untouched.')) return;
+      if (!confirm('Demote this instance from the primary side?\n\nIt rejoins the fleet as a worker and restarts once. The database on this machine is left untouched.')) return;
       try {
         let res = await api('POST', `/bots/${botId}/app-demote`, {});
         if (!res.success && res.needsConfirm) {
@@ -2620,7 +2639,7 @@
           return;
         }
         body.innerHTML = `
-          <div class="env-tip">Hands the fleet database between machines when one of them cannot accept connections (NAT). The machine that has the GOOD database arms as sender and dials out; the machine being rescued arms as receiver and listens. Arming is manual on both ends, and the receiver's database is the one that gets overwritten.</div>
+          <div class="env-tip">Hands this bot's managed database between machines when one of them cannot accept connections (NAT). The machine that has the GOOD database arms as sender and dials out; the machine being rescued arms as receiver and listens. Arming is manual on both ends, and the receiver's database is the one that gets overwritten.</div>
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-top:8px;">Receive INTO this machine (this database will be replaced)</div>
           <div class="env-row" style="align-items:center;">
             <input type="text" id="rc-recv-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
@@ -2728,7 +2747,7 @@
           const src = res.sourceIdentity || {};
           const sentence = res.state === 'outdated'
             ? `Rescue INTO this machine?\n\nThis machine's database is treated as STALE: it is dumped once (kept with the backups) and then REPLACED by the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}). Anything written here after the failover is discarded.`
-            : `Rescue INTO this machine?\n\nThis machine has no fleet database yet; it will be seeded from the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}).`;
+            : `Rescue INTO this machine?\n\nThis machine has no managed database yet; it will be seeded from the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}).`;
           if (!confirm(sentence)) return;
           res = await api('POST', `/bots/${botId}/recovery-rescue`, { confirm: true });
         }
@@ -2852,7 +2871,7 @@
       body.innerHTML = `
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Earlier database backups</div>
-          <div class="env-tip">Dumps taken while this instance hosted the fleet database, including the one taken just before it was re-seeded. Kept for recovery; restoring them needs a machine that hosts the database.</div>
+          <div class="env-tip">Dumps taken while this instance hosted this bot's managed database, including the one taken just before it was re-seeded. Kept for recovery; restoring them needs a machine that hosts the database.</div>
           ${backups.map(b => `
             <div class="env-row" style="align-items:center;">
               <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
@@ -2885,9 +2904,9 @@
       if (!r.record) {
         body.innerHTML = `
           ${errHtml}
-          <div class="env-tip">A live standby copy of the fleet database, streaming from the master's machine. If that machine dies, promoting this node's backup master also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
+          <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. If that machine dies, promoting this node's instance also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
           <div class="form-group"><label>Replication DSN</label>
-            <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/smdb?sslmode=verify-full"></div>
+            <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
           <div class="form-group"><label>Primary certificate (PEM)</label>
             <textarea id="replica-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
           <div class="env-row" style="align-items:center;">
@@ -2919,8 +2938,8 @@
       const isCopy = !!(r.live && r.live.inRecovery === true);
       const transferHtml = (appHooks && isCopy) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
-          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the master side</div>
-          <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old master's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
+          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the primary side</div>
+          <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old primary's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', false)">Transfer</button>
             <button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', true)">Transfer and retire</button>
@@ -2946,9 +2965,9 @@
     async function appTransfer(botId, retireOldMaster) {
       const label = retireOldMaster ? 'Transfer and retire' : 'Transfer';
       const extra = retireOldMaster
-        ? '\n\nThe old machine will also be told to stand down and stop serving as master.'
+        ? '\n\nThe old machine will also be told to stand down and stop serving as the primary.'
         : '';
-      if (!confirm(`${label}: make this machine the master side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${extra}`)) return;
+      if (!confirm(`${label}: make this machine the primary side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${extra}`)) return;
       try {
         let res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster });
         if (!res.success && res.needsLagConfirm) {
@@ -2956,7 +2975,7 @@
           // including that a master whose database recovered since its last
           // beacon still reads as dead here.
           const lag = typeof res.lagMs === 'number' ? `\n\nThis copy is behind by about ${Math.round(res.lagMs / 1000)}s.` : '';
-          if (!confirm(`${res.error || 'The old master cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
+          if (!confirm(`${res.error || 'The old primary cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
           res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster, confirmLag: true });
         }
         if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
@@ -3012,7 +3031,7 @@
     }
 
     async function adoptPromotedReplica(botId) {
-      if (!confirm('Adopt this database as this machine\'s fleet database?\n\nUse this after this node was promoted and now serves the fleet. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
+      if (!confirm('Adopt this database as this machine\'s own?\n\nUse this after this node was promoted and now serves the fleet. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
         if (res.success) {

@@ -35,13 +35,20 @@ export interface EnvFieldMeta {
   placeholder?: string;
   inputType?: 'number';
   list?: boolean;                                       // dynamic list editor; value = comma-joined entries
+  /**
+   * What this row IS (stamped server-side from the app's capability record),
+   * so the browser never matches an env key by spelling.
+   */
+  semantic?: 'peer-role' | 'peer-list' | 'peer-secret' | 'db-dsn';
+  /** For 'peer-role': the option values meaning "this node dials a peer". */
+  semanticValues?: string[];
 }
 
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list };
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues };
 }
 
 // Fleet vars the manager injects at deploy time (the fleet contract's plumbing);
@@ -189,9 +196,17 @@ export function buildWizardEnvList(
   // its guided rows from that record (PLAN_REPLICATION 20.18: the gate and the
   // fields come from ONE declaration, so they can never disagree). Guided rows
   // replace same-key rows a raw scan may have found, so metadata always wins.
-  const controlPlane = findAppCapabilities(options?.sourceUrl)?.controlPlane;
+  const record = findAppCapabilities(options?.sourceUrl);
+  const controlPlane = record?.controlPlane;
   if (controlPlane) {
-    const fleet = controlPlane.wizardFields;
+    const semanticOf = (key: string): EnvFieldMeta => {
+      if (key === controlPlane.roleEnv.key) return { semantic: 'peer-role', semanticValues: controlPlane.roleEnv.dialsOut };
+      if (key === controlPlane.dialEnv) return { semantic: 'peer-list' };
+      if (controlPlane.groupSecretEnv && key === controlPlane.groupSecretEnv) return { semantic: 'peer-secret' };
+      if (record?.companionDb && key === record.companionDb.env.url) return { semantic: 'db-dsn' };
+      return {};
+    };
+    const fleet = controlPlane.wizardFields.map(f => ({ ...f, ...semanticOf(f.key) }));
     const fleetKeys = new Set(fleet.map(f => f.key));
     for (let i = vars.length - 1; i >= 0; i--) {
       if (fleetKeys.has(vars[i].key)) vars.splice(i, 1);

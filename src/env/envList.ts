@@ -398,7 +398,10 @@ export function buildBotEnvList(
       urlsRow.isSet = true;
     }
     if (roleRow && storedRole !== 'master') {
-      const dials = legacyUrl !== '' || (stored['MASTER_URLS'] || '').trim() !== '';
+      // Only the LEGACY single MASTER_URL implies a role. Every node carries
+      // MASTER_URLS, the master included, so folding it in here rendered a
+      // blank-role master as a co-worker and any save then demoted it.
+      const dials = legacyUrl !== '';
       if ((stored['FLEET_BACKUP_MASTER'] || '').trim() === '1') {
         roleRow.value = 'backup-master';
         roleRow.isSet = true;

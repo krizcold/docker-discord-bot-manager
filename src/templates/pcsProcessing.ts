@@ -1255,7 +1255,7 @@ export function getFleetControlPort(composeContent: string): number | null {
 
 /** Absent/empty BOT_NODE_ROLE means master, matching the bot's own role resolution. */
 export function isFleetMaster(envVars?: Record<string, string>): boolean {
-  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim();
+  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
   return role === '' || role === 'master';
 }
 

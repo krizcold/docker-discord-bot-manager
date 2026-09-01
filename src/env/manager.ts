@@ -77,7 +77,7 @@ function loadOrCreateKdfSalt(): string {
 const DERIVED_KEY = crypto.scryptSync(ENCRYPTION_KEY, loadOrCreateKdfSalt(), 32);
 
 // Sensitive env vars that should be encrypted
-const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'DATA_BACKEND_LOCAL_URL'];
+const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'DATA_BACKEND_LOCAL_URL', 'CONTROL_STORE_URL'];
 
 interface EnvStorage {
   vars: Record<string, string>;

@@ -1818,10 +1818,19 @@
       const genBtn = meta.generate ? `<button class="btn btn-secondary btn-small" onclick="generateEnvSecret(this)" title="Generate a random secret" type="button">Generate</button>` : '';
       let valueHtml;
       if (meta.options) {
+        // A stored value matching no option would leave the select on its FIRST
+        // entry, and saving writes that back - silently rewriting a role or a
+        // backend nobody touched. Match the way the app reads these (trim and
+        // lowercase), and keep a genuinely unknown value as its own option. An
+        // EMPTY value still falls through, so unset rows save their default.
+        const cur = String(value);
+        const norm = cur.trim().toLowerCase();
+        const hit = meta.options.find(o => String(o.value) === cur)
+          || meta.options.find(o => String(o.value).trim().toLowerCase() === norm);
         const optionsHtml = meta.options.map(o => {
           const v = String(o.value);
-          return `<option value="${escapeHtml(v)}"${v === String(value) ? ' selected' : ''}>${escapeHtml(o.label || v)}</option>`;
-        }).join('');
+          return `<option value="${escapeHtml(v)}"${hit && v === String(hit.value) ? ' selected' : ''}>${escapeHtml(o.label || v)}</option>`;
+        }).join('') + (!hit && cur !== '' ? `<option value="${escapeHtml(cur)}" data-adhoc="1" selected>${escapeHtml(cur)} (current)</option>` : '');
         valueHtml = `<select class="env-value">${optionsHtml}</select>`;
       } else if (meta.list) {
         // Dynamic list editor: the visible item inputs join (comma) into a
@@ -1994,6 +2003,24 @@
     // input event must fire so conditionals and dependents follow.
     function setEnvInputValue(input, value) {
       if (!input) return;
+      // A select handed a value it has no option for blanks itself, and for
+      // these rows an empty value is not neutral (an unset role reads as
+      // master). Match it the way the app does, else carry it as its own option.
+      if (input.tagName === 'SELECT' && String(value) !== '') {
+        const cur = String(value);
+        const norm = cur.trim().toLowerCase();
+        // Drop a carried option from an earlier fill, or repeated loads stack
+        // one unrecognised value per call and all of them stay selectable.
+        Array.from(input.options).forEach(o => { if (o.dataset.adhoc === '1' && o.value !== cur) o.remove(); });
+        const opts = Array.from(input.options);
+        const hit = opts.find(o => o.value === cur) || opts.find(o => o.value.trim().toLowerCase() === norm);
+        if (hit) value = hit.value;
+        else {
+          const carried = new Option(cur + ' (current)', cur);
+          carried.dataset.adhoc = '1';
+          input.add(carried);
+        }
+      }
       input.value = value;
       delete input.dataset.generated;
       const list = input.closest('.env-list');
@@ -2122,7 +2149,11 @@
         if (!m) return;
         for (const [key, value] of [['MASTER_URLS', candidatesOf(m).join(',')], ['CONTROL_SECRET', m.controlSecret]]) {
           fleetSetEnvValue(container, key, value);
-          const el = (fleetEnvWrapper(container, key) || container).querySelector('.env-row .env-value');
+          // No falling back to the container: with the row absent this would
+          // mark the FIRST field in the form (the token) as machine-owned, and
+          // leaving same-server mode below wipes whatever carries that mark.
+          const wrapper = fleetEnvWrapper(container, key);
+          const el = wrapper && wrapper.querySelector('.env-row .env-value');
           if (el) el.dataset.autofilled = '1';
         }
       };
@@ -2140,7 +2171,8 @@
           // Switched to manual entry: take back what same-server filled in, so
           // the operator edits their own values rather than a hidden fleet's.
           for (const key of ['MASTER_URLS', 'CONTROL_SECRET']) {
-            const el = (fleetEnvWrapper(container, key) || container).querySelector('.env-row .env-value');
+            const wrapper = fleetEnvWrapper(container, key);
+            const el = wrapper && wrapper.querySelector('.env-row .env-value');
             if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
           }
         }

@@ -580,7 +580,7 @@ export async function adoptPromotedReplica(
   // beside it (F1: same-host consumers cannot dial the public form).
   envManager.setEnvVars(instance.id, {
     DATA_BACKEND: 'postgres',
-    DATA_BACKEND_URL: `postgresql://smdb:${encodeURIComponent(password)}@${rec.containerName}:5432/smdb`,
+    DATA_BACKEND_URL: `postgresql://smdb:${encodeURIComponent(password)}@${rec.containerName}:5432/smdb?sslmode=no-verify`,
   });
 
   const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort);

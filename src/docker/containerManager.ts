@@ -2345,7 +2345,7 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
 
   // Env store first (the wizard writes through it); registry mirror as fallback.
   const stored = { ...instance.envVars, ...envManager.getEnvVars(instance.id) };
-  if ((stored['DATA_BACKEND'] || '').trim() !== 'postgres') return null;
+  if ((stored['DATA_BACKEND'] || '').trim().toLowerCase() !== 'postgres') return null;
 
   const containerName = instance.fleetDb?.containerName || `${instance.sanitizedName}-fleet-postgres`;
   const volume = instance.fleetDb?.volume || `${instance.sanitizedName}-fleet-postgres-data`;

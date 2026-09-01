@@ -31,7 +31,7 @@ import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '..
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, isFleetMaster, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
+import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
 import { hasAppHooks } from '../../instance/appHookClient';
 import * as appLifecycle from '../../instance/appLifecycle';
@@ -235,7 +235,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       for (const bot of containerManager.getAllBots()) {
         try {
           const env = envManager.getEnvVars(bot.id);
-          if (!isFleetMaster(env)) continue;
+          // Mirror the bot's own role resolution: an explicit role wins, and a
+          // blank role with the LEGACY single MASTER_URL is a co-worker. Listing
+          // one would point a joining node at a peer that runs no control server.
+          // MASTER_URLS never implies a role - every node carries that list.
+          const nodeRole = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
+          const legacyDial = (env['MASTER_URL'] || '').trim() !== '';
+          if (!(nodeRole === 'master' || (nodeRole === '' && !legacyDial))) continue;
           const addrs = fleetAddrsOf(bot);
           if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
 

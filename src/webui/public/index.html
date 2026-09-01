@@ -1414,9 +1414,10 @@
               </select>` : '';
 
             // Database modal: backups + replication on a managed-DB instance;
-            // the standby replica surface on fleet workers.
-            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetWorker)
-              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : 'Standby replica of this bot\'s managed database on this machine'}">Database</button>`
+            // the standby replica surface on fleet workers; the kept safety
+            // dumps after a decommission destroyed the database itself.
+            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetWorker || bot.hasDbBackups)
+              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine' : 'Earlier database backups kept on this machine'}">Database</button>`
               : '';
 
             return `
@@ -2447,6 +2448,9 @@
             <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
             <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached standby may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
             <button class="btn btn-primary btn-small" onclick="enableFleetReplication('${botId}')">Enable</button>
+          </div>
+          <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+            <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
           </div>`;
         return;
       }
@@ -2514,8 +2518,14 @@
           <div class="env-tip"><b>Demote</b> stops this instance being the primary side and rejoins it as a worker; the database here stays untouched. <b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-small" onclick="appDemote('${botId}')">Demote</button>
+            <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission</button>
           </div>
-        </div>` : ''}
+        </div>` : `
+        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+          <div style="margin-top:6px;">
+            <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
+          </div>
+        </div>`}
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
@@ -2532,6 +2542,27 @@
           : '<div class="env-tip" style="color:var(--warning);">Stop the instance to re-seed: this deletes the database it is currently running on.</div>'}
         </div>
         `;
+    }
+
+    /**
+     * Destroy this instance's managed database. The server refuses unless a
+     * fresh safety dump succeeds; that dump is the recovery path.
+     */
+    async function decommissionFleetDb(botId) {
+      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first and kept with the backups; if the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
+      if (!confirm(warning)) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
+        if (!res.success) { showMessage('error', res.error || 'Decommission refused'); return; }
+        showMessage('success', res.dumpFile
+          ? `Database decommissioned; safety dump kept: ${res.dumpFile}`
+          : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list)');
+      } catch (err) {
+        showMessage('error', 'Decommission failed');
+      } finally {
+        await loadBots();
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
     }
 
     /**

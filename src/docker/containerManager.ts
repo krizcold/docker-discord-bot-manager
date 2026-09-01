@@ -565,14 +565,20 @@ export async function retireFleetDbSidecar(botId: string): Promise<{ success: bo
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
   try {
-    const appName = resolveAppName(botId);
-    const composePath = resolveComposePath(botId, appName);
-    if (fs.existsSync(composePath)) {
-      fs.writeFileSync(composePath, removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8')));
-    }
+    // Container and volume go FIRST: if either fails, the compose service is
+    // still declared and the record kept, so a retry can start the sidecar
+    // and dump again. Both strippers run because an adopted standby's
+    // database rides the 'fleet-postgres-replica' service key until its next
+    // rebuild; callers guard that no real standby record exists, so any
+    // replica-keyed service here IS this database (or recordless debris).
     await execAsync(`docker rm -f "${fleetDb.containerName}"`).catch(() => { /* already gone */ });
     if (!dockerClient.removeVolume(fleetDb.volume)) {
       return { success: false, error: `could not remove the old database volume ${fleetDb.volume}; the container may still be running` };
+    }
+    const appName = resolveAppName(botId);
+    const composePath = resolveComposePath(botId, appName);
+    if (fs.existsSync(composePath)) {
+      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8'))));
     }
     const registry = loadRegistry();
     const stored = registry.instances[botId];

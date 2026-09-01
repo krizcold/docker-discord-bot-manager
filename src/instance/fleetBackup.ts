@@ -7,7 +7,7 @@
  * databases are never dumped.
  *
  * Dumps stream to <DATA_DIR>/backups/<botId>/fleet-postgres/<ISO>.dump with a
- * keep-newest retention trim (pre-restore-*.dump files are exempt). Restore
+ * keep-newest retention trim (pre-*.dump safety files are exempt). Restore
  * order: safety dump FIRST (the sidecar is a service of the instance's own
  * compose project, so stopping the host takes the database down with it),
  * courtesy stop of the managed instances this manager can see on the URL,
@@ -47,6 +47,22 @@ const busy: Set<string> = new Set();
 
 export function getFleetBackupError(botId: string): string | null {
   return fenceStuck.get(botId) || lastErrors.get(botId) || null;
+}
+
+/**
+ * Cross-module claim of the per-instance backup-op slot, so a destructive
+ * lane (decommission) and this module's own dump/restore can never
+ * interleave: restore and the scheduled dump refuse while it is claimed,
+ * and the claimer refuses while a dump or restore is in flight.
+ */
+export function claimFleetBackupBusy(botId: string): boolean {
+  if (busy.has(botId)) return false;
+  busy.add(botId);
+  return true;
+}
+
+export function releaseFleetBackupBusy(botId: string): void {
+  busy.delete(botId);
 }
 
 /**
@@ -204,11 +220,13 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
 }
 
 /**
- * Keep the newest `keep` dumps; pre-restore-*.dump safety dumps are exempt.
+ * Keep the newest `keep` dumps; every pre-*.dump safety file is exempt
+ * (pre-restore-, pre-reseed-, pre-rescue-, pre-decommission-): each one is
+ * some destructive lane's recovery copy and must never age out under it.
  */
 function trimFleetBackups(botId: string, keep: number): void {
   const dir = backupDir(botId);
-  const trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-restore-'));
+  const trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-'));
   for (const f of trimmable.slice(keep)) {
     try {
       fs.unlinkSync(path.join(dir, f.file));

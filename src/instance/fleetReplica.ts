@@ -21,6 +21,7 @@ import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { capabilityRefusal } from './appLifecycle';
 import { InstanceConfig, FleetDbReplicaRecord } from '../types';
 
 const REPLICATION_SLOT = 'fleet_standby';
@@ -37,6 +38,18 @@ const lastErrors: Map<string, string> = new Map();
 
 function seedContainerName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-fleet-replica-seed`;
+}
+
+// 'absent' only when docker itself says "no such volume": any other failure
+// (daemon down, spawn EAGAIN) is 'unknown', which the caller must refuse on -
+// inferring absence from an arbitrary error skips a dump gate over real data.
+function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown'> {
+  return new Promise(resolve => {
+    execFile('docker', ['volume', 'inspect', name], (err, _stdout, stderr) => {
+      if (!err) return resolve('exists');
+      resolve(String(stderr || '').toLowerCase().includes('no such volume') ? 'absent' : 'unknown');
+    });
+  });
 }
 
 function volExec(volume: string, script: string, stdin?: string, extraMounts: string[] = []): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -492,6 +505,98 @@ export function reseedStalePrimary(
     retireFleetDbEnvPins(instance.id);
   });
   return { success: true, started: true };
+}
+
+/**
+ * Destroy this instance's managed fleet database (PLAN_REPLICATION 20.13
+ * [Decommission]; design ruled 2026-09-01: DUMP-GATED DESTROY). "Is it still
+ * in use?" proved unanswerable by enumerating consumers five review rounds
+ * running (the B4m-2a record), so no app fact gates anything here. The ONLY
+ * permit is a fresh pre-decommission dump that SUCCEEDS: a wrong click then
+ * costs downtime, not data, because the dump restores through the restore
+ * lane into a re-provisioned sidecar. The refusals below are the manager's
+ * OWN records exclusively.
+ */
+export async function decommissionFleetDb(
+  botId: string
+): Promise<{ success: boolean; error?: string; dumpFile?: string }> {
+  try {
+    // The bot op lock is held for the whole lane so a concurrent Start cannot
+    // boot the instance onto the database mid-destroy; the guards re-read a
+    // fresh snapshot INSIDE the lock, since callers hold a stale one.
+    return await containerManager.withExternalBotOp(botId, 'decommission', async () => {
+      const instance = containerManager.getBot(botId);
+      if (!instance?.fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+      const refusal = capabilityRefusal(instance);
+      if (refusal) return { success: false, error: refusal };
+      if (instance.fleetDbReplica) return { success: false, error: 'This instance also holds a standby copy - remove or adopt it before decommissioning the primary database' };
+      if (instance.recoveryChannel) return { success: false, error: 'A recovery channel is armed on this database - disarm it first' };
+      if (instance.recoveryRescue) return { success: false, error: 'A database rescue is in progress on this instance - finish or cancel it first' };
+      if (provisioning.has(instance.id)) return { success: false, error: 'Provisioning is already running on this instance' };
+      if (instance.status === 'running') {
+        return { success: false, error: 'Stop the instance first: decommission destroys the database it is running on' };
+      }
+      // The status record can lie after a compose down that failed but still
+      // reported success, so ask docker itself. The probe excludes the
+      // sidecar by exact record name, so a retry with the database running
+      // alone still passes.
+      const liveContainers = await containerManager.runningNonSidecarContainers(instance.id);
+      if (liveContainers === null) {
+        return { success: false, error: 'Could not verify that this instance is fully stopped (docker did not answer) - try again' };
+      }
+      if (liveContainers.length > 0) {
+        return { success: false, error: `Containers of this instance are still running (${liveContainers.join(', ')}) - stop it fully first` };
+      }
+      if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+        return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+      }
+      try {
+        // A volume PROVEN absent has nothing to protect, and starting the
+        // sidecar would MINT a fresh empty database whose dump would then
+        // pose as the safety copy (a partial earlier attempt destroys the
+        // volume before the compose strip). Only then is the dump skipped;
+        // that earlier attempt's real dump is already in the backups list.
+        // An unanswerable probe refuses: skipping the gate on a guess is the
+        // destroy-without-dump hole this whole design exists to close.
+        let dumpFile: string | undefined;
+        const volState = await dockerVolumeState(instance.fleetDb.volume);
+        if (volState === 'unknown') {
+          return { success: false, error: 'Refused, nothing was destroyed: could not verify the database volume (docker did not answer) - try again' };
+        }
+        if (volState === 'exists') {
+          // The permit. Stopping the instance took the sidecar down with its
+          // compose project, so it comes back up alone to be dumped at all.
+          const started = await containerManager.startFleetDbSidecar(instance.id);
+          if (!started.success) {
+            return { success: false, error: `Refused, nothing was destroyed: the database did not come up for the pre-decommission dump: ${started.error}. If its container started, it was left running alone for inspection` };
+          }
+          const dump = await fleetBackup.runFleetDump(instance, 'pre-decommission-');
+          if (!dump.success) {
+            return { success: false, error: `Refused, nothing was destroyed: the pre-decommission dump failed: ${dump.error}. The database was left running alone for inspection` };
+          }
+          dumpFile = dump.file;
+        }
+
+        const retired = await containerManager.retireFleetDbSidecar(instance.id);
+        if (!retired.success) {
+          return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}`, dumpFile };
+        }
+        try {
+          retireFleetDbEnvPins(instance.id);
+        } catch (err) {
+          // The database is already destroyed and the dump kept: a pins
+          // failure must not read as a refusal. Leftover pins only mean a
+          // later rebuild re-mints a recorded empty sidecar.
+          console.error(`[FleetReplica] Decommissioned ${instance.id} but failed to retire its env pins:`, err);
+        }
+        return { success: true, dumpFile };
+      } finally {
+        fleetBackup.releaseFleetBackupBusy(instance.id);
+      }
+    });
+  } catch (err) {
+    return { success: false, error: String((err as Error)?.message || err) };
+  }
 }
 
 /**

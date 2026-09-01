@@ -586,10 +586,20 @@ export async function getContainerStats(containerId: string): Promise<{
 }
 
 /**
- * Remove a Docker volume by name
+ * Remove a Docker volume by name. A volume PROVEN absent counts as removed
+ * (a retry after a partial teardown must not fail on the step a previous
+ * attempt completed), but absence must come from docker saying "no such
+ * volume": a daemon that cannot answer reads as failure, or a teardown
+ * would report success over a surviving volume.
  */
 export function removeVolume(name: string): boolean {
-  return execDockerSafe(['volume', 'rm', name]);
+  if (execDockerSafe(['volume', 'rm', name])) return true;
+  try {
+    execDocker(['volume', 'inspect', name]);
+    return false;
+  } catch (err) {
+    return String((err as Error)?.message || err).toLowerCase().includes('no such volume');
+  }
 }
 
 /**

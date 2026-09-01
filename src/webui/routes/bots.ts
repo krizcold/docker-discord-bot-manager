@@ -86,6 +86,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           lastError: fleetBackup.getFleetBackupError(bot.id),
           ...fleetBackup.effectiveFleetBackup(bot),
         } : null;
+        // A decommissioned database's safety dump must stay reachable: this
+        // is the Database button's only reason to render once fleetDb is gone.
+        const hasDbBackups = bot.fleetDb ? undefined : fleetBackup.listFleetBackups(bot.id).length > 0;
 
         return {
           ...bot,
@@ -93,6 +96,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           fleetBackup: fleetBackupInfo,
+          hasDbBackups,
           // Cached verdict from the background sampler: null when this instance
           // has no replication role. Never probed inline - the list is polled.
           replicationHealth: getReplicationHealth(bot.id),
@@ -1339,6 +1343,25 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json(result.success
         ? { success: true, steps: result.steps }
         : { success: false, error: result.error, steps: result.steps });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-db/decommission - Destroy the managed fleet
+   * database (B4m-2c, dump-gated destroy). The only permit is a fresh
+   * pre-decommission dump; the refusals are the manager's own records, never
+   * app facts.
+   */
+  router.post('/:id/fleet-db/decommission', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json(await fleetReplica.decommissionFleetDb(bot.id));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

@@ -18,6 +18,7 @@ import {
   isSensitive,
   DetectedEnvVar,
 } from './manager';
+import { findAppCapabilities } from '../config/appCapabilities';
 
 /**
  * General presentation metadata an env row may carry (any bot, any var). The
@@ -184,11 +185,13 @@ export function buildWizardEnvList(
     }
   }
 
-  // Fleet section: any bot whose compose declares the fleet.control-port label
-  // (the fleet contract marker) gets the guided fleet fields. Guided rows replace
-  // same-key rows a raw scan may have found, so metadata always wins.
-  if (composeDeclaresFleet(repoPath)) {
-    const fleet = fleetEnvFields();
+  // Fleet section: an app whose capability record declares a control plane gets
+  // its guided rows from that record (PLAN_REPLICATION 20.18: the gate and the
+  // fields come from ONE declaration, so they can never disagree). Guided rows
+  // replace same-key rows a raw scan may have found, so metadata always wins.
+  const controlPlane = findAppCapabilities(options?.sourceUrl)?.controlPlane;
+  if (controlPlane) {
+    const fleet = controlPlane.wizardFields;
     const fleetKeys = new Set(fleet.map(f => f.key));
     for (let i = vars.length - 1; i >= 0; i--) {
       if (fleetKeys.has(vars[i].key)) vars.splice(i, 1);
@@ -239,102 +242,6 @@ export function composeDeclaresFleet(repoPath: string | null): boolean {
     }
   }
   return false;
-}
-
-/**
- * Guided env fields for the bot fleet contract (BOT_NODE_ROLE and friends, read
- * by the bot instance). CONTROL_PORT / FLEET_PUBLIC_URL are deliberately absent:
- * the manager injects those itself.
- */
-function fleetEnvFields(): WizardEnvVar[] {
-  const base = { defaultValue: '', required: false, source: 'compose' as const, sensitive: false, autoWired: false, group: 'Fleet' };
-  // backup-master is a designated co-worker: it dials a master like any worker
-  // and additionally gets the Promote surface. Every worker-role conditional
-  // must match both values.
-  const whenWorkerRole = { key: 'BOT_NODE_ROLE', equals: ['co-worker', 'backup-master'] };
-  return [
-    {
-      ...base,
-      key: 'BOT_NODE_ROLE',
-      displayLabel: 'Fleet Role',
-      description: 'Master runs the control plane and assigns shards. Co-worker dials into a master. Backup Master is a co-worker that can take over when the master dies (postgres data backend only). A single standalone bot is a master.',
-      defaultValue: 'master',
-      options: [
-        { value: 'master', label: 'Master' },
-        { value: 'co-worker', label: 'Co-worker' },
-        { value: 'backup-master', label: 'Backup Master' },
-      ],
-      groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
-    },
-    {
-      ...base,
-      key: 'MASTER_URLS',
-      displayLabel: 'Master Candidates',
-      description: 'Ordered list of every master-capable control URL: the master first, then the backup master. Workers cycle through it on reconnect, so a failover needs no reconfiguration. A master lists the OTHER master-capable nodes: it checks them before claiming the fleet at startup, so a master that comes back after a failover parks itself instead of splitting the fleet in two, and can then be demoted from its web UI. Optional for a master, required for a worker. Same-server installs fill this automatically.',
-      placeholder: 'wss://mybot-fleet.dbot.example.com',
-      list: true,
-      requiredWhen: whenWorkerRole,
-    },
-    {
-      ...base,
-      key: 'CONTROL_SECRET',
-      displayLabel: 'Control Secret',
-      description: 'Shared secret for the whole fleet: every node, the backup master included, must carry the SAME value. Generated on the master; same-server installs fill it automatically, workers on other machines paste it from the master.',
-      sensitive: true,
-      generate: true,
-      requiredWhen: whenWorkerRole,
-    },
-    {
-      ...base,
-      key: 'FLEET_SHARD_COUNT',
-      displayLabel: 'Fleet Shard Count',
-      description: 'Advanced: total shards across the fleet. Blank = Discord decides the count (right for almost every fleet). Set it (e.g. 8) only to spread a few test guilds across instances.',
-      inputType: 'number',
-      advanced: true,
-    },
-    {
-      ...base,
-      key: 'FLEET_SHARD_CAPACITY',
-      displayLabel: 'Fleet Shard Capacity',
-      description: 'Advanced: max shards THIS instance holds. Default 1. The master only hands out unassigned shards; a worker with no free shard waits on hold.',
-      inputType: 'number',
-      advanced: true,
-    },
-    {
-      ...base,
-      key: 'PIN_TEST_GUILD_SHARD',
-      displayLabel: 'Pin Test Guild Shard',
-      description: "Master only: keep the shard containing this bot's GUILD_ID on the master. Useful when testing.",
-      defaultValue: 'false',
-      options: [{ value: 'false' }, { value: 'true' }],
-    },
-    {
-      ...base,
-      key: 'NODE_NAME',
-      displayLabel: 'Node Name',
-      description: "A friendly name for this instance in the Fleet view (e.g. 'yundera', 'home-pc').",
-    },
-    {
-      ...base,
-      key: 'DATA_BACKEND',
-      displayLabel: 'Data Backend',
-      description: 'file keeps data in simple per-instance JSON files (the default). postgres uses a central database, for multi-machine fleets and big bots.',
-      defaultValue: 'file',
-      options: [{ value: 'file' }, { value: 'postgres' }],
-      showWhen: { key: 'BOT_NODE_ROLE', equals: 'master' },
-      advanced: true,
-    },
-    {
-      ...base,
-      key: 'DATA_BACKEND_URL',
-      displayLabel: 'Database URL',
-      description: 'Blank provisions a managed Postgres on this server. Paste a postgresql:// URL to use an external database instead.',
-      sensitive: true,
-      showWhen: { key: 'DATA_BACKEND', equals: 'postgres' },
-      placeholder: 'blank = managed Postgres on this server',
-      advanced: true,
-    },
-  ];
 }
 
 export interface EditorEnvVar extends EnvFieldMeta {

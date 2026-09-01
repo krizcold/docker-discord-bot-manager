@@ -356,7 +356,8 @@ export interface EditorEnvVar extends EnvFieldMeta {
 export function buildBotEnvList(
   repoPath: string | null,
   botId: string,
-  tokenVarName?: string
+  tokenVarName?: string,
+  sourceUrl?: string
 ): EditorEnvVar[] {
   const stored = getEnvVars(botId);
   const result: EditorEnvVar[] = [];
@@ -364,7 +365,7 @@ export function buildBotEnvList(
 
   // WEBUI_USER/WEBUI_PASSWORD are surfaced via buildWizardEnvList (below) so they
   // appear in both the wizard and the editor without duplication.
-  const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath).vars : [];
+  const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath, { sourceUrl }).vars : [];
   for (const d of detected) {
     if (d.autoWired) continue;   // deploy-injected, not user-editable
     seen.add(d.key);

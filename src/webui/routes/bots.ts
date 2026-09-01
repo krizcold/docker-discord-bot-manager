@@ -900,7 +900,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
 
-      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName);
+      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.sourceUrl || undefined);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
 
       res.json({

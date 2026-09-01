@@ -105,9 +105,13 @@ export interface AppHooksSpec {
  */
 export interface ControlPlaneSpec {
   /**
-   * Env keys the manager AUTHORS on the app service. It owns every one: they
-   * are suppressed from the wizard and env editor, and retired from a stale
-   * compose when no longer derivable. Never author a key absent here.
+   * Env keys the manager AUTHORS on the app service: suppressed from the
+   * wizard's detected rows and retired from a stale compose when no longer
+   * derivable. Never author a key absent here. The manager computes these at
+   * deploy and never STORES one, so a stored value under one of these names is
+   * operator-written and the editor keeps it visible; transferUrl in
+   * particular is hand-set on rigs with no public base, where the manager
+   * cannot judge container-name reachability.
    */
   env: {
     port: string;

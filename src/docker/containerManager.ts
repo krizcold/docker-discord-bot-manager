@@ -79,6 +79,7 @@ import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
 import * as envManager from '../env/manager';
 import { composeDeclaresFleet } from '../env/envList';
+import { findAppCapabilities } from '../config/appCapabilities';
 import { getDeploymentMode } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
@@ -1423,14 +1424,17 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   let fleetHostPort: number | undefined;
   let transferHostPort: number | undefined;
   if (controlPort !== null) {
+    const cp = findAppCapabilities(instance.sourceUrl)?.controlPlane;
     if (BOT_DOMAIN_BASE) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort);
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, controlPort,
+        { envAdvertise: cp ? { key: cp.env.publicUrl, scheme: cp.urlScheme.secure } : null });
     }
     // Transfer route: EVERY fleet node advertises one (migration legs dial in
     // either direction), unlike the master-only control route. Only for an app
     // whose compose declares the transfer marker label.
     if (BOT_DOMAIN_BASE && transferPort !== null) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort, { envKey: 'TRANSFER_URL' });
+      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transferPort,
+        { envAdvertise: cp?.env.transferUrl ? { key: cp.env.transferUrl, scheme: cp.urlScheme.secure } : null });
     }
     const existing = getPublishedFleetHostPort(content, controlPort);
     if (existing !== null) {
@@ -1590,12 +1594,13 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
 }
 
 /**
- * Fleet wiring derived from the deployed compose's marker labels: CONTROL_PORT
- * whenever the control marker is present; FLEET_PUBLIC_URL only for a master
- * with a public base; TRANSFER_PORT/TRANSFER_URL only when the compose also
- * declares the transfer marker (an absent label means the app has one
- * channel). Re-derived from the compose so start-time env syncs agree with
- * what the build exposed.
+ * Fleet wiring derived from the deployed compose's marker labels, spelled by
+ * the app's capability record: the control-port key whenever the control
+ * marker is present; the public-URL key only for a node with a public base;
+ * the transfer pair only when the compose also declares the transfer marker
+ * (an absent label means the app has one channel). No record = no authored
+ * env. Re-derived from the compose so start-time env syncs agree with what
+ * the build exposed.
  */
 function fleetEnv(instance: InstanceConfig): Record<string, string> {
   try {
@@ -1604,26 +1609,30 @@ function fleetEnv(instance: InstanceConfig): Record<string, string> {
     const composeContent = fs.readFileSync(composePath, 'utf-8');
     const controlPort = getFleetControlPort(composeContent);
     if (controlPort === null) return {};
-    const env: Record<string, string> = { CONTROL_PORT: String(controlPort) };
-    const transferPort = getFleetTransferPort(composeContent);
-    if (transferPort !== null) env.TRANSFER_PORT = String(transferPort);
-    const host = fleetPublicHost(instance.sanitizedName);
-    // Advertise the control route only once the built compose actually
-    // serves it (same rule as TRANSFER_URL below): a pre-standby worker
-    // build restarted after a manager update must not advertise a route no
-    // proxy label backs until its rebuild.
-    if (host && composeContent.includes(host)) env.FLEET_PUBLIC_URL = `wss://${host}`;
-    if (transferPort !== null) {
-      const transferHost = transferPublicHost(instance.sanitizedName);
-      // Advertise the public route only once the built compose actually
-      // serves it: a pre-transfer build restarted after a manager update
-      // must not advertise a route no proxy label backs until its rebuild.
-      // No same-box container-name fallback: whether a peer can reach a
-      // container name is app topology the manager cannot judge (the old
-      // guess read the dial list and diverged from the app's own role
-      // resolution). A no-base rig sets the transfer URL by hand; without
-      // one the app refuses a migration loudly and names the fix.
-      if (transferHost && composeContent.includes(transferHost)) env.TRANSFER_URL = `wss://${transferHost}`;
+    const env: Record<string, string> = {};
+    const cp = findAppCapabilities(instance.sourceUrl)?.controlPlane;
+    if (cp) {
+      env[cp.env.port] = String(controlPort);
+      const transferPort = getFleetTransferPort(composeContent);
+      if (transferPort !== null && cp.env.transferPort) env[cp.env.transferPort] = String(transferPort);
+      const host = fleetPublicHost(instance.sanitizedName);
+      // Advertise the control route only once the built compose actually
+      // serves it (same rule as the transfer URL below): a pre-standby worker
+      // build restarted after a manager update must not advertise a route no
+      // proxy label backs until its rebuild.
+      if (host && composeContent.includes(host)) env[cp.env.publicUrl] = `${cp.urlScheme.secure}://${host}`;
+      if (transferPort !== null && cp.env.transferUrl) {
+        const transferHost = transferPublicHost(instance.sanitizedName);
+        // Advertise the public route only once the built compose actually
+        // serves it: a pre-transfer build restarted after a manager update
+        // must not advertise a route no proxy label backs until its rebuild.
+        // No same-box container-name fallback: whether a peer can reach a
+        // container name is app topology the manager cannot judge (the old
+        // guess read the dial list and diverged from the app's own role
+        // resolution). A no-base rig sets the transfer URL by hand; without
+        // one the app refuses a migration loudly and names the fix.
+        if (transferHost && composeContent.includes(transferHost)) env[cp.env.transferUrl] = `${cp.urlScheme.secure}://${transferHost}`;
+      }
     }
     // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
     // bot's promote flow promotes this database first. Credentials are the
@@ -1714,15 +1723,18 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       } else {
         service.environment = { ...allEnv };
       }
-      // Role or public base may have changed since build: a FLEET_PUBLIC_URL or
-      // TRANSFER_URL the build injected must not survive when no longer derivable.
-      // TRANSFER_URL is a generic enough name that a non-fleet bot's compose may
-      // legitimately ship one, so its cleanup is gated on the transfer marker:
-      // the manager only ever authors it where that label exists, and a
-      // pre-label compose keeps its built pins (they still match the routes its
-      // own build created) until its rebuild.
-      if (!('FLEET_PUBLIC_URL' in allEnv)) deleteComposeEnv(service.environment, 'FLEET_PUBLIC_URL');
-      if (!('TRANSFER_URL' in allEnv) && getFleetTransferPort(raw) !== null) deleteComposeEnv(service.environment, 'TRANSFER_URL');
+      // Role or public base may have changed since build: a public-URL or
+      // transfer-URL value the build injected must not survive when no longer
+      // derivable. Cleanup only reaches keys the RECORD declares (the manager
+      // never authors any other app's spelling), and the transfer key only
+      // where the transfer marker exists; a pre-label compose keeps its built
+      // pins (they still match the routes its own build created) until its
+      // rebuild.
+      const cpDel = findAppCapabilities(instance.sourceUrl)?.controlPlane;
+      if (cpDel) {
+        if (!(cpDel.env.publicUrl in allEnv)) deleteComposeEnv(service.environment, cpDel.env.publicUrl);
+        if (cpDel.env.transferUrl && !(cpDel.env.transferUrl in allEnv) && getFleetTransferPort(raw) !== null) deleteComposeEnv(service.environment, cpDel.env.transferUrl);
+      }
       // The local-replica keys must not survive in a compose once the standby
       // they described is gone: a stale copy would keep pointing the app at a
       // database this machine no longer hosts.

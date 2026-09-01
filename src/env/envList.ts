@@ -51,12 +51,20 @@ function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
   return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues };
 }
 
-// Fleet vars the manager injects at deploy time (the fleet contract's plumbing);
-// never user-editable, so they must not surface in the wizard or the editor.
-const MANAGER_INJECTED_FLEET_ENV = new Set(['CONTROL_PORT', 'TRANSFER_PORT', 'FLEET_PUBLIC_URL', 'TRANSFER_URL']);
-
-function isManagerInjectedFleetEnv(key: string): boolean {
-  return MANAGER_INJECTED_FLEET_ENV.has(key.toUpperCase());
+// Keys the manager authors on this app's service at deploy time, per the app's
+// own capability record (PLAN_REPLICATION 20.18: never author a key absent
+// there). Suppressed from the wizard's DETECTED rows only: a STORED value
+// under one of these names is operator-written (the manager never stores one)
+// and the editor keeps it visible - the hand-set transfer URL on a no-base rig
+// is the supported case. An app with no record has no keys to suppress.
+function managerInjectedFleetEnv(sourceUrl?: string | null): Set<string> {
+  const env = findAppCapabilities(sourceUrl)?.controlPlane?.env;
+  if (!env) return new Set();
+  return new Set(
+    [env.port, env.publicUrl, env.transferPort, env.transferUrl]
+      .filter((k): k is string => !!k)
+      .map(k => k.toUpperCase())
+  );
 }
 
 // Keys the operator is expected to set on a fresh install, so they always stay
@@ -208,8 +216,9 @@ export function buildWizardEnvList(
   // Auto-fold low-touch prefilled rows into Advanced. Only ungrouped rows: a group
   // (e.g. Fleet) curates its own advanced flags, and its primary controls must stay
   // visible. Explicit flags already set on a row are left untouched.
+  const injected = managerInjectedFleetEnv(options?.sourceUrl);
   const surfaced = vars
-    .filter(v => !isManagerInjectedFleetEnv(v.key))
+    .filter(v => !injected.has(v.key.toUpperCase()))
     .map(v => (!v.group && v.advanced === undefined && isAdvancedEnv(v)) ? { ...v, advanced: true } : v);
   return { vars: surfaced, detection };
 }
@@ -296,9 +305,13 @@ export function buildBotEnvList(
     });
   }
 
-  // User-added vars not surfaced by detection.
+  // User-added vars not surfaced by detection. Keys the manager authors are
+  // NOT filtered here: it computes them at deploy and never stores one, so a
+  // STORED value under such a name is operator-written and must stay visible
+  // (the hand-set transfer URL on a rig with no public base is the supported
+  // case; hiding it made that lane write-only).
   for (const [key, value] of Object.entries(stored)) {
-    if (seen.has(key) || isManagerInjectedFleetEnv(key)) continue;
+    if (seen.has(key)) continue;
     seen.add(key);
     const sensitive = isSensitive(key);
     result.push({

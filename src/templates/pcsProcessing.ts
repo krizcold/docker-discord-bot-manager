@@ -13,6 +13,7 @@ import { parseDocument, stringify } from 'yaml';
 import { BotConfig, DeploymentMode } from '../types';
 import { buildStatusPageService } from './statusPage';
 import { findConfigTemplate } from '../config/configTemplates';
+import { findAppCapabilities } from '../config/appCapabilities';
 
 const execAsync = promisify(exec);
 
@@ -498,11 +499,16 @@ export function processComposeForCasaOS(
     const fleetSvcName = getAppServiceName(compose);
     const fleetSvc = fleetSvcName ? services[fleetSvcName] : undefined;
     if (fleetSvc) {
-      setServiceEnv(fleetSvc, 'CONTROL_PORT', String(fleetPort));
+      // Env key names and URL schemes come from the app's capability record;
+      // the routes themselves stay label-driven. An app with the marker but no
+      // record gets the structural wiring and NO authored env: the manager
+      // never guesses another app's key spelling (PLAN_REPLICATION 20.18).
+      const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
+      if (cp) setServiceEnv(fleetSvc, cp.env.port, String(fleetPort));
       // The transfer channel has its own marker label; absent means the app
       // declares one channel and gets no transfer wiring at all.
       const transferPort = fleetTransferPortOfCompose(compose);
-      if (transferPort !== null) setServiceEnv(fleetSvc, 'TRANSFER_PORT', String(transferPort));
+      if (transferPort !== null && cp?.env.transferPort) setServiceEnv(fleetSvc, cp.env.transferPort, String(transferPort));
       if (pcs.APP_DOMAIN) {
         // EVERY fleet node gets the control route (PLAN_STANDBY 3.6): a
         // promotable backup must be dialable in advance. Workers dial the app
@@ -521,7 +527,7 @@ export function processComposeForCasaOS(
           setServiceLabel(fleetSvc, `caddy_${nipIdx}.import`, 'gateway_tls');
           setServiceLabel(fleetSvc, `caddy_${nipIdx}.reverse_proxy`, `{{upstreams ${fleetPort}}}`);
         }
-        setServiceEnv(fleetSvc, 'FLEET_PUBLIC_URL', `wss://${fleetHost}`);
+        if (cp) setServiceEnv(fleetSvc, cp.env.publicUrl, `${cp.urlScheme.secure}://${fleetHost}`);
       }
       if (pcs.APP_DOMAIN && transferPort !== null) {
         // Transfer route (container port from the transfer marker label):
@@ -539,7 +545,7 @@ export function processComposeForCasaOS(
           setServiceLabel(fleetSvc, `caddy_${tNipIdx}.import`, 'gateway_tls');
           setServiceLabel(fleetSvc, `caddy_${tNipIdx}.reverse_proxy`, `{{upstreams ${transferPort}}}`);
         }
-        setServiceEnv(fleetSvc, 'TRANSFER_URL', `wss://${transferHost}`);
+        if (cp?.env.transferUrl) setServiceEnv(fleetSvc, cp.env.transferUrl, `${cp.urlScheme.secure}://${transferHost}`);
       }
       // Caddy resolves {{upstreams}} over the ingress network, so a fleet
       // node's app container must join it (co-workers too: their transfer
@@ -970,15 +976,17 @@ export function processComposeForDocker(
     if (!topNets['dbm_internal']) topNets['dbm_internal'] = { name: 'dbm_internal', external: true };
   }
 
-  // CONTROL_PORT/TRANSFER_PORT each follow their own marker label; exposure
+  // The control/transfer port env each follow their own marker label, spelled
+  // by the app's capability record (no record = no authored env); exposure
   // (proxy route or localhost publish) is layered on by applyDockerHostPort.
   const fleetPort = fleetControlPortOfCompose(compose);
   if (fleetPort !== null) {
     const fleetSvcName = getAppServiceName(compose);
-    if (fleetSvcName && services[fleetSvcName]) {
-      setServiceEnv(services[fleetSvcName], 'CONTROL_PORT', String(fleetPort));
+    const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
+    if (fleetSvcName && services[fleetSvcName] && cp) {
+      setServiceEnv(services[fleetSvcName], cp.env.port, String(fleetPort));
       const transferPort = fleetTransferPortOfCompose(compose);
-      if (transferPort !== null) setServiceEnv(services[fleetSvcName], 'TRANSFER_PORT', String(transferPort));
+      if (transferPort !== null && cp.env.transferPort) setServiceEnv(services[fleetSvcName], cp.env.transferPort, String(transferPort));
     }
   }
 
@@ -1357,16 +1365,18 @@ export function fleetAppContainerName(composeContent: string): string | null {
 
 /**
  * Remote-mode fleet route: caddy-docker-proxy labels on the APP service so the
- * bundled Caddy serves the fleet control endpoint at `host` over automatic TLS,
- * plus FLEET_PUBLIC_URL for the bot (or `opts.envKey`, e.g. TRANSFER_URL for
- * the transfer route). Never forward_auth: workers are machine clients that
- * authenticate with CONTROL_SECRET (transfer: single-use tokens), not Authelia.
+ * bundled Caddy serves the fleet control endpoint at `host` over automatic TLS.
+ * `envAdvertise` names the env key and URL scheme the app reads the finished
+ * route through (both from the capability record); it is stated per call so two
+ * routes can never silently write one key, and null (no record) attaches the
+ * route without authoring any env. Never forward_auth: workers are machine
+ * clients that authenticate with the app's own shared secret, not Authelia.
  */
 export function attachFleetToProxy(
   composeContent: string,
   host: string,
   controlPort: number,
-  opts: { network?: string; envKey?: string } = {}
+  opts: { network?: string; envAdvertise: { key: string; scheme: string } | null }
 ): string {
   const network = opts.network || 'dbm_remote';
   let compose: Record<string, unknown>;
@@ -1398,7 +1408,7 @@ export function attachFleetToProxy(
   const nets = compose.networks as Record<string, unknown>;
   if (!nets[network]) nets[network] = { name: network, external: true };
 
-  setServiceEnv(svc, opts.envKey || 'FLEET_PUBLIC_URL', `wss://${host}`);
+  if (opts.envAdvertise) setServiceEnv(svc, opts.envAdvertise.key, `${opts.envAdvertise.scheme}://${host}`);
   return stringify(compose, { lineWidth: 0 });
 }
 

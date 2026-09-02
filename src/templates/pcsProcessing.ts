@@ -1500,7 +1500,7 @@ export function publishFleetHostPort(
 export function addFleetPostgresService(
   composeContent: string,
   bot: BotConfig,
-  db: { containerName: string; volume: string; password: string },
+  db: { containerName: string; volume: string; password: string; user: string; db: string },
   opts: { mode?: DeploymentMode } = {}
 ): string {
   let compose: Record<string, unknown>;
@@ -1523,13 +1523,13 @@ export function addFleetPostgresService(
     restart: 'unless-stopped',
     cpu_shares: 10,
     environment: {
-      POSTGRES_USER: 'smdb',
-      POSTGRES_DB: 'smdb',
+      POSTGRES_USER: db.user,
+      POSTGRES_DB: db.db,
       POSTGRES_PASSWORD: db.password,
     },
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {
-      test: ['CMD-SHELL', 'pg_isready -U smdb -d smdb'],
+      test: ['CMD-SHELL', `pg_isready -U ${db.user} -d ${db.db}`],
       interval: '10s',
       timeout: '5s',
       retries: 5,
@@ -1578,7 +1578,7 @@ export function addFleetPostgresService(
 export function addFleetPostgresReplicaService(
   composeContent: string,
   bot: BotConfig,
-  replica: { containerName: string; volume: string; hostPort: number },
+  replica: { containerName: string; volume: string; hostPort: number; user?: string; db?: string },
   opts: { mode?: DeploymentMode } = {}
 ): string {
   let compose: Record<string, unknown>;
@@ -1602,7 +1602,9 @@ export function addFleetPostgresReplicaService(
     ports: [`${replica.hostPort}:5432`],
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {
-      test: ['CMD-SHELL', 'pg_isready -U smdb -d smdb'],
+      // A record stamped before the identity fields checks acceptance only
+      // (pg_isready never authenticates, so no role name is guessed).
+      test: ['CMD-SHELL', replica.user && replica.db ? `pg_isready -U ${replica.user} -d ${replica.db}` : 'pg_isready'],
       interval: '10s',
       timeout: '5s',
       retries: 5,

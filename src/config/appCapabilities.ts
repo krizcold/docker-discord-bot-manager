@@ -57,7 +57,23 @@ export interface CompanionDbSpec {
      * fresh sidecar for a node that just stopped owning a database.
      */
     mode?: { key: string; value: string };
+    /**
+     * Local-standby hand-off DSNs the manager authors beside a provisioned
+     * standby: the container-name form and the canonical public form. The
+     * app's own promote flow consumes them; retired with the standby.
+     */
+    replicaUrl?: string;
+    replicaPublicUrl?: string;
   };
+  /**
+   * Path (relative to the app's data dir) of the app's OWN env file. The
+   * manager reads it ONLY to recover this app's companion credentials in flows
+   * where the app is stopped and no hook can answer (ruling F1 2026-09-01); a
+   * present-but-unparseable value refuses loudly rather than guessing. The DSN
+   * query spelling the manager authors (sslmode=no-verify, the node-postgres
+   * form) is a manager constant, not a per-app field (ruling F2 2026-09-01).
+   */
+  appEnvFile?: string;
   /**
    * Keys the manager REWRITES only where they are already set, and retires with
    * the block above. It never authors one: an absent key means this app is not
@@ -173,6 +189,8 @@ const smdbDbEnv = {
   url: 'DATA_BACKEND_URL',
   publicUrl: 'DATA_BACKEND_PUBLIC_URL',
   mode: { key: 'DATA_BACKEND', value: 'postgres' },
+  replicaUrl: 'FLEET_DB_REPLICA_URL',
+  replicaPublicUrl: 'FLEET_DB_REPLICA_PUBLIC_URL',
 };
 const smdbRoleEnv = {
   key: 'BOT_NODE_ROLE',
@@ -281,6 +299,7 @@ const superModularDiscordBot: AppCapabilityManifest = {
     user: 'smdb',
     database: 'smdb',
     env: smdbDbEnv,
+    appEnvFile: '.env',
     // Repointed on promotion and on rescue, only where the fleet already runs a
     // separate control store; never created.
     repointedEnv: ['CONTROL_STORE_URL'],

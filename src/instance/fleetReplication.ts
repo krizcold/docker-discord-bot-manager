@@ -8,10 +8,10 @@
  * PGDATA via docker exec, so it survives container recreation and needs no
  * compose changes beyond the published port (synced on every start).
  *
- * The stored DATA_BACKEND_URL keeps the container-name form: the host-reachable
+ * The stored database URL keeps the container-name form: the host-reachable
  * canonical form cannot hairpin from containers sharing a docker network with
  * the sidecar (F1), and that includes this instance's own bot. The canonical
- * form rides DATA_BACKEND_PUBLIC_URL instead; the master delivers both and
+ * form rides the record's public-URL key instead; the master delivers both and
  * each worker picks the one it can resolve. sslmode=no-verify is the
  * node-postgres spelling for "encrypt, pinned trust comes later"
  * (pg-connection-string treats bare `require` as verify-against-CAs, which a
@@ -25,6 +25,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
+import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 
@@ -87,7 +88,9 @@ function isIpAddress(host: string): boolean {
 
 /** The database password, recovered from the stored URL like the managed-lane redeploy does. */
 function storedDbPassword(instance: InstanceConfig): string | null {
-  const url = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  if (!urlKey) return null;
+  const url = (envManager.getEnvVars(instance.id)[urlKey] || '').trim();
   try {
     return decodeURIComponent(new URL(url).password) || null;
   } catch {
@@ -161,6 +164,14 @@ export async function enableFleetReplication(
 ): Promise<{ success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
+  // Record check FIRST: everything past the preflight mutates the live
+  // cluster (role, slot, ssl, pg_hba), so a missing key name must refuse
+  // before any of it or a failed enable leaks a WAL-retaining slot with no
+  // record for disable to act on.
+  const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
+  if (!dbEnv?.publicUrl) {
+    return { success: false, error: 'This app declares no public database URL key, so replication cannot publish the canonical form' };
+  }
   const host = publicHost.trim();
   if (!host || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(host)) {
     return { success: false, error: 'Public host must be a bare hostname or IPv4 address' };
@@ -241,8 +252,8 @@ export async function enableFleetReplication(
   // Both stores, deliberately: the env store is what the editor reads, but the
   // deployed compose env is built from the instance record, so a key missing
   // there never reaches the container.
-  envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: localUrl, DATA_BACKEND_PUBLIC_URL: publicUrl });
-  await containerManager.updateBot(instance.id, { envVars: { DATA_BACKEND_PUBLIC_URL: publicUrl } });
+  envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
+  await containerManager.updateBot(instance.id, { envVars: { [dbEnv.publicUrl]: publicUrl } });
   containerManager.updateInstanceFleetDbReplication(instance.id, replication, localUrl);
   return { success: true, restartRequired: true, certRotated };
 }
@@ -283,11 +294,15 @@ export async function disableFleetReplication(
 
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
+  const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
+  if (!dbEnv) return { success: false, error: 'This app declares no managed database companion' };
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
-  envManager.setEnvVars(instance.id, { DATA_BACKEND_URL: revertUrl });
-  envManager.deleteEnvVar(instance.id, 'DATA_BACKEND_PUBLIC_URL');
-  containerManager.removeBotEnvVars(instance.id, ['DATA_BACKEND_PUBLIC_URL']);
-  containerManager.removeEnvKeyFromDeployedCompose(instance.id, 'DATA_BACKEND_PUBLIC_URL');
+  envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
+  if (dbEnv.publicUrl) {
+    envManager.deleteEnvVar(instance.id, dbEnv.publicUrl);
+    containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
+    containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
+  }
   containerManager.updateInstanceFleetDbReplication(instance.id, null, revertUrl);
   return { success: true, restartRequired: true };
 }

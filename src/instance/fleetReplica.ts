@@ -20,7 +20,7 @@ import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
-import { findAppCapabilities } from '../config/appCapabilities';
+import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal } from './appLifecycle';
 import { InstanceConfig, FleetDbReplicaRecord } from '../types';
 
@@ -104,9 +104,10 @@ function parsePrimaryDsn(dsn: string): { ok: true; parsed: ParsedDsn } | { ok: f
     password: decodeURIComponent(url.password),
     host: url.hostname,
     port: Number(url.port) || 5432,
-    db: (url.pathname || '/smdb').replace(/^\//, '') || 'smdb',
+    db: (url.pathname || '').replace(/^\//, ''),
   };
   if (!parsed.user || !parsed.password) return { ok: false, error: 'DSN must carry the replication user and password' };
+  if (!parsed.db) return { ok: false, error: 'DSN must name the database' };
   for (const [name, value] of [['user', parsed.user], ['password', parsed.password], ['host', parsed.host], ['database', parsed.db]] as const) {
     if (!/^[A-Za-z0-9._~-]+$/.test(value)) return { ok: false, error: `DSN ${name} contains unsupported characters` };
   }
@@ -149,7 +150,15 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
     primaryHost: rec.primaryHost,
     primaryPort: rec.primaryPort,
   };
-  const probe = await replicaExec(rec.containerName, ['psql', '-U', 'smdb', '-d', 'smdb', '-Atc',
+  // Identity from the STAMP, like every sibling; a record stamped before the
+  // identity fields cannot be probed and says so instead of guessing a role.
+  // status.live stays ABSENT (unknown), never a fabricated running:false -
+  // consumers would read that as "container down", which is a different claim.
+  if (!rec.user || !rec.db) {
+    status.lastError = status.lastError || 'standby record predates identity stamping; retire and re-provision the standby';
+    return status;
+  }
+  const probe = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc',
     `SELECT pg_is_in_recovery(),
             (SELECT status FROM pg_stat_wal_receiver LIMIT 1),
             (pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()),
@@ -199,6 +208,10 @@ function validateIntake(
 }
 
 function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): FleetDbReplicaRecord {
+  // Identity stamped from the capability record at provisioning time (the
+  // standby is a byte copy of that app's database); the DSN's own user is the
+  // replication login, not the app identity.
+  const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   return {
     containerName: `${instance.sanitizedName}-fleet-postgres-replica`,
     volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
@@ -208,6 +221,7 @@ function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): Fl
     publicHost: intake.host,
     hostPort: intake.port,
     certHost: intake.host,
+    ...(spec ? { user: spec.user, db: spec.database } : {}),
   };
 }
 
@@ -250,6 +264,12 @@ export function provisionFleetReplica(
   if (provisioning.has(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  // Null record routes through refusal, never a silent degrade: the standby
+  // record's identity is stamped from the capability record, so without one
+  // the minted record could never be probed or adopted.
+  if (!findAppCapabilities(instance.sourceUrl)?.companionDb) {
+    return { success: false, error: 'This app declares no managed database companion' };
+  }
   // A standby lives beside a fleet WORKER (R7): an instance with its own
   // managed database is the primary side, and a non-fleet bot has no use for
   // a fleet replica.
@@ -392,12 +412,12 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
 /**
  * Stop pinning the fleet database on a node that no longer hosts it. A worker
  * is not told its database by the manager at all: the master delivers it on
- * register and the bot persists it in data/.env. Leaving the old values in the
- * manager env would pin them into the container, where they outrank data/.env,
- * so the master's delivery could never take effect and this node could never
- * pair-promote later (its own promote refuses on exactly that pin). DATA_BACKEND
- * goes too, otherwise the next rebuild reads it with no URL beside it and mints
- * a fresh sidecar for a node that just stopped having one.
+ * register and the bot persists it in its own env file. Leaving the old values
+ * in the manager env would pin them into the container, where they outrank the
+ * app's own store, so the master's delivery could never take effect and this
+ * node could never pair-promote later (its own promote refuses on exactly that
+ * pin). The mode key goes too, otherwise the next rebuild reads it with no URL
+ * beside it and mints a fresh sidecar for a node that just stopped having one.
  */
 function retireFleetDbEnvPins(botId: string): void {
   for (const key of companionEnvKeys(botId)) {
@@ -409,14 +429,15 @@ function retireFleetDbEnvPins(botId: string): void {
 
 /**
  * Every key the manager must stop pinning for this app's companion database.
- * Driven by the app's capability record where it declares one; the literal list
- * is the fallback for an app that declares none, so behaviour is unchanged there.
+ * Driven entirely by the app's capability record: an app that declares none
+ * has no keys the manager could have pinned, so nothing is deleted from its
+ * stores (the manager never invents another app's spelling).
  * appOwnedEnv is included deliberately: the manager never authors those, so a
  * value in ITS stores is an anomaly that would outrank the app's own store.
  */
 function companionEnvKeys(botId: string): string[] {
   const db = findAppCapabilities(containerManager.getBot(botId)?.sourceUrl)?.companionDb;
-  if (!db) return ['DATA_BACKEND', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'CONTROL_STORE_URL'];
+  if (!db) return [];
   const keys = [db.env.url, db.env.publicUrl, db.env.mode?.key, ...(db.repointedEnv ?? []), ...(db.appOwnedEnv ?? [])];
   return Array.from(new Set(keys.filter((k): k is string => !!k)));
 }
@@ -449,6 +470,11 @@ export function reseedStalePrimary(
   if (provisioning.has(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  // Same null-record refusal as provisionFleetReplica: the re-seeded standby's
+  // record is stamped from the capability record.
+  if (!findAppCapabilities(instance.sourceUrl)?.companionDb) {
+    return { success: false, error: 'This app declares no managed database companion' };
+  }
   if (instance.status === 'running') {
     return { success: false, error: 'Stop the instance first: re-seeding deletes the database it is currently running on' };
   }
@@ -602,18 +628,23 @@ export async function decommissionFleetDb(
 /**
  * The fleet database password, for an instance whose manager env store has
  * none. A worker is never told the URL by the manager: the master delivers it
- * on register and the bot persists it in its own data/.env, so that file is
- * the only place this machine's copy of the fleet credentials exists.
+ * on register and the bot persists it in its OWN env file (declared as
+ * companionDb.appEnvFile, ruling F1: the file read serves exactly the flows
+ * where the app is stopped and no hook can answer), so that file is the only
+ * place this machine's copy of the fleet credentials exists. An unparseable
+ * value refuses (returns null) rather than guessing.
  */
-function fleetPasswordFromBotEnv(botId: string): string | null {
+function fleetPasswordFromBotEnv(botId: string, db: CompanionDbSpec): string | null {
+  if (!db.appEnvFile) return null;
   let raw: string;
   try {
-    raw = fs.readFileSync(path.join(getDataPath(botId), '.env'), 'utf-8');
+    raw = fs.readFileSync(path.join(getDataPath(botId), db.appEnvFile), 'utf-8');
   } catch {
     return null;
   }
+  const keyLine = new RegExp(`^\\s*${db.env.url}\\s*=\\s*(.*)$`);
   for (const line of raw.split('\n')) {
-    const match = /^\s*DATA_BACKEND_URL\s*=\s*(.*)$/.exec(line);
+    const match = keyLine.exec(line);
     if (!match) continue;
     const value = match[1].trim().replace(/^["']|["']$/g, '');
     try {
@@ -650,6 +681,11 @@ export async function adoptPromotedReplica(
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
 
+  // The pre-field gate first, with the real remedy: the status probe cannot
+  // even run for such a record, and "start the instance" would be a lie.
+  if (!rec.user || !rec.db) {
+    return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby before adopting' };
+  }
   const status = await getFleetReplicaStatus(instance);
   if (!status.live?.running) {
     return { success: false, error: 'The standby container is not running, so it cannot be adopted; start the instance first' };
@@ -660,18 +696,21 @@ export async function adoptPromotedReplica(
     return { success: false, error: 'This copy is still following a primary, so it is not this machine\'s database yet. Promote this node first (its own web UI), then adopt' };
   }
 
+  const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
+  if (!db) return { success: false, error: 'This app declares no managed database companion' };
+
   // A worker's manager env store carries no database URL, so the managed-lane
   // checks (and the password enableFleetReplication needs) have nothing to read
   // until this instance is filed like any other database host.
   const password = (() => {
-    const current = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+    const current = (envManager.getEnvVars(instance.id)[db.env.url] || '').trim();
     if (current !== '') {
       try { return decodeURIComponent(new URL(current).password) || null; } catch { return null; }
     }
-    return fleetPasswordFromBotEnv(instance.id);
+    return fleetPasswordFromBotEnv(instance.id, db);
   })();
   if (!password) {
-    return { success: false, error: 'Could not recover the fleet database credentials from this instance (neither the manager env nor the bot data/.env carries a usable DATA_BACKEND_URL), so the database cannot be adopted' };
+    return { success: false, error: 'Could not recover the fleet database credentials from this instance (neither the manager env nor the app\'s own env file carries a usable database URL), so the database cannot be adopted' };
   }
 
   const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id);
@@ -683,9 +722,12 @@ export async function adoptPromotedReplica(
   // MANAGED, so a rebuild landing between here and the enable below still keeps
   // the database in the compose. The enable keeps it and adds the public form
   // beside it (F1: same-host consumers cannot dial the public form).
+  // Identity from the STAMP (rec.user/rec.db): adoption files an EXISTING
+  // byte-copied cluster, whose role and database are whatever provisioning
+  // stamped, not whatever the mutable per-source record says today.
   envManager.setEnvVars(instance.id, {
-    DATA_BACKEND: 'postgres',
-    DATA_BACKEND_URL: `postgresql://smdb:${encodeURIComponent(password)}@${rec.containerName}:5432/smdb?sslmode=no-verify`,
+    ...(db.env.mode ? { [db.env.mode.key]: db.env.mode.value } : {}),
+    [db.env.url]: `postgresql://${rec.user}:${encodeURIComponent(password)}@${rec.containerName}:5432/${rec.db}?sslmode=no-verify`,
   });
 
   const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort);
@@ -695,15 +737,19 @@ export async function adoptPromotedReplica(
     // the record back would hide a live primary behind a standby surface again.
     return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
   }
-  // enableFleetReplication repoints DATA_BACKEND_URL; the control store URL
-  // only exists when the topology splits them, and then it moves too. Both
-  // stores: the deployed compose env is built from the instance record, so
-  // an env-store-only move would bake the stale pin back in on next start.
+  // enableFleetReplication repoints the database URL; a repointed key (e.g. a
+  // split control store's URL) only exists when set, and then it moves too.
+  // Both stores: the deployed compose env is built from the instance record,
+  // so an env-store-only move would bake the stale pin back in on next start.
   const stored = envManager.getEnvVars(instance.id);
-  if ((stored['CONTROL_STORE_URL'] || '').trim() !== '') {
-    const controlUrl = (stored['DATA_BACKEND_URL'] || '').trim();
-    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: controlUrl });
-    await containerManager.updateBot(instance.id, { envVars: { CONTROL_STORE_URL: controlUrl } });
+  const repointUrl = (stored[db.env.url] || '').trim();
+  const repoints: Record<string, string> = {};
+  for (const key of db.repointedEnv ?? []) {
+    if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
+  }
+  if (Object.keys(repoints).length) {
+    envManager.setEnvVars(instance.id, repoints);
+    await containerManager.updateBot(instance.id, { envVars: repoints });
   }
   return { success: true, restartRequired: true };
 }

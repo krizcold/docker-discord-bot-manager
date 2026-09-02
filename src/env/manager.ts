@@ -11,6 +11,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { parseDocument } from 'yaml';
 import { getEnvPath, getDataDir } from '../git/repoManager';
+import { APP_CAPABILITIES } from '../config/appCapabilities';
 
 /**
  * Resolve the AES key used to encrypt sensitive env/config values. It MUST be
@@ -76,8 +77,16 @@ function loadOrCreateKdfSalt(): string {
 // every container start/status pass.
 const DERIVED_KEY = crypto.scryptSync(ENCRYPTION_KEY, loadOrCreateKdfSalt(), 32);
 
-// Sensitive env vars that should be encrypted
-const SENSITIVE_VARS = ['DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN', 'DATA_BACKEND_URL', 'DATA_BACKEND_PUBLIC_URL', 'DATA_BACKEND_LOCAL_URL', 'CONTROL_STORE_URL'];
+// Sensitive env vars that should be encrypted: the generic secret shapes, plus
+// every companion-database key each app capability record declares (the DSNs
+// and the repointed/app-owned keys carry the same credentials). Record-derived
+// so a new app's keys are covered without editing this list.
+const SENSITIVE_VARS = [
+  'DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN',
+  ...APP_CAPABILITIES.flatMap(r => r.companionDb
+    ? [r.companionDb.env.url, r.companionDb.env.publicUrl, ...(r.companionDb.repointedEnv ?? []), ...(r.companionDb.appOwnedEnv ?? [])]
+    : []),
+].filter((k): k is string => !!k).map(k => k.toUpperCase());
 
 interface EnvStorage {
   vars: Record<string, string>;

@@ -121,7 +121,13 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     return { ...base, severity: 'ok', message: `Provisioning (${status.provisioning.phase})`, lagSeconds: null };
   }
   const live = status.live;
-  if (!live || !live.running) {
+  // live ABSENT means the status could not even be probed (e.g. a record
+  // stamped before the identity fields), which is a different claim than a
+  // stopped container; say the real reason.
+  if (!live) {
+    return { ...base, severity: 'error', message: status.lastError || 'Standby state could not be read', lagSeconds: null };
+  }
+  if (!live.running) {
     return { ...base, severity: 'error', message: 'Standby container is not running, so it is no longer receiving changes', lagSeconds: null };
   }
   if (live.inRecovery === false) {

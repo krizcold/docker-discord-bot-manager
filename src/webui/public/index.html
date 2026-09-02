@@ -2922,7 +2922,7 @@
         return;
       }
       const r = res.replica || { present: false };
-      const errHtml = r.lastError ? `<div class="error-message">Last attempt failed: ${escapeHtml(r.lastError)}</div>` : '';
+      const errHtml = r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
 
       if (r.provisioning) {
         body.innerHTML = `
@@ -2952,9 +2952,13 @@
       const lagText = live.caughtUp === true ? ', caught up'
         : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
       // Every branch above the last means this copy has stopped protecting the
-      // fleet, which must not read as an ordinary status line.
+      // fleet, which must not read as an ordinary status line. An absent live
+      // block means the state could not be read at all (the reason rides
+      // lastError above), which must not claim the container is down.
       const laggingBehind = live.caughtUp !== true && live.replayLagSeconds != null && live.replayLagSeconds > 60;
-      const stateHtml = !live.running
+      const stateHtml = !r.live
+        ? ''
+        : !live.running
         ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
         : live.inRecovery === false
           ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>

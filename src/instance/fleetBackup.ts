@@ -3,8 +3,8 @@
  *
  * Runs on a 1-minute tick. Daily pg_dump of manager-provisioned fleet Postgres
  * sidecars ONLY: an instance is in scope when it carries a fleetDb record AND
- * its stored DATA_BACKEND_URL still points at that sidecar container. External
- * databases are never dumped.
+ * its stored database URL (under the capability record's key) still points at
+ * that sidecar container. External databases are never dumped.
  *
  * Dumps stream to <DATA_DIR>/backups/<botId>/fleet-postgres/<ISO>.dump with a
  * keep-newest retention trim (pre-*.dump safety files are exempt). Restore
@@ -23,6 +23,7 @@ import * as path from 'path';
 import { spawn, execFile } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
+import { findAppCapabilities } from '../config/appCapabilities';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -75,12 +76,14 @@ export function effectiveFleetBackup(instance: InstanceConfig): FleetBackupConfi
 
 /**
  * Scope guard: dump only what the manager provisioned. True when the instance
- * has a fleetDb record AND the stored DATA_BACKEND_URL's hostname still equals
- * the sidecar container name.
+ * has a fleetDb record AND the stored database URL's hostname (under the
+ * record-declared key) still equals the sidecar container name.
  */
 export function isFleetBackupScoped(instance: InstanceConfig): boolean {
   if (!instance.fleetDb) return false;
-  const url = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  if (!urlKey) return false;
+  const url = (envManager.getEnvVars(instance.id)[urlKey] || '').trim();
   if (!url) return false;
   try {
     const host = new URL(url).hostname;
@@ -374,7 +377,8 @@ export async function restoreFleetBackup(
   const dumpPath = path.join(backupDir(botId), file);
   if (!fs.existsSync(dumpPath)) return { success: false, error: 'Dump file not found', steps };
 
-  const url = (envManager.getEnvVars(botId)['DATA_BACKEND_URL'] || '').trim();
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  const url = urlKey ? (envManager.getEnvVars(botId)[urlKey] || '').trim() : '';
   if (!url) return { success: false, error: 'Instance has no stored database URL', steps };
 
   if (busy.has(botId)) return { success: false, error: 'A backup operation is already in progress', steps };
@@ -414,11 +418,13 @@ export async function restoreFleetBackup(
 
     // 2. Courtesy stop of every running managed instance this manager can see
     // on this exact URL. It cannot see them all (a worker's DSN lives in the
-    // bot's own data/.env, and other machines' instances are out of reach
-    // entirely), which is why the fence below is the actual protection.
-    const sharing = containerManager.getAllBots().filter(b =>
-      (envManager.getEnvVars(b.id)['DATA_BACKEND_URL'] || '').trim() === url
-    );
+    // bot's own env file, and other machines' instances are out of reach
+    // entirely), which is why the fence below is the actual protection. The
+    // key is resolved PER CANDIDATE: another app spells its DSN differently.
+    const sharing = containerManager.getAllBots().filter(b => {
+      const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
+      return !!key && (envManager.getEnvVars(b.id)[key] || '').trim() === url;
+    });
     for (const b of sharing) {
       if (b.status !== 'running') continue;
       const stop = await asResult(containerManager.stopBot(b.id));

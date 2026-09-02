@@ -30,6 +30,7 @@
 import { execFile } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
+import { findAppCapabilities } from '../config/appCapabilities';
 import * as appLifecycle from './appLifecycle';
 import { runFleetDump } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
@@ -546,10 +547,12 @@ async function phaseTeardown(instance: InstanceConfig): Promise<void> {
 async function phaseFlip(instance: InstanceConfig): Promise<void> {
   const fleetDb = instance.fleetDb!;
   const rescue = instance.recoveryRescue!;
-  const storedUrl = (envManager.getEnvVars(instance.id)['DATA_BACKEND_URL'] || '').trim();
+  const dbSpec = findAppCapabilities(instance.sourceUrl)?.companionDb;
+  if (!dbSpec) throw new Error('this app declares no managed database companion');
+  const storedUrl = (envManager.getEnvVars(instance.id)[dbSpec.env.url] || '').trim();
   let password = '';
   try { password = decodeURIComponent(new URL(storedUrl).password); } catch { /* refused below */ }
-  if (!password) throw new Error('could not recover the database password from the stored DATA_BACKEND_URL');
+  if (!password) throw new Error('could not recover the database password from the stored database URL');
   // The leading RESET lifts a quiesce write fence the copy may have inherited
   // (a re-rescue rsyncs a fenced source's auto.conf in): ALTER ROLE is a real
   // catalog write and read-only refuses it, which would wedge the flip.
@@ -573,13 +576,17 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   const enabled = await enableFleetReplication(fresh, host, fresh.fleetDb?.replication?.hostPort, undefined, { rotateCert: true });
   if (!enabled.success) throw new Error(`the copy is primary but enabling replication failed: ${enabled.error}`);
   const stored = envManager.getEnvVars(instance.id);
-  if ((stored['CONTROL_STORE_URL'] || '').trim() !== '') {
+  const repointUrl = (stored[dbSpec.env.url] || '').trim();
+  const repoints: Record<string, string> = {};
+  for (const key of dbSpec.repointedEnv ?? []) {
+    if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
+  }
+  if (Object.keys(repoints).length) {
     // Both stores, like retireFleetDbEnvPins removes from both: the deployed
     // compose env is built from the instance record, so an env-store-only
     // mirror would start the fleet on the stale pinned value.
-    const controlUrl = (stored['DATA_BACKEND_URL'] || '').trim();
-    envManager.setEnvVars(instance.id, { CONTROL_STORE_URL: controlUrl });
-    await containerManager.updateBot(instance.id, { envVars: { CONTROL_STORE_URL: controlUrl } });
+    envManager.setEnvVars(instance.id, repoints);
+    await containerManager.updateBot(instance.id, { envVars: repoints });
   }
 
   // The record clears BEFORE the start (the start-guard keys on it); from

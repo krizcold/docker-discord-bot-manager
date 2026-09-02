@@ -241,24 +241,6 @@ function composeReferencesCredentials(repoPath: string | null): boolean {
   return false;
 }
 
-/**
- * Whether the bot's source compose declares the `fleet.control-port` label, the
- * general marker a fleet-capable bot uses to opt into fleet plumbing. Any bot
- * declaring it gets the guided Fleet env section; no bot is named in code.
- */
-export function composeDeclaresFleet(repoPath: string | null): boolean {
-  if (!repoPath) return false;
-  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
-    try {
-      const p = path.join(repoPath, name);
-      if (fs.existsSync(p) && /fleet\.control-port/.test(fs.readFileSync(p, 'utf-8'))) return true;
-    } catch {
-      // ignore unreadable compose
-    }
-  }
-  return false;
-}
-
 export interface EditorEnvVar extends EnvFieldMeta {
   key: string;
   displayLabel: string;

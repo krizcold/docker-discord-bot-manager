@@ -46,7 +46,7 @@ export interface SourceRegistry {
 // ─── Instance (Bot) ───
 
 // Manager-provisioned fleet Postgres sidecar. Once created it is never dropped:
-// flipping DATA_BACKEND back to file keeps the record and the volume (data retention).
+// flipping the backend mode away keeps the record and the volume (data retention).
 export interface FleetDbRecord {
   containerName: string;
   user: string;
@@ -77,6 +77,11 @@ export interface FleetDbReplication {
 export interface FleetDbReplicaRecord {
   containerName: string;
   volume: string;
+  /** App database identity, stamped from the capability record at provisioning.
+   * Absent on records stamped before 2026-09-01: readers author/probe nothing
+   * for those; retire + re-provision the standby. */
+  user?: string;
+  db?: string;
   slot: string;                        // slot name on the PRIMARY this standby consumes
   primaryHost: string;                 // primary endpoint (for display/diagnostics)
   primaryPort: number;

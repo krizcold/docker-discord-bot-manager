@@ -42,13 +42,18 @@ export interface EnvFieldMeta {
   semantic?: 'peer-role' | 'peer-list' | 'peer-secret' | 'db-dsn';
   /** For 'peer-role': the option values meaning "this node dials a peer". */
   semanticValues?: string[];
+  /**
+   * For 'peer-role': the record's dialTargetOrder - the order a joining node
+   * lists dialable peers, position 0 being the primary target.
+   */
+  semanticTargetOrder?: string[];
 }
 
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues };
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder };
 }
 
 // Keys the manager authors on this app's service at deploy time, per the app's
@@ -199,7 +204,7 @@ export function buildWizardEnvList(
   const controlPlane = record?.controlPlane;
   if (controlPlane) {
     const semanticOf = (key: string): EnvFieldMeta => {
-      if (key === controlPlane.roleEnv.key) return { semantic: 'peer-role', semanticValues: controlPlane.roleEnv.dialsOut };
+      if (key === controlPlane.roleEnv.key) return { semantic: 'peer-role', semanticValues: controlPlane.roleEnv.dialsOut, semanticTargetOrder: controlPlane.roleEnv.dialTargetOrder };
       if (key === controlPlane.dialEnv) return { semantic: 'peer-list' };
       if (controlPlane.groupSecretEnv && key === controlPlane.groupSecretEnv) return { semantic: 'peer-secret' };
       if (record?.companionDb && key === record.companionDb.env.url) return { semantic: 'db-dsn' };

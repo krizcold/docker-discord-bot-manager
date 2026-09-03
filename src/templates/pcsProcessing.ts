@@ -1318,12 +1318,6 @@ export function getFleetTransferService(composeContent: string): { service: stri
   return compose ? fleetMarkOfCompose(compose, FLEET_TRANSFER_PORT_LABEL) : null;
 }
 
-/** Absent/empty BOT_NODE_ROLE means master, matching the bot's own role resolution. */
-export function isFleetMaster(envVars?: Record<string, string>): boolean {
-  const role = (envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-  return role === '' || role === 'master';
-}
-
 /**
  * Public hostname of this instance's fleet control endpoint, or null when no
  * public base exists for the mode (e.g. standalone/Windows). Mirrors the web UI

@@ -1853,7 +1853,8 @@
         (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${equalsAttr(meta.showWhen.equals)}"` : '') +
         (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '') +
         (meta.semantic ? ` data-semantic="${escapeHtml(meta.semantic)}"` : '') +
-        (Array.isArray(meta.semanticValues) && meta.semanticValues.length ? ` data-semantic-values="${escapeHtml(meta.semanticValues.join(','))}"` : '');
+        (Array.isArray(meta.semanticValues) && meta.semanticValues.length ? ` data-semantic-values="${escapeHtml(meta.semanticValues.join(','))}"` : '') +
+        (Array.isArray(meta.semanticTargetOrder) && meta.semanticTargetOrder.length ? ` data-semantic-target-order="${escapeHtml(meta.semanticTargetOrder.join(','))}"` : '');
       return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row${meta.list ? ' env-row-list' : ''}">
@@ -2011,6 +2012,10 @@
     function semanticValuesOf(container, semantic) {
       const w = semanticWrapper(container, semantic);
       return (w && w.dataset.semanticValues) ? w.dataset.semanticValues.split(',') : [];
+    }
+    function semanticTargetOrderOf(container, semantic) {
+      const w = semanticWrapper(container, semantic);
+      return (w && w.dataset.semanticTargetOrder) ? w.dataset.semanticTargetOrder.split(',') : [];
     }
     // "This node dials a peer": the role row's value is one of the dial-out
     // values the record stamped onto the row itself.
@@ -2220,20 +2225,22 @@
     }
 
     // Preview of the public URL this node advertises, below the role row.
-    // Shown for both promotable roles: workers dial the master here, and
-    // must carry a backup master's URL too so a failover needs no rewiring.
-    // Wizard-only (needs the name input); deliberately not an .env-row, so env
-    // collectors skip it.
-    const FLEET_URL_PREVIEW_TEXT = {
-      'master': {
+    // Shown for every dial-target role, by POSITION in the record-stamped
+    // dialTargetOrder: position 0 is the primary target workers connect to,
+    // every later position a target workers must also list so a failover
+    // needs no rewiring. No role value is spelled here (PLAN_REPLICATION
+    // 20.18 step 7). Wizard-only (needs the name input); deliberately not an
+    // .env-row, so env collectors skip it.
+    const FLEET_URL_PREVIEW_TEXT = [
+      {
         label: 'Workers will connect at',
-        title: 'This URL becomes live once the bot is installed and started as master.',
+        title: 'This URL becomes live once the bot is installed and started in this role.',
       },
-      'backup-master': {
+      {
         label: 'Workers must also list this URL',
-        title: "Add this URL to every co-worker's Master Candidates, after the master's, so they follow the failover when this node takes over.",
+        title: "Add this URL to every worker's candidate list, after the primary target's, so they follow the failover when this node takes over.",
       },
-    };
+    ];
 
     function attachFleetMasterUrlPreview(container, fleetUrlTemplate) {
       if (!fleetUrlTemplate) return;
@@ -2241,11 +2248,13 @@
       if (!nameInput) return;
       const roleWrapper = semanticWrapper(container, 'peer-role');
       if (!roleWrapper || container.querySelector('.fleet-url-preview')) return;
+      const targetOrder = semanticTargetOrderOf(container, 'peer-role');
+      if (!targetOrder.length) return;
 
       const el = document.createElement('div');
       el.className = 'fleet-url-preview';
       el.dataset.showKey = semanticEnvKey(container, 'peer-role');
-      el.dataset.showEquals = Object.keys(FLEET_URL_PREVIEW_TEXT).join(',');
+      el.dataset.showEquals = targetOrder.join(',');
       el.innerHTML = `
         <div class="fleet-url-label"></div>
         <div class="fleet-url-line">
@@ -2257,7 +2266,8 @@
       const urlOf = () => fleetUrlTemplate.replace('{name}', sanitizeNamePreview(nameInput.value.trim()));
       const update = () => {
         urlSpan.textContent = urlOf();
-        const text = FLEET_URL_PREVIEW_TEXT[semanticEnvValue(container, 'peer-role')];
+        const position = targetOrder.indexOf(semanticEnvValue(container, 'peer-role'));
+        const text = position < 0 ? null : FLEET_URL_PREVIEW_TEXT[Math.min(position, FLEET_URL_PREVIEW_TEXT.length - 1)];
         if (text) {
           labelEl.textContent = text.label;
           labelEl.title = text.title;

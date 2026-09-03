@@ -34,6 +34,7 @@ import { readEnvsFromComposeFile } from '../../docker/containerManager';
 import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir } from '../../git/repoManager';
 import { hasAppHooks } from '../../instance/appHookClient';
+import { findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
@@ -101,9 +102,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // has no replication role. Never probed inline - the list is polled.
           replicationHealth: getReplicationHealth(bot.id),
           // Fleet-worker marker: drives the Database button's replica surface.
-          // Explicit worker roles only - an absent role means master, and a
-          // plain bot has no use for a fleet standby (R7).
-          fleetWorker: ['co-worker', 'backup-master'].includes((bot.envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase()),
+          // A node that dials out per its app's own record; the default fold
+          // keeps an absent role out of the dial-out set (R7), and an app
+          // declaring no control plane has no worker semantics at all.
+          fleetWorker: (() => {
+            const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
+            return !!cp && cp.roleEnv.dialsOut.includes(foldedRoleValue(cp.roleEnv, bot.envVars?.[cp.roleEnv.key]));
+          })(),
           // Whether this app declares lifecycle hooks, so the UI knows if the
           // one-click surfaces can work at all before offering them.
           appHooks: hasAppHooks(bot),
@@ -172,24 +177,27 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * GET /api/bots/fleet/masters - Fleet masters running on this manager, with the
-   * connection info a co-worker install needs. Returns CONTROL_SECRET in plaintext
-   * like /api/recover-envs does: the whole API sits behind the manager's auth edge
-   * and the value exists to be filled into a co-worker's secret field.
-   * Each master carries two addresses: localUrl for a same-manager worker (dials
+   * GET /api/bots/fleet/masters - Fleet dial targets running on this manager,
+   * with the connection info a joining worker install needs. Returns the shared
+   * control secret in plaintext like /api/recover-envs does: the whole API sits
+   * behind the manager's auth edge and the value exists to be filled into a
+   * joining worker's secret field.
+   * Each entry carries two addresses: localUrl for a same-manager worker (dials
    * over the shared network, no public round-trip) and masterUrl for a genuinely
-   * cross-host worker (public wss). Either may be null when it cannot be derived.
-   * Also returns fleetUrlTemplate: a full URL template with a {name} placeholder
-   * for the sanitized instance name, so the install wizard can preview a new
-   * node's public URL without composing one itself; null when no public base
-   * exists.
+   * cross-host worker (public secure URL). Either may be null when it cannot be
+   * derived. Also returns fleetUrlTemplate: a full URL template with a {name}
+   * placeholder for the sanitized instance name, so the install wizard can
+   * preview a new node's public URL without composing one itself; null when no
+   * public base exists.
    */
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
       const dataRoot = process.env.DATA_ROOT || '/DATA';
       // Deployed compose, resolved like containerManager's resolveComposePath:
-      // CasaOS metadata path when present, else the bot-dir copy.
-      const fleetAddrsOf = (bot: { id: string; sanitizedName: string }) => {
+      // CasaOS metadata path when present, else the bot-dir copy. Schemes come
+      // from the bot's own record: the public route is TLS-terminated at the
+      // proxy, the same-box container-name dial never is.
+      const fleetAddrsOf = (bot: { id: string; sanitizedName: string }, urlScheme: { secure: string; plain: string }) => {
         const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
         const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
         if (!fs.existsSync(composePath)) return null;
@@ -197,11 +205,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         const controlPort = getFleetControlPort(composeContent);
         if (controlPort === null) return null;
 
-        // Public wss URL a genuinely cross-host worker uses. Same URL the
-        // injection path hands the node as FLEET_PUBLIC_URL; null when no
+        // Public URL a genuinely cross-host worker uses. Same URL the
+        // injection path authors under the record's publicUrl key; null when no
         // publicly-trusted base exists for the mode (e.g. standalone/Windows).
         const host = fleetPublicHost(bot.sanitizedName);
-        const publicUrl = host ? `wss://${host}` : null;
+        const publicUrl = host ? `${urlScheme.secure}://${host}` : null;
 
         // Local URL a same-host/same-manager worker should dial instead, so the
         // handshake stays on the box rather than looping out through the public
@@ -211,24 +219,28 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         // loopback-bound, so on bare Linux a container-name dial is the only
         // route that works.
         const cname = fleetAppContainerName(composeContent);
-        const localUrl = cname ? `ws://${cname}:${controlPort}` : null;
+        const localUrl = cname ? `${urlScheme.plain}://${cname}:${controlPort}` : null;
         return { publicUrl, localUrl };
       };
 
-      // Designated backup masters, keyed by the fleet they belong to: one
-      // CONTROL_SECRET per fleet, so a backup joins the master whose secret it
-      // shares. They come second in a candidate list (the master leads).
-      const backups: Array<{ id: string; localUrl: string | null; publicUrl: string | null; secret: string }> = [];
+      // Secondary dial targets per each bot's own record: every folded role
+      // value AFTER the first entry of dialTargetOrder. One shared secret per
+      // fleet pairs them with their primary; the manager reads only the
+      // POSITION, never what the values mean. Secondaries come second in a
+      // candidate list (the first dial target leads).
+      const secondaries: Array<{ id: string; localUrl: string | null; publicUrl: string | null; secret: string }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
+          const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
+          if (!cp || !cp.groupSecretEnv) continue;
           const env = envManager.getEnvVars(bot.id);
-          const role = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-          if (role !== 'backup-master') continue;
-          const secret = (env['CONTROL_SECRET'] || '').trim();
+          const folded = foldedRoleValue(cp.roleEnv, env[cp.roleEnv.key]);
+          if (cp.roleEnv.dialTargetOrder.indexOf(folded) <= 0) continue;
+          const secret = (env[cp.groupSecretEnv] || '').trim();
           if (secret === '') continue;
-          const addrs = fleetAddrsOf(bot);
+          const addrs = fleetAddrsOf(bot, cp.urlScheme);
           if (!addrs) continue;
-          backups.push({ id: bot.id, localUrl: addrs.localUrl, publicUrl: addrs.publicUrl, secret });
+          secondaries.push({ id: bot.id, localUrl: addrs.localUrl, publicUrl: addrs.publicUrl, secret });
         } catch {
           // an unreadable instance must not break the list
         }
@@ -240,19 +252,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
+          const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
+          if (!cp) continue;
           const env = envManager.getEnvVars(bot.id);
-          // An explicit role wins; a blank role reads as master, matching the
-          // bot. MASTER_URLS never implies a role - every node carries that
-          // list, the master included.
-          const nodeRole = (env['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-          if (nodeRole !== 'master' && nodeRole !== '') continue;
-          const addrs = fleetAddrsOf(bot);
+          // An explicit value wins; a blank one folds to the record's default
+          // (F4: absent means leader). The record's FIRST dial target leads
+          // the candidate list; the dial list key never implies a role - every
+          // node carries that list, the first target included.
+          const folded = foldedRoleValue(cp.roleEnv, env[cp.roleEnv.key]);
+          if (folded !== cp.roleEnv.dialTargetOrder[0]) continue;
+          const addrs = fleetAddrsOf(bot, cp.urlScheme);
           if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
 
-          const controlSecret = (env['CONTROL_SECRET'] || '').trim();
-          // Roles are disjoint, so a node cannot match both lists any more;
-          // the id filter stays as a cheap invariant guard.
-          const peers = controlSecret === '' ? [] : backups.filter(b => b.secret === controlSecret && b.id !== bot.id);
+          const controlSecret = cp.groupSecretEnv ? (env[cp.groupSecretEnv] || '').trim() : '';
+          // Positions in dialTargetOrder are disjoint, so a node cannot match
+          // both lists; the id filter stays as a cheap invariant guard.
+          const peers = controlSecret === '' ? [] : secondaries.filter(b => b.secret === controlSecret && b.id !== bot.id);
           const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
           const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
           const publicCandidates = dedupe([addrs.publicUrl, ...peers.map(p => p.publicUrl)]);

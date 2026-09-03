@@ -335,3 +335,9 @@ export function findAppCapabilities(sourceUrl: string | null | undefined): AppCa
   if (!sourceUrl) return null;
   return APP_CAPABILITIES.find(record => matchesSource(record.match, sourceUrl)) || null;
 }
+
+/** The folded role value: an absent or empty value reads as the record's default. */
+export function foldedRoleValue(roleEnv: ControlPlaneSpec['roleEnv'], raw: string | undefined): string {
+  const value = (raw || '').trim().toLowerCase();
+  return value === '' ? roleEnv.default : value;
+}

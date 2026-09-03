@@ -20,7 +20,7 @@ import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
-import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
+import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal } from './appLifecycle';
 import { InstanceConfig, FleetDbReplicaRecord } from '../types';
 
@@ -274,9 +274,13 @@ export function provisionFleetReplica(
   // managed database is the primary side, and a non-fleet bot has no use for
   // a fleet replica.
   if (instance.fleetDb) return { success: false, error: 'This instance hosts the fleet database itself - replication is managed from its Database modal' };
-  const role = (instance.envVars?.['BOT_NODE_ROLE'] || '').trim().toLowerCase();
-  if (role !== 'co-worker' && role !== 'backup-master') {
-    return { success: false, error: 'A replica belongs beside a fleet worker (set BOT_NODE_ROLE to co-worker or backup-master first)' };
+  const controlPlane = findAppCapabilities(instance.sourceUrl)?.controlPlane;
+  if (!controlPlane) {
+    return { success: false, error: 'This app declares no fleet control plane - a standby belongs beside a fleet worker' };
+  }
+  const folded = foldedRoleValue(controlPlane.roleEnv, instance.envVars?.[controlPlane.roleEnv.key]);
+  if (!controlPlane.roleEnv.dialsOut.includes(folded)) {
+    return { success: false, error: `A replica belongs beside a fleet worker (set ${controlPlane.roleEnv.key} to ${controlPlane.roleEnv.dialsOut.join(' or ')} first)` };
   }
   if (!containerManager.deployedComposeExists(instance.id)) {
     return { success: false, error: 'Install/build the instance first - the standby joins its compose project' };

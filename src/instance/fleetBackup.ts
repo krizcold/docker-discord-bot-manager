@@ -97,13 +97,30 @@ export function isFleetBackupScoped(instance: InstanceConfig): boolean {
 }
 
 /**
+ * The dump guard cannot verify scope when the store is unreadable or the URL
+ * key ITSELF no longer decrypts. An unrelated damaged ciphertext leaves the
+ * scope fully verifiable and must not stop the safety net.
+ */
+function backupScopeUnverifiable(instance: InstanceConfig): { corrupt: boolean; urlUndecryptable: boolean } {
+  const { corrupt, undecryptable } = envManager.getEnvVarsWithStatus(instance.id);
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  return { corrupt, urlUndecryptable: !!urlKey && undecryptable.includes(urlKey) };
+}
+
+/**
  * Stale when enabled + in scope and no successful dump within 36h. A never-
  * dumped instance is measured from its creation so a fresh install does not
  * warn before its first scheduled run.
  */
 export function isFleetBackupStale(instance: InstanceConfig): boolean {
   if (!effectiveFleetBackup(instance).enabled) return false;
-  if (!isFleetBackupScoped(instance)) return false;
+  if (!instance.fleetDb) return false;
+  // A broken store cannot verify scope, and the dumps HAVE stopped - which is
+  // exactly what this badge exists to surface; only a readable store that
+  // genuinely reads out of scope suppresses it. Restart-proof, unlike the
+  // tick's in-memory error entry.
+  const { corrupt, urlUndecryptable } = backupScopeUnverifiable(instance);
+  if (!corrupt && !urlUndecryptable && !isFleetBackupScoped(instance)) return false;
   const baseline = instance.lastFleetBackupAt || Date.parse(instance.createdAt) || 0;
   return Date.now() - baseline > STALE_AFTER_MS;
 }
@@ -379,6 +396,16 @@ async function runFleetBackupTick(): Promise<void> {
     if (!instance.fleetDb || busy.has(instance.id)) continue;
     const config = effectiveFleetBackup(instance);
     if (!config.enabled || currentHour !== config.hour) continue;
+    // A broken store would silently unscope the dump guard and stop the
+    // nightly safety net with no surfaced signal; record the stoppage loudly.
+    const scopeCheck = backupScopeUnverifiable(instance);
+    if (scopeCheck.corrupt || scopeCheck.urlUndecryptable) {
+      lastErrors.set(instance.id, scopeCheck.corrupt
+        ? 'the env store cannot be read (preserved as storage.json.corrupt), so the scheduled dump cannot verify its scope'
+        : 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope');
+      console.error(`[FleetBackup] Skipping the scheduled dump for ${instance.displayName} (${instance.id}): env store unreadable or the database URL undecryptable`);
+      continue;
+    }
     if (!isFleetBackupScoped(instance)) continue;
 
     const last = Math.max(lastAttempts.get(instance.id) || 0, instance.lastFleetBackupAt || 0);
@@ -419,8 +446,17 @@ export async function restoreFleetBackup(
   const dumpPath = path.join(backupDir(botId), file);
   if (!fs.existsSync(dumpPath)) return { success: false, error: 'Dump file not found', steps };
 
+  // Name the real problem when the store is broken: 'no stored database URL'
+  // would steer the operator toward re-provisioning instead of the repair.
+  const store = envManager.getEnvVarsWithStatus(botId);
+  if (store.corrupt) {
+    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before restoring a dump', steps };
+  }
   const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
-  const url = urlKey ? (envManager.getEnvVars(botId)[urlKey] || '').trim() : '';
+  if (urlKey && store.undecryptable.includes(urlKey)) {
+    return { success: false, error: 'The stored database URL no longer decrypts (the encryption key changed?); re-enter it or restore the key before restoring a dump', steps };
+  }
+  const url = urlKey ? (store.vars[urlKey] || '').trim() : '';
   if (!url) return { success: false, error: 'Instance has no stored database URL', steps };
 
   if (busy.has(botId)) return { success: false, error: 'A backup operation is already in progress', steps };

@@ -552,7 +552,7 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   const storedUrl = (envManager.getEnvVars(instance.id)[dbSpec.env.url] || '').trim();
   let password = '';
   try { password = decodeURIComponent(new URL(storedUrl).password); } catch { /* refused below */ }
-  if (!password) throw new Error('could not recover the database password from the stored database URL');
+  if (!password) throw new Error(envManager.storeBrokenDiagnosis(instance.id) || 'could not recover the database password from the stored database URL');
   // The leading RESET lifts a quiesce write fence the copy may have inherited
   // (a re-rescue rsyncs a fenced source's auto.conf in): ALTER ROLE is a real
   // catalog write and read-only refuses it, which would wedge the flip.
@@ -581,13 +581,9 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   for (const key of dbSpec.repointedEnv ?? []) {
     if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
   }
-  if (Object.keys(repoints).length) {
-    // Both stores, like retireFleetDbEnvPins removes from both: the deployed
-    // compose env is built from the instance record, so an env-store-only
-    // mirror would start the fleet on the stale pinned value.
-    envManager.setEnvVars(instance.id, repoints);
-    await containerManager.updateBot(instance.id, { envVars: repoints });
-  }
+  // The env store alone: container env assembly derives sensitive values from
+  // it at read time (the two-store strip).
+  if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
 
   // The record clears BEFORE the start (the start-guard keys on it); from
   // here the swap is complete and a failed start is an ordinary start problem.

@@ -192,7 +192,7 @@ export async function enableFleetReplication(
     return { success: false, error: 'Database container is not running (start the instance first)' };
   }
   const dbPassword = storedDbPassword(instance);
-  if (!dbPassword) return { success: false, error: 'Could not recover the database password from the stored URL' };
+  if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
 
   const previousCertHost = fleetDb.replication?.certHost;
   // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
@@ -249,12 +249,10 @@ export async function enableFleetReplication(
   // address pools allocates outside it; hostssl covers every subnet.
   const localUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   const publicUrl = canonicalFleetUrl(instance, replication, dbPassword);
-  // Both stores, deliberately: the env store is what the editor reads, but the
-  // deployed compose env is built from the instance record, so a key missing
-  // there never reaches the container.
+  // The env store alone: container env assembly derives sensitive values from
+  // it at read time (the two-store strip), so no record mirror exists to sync.
   envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
-  await containerManager.updateBot(instance.id, { envVars: { [dbEnv.publicUrl]: publicUrl } });
-  containerManager.updateInstanceFleetDbReplication(instance.id, replication, localUrl);
+  containerManager.updateInstanceFleetDbReplication(instance.id, replication);
   return { success: true, restartRequired: true, certRotated };
 }
 
@@ -272,7 +270,7 @@ export async function disableFleetReplication(
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
   const dbPassword = storedDbPassword(instance);
-  if (!dbPassword) return { success: false, error: 'Could not recover the database password from the stored URL' };
+  if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   if (!await isContainerRunning(fleetDb.containerName)) {
     return { success: false, error: 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)' };
   }
@@ -303,7 +301,7 @@ export async function disableFleetReplication(
     containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
     containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
   }
-  containerManager.updateInstanceFleetDbReplication(instance.id, null, revertUrl);
+  containerManager.updateInstanceFleetDbReplication(instance.id, null);
   return { success: true, restartRequired: true };
 }
 

@@ -485,6 +485,12 @@ export function reseedStalePrimary(
   if (!containerManager.deployedComposeExists(instance.id)) {
     return { success: false, error: 'Install/build the instance first - the standby joins its compose project' };
   }
+  // BEFORE anything destructive: a corrupt store would make the pins retire
+  // throw AFTER the stale database is destroyed, leaving the node pinned to a
+  // database that no longer exists and the lane not re-runnable.
+  if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
+    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before re-seeding' };
+  }
 
   const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
   if (!validated.ok) return { success: false, error: validated.error };
@@ -525,6 +531,12 @@ export function reseedStalePrimary(
       : { success: false, error: started.error };
     if (!dump.success) {
       console.warn(`[FleetReplica] Could not dump the stale primary before re-seeding ${instance.id}: ${dump.error}`);
+    }
+    // Re-check just before the destructive step: the dump above can take
+    // minutes, and a store that corrupted meanwhile would make the pins
+    // retire below throw AFTER the database was destroyed.
+    if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
+      throw new Error('the env store corrupted while the safety dump ran (preserved as storage.json.corrupt); nothing was destroyed - restore it and retry');
     }
     const retired = await containerManager.retireFleetDbSidecar(instance.id);
     if (!retired.success) throw new Error(`could not retire the stale database: ${retired.error}`);
@@ -704,6 +716,13 @@ export async function adoptPromotedReplica(
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!db) return { success: false, error: 'This app declares no managed database companion' };
 
+  // BEFORE the record flip: a corrupt store would make the env write below
+  // throw after the standby record is already consumed, leaving a half-done
+  // adopt no lane can finish. Refusing here keeps the adopt retryable.
+  if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
+    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before adopting' };
+  }
+
   // A worker's manager env store carries no database URL, so the managed-lane
   // checks (and the password enableFleetReplication needs) have nothing to read
   // until this instance is filed like any other database host.
@@ -744,17 +763,14 @@ export async function adoptPromotedReplica(
   }
   // enableFleetReplication repoints the database URL; a repointed key (e.g. a
   // split control store's URL) only exists when set, and then it moves too.
-  // Both stores: the deployed compose env is built from the instance record,
-  // so an env-store-only move would bake the stale pin back in on next start.
+  // The env store alone: container env assembly derives sensitive values from
+  // it at read time (the two-store strip).
   const stored = envManager.getEnvVars(instance.id);
   const repointUrl = (stored[db.env.url] || '').trim();
   const repoints: Record<string, string> = {};
   for (const key of db.repointedEnv ?? []) {
     if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
   }
-  if (Object.keys(repoints).length) {
-    envManager.setEnvVars(instance.id, repoints);
-    await containerManager.updateBot(instance.id, { envVars: repoints });
-  }
+  if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
   return { success: true, restartRequired: true };
 }

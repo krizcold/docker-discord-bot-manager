@@ -12,6 +12,7 @@ import { v4 as uuidv4 } from 'uuid';
 import simpleGit, { SimpleGit } from 'simple-git';
 import { SourceMeta, SourceRegistry, CreateSourceRequest, UpdateSourceRequest } from '../types';
 import { hasExistingCompose, extractAppName } from '../templates/compose';
+import { isSensitive } from '../env/manager';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
@@ -432,6 +433,15 @@ function reAssociateInstances(sourceId: string, sourceUrl: string): void {
     }
 
     if (changed) {
+      // Same persistence boundary as the registry save: sensitive env values
+      // never persist in the record (the two-store strip), and this direct
+      // write must not round-trip a legacy record's plaintext past the scrub.
+      for (const inst of Object.values(data.instances || {}) as any[]) {
+        if (!inst.envVars) continue;
+        for (const key of Object.keys(inst.envVars)) {
+          if (isSensitive(key)) delete inst.envVars[key];
+        }
+      }
       const tmp = `${instancesFile}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
       fs.renameSync(tmp, instancesFile);

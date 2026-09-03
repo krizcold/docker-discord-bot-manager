@@ -132,14 +132,38 @@ function loadRegistry(): InstanceRegistry {
   return { instances: {} };
 }
 
+/**
+ * The registry never persists sensitive env values: they live only in the
+ * encrypted env store, and container env assembly derives them from there at
+ * read time (the PLAN_REPLICATION two-store ruling). Enforced at the
+ * persistence boundary so every mutation path is covered and a record that
+ * still carries old plaintext self-scrubs on its next save.
+ */
+function withoutSensitiveKeys(envVars: Record<string, string> | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(envVars || {})) {
+    if (envManager.isSensitive(key)) continue;
+    // Same scalar coercion as the store's write side, so one dual write can
+    // never author two different values (a raw JSON null in the record would
+    // bake a literal "null" into the compose while the store reads '').
+    const given = raw as unknown;
+    out[key] = given === null || given === undefined ? '' : String(given);
+  }
+  return out;
+}
+
 function saveRegistrySync(registry: InstanceRegistry): void {
   try {
     fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
+    const instances: InstanceRegistry['instances'] = {};
+    for (const [id, inst] of Object.entries(registry.instances)) {
+      instances[id] = inst.envVars ? { ...inst, envVars: withoutSensitiveKeys(inst.envVars) } : inst;
+    }
     // Atomic write: a truncated/interrupted write (e.g. the container killed mid-save
     // during a rebuild) would otherwise corrupt the file, and the next load would
     // silently fall back to an empty registry and then persist it - losing every bot.
     const tmp = `${REGISTRY_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify({ ...registry, instances }, null, 2));
     fs.renameSync(tmp, REGISTRY_FILE);
   } catch (error) {
     console.error('[ContainerManager] Failed to save registry:', error);
@@ -275,6 +299,12 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     console.log(`[ContainerManager] Instance ${instanceId} detected: type=${detection.type}, hasCompose=${detection.hasCompose}`);
   }
 
+  // Create-time env goes through the store so sensitive values land encrypted;
+  // the record keeps only the non-sensitive keys.
+  if (request.envVars && Object.keys(request.envVars).length > 0) {
+    envManager.setEnvVars(instanceId, request.envVars);
+  }
+
   const instance: InstanceConfig = {
     id: instanceId,
     sourceId: request.sourceId,
@@ -286,7 +316,7 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
     status: 'stopped',
     containerIds: [],
     updateToken,
-    envVars: request.envVars || {},
+    envVars: withoutSensitiveKeys(request.envVars),
     botType: detection?.type,
     hasDatabase: detection?.hasDatabase,
     databases: detection?.databases,
@@ -325,6 +355,11 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
   fs.mkdirSync(botDir, { recursive: true });
   fs.mkdirSync(dataPath, { recursive: true });
 
+  // Same create-time routing as the git lane: store first, filtered record.
+  if (request.envVars && Object.keys(request.envVars).length > 0) {
+    envManager.setEnvVars(instanceId, request.envVars);
+  }
+
   const instance: InstanceConfig = {
     id: instanceId,
     sourceId: null,
@@ -337,7 +372,7 @@ export async function createDockerImageInstance(request: CreateDockerImageInstan
     status: 'stopped',
     containerIds: [],
     updateToken,
-    envVars: request.envVars || {},
+    envVars: withoutSensitiveKeys(request.envVars),
     lastBuiltCommit: null,
     createdAt: now,
     updatedAt: now,
@@ -392,15 +427,13 @@ export function updateInstanceFleetBackup(botId: string, enabled: boolean, hour?
 }
 
 /**
- * Persist (or clear) the sidecar's replication posture; optionally mirrors a
- * rewritten database URL (under the record-declared key) into the instance
- * record alongside it (the env store copy is the caller's job). Applies to the
- * compose on the next start.
+ * Persist (or clear) the sidecar's replication posture (the rewritten database
+ * URL lives only in the encrypted env store). Applies to the compose on the
+ * next start.
  */
 export function updateInstanceFleetDbReplication(
   botId: string,
   replication: FleetDbReplication | null,
-  envUrl?: string,
 ): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -411,8 +444,6 @@ export function updateInstanceFleetDbReplication(
     const { replication: _drop, ...rest } = instance.fleetDb;
     instance.fleetDb = rest;
   }
-  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
-  if (envUrl !== undefined && urlKey) instance.envVars = { ...instance.envVars, [urlKey]: envUrl };
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
@@ -677,7 +708,14 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     instance.sanitizedName = names.sanitizedName;
     instance.titleName = names.titleName;
   }
-  if (update.envVars) instance.envVars = { ...instance.envVars, ...update.envVars };
+  if (update.envVars) {
+    // The single env dual-write funnel, AFTER the rename validation so a
+    // refused update persists nothing anywhere: the store takes everything
+    // (sensitive values encrypted; throws on a corrupt store before any state
+    // changes), the record keeps only the non-sensitive keys.
+    envManager.setEnvVars(botId, update.envVars);
+    instance.envVars = withoutSensitiveKeys({ ...instance.envVars, ...update.envVars });
+  }
   instance.updatedAt = new Date().toISOString();
 
   registry.instances[botId] = instance;
@@ -1595,13 +1633,40 @@ export function readBotManagerMarker(appName: string): {
 }
 
 /**
+ * The instance's user-configured env: the record's non-sensitive keys plus the
+ * env store's SENSITIVE values (post the two-store strip the record never
+ * carries a sensitive value, so the store is the only source of secrets at
+ * injection time). Only the sensitive store keys merge: a non-sensitive key
+ * the store holds alone is a deliberate store-only value (the adopt lane's
+ * mode key, per the appCapabilities env.mode contract) that must NOT be baked
+ * into the compose. Throws when the store is unreadable or a stored
+ * ciphertext no longer decrypts: silently starting a bot without its secrets
+ * (and letting the compose sync strip keys a working deploy still carries)
+ * would be far worse than refusing with the cause named.
+ */
+export function mergedEnvVars(instance: InstanceConfig): Record<string, string> {
+  const { vars, undecryptable, corrupt } = envManager.getEnvVarsWithStatus(instance.id);
+  if (corrupt) {
+    throw new Error(`The env store for ${instance.displayName} exists but cannot be read (preserved as storage.json.corrupt). Restore storage.json from the preserved copy, or delete it to deliberately start with an empty store.`);
+  }
+  if (undecryptable.length > 0) {
+    throw new Error(`The encrypted env store for ${instance.displayName} holds values that no longer decrypt (${undecryptable.join(', ')}). The encryption key or salt changed; re-enter them in the env editor.`);
+  }
+  const sensitive: Record<string, string> = {};
+  for (const [key, value] of Object.entries(vars)) {
+    if (envManager.isSensitive(key)) sensitive[key] = value;
+  }
+  return { ...instance.envVars, ...sensitive };
+}
+
+/**
  * The bot's effective env: user-configured vars plus the manager-injected
  * wiring. Used both for per-service compose injection and the deployed .env file.
  */
 function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   return {
-    ...instance.envVars,
+    ...mergedEnvVars(instance),
     ...fleetEnv(instance),
     BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
     BOT_ID: instance.id,
@@ -1712,6 +1777,10 @@ function deleteComposeEnv(env: any, key: string): void {
 function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void {
   if (!fs.existsSync(composePath)) return;
 
+  // Outside the catch-all: an undecryptable store must refuse the start before
+  // this rewrites the compose, not degrade into a sync warning.
+  const merged = mergedEnvVars(instance);
+
   try {
     const raw = fs.readFileSync(composePath, 'utf-8');
     const doc = YAML.parseDocument(raw);
@@ -1778,8 +1847,8 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
     // substitution-only inputs from every service. Structural - keyed on the env that
     // exists, never on a bot/image name. Blank credentials leave the compose's shipped
     // login untouched: blanking USER/PASSWORD would disable the gateway's auth.
-    const webUser = instance.envVars?.['WEBUI_USER'] || '';
-    const webPass = instance.envVars?.['WEBUI_PASSWORD'] || '';
+    const webUser = merged['WEBUI_USER'] || '';
+    const webPass = merged['WEBUI_PASSWORD'] || '';
     for (const svc of Object.values(services) as any[]) {
       if (!svc || !svc.environment) continue;
       if (webUser) setComposeEnvIfPresent(svc.environment, 'USER', webUser);
@@ -2225,6 +2294,17 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 
+  // Preflight before anything destructive: the rebuild's env assembly refuses
+  // on a broken store, and by then this lane has already stopped the bot and
+  // deleted its image - turning a working deployment into an unstartable one.
+  const envStatus = envManager.getEnvVarsWithStatus(botId);
+  if (envStatus.corrupt) {
+    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before updating' };
+  }
+  if (envStatus.undecryptable.length > 0) {
+    return { success: false, error: `The env store holds values that no longer decrypt (${envStatus.undecryptable.join(', ')}); re-enter them or restore the encryption key before updating` };
+  }
+
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {
@@ -2351,7 +2431,7 @@ async function buildDockerImageInstance(
   fs.mkdirSync(dataPath, { recursive: true });
 
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
-  const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
+  const envWithToken = { ...mergedEnvVars(instance), BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
 
   // Use displayName for the compose bot config (BotConfig compat)
   const botForCompose: any = { ...instance, envVars: envWithToken };
@@ -2469,8 +2549,10 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
   const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!spec) return null;
 
-  // Env store first (the wizard writes through it); registry mirror as fallback.
-  const stored = { ...instance.envVars, ...envManager.getEnvVars(instance.id) };
+  // Decision logic reads the FULL store over the record (the adopt lane writes
+  // the mode key store-only); mergedEnvVars first so a broken store refuses
+  // here instead of reading as opted-out and dropping the sidecar service.
+  const stored = { ...mergedEnvVars(instance), ...envManager.getEnvVars(instance.id) };
   // An app declaring no mode key has no operator opt-in gate: the URL semantics
   // below decide alone.
   if (spec.env.mode && (stored[spec.env.mode.key] || '').trim().toLowerCase() !== spec.env.mode.value) return null;
@@ -2483,7 +2565,7 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
     const password = crypto.randomBytes(24).toString('base64url');
     const newUrl = `postgresql://${spec.user}:${password}@${containerName}:5432/${spec.database}`;
     envManager.setEnvVars(instance.id, { [spec.env.url]: newUrl });
-    stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume }, newUrl);
+    stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume });
     return { containerName, volume, password, user: spec.user, db: spec.database };
   }
 
@@ -2504,25 +2586,19 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
   if (host !== containerName && !(replicationHost && host === replicationHost)) return null;   // external lane
 
   if (!instance.fleetDb) stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume });
-  if ((instance.envVars?.[spec.env.url] || '') !== url) {
-    instance.envVars = { ...instance.envVars, [spec.env.url]: url };
-  }
   return { containerName, volume, password, user: instance.fleetDb!.user, db: instance.fleetDb!.db };
 }
 
-/** Persist the fleetDb record (and the generated URL, under the record-declared key) on the instance, in-memory and in the registry. */
-function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord, envUrl?: string): void {
-  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+/** Persist the fleetDb record on the instance, in-memory and in the registry (the URL lives only in the encrypted env store). */
+function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord): void {
   const registry = loadRegistry();
   const inst = registry.instances[instance.id];
   if (inst) {
     inst.fleetDb = record;
-    if (envUrl !== undefined && urlKey) inst.envVars = { ...inst.envVars, [urlKey]: envUrl };
     inst.updatedAt = new Date().toISOString();
     saveRegistry(registry);
   }
   instance.fleetDb = record;
-  if (envUrl !== undefined && urlKey) instance.envVars = { ...instance.envVars, [urlKey]: envUrl };
 }
 
 async function buildGitInstance(
@@ -2595,7 +2671,7 @@ async function buildGitInstance(
   const fleetDb = ensureFleetDataBackend(instance);
 
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
-  const envWithToken = { ...instance.envVars, BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
+  const envWithToken = { ...mergedEnvVars(instance), BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };
   const botWithEnv: any = { ...instance, envVars: envWithToken };
 
   const existingComposePath = hasExistingCompose(repoPath);

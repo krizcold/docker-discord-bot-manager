@@ -390,6 +390,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // for crash-safety, rolled back if the deletion fails.
       let savedGroupId: string | null = null;
       if (keepEnv) {
+        // A corrupt store would vault NOTHING, and undecryptable values would
+        // vault as empty strings, while the deletion goes on to destroy the
+        // bot dir including the last recoverable copy (storage.json.corrupt,
+        // or ciphertext a restored key file would decrypt again) - on the very
+        // lane that promises preservation. Refuse; unchecking the env-preserve
+        // option is the explicit consent path for deleting anyway.
+        const { corrupt, undecryptable } = envManager.getEnvVarsWithStatus(req.params.id);
+        if (corrupt) {
+          res.status(409).json({ success: false, error: 'The env store for this bot cannot be read (preserved as storage.json.corrupt), so its values cannot be vaulted. Restore the store first, or delete again without preserving env values to proceed.' });
+          return;
+        }
+        if (undecryptable.length > 0) {
+          res.status(409).json({ success: false, error: `The env store for this bot holds values that no longer decrypt (${undecryptable.join(', ')}), so they cannot be vaulted. Restoring the original encryption key would recover them; or delete again without preserving env values to proceed.` });
+          return;
+        }
         try {
           const envVars = envManager.getEnvVars(req.params.id);
           if (envVars) {
@@ -954,9 +969,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const envVars = { ...vars };
-      envManager.setEnvVars(req.params.id, envVars);
-      await containerManager.updateBot(req.params.id, { envVars });
+      // updateBot is the dual-write funnel: the store takes everything
+      // (sensitive values encrypted), the record keeps the non-sensitive keys.
+      await containerManager.updateBot(req.params.id, { envVars: { ...vars } });
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));

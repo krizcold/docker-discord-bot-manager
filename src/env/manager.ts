@@ -113,14 +113,14 @@ export function encrypt(text: string): string {
 }
 
 /**
- * Decrypt a value. Returns '' on failure (never throws) so the env editor can
- * still render and let the user re-enter the value; the pre-v2 case gets its
- * own message because the operator action is re-entry, not debugging.
+ * Decrypt a value, or null when the ciphertext cannot be decrypted (key/salt
+ * changed, or the retired pre-v2 format). Null is distinct from a legitimately
+ * empty value, which decrypts to ''.
  */
-export function decrypt(encrypted: string): string {
+function decryptOrNull(encrypted: string): string | null {
   if (!encrypted.startsWith('v2:')) {
     console.error('[EnvManager] Value is stored in the retired pre-v2 format and cannot be decrypted; re-enter it in the env editor');
-    return '';
+    return null;
   }
   try {
     const [, ivHex, tagHex, dataHex] = encrypted.split(':');
@@ -129,62 +129,145 @@ export function decrypt(encrypted: string): string {
     return Buffer.concat([decipher.update(Buffer.from(dataHex, 'hex')), decipher.final()]).toString('utf8');
   } catch (error) {
     console.error('[EnvManager] Decryption failed:', error);
-    return '';
+    return null;
   }
 }
 
 /**
- * Load env storage for a bot
+ * Decrypt a value. Returns '' on failure (never throws) so the env editor can
+ * still render and let the user re-enter the value.
  */
-function loadEnvStorage(botId: string): EnvStorage {
+export function decrypt(encrypted: string): string {
+  return decryptOrNull(encrypted) ?? '';
+}
+
+/**
+ * Load env storage for a bot. A missing file is a legitimately empty store; a
+ * file that EXISTS but cannot be read or parsed is reported corrupt (and
+ * preserved as .corrupt before any later save can overwrite the only copy of
+ * the secrets) so container env assembly can refuse instead of silently
+ * starting secretless.
+ */
+function loadEnvStorage(botId: string): { storage: EnvStorage; corrupt: boolean } {
   const envPath = getEnvPath(botId);
   const storagePath = path.join(envPath, 'storage.json');
 
   try {
     if (fs.existsSync(storagePath)) {
       const content = fs.readFileSync(storagePath, 'utf-8');
-      return JSON.parse(content);
+      const parsed = JSON.parse(content);
+      // Shape check: valid JSON that is not an EnvStorage (null, an array,
+      // garbage vars/encrypted, or a non-string ciphertext) is corruption
+      // too, not a crash further down. A scalar plain value coerces instead
+      // of condemning the whole store: setEnvVars refuses structured values
+      // at write time, so only scalars can legitimately appear here.
+      const isMapOf = (v: unknown, ok: (x: unknown) => boolean): boolean =>
+        v === undefined || (!!v && typeof v === 'object' && !Array.isArray(v)
+          && Object.values(v as Record<string, unknown>).every(ok));
+      // null tolerated like the writer tolerates it (coerced to ''), so a
+      // legacy null value cannot condemn the whole store.
+      const scalar = (x: unknown): boolean => x === null || typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean';
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || !isMapOf(parsed.vars, scalar) || !isMapOf(parsed.encrypted, x => typeof x === 'string')) {
+        throw new Error('storage.json is not an env store');
+      }
+      const vars: Record<string, string> = {};
+      for (const [k, v] of Object.entries((parsed.vars ?? {}) as Record<string, unknown>)) vars[k] = v === null ? '' : String(v);
+      // The store reads healthy again: clear a preserved copy left by an
+      // earlier incident, so a LATER corruption preserves its own bytes
+      // instead of being shadowed by stale secrets the refusal messages
+      // would then misdirect the operator to restore.
+      try { fs.rmSync(`${storagePath}.corrupt`, { force: true }); } catch { /* best effort */ }
+      return { storage: { vars, encrypted: parsed.encrypted ?? {} }, corrupt: false };
     }
   } catch (error) {
     console.error(`[EnvManager] Failed to load env storage for bot ${botId}:`, error);
+    // Preserve once: loads run continuously, and re-copying on every failed
+    // load could clobber the preserved copy with a half-restored snapshot
+    // while the operator performs the documented live restore.
+    try {
+      if (!fs.existsSync(`${storagePath}.corrupt`)) fs.copyFileSync(storagePath, `${storagePath}.corrupt`);
+    } catch { /* best effort */ }
+    return { storage: { vars: {}, encrypted: {} }, corrupt: true };
   }
 
-  return { vars: {}, encrypted: {} };
+  return { storage: { vars: {}, encrypted: {} }, corrupt: false };
 }
 
 /**
- * Save env storage for a bot
+ * A write against a corrupt store would atomically replace it with a valid
+ * store holding only the keys just written - disarming the corrupt-store
+ * refusal and losing every other secret as a side effect of any save (an
+ * editor save, a key delete, a fleet lane's repoint). Refuse instead; the
+ * remedy is deliberate: restore storage.json from storage.json.corrupt, or
+ * delete storage.json to start over empty on purpose.
+ */
+function refuseCorrupt(botId: string, corrupt: boolean): void {
+  if (!corrupt) return;
+  throw new Error(`The env store for bot ${botId} exists but cannot be read (preserved as storage.json.corrupt); refusing to overwrite it. Restore storage.json from the preserved copy, or delete it to deliberately start with an empty store.`);
+}
+
+/**
+ * Save env storage for a bot. Atomic: post the two-store strip this file is
+ * the only source of secrets, so a kill mid-save must not leave it truncated
+ * (the same hazard the registry save guards against).
  */
 function saveEnvStorage(botId: string, storage: EnvStorage): void {
   const envPath = getEnvPath(botId);
   fs.mkdirSync(envPath, { recursive: true });
 
   const storagePath = path.join(envPath, 'storage.json');
-  fs.writeFileSync(storagePath, JSON.stringify(storage, null, 2));
+  const tmp = `${storagePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(storage, null, 2));
+  fs.renameSync(tmp, storagePath);
 }
 
 /**
- * Get all environment variables for a bot (decrypted)
+ * Get all environment variables for a bot, with the keys whose stored
+ * ciphertext no longer decrypts reported separately instead of silently
+ * reading as ''. Container env assembly refuses on those: starting a bot
+ * without its secrets is worse than refusing to start it.
  */
-export function getEnvVars(botId: string): Record<string, string> {
-  const storage = loadEnvStorage(botId);
-  const result: Record<string, string> = { ...storage.vars };
+export function getEnvVarsWithStatus(botId: string): { vars: Record<string, string>; undecryptable: string[]; corrupt: boolean } {
+  const { storage, corrupt } = loadEnvStorage(botId);
+  const vars: Record<string, string> = { ...storage.vars };
+  const undecryptable: string[] = [];
 
-  // Decrypt sensitive vars
   for (const [key, encrypted] of Object.entries(storage.encrypted)) {
-    result[key] = decrypt(encrypted);
+    const value = decryptOrNull(encrypted);
+    if (value === null) undecryptable.push(key);
+    else vars[key] = value;
   }
 
-  return result;
+  return { vars, undecryptable, corrupt };
+}
+
+/**
+ * Get all environment variables for a bot (decrypted; an undecryptable value
+ * reads as '' so the env editor can render and offer re-entry)
+ */
+export function getEnvVars(botId: string): Record<string, string> {
+  const { vars, undecryptable } = getEnvVarsWithStatus(botId);
+  for (const key of undecryptable) vars[key] = '';
+  return vars;
 }
 
 /**
  * Set environment variables for a bot
  */
 export function setEnvVars(botId: string, vars: Record<string, string>): void {
-  const storage = loadEnvStorage(botId);
+  const { storage, corrupt } = loadEnvStorage(botId);
+  refuseCorrupt(botId, corrupt);
 
-  for (const [key, value] of Object.entries(vars)) {
+  for (const [key, raw] of Object.entries(vars)) {
+    // The API is a first-class surface and JSON bodies carry types: a scalar
+    // coerces, a structured value refuses loudly - the writer must never
+    // author a store the loader would classify corrupt.
+    const given = raw as unknown;
+    if (given !== null && given !== undefined && typeof given === 'object') {
+      throw new Error(`The env value for ${key} is not a scalar; refusing to store it`);
+    }
+    const value = given === null || given === undefined ? '' : String(given);
     if (isSensitive(key)) {
       storage.encrypted[key] = encrypt(value);
       delete storage.vars[key];
@@ -199,10 +282,23 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
 }
 
 /**
+ * A one-line diagnosis when a stored secret read came back unusable, so
+ * refusal messages name the real problem instead of the value the operator
+ * would otherwise chase. Null when the store is healthy.
+ */
+export function storeBrokenDiagnosis(botId: string): string | null {
+  const { corrupt, undecryptable } = getEnvVarsWithStatus(botId);
+  if (corrupt) return 'the env store cannot be read (preserved as storage.json.corrupt); restore it first';
+  if (undecryptable.length > 0) return `the env store holds values that no longer decrypt (${undecryptable.join(', ')}); re-enter them or restore the encryption key first`;
+  return null;
+}
+
+/**
  * Delete an environment variable
  */
 export function deleteEnvVar(botId: string, key: string): void {
-  const storage = loadEnvStorage(botId);
+  const { storage, corrupt } = loadEnvStorage(botId);
+  refuseCorrupt(botId, corrupt);
   delete storage.vars[key];
   delete storage.encrypted[key];
   saveEnvStorage(botId, storage);

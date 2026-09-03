@@ -1341,7 +1341,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const result = await fleetBackup.restoreFleetBackup(req.params.id, file);
       res.json(result.success
-        ? { success: true, steps: result.steps }
+        ? {
+          success: true,
+          steps: result.steps,
+          ...(result.warning ? { warning: result.warning } : {}),
+          note: 'A restore brings back whatever the dump remembers: if it predates the removal of a fleet node, the shard table may hold frozen leases on that dead registration - check the fleet table and declare-lost any node that no longer exists',
+        }
         : { success: false, error: result.error, steps: result.steps });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

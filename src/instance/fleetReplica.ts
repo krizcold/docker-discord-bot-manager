@@ -615,6 +615,7 @@ export async function decommissionFleetDb(
           // later rebuild re-mints a recorded empty sidecar.
           console.error(`[FleetReplica] Decommissioned ${instance.id} but failed to retire its env pins:`, err);
         }
+        fleetBackup.clearTermFloor(instance.id);
         return { success: true, dumpFile };
       } finally {
         fleetBackup.releaseFleetBackupBusy(instance.id);

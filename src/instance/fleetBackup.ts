@@ -112,6 +112,48 @@ function backupDir(botId: string): string {
   return path.join(DATA_DIR, 'backups', botId, 'fleet-postgres');
 }
 
+/**
+ * The highest control term this lane ever observed live, persisted so a retry
+ * after a failed restore (the live database is gone by then) still knows the
+ * pre-restore term. Ratchets upward only; .json so listFleetBackups' .dump
+ * filter never shows it.
+ */
+function termFloorPath(botId: string): string {
+  return path.join(backupDir(botId), 'term-floor.json');
+}
+
+function readTermFloor(botId: string): number | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(termFloorPath(botId), 'utf-8'));
+    return Number.isInteger(parsed?.term) ? parsed.term : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeTermFloor(botId: string, term: number): void {
+  try {
+    fs.mkdirSync(backupDir(botId), { recursive: true });
+    fs.writeFileSync(termFloorPath(botId), JSON.stringify({ term }));
+  } catch (err: any) {
+    console.error(`[FleetBackup] Could not persist the term floor for ${botId}: ${err?.message || err}`);
+  }
+}
+
+/**
+ * A decommission ENDS the term space: a rebuilt database starts its terms
+ * near zero, and a floor carried over from the destroyed generation would
+ * advance the fresh space to the dead one's high-water mark - silently
+ * defeating the witness fence the floor exists to serve.
+ */
+export function clearTermFloor(botId: string): void {
+  try {
+    fs.rmSync(termFloorPath(botId), { force: true });
+  } catch (err: any) {
+    console.error(`[FleetBackup] Could not clear the term floor for ${botId}: ${err?.message || err}`);
+  }
+}
+
 function isContainerRunning(containerName: string): Promise<boolean> {
   return new Promise(resolve => {
     execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout) => {
@@ -361,9 +403,9 @@ async function runFleetBackupTick(): Promise<void> {
 export async function restoreFleetBackup(
   botId: string,
   file: string
-): Promise<{ success: boolean; error?: string; steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; restarted: string[] } }> {
-  const steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; restarted: string[] } = {
-    stopped: [], preRestoreDump: null, restored: false, restarted: [],
+): Promise<{ success: boolean; error?: string; warning?: string; steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; restarted: string[] } }> {
+  const steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; restarted: string[] } = {
+    stopped: [], preRestoreDump: null, restored: false, termReconciledTo: null, restarted: [],
   };
 
   if (file.includes('/') || file.includes('\\') || file.includes('..') || !file.endsWith('.dump')) {
@@ -407,6 +449,15 @@ export async function restoreFleetBackup(
     if (!exists.ok) {
       return { success: false, error: `Could not check the database before the restore: ${exists.stderr.trim().split('\n').pop()}`, steps };
     }
+    // The app's control term must never move backwards: the witness fence
+    // parks a master whose store term sits below a claim any node ever
+    // posted, and only this lane knows the rewind is a deliberate restore
+    // rather than a stale fork (F-R5-1). Capture the live term, keep the
+    // highest value ever seen in the persisted floor (a retry after a failed
+    // restore probes a partial or missing database), and advance the restored
+    // copy to it after pg_restore. Tolerant on purpose: a database without
+    // the table simply skips the reconcile.
+    let liveTerm: number | null = readTermFloor(botId);
     if (exists.stdout.trim() !== '0') {
       const safety = await runFleetDump(instance, 'pre-restore-');
       if (!safety.success) {
@@ -414,6 +465,14 @@ export async function restoreFleetBackup(
         return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
       }
       steps.preRestoreDump = safety.file || null;
+
+      const termProbe = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
+        '-c', 'SELECT max(term) FROM smdb_control.term']);
+      const parsed = Number.parseInt(termProbe.stdout.trim(), 10);
+      if (termProbe.ok && Number.isInteger(parsed) && (liveTerm === null || parsed > liveTerm)) {
+        liveTerm = parsed;
+        writeTermFloor(botId, parsed);
+      }
     }
 
     // 2. Courtesy stop of every running managed instance this manager can see
@@ -551,9 +610,23 @@ export async function restoreFleetBackup(
       });
     });
 
+    let termWarning = '';
     if (restore.success) {
       steps.restored = true;
       lastErrors.delete(botId);
+      if (liveTerm !== null) {
+        // RETURNING-counted: a psql exit 0 with zero rows updated (a dump
+        // whose term table exists but is empty) must warn, not report success.
+        const bump = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+          'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+          '-c', `WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, ${liveTerm}) RETURNING 1) SELECT count(*) FROM u`]);
+        if (bump.ok && Number.parseInt(bump.stdout.trim(), 10) >= 1) {
+          steps.termReconciledTo = liveTerm;
+        } else {
+          termWarning = `; the restored control term could not be advanced to the pre-restore value (${liveTerm})${bump.ok ? ' - the restored dump has no control term row' : ''} - if the master parks on the witness fence, advance smdb_control.term by hand and restart it`;
+          console.error(`[FleetBackup] Term reconcile failed on ${fleetDb.containerName}: ${bump.ok ? 'no term row to advance' : bump.stderr.trim().split('\n').pop()}`);
+        }
+      }
     } else {
       lastErrors.set(botId, `Restore failed: ${restore.error}`);
     }
@@ -586,8 +659,8 @@ export async function restoreFleetBackup(
     }
 
     if (!restore.success) return { success: false, error: `${restore.error}${liftWarning}`, steps };
-    if (lift !== 'lifted') return { success: false, error: 'Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)', steps };
-    return { success: true, steps };
+    if (lift !== 'lifted') return { success: false, error: `Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)${termWarning}`, steps };
+    return { success: true, ...(termWarning ? { warning: termWarning.slice(2) } : {}), steps };
   } finally {
     // The leftover-lift attempt must finish before the busy gate opens, or a
     // retry's fresh fence could be dissolved by this stale lift mid-restore.

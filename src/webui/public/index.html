@@ -3124,9 +3124,11 @@
         const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
         if (res.success) {
           const s = res.steps || {};
-          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, restarted ${(s.restarted || []).length}`);
+          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
+          if (res.warning) alert(`Restore finished WITH A WARNING:\n\n${res.warning}\n\n${res.note || ''}`);
         } else {
           showMessage('error', res.error || 'Restore failed');
+          if (res.steps && res.steps.restored) alert(`The data was restored, but the lane finished WITH PROBLEMS:\n\n${res.error || ''}`);
         }
       } catch (err) {
         showMessage('error', 'Restore failed');

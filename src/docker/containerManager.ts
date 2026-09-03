@@ -19,6 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, RecoveryChannelRecord, RecoveryRescueRecord,
+  ContainerInfo,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -1359,9 +1360,15 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
   let publicUrl: string | undefined;
   let hostPort: number | undefined;
 
-  // A running bot publishes its own port; that must not block reusing it on rebuild.
+  // A running bot publishes its own port; that must not block reusing it on
+  // rebuild. Boundary-exact on purpose (no labels reach this sync listing):
+  // bare startsWith would claim a sibling whose name this one prefixes.
   const isOwnContainer = (name: string) =>
-    name.startsWith(instance.sanitizedName) || name.includes(`-${instance.id}-`);
+    name === instance.sanitizedName
+    || name === `${instance.sanitizedName}app`
+    || name.startsWith(`${instance.sanitizedName}-`)
+    || name === `bot-${instance.id}`
+    || name.includes(`-${instance.id}-`);
   const portsClaimedByOthers = () => {
     const used = new Set<number>();
     for (const b of getAllBots()) {
@@ -2110,13 +2117,24 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
 
 // ─── Container ID Resolution ───
 
+/**
+ * Ownership by label first, name shapes last: name.startsWith(appName) is
+ * substring matching, so "fmdbworker" would claim "fmdbworker2app". A bot-id
+ * or compose-project label is authoritative either way it points; the name
+ * arms remain only for containers from before either label was stamped.
+ */
+function ownedBotContainers(containers: ContainerInfo[], botId: string, appName: string): ContainerInfo[] {
+  return containers.filter(c => {
+    if (c.botId) return c.botId === botId;
+    if (c.project) return c.project === appName || c.project === `bot-${botId}`;
+    return c.name.startsWith(appName) || c.name.includes(`-${botId}-`);
+  });
+}
+
 async function getContainerIdsForBot(botId: string): Promise<string[]> {
   const containers = await dockerClient.listBotContainers();
   const appName = resolveAppName(botId);
-  const botContainers = containers.filter(c =>
-    c.name.startsWith(appName) || c.name.includes(`-${botId}-`)
-  );
-  return botContainers.map(c => c.id);
+  return ownedBotContainers(containers, botId, appName).map(c => c.id);
 }
 
 // ─── Stop ───
@@ -2952,8 +2970,7 @@ export async function syncContainerStates(): Promise<void> {
     }
 
     const appName = resolveAppName(instance.id);
-    // Same matching as getContainerIdsForBot: generated composes (docker-image /
-    // no-compose git bots) name containers bot-<id>-*, not <sanitizedName>*.
+    // Same matching as getContainerIdsForBot (ownedBotContainers).
     // Standalone-capable service containers are excluded by exact name: the
     // fleet sidecar, a replica, or a recovery helper routinely runs ALONE
     // (dumps, re-seeds, rescues), and counting one as "the bot" flips the
@@ -2966,8 +2983,8 @@ export async function syncContainerStates(): Promise<void> {
       `${instance.sanitizedName}-recovery-rsyncd`,
       `${instance.sanitizedName}-recovery-rsync`,
     ]);
-    const botContainers = containers.filter(c =>
-      (c.name.startsWith(appName) || c.name.includes(`-${instance.id}-`)) && !standalone.has(c.name));
+    const botContainers = ownedBotContainers(containers, instance.id, appName)
+      .filter(c => !standalone.has(c.name));
     const runningContainers = botContainers.filter(c => c.state === 'running');
     const runningIds = runningContainers.map(c => c.id);
 

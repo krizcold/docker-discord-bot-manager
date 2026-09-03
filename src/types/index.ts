@@ -316,6 +316,10 @@ export interface ContainerInfo {
   state: string;
   status: string;
   ports: PortBinding[];
+  /** com.docker.compose.project label; absent on plain docker-run containers. */
+  project?: string;
+  /** bot-id ownership label; absent on containers from before it was stamped. */
+  botId?: string;
 }
 
 export interface PortBinding {

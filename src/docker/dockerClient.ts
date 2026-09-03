@@ -94,19 +94,21 @@ export async function listBotContainers(): Promise<ContainerInfo[]> {
     const output = execDocker([
       'ps', '-a',
       '--filter', 'label=managed-by=discord-bot-manager',
-      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}'
+      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}|{{.Label "com.docker.compose.project"}}|{{.Label "bot-id"}}'
     ]);
 
     if (!output) return [];
 
     return output.split('\n').filter(line => line.trim()).map(line => {
-      const [id, name, state, status] = line.split('|');
+      const [id, name, state, status, project, botId] = line.split('|');
       return {
         id,
         name,
         state,
         status,
-        ports: []
+        ports: [],
+        ...(project ? { project } : {}),
+        ...(botId ? { botId } : {})
       };
     });
   } catch (error) {

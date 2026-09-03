@@ -20,6 +20,8 @@ export interface AppFacts {
   term: number | null;
   standalone: boolean;
   backupMaster: boolean;
+  /** The app's own verdict that this node is where the copy block belongs. */
+  copyBlockTarget: boolean;
   superseded: { byNodeId: string; byNodeName: string; term: number; retireRequested: boolean; at: number; source: string; steppedDown: boolean } | null;
   promote: any;
   emptyStoreHold: any;

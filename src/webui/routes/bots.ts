@@ -1409,11 +1409,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         void (async () => {
           try {
             const facts = await appLifecycle.getAppFacts(bot);
-            // Only a MASTER relays the block onward, and only its own is right:
-            // publishing onto a backup would overwrite the block its master
-            // relayed, and publishing during a lifecycle op could re-add one a
-            // decommission just retracted.
-            if (!facts.success || facts.facts?.role !== 'master' || !facts.facts.initialized) return;
+            // Only the node the app itself marks as the copy-block target
+            // relays the block onward: publishing onto a backup would overwrite
+            // the block its master relayed, and publishing during a lifecycle
+            // op could re-add one a decommission just retracted.
+            if (!facts.success || facts.facts?.copyBlockTarget !== true) return;
             if (containerManager.isBotBusy(bot.id)) return;
             const published = await appLifecycle.ensureCopyBlockCurrent(bot, facts.facts?.copyBlock ?? null);
             if (!published.success) console.warn(`[Bots] Copy block not published to ${bot.sanitizedName}: ${published.error}`);
@@ -1778,9 +1778,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await appLifecycle.getAppFacts(bot);
-      // initialized too: the pre-init state branch reports role 'master'
-      // regardless of what this node will actually become.
-      if (result.success && result.facts?.role === 'master' && result.facts.initialized
+      if (result.success && result.facts?.copyBlockTarget === true
           && bot.fleetDb?.replication && !containerManager.isBotBusy(bot.id)) {
         const delivered = await appLifecycle.ensureCopyBlockCurrent(bot, result.facts.copyBlock);
         // Re-read only when something was actually published, so what the UI

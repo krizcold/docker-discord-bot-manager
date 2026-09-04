@@ -1647,7 +1647,7 @@ export function readBotManagerMarker(appName: string): {
 export function mergedEnvVars(instance: InstanceConfig): Record<string, string> {
   const { vars, undecryptable, corrupt } = envManager.getEnvVarsWithStatus(instance.id);
   if (corrupt) {
-    throw new Error(`The env store for ${instance.displayName} exists but cannot be read (preserved as storage.json.corrupt). Restore storage.json from the preserved copy, or delete it to deliberately start with an empty store.`);
+    throw new Error(`The env store for ${instance.displayName} exists but cannot be read. Repair or replace storage.json (the damaged original is preserved as storage.json.corrupt), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
   }
   if (undecryptable.length > 0) {
     throw new Error(`The encrypted env store for ${instance.displayName} holds values that no longer decrypt (${undecryptable.join(', ')}). The encryption key or salt changed; re-enter them in the env editor.`);

@@ -204,7 +204,7 @@ function loadEnvStorage(botId: string): { storage: EnvStorage; corrupt: boolean 
  */
 function refuseCorrupt(botId: string, corrupt: boolean): void {
   if (!corrupt) return;
-  throw new Error(`The env store for bot ${botId} exists but cannot be read (preserved as storage.json.corrupt); refusing to overwrite it. Restore storage.json from the preserved copy, or delete it to deliberately start with an empty store.`);
+  throw new Error(`The env store for bot ${botId} exists but cannot be read; refusing to overwrite it. Repair or replace storage.json (the damaged original is preserved as storage.json.corrupt), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
 }
 
 /**

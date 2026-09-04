@@ -3,7 +3,7 @@
  *
  * Provides a unified view of all env vars across bot instances + standalone vault entries.
  * Standalone entries and deleted-bot credential groups stored encrypted at rest in /data/data/vault.json as
- * { v: 1, data: "<iv>:<ciphertext>" } using the env manager's AES-256-CBC helpers.
+ * { v: 1, data: "v2:<iv>:<authTag>:<ciphertext>" } using the env manager's AES-256-GCM helpers.
  * Bot instance envs read from their existing encrypted storage.
  */
 
@@ -43,6 +43,9 @@ export function loadVault(): VaultConfig {
     const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
     if (!wrapper || typeof wrapper.data !== 'string') throw new Error('unrecognized vault format');
     const raw = JSON.parse(envManager.decrypt(wrapper.data));
+    // Healthy again: clear a preserved copy left by an earlier incident so a
+    // later corruption preserves its own bytes.
+    try { fs.rmSync(`${VAULT_FILE}.corrupt`, { force: true }); } catch { /* best effort */ }
     return {
       standalone: raw.standalone || [],
       deletedBots: raw.deletedBots || [],
@@ -52,14 +55,57 @@ export function loadVault(): VaultConfig {
       warnedUnreadableVault = true;
       console.warn('[Vault] vault.json is unreadable or cannot be decrypted; starting with an empty vault');
     }
+    // Preserve once: the broken file is the only copy of every vaulted group.
+    try {
+      if (!fs.existsSync(`${VAULT_FILE}.corrupt`)) fs.copyFileSync(VAULT_FILE, `${VAULT_FILE}.corrupt`);
+    } catch { /* best effort */ }
     return { standalone: [], deletedBots: [] };
   }
 }
 
+/**
+ * True when vault.json EXISTS but cannot be read/decrypted. loadVault degrades
+ * that state to an empty vault (so the UI still renders), which means any
+ * save layered on such a load would overwrite every previously vaulted group.
+ * Lanes that write on behalf of a preservation promise probe this first and
+ * refuse instead.
+ */
+export function vaultFileBroken(): boolean {
+  let broken = false;
+  try {
+    if (!fs.existsSync(VAULT_FILE)) return false;
+    const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
+    if (!wrapper || typeof wrapper.data !== 'string') broken = true;
+    else JSON.parse(envManager.decrypt(wrapper.data));
+  } catch {
+    broken = true;
+  }
+  if (broken) {
+    // The refusals this probe drives name vault.json.corrupt as the preserved
+    // evidence, so the probe itself must have created it: a refusal can be the
+    // process's first vault touch.
+    try {
+      if (!fs.existsSync(`${VAULT_FILE}.corrupt`)) fs.copyFileSync(VAULT_FILE, `${VAULT_FILE}.corrupt`);
+    } catch { /* best effort */ }
+  }
+  return broken;
+}
+
 export function saveVault(config: VaultConfig): void {
+  // Refuse to overwrite a broken vault: the config being saved was loaded as
+  // empty from it, so the write would destroy every previously vaulted group.
+  // Guarded here so every caller (vault routes, delete lane, rollbacks) is
+  // covered.
+  if (vaultFileBroken()) {
+    throw new Error('vault.json exists but cannot be read; refusing to overwrite it (the save would destroy every previously vaulted group). Repair or remove vault.json first (the damaged original is preserved as vault.json.corrupt).');
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const wrapper = { v: 1, data: envManager.encrypt(JSON.stringify(config)) };
-  fs.writeFileSync(VAULT_FILE, JSON.stringify(wrapper, null, 2));
+  // Atomic: this file is the only home of the vaulted groups, so a kill
+  // mid-save must not leave it truncated.
+  const tmp = `${VAULT_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(wrapper, null, 2));
+  fs.renameSync(tmp, VAULT_FILE);
 }
 
 function maskValue(value: string): string {

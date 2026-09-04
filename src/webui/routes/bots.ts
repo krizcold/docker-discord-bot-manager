@@ -22,7 +22,7 @@ import * as fleetReplica from '../../instance/fleetReplica';
 import * as recoveryChannel from '../../instance/recoveryChannel';
 import * as recoveryRescue from '../../instance/recoveryRescue';
 import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
-import { loadVault, saveVault } from './vault';
+import { loadVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
@@ -32,7 +32,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
 import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
-import { getBotDir } from '../../git/repoManager';
+import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { hasAppHooks } from '../../instance/appHookClient';
 import { findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
@@ -407,32 +407,50 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
         try {
           const envVars = envManager.getEnvVars(req.params.id);
-          if (envVars) {
-            const entries = Object.entries(envVars)
-              .filter(([key]) => !BOT_MANAGER_KEYS.has(key))
-              .map(([key, value]) => ({ key, value }));
-            if (entries.length > 0) {
-              const vault = loadVault();
-              const groupId = randomUUID();
-              vault.deletedBots.push({
-                id: groupId,
-                botName: bot.displayName,
-                sanitizedName: bot.sanitizedName,
-                deletedAt: Date.now(),
-                entries,
-              });
-              saveVault(vault);
-              savedGroupId = groupId;
+          const entries = Object.entries(envVars || {})
+            .filter(([key]) => !BOT_MANAGER_KEYS.has(key))
+            .map(([key, value]) => ({ key, value }));
+          if (entries.length > 0) {
+            // An unreadable vault file loads as an empty vault, so saving the
+            // new group into it would overwrite every previously vaulted
+            // group. Probed only when there is something to vault: an empty
+            // env store must not block the delete.
+            if (vaultFileBroken()) {
+              res.status(409).json({ success: false, error: 'The credentials vault (vault.json) exists but cannot be read, so preserving this bot\'s env values would overwrite every previously vaulted group. Repair or remove vault.json first (the damaged original is preserved as vault.json.corrupt), or delete again without preserving env values to proceed.' });
+              return;
             }
+            const vault = loadVault();
+            const groupId = randomUUID();
+            vault.deletedBots.push({
+              id: groupId,
+              botName: bot.displayName,
+              sanitizedName: bot.sanitizedName,
+              deletedAt: Date.now(),
+              entries,
+            });
+            saveVault(vault);
+            savedGroupId = groupId;
           }
         } catch (err) {
-          console.warn(`[API] Failed to preserve env vars in vault: ${err}`);
+          // A failed vault write on the lane that promises preservation must
+          // refuse the deletion, not warn and destroy the only copy.
+          res.status(409).json({ success: false, error: `Preserving the env values in the vault failed (${err}), so nothing was deleted. Fix the vault write, or delete again without preserving env values to proceed.` });
+          return;
         }
       }
 
       const rollbackVaultGroup = () => {
         if (!savedGroupId) return;
         try {
+          // A failed deleteBot may still have destroyed the bot dir (and the
+          // env store in it) before its failure gate threw; the vault group is
+          // then the only surviving copy and must stay. A duplicate group from
+          // a later successful retry is benign; a removed group is
+          // unrecoverable.
+          if (!fs.existsSync(path.join(getEnvPath(req.params.id), 'storage.json'))) {
+            console.warn('[API] Delete failed after the env store was destroyed; keeping the vault group as the only surviving copy');
+            return;
+          }
           const vault = loadVault();
           vault.deletedBots = vault.deletedBots.filter(g => g.id !== savedGroupId);
           saveVault(vault);

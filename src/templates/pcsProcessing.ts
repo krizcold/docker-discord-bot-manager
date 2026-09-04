@@ -1717,7 +1717,7 @@ function hostSrcToLocal(src: string, prefix: string, containerBotDir: string): s
  * source:dest separator - critical in docker mode on Windows, where bind sources
  * are absolute host paths.
  */
-function splitDockerVolume(vol: string): { source: string; dest: string } | null {
+export function splitDockerVolume(vol: string): { source: string; dest: string } | null {
   const drive = vol.match(/^([A-Za-z]:[\\/][^:]*):(.*)$/);
   if (drive) return { source: drive[1], dest: drive[2].split(':')[0] };
   const i = vol.indexOf(':');

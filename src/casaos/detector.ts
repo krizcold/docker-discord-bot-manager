@@ -107,9 +107,13 @@ export async function getDeploymentMode(): Promise<DeploymentMode> {
 
   const config = loadConfig();
 
-  if (config && !config.autoDetected) {
-    // User manually set the mode
+  // A persisted mode wins whether an operator pinned it or a first detection
+  // wrote it. Re-detecting on every start let a platform change silently
+  // re-decide the mode, and the mode picks where an instance's data lives, so a
+  // flip relocates a running instance onto an empty directory at its next build.
+  if (config && (VALID_MODES as readonly string[]).includes(config.deploymentMode)) {
     cachedMode = config.deploymentMode;
+    console.log(`[CasaOS] Deployment mode: ${cachedMode} (${config.autoDetected === false ? 'set by operator' : 'persisted from an earlier detection'})`);
     return cachedMode;
   }
 
@@ -140,7 +144,24 @@ export function setDeploymentMode(mode: DeploymentMode): void {
 }
 
 /**
- * Clear cached mode (forces re-detection on next call)
+ * True when the running mode was DECLARED rather than guessed: an explicit
+ * DEPLOYMENT_MODE, or a persisted mode an operator set. Callers that refuse a
+ * mode-driven change use this to refuse only the accidental case, so a
+ * deliberate switch is never blocked.
+ */
+export function isModeExplicit(): boolean {
+  if (parseEnvMode()) return true;
+  const config = loadConfig();
+  if (!config || config.autoDetected !== false) return false;
+  // Same validity test getDeploymentMode applies, so a config it would reject
+  // cannot read as a declaration here.
+  return (VALID_MODES as readonly string[]).includes(config.deploymentMode);
+}
+
+/**
+ * Drop the in-process cache so the next call re-reads config.json. It does NOT
+ * force re-detection: a persisted mode still wins, and detection only runs when
+ * there is no config to honour.
  */
 export function clearCache(): void {
   cachedMode = null;

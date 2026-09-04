@@ -76,13 +76,14 @@ import {
   redeliverConfigFiles,
   fixPostDeployOwnership,
   executeInstallCommand,
-  removeFleetPostgresService
+  removeFleetPostgresService,
+  splitDockerVolume
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
-import { getDeploymentMode } from '../casaos/detector';
+import { getDeploymentMode, isModeExplicit } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
@@ -2430,6 +2431,12 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
+  // Same preflight for a deployment-mode change: the build refuses on it, and
+  // this lane must not stop the bot and delete its image on the way there.
+  const modeRefusal = await modeMismatchRefusal(instance);
+  if (modeRefusal) {
+    return { success: false, error: modeRefusal };
+  }
 
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
@@ -2496,6 +2503,78 @@ function resolveImageDataTarget(imageRef: string): string {
   return '/app/data';
 }
 
+/**
+ * The deployment mode an instance's DEPLOYED compose was authored under, read
+ * back from where its binds point: docker mode roots them at the manager's own
+ * host bot dir, CasaOS mode at the platform's AppData folder. Null when there is
+ * no compose yet, or no bind that identifies either shape.
+ *
+ * The docker test must run FIRST: on a CasaOS-style host the manager's own data
+ * dir lives under AppData too, so a docker-mode bind matches both prefixes and
+ * only the more specific one tells the truth.
+ */
+function deployedBindMode(instance: InstanceConfig): DeploymentMode | null {
+  const composePath = path.join(getBotDir(instance.id), 'docker-compose.yml');
+  let doc: any;
+  try {
+    if (!fs.existsSync(composePath)) return null;
+    doc = YAML.parse(fs.readFileSync(composePath, 'utf-8'));
+  } catch {
+    return null;
+  }
+
+  const sources: string[] = [];
+  for (const service of Object.values<any>(doc?.services || {})) {
+    if (!Array.isArray(service?.volumes)) continue;
+    for (const vol of service.volumes) {
+      if (typeof vol === 'string') {
+        const split = splitDockerVolume(vol);
+        if (split) sources.push(split.source);
+      } else if (vol && vol.type !== 'volume' && typeof vol.source === 'string') {
+        sources.push(vol.source);
+      }
+    }
+  }
+
+  const norm = sources.map(s => s.replace(/\\/g, '/').replace(/\/+$/, ''));
+  const under = (root: string) => norm.some(s => s === root || s.startsWith(`${root}/`));
+
+  const hostBotDir = hostBotDirFor(instance.id).replace(/\/+$/, '');
+  if (under(hostBotDir)) return 'docker';
+
+  const appData = `${(process.env.DATA_ROOT || '/DATA').replace(/\\/g, '/').replace(/\/+$/, '')}/AppData`;
+  if (under(appData)) return 'casaos';
+
+  return null;
+}
+
+/**
+ * Refusal text when a build would re-author this instance under a different
+ * deployment mode than the one it was deployed with, else null. That moves its
+ * data bind, so it would come back on an empty directory with its real data left
+ * at the old path.
+ *
+ * Only the ACCIDENTAL move is refused. Once an operator has declared the mode,
+ * the move is their intent, and refusing it would trap the instance: a build is
+ * the only thing that re-authors a compose, so the guard would block its own
+ * recovery path.
+ */
+async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Promise<string | null> {
+  const current = await getDeploymentMode();
+  const deployed = deployedBindMode(instance);
+  if (!deployed || deployed === current) return null;
+
+  if (isModeExplicit()) {
+    // Declared, so it proceeds. Still say it out loud in the build log: the
+    // declaration is manager-wide while this consequence is per-instance, so
+    // this may not be the instance the operator had in mind.
+    if (emit) emit(`[Warning] ${instance.displayName} was deployed under ${deployed} mode and is being re-authored under ${current}. It will start on the ${current} path, and whatever it holds under the ${deployed} path stays there.`, 'warning');
+    return null;
+  }
+
+  return `This instance was deployed under ${deployed} mode, but the manager auto-detected ${current} mode. Building would re-author its data bind, so it would start on the ${current} path while its current data stays under the ${deployed} one. Declare the mode and build again: PUT /api/system/deployment {"mode":"${deployed}"} keeps this instance where its data already is, and {"mode":"${current}"} accepts the detected mode for the whole manager, after which this instance moves on its next build.`;
+}
+
 export async function buildBot(botId: string): Promise<{ success: boolean; error?: string }> {
   return withLoggedBotOp(botId, 'build', () => buildBotImpl(botId));
 }
@@ -2514,10 +2593,17 @@ async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: 
 
   try {
     emit(`[Build] Build process started for ${instance.displayName}`, 'system');
-    updateBotStatus(botId, 'building');
 
     const deploymentMode = await getDeploymentMode();
     const isCasaOS = deploymentMode === 'casaos';
+
+    const modeRefusal = await modeMismatchRefusal(instance, emit);
+    if (modeRefusal) {
+      emit(`[Error] ${modeRefusal}`, 'error');
+      return { success: false, error: modeRefusal };
+    }
+
+    updateBotStatus(botId, 'building');
 
     if (sourceType === 'docker-image') {
       return await buildDockerImageInstance(instance, emit, isCasaOS);

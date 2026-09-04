@@ -2000,7 +2000,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       // Re-apply edited config files so config changes made while stopped take
       // effect on start (mirrors the env re-sync above). Binds already exist from
       // the build, so this only rewrites the bind-mounted host files.
-      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      const cfgFiles = reapplyableConfigFiles(botId, emit);
       if (cfgFiles.length > 0) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
@@ -2043,7 +2043,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
 
       // Re-apply edited config files so changes made while stopped take effect.
-      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      const cfgFiles = reapplyableConfigFiles(botId, emit);
       if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
         try {
           redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
@@ -2082,6 +2082,28 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
   }
 }
 
+/**
+ * Config files for the start-path re-apply. A broken store skips the rewrite
+ * loudly instead of rewriting real host configs to '': the previously
+ * delivered files stay in place as the last-known-good config, so the start
+ * can proceed. The build lanes, which author the host files fresh, refuse
+ * instead (getConfigFilesStrict).
+ */
+function reapplyableConfigFiles(botId: string, emit: EmitFn): configFileManager.BotConfigFile[] {
+  const { files, undecryptable, corrupt } = configFileManager.getConfigFilesWithStatus(botId);
+  if (corrupt) {
+    emit('[Config] The config-file store cannot be read (the damaged original is preserved as configFiles.json.corrupt); keeping the previously delivered config files', 'warning');
+    return [];
+  }
+  const enabled = files.filter(c => c.enabled !== false);
+  const blocking = enabled.filter(f => undecryptable.includes(f.path));
+  if (blocking.length > 0) {
+    emit(`[Config] Stored config file bodies no longer decrypt (${blocking.map(f => f.path).join(', ')}); keeping the previously delivered config files`, 'warning');
+    return [];
+  }
+  return enabled;
+}
+
 async function startDockerImageBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
@@ -2117,7 +2139,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       updateBotStatus(botId, 'starting');
 
       // Re-apply edited config files so config changes take effect on start.
-      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      const cfgFiles = reapplyableConfigFiles(botId, emit);
       if (cfgFiles.length > 0) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
@@ -2147,7 +2169,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       syncComposeEnvVars(instance, composePath);
       writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
 
-      const cfgFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+      const cfgFiles = reapplyableConfigFiles(botId, emit);
       if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
@@ -2304,6 +2326,17 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
   if (envStatus.undecryptable.length > 0) {
     return { success: false, error: `The env store holds values that no longer decrypt (${envStatus.undecryptable.join(', ')}); re-enter them or restore the encryption key before updating` };
   }
+  // Same preflight for the config-file store: the rebuild's delivery refuses
+  // on it (getConfigFilesStrict), and a running bot must not be stopped and
+  // stripped of its image on the way to that refusal.
+  const cfgStatus = configFileManager.getConfigFilesWithStatus(botId);
+  if (cfgStatus.corrupt) {
+    return { success: false, error: 'The config-file store for this instance cannot be read (preserved as configFiles.json.corrupt); repair or replace it before updating' };
+  }
+  const cfgBroken = cfgStatus.files.filter(f => f.enabled !== false && cfgStatus.undecryptable.includes(f.path)).map(f => f.path);
+  if (cfgBroken.length > 0) {
+    return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
+  }
 
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
@@ -2442,7 +2475,7 @@ async function buildDockerImageInstance(
   composeContent = processed.content;
 
   // Config files: deliver/bind user-supplied config files (mode-aware).
-  const configFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+  const configFiles = configFileManager.getConfigFilesStrict(botId).filter(c => c.enabled !== false);
   if (isCasaOS) {
     if (configFiles.length > 0) {
       emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
@@ -2789,7 +2822,7 @@ async function buildGitInstance(
   }
 
   // Deliver volume dirs + user-edited config files (mode-aware).
-  const configFiles = configFileManager.getConfigFiles(botId).filter(c => c.enabled !== false);
+  const configFiles = configFileManager.getConfigFilesStrict(botId).filter(c => c.enabled !== false);
   let bindOnlyConfigs: typeof configFiles = [];
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');

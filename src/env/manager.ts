@@ -117,7 +117,7 @@ export function encrypt(text: string): string {
  * changed, or the retired pre-v2 format). Null is distinct from a legitimately
  * empty value, which decrypts to ''.
  */
-function decryptOrNull(encrypted: string): string | null {
+export function decryptOrNull(encrypted: string): string | null {
   if (!encrypted.startsWith('v2:')) {
     console.error('[EnvManager] Value is stored in the retired pre-v2 format and cannot be decrypted; re-enter it in the env editor');
     return null;

@@ -339,11 +339,11 @@ export function buildBotConfigList(
   repoPath: string | null,
   botId: string,
   sourceUrl?: string
-): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean }> {
-  const stored = configFileManager.getConfigFiles(botId);
+): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean }> {
+  const { files: stored, undecryptable } = configFileManager.getConfigFilesWithStatus(botId);
   const storedByPath = new Map(stored.map(s => [s.path, s]));
   const seen = new Set<string>();
-  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean }> = [];
+  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean }> = [];
 
   const detected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
   const declared = (repoPath && fs.existsSync(repoPath) && sourceUrl)
@@ -356,13 +356,17 @@ export function buildBotConfigList(
       body: s ? s.body : applyTemplateModifiers(sourceUrl || '', cf.targetName, cf.format, cf.rawBody),
       readOnly: s ? s.readOnly !== false : true,
       enabled: s ? s.enabled !== false : true,
+      ...(s && undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
     });
   }
 
   for (const s of stored) {
     if (seen.has(s.path)) continue;
     seen.add(s.path);
-    result.push({ path: s.path, body: s.body, readOnly: s.readOnly !== false, enabled: s.enabled !== false });
+    result.push({
+      path: s.path, body: s.body, readOnly: s.readOnly !== false, enabled: s.enabled !== false,
+      ...(undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
+    });
   }
 
   return result;

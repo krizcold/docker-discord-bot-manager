@@ -95,6 +95,11 @@ async function databaseIdentity(instance: InstanceConfig): Promise<Record<string
 async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'instance no longer has a managed fleet database; disarm the recovery channel' };
+  // A key-loss-scrubbed credential would spawn a relay that exits fatally and
+  // crash-loops under its restart policy, with no key-loss diagnosis anywhere.
+  if (!record.token || (record.mode === 'receiver' && !record.tlsKey)) {
+    return { ok: false, error: 'the stored channel credentials no longer decrypt (the manager encryption key changed or was lost); restore the key, or disarm and re-arm the channel' };
+  }
   const image = await selfImage();
   if (!image.ok) return { ok: false, error: image.error };
   const network = await sidecarNetwork(fleetDb.containerName);
@@ -318,7 +323,9 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
     publicHost: record.publicHost,
     tunnelPort: record.tunnelPort,
     endpoint: record.mode === 'source' ? `${record.endpointHost}:${record.endpointPort}` : undefined,
-    block: record.mode === 'receiver' && record.publicHost && record.tunnelPort && record.tlsCert
+    // No block when the token was key-loss-scrubbed to '': the paired machine
+    // would fail on it as a token error, misdirecting away from the key loss.
+    block: record.mode === 'receiver' && record.publicHost && record.tunnelPort && record.tlsCert && record.token
       ? { host: record.publicHost, port: record.tunnelPort, cert: record.tlsCert, token: record.token }
       : undefined,
   };

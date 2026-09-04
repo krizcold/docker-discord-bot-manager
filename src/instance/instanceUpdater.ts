@@ -99,7 +99,7 @@ async function runInstanceUpdateTick(): Promise<void> {
       if (result.success) {
         console.log(`[InstanceUpdater] Instance ${bot.displayName} rebuilt successfully`);
         if (broadcastFn) {
-          broadcastFn('bot:rebuilt', containerManager.getBot(bot.id));
+          broadcastFn('bot:rebuilt', containerManager.withoutRecordSecrets(containerManager.getBot(bot.id)));
         }
       } else {
         console.error(`[InstanceUpdater] Failed to rebuild ${bot.displayName}: ${result.error}`);

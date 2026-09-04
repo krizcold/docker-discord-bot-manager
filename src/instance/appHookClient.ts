@@ -49,6 +49,11 @@ function resolveEndpoint(instance: InstanceConfig, action: AppHookAction): Resol
   const hooks: AppHooksSpec | undefined = caps?.hooks;
   if (!hooks) return { error: 'this app declares no lifecycle hooks' };
 
+  // '' is the registry's key-loss scrub marker (a minted token is never
+  // empty); undefined means the token was never minted.
+  if (instance.updateToken === '') {
+    return { error: 'the stored manager token no longer decrypts (the manager encryption key changed or was lost); restore the key' };
+  }
   const token = (instance.updateToken || '').trim();
   if (!token) return { error: 'this instance has no manager token yet (start it once)' };
 

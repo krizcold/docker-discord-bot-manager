@@ -39,6 +39,10 @@ import * as appLifecycle from '../../instance/appLifecycle';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
+// Every record that leaves for the browser (response or WS broadcast) goes
+// through this: the registry-held secrets never ship to the UI.
+const publicBot = containerManager.withoutRecordSecrets;
+
 // Full-bot WS payloads carry activeOp so cards can clear/set busy state
 // without waiting for the next GET /api/bots refresh.
 function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | (T & { activeOp: string | null }) {
@@ -92,7 +96,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         const hasDbBackups = bot.fleetDb ? undefined : fleetBackup.listFleetBackups(bot.id).length > 0;
 
         return {
-          ...bot,
+          ...publicBot(bot)!,
           autoUpdate: bot.autoUpdate || false,
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
@@ -154,8 +158,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           imageRef: body.imageRef,
           envVars: body.envVars,
         });
-        broadcastToClients(wss, 'bot:created', bot);
-        res.json({ success: true, bot });
+        broadcastToClients(wss, 'bot:created', publicBot(bot));
+        res.json({ success: true, bot: publicBot(bot) });
         return;
       }
 
@@ -165,8 +169,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           displayName: body.displayName,
           envVars: body.envVars,
         });
-        broadcastToClients(wss, 'bot:created', bot);
-        res.json({ success: true, bot });
+        broadcastToClients(wss, 'bot:created', publicBot(bot));
+        res.json({ success: true, bot: publicBot(bot) });
         return;
       }
 
@@ -314,7 +318,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
       }
 
-      res.json({ success: true, bot, source, repoInfo, updateAvailable });
+      res.json({ success: true, bot: publicBot(bot), source, repoInfo, updateAvailable });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -332,8 +336,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      broadcastToClients(wss, 'bot:updated', bot);
-      res.json({ success: true, bot });
+      broadcastToClients(wss, 'bot:updated', publicBot(bot));
+      res.json({ success: true, bot: publicBot(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -356,8 +360,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      broadcastToClients(wss, 'bot:updated', bot);
-      res.json({ success: true, bot });
+      broadcastToClients(wss, 'bot:updated', publicBot(bot));
+      res.json({ success: true, bot: publicBot(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -500,7 +504,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.startBot(botId).then((result) => {
-        const updatedBot = withActiveOp(containerManager.getBot(botId));
+        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
           broadcastToClients(wss, 'bot:started', updatedBot);
         } else {
@@ -531,7 +535,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const bot = withActiveOp(containerManager.getBot(req.params.id));
+      const bot = withActiveOp(publicBot(containerManager.getBot(req.params.id)));
       broadcastToClients(wss, 'bot:stopped', bot);
       res.json({ success: true, bot });
     } catch (error) {
@@ -560,7 +564,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.restartBot(botId).then((result) => {
-        const updatedBot = withActiveOp(containerManager.getBot(botId));
+        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
           broadcastToClients(wss, 'bot:restarted', updatedBot);
         } else {
@@ -608,7 +612,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // source itself, so no pre-fetch is needed here.
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(containerManager.getBot(botId)));
+          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(publicBot(containerManager.getBot(botId))));
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
@@ -641,7 +645,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.buildBot(botId).then((result) => {
-        const updatedBot = withActiveOp(containerManager.getBot(botId));
+        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
           broadcastToClients(wss, 'bot:built', updatedBot);
         } else {
@@ -992,7 +996,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       await containerManager.updateBot(req.params.id, { envVars: { ...vars } });
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1020,7 +1024,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       containerManager.removeBotEnvVars(req.params.id, [req.params.key]);
       containerManager.removeEnvKeyFromDeployedCompose(req.params.id, req.params.key);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1145,7 +1149,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       configFileManager.setConfigFiles(req.params.id, files);
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1238,7 +1242,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       containerManager.setWebUiReady(botId, true);
-      broadcastToClients(wss, 'bot:updated', containerManager.getBot(botId));
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(botId)));
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1284,7 +1288,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(containerManager.getBot(botId)));
+          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(publicBot(containerManager.getBot(botId))));
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
@@ -1315,7 +1319,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const updated = containerManager.updateInstanceAutoUpdate(req.params.id, enabled, interval, hour);
-      broadcastToClients(wss, 'bot:updated', updated);
+      broadcastToClients(wss, 'bot:updated', publicBot(updated));
       res.json({ success: true, autoUpdate: enabled, autoUpdateInterval: updated?.autoUpdateInterval, autoUpdateHour: updated?.autoUpdateHour });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1341,7 +1345,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const updated = containerManager.updateInstanceFleetBackup(req.params.id, enabled, hour, keep);
-      broadcastToClients(wss, 'bot:updated', updated);
+      broadcastToClients(wss, 'bot:updated', publicBot(updated));
       res.json({ success: true, fleetBackup: updated?.fleetBackup });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1510,7 +1514,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       } else {
         result = await fleetReplication.disableFleetReplication(bot);
       }
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1602,7 +1606,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(400).json({ success: false, error: "mode must be 'receiver' or 'source'" });
         return;
       }
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1617,7 +1621,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await recoveryChannel.disarmRecoveryChannel(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1647,7 +1651,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await recoveryRescue.startRescue(bot, req.body?.confirm === true);
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1662,7 +1666,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await recoveryRescue.cancelRescue(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1682,7 +1686,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = recoveryRescue.startSwap(bot, req.body?.confirm === true);
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1711,7 +1715,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const delivered = await appLifecycle.deliverCopyBlock(fresh);
           if (!delivered.success) console.warn(`[Bots] Copy block not republished after adopt on ${fresh.sanitizedName}: ${delivered.error}`);
         }
-        broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+        broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       }
       res.json(result);
     } catch (error) {
@@ -1757,7 +1761,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       const result = await fleetReplica.removeFleetReplica(bot);
       if (result.success) {
-        broadcastToClients(wss, 'bot:updated', containerManager.getBot(req.params.id));
+        broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
         res.json({ success: true, warning: "The primary's replication slot is now orphaned and retains WAL: disable replication on the primary, or provision a new replica soon" });
         return;
       }
@@ -1786,8 +1790,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const updated = containerManager.updateInstanceWebAuth(req.params.id, mode);
-      broadcastToClients(wss, 'bot:updated', updated);
-      res.json({ success: true, bot: updated });
+      broadcastToClients(wss, 'bot:updated', publicBot(updated));
+      res.json({ success: true, bot: publicBot(updated) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1850,7 +1854,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         confirmLag: req.body?.confirmLag === true,
         retireOldMaster: req.body?.retireOldMaster === true,
       });
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(bot.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1866,7 +1870,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = await appLifecycle.demote(bot, req.body?.confirm === true);
-      if (result.success) broadcastToClients(wss, 'bot:updated', containerManager.getBot(bot.id));
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

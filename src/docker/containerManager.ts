@@ -119,7 +119,9 @@ function loadRegistry(): InstanceRegistry {
   try {
     if (fs.existsSync(REGISTRY_FILE)) {
       const content = fs.readFileSync(REGISTRY_FILE, 'utf-8');
-      return JSON.parse(content);
+      const registry: InstanceRegistry = JSON.parse(content);
+      for (const inst of Object.values(registry.instances || {})) decryptRecordSecrets(inst);
+      return registry;
     }
   } catch (error) {
     console.error('[ContainerManager] Failed to load registry:', error);
@@ -152,12 +154,103 @@ function withoutSensitiveKeys(envVars: Record<string, string> | undefined): Reco
   return out;
 }
 
+// The four registry-held structured secrets (updateToken, the replication
+// password, the recovery channel's token and TLS key) persist encrypted, the
+// sibling of the env two-store strip for values that are not env vars and so
+// have no env-store home. In-memory records always carry plaintext; these
+// helpers run only at the load/save boundary. A pre-encryption plaintext value
+// passes through load untouched and self-scrubs to ciphertext on the next
+// save. On key loss the in-memory value reads '' (loud, warn-once) so
+// consumers refuse, while the original ciphertext is stashed and written back
+// verbatim by every save: the registry never loses it, and a restored key
+// heals everything in place on the next load.
+const warnedRecordSecrets = new Set<string>();
+const lostRecordBlobs = new Map<string, string>();
+
+function decryptRecordSecret(instId: string, field: string, value: string | undefined): string | undefined {
+  if (!value || !value.startsWith('v2:')) return value;
+  const key = `${instId}:${field}`;
+  // The derived key is fixed for the process lifetime, so a blob that failed
+  // once cannot heal without a restart: skip re-decrypting it (the decrypt
+  // helper logs per failure, and loads run on every registry accessor).
+  if (lostRecordBlobs.get(key) === value) return '';
+  const plain = envManager.decryptOrNull(value);
+  if (plain !== null) {
+    lostRecordBlobs.delete(key);
+    warnedRecordSecrets.delete(key);
+    return plain;
+  }
+  lostRecordBlobs.set(key, value);
+  if (!warnedRecordSecrets.has(key)) {
+    warnedRecordSecrets.add(key);
+    console.error(`[ContainerManager] ${field} for instance ${instId} no longer decrypts (encryption key changed or lost); its ciphertext stays preserved in the registry - restore the key, or re-provision the value`);
+  }
+  return '';
+}
+
+function decryptRecordSecrets(inst: InstanceConfig): void {
+  inst.updateToken = decryptRecordSecret(inst.id, 'updateToken', inst.updateToken);
+  if (inst.fleetDb?.replication) {
+    inst.fleetDb.replication.password = decryptRecordSecret(inst.id, 'fleetDb.replication.password', inst.fleetDb.replication.password) ?? '';
+  }
+  if (inst.recoveryChannel) {
+    inst.recoveryChannel.token = decryptRecordSecret(inst.id, 'recoveryChannel.token', inst.recoveryChannel.token) ?? '';
+    inst.recoveryChannel.tlsKey = decryptRecordSecret(inst.id, 'recoveryChannel.tlsKey', inst.recoveryChannel.tlsKey);
+  }
+}
+
+function encryptedOrStashed(instId: string, field: string, plain: string | undefined): string | undefined {
+  if (plain) return envManager.encrypt(plain);
+  // Only the '' scrub marker consults the stash: an ABSENT field means the
+  // operator re-provisioned the structure away (e.g. a receiver re-armed as
+  // source), and resurrecting the stale blob into it would mint a phantom
+  // key-loss forever.
+  if (plain === undefined) return undefined;
+  // '' with a stashed blob is a key-loss read: write the original ciphertext
+  // back so no save can destroy it.
+  return lostRecordBlobs.get(`${instId}:${field}`) ?? plain;
+}
+
+function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
+  const out: InstanceConfig = inst.envVars ? { ...inst, envVars: withoutSensitiveKeys(inst.envVars) } : { ...inst };
+  out.updateToken = encryptedOrStashed(inst.id, 'updateToken', out.updateToken);
+  if (out.fleetDb?.replication) {
+    out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: encryptedOrStashed(inst.id, 'fleetDb.replication.password', out.fleetDb.replication.password) ?? '' } };
+  }
+  if (out.recoveryChannel) {
+    const rc = { ...out.recoveryChannel };
+    rc.token = encryptedOrStashed(inst.id, 'recoveryChannel.token', rc.token) ?? '';
+    rc.tlsKey = encryptedOrStashed(inst.id, 'recoveryChannel.tlsKey', rc.tlsKey);
+    out.recoveryChannel = rc;
+  }
+  return out;
+}
+
+/**
+ * Response-boundary copy of a record with the four registry-held secrets
+ * removed: the browser has no use for them. (The recovery arm block carries
+ * its own copy-paste credential through its dedicated surface.)
+ */
+export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfig | null {
+  if (!inst) return inst;
+  const out: InstanceConfig = { ...inst };
+  delete out.updateToken;
+  if (out.fleetDb?.replication) {
+    out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
+  }
+  if (out.recoveryChannel) {
+    out.recoveryChannel = { ...out.recoveryChannel, token: '' };
+    delete out.recoveryChannel.tlsKey;
+  }
+  return out;
+}
+
 function saveRegistrySync(registry: InstanceRegistry): void {
   try {
     fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
     const instances: InstanceRegistry['instances'] = {};
     for (const [id, inst] of Object.entries(registry.instances)) {
-      instances[id] = inst.envVars ? { ...inst, envVars: withoutSensitiveKeys(inst.envVars) } : inst;
+      instances[id] = withRecordSecretsEncrypted(inst);
     }
     // Atomic write: a truncated/interrupted write (e.g. the container killed mid-save
     // during a rebuild) would otherwise corrupt the file, and the next load would
@@ -1336,7 +1429,7 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     // nudge the UI once the grace period elapses so its Open button un-gates.
     if (status === 'starting') {
       setTimeout(() => {
-        if (broadcastFn) broadcastFn('bot:updated', getBot(botId));
+        if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
       }, WEBUI_READY_GRACE_MS).unref();
     }
   }

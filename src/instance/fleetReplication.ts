@@ -193,6 +193,13 @@ export async function enableFleetReplication(
   }
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
+  // An existing posture whose password reads empty is a key-loss scrub, not an
+  // absent credential: minting a fresh one here would silently rotate the
+  // fleet's replication credential and break every standby at its next
+  // reconnect.
+  if (fleetDb.replication && !fleetDb.replication.password) {
+    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable replication and re-enable it to mint a fresh credential (existing standbys must then be re-seeded).' };
+  }
 
   const previousCertHost = fleetDb.replication?.certHost;
   // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
@@ -427,6 +434,12 @@ export async function getReplicaCopyBlock(
   const fleetDb = instance.fleetDb;
   const repl = fleetDb?.replication;
   if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled' };
+  // A key-loss-scrubbed password would mint a passwordless DSN that fails as
+  // an auth error on the OTHER machine, misdirecting the operator away from
+  // the key loss here.
+  if (!repl.password) {
+    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to mint a fresh credential.' };
+  }
   if (!await isContainerRunning(fleetDb.containerName)) {
     return { success: false, error: 'Database container is not running' };
   }

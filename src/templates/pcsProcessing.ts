@@ -14,6 +14,7 @@ import { BotConfig, DeploymentMode } from '../types';
 import { buildStatusPageService } from './statusPage';
 import { findConfigTemplate } from '../config/configTemplates';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { isCasaOSAvailable } from '../casaos/detector';
 
 const execAsync = promisify(exec);
 
@@ -1670,7 +1671,7 @@ export function removeFleetPostgresReplicaService(composeContent: string): strin
   return stringify(compose, { lineWidth: 0 });
 }
 
-// ─── Docker-mode volume + config-file delivery (Node fs, no casaos container) ──
+// ─── Docker-mode volume + config-file delivery (Node fs) ──
 
 function dockerEnsureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
@@ -1749,7 +1750,7 @@ function dockerDeclaredBinds(services: Record<string, Record<string, unknown>>, 
 /**
  * Docker-mode equivalent of createVolumeDirectories + applyUserConfigOverrides +
  * addConfigFileBinds + writeConfigFiles, using Node fs against the bot's own data
- * dir (no /DATA, no casaos container). Expects a compose whose relative binds were
+ * dir (no /DATA). Expects a compose whose relative binds were
  * already rewritten to absolute host paths under hostBotDir (processComposeForDocker).
  * Returns the (possibly modified) compose content with config-file binds added.
  */
@@ -1857,9 +1858,9 @@ export function redeliverDockerConfigFiles(
  * bot service runs as the injected PUID:PGID, so without this it hits EACCES on the
  * first in-place write to a delivered file. Reassigns ONLY root-owned paths (the Node
  * equivalent of `chown -R --from=root`), so a service that took its own bind dir
- * (e.g. Postgres -> uid 999) is left alone. On CasaOS this is handled by
- * fixPostDeployOwnership via the casaos sidecar; docker mode has no sidecar, so the
- * manager (which bind-mounts the data dir) chowns the host files directly.
+ * (e.g. Postgres -> uid 999) is left alone. The CasaOS equivalent is
+ * fixPostDeployOwnership, which sweeps the app dir and the metadata dir after a
+ * deploy; both reach the files directly, because the manager bind-mounts them.
  */
 export function fixDockerBotOwnership(containerBotDir: string, logFn?: (msg: string) => void): void {
   if (process.platform === 'win32') return;   // bind-mount ownership is virtualized on Docker Desktop
@@ -1888,6 +1889,102 @@ export function fixDockerBotOwnership(containerBotDir: string, logFn?: (msg: str
   if (fixed) log(`[Docker] Fixed ownership of ${fixed} root-owned path(s) -> ${uid}:${gid}`);
 }
 
+/**
+ * Hand a path the manager just wrote to the app's uid, optionally setting its
+ * mode. The manager runs as root with the AppData root mounted, so this reaches
+ * every app's files directly and needs no platform service.
+ *
+ * Only ROOT-owned entries are reassigned: a service that chowned its own bind
+ * mount to its runtime user (Postgres and its uid-999 0700 data dir) must be
+ * left alone, or it comes back to a permission error.
+ */
+let warnedNonNumericIds = false;
+
+export function grantToApp(
+  target: string,
+  opts: { recursive?: boolean; mode?: string; log?: (msg: string) => void } = {},
+): void {
+  if (process.platform === 'win32') return;   // bind-mount ownership is virtualized on Docker Desktop
+  const pcs = getPCSEnvironment();
+  const uid = parseInt(pcs.PUID, 10);
+  const gid = parseInt(pcs.PGID, 10);
+  const warn = opts.log || ((msg: string) => console.warn(msg));
+
+  // A silent ownership failure surfaces much later as the bot hitting EACCES on
+  // its own files, so say it here instead. The PUID/PGID complaint is about the
+  // environment, not the path, so it is said once per process rather than once
+  // per delivered file.
+  let failure: string | null = null;
+  const ownable = Number.isInteger(uid) && Number.isInteger(gid);
+  if (!ownable && !warnedNonNumericIds) {
+    warnedNonNumericIds = true;
+    warn(`[PCS] Warning: PUID/PGID are not numeric (${pcs.PUID}:${pcs.PGID}), delivered files are left owned by root`);
+  }
+
+  const chownRootOwned = (p: string): void => {
+    let st: fs.Stats;
+    try { st = fs.lstatSync(p); } catch { return; }
+    if (st.uid === 0) {
+      try { (st.isSymbolicLink() ? fs.lchownSync : fs.chownSync)(p, uid, gid); }
+      catch (e) { if (!failure) failure = `${p}: ${e}`; }
+    }
+    if (opts.recursive && st.isDirectory()) {
+      let entries: string[] = [];
+      try { entries = fs.readdirSync(p); } catch { return; }
+      for (const e of entries) chownRootOwned(path.join(p, e));
+    }
+  };
+  if (ownable) chownRootOwned(target);
+
+  // Only the named target: a recursive chown carries no single right mode
+  // (directories need the execute bit that files must not have). chmod follows
+  // a symlink where lchown above does not, so a planted link is left alone
+  // rather than having its target's mode changed.
+  if (opts.mode !== undefined) {
+    try {
+      if (!fs.lstatSync(target).isSymbolicLink()) fs.chmodSync(target, parseInt(opts.mode, 8));
+    } catch (e) { if (!failure) failure = `${target} mode ${opts.mode}: ${e}`; }
+  }
+
+  if (failure) warn(`[PCS] Warning: could not set ownership or mode (${failure})`);
+}
+
+/**
+ * Hand an OPEN file to the app's uid. Chowning the fd rather than the path is
+ * what makes this safe against a component being swapped after the path was
+ * checked: the inode is already pinned, so the change cannot be redirected.
+ */
+export function grantFd(fd: number, log?: (msg: string) => void): void {
+  if (process.platform === 'win32') return;   // bind-mount ownership is virtualized on Docker Desktop
+  const pcs = getPCSEnvironment();
+  const uid = parseInt(pcs.PUID, 10);
+  const gid = parseInt(pcs.PGID, 10);
+  const warn = log || ((msg: string) => console.warn(msg));
+
+  if (!Number.isInteger(uid) || !Number.isInteger(gid)) {
+    if (!warnedNonNumericIds) {
+      warnedNonNumericIds = true;
+      warn(`[PCS] Warning: PUID/PGID are not numeric (${pcs.PUID}:${pcs.PGID}), delivered files are left owned by root`);
+    }
+    return;
+  }
+  try {
+    if (fs.fstatSync(fd).uid === 0) fs.fchownSync(fd, uid, gid);
+  } catch (e) {
+    warn(`[PCS] Warning: could not set ownership on the written file (${e})`);
+  }
+}
+
+/**
+ * mkdir -p that hands every level it actually had to create to the app. Node
+ * reports the FIRST directory created, so the recursive grant starts there and
+ * never touches pre-existing parents.
+ */
+function mkdirForApp(dirPath: string, log?: (msg: string) => void): void {
+  const created = fs.mkdirSync(dirPath, { recursive: true });
+  if (created) grantToApp(created, { recursive: true, log });
+}
+
 // ─── Volume Directory Creation ─────────────────────────────────────────────
 
 /**
@@ -1898,24 +1995,15 @@ export function fixDockerBotOwnership(containerBotDir: string, logFn?: (msg: str
  * on redeploy. `mode` lets a delivered dir a container must write to be made
  * world-writable (e.g. a Lavalink plugins dir it downloads into at startup).
  */
-async function ensureVolumeDir(
+function ensureVolumeDir(
   dirPath: string,
-  log: (msg: string) => void,
   mode = '755',
   preserveExisting = true,
-): Promise<void> {
+  log?: (msg: string) => void,
+): void {
   if (preserveExisting && fs.existsSync(dirPath)) return;
-  try {
-    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dirPath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${dirPath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chmod ${mode} "${dirPath}"`, { timeout: 10000 });
-  } catch {
-    fs.mkdirSync(dirPath, { recursive: true });
-    try {
-      await execAsync(`chown 1000:1000 "${dirPath}"`, { timeout: 5000 });
-      await execAsync(`chmod ${mode} "${dirPath}"`, { timeout: 5000 });
-    } catch { /* best effort */ }
-  }
+  mkdirForApp(dirPath, log);
+  grantToApp(dirPath, { mode, log });
 }
 
 // Repo entries never delivered into a bind mount (heavy / irrelevant).
@@ -1934,20 +2022,11 @@ async function deliverRepoFile(repoSrc: string, target: string, log: (msg: strin
     if (st.isFile() && st.size > 0) return;   // seed: keep an already-delivered/mutated (non-empty) file
     // Re-deliver over an EMPTY file (e.g. a config blanked by accident) or a
     // wrong-type target (an empty dir Docker created where a file belongs).
-    try { await execAsync(`docker exec casaos rm -rf "${target}"`, { timeout: 10000 }); }
-    catch { try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ } }
+    try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ }
   }
-  await ensureVolumeDir(path.dirname(target), log);
+  ensureVolumeDir(path.dirname(target), '755', true, log);
   fs.writeFileSync(target, fs.readFileSync(repoSrc));
-  try {
-    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${target}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chmod 644 "${target}"`, { timeout: 10000 });
-  } catch {
-    try {
-      await execAsync(`chown 1000:1000 "${target}"`, { timeout: 5000 });
-      await execAsync(`chmod 644 "${target}"`, { timeout: 5000 });
-    } catch { /* best effort */ }
-  }
+  grantToApp(target, { mode: '644', log });
 }
 
 /**
@@ -1956,7 +2035,7 @@ async function deliverRepoFile(repoSrc: string, target: string, log: (msg: strin
 async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
   // A repo-provided bind dir is app-managed and a foreign-uid container may need
   // to write into it (e.g. Lavalink downloading plugin jars), so make it writable.
-  await ensureVolumeDir(target, log, '777', false);
+  ensureVolumeDir(target, '777', false, log);
   for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
     if (SKIP_DELIVER.has(entry.name)) continue;
     const childRepo = path.join(repoSrc, entry.name);
@@ -2036,7 +2115,7 @@ export async function createVolumeDirectories(
         await deliverRepoDir(repoSrc, target, log);
         log(`[PCS] Delivered directory to volume path: ${target}`);
       } else {
-        await ensureVolumeDir(target, log);
+        ensureVolumeDir(target, '755', true, log);
         log(`[PCS] Created volume directory: ${target}`);
       }
     } catch (err) {
@@ -2064,42 +2143,12 @@ export async function saveToCasaOSMetadata(
   const composePath = path.join(metadataDir, 'docker-compose.yml');
 
   // Create metadata directory
-  try {
-    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${metadataDir}"`, {
-      timeout: 10000,
-    });
-    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${metadataDir}"`, {
-      timeout: 10000,
-    });
-  } catch {
-    try {
-      fs.mkdirSync(metadataDir, { recursive: true });
-      await execAsync(`chown -R 1000:1000 "${metadataDir}"`, { timeout: 5000 });
-    } catch (fallbackErr) {
-      log(`[PCS] Warning: Could not set ownership on ${metadataDir}: ${fallbackErr}`);
-      fs.mkdirSync(metadataDir, { recursive: true });
-    }
-  }
+  mkdirForApp(metadataDir, log);
+  grantToApp(metadataDir, { recursive: true, log });
 
   // Write compose file
   fs.writeFileSync(composePath, composeContent);
-
-  // Fix ownership on compose file
-  try {
-    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${composePath}"`, {
-      timeout: 10000,
-    });
-    await execAsync(`docker exec casaos chmod 644 "${composePath}"`, {
-      timeout: 10000,
-    });
-  } catch {
-    try {
-      await execAsync(`chown 1000:1000 "${composePath}"`, { timeout: 5000 });
-      await execAsync(`chmod 644 "${composePath}"`, { timeout: 5000 });
-    } catch {
-      // Best effort
-    }
-  }
+  grantToApp(composePath, { mode: '644', log });
 
   log(`[PCS] Saved CasaOS metadata compose to ${composePath}`);
   return composePath;
@@ -2107,7 +2156,7 @@ export async function saveToCasaOSMetadata(
 
 /**
  * Write the status-page index.html into the sidecar's bind-mounted dir.
- * Mirrors saveToCasaOSMetadata's docker-exec-into-casaos write pattern.
+ * Mirrors saveToCasaOSMetadata's write pattern.
  */
 export async function writeStatusPage(
   appName: string,
@@ -2120,32 +2169,11 @@ export async function writeStatusPage(
   const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'status-page');
   const filePath = path.join(dir, 'index.html');
 
-  try {
-    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dir}"`, { timeout: 10000 });
-  } catch {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      await execAsync(`chown -R 1000:1000 "${dir}"`, { timeout: 5000 });
-    } catch (fallbackErr) {
-      log(`[PCS] Warning: Could not set ownership on ${dir}: ${fallbackErr}`);
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  }
+  mkdirForApp(dir, log);
+  grantToApp(dir, { recursive: true, log });
 
   fs.writeFileSync(filePath, html);
-
-  try {
-    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chmod 644 "${filePath}"`, { timeout: 10000 });
-  } catch {
-    try {
-      await execAsync(`chown 1000:1000 "${filePath}"`, { timeout: 5000 });
-      await execAsync(`chmod 644 "${filePath}"`, { timeout: 5000 });
-    } catch {
-      // Best effort
-    }
-  }
+  grantToApp(filePath, { mode: '644', log });
 
   log(`[PCS] Wrote status page to ${filePath}`);
   return filePath;
@@ -2202,7 +2230,7 @@ export function addConfigFileBinds(
 
 /**
  * Write user-supplied config files into the bind-mounted config dir.
- * Mirrors writeStatusPage's docker-exec-into-casaos write pattern.
+ * Mirrors writeStatusPage's write pattern.
  */
 export async function writeConfigFiles(
   appName: string,
@@ -2214,33 +2242,13 @@ export async function writeConfigFiles(
   const pcs = getPCSEnvironment();
   const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'config');
 
-  try {
-    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chown -R ubuntu:ubuntu "${dir}"`, { timeout: 10000 });
-  } catch {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-      await execAsync(`chown -R 1000:1000 "${dir}"`, { timeout: 5000 });
-    } catch (fallbackErr) {
-      log(`[PCS] Warning: Could not set ownership on ${dir}: ${fallbackErr}`);
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  }
+  mkdirForApp(dir, log);
+  grantToApp(dir, { recursive: true, log });
 
   for (const f of files) {
     const filePath = path.join(dir, path.basename(f.path));
     fs.writeFileSync(filePath, f.body);
-    try {
-      await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
-      await execAsync(`docker exec casaos chmod 644 "${filePath}"`, { timeout: 10000 });
-    } catch {
-      try {
-        await execAsync(`chown 1000:1000 "${filePath}"`, { timeout: 5000 });
-        await execAsync(`chmod 644 "${filePath}"`, { timeout: 5000 });
-      } catch {
-        // Best effort
-      }
-    }
+    grantToApp(filePath, { mode: '644', log });
     log(`[PCS] Wrote config file to ${filePath}`);
   }
 }
@@ -2315,21 +2323,12 @@ export async function applyUserConfigOverrides(
     if (!source) continue;   // not a compose-declared bind -> caller adds a bind instead
     handled.add(cf.path);
     try {
-      await ensureVolumeDir(path.dirname(source), log);
+      ensureVolumeDir(path.dirname(source), '755', true, log);
       // The user's stored config is authoritative for this bind: replace whatever
       // createVolumeDirectories delivered (the repo template) with the user's body.
-      try { await execAsync(`docker exec casaos rm -rf "${source}"`, { timeout: 10000 }); }
-      catch { try { fs.rmSync(source, { recursive: true, force: true }); } catch { /* best effort */ } }
+      try { fs.rmSync(source, { recursive: true, force: true }); } catch { /* best effort */ }
       fs.writeFileSync(source, cf.body);
-      try {
-        await execAsync(`docker exec casaos chown ubuntu:ubuntu "${source}"`, { timeout: 10000 });
-        await execAsync(`docker exec casaos chmod 644 "${source}"`, { timeout: 10000 });
-      } catch {
-        try {
-          await execAsync(`chown 1000:1000 "${source}"`, { timeout: 5000 });
-          await execAsync(`chmod 644 "${source}"`, { timeout: 5000 });
-        } catch { /* best effort */ }
-      }
+      grantToApp(source, { mode: '644', log });
       log(`[PCS] Delivered user config to ${source} (bind ${cf.path})`);
     } catch (err) {
       log(`[PCS] Warning: could not deliver user config for ${cf.path}: ${err}`);
@@ -2366,20 +2365,10 @@ export async function writeComposeEnvFile(
     .filter(([key]) => key)
     .map(([key, value]) => `${key}=${formatDotenvValue(value)}`);
 
-  try {
-    await execAsync(`docker exec --user ubuntu casaos mkdir -p "${dir}"`, { timeout: 10000 });
-  } catch {
-    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best effort */ }
-  }
+  try { mkdirForApp(dir, log); } catch { /* best effort */ }
 
   fs.writeFileSync(filePath, lines.join('\n') + '\n');
-
-  try {
-    await execAsync(`docker exec casaos chown ubuntu:ubuntu "${filePath}"`, { timeout: 10000 });
-    await execAsync(`docker exec casaos chmod 600 "${filePath}"`, { timeout: 10000 });
-  } catch {
-    try { await execAsync(`chmod 600 "${filePath}"`, { timeout: 5000 }); } catch { /* best effort */ }
-  }
+  grantToApp(filePath, { mode: '600', log });
 
   log(`[PCS] Wrote ${lines.length} env var(s) to ${filePath}`);
   return filePath;
@@ -2431,10 +2420,10 @@ export async function removeAppData(
 
 /**
  * Fix ownership of directories Docker may have created as root after deploy.
- * Only ROOT-owned paths are reassigned (`--from=root`): a service that chowned
- * its own bind mount to its runtime user (e.g. Postgres setting its data dir to
- * uid 999, mode 0700) is left alone, otherwise this would steal it back to 1000
- * and break the container with a permission error.
+ * Only ROOT-owned paths are reassigned: a service that chowned its own bind
+ * mount to its runtime user (e.g. Postgres setting its data dir to uid 999,
+ * mode 0700) is left alone, otherwise this would steal it back to 1000 and
+ * break the container with a permission error.
  */
 export async function fixPostDeployOwnership(
   appName: string,
@@ -2446,23 +2435,13 @@ export async function fixPostDeployOwnership(
   const appDataDir = path.join(pcs.DATA_ROOT, 'AppData', appName);
   const metadataDir = path.join(pcs.DATA_ROOT, 'AppData', 'casaos', 'apps', appName);
 
-  const fixDir = async (dirPath: string) => {
+  const fixDir = (dirPath: string) => {
     if (!fs.existsSync(dirPath)) return;
-    try {
-      await execAsync(`docker exec casaos chown -R --from=root ubuntu:ubuntu "${dirPath}"`, {
-        timeout: 10000,
-      });
-    } catch {
-      try {
-        await execAsync(`chown -R --from=root 1000:1000 "${dirPath}"`, { timeout: 5000 });
-      } catch {
-        // Best effort
-      }
-    }
+    grantToApp(dirPath, { recursive: true, log });
   };
 
-  await fixDir(appDataDir);
-  await fixDir(metadataDir);
+  fixDir(appDataDir);
+  fixDir(metadataDir);
   log(`[PCS] Fixed post-deploy ownership for ${appName}`);
 }
 
@@ -2493,6 +2472,17 @@ export async function executeInstallCommand(
   const cmdKey = type === 'pre' ? 'pre-install-cmd' : 'post-install-cmd';
   const cmd = xcasaos[cmdKey];
   if (!cmd || typeof cmd !== 'string') return;
+
+  // This is the APP's own shell, so it runs in the platform's container and
+  // never in the manager, which holds the docker socket. A host without that
+  // container has nowhere safe to run it, and saying so beats a bare
+  // "No such container" from the exec.
+  if (!(await isCasaOSAvailable())) {
+    const need = `needs the platform's casaos container, which this host does not run`;
+    if (type === 'pre') throw new Error(`The ${type}-install command ${need}`);
+    log(`[PCS] Warning: skipped the ${type}-install command because it ${need}`);
+    return;
+  }
 
   const scriptId = Date.now().toString(36);
   const tempScript = `/tmp/botmgr-${type}install-${scriptId}.sh`;

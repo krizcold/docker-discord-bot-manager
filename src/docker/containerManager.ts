@@ -1132,7 +1132,8 @@ export async function deleteBot(botId: string, keepData: boolean = false): Promi
 /**
  * Everything a delete is responsible for removing that still exists. Empty
  * means the delete achieved its goal regardless of what individual steps
- * reported (an already-uninstalled app fails the API call but leaves nothing).
+ * reported (a step can error, such as a failed docker rm or a retry after a
+ * partial delete, while nothing it owns actually remains).
  */
 async function listDeleteRemnants(
   instance: InstanceConfig,
@@ -1245,27 +1246,8 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   // 1. Uninstall containers
   try {
     if (deploymentMode === 'casaos') {
-      if (keepData) {
-        console.log(`[ContainerManager] Preserving data; manual cleanup only for ${appName}`);
-        const cleanup = await performManualCleanup(appName, false);
-        failures.push(...cleanup.failures);
-      } else {
-        let apiSuccess = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          console.log(`[ContainerManager] CasaOS API uninstall attempt ${attempt}/3 for ${appName}...`);
-          const result = await casaosApi.uninstallApp(appName);
-          if (result) {
-            apiSuccess = true;
-            break;
-          }
-          if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
-        }
-        const cleanup = await performManualCleanup(appName, true);
-        failures.push(...cleanup.failures);
-        if (!apiSuccess) {
-          failures.push(`CasaOS API uninstall failed after 3 attempts for ${appName} (manual cleanup attempted)`);
-        }
-      }
+      const cleanup = await performManualCleanup(appName, !keepData);
+      failures.push(...cleanup.failures);
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
       const cleanup = await performDockerCleanup(appName, composePath);
@@ -1631,8 +1613,8 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
 
 /**
  * Write a .env next to the bot's compose so `${VAR}` interpolation and `env_file:`
- * services resolve in docker mode. Mirrors writeComposeEnvFile but uses plain fs
- * (no /DATA, no docker-exec-into-casaos).
+ * services resolve in docker mode. Mirrors writeComposeEnvFile, but under the
+ * manager data dir rather than /DATA.
  */
 function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
   try {

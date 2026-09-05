@@ -342,8 +342,48 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   const wipe = await volExec(record.volume, `find ${PGDATA} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`);
   if (!wipe.ok) throw new Error(`could not clear the replica volume: ${wipe.stderr.trim()}`);
 
-  provisioning.set(instance.id, { phase: 'seeding', startedAt: Date.now() });
   const seedDsn = `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+
+  // A slot the WAL bound invalidated stays invalidated for good: a seed on it
+  // streams but retains nothing (the primary reports it unreserved while
+  // attached and loses it again at the first blip), so the re-seed the lost
+  // verdict prescribes would loop. The replicator role may drop and re-create
+  // slots, so an inactive invalidated slot is re-created here. A live one is
+  // left alone, and a MISSING one stays missing: a primary whose replication
+  // was disabled must keep refusing the seed exactly as before.
+  const resetName = `${seedName}-slot`;
+  await new Promise<void>(resolve => execFile('docker', ['rm', '-f', resetName], () => resolve()));
+  const slotReset = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+    const child = spawn('docker', ['run', '--rm', '--name', resetName,
+      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
+      '--entrypoint', 'psql', 'postgres:16-alpine',
+      seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
+      DO $$ DECLARE s record; BEGIN
+        SELECT active, wal_status INTO s FROM pg_replication_slots WHERE slot_name = '${record.slot}';
+        IF FOUND AND NOT s.active AND s.wal_status IN ('lost', 'unreserved') THEN
+          PERFORM pg_drop_replication_slot('${record.slot}');
+          PERFORM pg_create_physical_replication_slot('${record.slot}');
+        END IF;
+      END $$;`]);
+    let stderr = '';
+    // Same rule as the seed below: a signal to the CLI is proxied to psql as
+    // PID 1, which drops it, so the container is removed by name instead.
+    const timer = setTimeout(() => {
+      execFile('docker', ['rm', '-f', resetName], () => child.kill('SIGKILL'));
+    }, 60_000);
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
+    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
+  });
+  if (!slotReset.ok) {
+    // psql prints ERROR, DETAIL and CONTEXT lines; the ERROR line is the one
+    // to show, never with the DSN's password should it ever be echoed.
+    const lines = slotReset.stderr.trim().split('\n');
+    const reason = (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').split(dsn.password).join('***');
+    throw new Error(`could not reset the replication slot on the primary: ${reason}`);
+  }
+
+  provisioning.set(instance.id, { phase: 'seeding', startedAt: Date.now() });
   const seed = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
     const child = spawn('docker', ['run', '--rm', '--name', seedName,
       '-v', `${record.volume}:${PGDATA}`,

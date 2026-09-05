@@ -2976,6 +2976,18 @@
           : live.receiverStatus !== 'streaming'
             ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
             : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
+      // What the PRIMARY says about this copy's slot, relayed through the bot:
+      // the only side that can tell a lost slot from a primary that is offline.
+      const slot = res.slot || null;
+      const slotHtml = !slot
+        ? ''
+        : slot.lost
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. Remove the replica and provision it again from a fresh copy block.</div>`
+          : slot.walStatus === 'absent'
+            ? `<div class="error-message">The primary has no replication slot named <b>${escapeHtml(slot.slotName)}</b> any more: this copy cannot resume streaming. Remove the replica and provision it again.</div>`
+            : slot.walStatus === 'unreserved'
+              ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> past the WAL retention bound and about to be invalidated; reconnect this standby now or plan a re-seed.</div>`
+              : `<div class="env-tip">Primary reports slot <b>${escapeHtml(slot.slotName)}</b>: ${slot.walStatus === 'unused' ? 'unused (no standby has attached to it yet)' : escapeHtml(slot.walStatus)}${slot.observedAt ? ` (as of ${new Date(slot.observedAt).toLocaleTimeString()})` : ''}</div>`;
       // The transfer surface is offered only while this really is a copy: a
       // promoted database is no longer a standby and its instance is the master
       // side already.
@@ -2995,6 +3007,7 @@
         ${errHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${stateHtml}
+        ${slotHtml}
         <div class="env-tip">The bot on this instance picks the replica up (for promote-the-pair) on its next restart.</div>
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>

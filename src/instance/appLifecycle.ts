@@ -28,6 +28,13 @@ export interface AppFacts {
   takeoverHold: any;
   staleMasterPark: any;
   copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
+  /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
+  standbySlot: {
+    slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;
+    observedAt: number; receivedAt: number; fromNodeId: string; fromTerm: number; sourceIsCurrentMaster: boolean | null;
+  } | null;
+  /** The app's own verdict: the fact is fresh, the slot is lost, and it is on the master this copy follows. */
+  standbySlotLost: boolean;
 }
 
 export interface ActionResult {
@@ -66,9 +73,9 @@ function fromHook(result: { ok: boolean; body?: any; error?: string }): ActionRe
 }
 
 /** The app's recorded facts, or a named reason they could not be read. */
-export async function getAppFacts(instance: InstanceConfig): Promise<{ success: boolean; facts?: AppFacts; error?: string }> {
+export async function getAppFacts(instance: InstanceConfig, timeoutMs?: number): Promise<{ success: boolean; facts?: AppFacts; error?: string }> {
   if (!hasAppHooks(instance)) return { success: false, error: 'this app declares no lifecycle hooks' };
-  const result = await callAppHook<AppFacts & { success: boolean }>(instance, 'facts', 'GET');
+  const result = await callAppHook<AppFacts & { success: boolean }>(instance, 'facts', 'GET', undefined, timeoutMs);
   if (!result.ok) return { success: false, error: result.error };
   return { success: true, facts: result.body as AppFacts };
 }

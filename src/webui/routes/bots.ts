@@ -1532,7 +1532,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot) });
+      // The primary's word on this standby's slot rides the cached health
+      // verdict (20.17); the live probe below cannot see it from this machine.
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

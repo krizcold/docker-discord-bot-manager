@@ -78,6 +78,7 @@ export async function callAppHook<T = any>(
   action: AppHookAction,
   method: 'GET' | 'POST' = 'POST',
   body?: unknown,
+  timeoutMs: number = HOOK_TIMEOUT_MS,
 ): Promise<AppHookResult<T>> {
   const resolved = resolveEndpoint(instance, action);
   if ('error' in resolved) return { ok: false, error: resolved.error };
@@ -92,7 +93,7 @@ export async function callAppHook<T = any>(
       body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
       // A direct container dial has no legitimate redirect; never replay the token.
       redirect: 'error',
-      signal: AbortSignal.timeout(HOOK_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const parsed: any = await res.json().catch(() => null);
     if (!res.ok) {

@@ -13,7 +13,7 @@
 
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
-import { getFleetReplicaStatus } from './fleetReplica';
+import { getFleetReplicaStatus, seedPurposeLabel, AUTO_RESEED_MAX_ATTEMPTS } from './fleetReplica';
 import { getAppFacts } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
@@ -167,6 +167,9 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   if (status.provisioning) {
     return { ...base, severity: 'ok', message: `Provisioning (${status.provisioning.phase})`, lagSeconds: null };
   }
+  if (status.parkedSeed) {
+    return { ...base, severity: 'error', message: `${seedPurposeLabel(status.parkedSeed.purpose)} stopped during ${status.parkedSeed.phase}: ${status.parkedSeed.lastError}`, lagSeconds: null };
+  }
   const live = status.live;
   // live ABSENT means the status could not even be probed (e.g. a record
   // stamped before the identity fields), which is a different claim than a
@@ -184,7 +187,12 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // slot can never be resumed, whereas "not streaming" alone cannot tell a
   // lost slot from a primary that is merely offline.
   if (slot?.lost) {
-    return { ...base, severity: 'error', message: `The primary reports replication slot ${slot.slotName} as lost (its retained WAL passed the bound); this copy can never catch up and must be re-seeded`, lagSeconds: null };
+    const ledger = status.autoReseed;
+    const who = ledger?.trigger === 'operator' ? 'the last manual re-seed' : 'the automatic re-seed';
+    const auto = ledger?.lastError
+      ? `; ${who} ${ledger.attempts >= AUTO_RESEED_MAX_ATTEMPTS ? `stopped after ${ledger.attempts} attempts` : `failed (attempt ${ledger.attempts})`}: ${ledger.lastError}`
+      : '; the manager re-seeds it automatically from the copy block the bot holds';
+    return { ...base, severity: 'error', message: `The primary reports replication slot ${slot.slotName} as lost (its retained WAL passed the bound); this copy can never catch up${auto}`, lagSeconds: null };
   }
   if (slot && slot.walStatus === 'absent') {
     return { ...base, severity: 'error', message: `The primary has no replication slot named ${slot.slotName} any more; this copy cannot resume streaming and must be re-seeded`, lagSeconds: null };
@@ -206,8 +214,13 @@ async function runTick(): Promise<void> {
   const instances = containerManager.getAllBots();
   const live = new Set<string>();
   for (const instance of instances) {
-    const isPrimary = !!instance.fleetDb?.replication;
-    const isReplica = !!instance.fleetDbReplica;
+    // A seed has no standby record for two of its three purposes, so it would
+    // fall through the role gate unreported. A LIVE primary still outranks it;
+    // a stopped one is not making a live claim, and only the replica sample
+    // can report the seed at all.
+    const seeding = !!instance.fleetDbReplicaSeed;
+    const isPrimary = !!instance.fleetDb?.replication && !(seeding && instance.status !== 'running');
+    const isReplica = !!instance.fleetDbReplica || seeding;
     if (!isPrimary && !isReplica) continue;
     live.add(instance.id);
     // A stopped PRIMARY instance is an operator decision, not a broken link

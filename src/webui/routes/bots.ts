@@ -1774,6 +1774,46 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
+   * DELETE /api/bots/:id/fleet-replica/seed - Cancel the seed in flight
+   * (preparing or seeding), or dismiss a parked one. Past the copy the answer
+   * is to remove the standby afterwards.
+   */
+  router.delete('/:id/fleet-replica/seed', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetReplica.cancelReplicaSeed(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-replica/reseed - Re-seed this standby now from
+   * the copy block the bot holds (the automatic re-seed's manual retry; resets
+   * its attempt ledger). Async: poll GET /fleet-replica for the phase.
+   */
+  router.post('/:id/fleet-replica/reseed', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetReplica.reseedStandby(bot, 'operator');
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
    * PUT /api/bots/:id/web-auth - Set the public URL auth mode on the INSTANCE.
    * Applies on the bot's next start.
    */

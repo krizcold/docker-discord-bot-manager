@@ -14,6 +14,8 @@ import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
 import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
+import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
+import { startFleetReplicaAuto, stopFleetReplicaAuto } from './instance/fleetReplicaAuto';
 import { startRecoveryChannelReconciler, stopRecoveryChannelReconciler } from './instance/recoveryChannel';
 import { startRecoveryControlServer, stopRecoveryControlServer } from './instance/recoveryControl';
 import { resumeRecoveryRescues } from './instance/recoveryRescue';
@@ -96,6 +98,7 @@ async function main(): Promise<void> {
   console.log('[Init] Syncing container states...');
   resetTransientStatuses();
   await syncContainerStates();
+  await parkInterruptedReplicaSeeds();
 
   // Start web server
   console.log('[Init] Starting web server...');
@@ -112,6 +115,9 @@ async function main(): Promise<void> {
 
   // Start the replication health sampler (feeds the instance list's badges)
   startFleetReplicationHealth();
+
+  // Automatic re-seed of a standby whose slot the primary reports lost (20.14)
+  startFleetReplicaAuto();
 
   // Keep armed recovery-channel relays alive (the record survives; the helper must too)
   startRecoveryChannelReconciler();
@@ -131,6 +137,7 @@ process.on('SIGTERM', () => {
   stopInstanceUpdater();
   stopFleetBackupScheduler();
   stopFleetReplicationHealth();
+  stopFleetReplicaAuto();
   stopRecoveryChannelReconciler();
   stopRecoveryControlServer();
   stopStateReconciler();

@@ -88,6 +88,45 @@ export interface FleetDbReplicaRecord {
   publicHost: string;                  // this machine's advertised host (post-promotion serving)
   hostPort: number;                    // published host port (container 5432)
   certHost: string;                    // host THIS standby's own server cert names
+  /** The automatic re-seed's attempt ledger (PLAN_REPLICATION 20.14): paces the tick and stops it after the cap. */
+  autoReseed?: FleetReplicaAutoReseedLedger;
+  /** The manager cleared this copy for a re-seed that has not finished: there is nothing to serve, protect or start. */
+  copyCleared?: boolean;
+}
+
+export interface FleetReplicaAutoReseedLedger {
+  attempts: number;
+  lastAttemptAt: number;
+  /** Who asked for the last attempt, so the operator's own retry is never reported as the automation's. */
+  trigger: 'automatic' | 'operator';
+  lastError?: string;
+  lastSuccessAt?: number;
+}
+
+export type FleetReplicaSeedPurpose = 'provision' | 'reseed-standby' | 'reseed-stale-primary';
+export type FleetReplicaSeedPhase = 'preparing' | 'seeding' | 'configuring' | 'starting';
+
+// The standby seed in flight (PLAN_REPLICATION 20.14, B4m-2b). Persisted so a
+// manager restart shows the operation instead of losing it; endpoints only,
+// never the replication credential, which the seed takes from its intake.
+export interface FleetReplicaSeedRecord {
+  purpose: FleetReplicaSeedPurpose;
+  phase: FleetReplicaSeedPhase;
+  startedAt: number;
+  updatedAt: number;
+  publicHost: string;
+  hostPort: number;
+  primaryHost: string;
+  primaryPort: number;
+  slot: string;
+  /** Past the first irreversible step (the copy cleared, or the stale database retired), so cancelling can no longer restore what was there. */
+  committed?: boolean;
+  /** No runner owns it any more (it failed, or the manager restarted mid-seed): kept for display until Retry or Dismiss. */
+  parked?: boolean;
+  /** An operator stopped this run, so nothing may restart it on their behalf. */
+  cancelled?: boolean;
+  lastError?: string;
+  cancelRequested?: boolean;
 }
 
 // Recovery-channel arm state (PLAN_REPLICATION.md Section 18, RC-2). One
@@ -173,6 +212,7 @@ export interface InstanceConfig {
   webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
+  fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults

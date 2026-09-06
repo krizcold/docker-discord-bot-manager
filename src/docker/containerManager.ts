@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, RecoveryChannelRecord, RecoveryRescueRecord,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
   ContainerInfo,
 } from '../types';
 import * as dockerClient from './dockerClient';
@@ -577,6 +577,22 @@ export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryResc
   return instance;
 }
 
+export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetReplicaSeedRecord | null): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return null;
+  if (seed) instance.fleetDbReplicaSeed = seed;
+  else delete instance.fleetDbReplicaSeed;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return instance;
+}
+
+/** For modules that change an instance outside a route (the routes broadcast themselves). */
+export function broadcastBotUpdated(botId: string): void {
+  if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
+}
+
 /**
  * Write the standby service into the DEPLOYED compose and start it (targeted
  * up; the running app service is untouched). Used by the provisioning flow;
@@ -638,12 +654,15 @@ export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean;
   }
   stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume };
   delete stored.fleetDbReplica;
+  // The seed record is about the standby this adopt just consumed.
+  delete stored.fleetDbReplicaSeed;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   const live = getBot(botId);
   if (live) {
     live.fleetDb = { ...stored.fleetDb };
     delete live.fleetDbReplica;
+    delete live.fleetDbReplicaSeed;
   }
   return { success: true };
 }
@@ -1170,6 +1189,8 @@ async function listDeleteRemnants(
     `${instance.sanitizedName}-recovery-rsyncd`,
     `${instance.sanitizedName}-recovery-rsync`,
     `${instance.sanitizedName}-fleet-replica-seed`,
+    `${instance.sanitizedName}-fleet-replica-seed-slot`,
+    `${instance.sanitizedName}-fleet-postgres-replica-data-helper`,
   ]) {
     if (!name) continue;
     const present = await execAsync(`docker inspect "${name}"`).then(() => true).catch(() => false);
@@ -1326,6 +1347,8 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   // same names unconditionally - a remnant the delete never retries removing
   // would wedge the delete in error forever.
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-slot`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-fleet-postgres-replica-data-helper`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsyncd`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsync`, failures);
 
@@ -2652,9 +2675,11 @@ async function buildDockerImageInstance(
 
   // Same rule as the git lanes: a rebuilt compose missing the standby service
   // would destroy the replica on the next up --remove-orphans.
-  if (instance.fleetDbReplica) {
+  if (instance.fleetDbReplica && !instance.fleetDbReplica.copyCleared) {
     composeContent = addFleetPostgresReplicaService(composeContent, botForCompose, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
     emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
+  } else if (instance.fleetDbReplica) {
+    emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
 
   writeComposeFile(botDir, composeContent);
@@ -2977,9 +3002,11 @@ async function buildGitInstance(
   // Re-inject the standby on every rebuild, in EVERY compose lane: compose up
   // runs --remove-orphans, so a rebuilt compose missing this service would
   // destroy the replica.
-  if (instance.fleetDbReplica) {
+  if (instance.fleetDbReplica && !instance.fleetDbReplica.copyCleared) {
     composeContent = addFleetPostgresReplicaService(composeContent, botWithEnv, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
     emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
+  } else if (instance.fleetDbReplica) {
+    emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
 
   // Deliver volume dirs + user-edited config files (mode-aware).

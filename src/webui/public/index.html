@@ -2363,6 +2363,12 @@
       return bytes + ' B';
     }
 
+    function seedPurposeText(purpose) {
+      if (purpose === 'reseed-standby') return 'Re-seeding the standby';
+      if (purpose === 'reseed-stale-primary') return 'Re-seeding this database as a standby';
+      return 'Provisioning the standby';
+    }
+
     async function showFleetBackups(botId) {
       fleetBackupBotId = botId;
       const bot = bots.find(b => b.id === botId);
@@ -2409,6 +2415,7 @@
 
       content.innerHTML = `
         <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
+        <div id="fleet-seed-banner"></div>
         ${fb.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : ''}
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
           <label class="toggle-switch">
@@ -2434,8 +2441,52 @@
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
         </div>`;
+      renderSeedBanner(botId);
       renderFleetReplication(botId);
       renderRecoveryChannel(botId);
+    }
+
+    let seedBannerSeq = 0;
+    /**
+     * The seed surface for an instance that hosts its own database: a
+     * stale-primary re-seed keeps that modal until its own retire runs. Server
+     * state only, so the phase, the cancel window and what is already gone are
+     * all the manager's live answer rather than a list snapshot.
+     */
+    async function renderSeedBanner(botId) {
+      const box = document.getElementById('fleet-seed-banner');
+      if (!box || fleetBackupBotId !== botId) return;
+      const seq = ++seedBannerSeq;
+      let res = null;
+      try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
+      const still = document.getElementById('fleet-seed-banner');
+      if (!still || fleetBackupBotId !== botId || seq !== seedBannerSeq) return;
+      // An unreadable answer is UNKNOWN, never "no seed is running": this is the
+      // only seed surface an instance that hosts its own database has.
+      if (!res || !res.success) {
+        still.innerHTML = '<div class="env-tip">Could not read the seed state; retrying...</div>';
+        setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
+        return;
+      }
+      const r = res.replica || null;
+      if (r && r.provisioning) {
+        const p = r.provisioning;
+        const cancelHtml = p.cancelRequested
+          ? '<div class="env-tip">Cancelling at the next step...</div>'
+          : p.cancelable
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}')">Cancel</button></div>`
+            : '';
+        still.innerHTML = `<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${cancelHtml}`;
+        setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
+        return;
+      }
+      if (r && r.parkedSeed) {
+        const k = r.parkedSeed;
+        still.innerHTML = `<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}
+          <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}')">Dismiss</button></div></div>`;
+        return;
+      }
+      still.innerHTML = '';
     }
 
     // ─── Fleet DB Replication (PLAN_REPLICATION.md Stage 1) ───
@@ -2928,16 +2979,34 @@
       try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
       if (!res || !res.success) {
-        body.innerHTML = '<div class="error-message">Failed to load replica status</div>';
+        // Keep asking: this panel now carries the live Cancel and Dismiss, so
+        // one unreadable answer must not take them away until the modal is
+        // closed and reopened.
+        body.innerHTML = '<div class="error-message">Failed to load replica status; retrying...</div>';
+        setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
         return;
       }
       const r = res.replica || { present: false };
-      const errHtml = r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
+      const seedWhat = seedPurposeText;
+      // A parked seed (failed, or interrupted by a manager restart) stays on
+      // show until the operator retries or dismisses it.
+      const parked = r.parkedSeed || null;
+      const errHtml = parked
+        ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}')">Dismiss</button></div></div>`
+        : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
 
       if (r.provisioning) {
+        const p = r.provisioning;
+        const cancelHtml = p.cancelRequested
+          ? '<div class="env-tip">Cancelling at the next step...</div>'
+          : p.cancelable
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}')">Cancel</button></div>`
+            : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
         body.innerHTML = `
           ${errHtml}
-          <div class="env-tip">Provisioning: <b>${escapeHtml(r.provisioning.phase)}</b> (${r.provisioning.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>`;
+          <div class="env-tip">${seedWhat(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
+          ${cancelHtml}`;
         setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
         return;
       }
@@ -2978,11 +3047,15 @@
             : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
       // What the PRIMARY says about this copy's slot, relayed through the bot:
       // the only side that can tell a lost slot from a primary that is offline.
+      const led = r.autoReseed || null;
+      const stopped = !!(led && led.lastError && r.autoReseedStopped);
+      const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
+      const ownParkedReseed = !!(r.parkedSeed && r.parkedSeed.purpose === 'reseed-standby' && !r.parkedSeed.cancelled);
       const slot = res.slot || null;
       const slotHtml = !slot
         ? ''
         : slot.lost
-          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. Remove the replica and provision it again from a fresh copy block.</div>`
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. ${stopped ? 'Re-seeding it has stopped after repeated failures; see below.' : 'The manager re-seeds it automatically from the copy block the bot holds.'}</div>`
           : slot.walStatus === 'absent'
             ? `<div class="error-message">The primary has no replication slot named <b>${escapeHtml(slot.slotName)}</b> any more: this copy cannot resume streaming. Remove the replica and provision it again.</div>`
             : slot.walStatus === 'unreserved'
@@ -3002,15 +3075,32 @@
             <button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', true)">Transfer and retire</button>
           </div>
         </div>` : '';
+      // The re-seed ledger (20.14): who asked last, why it stopped, or when it last ran.
+      const ledWho = led && led.trigger === 'operator' ? 'Re-seed now' : 'Automatic re-seed';
+      const ledgerHtml = !led
+        ? ''
+        : led.lastError
+          ? `<div class="error-message">${ledWho} attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${stopped ? ' It has stopped after repeated failures; fix the cause, then use Re-seed now.' : cancelled ? ' It was cancelled, so nothing retries it; use Re-seed now when you want it.' : (slot && slot.lost) || ownParkedReseed ? ' It retries periodically until it succeeds.' : ''}</div>`
+          : led.lastSuccessAt
+            ? `<div class="env-tip">Last re-seed completed at ${new Date(led.lastSuccessAt).toLocaleString()}.</div>`
+            : `<div class="env-tip">${ledWho} attempt ${led.attempts} started at ${new Date(led.lastAttemptAt).toLocaleString()}.</div>`;
+      // Offered while this is still a copy: a live one, or one the manager's own
+      // stopped re-seed took down. A promoted database is adopted or removed,
+      // and a record too old to probe has no state to re-seed from.
+      const reseedHtml = (appHooks && r.live && live.inRecovery !== false)
+        ? `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
+        : '';
 
       body.innerHTML = `
         ${errHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${stateHtml}
         ${slotHtml}
+        ${ledgerHtml}
         <div class="env-tip">The bot on this instance picks the replica up (for promote-the-pair) on its next restart.</div>
-        <div style="margin-top:6px;">
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
+          ${reseedHtml}
         </div>
         ${transferHtml}`;
     }
@@ -3114,6 +3204,43 @@
         }
       } catch (err) {
         showMessage('error', 'Failed to remove replica');
+      }
+      renderFleetReplica(botId);
+      loadBots();
+    }
+
+    async function cancelReplicaSeed(botId, parked, committed, purpose) {
+      const gone = purpose === 'reseed-stale-primary'
+        ? 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.'
+        : purpose === 'reseed-standby'
+          ? 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.'
+          : 'The partial copy is discarded; nothing else on this instance is affected.';
+      const warn = committed ? `\n\n${gone}` : '\n\nNothing has been deleted by this run yet.';
+      const question = parked
+        ? `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`
+        : `Cancel this seed?\n\nThe copy stops at its next step.${warn}`;
+      if ((!parked || committed) && !confirm(question)) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/fleet-replica/seed`);
+        // The server decides which branch it took: the view may be stale.
+        if (res.success) showMessage('success', res.dismissed ? 'Dismissed' : 'Cancel requested');
+        else showMessage('error', res.error || 'Failed to cancel the seed');
+      } catch (err) {
+        showMessage('error', 'Failed to cancel the seed');
+      }
+      if (document.getElementById('fleet-replica-body')) renderFleetReplica(botId);
+      else if (document.getElementById('fleet-seed-banner')) renderSeedBanner(botId);
+      loadBots();
+    }
+
+    async function reseedStandbyNow(botId) {
+      if (!confirm('Re-seed this standby now?\n\nThe current copy is deleted and replaced with a fresh copy of the primary, taken with the copy block the bot holds. Streaming resumes when the copy completes.')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replica/reseed`);
+        if (res.success) showMessage('success', 'Re-seed started');
+        else showMessage('error', res.error || 'Failed to start the re-seed');
+      } catch (err) {
+        showMessage('error', 'Failed to start the re-seed');
       }
       renderFleetReplica(botId);
       loadBots();

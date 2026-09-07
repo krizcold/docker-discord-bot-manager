@@ -19,6 +19,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
+import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal, getAppFacts } from './appLifecycle';
@@ -28,6 +29,7 @@ import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, Fle
 const REPLICATION_SLOT = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;
 const PGDATA = '/var/lib/postgresql/data';
+const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const SEED_TIMEOUT_MS = 30 * 60 * 1000;
 const PULL_TIMEOUT_MS = 10 * 60 * 1000;
 // Generous: volExec calls run under `docker run`, and slow disks are real.
@@ -910,6 +912,59 @@ export async function decommissionFleetDb(
 }
 
 /**
+ * Bind sources of every container this instance owns, as the HOST daemon sees
+ * them, forward-slashed. The bot-id label is stamped on every service the
+ * manager authors, so this still finds them after a rename that the container
+ * names have not caught up with.
+ */
+function instanceBindSources(botId: string): Promise<string[]> {
+  return new Promise(resolve => {
+    execFile('docker', ['ps', '-a', '--filter', `label=bot-id=${botId}`, '--format', '{{.Names}}'], { timeout: EXEC_TIMEOUT_MS }, (listErr, listOut) => {
+      const names = listErr ? [] : String(listOut).split('\n').map(line => line.trim()).filter(Boolean);
+      if (!names.length) return resolve([]);
+      const format = '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}';
+      // The error is deliberately ignored: a name that vanished between the two
+      // calls exits non-zero while docker still prints every container it did
+      // resolve, and a container that is gone mounts nothing, so that output is
+      // complete. A daemon that cannot answer at all prints nothing and the
+      // caller falls back on an empty list either way.
+      execFile('docker', ['inspect', '--format', format, ...names], { timeout: EXEC_TIMEOUT_MS }, (_inspectErr, inspectOut) => {
+        resolve(String(inspectOut)
+          .split('\n')
+          .map(line => line.trim().replace(/\\/g, '/').replace(/\/+$/, ''))
+          .filter(Boolean));
+      });
+    });
+  });
+}
+
+/**
+ * This instance's data directory, in the path space THIS process reads from.
+ * The deployed containers are the only witness that survives a rename or a
+ * deployment-mode flip, so their binds decide; the per-mode convention answers
+ * only when no container exists to ask. Docker reports HOST paths, which reach
+ * the manager at its own mount points, so a source that cannot be translated
+ * back is discarded rather than guessed at, and so is an ambiguous one.
+ */
+async function instanceDataDir(instance: InstanceConfig): Promise<string> {
+  const ownDataBind = `${containerManager.hostBotDirFor(instance.id)}/data`;
+  const appData = `${DATA_ROOT}/AppData/`;
+  const resolved = new Set<string>();
+  for (const source of await instanceBindSources(instance.id)) {
+    // The app's data dir is the one bind whose source ends in `data`: the
+    // container side cannot tell them apart, since a shipped gateway mounts
+    // its own config at /data too.
+    if (path.posix.basename(source) !== 'data') continue;
+    if (source === ownDataBind) resolved.add(getDataPath(instance.id));
+    else if (source.startsWith(appData)) resolved.add(source);
+  }
+  if (resolved.size === 1) return resolved.values().next().value as string;
+  return (await getDeploymentMode()) === 'casaos'
+    ? path.posix.join(appData, instance.sanitizedName, 'data')
+    : getDataPath(instance.id);
+}
+
+/**
  * The fleet database password, for an instance whose manager env store has
  * none. A worker is never told the URL by the manager: the master delivers it
  * on register and the bot persists it in its OWN env file (declared as
@@ -918,11 +973,11 @@ export async function decommissionFleetDb(
  * place this machine's copy of the fleet credentials exists. An unparseable
  * value refuses (returns null) rather than guessing.
  */
-function fleetPasswordFromBotEnv(botId: string, db: CompanionDbSpec): string | null {
+function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string | null {
   if (!db.appEnvFile) return null;
   let raw: string;
   try {
-    raw = fs.readFileSync(path.join(getDataPath(botId), db.appEnvFile), 'utf-8');
+    raw = fs.readFileSync(path.join(dataDir, db.appEnvFile), 'utf-8');
   } catch {
     return null;
   }
@@ -993,15 +1048,19 @@ export async function adoptPromotedReplica(
   // A worker's manager env store carries no database URL, so the managed-lane
   // checks (and the password enableFleetReplication needs) have nothing to read
   // until this instance is filed like any other database host.
+  const dataDir = await instanceDataDir(instance);
   const password = (() => {
     const current = (envManager.getEnvVars(instance.id)[db.env.url] || '').trim();
     if (current !== '') {
       try { return decodeURIComponent(new URL(current).password) || null; } catch { return null; }
     }
-    return fleetPasswordFromBotEnv(instance.id, db);
+    return fleetPasswordFromBotEnv(dataDir, db);
   })();
   if (!password) {
-    return { success: false, error: 'Could not recover the fleet database credentials from this instance (neither the manager env nor the app\'s own env file carries a usable database URL), so the database cannot be adopted' };
+    // Naming the file keeps a wrong data dir apart from a genuinely absent
+    // credential: the two read identically from the outside.
+    const appEnvFile = db.appEnvFile ? path.posix.join(dataDir, db.appEnvFile) : 'no app env file is declared';
+    return { success: false, error: `Could not recover the fleet database credentials from this instance (neither the manager env nor ${appEnvFile} carries a usable database URL), so the database cannot be adopted` };
   }
 
   const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id);

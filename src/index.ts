@@ -15,6 +15,7 @@ import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUp
 import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
 import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
+import { parkInterruptedTransfers } from './instance/fleetTransfer';
 import { startFleetReplicaAuto, stopFleetReplicaAuto } from './instance/fleetReplicaAuto';
 import { startRecoveryChannelReconciler, stopRecoveryChannelReconciler } from './instance/recoveryChannel';
 import { startRecoveryControlServer, stopRecoveryControlServer } from './instance/recoveryControl';
@@ -99,6 +100,7 @@ async function main(): Promise<void> {
   resetTransientStatuses();
   await syncContainerStates();
   await parkInterruptedReplicaSeeds();
+  parkInterruptedTransfers();
 
   // Start web server
   console.log('[Init] Starting web server...');

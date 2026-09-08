@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
-  ContainerInfo,
+  ContainerInfo, FleetTransferRun,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -591,6 +591,16 @@ export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetRepli
   return instance;
 }
 
+export function updateInstanceFleetTransfer(botId: string, run: FleetTransferRun | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (run) instance.fleetTransfer = run;
+  else delete instance.fleetTransfer;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** For modules that change an instance outside a route (the routes broadcast themselves). */
 export function broadcastBotUpdated(botId: string): void {
   if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
@@ -657,8 +667,9 @@ export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean;
   }
   stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume };
   delete stored.fleetDbReplica;
-  // The seed record is about the standby this adopt just consumed.
+  // The seed record and any transfer run are about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
+  delete stored.fleetTransfer;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   const live = getBot(botId);
@@ -666,6 +677,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean;
     live.fleetDb = { ...stored.fleetDb };
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
+    delete live.fleetTransfer;
   }
   return { success: true };
 }
@@ -1465,6 +1477,18 @@ function setPendingApply(botId: string, pending: boolean): void {
   else delete instance.pendingApply;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
+}
+
+/**
+ * A change to the deployed project made while it runs (a standby attached,
+ * whose endpoint the app only learns from a recreated container) is applied
+ * the same way a build is: Start on the running instance, or Restart.
+ */
+export async function markPendingApplyIfRunning(botId: string): Promise<void> {
+  const appId = await runningAppContainerId(botId, resolveAppName(botId));
+  // An unanswered probe marks too: the apply itself refuses on one, and a
+  // mark on an instance that turns out stopped clears at its next start.
+  if (appId !== null) setPendingApply(botId, true);
 }
 
 /** Bot -> manager readiness ping: the bot's web UI is serving. Gates the Open button. */

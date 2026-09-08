@@ -129,6 +129,21 @@ export interface FleetReplicaSeedRecord {
   cancelRequested?: boolean;
 }
 
+export type FleetTransferPhase = 'seeding' | 'applying' | 'catching-up' | 'promoting';
+
+// A seed-first transfer in flight (PLAN_REPLICATION 20.19 F21): a designated
+// backup with no standby is seeded from the block its bot holds, recreated so
+// the app learns the copy, watched until caught up, then promoted through the
+// app's own hook. Parked when its runner is gone; Transfer again resumes it.
+export interface FleetTransferRun {
+  phase: FleetTransferPhase;
+  startedAt: number;
+  updatedAt: number;
+  retireOldMaster: boolean;
+  parked?: boolean;
+  lastError?: string;
+}
+
 // Recovery-channel arm state (PLAN_REPLICATION.md Section 18, RC-2). One
 // helper relay container per armed side; the record is the source of truth
 // the manager reconciles the container against on boot, so a manager restart
@@ -213,6 +228,7 @@ export interface InstanceConfig {
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
+  fleetTransfer?: FleetTransferRun;    // seed-first transfer in flight or parked (20.19 F21); cleared when the promote is handed to the app
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults

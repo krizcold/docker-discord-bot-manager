@@ -36,6 +36,7 @@ import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { hasAppHooks } from '../../instance/appHookClient';
 import { findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
+import * as fleetTransfer from '../../instance/fleetTransfer';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
@@ -1534,7 +1535,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       // The primary's word on this standby's slot rides the cached health
       // verdict (20.17); the live probe below cannot see it from this machine.
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, transfer: bot.fleetTransfer ?? null });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1558,6 +1559,29 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * POST /api/bots/:id/fleet-replica/from-facts - Provision a standby from the
+   * copy block the bot itself holds ({publicHost, hostPort?}); no paste.
+   * Async: poll the GET for the phase.
+   */
+  router.post('/:id/fleet-replica/from-facts', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { publicHost, hostPort } = req.body as { publicHost?: string; hostPort?: number };
+      if (!publicHost) {
+        res.status(400).json({ success: false, error: 'publicHost is required' });
+        return;
+      }
+      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1892,10 +1916,28 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await appLifecycle.transfer(bot, {
+      const result = await fleetTransfer.transferSide(bot, {
         confirmLag: req.body?.confirmLag === true,
         retireOldMaster: req.body?.retireOldMaster === true,
+        publicHost: typeof req.body?.publicHost === 'string' ? req.body.publicHost : undefined,
+        hostPort: typeof req.body?.hostPort === 'number' ? req.body.hostPort : undefined,
       });
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /:id/app-transfer - dismiss a parked seed-first transfer. */
+  router.delete('/:id/app-transfer', (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = fleetTransfer.dismissTransfer(bot);
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
       res.json(result);
     } catch (error) {

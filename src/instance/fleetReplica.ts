@@ -531,6 +531,36 @@ export function provisionFleetReplica(
   return { success: true, started: true };
 }
 
+/**
+ * Provision the first standby from the copy block the bot itself holds (a
+ * designated backup receives it on register, 20.14), so a joined machine
+ * needs no paste. Every guard is provisionFleetReplica's; only where the
+ * intake comes from differs.
+ */
+export async function provisionFleetReplicaFromFacts(
+  instance: InstanceConfig,
+  publicHost: string,
+  hostPort?: number,
+): Promise<{ success: boolean; error?: string; started?: boolean }> {
+  if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
+  if (!hasAppHooks(instance)) return { success: false, error: 'This app declares no lifecycle hooks, so the manager cannot read the copy block from it; paste the block instead' };
+  const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
+  if (!facts.success) return { success: false, error: `Could not read the copy block from the app: ${facts.error}` };
+  const block = facts.facts?.copyBlock;
+  if (!block?.dsn || !block.cert) {
+    return { success: false, error: 'The bot holds no copy block (only a designated backup receives one from the master); paste the block from the primary machine instead' };
+  }
+  // The app's own verdict: a block inherited from a former master names a
+  // fenced database, and a standby seeded from it would follow the wrong side.
+  if (facts.facts?.copyBlockCurrent === false) {
+    return { success: false, error: 'The block this node holds names a database that is not the one the fleet follows now (it came from a former master); wait for the current primary\'s manager to publish its block, or paste that block instead' };
+  }
+  if (facts.facts?.copyBlockCurrent !== true) {
+    return { success: false, error: 'The app did not say whether its block is current; paste the block from the primary machine instead' };
+  }
+  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort);
+}
+
 function seedDsnFor(dsn: ParsedDsn): string {
   return `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 }
@@ -728,6 +758,9 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
     if (purpose === 'provision') containerManager.updateInstanceFleetDbReplica(instance.id, null);
     throw new Error(`standby service start failed: ${apply.error}`);
   }
+  // The app learns its standby from its container environment, which only
+  // a recreate rewrites; the running project is marked so Start applies it.
+  if (purpose === 'provision') await containerManager.markPendingApplyIfRunning(instance.id);
 }
 
 /**
@@ -1289,6 +1322,12 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   const block = facts.facts?.copyBlock;
   if (!block?.dsn || !block.cert) {
     return refuse('The bot holds no copy block for the primary (only a designated backup receives one); remove the replica and provision it again from the block on the primary machine');
+  }
+  // The app's own verdict. The source check below cannot stand in for it: a
+  // block inherited from a former master names the very primary this standby
+  // still follows, so it passes that check while naming a fenced database.
+  if (facts.facts?.copyBlockCurrent === false) {
+    return refuse('The block this node holds names a database that is not the one the fleet follows now (it came from a former master); wait for the current primary\'s manager to publish its block, then re-seed');
   }
   const validated = validateIntake(block.dsn, block.cert, rec.publicHost, rec.hostPort);
   if (!validated.ok) return refuse(`The copy block the bot holds is unusable: ${validated.error}`);

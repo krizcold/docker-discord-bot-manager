@@ -28,6 +28,10 @@ export interface AppFacts {
   takeoverHold: any;
   staleMasterPark: any;
   copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
+  /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
+  copyBlockCurrent?: boolean | null;
+  /** The app's container carries a standby endpoint (it learned its standby); null while the bot is down. */
+  dbReplica?: boolean | null;
   /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
   standbySlot: {
     slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;

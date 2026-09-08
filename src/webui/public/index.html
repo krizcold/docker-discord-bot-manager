@@ -1337,7 +1337,7 @@
               ? '<span class="update-badge">Update available</span>'
               : '';
             const pendingBadge = bot.pendingApply
-              ? '<span class="update-badge" title="A build finished while this bot was running and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Build not applied</span>'
+              ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached) and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
               : '';
 
             // Fleet DB backup warning (failed or stale sidecar dump)
@@ -1445,7 +1445,7 @@
                     : bot.hostPort ? (isLocalBrowser
                       ? `<a class="btn btn-primary btn-small" href="http://${location.hostname}:${bot.hostPort}${escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                       : `<button class="btn btn-primary btn-small" disabled title="The bot's web UI port is bound to 127.0.0.1 on the server, so it is only reachable from the server itself. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.">Open</button>`) : ''}
-                  ${bot.pendingApply ? `<button class="btn btn-primary btn-small"${d} onclick="startBot('${bot.id}', 'Applying')" title="Apply the last build to the running project in place">Apply build</button>` : ''}
+                  ${bot.pendingApply ? `<button class="btn btn-primary btn-small"${d} onclick="startBot('${bot.id}', 'Applying')" title="Apply the pending change to the running project in place">Apply</button>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
@@ -2999,6 +2999,17 @@
         ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}
              <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}')">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
+      // A seed-first transfer (20.19 F21) in flight or parked; a live one keeps
+      // this panel polling, a parked one shows its reason until dismissed.
+      const run = res.transfer || null;
+      const runLive = !!(run && !run.parked);
+      const transferRunHtml = !run ? '' : run.parked
+        ? `<div class="error-message">Transfer stopped while <b>${escapeHtml(transferPhaseText(run.phase))}</b>: ${escapeHtml(run.lastError || 'unknown reason')} Continuing picks up from where it stopped.
+             <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+               <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', ${run.retireOldMaster === true}, ${!r.record}, true)">Continue transfer</button>
+               <button class="btn btn-secondary btn-small" onclick="dismissTransfer('${botId}')">Dismiss</button></div></div>`
+        : `<div class="env-tip">Transfer in progress: <b>${escapeHtml(transferPhaseText(run.phase))}</b> (${Math.round((Date.now() - run.startedAt) / 1000)}s).${run.phase === 'promoting' ? ' The bot reports the promote in its own Fleet view.' : ''}</div>`;
+      if (runLive && !r.provisioning) setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
 
       if (r.provisioning) {
         const p = r.provisioning;
@@ -3009,6 +3020,7 @@
             : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
         body.innerHTML = `
           ${errHtml}
+          ${transferRunHtml}
           <div class="env-tip">${seedWhat(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
           ${cancelHtml}`;
         setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
@@ -3016,8 +3028,23 @@
       }
 
       if (!r.record) {
+        // The block a designated backup already holds makes both the paste and
+        // the standby-first step of a transfer unnecessary (20.14, 20.19 F15/F21).
+        let facts = null;
+        if ((bots.find(b => b.id === botId) || {}).appHooks === true) {
+          try { const f = await api('GET', `/bots/${botId}/app-facts`); if (f && f.success) facts = f.facts; } catch (err) { facts = null; }
+          if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
+        }
+        const fromFactsHtml = (facts && facts.copyBlockPresent && !runLive) ? `
+          <div class="env-tip">This node already holds the primary's copy block (delivered over the fleet channel), so nothing needs pasting. Give this machine's public host and port below, then either provision the standby, or transfer in one action: the standby is seeded and caught up first, then this side is promoted.</div>
+          <div style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-primary btn-small" onclick="provisionFleetReplicaFromFacts('${botId}')">Provision from the block</button>
+            ${facts.backupMaster ? `<button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', false, true)">Transfer (seed first)</button>` : ''}
+          </div>` : '';
         body.innerHTML = `
           ${errHtml}
+          ${transferRunHtml}
+          ${fromFactsHtml}
           <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. If that machine dies, promoting this node's instance also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
           <div class="form-group"><label>Replication DSN</label>
             <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
@@ -3070,7 +3097,7 @@
       // side already.
       const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
       const isCopy = !!(r.live && r.live.inRecovery === true);
-      const transferHtml = (appHooks && isCopy) ? `
+      const transferHtml = (appHooks && isCopy && !runLive) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the primary side</div>
           <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old primary's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
@@ -3097,11 +3124,12 @@
 
       body.innerHTML = `
         ${errHtml}
+        ${transferRunHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${stateHtml}
         ${slotHtml}
         ${ledgerHtml}
-        <div class="env-tip">The bot on this instance picks the replica up (for promote-the-pair) on its next restart.</div>
+        <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
           ${reseedHtml}
@@ -3114,29 +3142,82 @@
      * verdict; this only relays the click and re-asks once when it wants the
      * replication lag acknowledged.
      */
-    async function appTransfer(botId, retireOldMaster) {
+    async function appTransfer(botId, retireOldMaster, seedFirst, resuming) {
       const label = retireOldMaster ? 'Transfer and retire' : 'Transfer';
       const extra = retireOldMaster
         ? '\n\nThe old machine will also be told to stand down and stop serving as the primary.'
         : '';
-      if (!confirm(`${label}: make this machine the primary side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${extra}`)) return;
+      const payload = { retireOldMaster };
+      if (seedFirst) {
+        const host = (document.getElementById('replica-host')?.value || '').trim();
+        const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+        // A run being continued knows the endpoint it served; only a fresh one
+        // has nobody to ask but the operator.
+        if (!host && !resuming) { showMessage('error', 'This machine\'s public host is required: the transfer seeds a standby first, and the fleet dials the copy there after the promote'); return; }
+        if (host) {
+          payload.publicHost = host;
+          if (portRaw !== '') payload.hostPort = Number(portRaw);
+        }
+      }
+      const seedNote = seedFirst
+        ? '\n\nThis node holds no standby yet: one is seeded from the primary and caught up first, then this side is promoted. The bot restarts once to learn its standby and once more in the promote.'
+        : '';
+      if (!confirm(`${label}: make this machine the primary side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${seedNote}${extra}`)) return;
       try {
-        let res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster });
+        let res = await api('POST', `/bots/${botId}/app-transfer`, payload);
         if (!res.success && res.needsLagConfirm) {
           // Show the app's OWN words: it knows things the manager does not,
           // including that a master whose database recovered since its last
           // beacon still reads as dead here.
           const lag = typeof res.lagMs === 'number' ? `\n\nThis copy is behind by about ${Math.round(res.lagMs / 1000)}s.` : '';
           if (!confirm(`${res.error || 'The old primary cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
-          res = await api('POST', `/bots/${botId}/app-transfer`, { retireOldMaster, confirmLag: true });
+          res = await api('POST', `/bots/${botId}/app-transfer`, { ...payload, confirmLag: true });
         }
         if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
-        showMessage('success', `${label} started; the bot reports progress in its own Fleet view`);
+        showMessage('success', res.seedFirst
+          ? `${label} started: the standby is seeded from the primary first; progress shows in this panel`
+          : `${label} started; the bot reports progress in its own Fleet view`);
         renderFleetReplica(botId);
         loadBots();
       } catch (err) {
         showMessage('error', `${label} failed`);
       }
+    }
+
+    function transferPhaseText(phase) {
+      if (phase === 'seeding') return 'seeding the standby from the primary';
+      if (phase === 'applying') return 'recreating the app so it learns its standby';
+      if (phase === 'catching-up') return 'waiting for the copy to catch up';
+      if (phase === 'promoting') return 'promoting this side';
+      return phase;
+    }
+
+    async function dismissTransfer(botId) {
+      try {
+        const res = await api('DELETE', `/bots/${botId}/app-transfer`);
+        if (!res.success) showMessage('error', res.error || 'Failed to dismiss the transfer');
+      } catch (err) {
+        showMessage('error', 'Failed to dismiss the transfer');
+      }
+      renderFleetReplica(botId);
+      loadBots();
+    }
+
+    async function provisionFleetReplicaFromFacts(botId) {
+      const host = (document.getElementById('replica-host')?.value || '').trim();
+      const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+      if (!host) { showMessage('error', 'This machine\'s public host is required'); return; }
+      const payload = { publicHost: host };
+      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, payload);
+        if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
+        showMessage('success', 'Provisioning started from the block this node holds');
+      } catch (err) {
+        showMessage('error', 'Failed to start provisioning');
+        return;
+      }
+      renderFleetReplica(botId);
     }
 
     async function provisionFleetReplica(botId) {

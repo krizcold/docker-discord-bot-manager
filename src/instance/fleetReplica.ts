@@ -32,6 +32,8 @@ const PGDATA = '/var/lib/postgresql/data';
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const SEED_TIMEOUT_MS = 30 * 60 * 1000;
 const PULL_TIMEOUT_MS = 10 * 60 * 1000;
+/** Matches the slot reset below it: the same connection, so the same patience. */
+const PROBE_TIMEOUT_MS = 60_000;
 // Generous: volExec calls run under `docker run`, and slow disks are real.
 const EXEC_TIMEOUT_MS = 120_000;
 
@@ -103,8 +105,12 @@ function slotResetContainerName(instance: InstanceConfig): string {
   return `${seedContainerName(instance)}-slot`;
 }
 
+function primaryProbeContainerName(instance: InstanceConfig): string {
+  return `${seedContainerName(instance)}-probe`;
+}
+
 function seedHelperNames(instance: InstanceConfig): string[] {
-  return [seedContainerName(instance), slotResetContainerName(instance)];
+  return [seedContainerName(instance), slotResetContainerName(instance), primaryProbeContainerName(instance)];
 }
 
 /** One spelling of each purpose for the manager's own text. */
@@ -234,6 +240,11 @@ function parsePrimaryDsn(dsn: string): { ok: true; parsed: ParsedDsn } | { ok: f
 
 function certFilePath(botId: string): string {
   return path.join(getBotDir(botId), 'fleet-replica', 'primary-ca.crt');
+}
+
+/** The same file as certFilePath, spelled for the daemon that mounts it. */
+function hostCertPathFor(botId: string): string {
+  return `${containerManager.hostBotDirFor(botId)}/fleet-replica/primary-ca.crt`;
 }
 
 export interface FleetReplicaStatus {
@@ -409,6 +420,12 @@ function startProvisioning(
   const ownsRecord = (): boolean => seedRecord(instance.id)?.startedAt === now;
   void containerManager.withExternalBotOp(instance.id, 'replica-seed', async () => {
     throwIfCancelled(instance.id);
+    // Ahead of the preflight, which is where every lane destroys: a refusal
+    // here has changed nothing and stays retryable.
+    await assertSeedableSource(instance, intake.dsn, intake.cert);
+    // The probe can take a minute, and the preflight past it destroys; a cancel
+    // filed while it ran is honoured here, with everything still in place.
+    throwIfCancelled(instance.id);
     if (preflight) await preflight();
     await runProvisioning(instance, record, intake.dsn, intake.cert, purpose);
   }).then(() => {
@@ -514,17 +531,31 @@ export function provisionFleetReplica(
   return { success: true, started: true };
 }
 
-async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaRecord, dsn: ParsedDsn, certPem: string, purpose: FleetReplicaSeedPurpose): Promise<void> {
+function seedDsnFor(dsn: ParsedDsn): string {
+  return `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+}
+
+/**
+ * Prove the source can be seeded from BEFORE any lane destroys anything. Every
+ * preflight is destructive (the stale-primary one retires the sidecar and its
+ * volume, the standby one strips the standby service out of the compose), and
+ * both run ahead of the seed, so a re-seed aimed at a database that is gone
+ * would otherwise consume the surviving copy and discover that second. Runs
+ * the connection the seed itself uses, so a source this rejects could not have
+ * been seeded from anyway.
+ *
+ * The cert write and the image pull belong here for the same reason: the probe
+ * needs both, and doing the pull first keeps the later short-timeout runs from
+ * absorbing a multi-minute pull.
+ */
+async function assertSeedableSource(instance: InstanceConfig, dsn: ParsedDsn, certPem: string): Promise<void> {
   // The primary's pinned cert: kept on disk for re-provisioning and mounted
   // into the seeding container; the standby's runtime copy lives in PGDATA.
   const certPath = certFilePath(instance.id);
   fs.mkdirSync(path.dirname(certPath), { recursive: true });
   fs.writeFileSync(certPath, certPem.endsWith('\n') ? certPem : certPem + '\n');
-  const hostCertPath = `${containerManager.hostBotDirFor(instance.id)}/fleet-replica/primary-ca.crt`;
-  const seedName = seedContainerName(instance);
+  const hostCertPath = hostCertPathFor(instance.id);
 
-  // First contact on a worker machine pulls the image; done explicitly so the
-  // later short-timeout docker runs never absorb a multi-minute pull.
   const pulled = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
     execFile('docker', ['pull', 'postgres:16-alpine'], { timeout: PULL_TIMEOUT_MS }, (err, _o, stderr) => {
       resolve({ ok: !err, stderr: String(stderr || err || '') });
@@ -533,9 +564,52 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   if (!pulled.ok) throw new Error(`could not pull postgres:16-alpine: ${pulled.stderr.trim().split('\n').pop()}`);
   throwIfCancelled(instance.id);
 
+  const probeName = primaryProbeContainerName(instance);
+  await dockerRmForce(probeName);
+  const probe = await new Promise<{ ok: boolean; stdout: string; stderr: string }>(resolve => {
+    const child = spawn('docker', ['run', '--rm', '--name', probeName,
+      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
+      '--entrypoint', 'psql', 'postgres:16-alpine',
+      seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc', 'SELECT pg_is_in_recovery()']);
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      execFile('docker', ['rm', '-f', probeName], () => child.kill('SIGKILL'));
+    }, PROBE_TIMEOUT_MS);
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
+    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
+  });
+  // committed describes the VOLUME, so a retry over an attempt that already
+  // wiped inherits it: the reassurance below would be a lie on exactly the
+  // record that most needs the truth.
+  const intact = seedRecord(instance.id)?.committed !== true ? ', so nothing has been changed' : '';
+
+  if (!probe.ok) {
+    // FIRST line, not last: a refused or timed-out connection puts the reason
+    // there ("... failed: Connection refused") and a generic hint after it,
+    // and this lane exists for exactly that failure.
+    const lines = probe.stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
+    const reason = (lines.find(l => l.startsWith('ERROR')) || lines[0] || 'psql failed').split(dsn.password).join('***');
+    throw new Error(`could not verify the primary at ${dsn.host}:${dsn.port}${intact}: ${reason}`);
+  }
+  // A source in recovery is a standby: seeding from it would copy a follower,
+  // and the slot this seed needs cannot be minted there.
+  if (probe.stdout.trim() !== 'f') {
+    throw new Error(`the source at ${dsn.host}:${dsn.port} is itself following a primary${intact}; seed from the machine that now serves the fleet`);
+  }
+}
+
+async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaRecord, dsn: ParsedDsn, certPem: string, purpose: FleetReplicaSeedPurpose): Promise<void> {
+  const hostCertPath = hostCertPathFor(instance.id);
+  const seedName = seedContainerName(instance);
+
   // A ghost seeder from a previous timeout or a manager restart mid-seed still
   // holds the volume: kill it before touching anything.
   await dockerRmForce(seedName);
+
+  const seedDsn = seedDsnFor(dsn);
 
   // Whatever the volume holds is superseded here: manager debris on a first
   // provision, and on a re-seed the verified-stale copy 20.14 rules wipeable.
@@ -546,8 +620,6 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   const wipe = await volExec(record.volume, `find ${PGDATA} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`);
   if (!wipe.ok) throw new Error(`could not clear the replica volume: ${wipe.stderr.trim()}`);
   throwIfCancelled(instance.id);
-
-  const seedDsn = `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 
   // A slot the WAL bound invalidated stays invalidated for good: a seed on it
   // streams but retains nothing (the primary reports it unreserved while

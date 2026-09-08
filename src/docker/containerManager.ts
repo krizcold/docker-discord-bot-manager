@@ -1190,6 +1190,7 @@ async function listDeleteRemnants(
     `${instance.sanitizedName}-recovery-rsync`,
     `${instance.sanitizedName}-fleet-replica-seed`,
     `${instance.sanitizedName}-fleet-replica-seed-slot`,
+    `${instance.sanitizedName}-fleet-replica-seed-probe`,
     `${instance.sanitizedName}-fleet-postgres-replica-data-helper`,
   ]) {
     if (!name) continue;
@@ -1348,6 +1349,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   // would wedge the delete in error forever.
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-slot`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-probe`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-postgres-replica-data-helper`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsyncd`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsync`, failures);

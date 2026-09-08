@@ -230,6 +230,7 @@ export interface InstanceConfig {
   hasBeenStarted?: boolean;
   webUiReady?: boolean;                // true once the bot's web UI pinged back reachable after its last (re)start
   lastStartAt?: number;                // epoch ms of the last (re)start; drives the Open-button grace fallback
+  pendingApply?: boolean;              // a build finished while the project ran; Start (in place) or Restart applies it
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()

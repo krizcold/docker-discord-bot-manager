@@ -1336,6 +1336,9 @@
             const updateBadge = bot.updateAvailable
               ? '<span class="update-badge">Update available</span>'
               : '';
+            const pendingBadge = bot.pendingApply
+              ? '<span class="update-badge" title="A build finished while this bot was running and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Build not applied</span>'
+              : '';
 
             // Fleet DB backup warning (failed or stale sidecar dump)
             const fb = bot.fleetBackup;
@@ -1424,7 +1427,7 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${fbWarnBadge}${replWarnBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${pendingBadge}${fbWarnBadge}${replWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
@@ -1442,6 +1445,7 @@
                     : bot.hostPort ? (isLocalBrowser
                       ? `<a class="btn btn-primary btn-small" href="http://${location.hostname}:${bot.hostPort}${escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                       : `<button class="btn btn-primary btn-small" disabled title="The bot's web UI port is bound to 127.0.0.1 on the server, so it is only reachable from the server itself. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.">Open</button>`) : ''}
+                  ${bot.pendingApply ? `<button class="btn btn-primary btn-small"${d} onclick="startBot('${bot.id}', 'Applying')" title="Apply the last build to the running project in place">Apply build</button>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
                   <button class="btn btn-secondary btn-small" onclick="showLogs('${bot.id}', ${jsArg(botName)})">Logs</button>
@@ -1570,11 +1574,11 @@
     }
 
     // ─── Bot Actions (all guarded by busyBots to prevent double-clicks) ───
-    async function startBot(id) {
+    async function startBot(id, verb) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status)) || bot?.activeOp) return;
       busyBots.add(id); renderBots();
-      openTerminalPopup(id, bot ? bot.displayName : id, 'Installing');
+      openTerminalPopup(id, bot ? bot.displayName : id, verb || 'Installing');
       try {
         const res = await api('POST', `/bots/${id}/start`);
         // terminalBotId guards: the user may have closed this popup (or opened

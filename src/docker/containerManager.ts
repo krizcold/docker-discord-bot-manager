@@ -236,6 +236,9 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfi
   if (!inst) return inst;
   const out: InstanceConfig = { ...inst };
   delete out.updateToken;
+  // Explicit either way: the browser merges pushed records over what it holds,
+  // and an absent key cannot clear a flag it already shows.
+  out.pendingApply = inst.pendingApply === true;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
   }
@@ -1454,6 +1457,16 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   }
 }
 
+function setPendingApply(botId: string, pending: boolean): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance || (instance.pendingApply === true) === pending) return;
+  if (pending) instance.pendingApply = true;
+  else delete instance.pendingApply;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** Bot -> manager readiness ping: the bot's web UI is serving. Gates the Open button. */
 export function setWebUiReady(botId: string, ready: boolean): void {
   const registry = loadRegistry();
@@ -2017,7 +2030,11 @@ export async function runningNonSidecarContainers(botId: string): Promise<string
   }
 }
 
-async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
+/**
+ * The running app container's id: null when none runs, undefined when docker
+ * could not answer, which is evidence of nothing.
+ */
+async function runningAppContainerId(botId: string, appName: string): Promise<string | null | undefined> {
   let filters = `--filter "label=com.docker.compose.project=${appName}"`;
   try {
     const composePath = resolveComposePath(botId, appName);
@@ -2029,10 +2046,38 @@ async function hasRunningContainer(botId: string, appName: string): Promise<bool
   } catch { /* fall back to the project-wide check */ }
   try {
     const { stdout } = await execAsync(`docker ps -q ${filters}`);
-    return stdout.trim().length > 0;
+    const id = stdout.trim().split('\n')[0]?.trim();
+    return id ? id : null;
   } catch {
-    return true; // docker query failed: keep the conservative refusal
+    return undefined;
   }
+}
+
+async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
+  // A docker query that failed keeps the conservative refusal.
+  return await runningAppContainerId(botId, appName) !== null;
+}
+
+/** Every running container of the project, sorted; undefined when docker could not answer. */
+async function runningProjectContainerIds(appName: string): Promise<string[] | undefined> {
+  try {
+    const { stdout } = await execAsync(`docker ps -q --filter "label=com.docker.compose.project=${appName}"`);
+    return stdout.trim().split('\n').map(line => line.trim()).filter(Boolean).sort();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Open-button readiness an in-place apply must not reset when it recreated nothing. */
+function restoreWebUiReadiness(botId: string, snapshot: { webUiReady?: boolean; lastStartAt?: number }): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  instance.webUiReady = snapshot.webUiReady;
+  instance.lastStartAt = snapshot.lastStartAt;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
 }
 
 export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
@@ -2045,22 +2090,69 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
   if (instance.recoveryRescue) {
     return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
   }
+  let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
   if (instance.status === 'running') {
     // Reconcile against live container state: an externally-stopped bot
     // (docker kill, OOM) leaves the registry claiming running, and Start
     // would refuse forever while the container sits Exited.
-    if (await hasRunningContainer(botId, instance.sanitizedName)) {
-      return { success: false, error: 'Bot is already running' };
+    const appId = await runningAppContainerId(botId, instance.sanitizedName);
+    if (appId !== null) {
+      // A build that finished while the project ran left its compose and
+      // image unapplied; compose up on the live project applies them and
+      // recreates only what changed, so this is the one start that proceeds
+      // on a running instance. Only on a concrete answer: an unanswered
+      // probe is evidence of nothing, and compose could not act on it either.
+      if (instance.pendingApply !== true) return { success: false, error: 'Bot is already running' };
+      if (appId === undefined) return { success: false, error: 'Docker could not confirm whether the bot is running; retry in a moment' };
+      applyInPlace = {
+        projectIds: await runningProjectContainerIds(instance.sanitizedName),
+        webUiReady: instance.webUiReady,
+        lastStartAt: instance.lastStartAt,
+      };
+      logCollectors.get(botId).addLog('[Start] Applying the last build to the running project; only containers whose definition changed are recreated', 'info');
+    } else {
+      console.warn(`[ContainerManager] ${botId} marked running but no container is up; correcting to stopped`);
+      updateBotStatus(botId, 'stopped');
     }
-    console.warn(`[ContainerManager] ${botId} marked running but no container is up; correcting to stopped`);
-    updateBotStatus(botId, 'stopped');
   }
 
   const sourceType = instance.sourceType || 'git';
-  if (sourceType === 'docker-image') {
-    return startDockerImageBot(instance);
+  const result = sourceType === 'docker-image' ? await startDockerImageBot(instance) : await startGitBot(instance);
+  // Any successful start deploys the current compose and image, whichever way
+  // the project was reached (Restart, Stop then Start, Update).
+  if (result.success) setPendingApply(botId, false);
+  if (!applyInPlace) return result;
+
+  // The lane stamps 'starting' before compose up, which gates the Open button
+  // until the app pings back; a project compose left whole never pings again,
+  // so its readiness is put back. Keyed on every container of the project, not
+  // the app service alone: the web-facing service may be a different one.
+  const projectAfter = async (): Promise<'same' | 'changed' | 'unknown'> => {
+    const after = await runningProjectContainerIds(instance.sanitizedName);
+    if (!applyInPlace?.projectIds || !after) return 'unknown';
+    return after.join(',') === applyInPlace.projectIds.join(',') ? 'same' : 'changed';
+  };
+  if (result.success) {
+    if (await projectAfter() === 'same') restoreWebUiReadiness(botId, applyInPlace);
+    return result;
   }
-  return startGitBot(instance);
+  // The lane's catch stamped 'error', which is what a start that never got its
+  // containers up deserves; here the project may well have kept serving,
+  // which only a concrete answer proves.
+  const appId = await runningAppContainerId(botId, instance.sanitizedName);
+  if (typeof appId === 'string') {
+    updateBotStatus(botId, 'running', await getContainerIdsForBot(botId));
+    const project = await projectAfter();
+    logCollectors.get(botId).addLog(project === 'same'
+      ? '[Start] The apply failed; the previous build keeps running and the new one stays unapplied'
+      : project === 'changed'
+        ? '[Start] The apply failed after recreating some of the project; it keeps running, and Start applies whatever is still pending'
+        : '[Start] The apply failed; the project keeps running, and docker could not say whether any of its containers were recreated first', 'warning');
+    if (project === 'same') restoreWebUiReadiness(botId, applyInPlace);
+  } else if (appId === undefined) {
+    logCollectors.get(botId).addLog('[Start] The apply failed, and docker could not say whether the previous build still runs', 'warning');
+  }
+  return result;
 }
 
 async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
@@ -2586,6 +2678,32 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
   return withLoggedBotOp(botId, 'build', () => buildBotImpl(botId));
 }
 
+/**
+ * A build re-authors the deployed compose and rebuilds the image, but it
+ * never recreates a RUNNING project: compose up belongs to the start lane.
+ * Stamping such an instance 'stopped' made every lane trip over it: Stop
+ * refused it, the reconciler flipped it back, Start refused it as already
+ * running, and only an Update issued after the flip applied anything.
+ */
+async function stampBuildOutcome(botId: string, emit: EmitFn, statusBefore: BotStatus): Promise<void> {
+  const appId = await runningAppContainerId(botId, resolveAppName(botId));
+  // Docker not answering is evidence of nothing: what was known before the
+  // build stands.
+  if (appId === undefined) emit('[Build] Could not check whether the project is running; keeping what was known before the build', 'warning');
+  const running = appId === undefined ? statusBefore === 'running' : appId !== null;
+  if (running) {
+    setPendingApply(botId, true);
+    // Ids are refreshed only from an answer; a failed listing reads as [].
+    if (appId === undefined) updateBotStatus(botId, 'running');
+    else updateBotStatus(botId, 'running', await getContainerIdsForBot(botId));
+    emit('[Build] The running project was not recreated; Start (applies in place) or Restart applies this build', 'warning');
+    return;
+  }
+  // Nothing runs that the next Start would not deploy whole.
+  setPendingApply(botId, false);
+  updateBotStatus(botId, 'stopped');
+}
+
 async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
@@ -2703,7 +2821,7 @@ async function buildDockerImageInstance(
     }
   }
 
-  updateBotStatus(botId, 'stopped');
+  await stampBuildOutcome(botId, emit, instance.status);
   emit(`[Success] Build completed for ${instance.displayName}`, 'success');
   return { success: true };
 }
@@ -3161,7 +3279,7 @@ async function buildGitInstance(
     if (recordCommit) updateLastBuiltCommit(botId, recordCommit);
   }
 
-  updateBotStatus(botId, 'stopped');
+  await stampBuildOutcome(botId, emit, instance.status);
   emit(`[Success] Build completed successfully for ${instance.displayName}`, 'success');
   return { success: true };
 }

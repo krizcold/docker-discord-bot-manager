@@ -48,6 +48,8 @@ export interface ActionResult {
   needsConfirm?: boolean;
   /** The app wants the RPO acknowledged before promoting. */
   needsLagConfirm?: boolean;
+  /** The app says another designated backup received further than this copy (20.19 F14). */
+  needsLineageConfirm?: boolean;
   lagMs?: number | null;
   restartRequired?: boolean;
   [key: string]: unknown;
@@ -136,12 +138,13 @@ export async function deliverCopyBlock(instance: InstanceConfig): Promise<Action
  */
 export async function transfer(
   instance: InstanceConfig,
-  opts: { confirmLag?: boolean; retireOldMaster?: boolean } = {},
+  opts: { confirmLag?: boolean; confirmLineage?: boolean; retireOldMaster?: boolean } = {},
 ): Promise<ActionResult> {
   const refusal = capabilityRefusal(instance);
   if (refusal) return { success: false, error: refusal };
   return fromHook(await callAppHook(instance, 'promote', 'POST', {
     confirmLag: opts.confirmLag === true,
+    confirmLineage: opts.confirmLineage === true,
     retireOldMaster: opts.retireOldMaster === true,
   }));
 }

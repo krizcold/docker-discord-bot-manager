@@ -1921,7 +1921,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /:id/app-transfer { confirmLag?, retireOldMaster? } - make this whole
+   * POST /:id/app-transfer { confirmLag?, confirmLineage?, retireOldMaster? } - make this whole
    * side the master side. [Transfer] and [Transfer and retire] are the same call.
    */
   router.post('/:id/app-transfer', async (req: Request, res: Response) => {
@@ -1933,6 +1933,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       const result = await fleetTransfer.transferSide(bot, {
         confirmLag: req.body?.confirmLag === true,
+        confirmLineage: req.body?.confirmLineage === true,
         retireOldMaster: req.body?.retireOldMaster === true,
         publicHost: typeof req.body?.publicHost === 'string' ? req.body.publicHost : undefined,
         hostPort: typeof req.body?.hostPort === 'number' ? req.body.hostPort : undefined,

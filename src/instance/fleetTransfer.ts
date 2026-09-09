@@ -49,6 +49,8 @@ function openRun(botId: string, phase: FleetTransferRun['phase'], retireOldMaste
 
 export interface TransferOptions {
   confirmLag?: boolean;
+  /** The operator has seen that another designated backup received further than this copy. */
+  confirmLineage?: boolean;
   retireOldMaster?: boolean;
   /** This machine's endpoint for the copy it will serve; needed only when a standby has to be seeded first. */
   publicHost?: string;
@@ -71,8 +73,8 @@ export async function transferSide(instance: InstanceConfig, opts: TransferOptio
     // acknowledged, or refused) is answered by the app's promote directly, so
     // the operator's confirmLag reaches it and a dead primary is the failover
     // the app names, never a catch-up wait it can never satisfy.
-    if (!active || active.phase === 'promoting' || opts.confirmLag === true) {
-      const result = await promoteSide(instance, { confirmLag: opts.confirmLag, retireOldMaster: opts.retireOldMaster });
+    if (!active || active.phase === 'promoting' || opts.confirmLag === true || opts.confirmLineage === true) {
+      const result = await promoteSide(instance, { confirmLag: opts.confirmLag, confirmLineage: opts.confirmLineage, retireOldMaster: opts.retireOldMaster });
       if (result.success && active) {
         containerManager.updateInstanceFleetTransfer(instance.id, null);
         containerManager.broadcastBotUpdated(instance.id);
@@ -194,8 +196,10 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
       // The primary died between the copy and the promote: the app wants the
       // lag acknowledged, which is the operator's answer, given by pressing
       // Transfer again on the standby that now exists.
-      throw new Error(result.needsLagConfirm
-        ? `${result.error || 'the app wants the replication lag acknowledged'}; the standby now exists, so Continue transfer on the standby panel answers it`
+      // Both of the app's acknowledgements are answered the same way, by the
+      // operator continuing the run from the panel with the confirm attached.
+      throw new Error(result.needsLagConfirm || result.needsLineageConfirm
+        ? `${result.error || (result.needsLagConfirm ? 'the app wants the replication lag acknowledged' : 'another designated backup received further than this copy')}; the standby now exists, so Continue transfer on the standby panel answers it`
         : (result.error || 'the app refused the promote'));
     }
     if (owns()) {

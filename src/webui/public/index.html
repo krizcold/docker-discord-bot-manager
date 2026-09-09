@@ -3177,14 +3177,25 @@
         : '';
       if (!confirm(`${label}: make this machine the primary side?\n\nThe bot claims the fleet, this copy becomes the true database, and the other nodes repoint to it. The bot restarts once as part of this.${seedNote}${extra}`)) return;
       try {
-        let res = await api('POST', `/bots/${botId}/app-transfer`, payload);
-        if (!res.success && res.needsLagConfirm) {
-          // Show the app's OWN words: it knows things the manager does not,
-          // including that a master whose database recovered since its last
-          // beacon still reads as dead here.
-          const lag = typeof res.lagMs === 'number' ? `\n\nThis copy is behind by about ${Math.round(res.lagMs / 1000)}s.` : '';
-          if (!confirm(`${res.error || 'The old primary cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
-          res = await api('POST', `/bots/${botId}/app-transfer`, { ...payload, confirmLag: true });
+        let body = payload;
+        let res = await api('POST', `/bots/${botId}/app-transfer`, body);
+        // The app checks the RPO first and the lineage after it, so either can
+        // arrive on the answer to the other; each is asked once and carried on.
+        for (let round = 0; round < 2 && !res.success; round++) {
+          if (res.needsLagConfirm && !body.confirmLag) {
+            // Show the app's OWN words: it knows things the manager does not,
+            // including that a master whose database recovered since its last
+            // beacon still reads as dead here.
+            const lag = typeof res.lagMs === 'number' ? `\n\nThis copy is behind by about ${Math.round(res.lagMs / 1000)}s.` : '';
+            if (!confirm(`${res.error || 'The old primary cannot be reached, so this copy is promoted as-is.'}${lag}\n\nPromote anyway?`)) return;
+            body = { ...body, confirmLag: true };
+          } else if (res.needsLineageConfirm && !body.confirmLineage) {
+            if (!confirm(`${res.error || 'Another designated backup received further than this copy.'}\n\nPromote this copy anyway?`)) return;
+            body = { ...body, confirmLineage: true };
+          } else {
+            break;
+          }
+          res = await api('POST', `/bots/${botId}/app-transfer`, body);
         }
         if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
         showMessage('success', res.seedFirst

@@ -1205,6 +1205,7 @@ async function listDeleteRemnants(
     `${instance.sanitizedName}-recovery-rsync`,
     `${instance.sanitizedName}-fleet-replica-seed`,
     `${instance.sanitizedName}-fleet-replica-seed-slot`,
+    `${instance.sanitizedName}-fleet-replica-seed-slot-drop`,
     `${instance.sanitizedName}-fleet-replica-seed-probe`,
     `${instance.sanitizedName}-fleet-postgres-replica-data-helper`,
   ]) {
@@ -1348,7 +1349,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
     if (!keepData && !dockerClient.removeVolume(instance.fleetDbReplica.volume)) {
       failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
     }
-    console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps an orphaned replication slot that retains WAL - disable replication there or provision a new replica soon`);
+    console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps replication slot ${instance.fleetDbReplica.slot}, which retains WAL until it is dropped there (its Database modal lists the slot with a Drop action once nothing streams on it)`);
   }
 
   // 3c. Recovery-channel relay: never compose-managed, so nothing else
@@ -1364,6 +1365,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   // would wedge the delete in error forever.
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-slot`, failures);
+  await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-slot-drop`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-probe`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-postgres-replica-data-helper`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsyncd`, failures);

@@ -26,7 +26,12 @@ import { capabilityRefusal, getAppFacts } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 
-const REPLICATION_SLOT = 'fleet_standby';
+/** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
+const FLEET_SLOT_PREFIX = 'fleet_standby';
+/** The instance id is a lowercase uuid, so the name is always slot-legal (a-z, 0-9, _; 46 of 63 characters) and survives a rename. */
+function slotNameFor(instance: InstanceConfig): string {
+  return `${FLEET_SLOT_PREFIX}_${instance.id.replace(/-/g, '')}`;
+}
 const DEFAULT_HOST_PORT = 15432;
 const PGDATA = '/var/lib/postgresql/data';
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
@@ -110,7 +115,7 @@ function primaryProbeContainerName(instance: InstanceConfig): string {
 }
 
 function seedHelperNames(instance: InstanceConfig): string[] {
-  return [seedContainerName(instance), slotResetContainerName(instance), primaryProbeContainerName(instance)];
+  return [seedContainerName(instance), slotResetContainerName(instance), `${slotResetContainerName(instance)}-drop`, primaryProbeContainerName(instance)];
 }
 
 /** One spelling of each purpose for the manager's own text. */
@@ -372,7 +377,7 @@ function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): Fl
   return {
     containerName: `${instance.sanitizedName}-fleet-postgres-replica`,
     volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
-    slot: REPLICATION_SLOT,
+    slot: slotNameFor(instance),
     primaryHost: intake.dsn.host,
     primaryPort: intake.dsn.port,
     publicHost: intake.host,
@@ -427,7 +432,17 @@ function startProvisioning(
     // filed while it ran is honoured here, with everything still in place.
     throwIfCancelled(instance.id);
     if (preflight) await preflight();
-    await runProvisioning(instance, record, intake.dsn, intake.cert, purpose);
+    try {
+      await runProvisioning(instance, record, intake.dsn, intake.cert, purpose);
+    } catch (err) {
+      // A record still naming this slot means the standby's own copy survived
+      // and may yet stream on it; anything else leaves it retaining WAL for a
+      // copy that does not exist.
+      if (containerManager.getBot(instance.id)?.fleetDbReplica?.slot !== record.slot) {
+        await dropInactiveSlot(instance, seedDsnFor(intake.dsn), hostCertPathFor(instance.id), record.slot);
+      }
+      throw err;
+    }
   }).then(() => {
     if (!ownsRecord()) return;
     containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
@@ -651,13 +666,13 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   if (!wipe.ok) throw new Error(`could not clear the replica volume: ${wipe.stderr.trim()}`);
   throwIfCancelled(instance.id);
 
-  // A slot the WAL bound invalidated stays invalidated for good: a seed on it
-  // streams but retains nothing (the primary reports it unreserved while
-  // attached and loses it again at the first blip), so the re-seed the lost
-  // verdict prescribes would loop. The replicator role may drop and re-create
-  // slots, so an inactive invalidated slot is re-created here. A live one is
-  // left alone, and a MISSING one stays missing: a primary whose replication
-  // was disabled must keep refusing the seed exactly as before.
+  // The slot is this standby's own (20.19 F1) and is minted here when missing:
+  // the replicator role may create slots, and enable mints none. A slot the
+  // WAL bound invalidated stays invalidated for good (a seed on it streams but
+  // retains nothing and loses it again at the first blip), so an inactive lost
+  // or unreserved one is re-created. A live one is left alone: pg_basebackup
+  // then fails on the active slot, which is the truth about it. A primary whose
+  // replication was disabled refuses earlier, at the login disable revoked.
   const resetName = slotResetContainerName(instance);
   await dockerRmForce(resetName);
   const slotReset = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
@@ -667,7 +682,9 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
       seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
       DO $$ DECLARE s record; BEGIN
         SELECT active, wal_status INTO s FROM pg_replication_slots WHERE slot_name = '${record.slot}';
-        IF FOUND AND NOT s.active AND s.wal_status IN ('lost', 'unreserved') THEN
+        IF NOT FOUND THEN
+          PERFORM pg_create_physical_replication_slot('${record.slot}');
+        ELSIF NOT s.active AND s.wal_status IN ('lost', 'unreserved') THEN
           PERFORM pg_drop_replication_slot('${record.slot}');
           PERFORM pg_create_physical_replication_slot('${record.slot}');
         END IF;
@@ -687,7 +704,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
     // to show, never with the DSN's password should it ever be echoed.
     const lines = slotReset.stderr.trim().split('\n');
     const reason = (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').split(dsn.password).join('***');
-    throw new Error(`could not reset the replication slot on the primary: ${reason}`);
+    throw new Error(`could not prepare the replication slot on the primary: ${reason}`);
   }
 
   throwIfCancelled(instance.id);
@@ -709,7 +726,12 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
     child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
   });
-  if (!seed.ok) throw new Error(`pg_basebackup failed: ${seed.stderr.trim().split('\n').pop()}`);
+  if (!seed.ok) {
+    // The slot minted above would retain WAL on the primary for a copy that
+    // does not exist; dropped while inactive, and the next attempt mints again.
+    await dropInactiveSlot(instance, seedDsn, hostCertPath, record.slot);
+    throw new Error(`pg_basebackup failed: ${seed.stderr.trim().split('\n').pop()}`);
+  }
 
   throwIfCancelled(instance.id);
   saveSeed(instance.id, { phase: 'configuring' });
@@ -719,7 +741,9 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // the seed-time /primary-ca.crt mount does not exist once the service runs.
   const put = await volExec(record.volume, `cat > ${PGDATA}/primary-ca.crt && chown postgres:postgres ${PGDATA}/primary-ca.crt`, certPem);
   if (!put.ok) throw new Error(`cert install failed: ${put.stderr.trim()}`);
-  const conninfo = `user=${dsn.user} password=${dsn.password} host=${dsn.host} port=${dsn.port} sslmode=verify-full sslrootcert=${PGDATA}/primary-ca.crt application_name=${instance.sanitizedName}`;
+  // application_name is the slot name, so the primary's own status ties a
+  // streaming link to its slot without reading process ids.
+  const conninfo = `user=${dsn.user} password=${dsn.password} host=${dsn.host} port=${dsn.port} sslmode=verify-full sslrootcert=${PGDATA}/primary-ca.crt application_name=${record.slot}`;
   const conf = await volExec(record.volume, `cat >> ${PGDATA}/postgresql.auto.conf`, `primary_conninfo = '${conninfo}'\n`);
   if (!conf.ok) throw new Error(`primary_conninfo write failed: ${conf.stderr.trim()}`);
 
@@ -761,6 +785,27 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // The app learns its standby from its container environment, which only
   // a recreate rewrites; the running project is marked so Start applies it.
   if (purpose === 'provision') await containerManager.markPendingApplyIfRunning(instance.id);
+}
+
+/** Best effort: an inactive slot of this name on the primary is dropped; a failure is logged, never thrown. */
+async function dropInactiveSlot(instance: InstanceConfig, seedDsn: string, hostCertPath: string, slot: string): Promise<void> {
+  const name = `${slotResetContainerName(instance)}-drop`;
+  await dockerRmForce(name);
+  const result = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+    const child = spawn('docker', ['run', '--rm', '--name', name,
+      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
+      '--entrypoint', 'psql', 'postgres:16-alpine',
+      seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc',
+      `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`]);
+    let stderr = '';
+    const timer = setTimeout(() => {
+      execFile('docker', ['rm', '-f', name], () => child.kill('SIGKILL'));
+    }, 60_000);
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
+    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
+  });
+  if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${result.stderr.trim().split('\n').pop()}`);
 }
 
 /**
@@ -1191,6 +1236,12 @@ export async function adoptPromotedReplica(
     // and the operator can retry Enable from the replication section. Rolling
     // the record back would hide a live primary behind a standby surface again.
     return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
+  }
+  // The promoted copy still carries the standby settings its seed wrote. On a
+  // primary they are inert, but every standby seeded from it would copy them.
+  for (const setting of ['primary_conninfo', 'primary_slot_name']) {
+    const reset = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', `ALTER SYSTEM RESET ${setting};`]);
+    if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${reset.stderr.trim().split('\n').pop()}`);
   }
   // enableFleetReplication repoints the database URL; a repointed key (e.g. a
   // split control store's URL) only exists when set, and then it moves too.

@@ -57,11 +57,11 @@ export interface FleetDbRecord {
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).
 // Present = the database is exposed (published port, TLS required off-host) and
-// carries a replication role + physical slot for a standby on another machine.
+// carries a replication role; every standby mints its own physical slot on it
+// (PLAN_REPLICATION 20.19 F1), so no slot is recorded here.
 export interface FleetDbReplication {
   role: string;                        // replication login role, e.g. 'replicator'
   password: string;                    // same trust domain as the URL mirror in this registry
-  slot: string;                        // physical replication slot name
   hostPort: number;                    // published host port (container 5432)
   publicHost: string;                  // operator-provided host workers/replicas dial
   certHost: string;                    // host the pinned cert names; differing publicHost forces regeneration

@@ -88,49 +88,51 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   }
   // An invalidated slot outranks everything below: its standby can never
   // resume from it, so the streaming picture is already lost (RC-1).
-  const lost = (status.live.slots || []).find(s => s.walStatus === 'lost');
+  const fleetSlots = (status.live.slots || []).filter(s => s.fleet);
+  // Retention is a property of the SLOT, not of what follows it: a slot this
+  // manager did not mint fills the same bound, so all of them are weighed and
+  // only the remedy differs.
+  const allSlots = status.live.slots || [];
+  const lost = allSlots.find(s => s.walStatus === 'lost');
   if (lost) {
-    return { ...base, severity: 'error', message: `Replication slot ${lost.slot} was invalidated (retained WAL passed the bound); its standby cannot resume and must be re-seeded from the copy block`, lagSeconds: null };
+    const remedy = lost.fleet ? 'its standby cannot resume and must be re-seeded from the copy block' : 'whatever was following it must start over';
+    return { ...base, severity: 'error', message: `Replication slot ${lost.slot} was invalidated (retained WAL passed the bound); ${remedy}`, lagSeconds: null };
   }
   // 'unreserved' = past the bound but not yet dropped; the standby can still
   // make it if it reconnects before the next checkpoint takes the WAL.
-  const unreserved = (status.live.slots || []).find(s => s.walStatus === 'unreserved');
+  const unreserved = allSlots.find(s => s.walStatus === 'unreserved');
   if (unreserved) {
-    return { ...base, severity: 'error', message: `Replication slot ${unreserved.slot} is past the WAL retention bound and about to be invalidated; reconnect its standby now or plan a re-seed`, lagSeconds: null };
+    const remedy = unreserved.fleet ? 'reconnect its standby now or plan a re-seed' : 'finish or stop whatever is following it now';
+    return { ...base, severity: 'error', message: `Replication slot ${unreserved.slot} is past the WAL retention bound and about to be invalidated; ${remedy}`, lagSeconds: null };
   }
   const bound = sizeSettingBytes(status.live.slotWalKeep);
-  const fattest = (status.live.slots || []).reduce<{ slot: string; retainedBytes: number } | null>((max, s) =>
-    s.retainedBytes !== null && (max === null || s.retainedBytes > max.retainedBytes) ? { slot: s.slot, retainedBytes: s.retainedBytes } : max, null);
+  const fattest = allSlots.reduce<{ slot: string; fleet: boolean; retainedBytes: number } | null>((max, s) =>
+    s.retainedBytes !== null && (max === null || s.retainedBytes > max.retainedBytes) ? { slot: s.slot, fleet: s.fleet, retainedBytes: s.retainedBytes } : max, null);
   const retentionWarn = bound !== null && fattest !== null && fattest.retainedBytes > bound / 2
-    ? `Replication slot ${fattest.slot} retains ${mb(fattest.retainedBytes)} MB of WAL (bound ${mb(bound)} MB); past the bound the slot invalidates and its standby must be re-seeded`
+    ? `Replication slot ${fattest.slot} retains ${mb(fattest.retainedBytes)} MB of WAL (bound ${mb(bound)} MB); past the bound the slot invalidates${fattest.fleet ? ' and its standby must be re-seeded' : ''}`
     : null;
-  const standbys = status.live.standbys;
-  if (standbys.length === 0) {
-    // Indistinguishable from "never set up": the primary keeps no memory of a
-    // standby beyond the slot, and the slot exists from the moment replication
-    // is enabled. Warn either way, because both states mean unprotected.
-    return {
-      ...base,
-      severity: 'warn',
-      message: retentionWarn ?? (status.live.slotActive
-        ? 'A standby holds the replication slot but is not streaming; the copy is stale'
-        : 'No standby is attached: this machine dying would take the fleet database with it'),
-      lagSeconds: null,
-    };
+  // Every standby that ever seeded left its slot, so the slots ARE the
+  // standbys: none means unprotected, an inactive one means a standby that
+  // stopped streaming (the copy behind it goes stale), and a streaming link
+  // is read off the slot it holds.
+  if (fleetSlots.length === 0) {
+    return { ...base, severity: 'warn', message: retentionWarn ?? 'No standby is attached: this machine dying would take the fleet database with it', lagSeconds: null };
   }
-  const broken = standbys.find(s => s.state !== 'streaming');
-  if (broken) {
-    return { ...base, severity: 'error', message: `Standby ${broken.clientAddr || 'link'} is ${broken.state || 'not streaming'} rather than streaming`, lagSeconds: null };
+  const silent = fleetSlots.find(s => !s.active || s.state !== 'streaming');
+  if (silent) {
+    const streaming = fleetSlots.filter(s => s.active && s.state === 'streaming').length;
+    const how = !silent.active ? 'not connected' : `${silent.state || 'not streaming'} rather than streaming`;
+    return { ...base, severity: 'error', message: `Standby on slot ${silent.slot} is ${how} (${streaming} of ${fleetSlots.length} streaming); its copy is going stale`, lagSeconds: null };
   }
   if (retentionWarn) {
     return { ...base, severity: 'warn', message: retentionWarn, lagSeconds: null };
   }
-  const worst = standbys.reduce<number | null>((max, s) =>
+  const worst = fleetSlots.reduce<number | null>((max, s) =>
     s.replayLagSeconds !== null && (max === null || s.replayLagSeconds > max) ? s.replayLagSeconds : max, null);
   if (worst !== null && worst > LAG_WARN_SECONDS) {
-    return { ...base, severity: 'warn', message: `Standby is ${Math.round(worst)}s behind; a failover now would lose that much`, lagSeconds: round(worst) };
+    return { ...base, severity: 'warn', message: `A standby is ${Math.round(worst)}s behind; a failover to it now would lose that much`, lagSeconds: round(worst) };
   }
-  return { ...base, severity: 'ok', message: `Streaming to ${standbys.length} standby${standbys.length === 1 ? '' : 's'}`, lagSeconds: round(worst) };
+  return { ...base, severity: 'ok', message: `Streaming to ${fleetSlots.length} standby${fleetSlots.length === 1 ? '' : 's'}`, lagSeconds: round(worst) };
 }
 
 /**
@@ -144,6 +146,9 @@ async function readSlotFact(instance: InstanceConfig): Promise<StandbySlotFact |
   const result = await getAppFacts(instance, FACTS_TIMEOUT_MS);
   const fact = result.success ? result.facts?.standbySlot : null;
   if (!fact || typeof fact.slotName !== 'string' || fact.slotName === '' || typeof fact.walStatus !== 'string' || fact.walStatus === '') return null;
+  // A fact about another slot (a record re-provisioned under a new name, an
+  // older record) is unknown, never a verdict on this copy.
+  if (instance.fleetDbReplica && fact.slotName !== instance.fleetDbReplica.slot) return null;
   if (fact.sourceIsCurrentMaster !== true) return null;
   if (!Number.isFinite(fact.receivedAt) || Date.now() - Number(fact.receivedAt) > SLOT_FACT_FRESH_MS) return null;
   return { slotName: fact.slotName, walStatus: fact.walStatus, observedAt: Number(fact.observedAt) || 0, lost: result.facts?.standbySlotLost === true };

@@ -2521,20 +2521,6 @@
       }
       const stopped = (bots.find(b => b.id === botId) || {}).status !== 'running';
       const live = r.live;
-      const standbys = (live && live.standbys) || [];
-      // A standby that stopped streaming is a silent loss of the whole point of
-      // replication, so it reads as an error rather than a status line.
-      const standbyHtml = standbys.length === 0
-        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take this bot's managed database with it. Use the block below on the standby machine.</div>`
-        : standbys.map(s => {
-            const lag = s.replayLagSeconds;
-            const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
-            if (s.state !== 'streaming') {
-              return `<div class="error-message">Standby ${escapeHtml(s.clientAddr || '?')} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale. Re-seed it from the standby machine's manager.</div>`;
-            }
-            const warn = lag != null && lag > 60;
-            return `<div class="env-tip" style="color:var(--${warn ? 'warning' : 'success'});">Standby ${escapeHtml(s.clientAddr || '?')}: streaming${lagText}${warn ? ' - a failover now would lose that much' : ''}</div>`;
-          }).join('');
       const block = res.block;
       const reach = r.reachability;
       const reachHtml = !live ? ''
@@ -2547,14 +2533,31 @@
         const f = { kB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 }[m[2] || 'MB'];
         return Number(m[1]) * f;
       })();
-      const slotsHtml = ((live && live.slots) || []).map(s => {
-        if (s.walStatus === 'lost') return `<div class="error-message">Slot <b>${escapeHtml(s.slot)}</b> was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below.</div>`;
-        if (s.walStatus === 'unreserved') return `<div class="error-message">Slot <b>${escapeHtml(s.slot)}</b> is past the WAL retention bound and about to be invalidated; reconnect its standby now.</div>`;
-        if (keepBytes !== null && s.retainedBytes !== null && s.retainedBytes > keepBytes / 2) {
-          return `<div class="env-tip" style="color:var(--warning);">Slot <b>${escapeHtml(s.slot)}</b> retains ${Math.round(s.retainedBytes / 1048576)} MB of WAL (bound ${Math.round(keepBytes / 1048576)} MB); its consumer is detached or falling behind.</div>`;
-        }
-        return '';
-      }).join('');
+      // Every standby that ever seeded left its slot on this primary, so the
+      // slots ARE the standbys: each one is read with the link streaming on it,
+      // and an inactive one can be dropped once its standby is gone.
+      const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
+      const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
+      const fleetSlotsHtml = fleetSlots.length === 0
+        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take this bot's managed database with it. Use the block below on each standby machine.</div>`
+        : fleetSlots.map(s => {
+            const who = `Standby on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
+            const retained = s.retainedBytes != null ? Math.round(s.retainedBytes / 1048576) : null;
+            const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the primary; a standby that used it must be re-seeded to attach again">Drop slot</button>` : '';
+            if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below, or drop the slot if that standby is gone.${dropBtn}</div>`;
+            if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL retention bound and about to be invalidated; reconnect the standby now.${dropBtn}</div>`;
+            if (!s.active) return `<div class="error-message">${who} is not connected: its copy is going stale${retained != null ? ` and the slot retains ${retained} MB of WAL` : ''}. Re-seed it from the standby machine's manager, or drop the slot if that standby is gone.${dropBtn}</div>`;
+            if (s.state !== 'streaming') return `<div class="error-message">${who} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale.</div>`;
+            const lag = s.replayLagSeconds;
+            const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
+            const warn = lag != null && lag > 60;
+            const retain = keepBytes !== null && s.retainedBytes !== null && s.retainedBytes > keepBytes / 2 ? ` - retains ${retained} MB of WAL (bound ${Math.round(keepBytes / 1048576)} MB)` : '';
+            return `<div class="env-tip" style="color:var(--${warn || retain ? 'warning' : 'success'});">${who}: streaming${lagText}${warn ? ' - a failover to it now would lose that much' : ''}${retain}</div>`;
+          }).join('');
+      // A slot this manager did not mint retains WAL on the same bound, so it is
+      // listed whether or not a standby of this primary is attached.
+      const slotsHtml = !live ? '' : fleetSlotsHtml
+        + otherSlots.map(s => `<div class="env-tip">Slot <b>${escapeHtml(s.slot)}</b> (${s.slot === 'recovery_channel' ? 'recovery channel' : 'not a fleet standby'}): ${escapeHtml(s.walStatus)}${s.active ? ', active' : ''}</div>`).join('');
       const keepTip = live && live.slotWalKeep === '-1'
         ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span> <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`
         : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
@@ -2562,7 +2565,6 @@
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
         ${reachHtml}
         ${slotsHtml}
-        ${standbyHtml}
         ${block ? `
         <div style="margin-top:6px;">
           <div style="display:flex;align-items:center;gap:8px;">
@@ -2572,7 +2574,7 @@
           </div>
           <input type="hidden" id="fleet-repl-dsn" value="${escapeHtml(block.dsn)}">
           <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
-          <div class="env-tip">Paste both into "Add a database replica" on the standby machine's manager.</div>
+          <div class="env-tip">Paste both into "Add a database replica" on each standby machine's manager; a designated backup can instead use the block its bot already holds.</div>
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
@@ -2696,8 +2698,19 @@
       renderFleetReplication(botId);
     }
 
+    async function dropFleetSlot(botId, slot) {
+      if (!confirm(`Drop replication slot ${slot} on this primary?\n\nThe WAL it retains is released. A standby that used it can no longer resume and must be re-seeded to attach again.`)) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/fleet-replication/slots/${encodeURIComponent(slot)}`);
+        showMessage(res.success ? 'success' : 'error', res.success ? `Slot ${slot} dropped` : (res.error || 'Failed to drop the slot'));
+      } catch (err) {
+        showMessage('error', 'Failed to drop the slot');
+      }
+      renderFleetReplication(botId);
+    }
+
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nThe published port closes and the database URL reverts on the next restart. An attached standby will stop receiving changes.')) return;
+      if (!confirm('Disable replication?\n\nRefused while any standby is still streaming: stop or remove standbys first. Inactive standby slots are dropped, the replication login is revoked, and the published port closes and the database URL reverts on the next restart.')) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
         if (res.success) {
@@ -3279,7 +3292,8 @@
       loadBots();
     }
     async function removeFleetReplica(botId) {
-      if (!confirm('Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps a replication slot for this standby that retains WAL until you disable replication there (or provision a new replica). Do that soon after removing.')) return;
+      const rec = (bots.find(b => b.id === botId) || {}).fleetDbReplica;
+      if (!confirm(`Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/fleet-replica`);
         if (res.success) {

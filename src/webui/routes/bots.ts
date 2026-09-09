@@ -1469,6 +1469,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /** DELETE /api/bots/:id/fleet-replication/slots/:slot - drop one inactive fleet standby slot on this primary. */
+  router.delete('/:id/fleet-replication/slots/:slot', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json(await fleetReplication.dropFleetSlot(bot, String(req.params.slot || '')));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   /**
    * POST /api/bots/:id/fleet-replication - Enable/update ({enabled:true,
    * publicHost, hostPort?}) or disable ({enabled:false}) the replication
@@ -1785,10 +1799,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
+      const slot = bot.fleetDbReplica?.slot;
       const result = await fleetReplica.removeFleetReplica(bot);
       if (result.success) {
         broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-        res.json({ success: true, warning: "The primary's replication slot is now orphaned and retains WAL: disable replication on the primary, or provision a new replica soon" });
+        res.json({ success: true, warning: `The primary keeps replication slot ${slot}, which retains WAL until it is dropped there: its Database modal lists the slot with a Drop action once nothing streams on it` });
         return;
       }
       res.json(result);

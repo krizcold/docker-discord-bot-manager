@@ -30,7 +30,8 @@ import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 
 const REPLICATION_ROLE = 'replicator';
-const REPLICATION_SLOT = 'fleet_standby';
+/** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
+const FLEET_SLOT_PREFIX = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;
 // Bounded slot retention (PLAN_REPLICATION.md RC-1): an absent standby must
 // fill the bound, not the disk - in the rescue direction the source is a
@@ -151,8 +152,9 @@ async function ensureServerCert(containerName: string, publicHost: string, certH
 
 /**
  * Enable (or update host/port of) the replication posture. Idempotent: the
- * replication password and slot survive re-enables; only the operator-provided
- * host/port move. The published port and the public-URL env apply on the next
+ * replication password survives re-enables and only the operator-provided
+ * host/port move. Slots belong to the standbys that mint them (20.19 F1); a
+ * freshly enabled primary has none until a standby seeds. The published port and the public-URL env apply on the next
  * instance restart.
  */
 export async function enableFleetReplication(
@@ -165,9 +167,8 @@ export async function enableFleetReplication(
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
   // Record check FIRST: everything past the preflight mutates the live
-  // cluster (role, slot, ssl, pg_hba), so a missing key name must refuse
-  // before any of it or a failed enable leaks a WAL-retaining slot with no
-  // record for disable to act on.
+  // cluster (role, ssl, pg_hba), so a missing key name must refuse before
+  // any of it or a failed enable leaves a live posture no record accounts for.
   const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
   if (!dbEnv?.publicUrl) {
     return { success: false, error: 'This app declares no public database URL key, so replication cannot publish the canonical form' };
@@ -217,9 +218,6 @@ export async function enableFleetReplication(
       ELSE
         ALTER ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${password}';
       END IF;
-      IF NOT EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = '${REPLICATION_SLOT}') THEN
-        PERFORM pg_create_physical_replication_slot('${REPLICATION_SLOT}');
-      END IF;
     END $$;`);
   if (!setup.ok) return { success: false, error: `database setup failed: ${setup.stderr.trim()}` };
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
@@ -241,7 +239,6 @@ export async function enableFleetReplication(
   const replication: FleetDbReplication = {
     role: REPLICATION_ROLE,
     password,
-    slot: REPLICATION_SLOT,
     hostPort: port,
     publicHost: host,
     certHost: host,
@@ -264,12 +261,13 @@ export async function enableFleetReplication(
 }
 
 /**
- * Disable: drop the slot FIRST (a leaked slot retains WAL until the disk
- * fills, so a disable that cannot drop it refuses and keeps the record), then
- * drop the record and revert the URL to the private sidecar form. A streaming
- * standby's walsender is terminated so the drop cannot be blocked by an active
- * slot. Cert, ssl=on and the role stay in PGDATA (harmless without the
- * published port). Port unpublish applies on the next restart.
+ * Disable: refuse while any fleet standby still streams (naming its slots),
+ * drop every inactive fleet slot FIRST (a leaked slot retains WAL until the
+ * disk fills, so a disable that cannot drop them refuses and keeps the record),
+ * revoke the replication login (the port may stay published until the next
+ * restart, and a seed against a disabled primary must fail at the login), then
+ * drop the record and revert the URL to the private sidecar form. Cert and
+ * ssl=on stay in PGDATA. Port unpublish applies on the next restart.
  */
 export async function disableFleetReplication(
   instance: InstanceConfig,
@@ -282,19 +280,34 @@ export async function disableFleetReplication(
     return { success: false, error: 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)' };
   }
 
+  const streaming = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+    `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND active;`);
+  if (!streaming.ok) {
+    return { success: false, error: `could not read the replication slots (nothing was disabled): ${streaming.stderr.trim()}` };
+  }
+  if (streaming.stdout.trim() !== '') {
+    return { success: false, error: `Standbys are still streaming on slot(s) ${streaming.stdout.trim()}; stop or remove them first (nothing was disabled)` };
+  }
   const drop = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
-    DO $$ DECLARE pid int; BEGIN
-      SELECT active_pid INTO pid FROM pg_replication_slots WHERE slot_name = '${REPLICATION_SLOT}';
-      IF pid IS NOT NULL THEN
-        PERFORM pg_terminate_backend(pid);
-        PERFORM pg_sleep(0.5);
-      END IF;
-      IF EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = '${REPLICATION_SLOT}') THEN
-        PERFORM pg_drop_replication_slot('${REPLICATION_SLOT}');
-      END IF;
+    DO $$ DECLARE s record; BEGIN
+      FOR s IN SELECT slot_name FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND NOT active LOOP
+        PERFORM pg_drop_replication_slot(s.slot_name);
+      END LOOP;
     END $$;`);
   if (!drop.ok) {
-    return { success: false, error: `slot drop failed (nothing was disabled; retry after stopping the standby): ${drop.stderr.trim()}` };
+    return { success: false, error: `slot drop failed (nothing was disabled): ${drop.stderr.trim()}` };
+  }
+  const left = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+    `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}');`);
+  if (!left.ok) {
+    return { success: false, error: `could not confirm the replication slots are gone (nothing else was changed): ${left.stderr.trim()}` };
+  }
+  if (left.stdout.trim() !== '') {
+    return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then disable again (nothing else was changed)` };
+  }
+  const revoke = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
+  if (!revoke.ok) {
+    return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
   }
 
   // ssl=on and the authored pg_hba survive the disable, so the local form
@@ -316,13 +329,16 @@ export interface FleetReplicationStatus {
   enabled: boolean;
   publicHost?: string;
   hostPort?: number;
-  slot?: string;
   live?: {
     sslOn: boolean;
-    slotActive: boolean;
     standbys: Array<{ clientAddr: string; state: string; replayLagSeconds: number | null }>;
-    /** Every physical slot on this primary; an invalidated one means its standby must re-seed. */
-    slots: Array<{ slot: string; walStatus: string; retainedBytes: number | null }>;
+    /**
+     * Every physical slot on this primary, joined to the link streaming on it
+     * (active_pid to pg_stat_replication.pid); an invalidated one means its
+     * standby must re-seed. fleet marks the standby slots this manager family
+     * mints; the recovery channel's slot is not one.
+     */
+    slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null }>;
     /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */
     slotWalKeep: string;
   };
@@ -374,27 +390,30 @@ export async function getFleetReplicationStatus(
     enabled: true,
     publicHost: repl.publicHost,
     hostPort: repl.hostPort,
-    slot: repl.slot,
   };
   const fleetDb = instance.fleetDb!;
   if (!await isContainerRunning(fleetDb.containerName)) return status;
 
   const probe = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
     `SELECT current_setting('ssl'),
-            (SELECT active FROM pg_replication_slots WHERE slot_name = '${repl.slot}'),
             (SELECT json_agg(json_build_object(
                'clientAddr', client_addr::text,
                'state', state,
                'replayLagSeconds', EXTRACT(EPOCH FROM replay_lag)))
              FROM pg_stat_replication),
             (SELECT json_agg(json_build_object(
-               'slot', slot_name,
-               'walStatus', wal_status,
-               'retainedBytes', GREATEST(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)))
-             FROM pg_replication_slots),
+               'slot', s.slot_name,
+               'walStatus', s.wal_status,
+               'active', s.active,
+               'retainedBytes', GREATEST(pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn), 0),
+               'clientAddr', r.client_addr::text,
+               'state', r.state,
+               'replayLagSeconds', EXTRACT(EPOCH FROM r.replay_lag)))
+             FROM pg_replication_slots s LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
+             WHERE s.slot_type = 'physical'),
             current_setting('max_slot_wal_keep_size');`);
   if (probe.ok) {
-    const [sslOn, slotActive, standbysJson, slotsJson, slotWalKeep] = probe.stdout.trim().split('|');
+    const [sslOn, standbysJson, slotsJson, slotWalKeep] = probe.stdout.trim().split('|');
     let standbys: Array<{ clientAddr: string; state: string; replayLagSeconds: number | null }> = [];
     try {
       const parsed = JSON.parse(standbysJson || 'null');
@@ -406,21 +425,52 @@ export async function getFleetReplicationStatus(
         }));
       }
     } catch { /* no standbys */ }
-    let slots: Array<{ slot: string; walStatus: string; retainedBytes: number | null }> = [];
+    let slots: NonNullable<FleetReplicationStatus['live']>['slots'] = [];
     try {
       const parsed = JSON.parse(slotsJson || 'null');
       if (Array.isArray(parsed)) {
         slots = parsed.map((s: any) => ({
           slot: String(s.slot || ''),
+          fleet: String(s.slot || '').startsWith(FLEET_SLOT_PREFIX),
           walStatus: String(s.walStatus || ''),
+          active: s.active === true,
           retainedBytes: s.retainedBytes === null || s.retainedBytes === undefined ? null : Number(s.retainedBytes),
+          clientAddr: s.clientAddr ? String(s.clientAddr) : null,
+          state: s.state ? String(s.state) : null,
+          replayLagSeconds: s.replayLagSeconds === null || s.replayLagSeconds === undefined ? null : Number(s.replayLagSeconds),
         }));
       }
     } catch { /* no slots */ }
-    status.live = { sslOn: sslOn === 'on', slotActive: slotActive === 't', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
+    status.live = { sslOn: sslOn === 'on', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
   }
   if (opts.probeEndpoint !== false) status.reachability = await cachedReachability(instance);
   return status;
+}
+
+/**
+ * Drop one INACTIVE fleet slot on this primary: the orphan a removed or
+ * decommissioned standby leaves behind, which retains WAL until dropped. An
+ * active slot has a standby on it and is never dropped from here.
+ */
+export async function dropFleetSlot(instance: InstanceConfig, slot: string): Promise<{ success: boolean; error?: string }> {
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
+  if (!/^[a-z0-9_]{1,63}$/.test(slot) || !slot.startsWith(FLEET_SLOT_PREFIX)) {
+    return { success: false, error: 'Only a fleet standby slot can be dropped here' };
+  }
+  if (!await isContainerRunning(fleetDb.containerName)) return { success: false, error: 'Database container is not running' };
+  const result = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
+    DO $$ DECLARE s record; BEGIN
+      SELECT active INTO s FROM pg_replication_slots WHERE slot_name = '${slot}';
+      IF NOT FOUND THEN RAISE EXCEPTION 'no slot named ${slot}'; END IF;
+      IF s.active THEN RAISE EXCEPTION 'a standby is streaming on ${slot}; stop or remove it first'; END IF;
+      PERFORM pg_drop_replication_slot('${slot}');
+    END $$;`);
+  if (!result.ok) {
+    const lines = result.stderr.trim().split('\n');
+    return { success: false, error: (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').replace(/^ERROR:\s*/, '') };
+  }
+  return { success: true };
 }
 
 /**

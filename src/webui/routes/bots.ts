@@ -1567,12 +1567,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number };
+      const { primaryDsn, cert, publicHost, hostPort, confirm } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean };
       if (!primaryDsn || !cert || !publicHost) {
         res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
         return;
       }
-      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort));
+      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort, confirm === true));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1590,12 +1590,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { publicHost, hostPort } = req.body as { publicHost?: string; hostPort?: number };
+      const { publicHost, hostPort, confirm } = req.body as { publicHost?: string; hostPort?: number; confirm?: boolean };
       if (!publicHost) {
         res.status(400).json({ success: false, error: 'publicHost is required' });
         return;
       }
-      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort));
+      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort, confirm === true));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1776,12 +1776,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number };
+      const { primaryDsn, cert, publicHost, hostPort, confirm } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean };
       if (!primaryDsn || !cert || !publicHost) {
         res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
         return;
       }
-      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort));
+      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort, confirm === true));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

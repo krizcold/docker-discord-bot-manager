@@ -3236,7 +3236,11 @@
       const payload = { publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        const res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, payload);
+        let res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, payload);
+        if (!res.success && res.needsConfirm) {
+          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return;
+          res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, { ...payload, confirm: true });
+        }
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started from the block this node holds');
       } catch (err) {
@@ -3255,7 +3259,11 @@
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        const res = await api('POST', `/bots/${botId}/fleet-replica`, payload);
+        let res = await api('POST', `/bots/${botId}/fleet-replica`, payload);
+        if (!res.success && res.needsConfirm) {
+          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return;
+          res = await api('POST', `/bots/${botId}/fleet-replica`, { ...payload, confirm: true });
+        }
         // Failure keeps the form (and everything pasted into it) intact.
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started');
@@ -3277,7 +3285,11 @@
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        const res = await api('POST', `/bots/${botId}/fleet-reseed`, payload);
+        let res = await api('POST', `/bots/${botId}/fleet-reseed`, payload);
+        if (!res.success && res.needsConfirm) {
+          if (!window.confirm(`${res.error}\n\nRe-seed it here anyway?`)) return;
+          res = await api('POST', `/bots/${botId}/fleet-reseed`, { ...payload, confirm: true });
+        }
         // Failure keeps the form (and everything pasted into it) intact.
         if (!res.success) { showMessage('error', res.error || 'Failed to start re-seeding'); return; }
         showMessage('success', 'Re-seeding started');

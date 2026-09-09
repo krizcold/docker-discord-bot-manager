@@ -99,6 +99,13 @@ export async function transferSide(instance: InstanceConfig, opts: TransferOptio
     return { success: false, error: 'this node holds no standby yet, so the transfer seeds one first and needs this machine\'s public host (and port) for the copy it will serve' };
   }
   const started = await fleetReplica.provisionFleetReplicaFromFacts(instance, publicHost, hostPort);
+  // A confirmable refusal is not confirmable HERE (20.19 F7): this run is
+  // unattended and ends in a promote, so a copy that seeds without ever
+  // streaming would be promoted on a 30 s grace. The two-step route puts the
+  // operator in front of the standby's own streaming state before promoting.
+  if (!started.success && started.needsConfirm) {
+    return { success: false, error: `${started.error}. This one-action transfer promotes without waiting for you, so seed the standby first with Provision from the block, check it reports streaming, then Transfer` };
+  }
   if (!started.success) return { success: false, error: started.error };
   const startedAt = openRun(instance.id, 'seeding', opts.retireOldMaster === true);
   void runSeedFirst(instance.id, startedAt);

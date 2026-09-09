@@ -498,7 +498,8 @@ export function provisionFleetReplica(
   certPem: string,
   publicHost: string,
   hostPort?: number,
-): { success: boolean; error?: string; started?: boolean } {
+  confirm?: boolean,
+): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
@@ -535,15 +536,15 @@ export function provisionFleetReplica(
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
-  // R2: a replica on the primary's own machine protects nothing. The DSN
-  // pointing at a replication endpoint THIS manager provisioned means the
-  // primary lives here.
+  // R2, downgraded to a warning by 20.19 F7: the DSN pointing at a replication
+  // endpoint THIS manager provisioned means the primary lives here, which is a
+  // weaker standby but a shape 20.9 lists, so the operator owns the trade.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
     return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
   });
-  if (samehost) {
-    return { success: false, error: `That primary ("${samehost.displayName}") lives on THIS machine - a replica here would die with it. Provision the replica on another machine's manager` };
+  if (samehost && !confirm) {
+    return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
   // The op lock keeps start/rebuild/delete away from the minutes-long seed
@@ -563,7 +564,8 @@ export async function provisionFleetReplicaFromFacts(
   instance: InstanceConfig,
   publicHost: string,
   hostPort?: number,
-): Promise<{ success: boolean; error?: string; started?: boolean }> {
+  confirm?: boolean,
+): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean }> {
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (!hasAppHooks(instance)) return { success: false, error: 'This app declares no lifecycle hooks, so the manager cannot read the copy block from it; paste the block instead' };
   const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
@@ -580,7 +582,7 @@ export async function provisionFleetReplicaFromFacts(
   if (facts.facts?.copyBlockCurrent !== true) {
     return { success: false, error: 'The app did not say whether its block is current; paste the block from the primary machine instead' };
   }
-  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort);
+  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort, confirm);
 }
 
 function seedDsnFor(dsn: ParsedDsn): string {
@@ -884,7 +886,8 @@ export function reseedStalePrimary(
   certPem: string,
   publicHost: string,
   hostPort?: number,
-): { success: boolean; error?: string; started?: boolean } {
+  confirm?: boolean,
+): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
   if (!instance.fleetDb) {
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
   }
@@ -928,13 +931,11 @@ export function reseedStalePrimary(
     const repl = other.fleetDb?.replication;
     return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
   });
-  if (samehost) {
-    return {
-      success: false,
-      error: samehost.id === instance.id
-        ? 'That block is this instance\'s OWN database, which is the stale one. Paste the block from the machine that now serves the fleet'
-        : `That primary ("${samehost.displayName}") lives on THIS machine - a replica here would die with it. Re-seed from the machine that now serves the fleet`,
-    };
+  if (samehost?.id === instance.id) {
+    return { success: false, error: 'That block is this instance\'s OWN database, which is the stale one. Paste the block from the machine that now serves the fleet' };
+  }
+  if (samehost && !confirm) {
+    return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
   const started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'reseed-stale-primary', async () => {

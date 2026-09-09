@@ -185,6 +185,7 @@ export async function enableFleetReplication(
   }
   const collision = containerManager.getAllBots().find(other =>
     (other.id !== instance.id && other.fleetDb?.replication?.hostPort === port)
+    || other.fleetDbReplica?.hostPort === port
     || other.recoveryChannel?.tunnelPort === port);
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };

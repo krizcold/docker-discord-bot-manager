@@ -750,6 +750,14 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // the seed-time /primary-ca.crt mount does not exist once the service runs.
   const put = await volExec(record.volume, `cat > ${PGDATA}/primary-ca.crt && chown postgres:postgres ${PGDATA}/primary-ca.crt`, certPem);
   if (!put.ok) throw new Error(`cert install failed: ${put.stderr.trim()}`);
+  // Two settings are inherited from the primary's auto.conf and are actively
+  // wrong on a copy (B6 map F18, E3): an armed synchronous_standby_names names
+  // standbys this cluster does not have, so its first write after any promotion
+  // hangs with the database reporting healthy; and a promote fence leaves the
+  // copy read-only at its own next promotion. Stripped, never reset, because
+  // the copy is not running yet.
+  const strip = await volExec(record.volume, `sed -i '/^synchronous_standby_names/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf`);
+  if (!strip.ok) throw new Error(`could not strip the primary's own settings from the copy: ${strip.stderr.trim()}`);
   // application_name is the slot name, so the primary's own status ties a
   // streaming link to its slot without reading process ids.
   const conninfo = `user=${dsn.user} password=${dsn.password} host=${dsn.host} port=${dsn.port} sslmode=verify-full sslrootcert=${PGDATA}/primary-ca.crt application_name=${record.slot}`;
@@ -1239,18 +1247,27 @@ export async function adoptPromotedReplica(
     [db.env.url]: `postgresql://${rec.user}:${encodeURIComponent(password)}@${rec.containerName}:5432/${rec.db}?sslmode=no-verify`,
   });
 
+  // BEFORE the enable, deliberately (B6 map F18/B13): the promoted copy still
+  // carries what its seed and its old primary wrote. primary_conninfo and
+  // primary_slot_name are merely inert here, but an inherited armed
+  // synchronous_standby_names names standbys that do not exist on THIS cluster,
+  // and enable's first catalog write would hang forever behind it with docker
+  // still reporting the database healthy. A read-only fence inherited the same
+  // way would refuse that write outright. ALTER SYSTEM itself writes no WAL, so
+  // it can always run, and the reload is what actually lifts a live wedge.
+  for (const setting of ['primary_conninfo', 'primary_slot_name', 'synchronous_standby_names', 'default_transaction_read_only']) {
+    const reset = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', `ALTER SYSTEM RESET ${setting};`]);
+    if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${reset.stderr.trim().split('\n').pop()}`);
+  }
+  const reload = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_reload_conf();']);
+  if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${reload.stderr.trim().split('\n').pop()}`);
+
   const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort);
   if (!enabled.success) {
     // Leave the adopted record in place: the database IS this machine's now,
     // and the operator can retry Enable from the replication section. Rolling
     // the record back would hide a live primary behind a standby surface again.
     return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
-  }
-  // The promoted copy still carries the standby settings its seed wrote. On a
-  // primary they are inert, but every standby seeded from it would copy them.
-  for (const setting of ['primary_conninfo', 'primary_slot_name']) {
-    const reset = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', `ALTER SYSTEM RESET ${setting};`]);
-    if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${reset.stderr.trim().split('\n').pop()}`);
   }
   // enableFleetReplication repoints the database URL; a repointed key (e.g. a
   // split control store's URL) only exists when set, and then it moves too.

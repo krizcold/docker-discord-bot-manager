@@ -289,6 +289,18 @@ export async function disableFleetReplication(
   if (streaming.stdout.trim() !== '') {
     return { success: false, error: `Standbys are still streaming on slot(s) ${streaming.stdout.trim()}; stop or remove them first (nothing was disabled)` };
   }
+  // Disabling replication leaves no standby to wait for, so an armed setting
+  // could only wedge this database's own next write (B6 map F18). Separate
+  // calls, for the reason the enable above records: ALTER SYSTEM refuses to run
+  // inside the implicit transaction a multi-statement psql -c wraps its input in.
+  const relax = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
+  if (!relax.ok) {
+    return { success: false, error: `could not relax the synchronous posture (nothing was disabled): ${relax.stderr.trim()}` };
+  }
+  const relaxed = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
+  if (!relaxed.ok) {
+    return { success: false, error: `could not reload after relaxing the synchronous posture (nothing was disabled): ${relaxed.stderr.trim()}` };
+  }
   const drop = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
     DO $$ DECLARE s record; BEGIN
       FOR s IN SELECT slot_name FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND NOT active LOOP

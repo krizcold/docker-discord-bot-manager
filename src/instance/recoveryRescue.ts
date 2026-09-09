@@ -559,6 +559,7 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   const alter = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
     '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
     '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
+    '-c', 'ALTER SYSTEM RESET synchronous_standby_names',
     '-c', 'SELECT pg_reload_conf()',
     '-c', `ALTER ROLE "${fleetDb.user}" WITH LOGIN PASSWORD '${password.replace(/'/g, "''")}'`]);
   if (!alter.ok) throw new Error(`could not reconcile the database credentials: ${alter.stderr.trim().split('\n').pop()}`);

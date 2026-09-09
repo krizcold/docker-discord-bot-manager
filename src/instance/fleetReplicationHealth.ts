@@ -35,6 +35,8 @@ export interface StandbySlotFact {
   observedAt: number;
   /** The app's verdict: fresh, lost, and on the master this copy follows. */
   lost: boolean;
+  /** Whether the primary this copy follows is the fleet's master; false is the survivor case (20.19 F5). */
+  sourceIsCurrentMaster: boolean;
 }
 
 export interface ReplicationHealth {
@@ -149,9 +151,27 @@ async function readSlotFact(instance: InstanceConfig): Promise<StandbySlotFact |
   // A fact about another slot (a record re-provisioned under a new name, an
   // older record) is unknown, never a verdict on this copy.
   if (instance.fleetDbReplica && fact.slotName !== instance.fleetDbReplica.slot) return null;
-  if (fact.sourceIsCurrentMaster !== true) return null;
+  // Unknown stays unknown; only a decided verdict is carried, and a fact from a
+  // master this copy no longer follows is news about the FLEET (20.19 F5), not
+  // a verdict on the slot, so the lost verdict is forced false there.
+  if (fact.sourceIsCurrentMaster !== true && fact.sourceIsCurrentMaster !== false) return null;
   if (!Number.isFinite(fact.receivedAt) || Date.now() - Number(fact.receivedAt) > SLOT_FACT_FRESH_MS) return null;
-  return { slotName: fact.slotName, walStatus: fact.walStatus, observedAt: Number(fact.observedAt) || 0, lost: result.facts?.standbySlotLost === true };
+  // The survivor verdict is only as fresh as the copy's own last READING of
+  // its source, which a rebuilt copy does not repeat at once: a fact whose
+  // source was read before this copy was built names the primary the REPLACED
+  // copy followed, and would call the new one a former master. Scoped to that
+  // verdict: a stale source cannot manufacture a 'current' one, and the lost
+  // verdict is the primary's own word rather than a reading of the source.
+  const seededAt = instance.fleetDbReplica?.seededAt ?? 0;
+  if (fact.sourceIsCurrentMaster === false && Number(fact.sourceAt) <= seededAt) return null;
+  const current = fact.sourceIsCurrentMaster === true;
+  return {
+    slotName: fact.slotName,
+    walStatus: fact.walStatus,
+    observedAt: Number(fact.observedAt) || 0,
+    lost: current && result.facts?.standbySlotLost === true,
+    sourceIsCurrentMaster: current,
+  };
 }
 
 async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealth> {
@@ -165,7 +185,12 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   const streamingNow = status.live?.receiverStatus === 'streaming';
   const streamingTwice = streamingNow && streamingSeen.get(instance.id) === true;
   streamingSeen.set(instance.id, streamingNow);
-  const contradicted = relayed !== null && streamingTwice
+  // Only a fact from the primary this copy actually follows can be
+  // contradicted by its receiver: a walsender refuses both verdicts. A
+  // survivor's fact comes from a DIFFERENT machine, and 'absent' is its
+  // signature there (the new master has no slot of that name), not a
+  // contradiction, so it must reach the survivor verdict below (20.19 F5).
+  const contradicted = relayed !== null && relayed.sourceIsCurrentMaster && streamingTwice
     && (relayed.walStatus === 'lost' || relayed.walStatus === 'absent');
   const slot = contradicted ? null : relayed;
   const base = { role: 'replica' as const, checkedAt: Date.now(), slot };
@@ -187,6 +212,15 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   }
   if (live.inRecovery === false) {
     return { ...base, severity: 'error', message: 'This copy has been promoted and no longer follows the primary; adopt it as the database of this machine, or re-provision it', lagSeconds: null };
+  }
+  // 20.19 F5: the fleet moved on and this copy still follows the machine it was
+  // seeded from. Nothing about it is broken, but it protects a database the
+  // fleet has left, and no verdict below is about the database it follows: only
+  // the current master pushes the slot table, and it reads its OWN database,
+  // where this copy has no slot at all.
+  if (slot && !slot.sourceIsCurrentMaster) {
+    const from = instance.fleetDbReplica ? `${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort}` : 'its source';
+    return { ...base, severity: 'warn', message: `This copy follows ${from}, which is no longer the fleet's master, so it protects a database the fleet has left; Re-seed now repoints it at the current primary`, lagSeconds: round(live.replayLagSeconds) };
   }
   // The primary's own word outranks the receiver's silence (20.17): a lost
   // slot can never be resumed, whereas "not streaming" alone cannot tell a

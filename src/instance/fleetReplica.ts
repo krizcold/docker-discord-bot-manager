@@ -33,6 +33,8 @@ function slotNameFor(instance: InstanceConfig): string {
   return `${FLEET_SLOT_PREFIX}_${instance.id.replace(/-/g, '')}`;
 }
 const DEFAULT_HOST_PORT = 15432;
+/** The app's own freshness window for the slot fact; duplicated rather than imported, because the health module reads this one. */
+const SLOT_FACT_FRESH_MS = 5 * 60_000;
 const PGDATA = '/var/lib/postgresql/data';
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const SEED_TIMEOUT_MS = 30 * 60 * 1000;
@@ -155,6 +157,26 @@ function setCopyCleared(botId: string, cleared: boolean): void {
 
 function ledgerSuccess(botId: string): void {
   patchLedger(botId, current => ({ attempts: 0, lastAttemptAt: current?.lastAttemptAt ?? Date.now(), trigger: current?.trigger ?? 'automatic', lastSuccessAt: Date.now() }));
+}
+
+/** Record a run that ended while a cancel stood, wherever it ended. */
+function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, committed: boolean): void {
+  // Before the first irreversible step the cancel restores what was there,
+  // so the record goes; after it the operator must be told what is gone.
+  const stranded = committed && purpose !== 'provision';
+  const what = !stranded
+    ? 'cancelled by the operator'
+    : purpose === 'reseed-standby'
+      ? 'cancelled after the old copy was cleared, so this standby holds no usable copy until it is re-seeded or removed'
+      : 'cancelled after the stale database was retired, so this node is now an ordinary worker without a standby (its pre-reseed dump is in the backups list if it succeeded)';
+  // The attempt is already counted, so the ledger must carry its reason or
+  // the modal keeps reporting an attempt that is no longer running.
+  if (purpose === 'reseed-standby') ledgerFailure(botId, what);
+  if (!stranded) {
+    containerManager.updateInstanceFleetDbReplicaSeed(botId, null);
+    return;
+  }
+  saveSeed(botId, { parked: true, cancelRequested: false, cancelled: true, lastError: what });
 }
 
 /** Whether the automatic re-seed may fire for this standby: under the cap and past the spacing. */
@@ -456,22 +478,7 @@ function startProvisioning(
       return;
     }
     if (err instanceof SeedCancelled || seedRecord(instance.id)?.cancelRequested === true) {
-      // Before the first irreversible step the cancel restores what was there,
-      // so the record goes; after it the operator must be told what is gone.
-      const stranded = seedRecord(instance.id)?.committed === true && purpose !== 'provision';
-      const what = !stranded
-        ? 'cancelled by the operator'
-        : purpose === 'reseed-standby'
-          ? 'cancelled after the old copy was cleared, so this standby holds no usable copy until it is re-seeded or removed'
-          : 'cancelled after the stale database was retired, so this node is now an ordinary worker without a standby (its pre-reseed dump is in the backups list if it succeeded)';
-      // The attempt is already counted, so the ledger must carry its reason or
-      // the modal keeps reporting an attempt that is no longer running.
-      if (purpose === 'reseed-standby') ledgerFailure(instance.id, what);
-      if (!stranded) {
-        containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
-        return;
-      }
-      saveSeed(instance.id, { parked: true, cancelRequested: false, cancelled: true, lastError: what });
+      settleCancelledSeed(instance.id, purpose, seedRecord(instance.id)?.committed === true);
       return;
     }
     saveSeed(instance.id, { parked: true, lastError: message });
@@ -773,7 +780,8 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // The copy is byte-complete here, so it goes back whole. Stripped explicitly:
   // a retry was handed the record an earlier attempt had already marked.
   const { copyCleared: _whole, ...restored } = record;
-  containerManager.updateInstanceFleetDbReplica(instance.id, ledger ? { ...restored, autoReseed: ledger } : restored);
+  const rebuilt = { ...restored, seededAt: Date.now() };
+  containerManager.updateInstanceFleetDbReplica(instance.id, ledger ? { ...rebuilt, autoReseed: ledger } : rebuilt);
   const apply = await containerManager.applyFleetDbReplicaService(instance.id);
   if (!apply.success) {
     // A first provision leaves no half record behind; either re-seed keeps the
@@ -1310,12 +1318,21 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
   for (const instance of containerManager.getAllBots()) {
     const seed = instance.fleetDbReplicaSeed;
     if (!seed || seed.parked) continue;
-    console.log(`[FleetReplica] ${instance.displayName} was seeding (${seed.phase}) when the manager stopped - parking it`);
+    const withdrawn = seed.cancelRequested === true;
+    console.log(`[FleetReplica] ${instance.displayName} was seeding (${seed.phase}) when the manager stopped - ${withdrawn ? 'settling the cancel the operator had filed' : 'parking it'}`);
     for (const name of seedHelperNames(instance)) {
       const result = await dockerRmForce(name);
       // Best effort by design: the record must be parked even with the daemon
       // wedged, and every later path re-runs this removal by name.
       if (!rmSettled(result)) console.warn(`[FleetReplica] Could not remove ${name}: ${result.stderr.trim().split('\n').pop()}`);
+    }
+    // The runner that would have answered the operator's cancel is gone, and
+    // an unanswered instruction is still theirs: this is the other end of a
+    // run, so it settles the same way rather than reading as an interruption
+    // that anything may resume.
+    if (withdrawn) {
+      settleCancelledSeed(instance.id, seed.purpose, seed.committed === true);
+      continue;
     }
     const message = `the manager restarted during the seed (phase ${seed.phase})`;
     saveSeed(instance.id, { parked: true, lastError: message });
@@ -1383,10 +1400,41 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   const validated = validateIntake(block.dsn, block.cert, rec.publicHost, rec.hostPort);
   if (!validated.ok) return refuse(`The copy block the bot holds is unusable: ${validated.error}`);
   const { dsn } = validated.intake;
+  // 20.19 F5: a re-seed may REPOINT a survivor of a failover. A block naming a
+  // different endpoint is the new master's, but only the app's own fact that
+  // this copy's source is no longer the fleet's master moves the record; the
+  // new source is proven by assertSeedableSource before anything destructive
+  // runs, and the copy is rebuilt whole either way (the credential rotated).
+  let target = rec;
   if (dsn.host !== rec.primaryHost || dsn.port !== rec.primaryPort) {
-    return refuse(`The copy block names ${dsn.host}:${dsn.port} but this standby follows ${rec.primaryHost}:${rec.primaryPort}; remove the replica and provision it from the new primary instead`);
+    // A stopped run of THIS repoint is the operator's own decision, still
+    // standing: the record only takes the new endpoint when a run finishes, so
+    // a repoint that died mid-way still reads as a mismatch, and its copy is
+    // already gone. A plain re-seed that a later failover overtook parked
+    // against the OLD endpoint, so it never matches here.
+    const stopped = seedRecord(instance.id);
+    // A cancel filed before the runner reached a boundary and then lost to a
+    // manager restart parks the record with the request standing and cancelled
+    // never set, and a withdrawn decision authorises nothing.
+    const authorised = stopped?.purpose === 'reseed-standby'
+      && stopped.cancelled !== true && stopped.cancelRequested !== true
+      && stopped.primaryHost === dsn.host && stopped.primaryPort === dsn.port;
+    if (!authorised) {
+      const fact = facts.facts?.standbySlot;
+      const leftBehind = fact?.sourceIsCurrentMaster === false
+        && Number.isFinite(fact.receivedAt) && Date.now() - Number(fact.receivedAt) <= SLOT_FACT_FRESH_MS;
+      if (!leftBehind) {
+        return refuse(`The copy block names ${dsn.host}:${dsn.port} but this standby follows ${rec.primaryHost}:${rec.primaryPort}, and the bot does not report its source as a former master; remove the replica and provision it from the new primary instead`);
+      }
+      // F5 rules out an automatic repoint: moving a standby to a different
+      // primary is the operator's decision, never a lane that runs on its own.
+      if (trigger !== 'operator') {
+        return refuse(`This standby follows ${rec.primaryHost}:${rec.primaryPort}, which is no longer the fleet's master; repointing it at ${dsn.host}:${dsn.port} is an operator decision, so the automatic re-seed stops here`);
+      }
+    }
+    target = { ...rec, primaryHost: dsn.host, primaryPort: dsn.port };
   }
-  const started = startProvisioning(instance, rec, validated.intake, 'reseed-standby', async () => {
+  const started = startProvisioning(instance, target, validated.intake, 'reseed-standby', async () => {
     // The permits were read before the lock: a Remove replica that landed
     // meanwhile must not be undone by this run writing its record back.
     const fresh = containerManager.getBot(instance.id)?.fleetDbReplica;

@@ -92,6 +92,8 @@ export interface FleetDbReplicaRecord {
   autoReseed?: FleetReplicaAutoReseedLedger;
   /** The manager cleared this copy for a re-seed that has not finished: there is nothing to serve, protect or start. */
   copyCleared?: boolean;
+  /** When this copy was last built whole. Absent on records stamped before 2026-09-09. */
+  seededAt?: number;
 }
 
 export interface FleetReplicaAutoReseedLedger {

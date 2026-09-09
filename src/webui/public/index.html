@@ -3098,6 +3098,8 @@
       const slot = res.slot || null;
       const slotHtml = !slot
         ? ''
+        : slot.sourceIsCurrentMaster === false
+        ? `<div class="error-message">This copy follows a primary that is no longer the fleet's master, so it protects a database the fleet has left. <b>Re-seed now</b> repoints it at the current primary; the whole copy is rebuilt, because the replication credential rotated with the handover.</div>`
         : slot.lost
           ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. ${stopped ? 'Re-seeding it has stopped after repeated failures; see below.' : 'The manager re-seeds it automatically from the copy block the bot holds.'}</div>`
           : slot.walStatus === 'absent'

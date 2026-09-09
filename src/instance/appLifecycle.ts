@@ -36,6 +36,7 @@ export interface AppFacts {
   standbySlot: {
     slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;
     observedAt: number; receivedAt: number; fromNodeId: string; fromTerm: number; sourceIsCurrentMaster: boolean | null;
+    sourceAt: number;
   } | null;
   /** The app's own verdict: the fact is fresh, the slot is lost, and it is on the master this copy follows. */
   standbySlotLost: boolean;

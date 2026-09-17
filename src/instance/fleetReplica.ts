@@ -22,7 +22,7 @@ import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication } from './fleetReplication';
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
-import { capabilityRefusal, getAppFacts } from './appLifecycle';
+import { capabilityRefusal, getAppFacts, postureFromRead, readStandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 
@@ -50,6 +50,11 @@ export const AUTO_RESEED_MAX_ATTEMPTS = 3;
 const AUTO_RESEED_SPACING_MS = 30 * 60_000;
 /** A facts read on the re-seed's entry must not hang it; the hook's default timeout is sized for a promote. */
 const FACTS_TIMEOUT_MS = 10_000;
+
+/** A node id as the fleet's own UI abbreviates it; the manager knows no node names. */
+function shortId(id: string | null): string {
+  return id ? id.slice(0, 8) : 'an unknown node';
+}
 
 /**
  * The seed in flight lives on the instance record, never in memory: a manager
@@ -835,6 +840,17 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'No replica on this instance' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
+  // A stand-in's copy IS the fleet's database (20.5): removing it takes the
+  // fleet down. Judged from the app's fact alone (B6 map F34). Not refused
+  // when the app is silent, and not on an ended lane: this removal keeps the
+  // data volume, it is the one exit left when nothing else answers, and the
+  // modal's confirm names what may be inside; the destructive act is the
+  // later Provision, which the operator takes separately.
+  const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  if (standing?.role === 'stand-in' && standing.live) {
+    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing it would take the fleet's database down. It returns to standby duty through the failback, or by hand after a manual promote or demote` };
+  }
   const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
   if (!removed.success) return removed;
   containerManager.updateInstanceFleetDbReplica(instance.id, null);
@@ -1201,6 +1217,20 @@ export async function adoptPromotedReplica(
   if (status.live.inRecovery !== false) {
     return { success: false, error: 'This copy is still following a primary, so it is not this machine\'s database yet. Promote this node first (its own web UI), then adopt' };
   }
+  // Out of recovery says nothing about WHY (B6 map F34): a stand-in's copy is
+  // promoted too, and filing it would make a temporary copy this machine's
+  // own for good. Only the app's fact tells the two apart, so no fact, no adopt.
+  const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
+  if (posture.read === 'unanswered') {
+    return { success: false, error: `The app on this instance is not answering (${posture.error}), so the manager cannot tell whether this copy stands in for a dead master or was promoted for good; ${unansweredRemedy(posture.error)} before adopting` };
+  }
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  if (standing?.role === 'stand-in' && standing.live) {
+    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)} (20.5): it is the fleet's database only until the failback, and adopting it would file a temporary copy as this machine's own. Promote this node by hand first if it should become the true master, then adopt` };
+  }
+  if (standing?.role === 'stand-in') {
+    return { success: false, error: `This copy took the fleet's writes as a stand-in for ${shortId(standing.coveringNodeId)} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}) with those writes still only here; adopting would file them under a node that no longer serves the fleet. Promote this node by hand first (its own web UI), then adopt` };
+  }
 
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!db) return { success: false, error: 'This app declares no managed database companion' };
@@ -1281,6 +1311,36 @@ export async function adoptPromotedReplica(
   }
   if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
   return { success: true, restartRequired: true };
+}
+
+/**
+ * The copy block for a stand-in's PROMOTED copy (20.5, B6 map F33): the
+ * temporary source the returning master re-seeds from. Nothing is filed and
+ * nothing is delivered to the bot, so peers still receive no seed source
+ * (F35). The credential is the one the seed wrote into this copy's own
+ * primary_conninfo: the byte-copied catalog still holds that role, the
+ * byte-copied pg_hba still admits it over TLS, and the certificate is the one
+ * the seed minted for this machine's endpoint.
+ */
+export async function getStandInCopyBlock(
+  instance: InstanceConfig,
+): Promise<{ success: boolean; error?: string; dsn?: string; cert?: string }> {
+  const rec = instance.fleetDbReplica;
+  if (!rec) return { success: false, error: 'This instance has no standby' };
+  if (!rec.user || !rec.db) return { success: false, error: 'This standby record predates identity stamping; the copy cannot be read' };
+  const recovery = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery();']);
+  if (!recovery.ok) return { success: false, error: 'The copy could not be probed (is the standby container running?)' };
+  if (recovery.stdout.trim() !== 'f') return { success: false, error: 'This copy is still in recovery, so it is not a source yet' };
+  const conf = await replicaExec(rec.containerName, ['sh', '-c', `grep '^primary_conninfo' ${PGDATA}/postgresql.auto.conf | tail -n 1`]);
+  const line = conf.ok ? conf.stdout.trim() : '';
+  // The value is quoted, so the first keyword follows a quote, not a space.
+  const user = /(?:^|[\s'])user=([^\s']+)/.exec(line)?.[1];
+  const password = /(?:^|[\s'])password=([^\s']+)/.exec(line)?.[1];
+  if (!user || !password) return { success: false, error: 'The replication credential could not be recovered from the copy\'s own connection settings' };
+  const cert = await replicaExec(rec.containerName, ['cat', `${PGDATA}/server.crt`]);
+  if (!cert.ok) return { success: false, error: 'Could not read the copy\'s server certificate' };
+  const dsn = `postgresql://${user}:${encodeURIComponent(password)}@${rec.publicHost}:${rec.hostPort}/${rec.db}?sslmode=verify-full`;
+  return { success: true, dsn, cert: cert.stdout };
 }
 
 /**
@@ -1379,6 +1439,25 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (!rec.user || !rec.db) return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby' };
   const capability = capabilityRefusal(instance);
   if (capability) return { success: false, error: capability };
+  const status = await getFleetReplicaStatus(instance);
+  // The app's explicit stand-in posture outranks the recovery reading (20.5,
+  // B6 map F34/F35): a serving copy IS the fleet's database, and a peer's copy
+  // keeps its place for the failback. Judged BEFORE the ledger: a freeze can
+  // last hours, and counting it as attempts would latch the automatic re-seed
+  // off for good. One facts read serves this and the copy block below.
+  const factsRead = hasAppHooks(instance) ? await getAppFacts(instance, FACTS_TIMEOUT_MS) : null;
+  const posture = postureFromRead(instance, factsRead);
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  const promotedCopy = status.live?.running === true && status.live.inRecovery === false;
+  if (standing?.role === 'stand-in' && standing.live) {
+    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; re-seeding it would destroy the database the fleet is on. It returns to standby duty through the failback, or by hand after a manual promote` };
+  }
+  if (standing?.role === 'stand-in' && promotedCopy) {
+    return { success: false, error: `This copy took the fleet's writes as a stand-in for ${shortId(standing.coveringNodeId)} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}); re-seeding would discard writes that may exist only here. Promote this node by hand to keep them, or remove the replica and provision it again to discard them` };
+  }
+  if (standing?.role === 'peer') {
+    return { success: false, error: `The fleet is being served by a stand-in for ${shortId(standing.coveringNodeId)}, whose database this copy follows; it keeps its place for the failback and is not re-seeded until that settles` };
+  }
   if (trigger === 'operator') patchLedger(instance.id, () => undefined);
   ledgerAttempt(instance.id, trigger);
   const refuse = (error: string): { success: false; error: string } => {
@@ -1386,7 +1465,11 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     return { success: false, error };
   };
 
-  const status = await getFleetReplicaStatus(instance);
+  // An unanswered app is a failure the ledger exists to latch (the attempt
+  // cap stops the automatic retry), unlike the freezes above.
+  if (posture.read === 'unanswered') {
+    return refuse(`The app on this instance is not answering (${posture.error}), so the manager cannot tell whether this copy is standing in for a dead master; ${unansweredRemedy(posture.error)} before re-seeding it`);
+  }
   // Never re-seeded over, whoever asks and whatever a stopped run left behind:
   // a promoted copy is the database its fleet now serves.
   if (status.live?.running && status.live.inRecovery !== true) {
@@ -1403,7 +1486,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     return refuse('The standby container is not running, or could not be probed, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and rebuild it if a stopped re-seed took the standby service out of its compose');
   }
   if (!hasAppHooks(instance)) return refuse('This app declares no lifecycle hooks, so the manager cannot obtain the copy block; remove the replica and provision it again by hand');
-  const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
+  const facts = factsRead ?? await getAppFacts(instance, FACTS_TIMEOUT_MS);
   if (!facts.success) return refuse(`Could not read the copy block from the app: ${facts.error}`);
   const block = facts.facts?.copyBlock;
   if (!block?.dsn || !block.cert) {

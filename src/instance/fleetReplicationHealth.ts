@@ -14,7 +14,7 @@
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
 import { getFleetReplicaStatus, seedPurposeLabel, AUTO_RESEED_MAX_ATTEMPTS } from './fleetReplica';
-import { getAppFacts } from './appLifecycle';
+import { FactsRead, getAppFacts, postureFromRead, StandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
 
@@ -48,6 +48,8 @@ export interface ReplicationHealth {
   checkedAt: number;
   /** Replica only; null when the app reported nothing usable (stopped, unreachable, stale, or no fact yet). */
   slot?: StandbySlotFact | null;
+  /** The app's explicit stand-in posture (20.5, B6 map F34); absent or null when none. */
+  standIn?: StandInPosture | null;
 }
 
 const cache: Map<string, ReplicationHealth> = new Map();
@@ -62,6 +64,15 @@ export function getReplicationHealth(botId: string): ReplicationHealth | null {
 
 function round(seconds: number | null | undefined): number | null {
   return seconds === null || seconds === undefined || !Number.isFinite(seconds) ? null : Math.round(seconds * 10) / 10;
+}
+
+/** A node id as the fleet's own UI abbreviates it; the manager knows no node names. */
+function shortId(id: string | null): string {
+  return id ? id.slice(0, 8) : 'an unknown node';
+}
+
+function sinceText(ms: number | null): string {
+  return ms ? ` since ${new Date(ms).toISOString().slice(11, 16)} UTC` : '';
 }
 
 /** Postgres size-GUC string ('4GB', '4096MB', '-1') to bytes; null = unbounded or unparsable. */
@@ -82,6 +93,22 @@ function mb(bytes: number): number {
 async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealth> {
   const status = await getFleetReplicationStatus(instance, { probeEndpoint: false });
   const base = { role: 'primary' as const, checkedAt: Date.now() };
+  // The app's own word outranks every slot reading (B6 map F34, E13): while
+  // this master is parked behind a stand-in that took the fleet's writes, the
+  // copy going stale is THIS one, whatever its inactive slots say.
+  const posture = postureFromRead(instance, await readFacts(instance));
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  if (standing?.role === 'covered') {
+    return { ...base, standIn: standing, severity: 'error', message: `This node is parked behind its stand-in ${shortId(standing.standInNodeId)}, which took the fleet's writes${sinceText(standing.since)} while this node was down; this database is the copy that is behind. Stop this instance, then paste that node's copy block (on its Database modal) under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand`, lagSeconds: null };
+  }
+  const verdict = primaryLinkVerdict(status, base);
+  // A node that is both sides (a standby beside its own primary, 20.19 F7)
+  // is sampled as a primary; its standby's posture still rides the verdict so
+  // the automatic re-seed's skip can read it.
+  return standing && instance.fleetDbReplica ? { ...verdict, standIn: standing } : verdict;
+}
+
+function primaryLinkVerdict(status: Awaited<ReturnType<typeof getFleetReplicationStatus>>, base: { role: 'primary'; checkedAt: number }): ReplicationHealth {
   if (!status.live) {
     return { ...base, severity: 'warn', message: 'Database container is not running, so nothing is being replicated', lagSeconds: null };
   }
@@ -143,10 +170,16 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
  * or a record about a master this copy does not follow. Unknown never widens a
  * verdict (the 2a lesson): the caller treats null exactly like "no fact".
  */
-async function readSlotFact(instance: InstanceConfig): Promise<StandbySlotFact | null> {
+/** One facts read per sample: the slot fact and the stand-in posture come from the SAME answer, so they cannot disagree. */
+async function readFacts(instance: InstanceConfig): Promise<FactsRead | null> {
   if (instance.status !== 'running' || !hasAppHooks(instance)) return null;
-  const result = await getAppFacts(instance, FACTS_TIMEOUT_MS);
-  const fact = result.success ? result.facts?.standbySlot : null;
+  return getAppFacts(instance, FACTS_TIMEOUT_MS);
+}
+
+function readSlotFact(instance: InstanceConfig, result: FactsRead | null): StandbySlotFact | null {
+  if (!result || !result.success) return null;
+  const facts = result.facts;
+  const fact = facts?.standbySlot;
   if (!fact || typeof fact.slotName !== 'string' || fact.slotName === '' || typeof fact.walStatus !== 'string' || fact.walStatus === '') return null;
   // A fact about another slot (a record re-provisioned under a new name, an
   // older record) is unknown, never a verdict on this copy.
@@ -169,14 +202,15 @@ async function readSlotFact(instance: InstanceConfig): Promise<StandbySlotFact |
     slotName: fact.slotName,
     walStatus: fact.walStatus,
     observedAt: Number(fact.observedAt) || 0,
-    lost: current && result.facts?.standbySlotLost === true,
+    lost: current && facts?.standbySlotLost === true,
     sourceIsCurrentMaster: current,
   };
 }
 
 async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealth> {
   const status = await getFleetReplicaStatus(instance);
-  const relayed = await readSlotFact(instance);
+  const read = await readFacts(instance);
+  const relayed = readSlotFact(instance, read);
   // A receiver that streams contradicts "lost" or "absent" (a walsender refuses
   // both), which marks a record from before a re-seed: it reads as unknown,
   // never as a verdict on the copy that replaced it. One reading is not enough:
@@ -194,6 +228,11 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     && (relayed.walStatus === 'lost' || relayed.walStatus === 'absent');
   const slot = contradicted ? null : relayed;
   const base = { role: 'replica' as const, checkedAt: Date.now(), slot };
+  // A stand-in whose container is down or whose app has gone silent keeps its
+  // last word on the badge, and the automatic re-seed keeps skipping it: the
+  // fact is not gone, it is unreadable, and that is not the same claim.
+  const last = cache.get(instance.id)?.standIn;
+  const remembered = last?.role === 'stand-in' ? last : null;
   if (status.provisioning) {
     return { ...base, severity: 'ok', message: `Provisioning (${status.provisioning.phase})`, lagSeconds: null };
   }
@@ -204,14 +243,44 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // live ABSENT means the status could not even be probed (e.g. a record
   // stamped before the identity fields), which is a different claim than a
   // stopped container; say the real reason.
+  const lastSeen = remembered ? `; it was standing in for ${shortId(remembered.coveringNodeId)} when last seen` : '';
   if (!live) {
-    return { ...base, severity: 'error', message: status.lastError || 'Standby state could not be read', lagSeconds: null };
+    return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `${status.lastError || 'Standby state could not be read'}${lastSeen}`, lagSeconds: null };
   }
   if (!live.running) {
-    return { ...base, severity: 'error', message: 'Standby container is not running, so it is no longer receiving changes', lagSeconds: null };
+    return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `Standby container is not running, so it is no longer receiving changes${lastSeen}`, lagSeconds: null };
+  }
+  // The app's explicit posture (B6 map F34): a copy standing in for a dead
+  // master is read from that fact alone, never from its recovery state, which
+  // cannot tell a stand-in from a promotion.
+  const posture = postureFromRead(instance, read);
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  // An ended lane counts only while its promoted copy is still here.
+  if (standing?.role === 'stand-in' && (standing.live || live.inRecovery === false)) {
+    const who = shortId(standing.coveringNodeId);
+    if (!standing.live) {
+      return { ...base, standIn: standing, severity: 'error', message: `This copy took the fleet's writes as a stand-in for ${who} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}); those writes may exist only here. Promote this node by hand to keep them (its own web UI), then adopt; to discard them, remove the replica and provision it again`, lagSeconds: null };
+    }
+    if (standing.holdsWrites) {
+      return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who} and holding the fleet's writes${sinceText(standing.since)} (a partial takeover): this copy is the fleet database until the failback or a manual promote, and is neither adopted nor re-seeded while it stands in`, lagSeconds: null };
+    }
+    if (live.inRecovery === false) {
+      return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who}: taking the fleet's writes now (the copy has been promoted and the bot is restarting onto it)`, lagSeconds: null };
+    }
+    const dark = live.receiverStatus === 'streaming' ? '' : '; its primary is gone, so this copy is not streaming';
+    return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who} read-only (a partial takeover)${dark}; writes are taken automatically once the hold expires, if this copy was provably in sync`, lagSeconds: round(live.replayLagSeconds) };
   }
   if (live.inRecovery === false) {
+    if (posture.read === 'unanswered') {
+      return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `This copy has left recovery and its app is not answering (${posture.error}), so the manager cannot tell a stand-in from a promotion${remembered ? ` (it was standing in for ${shortId(remembered.coveringNodeId)} when last seen)` : ''}; ${unansweredRemedy(posture.error)} before adopting or re-seeding it`, lagSeconds: null };
+    }
     return { ...base, severity: 'error', message: 'This copy has been promoted and no longer follows the primary; adopt it as the database of this machine, or re-provision it', lagSeconds: null };
+  }
+  // F35: a peer's wording is driven by the stand-in fact, not by the survivor
+  // verdict below, which would invite a re-seed off a temporary primary.
+  if (standing?.role === 'peer') {
+    const dark = live.receiverStatus === 'streaming' ? '' : ' (its primary is down, so it is not streaming meanwhile)';
+    return { ...base, standIn: standing, severity: 'warn', message: `The fleet is being served by a stand-in for ${shortId(standing.coveringNodeId)}, whose database this copy follows; this copy keeps its place for the failback and is not re-seeded until that settles${dark}`, lagSeconds: round(live.replayLagSeconds) };
   }
   // 20.19 F5: the fleet moved on and this copy still follows the machine it was
   // seeded from. Nothing about it is broken, but it protects a database the
@@ -269,13 +338,13 @@ async function runTick(): Promise<void> {
     // its standby is sampled regardless - a dead standby must never hide
     // behind a stopped instance (drill R-5, finding F2).
     if (isPrimary && instance.status !== 'running') {
-      cache.set(instance.id, {
-        role: 'primary',
-        severity: 'ok',
-        message: 'Instance is stopped',
-        lagSeconds: null,
-        checkedAt: Date.now(),
-      });
+      // A primary stopped while parked behind a stand-in (20.5) keeps that
+      // word: stopping is the first step of the re-seed its verdict asks for,
+      // and the form for that re-seed only renders on a stopped instance.
+      const covered = cache.get(instance.id)?.standIn;
+      cache.set(instance.id, covered?.role === 'covered'
+        ? { role: 'primary', severity: 'warn', message: `Instance is stopped; it was parked behind its stand-in ${shortId(covered.standInNodeId)}, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal`, lagSeconds: null, checkedAt: Date.now(), standIn: covered }
+        : { role: 'primary', severity: 'ok', message: 'Instance is stopped', lagSeconds: null, checkedAt: Date.now() });
       continue;
     }
     try {
@@ -298,12 +367,20 @@ async function runTick(): Promise<void> {
   }
 }
 
+let ticking = false;
+/** A tick that outlives the interval (facts reads are bounded, but many add up) must not overlap itself: the two-tick streaming rule reads consecutive samples. */
+async function guardedTick(): Promise<void> {
+  if (ticking) return;
+  ticking = true;
+  try { await runTick(); } finally { ticking = false; }
+}
+
 export function startFleetReplicationHealth(): void {
   if (intervalHandle) return;
   console.log(`[FleetReplication] Health sampler started (tick: ${TICK_INTERVAL_MS / 1000}s)`);
-  void runTick().catch(err => console.error('[FleetReplication] Health tick error:', err));
+  void guardedTick().catch(err => console.error('[FleetReplication] Health tick error:', err));
   intervalHandle = setInterval(() => {
-    runTick().catch(err => console.error('[FleetReplication] Health tick error:', err));
+    guardedTick().catch(err => console.error('[FleetReplication] Health tick error:', err));
   }, TICK_INTERVAL_MS);
 }
 

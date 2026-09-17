@@ -1460,10 +1460,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       if (status.enabled && req.query.include === 'block') {
         const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
+        res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
         return;
       }
-      res.json({ success: true, replication: status });
+      res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1549,7 +1549,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       // The primary's word on this standby's slot rides the cached health
       // verdict (20.17); the live probe below cannot see it from this machine.
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, transfer: bot.fleetTransfer ?? null });
+      // The stand-in posture is read LIVE (B6 map F34): the modal offers adopt
+      // and re-seed on it, and a minute-old cache could offer a lane the app
+      // has just refused. Skipped while a seed runs: there is no copy to ask about.
+      const seeding = !!bot.fleetDbReplicaSeed && !bot.fleetDbReplicaSeed.parked;
+      const standIn = bot.fleetDbReplica && !seeding ? await appLifecycle.readStandInPosture(bot, 10_000) : null;
+      const standing = standIn?.read === 'ok' ? standIn.posture : null;
+      let block: { dsn: string; cert: string } | null = null;
+      let blockError: string | null = null;
+      if (req.query.include === 'block' && standing?.role === 'stand-in' && standing.live && standing.holdsWrites) {
+        const built = await fleetReplica.getStandInCopyBlock(bot);
+        if (built.success && built.dsn && built.cert) block = { dsn: built.dsn, cert: built.cert };
+        else blockError = built.error ?? 'block unavailable';
+      }
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

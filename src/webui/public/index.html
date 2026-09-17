@@ -2536,6 +2536,10 @@
       // Every standby that ever seeded left its slot on this primary, so the
       // slots ARE the standbys: each one is read with the link streaming on it,
       // and an inactive one can be dropped once its standby is gone.
+      // Parked behind a stand-in (20.5, E13): the copy going stale is THIS one,
+      // and the inactive slot below is the stand-in that now serves the fleet.
+      const covered = !!(res.standIn && res.standIn.role === 'covered');
+      const coveredHtml = !covered ? '' : `<div class="error-message">PARKED BEHIND A STAND-IN: node <b>${escapeHtml((res.standIn.standInNodeId || '').slice(0, 8))}</b> took the fleet's writes while this node was down, so this database is the copy that is behind. ${stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby'}; or promote that node by hand.</div>`;
       const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
       const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
       const fleetSlotsHtml = fleetSlots.length === 0
@@ -2544,6 +2548,9 @@
             const who = `Standby on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
             const retained = s.retainedBytes != null ? Math.round(s.retainedBytes / 1048576) : null;
             const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the primary; a standby that used it must be re-seeded to attach again">Drop slot</button>` : '';
+            // Every remedy below points at a standby that, while this node is
+            // parked, may be the stand-in serving the fleet: none applies.
+            if (covered) return `<div class="env-tip">${who}: ${escapeHtml(s.walStatus)}${s.active ? ', active' : ', not connected'} while this node is parked behind its stand-in${retained != null ? ` (the slot retains ${retained} MB of WAL)` : ''}.</div>`;
             if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below, or drop the slot if that standby is gone.${dropBtn}</div>`;
             if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL retention bound and about to be invalidated; reconnect the standby now.${dropBtn}</div>`;
             if (!s.active) return `<div class="error-message">${who} is not connected: its copy is going stale${retained != null ? ` and the slot retains ${retained} MB of WAL` : ''}. Re-seed it from the standby machine's manager, or drop the slot if that standby is gone.${dropBtn}</div>`;
@@ -2564,6 +2571,7 @@
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
         ${reachHtml}
+        ${coveredHtml}
         ${slotsHtml}
         ${block ? `
         <div style="margin-top:6px;">
@@ -2946,16 +2954,16 @@
       renderRecoveryChannel(botId);
     }
 
-    function copyFleetReplBlock(btn) {
-      const el = document.getElementById('fleet-repl-dsn');
+    function copyFleetReplBlock(btn, id) {
+      const el = document.getElementById(id || 'fleet-repl-dsn');
       if (!el) return;
       navigator.clipboard.writeText(el.value);
       btn.textContent = 'Copied';
       setTimeout(() => { btn.textContent = 'Copy DSN'; }, 1500);
     }
 
-    function copyFleetReplCert(btn) {
-      const el = document.getElementById('fleet-repl-cert');
+    function copyFleetReplCert(btn, id) {
+      const el = document.getElementById(id || 'fleet-repl-cert');
       if (!el) return;
       navigator.clipboard.writeText(el.value);
       btn.textContent = 'Copied';
@@ -2993,7 +3001,7 @@
       if (!body || fleetBackupBotId !== botId) return;
       const seq = ++replicaPollSeq;
       let res = null;
-      try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
+      try { res = await api('GET', `/bots/${botId}/fleet-replica?include=block`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
       if (!res || !res.success) {
         // Keep asking: this panel now carries the live Cancel and Dismiss, so
@@ -3072,6 +3080,21 @@
       }
 
       const live = r.live || {};
+      // The app's explicit stand-in posture, read live by the route (20.5):
+      // the copy's recovery state alone cannot tell a stand-in from a promotion.
+      const posture = res.standIn || null;
+      const standing = posture && posture.read === 'ok' ? posture.posture : null;
+      // An ended lane matters only while its promoted copy is still here: a
+      // standby seeded afterwards is a plain copy again. With the copy
+      // unreadable (container down) nothing is asserted, but the Remove
+      // confirm still hedges, because the record says writes were taken.
+      const endedRecord = !!(standing && standing.role === 'stand-in' && !standing.live);
+      const standEnded = endedRecord && live.inRecovery === false;
+      const removeMayHoldWrites = endedRecord && live.inRecovery !== true;
+      const standingIn = !!(standing && standing.role === 'stand-in' && (standing.live || standEnded));
+      const peerFrozen = !!(standing && standing.role === 'peer');
+      const unanswered = !!(posture && posture.read === 'unanswered');
+      const who = standing && standing.coveringNodeId ? escapeHtml(standing.coveringNodeId.slice(0, 8)) : 'the master';
       const lagText = live.caughtUp === true ? ', caught up'
         : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
       // Every branch above the last means this copy has stopped protecting the
@@ -3083,12 +3106,37 @@
         ? ''
         : !live.running
         ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
+        : standEnded
+          ? `<div class="error-message">This copy took the fleet's writes as a stand-in for <b>${who}</b> and the lane ended (${escapeHtml(standing.disarmReason || 'no reason recorded')}); those writes may exist only here. Promote this node by hand to keep them (its own web UI), then adopt. To discard them, remove the replica and provision it again.</div>`
+        : standingIn && standing.holdsWrites
+          ? `<div class="env-tip" style="color:var(--warning);">STANDING IN for <b>${who}</b> and holding the fleet's writes: a partial takeover. This copy is the fleet database until the master returns for the failback or this node is promoted by hand; it is neither adopted nor re-seeded while it stands in.</div>`
+        : standingIn
+          ? `<div class="env-tip" style="color:var(--warning);">STANDING IN for <b>${who}</b>${live.inRecovery === false ? ': taking the fleet\'s writes now (the copy has been promoted and the bot is restarting onto it)' : ' read-only: a partial takeover. Its primary is gone; writes are taken automatically once the hold expires, if this copy was provably in sync'}.</div>`
+        : live.inRecovery === false && unanswered
+          ? `<div class="error-message">This copy has left recovery and its app is not answering (${escapeHtml(posture.error || 'no answer')}), so the manager cannot tell a stand-in from a promotion. Nothing is adopted or re-seeded until it answers; removing the replica keeps its volume.</div>`
         : live.inRecovery === false
           ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>
              <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
+          : peerFrozen
+            ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')}); it is down`}. This copy keeps its place while a stand-in serves the fleet (below).</div>`
           : live.receiverStatus !== 'streaming'
             ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
             : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
+      // The block a stand-in hands out (20.5, F33): the returning master is
+      // re-seeded from this copy by hand until the failback lane exists.
+      const standInBlockHtml = !(standingIn && standing.live && standing.holdsWrites) ? ''
+        : res.block
+          ? `<div style="margin-top:6px;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span style="font-size:0.78rem;color:var(--text-secondary);">Copy block for this copy</span>
+                <button class="btn btn-secondary btn-small" onclick="copyFleetReplBlock(this, 'standin-block-dsn')">Copy DSN</button>
+                <button class="btn btn-secondary btn-small" onclick="copyFleetReplCert(this, 'standin-block-cert')">Copy certificate</button>
+              </div>
+              <input type="hidden" id="standin-block-dsn" value="${escapeHtml(res.block.dsn)}">
+              <input type="hidden" id="standin-block-cert" value="${escapeHtml(res.block.cert)}">
+              <div class="env-tip">Paste both into the returning master's Database modal under "Failed over to another machine?" to re-seed it as a standby of this copy.</div>
+            </div>`
+          : `<div class="env-tip" style="color:var(--warning);">${escapeHtml(res.blockError || 'Copy block unavailable')}</div>`;
       // What the PRIMARY says about this copy's slot, relayed through the bot:
       // the only side that can tell a lost slot from a primary that is offline.
       const led = r.autoReseed || null;
@@ -3096,7 +3144,13 @@
       const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
       const ownParkedReseed = !!(r.parkedSeed && r.parkedSeed.purpose === 'reseed-standby' && !r.parkedSeed.cancelled);
       const slot = res.slot || null;
-      const slotHtml = !slot
+      // A stand-in's own slot fact describes the master it covers, stale for
+      // minutes after that master died; every remedy it would name is refused.
+      const slotHtml = standingIn
+        ? ''
+        : peerFrozen
+        ? `<div class="env-tip" style="color:var(--warning);">The fleet is being served by a stand-in for <b>${who}</b>, whose database this copy follows. This copy keeps its place for the failback and is not re-seeded until that settles.</div>`
+        : !slot
         ? ''
         : slot.sourceIsCurrentMaster === false
         ? `<div class="error-message">This copy follows a primary that is no longer the fleet's master, so it protects a database the fleet has left. <b>Re-seed now</b> repoints it at the current primary; the whole copy is rebuilt, because the replication credential rotated with the handover.</div>`
@@ -3133,8 +3187,10 @@
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is adopted or removed,
       // and a record too old to probe has no state to re-seed from.
-      const reseedHtml = (appHooks && r.live && live.inRecovery !== false)
-        ? `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
+      const reseedHtml = (appHooks && r.live && live.inRecovery !== false && !standingIn && !peerFrozen)
+        ? unanswered
+          ? `<span class="env-tip" style="color:var(--warning);">Re-seed is unavailable: the app is not answering (${escapeHtml(posture.error || 'no answer')}).</span>`
+          : `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
         : '';
 
       body.innerHTML = `
@@ -3142,11 +3198,12 @@
         ${transferRunHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${stateHtml}
+        ${standInBlockHtml}
         ${slotHtml}
         ${ledgerHtml}
         <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
-          <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
+          ${standingIn && standing.live ? '' : `<button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}', ${removeMayHoldWrites ? 'true' : 'false'}, ${unanswered ? 'true' : 'false'})">Remove replica</button>`}
           ${reseedHtml}
         </div>
         ${transferHtml}`;
@@ -3316,9 +3373,14 @@
       hideFleetBackups();
       loadBots();
     }
-    async function removeFleetReplica(botId) {
+    async function removeFleetReplica(botId, holdsOutageWrites, appSilent) {
       const rec = (bots.find(b => b.id === botId) || {}).fleetDbReplica;
-      if (!confirm(`Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
+      const outage = holdsOutageWrites
+        ? '\n\nThis copy took the fleet\'s writes while it stood in for the dead master, and may hold writes no other database has. The data volume survives this removal, but provisioning a replica again afterwards wipes it. Promote this node by hand instead if those writes must be kept.'
+        : appSilent
+          ? '\n\nThe app on this instance is not answering, so the manager cannot tell whether this copy is standing in for a dead master and holds writes nothing else has. The data volume survives this removal, but provisioning a replica again afterwards wipes it.'
+          : '';
+      if (!confirm(`Remove this replica?${outage}\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/fleet-replica`);
         if (res.success) {

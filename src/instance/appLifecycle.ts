@@ -11,6 +11,23 @@ import { callAppHook, hasAppHooks } from './appHookClient';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { InstanceConfig } from '../types';
 
+/** The app's stand-in lane (20.5, B6-f): the one fact a manager may read a stand-in from. */
+export interface StandInFact {
+  /** This boot IS the stand-in the record describes; false on a node showing why its last attempt ended. */
+  live: boolean;
+  phase: 'claimed' | 'serving' | 'promoting' | 'promoted' | 'disarmed';
+  coveringNodeId: string;
+  armedAt: number;
+  inheritedTerm: number | null;
+  holdUntil: number;
+  writeGate: string | null;
+  writeRefusal: string | null;
+  promotedAt: number | null;
+  disarmedAt: number | null;
+  disarmReason: string | null;
+  rearmAfter: number | null;
+}
+
 export interface AppFacts {
   running: boolean;
   initialized: boolean;
@@ -26,7 +43,12 @@ export interface AppFacts {
   promote: any;
   emptyStoreHold: any;
   takeoverHold: any;
-  staleMasterPark: any;
+  /** The stale-master park; standInNodeId names the stand-in whose copy took the fleet's writes while this master was down (20.5). */
+  staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number; standInNodeId?: string | null } | null;
+  /** The stand-in lane on this node (20.5): live while it holds the fleet for a dead master, its last record otherwise. */
+  standIn: StandInFact | null;
+  /** Co-worker: the node it registered with stands in for that master, so the fleet runs on a temporary copy (20.5). */
+  masterStandingInFor?: string | null;
   copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
   /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
   copyBlockCurrent?: boolean | null;
@@ -85,6 +107,95 @@ export async function getAppFacts(instance: InstanceConfig, timeoutMs?: number):
   const result = await callAppHook<AppFacts & { success: boolean }>(instance, 'facts', 'GET', undefined, timeoutMs);
   if (!result.ok) return { success: false, error: result.error };
   return { success: true, facts: result.body as AppFacts };
+}
+
+/**
+ * What a stand-in means for THIS machine's database (20.5, B6 map F33-F35):
+ * its own copy is the temporary database, its primary is parked behind one,
+ * or the fleet it belongs to is served by one. Read from the app's explicit
+ * facts alone; a copy's recovery state cannot tell a stand-in from a promotion
+ * (F34), so an unreadable app is 'unanswered', never "no stand-in".
+ */
+export interface StandInPosture {
+  role: 'stand-in' | 'covered' | 'peer';
+  /**
+   * The lane is live. False only for role 'stand-in': the lane ENDED (a demote,
+   * a step-down) after the copy took the fleet's writes, so the copy may hold
+   * writes no other database has. Consumers apply that only while the copy is
+   * still out of recovery; a standby seeded afterwards is a plain copy again.
+   */
+  live: boolean;
+  /** The node holding the fleet; null when a peer's reply did not name it. */
+  standInNodeId: string | null;
+  /** The master it stands in for. */
+  coveringNodeId: string | null;
+  /** The stand-in's copy has been promoted and takes the fleet's writes; null when this side cannot tell. */
+  holdsWrites: boolean | null;
+  since: number | null;
+  /** Why an ended lane ended, in the app's words. */
+  disarmReason: string | null;
+}
+
+export type StandInRead =
+  | { read: 'ok'; posture: StandInPosture | null }
+  | { read: 'unanswered'; error: string }
+  /** The app declares no hooks, so no stand-in can exist on it. */
+  | { read: 'none' };
+
+export function postureFromFacts(facts: AppFacts): StandInPosture | null {
+  const own = facts.standIn;
+  const covers = !!own && typeof own.coveringNodeId === 'string' && own.coveringNodeId !== '';
+  if (own && covers && own.live === true) {
+    const promoted = own.phase === 'promoted';
+    return { role: 'stand-in', live: true, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: promoted, since: promoted ? own.promotedAt : own.armedAt, disarmReason: null };
+  }
+  // A lane that ended AFTER taking the writes (a demote, a step-down) leaves a
+  // promoted copy that may hold writes nothing else has; only the manual
+  // promote makes them the fleet's for good. That exit is recognised by the
+  // reason the bot's promote engine writes (its one site), because the boot
+  // that follows reports role master with initialized false for as long as
+  // it holds, and a mid-boot master cannot be told from a demoted co-worker.
+  const promotedByHand = own?.disarmReason === 'promoted by hand into the true master';
+  if (own && covers && own.phase === 'disarmed' && own.promotedAt !== null && !promotedByHand && !(facts.role === 'master' && facts.initialized === true)) {
+    return { role: 'stand-in', live: false, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: true, since: own.promotedAt, disarmReason: own.disarmReason };
+  }
+  const park = facts.staleMasterPark;
+  if (park && typeof park.standInNodeId === 'string' && park.standInNodeId !== '') {
+    // Derived, not asserted: a stand-in at the master's OWN term is serve-only
+    // and never parks it (B6-f2); a higher term is the writes-taken signal.
+    return { role: 'covered', live: true, standInNodeId: park.standInNodeId, coveringNodeId: facts.nodeId || null, holdsWrites: park.observedTerm > park.localTerm, since: park.at, disarmReason: null };
+  }
+  const served = facts.masterStandingInFor;
+  if (typeof served === 'string' && served !== '') {
+    return { role: 'peer', live: true, standInNodeId: null, coveringNodeId: served, holdsWrites: null, since: null, disarmReason: null };
+  }
+  return null;
+}
+
+export type FactsRead = Awaited<ReturnType<typeof getAppFacts>>;
+
+/** The posture from an answer already in hand, so one facts read serves every verdict taken from it. */
+export function postureFromRead(instance: InstanceConfig, read: FactsRead | null): StandInRead {
+  if (!hasAppHooks(instance)) return { read: 'none' };
+  if (instance.status !== 'running') return { read: 'unanswered', error: 'the instance is not running' };
+  if (!read || !read.success || !read.facts) return { read: 'unanswered', error: read?.error || 'no facts' };
+  // The stand-in fact lives in the bot process; the parent answers the hook
+  // while that process is down, and a null there is silence, not a verdict.
+  if (read.facts.running !== true) return { read: 'unanswered', error: 'the bot process is not running' };
+  return { read: 'ok', posture: postureFromFacts(read.facts) };
+}
+
+export async function readStandInPosture(instance: InstanceConfig, timeoutMs?: number): Promise<StandInRead> {
+  if (!hasAppHooks(instance)) return { read: 'none' };
+  if (instance.status !== 'running') return { read: 'unanswered', error: 'the instance is not running' };
+  return postureFromRead(instance, await getAppFacts(instance, timeoutMs));
+}
+
+/** What an operator can do about an unanswered facts read, as a clause that precedes "before <the lane>". */
+export function unansweredRemedy(error: string): string {
+  if (/bot process/.test(error)) return 'wait for the bot process to come back, or read its logs,';
+  if (/instance is not running/.test(error)) return 'start the instance';
+  return 'wait for the app to answer, or restart the instance,';
 }
 
 /**

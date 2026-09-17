@@ -23,6 +23,10 @@ async function runTick(): Promise<void> {
     // A cancel is an instruction, not a pause: nothing restarts on the
     // operator's behalf until they dismiss the stopped run or ask again.
     if (seed?.cancelled === true) continue;
+    // A stand-in posture on this copy, its own or its fleet's, freezes it
+    // (20.5, B6 map F35): the permit in reseedStandby refuses anyway, and
+    // skipping here keeps the ledger clear of a freeze that can last hours.
+    if (getReplicationHealth(instance.id)?.standIn) continue;
     // The ruled re-fire of a stopped re-seed cannot ride the slot fact: the
     // seed drops and re-creates the slot before it copies, and a standby
     // whose copy was cleared reports nothing at all. Its own parked record is

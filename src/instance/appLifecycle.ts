@@ -43,8 +43,9 @@ export interface AppFacts {
   promote: any;
   emptyStoreHold: any;
   takeoverHold: any;
-  /** The stale-master park; standInNodeId names the stand-in whose copy took the fleet's writes while this master was down (20.5). */
-  staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number; standInNodeId?: string | null } | null;
+  staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number } | null;
+  /** The follower hold (20.5, B6 map F28): this master came back behind a stand-in that took the fleet's writes (behind), or on a database that is a copy of another node's (copy), and follows the node holding the fleet as a co-worker until the failback promotes it back. */
+  followerHold: { reason: 'behind' | 'copy'; standInNodeId: string | null; standInName: string | null; observedTerm: number | null; localTerm: number | null; seenVia: string; since: number; following: string | null; followingForms?: string[]; namesThisNode: boolean | null } | null;
   /** The stand-in lane on this node (20.5): live while it holds the fleet for a dead master, its last record otherwise. */
   standIn: StandInFact | null;
   /** Co-worker: the node it registered with stands in for that master, so the fleet runs on a temporary copy (20.5). */
@@ -134,6 +135,12 @@ export interface StandInPosture {
   since: number | null;
   /** Why an ended lane ended, in the app's words. */
   disarmReason: string | null;
+  /** Role 'covered' only: this database is behind the stand-in's copy, or is a copy of it. */
+  holdReason: 'behind' | 'copy' | null;
+  /** Role 'covered' only: the node this bot registered with still says it stands in for it (null until registered; false once a hand promote or an ended lane stopped it). */
+  namesThisNode: boolean | null;
+  /** Role 'covered' only: the database the node it follows delivered is installed and serving here; false while it could not be dialed or verified. */
+  followsDelivered: boolean | null;
 }
 
 export type StandInRead =
@@ -147,7 +154,7 @@ export function postureFromFacts(facts: AppFacts): StandInPosture | null {
   const covers = !!own && typeof own.coveringNodeId === 'string' && own.coveringNodeId !== '';
   if (own && covers && own.live === true) {
     const promoted = own.phase === 'promoted';
-    return { role: 'stand-in', live: true, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: promoted, since: promoted ? own.promotedAt : own.armedAt, disarmReason: null };
+    return { role: 'stand-in', live: true, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: promoted, since: promoted ? own.promotedAt : own.armedAt, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
   // A lane that ended AFTER taking the writes (a demote, a step-down) leaves a
   // promoted copy that may hold writes nothing else has; only the manual
@@ -157,17 +164,21 @@ export function postureFromFacts(facts: AppFacts): StandInPosture | null {
   // it holds, and a mid-boot master cannot be told from a demoted co-worker.
   const promotedByHand = own?.disarmReason === 'promoted by hand into the true master';
   if (own && covers && own.phase === 'disarmed' && own.promotedAt !== null && !promotedByHand && !(facts.role === 'master' && facts.initialized === true)) {
-    return { role: 'stand-in', live: false, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: true, since: own.promotedAt, disarmReason: own.disarmReason };
+    return { role: 'stand-in', live: false, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: true, since: own.promotedAt, disarmReason: own.disarmReason, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
-  const park = facts.staleMasterPark;
-  if (park && typeof park.standInNodeId === 'string' && park.standInNodeId !== '') {
-    // Derived, not asserted: a stand-in at the master's OWN term is serve-only
-    // and never parks it (B6-f2); a higher term is the writes-taken signal.
-    return { role: 'covered', live: true, standInNodeId: park.standInNodeId, coveringNodeId: facts.nodeId || null, holdsWrites: park.observedTerm > park.localTerm, since: park.at, disarmReason: null };
+  const hold = facts.followerHold;
+  if (hold && (hold.reason === 'behind' || hold.reason === 'copy')) {
+    // Both entries put the other copy ahead of this database: a stand-in that
+    // took writes at a higher term (a serve-only one never holds the master,
+    // B6-f2), or the copy this database was re-seeded from. Read before the
+    // peer fact below: the node it follows names THIS node, which on any
+    // other machine would read as a peer.
+    const named = typeof hold.standInNodeId === 'string' && hold.standInNodeId !== '' ? hold.standInNodeId : null;
+    return { role: 'covered', live: true, standInNodeId: named, coveringNodeId: facts.nodeId || null, holdsWrites: true, since: Number.isFinite(hold.since) ? hold.since : null, disarmReason: null, holdReason: hold.reason, namesThisNode: typeof hold.namesThisNode === 'boolean' ? hold.namesThisNode : null, followsDelivered: typeof hold.following === 'string' && hold.following !== '' };
   }
   const served = facts.masterStandingInFor;
   if (typeof served === 'string' && served !== '') {
-    return { role: 'peer', live: true, standInNodeId: null, coveringNodeId: served, holdsWrites: null, since: null, disarmReason: null };
+    return { role: 'peer', live: true, standInNodeId: null, coveringNodeId: served, holdsWrites: null, since: null, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
   return null;
 }

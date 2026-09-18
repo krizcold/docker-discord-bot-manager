@@ -2539,7 +2539,16 @@
       // Parked behind a stand-in (20.5, E13): the copy going stale is THIS one,
       // and the inactive slot below is the stand-in that now serves the fleet.
       const covered = !!(res.standIn && res.standIn.role === 'covered');
-      const coveredHtml = !covered ? '' : `<div class="error-message">PARKED BEHIND A STAND-IN: node <b>${escapeHtml((res.standIn.standInNodeId || '').slice(0, 8))}</b> took the fleet's writes while this node was down, so this database is the copy that is behind. ${stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby'}; or promote that node by hand.</div>`;
+      const coveredWho = escapeHtml((res.standIn && res.standIn.standInNodeId || '').slice(0, 8)) || 'the node holding the fleet';
+      const coveredHtml = !covered ? '' : res.standIn.namesThisNode === false
+        ? `<div class="error-message">RETURNING MASTER, LANE OVER: node <b>${coveredWho}</b> no longer stands in for this node (promoted by hand, or its lane ended), so there is no failback to run; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. Demote this node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.</div>`
+        : res.standIn.namesThisNode !== true
+        ? `<div class="error-message">RETURNING MASTER, NOT REGISTERED YET: this node's bot has not registered with the node holding the fleet, so the failback cannot start; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. The failback needs that node reachable${res.standIn.holdReason === 'behind' ? '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.' : '.'}</div>`
+        : res.standIn.followsDelivered === false
+        ? `<div class="error-message">RETURNING MASTER, DATABASE NOT INSTALLED: this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. ${res.standIn.holdReason === 'behind' ? (stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand') + '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.' : 'Or promote that node by hand.'}</div>`
+        : res.standIn.holdReason === 'copy'
+        ? `<div class="error-message">RETURNING MASTER: this database is a copy in recovery of node <b>${coveredWho}</b>'s, and this node's bot follows that node as a co-worker. Promote this node from its Fleet tab once the copy has caught up to take the fleet back; or promote that node by hand.</div>`
+        : `<div class="error-message">BEHIND A STAND-IN: node <b>${coveredWho}</b> took the fleet's writes while this node was down, so this database is the copy that is behind; this node's bot follows that node as a co-worker meanwhile. ${stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby'}, then start it and promote it from its Fleet tab once the copy has caught up; or promote that node by hand. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance's env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.</div>`;
       const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
       const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
       const fleetSlotsHtml = fleetSlots.length === 0
@@ -2550,7 +2559,7 @@
             const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the primary; a standby that used it must be re-seeded to attach again">Drop slot</button>` : '';
             // Every remedy below points at a standby that, while this node is
             // parked, may be the stand-in serving the fleet: none applies.
-            if (covered) return `<div class="env-tip">${who}: ${escapeHtml(s.walStatus)}${s.active ? ', active' : ', not connected'} while this node is parked behind its stand-in${retained != null ? ` (the slot retains ${retained} MB of WAL)` : ''}.</div>`;
+            if (covered) return `<div class="env-tip">${who}: ${escapeHtml(s.walStatus)}${s.active ? ', active' : ', not connected'} while this node is not serving the fleet${retained != null ? ` (the slot retains ${retained} MB of WAL)` : ''}.</div>`;
             if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below, or drop the slot if that standby is gone.${dropBtn}</div>`;
             if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL retention bound and about to be invalidated; reconnect the standby now.${dropBtn}</div>`;
             if (!s.active) return `<div class="error-message">${who} is not connected: its copy is going stale${retained != null ? ` and the slot retains ${retained} MB of WAL` : ''}. Re-seed it from the standby machine's manager, or drop the slot if that standby is gone.${dropBtn}</div>`;
@@ -2649,7 +2658,7 @@
       try {
         let res = await api('POST', `/bots/${botId}/app-demote`, {});
         if (!res.success && res.needsConfirm) {
-          if (!confirm(`${res.error}\n\nDemote anyway?`)) return;
+          if (!confirm(res.error)) return;
           res = await api('POST', `/bots/${botId}/app-demote`, { confirm: true });
         }
         if (!res.success) { showMessage('error', res.error || 'Demote failed'); return; }
@@ -3093,6 +3102,9 @@
       const removeMayHoldWrites = endedRecord && live.inRecovery !== true;
       const standingIn = !!(standing && standing.role === 'stand-in' && (standing.live || standEnded));
       const peerFrozen = !!(standing && standing.role === 'peer');
+      const coveredCopy = !!(standing && standing.role === 'covered');
+      const slot = res.slot || null;
+      const standInWho = standing && standing.standInNodeId ? escapeHtml(standing.standInNodeId.slice(0, 8)) : 'the node holding the fleet';
       const unanswered = !!(posture && posture.read === 'unanswered');
       const who = standing && standing.coveringNodeId ? escapeHtml(standing.coveringNodeId.slice(0, 8)) : 'the master';
       const lagText = live.caughtUp === true ? ', caught up'
@@ -3117,6 +3129,8 @@
         : live.inRecovery === false
           ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>
              <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
+          : coveredCopy
+            ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})`}. ${standing.namesThisNode === false ? (slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it and this copy follows a database that is no longer the fleet's; demote the node from its Fleet tab to stay a co-worker, then Re-seed now repoints this copy at the current primary; to make it a designated backup instead, re-seed it first, then set BOT_NODE_ROLE=backup-master on this node and restart it.` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it (promoted by hand, or its lane ended), so there is no failback to run; demote the node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.`) : standing.namesThisNode !== true ? `This is the RETURNING MASTER's copy, re-seeded for the failback, but its bot is not registered with the node holding the fleet yet; the failback needs that node reachable, and nothing is adopted or re-seeded meanwhile.` : standing.followsDelivered === false ? `This is the RETURNING MASTER's copy, re-seeded for the failback; this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so.` : slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy, but it follows a database other than the one the node holding the fleet serves (that node reports no slot of its own for it), so the failback cannot promote it; remove the replica and provision it again from the copy block on that node's Database modal.` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, and this node's bot follows that node as a co-worker; promote this node from its Fleet tab once the copy has caught up to take the fleet back.`}</div>`
           : peerFrozen
             ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')}); it is down`}. This copy keeps its place while a stand-in serves the fleet (below).</div>`
           : live.receiverStatus !== 'streaming'
@@ -3143,11 +3157,32 @@
       const stopped = !!(led && led.lastError && r.autoReseedStopped);
       const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
       const ownParkedReseed = !!(r.parkedSeed && r.parkedSeed.purpose === 'reseed-standby' && !r.parkedSeed.cancelled);
-      const slot = res.slot || null;
       // A stand-in's own slot fact describes the master it covers, stale for
       // minutes after that master died; every remedy it would name is refused.
       const slotHtml = standingIn
         ? ''
+        : coveredCopy && standing.namesThisNode === false
+        ? (slot && slot.sourceIsCurrentMaster === false
+          ? `<div class="error-message">This copy follows a database that is no longer the fleet's, and the node it was re-seeded from no longer stands in for this node. Demote the node from its Fleet tab to stay a co-worker; <b>Re-seed now</b> then repoints this copy at the current primary.</div>`
+          : slot && (slot.lost || slot.walStatus === 'absent')
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>${slot.lost ? 'lost' : 'absent'}</b>: this copy cannot catch up. Remove the replica and provision it again from the copy block on that node's Database modal.</div>`
+          : slot && slot.walStatus === 'unreserved'
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> past the WAL retention bound and about to be invalidated; get this copy streaming again now.</div>`
+          : slot
+          ? `<div class="env-tip">Primary reports slot <b>${escapeHtml(slot.slotName)}</b>: ${slot.walStatus === 'unused' ? 'unused (no standby has attached to it yet)' : escapeHtml(slot.walStatus)}${slot.observedAt ? ` (as of ${new Date(slot.observedAt).toLocaleTimeString()})` : ''}</div>`
+          : '')
+        : coveredCopy && (standing.namesThisNode !== true || standing.followsDelivered === false)
+        ? ''
+        : coveredCopy && slot && slot.sourceIsCurrentMaster === false
+        ? `<div class="error-message">This copy follows a database other than the one the node holding the fleet serves (that node reports no slot of its own for it), so the failback cannot promote it. Remove the replica and provision it again from the copy block on that node's Database modal.</div>`
+        : coveredCopy
+        ? (slot && (slot.lost || slot.walStatus === 'absent')
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>${slot.lost ? 'lost' : 'absent'}</b>, so the failback's catch-up cannot finish. This copy is frozen while this node follows the node holding the fleet: remove the replica and provision it again from the copy block on that node's Database modal.</div>`
+          : slot && slot.walStatus === 'unreserved'
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> past the WAL retention bound and about to be invalidated. This copy is the one the failback promotes: get it streaming again now, because a lost slot means removing and re-provisioning it.</div>`
+          : slot
+          ? `<div class="env-tip">Primary reports slot <b>${escapeHtml(slot.slotName)}</b>: ${slot.walStatus === 'unused' ? 'unused (no standby has attached to it yet)' : escapeHtml(slot.walStatus)}${slot.observedAt ? ` (as of ${new Date(slot.observedAt).toLocaleTimeString()})` : ''}</div>`
+          : '')
         : peerFrozen
         ? `<div class="env-tip" style="color:var(--warning);">The fleet is being served by a stand-in for <b>${who}</b>, whose database this copy follows. This copy keeps its place for the failback and is not re-seeded until that settles.</div>`
         : !slot
@@ -3187,7 +3222,7 @@
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is adopted or removed,
       // and a record too old to probe has no state to re-seed from.
-      const reseedHtml = (appHooks && r.live && live.inRecovery !== false && !standingIn && !peerFrozen)
+      const reseedHtml = (appHooks && r.live && live.inRecovery !== false && !standingIn && !peerFrozen && !coveredCopy)
         ? unanswered
           ? `<span class="env-tip" style="color:var(--warning);">Re-seed is unavailable: the app is not answering (${escapeHtml(posture.error || 'no answer')}).</span>`
           : `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
@@ -3338,7 +3373,7 @@
       const host = (document.getElementById('reseed-host')?.value || '').trim();
       const portRaw = (document.getElementById('reseed-port')?.value || '').trim();
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, demote the bot from its own web UI so it rejoins the fleet as a worker instead of trying to claim it again.')) return;
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {

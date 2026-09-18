@@ -1458,6 +1458,11 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (standing?.role === 'peer') {
     return { success: false, error: `The fleet is being served by a stand-in for ${shortId(standing.coveringNodeId)}, whose database this copy follows; it keeps its place for the failback and is not re-seeded until that settles` };
   }
+  if (standing?.role === 'covered') {
+    return { success: false, error: standing.namesThisNode === false
+      ? `This copy is the returning master's, and its bot is still in the follower hold of a failback that is over (the node it follows no longer stands in for it); demote the node from its Fleet tab to release the copy, then re-seed it`
+      : `This copy is the returning master's, held for the failback from ${standing.standInNodeId ? `its stand-in ${shortId(standing.standInNodeId)}` : 'the node holding the fleet'}; it is the copy the failback promotes, so it is not re-seeded from here` };
+  }
   if (trigger === 'operator') patchLedger(instance.id, () => undefined);
   ledgerAttempt(instance.id, trigger);
   const refuse = (error: string): { success: false; error: string } => {

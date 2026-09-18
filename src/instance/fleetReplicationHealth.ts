@@ -71,6 +71,11 @@ function shortId(id: string | null): string {
   return id ? id.slice(0, 8) : 'an unknown node';
 }
 
+/** The node a covered copy follows; the hold may not have read whose copy it holds yet. */
+function standInWho(id: string | null): string {
+  return id ? shortId(id) : 'the node holding the fleet';
+}
+
 function sinceText(ms: number | null): string {
   return ms ? ` since ${new Date(ms).toISOString().slice(11, 16)} UTC` : '';
 }
@@ -99,7 +104,21 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   const posture = postureFromRead(instance, await readFacts(instance));
   const standing = posture.read === 'ok' ? posture.posture : null;
   if (standing?.role === 'covered') {
-    return { ...base, standIn: standing, severity: 'error', message: `This node is parked behind its stand-in ${shortId(standing.standInNodeId)}, which took the fleet's writes${sinceText(standing.since)} while this node was down; this database is the copy that is behind. Stop this instance, then paste that node's copy block (on its Database modal) under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand`, lagSeconds: null };
+    const who = standInWho(standing.standInNodeId);
+    // The failback is over once the node this bot followed stops naming it (a
+    // hand promote, or its lane ended): the promote route is closed then.
+    if (standing.namesThisNode === false) {
+      return { ...base, standIn: standing, severity: 'error', message: `This node's bot followed ${standing.standInNodeId ? `its stand-in ${who}` : 'the node that was holding the fleet'}, which no longer stands in for it (promoted by hand, or its lane ended), so there is no failback to run; ${standing.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. Demote this node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup`, lagSeconds: null };
+    }
+    if (standing.namesThisNode !== true) {
+      return { ...base, standIn: standing, severity: 'error', message: `This node's bot has not registered with the node holding the fleet yet, so the failback cannot start (${standing.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}); the failback needs that node reachable${standing.holdReason === 'behind' ? '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage' : ''}`, lagSeconds: null };
+    }
+    if (standing.followsDelivered === false) {
+      return { ...base, standIn: standing, severity: 'error', message: `This node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so (${standing.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}); or promote that node by hand${standing.holdReason === 'behind' ? '. Stop this instance, then paste that node\'s copy block (on its Database modal) under "Failed over to another machine?" to re-seed this machine as its standby. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage' : ''}`, lagSeconds: null };
+    }
+    return { ...base, standIn: standing, severity: 'error', message: standing.holdReason === 'copy'
+      ? `This node's database is a copy in recovery of ${who}'s, and its bot follows that node as a co-worker; promote this node from its Fleet tab once the copy has caught up to take the fleet back, or promote that node by hand`
+      : `This node's bot follows its stand-in ${who} as a co-worker: that node took the fleet's writes${sinceText(standing.since)} while this node was down, so this database is the copy that is behind. Stop this instance, then paste that node's copy block (on its Database modal) under "Failed over to another machine?" to re-seed this machine as its standby, start it, and promote it from its Fleet tab once the copy has caught up; or promote that node by hand. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance's env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage`, lagSeconds: null };
   }
   const verdict = primaryLinkVerdict(status, base);
   // A node that is both sides (a standby beside its own primary, 20.19 F7)
@@ -270,6 +289,33 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     const dark = live.receiverStatus === 'streaming' ? '' : '; its primary is gone, so this copy is not streaming';
     return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who} read-only (a partial takeover)${dark}; writes are taken automatically once the hold expires, if this copy was provably in sync`, lagSeconds: round(live.replayLagSeconds) };
   }
+  // The returning master's own copy, re-seeded for the failback (B6 map F28):
+  // its bot follows the stand-in as a co-worker, and this copy is the one the
+  // failback promotes, so it is neither adopted nor re-seeded from here.
+  if (standing?.role === 'covered' && live.inRecovery !== false) {
+    const dark = live.receiverStatus === 'streaming' ? '' : ' (not streaming right now)';
+    // A slot fact from a master this copy does not follow is news about the
+    // fleet (20.19 F5), not a verdict on the slot: the copy protects a
+    // database the fleet has left, and no remedy that names "that node's copy
+    // block" applies to it.
+    const foreign = slot !== null && !slot.sourceIsCurrentMaster;
+    const broken = slot !== null && slot.sourceIsCurrentMaster && (slot.lost || slot.walStatus === 'absent');
+    const unreserved = slot !== null && slot.sourceIsCurrentMaster && slot.walStatus === 'unreserved';
+    const holderDb = standing.standInNodeId ? `its stand-in ${shortId(standing.standInNodeId)}'s` : 'the node holding the fleet\'s';
+    return { ...base, standIn: standing, severity: 'warn', message: standing.namesThisNode === false
+      ? `This is the returning master's copy of ${standInWho(standing.standInNodeId)}'s database${dark}, but that node no longer stands in for it (promoted by hand, or its lane ended), so there is no failback to run${foreign ? '; it follows a database that is no longer the fleet\'s' : broken ? `; the primary reports its slot as ${slot?.lost ? 'lost' : 'absent'}, so remove the replica and provision it again from that node's copy block` : unreserved ? '; the primary reports its slot past the WAL retention bound and about to be invalidated, so get this copy streaming again now' : ''}${foreign ? '; demote the node from its Fleet tab to stay a co-worker, then Re-seed now repoints this copy at the current primary; to make it a designated backup instead, re-seed it first, then set BOT_NODE_ROLE=backup-master on this node and restart it' : '; demote the node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup'}`
+      : standing.namesThisNode !== true
+      ? `This is the returning master's copy, re-seeded for the failback, but its bot is not registered with the node holding the fleet yet${dark}; the failback needs that node reachable, and this copy is neither adopted nor re-seeded meanwhile`
+      : standing.followsDelivered === false
+      ? `This is the returning master's copy, re-seeded for the failback${dark}; its bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so`
+      : foreign
+      ? `This is the returning master's copy, but it follows a database other than ${holderDb} (the node holding the fleet reports no slot of its own for it), so the failback cannot promote it; remove the replica and provision it again from the copy block on that node's Database modal`
+      : unreserved
+      ? `This is the returning master's copy of ${holderDb} database, but the primary reports its slot past the WAL retention bound and about to be invalidated; get this copy streaming again now, because a lost slot means removing and re-provisioning it`
+      : broken
+      ? `This is the returning master's copy of ${holderDb} database, but the primary reports its slot as ${slot?.lost ? 'lost' : 'absent'}, so the failback's catch-up cannot finish; remove the replica and provision it again from the copy block on that node's Database modal (Re-seed now stays unavailable while this node holds)`
+      : `This is the returning master's copy of ${holderDb} database${dark}; promote this node from its Fleet tab once it has caught up to take the fleet back`, lagSeconds: round(live.replayLagSeconds) };
+  }
   if (live.inRecovery === false) {
     if (posture.read === 'unanswered') {
       return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `This copy has left recovery and its app is not answering (${posture.error}), so the manager cannot tell a stand-in from a promotion${remembered ? ` (it was standing in for ${shortId(remembered.coveringNodeId)} when last seen)` : ''}; ${unansweredRemedy(posture.error)} before adopting or re-seeding it`, lagSeconds: null };
@@ -343,7 +389,13 @@ async function runTick(): Promise<void> {
       // and the form for that re-seed only renders on a stopped instance.
       const covered = cache.get(instance.id)?.standIn;
       cache.set(instance.id, covered?.role === 'covered'
-        ? { role: 'primary', severity: 'warn', message: `Instance is stopped; it was parked behind its stand-in ${shortId(covered.standInNodeId)}, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal`, lagSeconds: null, checkedAt: Date.now(), standIn: covered }
+        ? { role: 'primary', severity: 'warn', message: covered.namesThisNode === false
+          ? `Instance is stopped; its bot followed ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node that was holding the fleet'}, which no longer stands in for it, so there is no failback to run and this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and demote it from its Fleet tab to stay a co-worker`
+          : covered.namesThisNode === true && covered.followsDelivered === false
+          ? `Instance is stopped; its bot was registered with the node holding the fleet, but the database it delivered was not installed here, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal`
+          : covered.namesThisNode === null
+          ? `Instance is stopped; its bot had not registered with the node holding the fleet yet, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`
+          : `Instance is stopped; its bot was following ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node holding the fleet'}, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`, lagSeconds: null, checkedAt: Date.now(), standIn: covered }
         : { role: 'primary', severity: 'ok', message: 'Instance is stopped', lagSeconds: null, checkedAt: Date.now() });
       continue;
     }

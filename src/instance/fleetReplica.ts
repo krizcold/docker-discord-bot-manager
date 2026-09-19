@@ -20,11 +20,11 @@ import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
-import { generateCertPair, enableFleetReplication } from './fleetReplication';
+import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
-import { capabilityRefusal, getAppFacts, postureFromRead, readStandInPosture, unansweredRemedy } from './appLifecycle';
+import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyBlock, readStandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
-import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
+import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
 const FLEET_SLOT_PREFIX = 'fleet_standby';
@@ -73,6 +73,17 @@ function saveSeed(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
 }
 
 /** A seed a runner owns right now; a parked one blocks nothing. */
+/**
+ * A failback or drop-back run owns this instance's database lanes while it is
+ * on record (20.5, B6-i): the by-hand routes would race the very steps it
+ * sequences. Only the run itself (its startedAt token) passes.
+ */
+function runHold(instance: InstanceConfig, run?: number): string | null {
+  const active = instance.fleetFailback;
+  if (!active || active.startedAt === run) return null;
+  return `A ${active.mode} run is on this instance (${active.phase}); Continue, Cancel or Dismiss it on the Database modal first`;
+}
+
 function seedRunning(botId: string): boolean {
   const seed = seedRecord(botId);
   return seed !== null && seed.parked !== true;
@@ -283,7 +294,7 @@ export interface FleetReplicaStatus {
   present: boolean;
   provisioning?: { phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean };
   /** A seed no runner owns any more (it failed, or a manager restart interrupted it): Retry or Dismiss. */
-  parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean };
+  parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean };
   /** The automatic re-seed's attempt ledger, from the standby record. */
   autoReseed?: FleetReplicaAutoReseedLedger;
   /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
@@ -324,6 +335,8 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       at: seed.updatedAt,
       committed: seed.committed === true,
       cancelled: seed.cancelled === true,
+      // A committed seed that stopped after its refile left the copy whole and only its service down.
+      copyWhole: !!instance.fleetDbReplica && instance.fleetDbReplica.copyCleared !== true,
     };
   }
   const rec = instance.fleetDbReplica;
@@ -497,6 +510,8 @@ function startProvisioning(
  * exists (remove first), when the target volume holds data, or when the host
  * port collides with any other managed database on this manager.
  */
+const FAILBACK_PAST_WIPE: ReadonlySet<FleetFailbackPhase> = new Set(['seeding', 'applying', 'catching-up', 'promoting', 'adopting', 'restarting']);
+
 export function provisionFleetReplica(
   instance: InstanceConfig,
   primaryDsn: string,
@@ -504,7 +519,10 @@ export function provisionFleetReplica(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
+  opts: { run?: number } = {},
 ): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
+  const held = runHold(instance, opts.run);
+  if (held) return { success: false, error: held };
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
@@ -524,7 +542,17 @@ export function provisionFleetReplica(
     return { success: false, error: 'This app declares no fleet control plane - a standby belongs beside a fleet worker' };
   }
   const folded = foldedRoleValue(controlPlane.roleEnv, instance.envVars?.[controlPlane.roleEnv.key]);
-  if (!controlPlane.roleEnv.dialsOut.includes(folded)) {
+  // The failback run's own seed is exempt: a returning master keeps its master
+  // role by design and mid-failback follows another node's database by
+  // posture, which is what this gate asserts. Keyed on the record, not the
+  // bare token, so only the run on this instance holds it.
+  const inRun = typeof opts.run === 'number' && instance.fleetFailback?.startedAt === opts.run;
+  // So is the state a dismissed failback leaves once its seed retired this
+  // machine's own database (a decline recorded at seeding or later): the node
+  // still follows another node's database by posture, and this lane is the
+  // by-hand exit the run's park text names. The settle clears the decline.
+  const afterRetire = instance.fleetFailbackDeclined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(instance.fleetFailbackDeclined.phase);
+  if (!inRun && !afterRetire && !controlPlane.roleEnv.dialsOut.includes(folded)) {
     return { success: false, error: `A replica belongs beside a fleet worker (set ${controlPlane.roleEnv.key} to ${controlPlane.roleEnv.dialsOut.join(' or ')} first)` };
   }
   if (!containerManager.deployedComposeExists(instance.id)) {
@@ -571,6 +599,8 @@ export async function provisionFleetReplicaFromFacts(
   hostPort?: number,
   confirm?: boolean,
 ): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean }> {
+  const held = runHold(instance);
+  if (held) return { success: false, error: held };
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (!hasAppHooks(instance)) return { success: false, error: 'This app declares no lifecycle hooks, so the manager cannot read the copy block from it; paste the block instead' };
   const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
@@ -795,7 +825,9 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // The copy is byte-complete here, so it goes back whole. Stripped explicitly:
   // a retry was handed the record an earlier attempt had already marked.
   const { copyCleared: _whole, ...restored } = record;
-  const rebuilt = { ...restored, seededAt: Date.now() };
+  // The seed that built it, by identity: the run that asked reads it back.
+  const builtBy = seedRecord(instance.id)?.startedAt;
+  const rebuilt = { ...restored, seededAt: Date.now(), ...(typeof builtBy === 'number' ? { seededBy: builtBy } : {}) };
   containerManager.updateInstanceFleetDbReplica(instance.id, ledger ? { ...rebuilt, autoReseed: ledger } : rebuilt);
   const apply = await containerManager.applyFleetDbReplicaService(instance.id);
   if (!apply.success) {
@@ -837,6 +869,8 @@ async function dropInactiveSlot(instance: InstanceConfig, seedDsn: string, hostC
  * orphaned and retains WAL: the caller must surface that loudly.
  */
 export async function removeFleetReplica(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+  const held = runHold(instance);
+  if (held) return { success: false, error: held };
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'No replica on this instance' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
@@ -911,7 +945,10 @@ export function reseedStalePrimary(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
+  opts: { dumpDone?: boolean; run?: number } = {},
 ): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
+  const held = runHold(instance, opts.run);
+  if (held) return { success: false, error: held };
   if (!instance.fleetDb) {
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
   }
@@ -968,13 +1005,16 @@ export function reseedStalePrimary(
     // database has to come back up alone to be dumped at all. Best effort, and
     // deliberately not fatal: a database that will not start cannot be dumped,
     // and the operator has already accepted losing the diverged tail. The dump
-    // is a safety net, not a precondition.
-    const started = await containerManager.startFleetDbSidecar(instance.id);
-    const dump = started.success
-      ? await fleetBackup.runFleetDump(instance, 'pre-reseed-')
-      : { success: false, error: started.error };
-    if (!dump.success) {
-      console.warn(`[FleetReplica] Could not dump the stale primary before re-seeding ${instance.id}: ${dump.error}`);
+    // is a safety net, not a precondition. The failback run dumps before it
+    // parks for consent (F5), so it arrives here with the dump done.
+    if (!opts.dumpDone) {
+      const started = await containerManager.startFleetDbSidecar(instance.id);
+      const dump = started.success
+        ? await fleetBackup.runFleetDump(instance, 'pre-reseed-')
+        : { success: false, error: started.error };
+      if (!dump.success) {
+        console.warn(`[FleetReplica] Could not dump the stale primary before re-seeding ${instance.id}: ${dump.error}`);
+      }
     }
     // Re-check just before the destructive step: the dump above can take
     // minutes, and a store that corrupted meanwhile would make the pins
@@ -1021,6 +1061,8 @@ export async function decommissionFleetDb(
     return await containerManager.withExternalBotOp(botId, 'decommission', async () => {
       const instance = containerManager.getBot(botId);
       if (!instance?.fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+      const held = runHold(instance);
+      if (held) return { success: false, error: held };
       const refusal = capabilityRefusal(instance);
       if (refusal) return { success: false, error: refusal };
       if (instance.fleetDbReplica) return { success: false, error: 'This instance also holds a standby copy - remove or adopt it before decommissioning the primary database' };
@@ -1129,7 +1171,7 @@ function instanceBindSources(botId: string): Promise<string[]> {
  * the manager at its own mount points, so a source that cannot be translated
  * back is discarded rather than guessed at, and so is an ambiguous one.
  */
-async function instanceDataDir(instance: InstanceConfig): Promise<string> {
+export async function instanceDataDir(instance: InstanceConfig): Promise<string> {
   const ownDataBind = `${containerManager.hostBotDirFor(instance.id)}/data`;
   const appData = `${DATA_ROOT}/AppData/`;
   const resolved = new Set<string>();
@@ -1195,7 +1237,10 @@ function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string |
  */
 export async function adoptPromotedReplica(
   instance: InstanceConfig,
+  opts: { run?: number } = {},
 ): Promise<{ success: boolean; error?: string; restartRequired?: boolean }> {
+  const held = runHold(instance, opts.run);
+  if (held) return { success: false, error: held };
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to adopt' };
   if (instance.fleetDb) return { success: false, error: 'This instance already hosts a fleet database' };
@@ -1260,7 +1305,16 @@ export async function adoptPromotedReplica(
     return { success: false, error: `Could not recover the fleet database credentials from this instance (neither the manager env nor ${appEnvFile} carries a usable database URL), so the database cannot be adopted` };
   }
 
-  const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id);
+  // The copy's catalog still holds the replication role its seed used, and
+  // every standby of this lineage pins that credential and the certificate the
+  // seed minted for this endpoint (B6 map F30). Filing them makes enable keep
+  // both instead of minting, so a handover does not invalidate the fleet's
+  // trust. Unreadable means enable mints, as before.
+  const credential = await readCopyCredential(rec);
+  const replication = credential && credential.user === REPLICATION_ROLE
+    ? { role: credential.user, password: credential.password, hostPort: rec.hostPort, publicHost: rec.publicHost, certHost: rec.certHost }
+    : undefined;
+  const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication);
   if (!adopted.success) return adopted;
   const live = containerManager.getBot(instance.id);
   if (!live) return { success: false, error: 'Bot not found after adopting the record' };
@@ -1331,16 +1385,43 @@ export async function getStandInCopyBlock(
   const recovery = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery();']);
   if (!recovery.ok) return { success: false, error: 'The copy could not be probed (is the standby container running?)' };
   if (recovery.stdout.trim() !== 'f') return { success: false, error: 'This copy is still in recovery, so it is not a source yet' };
+  const credential = await readCopyCredential(rec);
+  if (!credential) return { success: false, error: 'The replication credential could not be recovered from the copy\'s own connection settings' };
+  const cert = await replicaExec(rec.containerName, ['cat', `${PGDATA}/server.crt`]);
+  if (!cert.ok) return { success: false, error: 'Could not read the copy\'s server certificate' };
+  const dsn = `postgresql://${credential.user}:${encodeURIComponent(credential.password)}@${rec.publicHost}:${rec.hostPort}/${rec.db}?sslmode=verify-full`;
+  return { success: true, dsn, cert: cert.stdout };
+}
+
+/** The replication credential the seed wrote into this copy's own primary_conninfo; null when unreadable. */
+async function readCopyCredential(rec: FleetDbReplicaRecord): Promise<{ user: string; password: string } | null> {
   const conf = await replicaExec(rec.containerName, ['sh', '-c', `grep '^primary_conninfo' ${PGDATA}/postgresql.auto.conf | tail -n 1`]);
   const line = conf.ok ? conf.stdout.trim() : '';
   // The value is quoted, so the first keyword follows a quote, not a space.
   const user = /(?:^|[\s'])user=([^\s']+)/.exec(line)?.[1];
   const password = /(?:^|[\s'])password=([^\s']+)/.exec(line)?.[1];
-  if (!user || !password) return { success: false, error: 'The replication credential could not be recovered from the copy\'s own connection settings' };
-  const cert = await replicaExec(rec.containerName, ['cat', `${PGDATA}/server.crt`]);
-  if (!cert.ok) return { success: false, error: 'Could not read the copy\'s server certificate' };
-  const dsn = `postgresql://${user}:${encodeURIComponent(password)}@${rec.publicHost}:${rec.hostPort}/${rec.db}?sslmode=verify-full`;
-  return { success: true, dsn, cert: cert.stdout };
+  return user && password ? { user, password } : null;
+}
+
+/**
+ * The stand-in's manager gives its bot the block for the PROMOTED copy it
+ * serves from, so the bot relays it to the node it stands in for on register
+ * (B6 map F32): the source the failback re-seeds the returning master from.
+ * Only when the bot says it is the block's target, and only until it holds a
+ * block naming this copy. Nothing is filed (F33).
+ */
+export async function publishStandInCopyBlock(instance: InstanceConfig, facts: AppFacts): Promise<void> {
+  const rec = instance.fleetDbReplica;
+  if (!rec || facts.copyBlockTarget !== true || containerManager.isBotBusy(instance.id)) return;
+  const held = facts.copyBlock?.dsn ? (() => { try { return new URL(facts.copyBlock!.dsn); } catch { return null; } })() : null;
+  if (held && held.hostname === rec.publicHost && (Number(held.port) || 5432) === rec.hostPort) return;
+  const block = await getStandInCopyBlock(instance);
+  if (!block.success || !block.dsn || !block.cert) {
+    console.warn(`[FleetReplica] ${instance.displayName}: the stand-in's copy block could not be produced for its bot: ${block.error}`);
+    return;
+  }
+  const published = await publishCopyBlock(instance, { dsn: block.dsn, cert: block.cert });
+  if (!published.success) console.warn(`[FleetReplica] ${instance.displayName}: the stand-in's copy block was not published to its bot: ${published.error}`);
 }
 
 /**
@@ -1430,7 +1511,12 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
  * recovery is refused whoever asks; the copy must also be up, unless the
  * manager itself already cleared it, when there is nothing left to protect.
  */
-export async function reseedStandby(instance: InstanceConfig, trigger: 'automatic' | 'operator'): Promise<{ success: boolean; error?: string; started?: boolean }> {
+export async function reseedStandby(instance: InstanceConfig, trigger: 'automatic' | 'operator', opts: { consentedRun?: number } = {}): Promise<{ success: boolean; error?: string; started?: boolean }> {
+  const held = runHold(instance, opts.consentedRun);
+  if (held) return { success: false, error: held };
+  // The drop-back run's consent (F32 under F5) is what re-seeds a promoted copy
+  // that took the fleet's writes as a stand-in: the operator saw the verdict.
+  const consented = opts.consentedRun !== undefined && instance.fleetFailback?.startedAt === opts.consentedRun && instance.fleetFailback.consentAt !== null;
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to re-seed' };
   if (seedRunning(instance.id)) return { success: false, error: 'A seed is already running on this instance' };
@@ -1452,7 +1538,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (standing?.role === 'stand-in' && standing.live) {
     return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; re-seeding it would destroy the database the fleet is on. It returns to standby duty through the failback, or by hand after a manual promote` };
   }
-  if (standing?.role === 'stand-in' && promotedCopy) {
+  if (standing?.role === 'stand-in' && promotedCopy && !consented) {
     return { success: false, error: `This copy took the fleet's writes as a stand-in for ${shortId(standing.coveringNodeId)} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}); re-seeding would discard writes that may exist only here. Promote this node by hand to keep them, or remove the replica and provision it again to discard them` };
   }
   if (standing?.role === 'peer') {
@@ -1477,7 +1563,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   }
   // Never re-seeded over, whoever asks and whatever a stopped run left behind:
   // a promoted copy is the database its fleet now serves.
-  if (status.live?.running && status.live.inRecovery !== true) {
+  if (status.live?.running && status.live.inRecovery !== true && !consented) {
     return refuse('This copy has been promoted and no longer follows a primary; adopt it or remove it instead of re-seeding');
   }
   // The copy must be up to be proven unpromoted, unless the manager itself

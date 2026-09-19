@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
-  ContainerInfo, FleetTransferRun,
+  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -601,6 +601,26 @@ export function updateInstanceFleetTransfer(botId: string, run: FleetTransferRun
   saveRegistry(registry);
 }
 
+export function updateInstanceFleetFailback(botId: string, run: FleetFailbackRun | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (run) instance.fleetFailback = run;
+  else delete instance.fleetFailback;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+export function updateInstanceFleetFailbackDeclined(botId: string, decline: FleetFailbackDecline | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (decline) instance.fleetFailbackDeclined = decline;
+  else delete instance.fleetFailbackDeclined;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** For modules that change an instance outside a route (the routes broadcast themselves). */
 export function broadcastBotUpdated(botId: string): void {
   if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
@@ -652,7 +672,7 @@ export function deployedComposeExists(botId: string): boolean {
  * re-seeded from) is unreachable. Record only: the container and volume are
  * the ones already running.
  */
-export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean; error?: string } {
+export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetDbReplication): { success: boolean; error?: string } {
   const registry = loadRegistry();
   const stored = registry.instances[botId];
   if (!stored) return { success: false, error: 'Bot not found' };
@@ -665,7 +685,9 @@ export function adoptFleetDbReplicaAsPrimary(botId: string): { success: boolean;
   if (!replica.user || !replica.db) {
     return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby before adopting' };
   }
-  stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume };
+  // The replication posture, when the caller recovered the credential the copy
+  // already carries (B6 map F30): enable then keeps it instead of minting.
+  stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume, ...(replication ? { replication } : {}) };
   delete stored.fleetDbReplica;
   // The seed record and any transfer run are about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;

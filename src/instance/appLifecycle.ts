@@ -9,7 +9,7 @@ import * as containerManager from '../docker/containerManager';
 import { getReplicaCopyBlock } from './fleetReplication';
 import { callAppHook, hasAppHooks } from './appHookClient';
 import { findAppCapabilities } from '../config/appCapabilities';
-import { InstanceConfig } from '../types';
+import { FleetLineageFact, InstanceConfig } from '../types';
 
 /** The app's stand-in lane (20.5, B6-f): the one fact a manager may read a stand-in from. */
 export interface StandInFact {
@@ -45,7 +45,7 @@ export interface AppFacts {
   takeoverHold: any;
   staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number } | null;
   /** The follower hold (20.5, B6 map F28): this master came back behind a stand-in that took the fleet's writes (behind), or on a database that is a copy of another node's (copy), and follows the node holding the fleet as a co-worker until the failback promotes it back. */
-  followerHold: { reason: 'behind' | 'copy'; standInNodeId: string | null; standInName: string | null; observedTerm: number | null; localTerm: number | null; seenVia: string; since: number; following: string | null; followingForms?: string[]; namesThisNode: boolean | null } | null;
+  followerHold: { reason: 'behind' | 'copy'; standInNodeId: string | null; standInName: string | null; observedTerm: number | null; localTerm: number | null; seenVia: string; since: number; following: string | null; followingForms?: string[]; namesThisNode: boolean | null; lineage?: FleetLineageFact | null } | null;
   /** The stand-in lane on this node (20.5): live while it holds the fleet for a dead master, its last record otherwise. */
   standIn: StandInFact | null;
   /** Co-worker: the node it registered with stands in for that master, so the fleet runs on a temporary copy (20.5). */
@@ -53,6 +53,10 @@ export interface AppFacts {
   copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
   /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
   copyBlockCurrent?: boolean | null;
+  /** The app's own verdict that the block names the database it FOLLOWS while holding or after a step-down (B6 map F32): the source the failback re-seeds from. */
+  copyBlockFollowed?: boolean | null;
+  /** A stand-in whose lane ended keeps a promoted copy of its own beside the database it follows; the bot's verdict on that copy (F31). */
+  ownCopyLineage?: FleetLineageFact | null;
   /** The app's container carries a standby endpoint (it learned its standby); null while the bot is down. */
   dbReplica?: boolean | null;
   /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
@@ -245,11 +249,16 @@ export async function ensureCopyBlockCurrent(
  */
 export async function deliverCopyBlock(instance: InstanceConfig): Promise<ActionResult> {
   if (!instance.fleetDb?.replication) return { success: false, error: 'replication is not enabled on this instance' };
-  if (!hasAppHooks(instance)) return { success: false, error: 'this app declares no lifecycle hooks' };
   const block = await getReplicaCopyBlock(instance);
   if (!block.success || !block.dsn || !block.cert) {
     return { success: false, error: block.error || 'could not assemble the copy block' };
   }
+  return publishCopyBlock(instance, { dsn: block.dsn, cert: block.cert });
+}
+
+/** Hand this node's app a copy block to relay; the app overwrites what it held. */
+export async function publishCopyBlock(instance: InstanceConfig, block: { dsn: string; cert: string }): Promise<ActionResult> {
+  if (!hasAppHooks(instance)) return { success: false, error: 'this app declares no lifecycle hooks' };
   return fromHook(await callAppHook(instance, 'copy-block', 'POST', { dsn: block.dsn, cert: block.cert }));
 }
 

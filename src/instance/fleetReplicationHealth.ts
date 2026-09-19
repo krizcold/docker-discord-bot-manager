@@ -13,7 +13,8 @@
 
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
-import { getFleetReplicaStatus, seedPurposeLabel, AUTO_RESEED_MAX_ATTEMPTS } from './fleetReplica';
+import { getFleetReplicaStatus, publishStandInCopyBlock, seedPurposeLabel, AUTO_RESEED_MAX_ATTEMPTS } from './fleetReplica';
+import * as fleetFailback from './fleetFailback';
 import { FactsRead, getAppFacts, postureFromRead, StandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
@@ -101,9 +102,15 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   // The app's own word outranks every slot reading (B6 map F34, E13): while
   // this master is parked behind a stand-in that took the fleet's writes, the
   // copy going stale is THIS one, whatever its inactive slots say.
-  const posture = postureFromRead(instance, await readFacts(instance));
+  const read = await readFacts(instance);
+  const posture = postureFromRead(instance, read);
   const standing = posture.read === 'ok' ? posture.posture : null;
+  if (read?.success && read.facts) fleetFailback.settleDecline(instance, read.facts, null);
+  fleetFailback.noteHandover(instance, read?.success ? read.facts ?? null : null, null);
   if (standing?.role === 'covered') {
+    // The failback opens itself here (20.5): the tick is the manager's poll of
+    // what its bot concluded, and the run parks before anything destructive.
+    if (read?.success && read.facts) fleetFailback.maybeOpenFailback(instance, read.facts, standing);
     const who = standInWho(standing.standInNodeId);
     // The failback is over once the node this bot followed stops naming it (a
     // hand promote, or its lane ended): the promote route is closed then.
@@ -274,6 +281,17 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // cannot tell a stand-in from a promotion.
   const posture = postureFromRead(instance, read);
   const standing = posture.read === 'ok' ? posture.posture : null;
+  if (read?.success && read.facts && standing?.role === 'stand-in') {
+    // A serving stand-in's block reaches the returning master through its bot
+    // (F32); an ended lane asked to drop back opens its run here (F5 park).
+    if (standing.live && standing.holdsWrites) void publishStandInCopyBlock(instance, read.facts);
+    else if (!standing.live) fleetFailback.maybeOpenDropBack(instance, read.facts, standing, live);
+  }
+  // The returning master's copy, re-seeded by hand: its instance carries only
+  // this standby record, so the failback opens from here, past the wipe.
+  if (read?.success && read.facts && standing?.role === 'covered') fleetFailback.maybeOpenFailback(instance, read.facts, standing);
+  if (read?.success && read.facts) fleetFailback.settleDecline(instance, read.facts, live);
+  fleetFailback.noteHandover(instance, read?.success ? read.facts ?? null : null, live);
   // An ended lane counts only while its promoted copy is still here.
   if (standing?.role === 'stand-in' && (standing.live || live.inRecovery === false)) {
     const who = shortId(standing.coveringNodeId);
@@ -388,6 +406,12 @@ async function runTick(): Promise<void> {
       // word: stopping is the first step of the re-seed its verdict asks for,
       // and the form for that re-seed only renders on a stopped instance.
       const covered = cache.get(instance.id)?.standIn;
+      // The failback run stopped it: the run's record is the word that
+      // survives a manager restart, where the cached posture does not.
+      if (instance.fleetFailback) {
+        cache.set(instance.id, { role: 'primary', severity: 'warn', message: fleetFailback.stoppedText(instance.fleetFailback), lagSeconds: null, checkedAt: Date.now(), ...(covered?.role === 'covered' ? { standIn: covered } : {}) });
+        continue;
+      }
       cache.set(instance.id, covered?.role === 'covered'
         ? { role: 'primary', severity: 'warn', message: covered.namesThisNode === false
           ? `Instance is stopped; its bot followed ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node that was holding the fleet'}, which no longer stands in for it, so there is no failback to run and this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and demote it from its Fleet tab to stay a co-worker`
@@ -400,7 +424,7 @@ async function runTick(): Promise<void> {
       continue;
     }
     try {
-      cache.set(instance.id, isPrimary ? await samplePrimary(instance) : await sampleReplica(instance));
+      cache.set(instance.id, withRun(instance, isPrimary ? await samplePrimary(instance) : await sampleReplica(instance)));
     } catch (error) {
       cache.set(instance.id, {
         role: isPrimary ? 'primary' : 'replica',
@@ -417,6 +441,23 @@ async function runTick(): Promise<void> {
   for (const id of [...streamingSeen.keys()]) {
     if (!live.has(id)) streamingSeen.delete(id);
   }
+}
+
+/** While a failback or drop-back run owns the instance, its phase leads every verdict: the run is what the operator acts on. */
+function withRun(instance: InstanceConfig, verdict: ReplicationHealth): ReplicationHealth {
+  const bot = containerManager.getBot(instance.id);
+  const run = bot?.fleetFailback;
+  if (!run) {
+    // A declined run leaves the by-hand verdict in force, led by the decline.
+    const decline = bot ? fleetFailback.activeDecline(bot, verdict.standIn) : null;
+    return decline ? { ...verdict, message: `${fleetFailback.declineText(decline)} ${verdict.message}` } : verdict;
+  }
+  const lead = run.parked && run.phase === 'wipe-consent' && !run.consentAt
+    ? `The ${run.mode} run is waiting for your answer on the Database modal (${fleetFailback.failbackPhaseText(run)}).`
+    : run.parked
+      ? `The ${run.mode} run stopped (${fleetFailback.failbackPhaseText(run)}): ${run.lastError || 'unknown reason'}.`
+      : `The ${run.mode} run is ${fleetFailback.failbackPhaseText(run)}.`;
+  return { ...verdict, severity: verdict.severity === 'error' ? 'error' : 'warn', message: `${lead} ${verdict.message}` };
 }
 
 let ticking = false;

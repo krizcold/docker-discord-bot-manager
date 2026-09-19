@@ -1419,7 +1419,9 @@
             // Database modal: backups + replication on a managed-DB instance;
             // the standby replica surface on fleet workers; the kept safety
             // dumps after a decommission destroyed the database itself.
-            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetWorker || bot.hasDbBackups)
+            // A failback run or a seed owns the instance through the window in
+            // which it carries neither database record; the modal holds their exits.
+            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetFailback || bot.fleetFailbackDeclined || bot.fleetWorker || bot.hasDbBackups)
               ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine' : 'Earlier database backups kept on this machine'}">Database</button>`
               : '';
 
@@ -2473,12 +2475,13 @@
         return;
       }
       const r = res.replica || null;
+      const hint = seedAfterRetire(res.failback || null, res.failbackDeclined || null) ? 'after-retire' : '';
       if (r && r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
           ? '<div class="env-tip">Cancelling at the next step...</div>'
           : p.cancelable
-            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}')">Cancel</button></div>`
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
             : '';
         still.innerHTML = `<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${cancelHtml}`;
         setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
@@ -2487,7 +2490,7 @@
       if (r && r.parkedSeed) {
         const k = r.parkedSeed;
         still.innerHTML = `<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}
-          <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}')">Dismiss</button></div></div>`;
+          <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}', '${hint}')">Dismiss</button></div></div>`;
         return;
       }
       still.innerHTML = '';
@@ -2497,16 +2500,26 @@
     async function renderFleetReplication(botId) {
       const body = document.getElementById('fleet-replication-body');
       if (!body || fleetBackupBotId !== botId) return;
+      const seq = renderFleetReplication.seq = (renderFleetReplication.seq || 0) + 1;
       let res = null;
       try { res = await api('GET', `/bots/${botId}/fleet-replication?include=block`); } catch (err) { res = null; }
-      if (!body.isConnected || fleetBackupBotId !== botId) return;
+      if (!body.isConnected || fleetBackupBotId !== botId || seq !== renderFleetReplication.seq) return;
+      // A live failback run moves on its own; the panel follows it.
+      if (res && res.success && res.failback && !res.failback.parked) setTimeout(() => { if (seq === renderFleetReplication.seq) renderFleetReplication(botId); }, 3000);
       if (!res || !res.success) {
-        body.innerHTML = '<div class="error-message">Failed to load replication status</div>';
+        // One unreadable answer must not take the run card away until the modal is reopened.
+        body.innerHTML = '<div class="error-message">Failed to load replication status; retrying...</div>';
+        setTimeout(() => { if (seq === renderFleetReplication.seq) renderFleetReplication(botId); }, 3000);
         return;
       }
       const r = res.replication || { enabled: false };
+      // The run card is drawn in every record shape: an adopt that filed the
+      // primary record without a replication posture parks its run here too.
+      const failback = res.failback || null;
+      const failbackHtml = failbackRunHtml(botId, failback, res.failbackCancelable === true);
       if (!r.enabled) {
         body.innerHTML = `
+          ${failbackHtml}
           <div class="env-tip">A standby copy of this database on another machine. Without one, this machine dying takes the database with it and the fleet cannot fail over.</div>
           <div class="env-row" style="align-items:center;">
             <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
@@ -2539,6 +2552,17 @@
       // Parked behind a stand-in (20.5, E13): the copy going stale is THIS one,
       // and the inactive slot below is the stand-in that now serves the fleet.
       const covered = !!(res.standIn && res.standIn.role === 'covered');
+      // The run opens itself within a minute of the hold; this opens it now,
+      // and after a decline it re-arms the automatic lane.
+      const declined = !failback && res.failbackDeclined && res.failbackDeclined.mode === 'failback' && covered ? res.failbackDeclined : null;
+      // The opener and the automatic lane both read the facts the bot reports,
+      // so a stopped instance (the by-hand re-seed below asks for one) gets the
+      // step to take, not a button the route refuses.
+      const failbackOpenHtml = covered && res.standIn.namesThisNode === true && !failback
+        ? (declined ? `<div class="env-tip" style="color:var(--warning);">The automatic failback was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. ${stopped ? 'Start the instance first; Fail back now then re-arms it once the bot answers.' : `<button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">Fail back now</button> <span class="env-tip">re-arms it and opens it now.</span>`}</div>`
+          : stopped ? '<div class="env-tip">Start the instance first: the failback run reads the facts the bot reports and opens itself once it answers.</div>'
+          : `<div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">Fail back now</button> <span class="env-tip">The failback run opens itself within a minute; this opens it now. It stops the instance, dumps this database, then parks and asks before wiping it.</span></div>`)
+        : '';
       const coveredWho = escapeHtml((res.standIn && res.standIn.standInNodeId || '').slice(0, 8)) || 'the node holding the fleet';
       const coveredHtml = !covered ? '' : res.standIn.namesThisNode === false
         ? `<div class="error-message">RETURNING MASTER, LANE OVER: node <b>${coveredWho}</b> no longer stands in for this node (promoted by hand, or its lane ended), so there is no failback to run; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. Demote this node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.</div>`
@@ -2580,7 +2604,7 @@
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
         ${reachHtml}
-        ${coveredHtml}
+        ${coveredHtml}${failbackHtml}${failbackOpenHtml}
         ${slotsHtml}
         ${block ? `
         <div style="margin-top:6px;">
@@ -2613,7 +2637,7 @@
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
-          ${stopped ? `
+          ${failback ? '<div class="env-tip">The failback run re-seeds this database itself; answer it above.</div>' : stopped ? `
           <div class="form-group"><label>New primary's replication DSN</label>
             <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
           <div class="form-group"><label>New primary's certificate (PEM)</label>
@@ -3025,9 +3049,14 @@
       // A parked seed (failed, or interrupted by a manager restart) stays on
       // show until the operator retries or dismisses it.
       const parked = r.parkedSeed || null;
+      const hint = seedAfterRetire(res.failback || null, res.failbackDeclined || null) ? 'after-retire' : '';
+      // A provision seed's record does not survive a failed apply, so its parked
+      // record with a whole copy is a manager restart in the apply window, and
+      // the retire warning is the one to keep.
+      const parkedHint = parked && parked.committed && parked.copyWhole === true && parked.purpose !== 'provision' ? (res.failback ? 'copy-whole-run' : 'copy-whole') : hint;
       const errHtml = parked
         ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}
-             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}')">Dismiss</button></div></div>`
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}', '${parkedHint}')">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
       // A seed-first transfer (20.19 F21) in flight or parked; a live one keeps
       // this panel polling, a parked one shows its reason until dismissed.
@@ -3039,18 +3068,28 @@
                <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', ${run.retireOldMaster === true}, ${!r.record}, true)">Continue transfer</button>
                <button class="btn btn-secondary btn-small" onclick="dismissTransfer('${botId}')">Dismiss</button></div></div>`
         : `<div class="env-tip">Transfer in progress: <b>${escapeHtml(transferPhaseText(run.phase))}</b> (${Math.round((Date.now() - run.startedAt) / 1000)}s).${run.phase === 'promoting' ? ' The bot reports the promote in its own Fleet view.' : ''}</div>`;
-      if (runLive && !r.provisioning) setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
+      const failback = res.failback || null;
+      const failbackHtml = failbackRunHtml(botId, failback, res.failbackCancelable === true);
+      const runHeld = !!failback;
+      // A declined run: the automatic lane is closed for this episode, the by-hand routes are open, and the re-arm is offered.
+      const declined = !failback && res.failbackDeclined ? res.failbackDeclined : null;
+      // This route sends the posture inside its read wrapper.
+      const standingNow = res.standIn && res.standIn.read === 'ok' ? res.standIn.posture : null;
+      const declinedHtml = !declined ? '' : declined.mode === 'drop-back'
+        ? (standingNow && standingNow.role === 'stand-in' && !standingNow.live ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '')
+        : (standingNow && standingNow.role === 'covered' ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '');
+      if ((runLive || (failback && !failback.parked)) && !r.provisioning) setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
 
       if (r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
           ? '<div class="env-tip">Cancelling at the next step...</div>'
           : p.cancelable
-            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}')">Cancel</button></div>`
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
             : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
         body.innerHTML = `
           ${errHtml}
-          ${transferRunHtml}
+          ${transferRunHtml}${failbackHtml}${declinedHtml}
           <div class="env-tip">${seedWhat(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
           ${cancelHtml}`;
         setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
@@ -3073,7 +3112,7 @@
           </div>` : '';
         body.innerHTML = `
           ${errHtml}
-          ${transferRunHtml}
+          ${transferRunHtml}${failbackHtml}${declinedHtml}
           ${fromFactsHtml}
           <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. If that machine dies, promoting this node's instance also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
           <div class="form-group"><label>Replication DSN</label>
@@ -3128,7 +3167,7 @@
           ? `<div class="error-message">This copy has left recovery and its app is not answering (${escapeHtml(posture.error || 'no answer')}), so the manager cannot tell a stand-in from a promotion. Nothing is adopted or re-seeded until it answers; removing the replica keeps its volume.</div>`
         : live.inRecovery === false
           ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>
-             <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
+             ${runHeld ? '' : `<div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`}`
           : coveredCopy
             ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})`}. ${standing.namesThisNode === false ? (slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it and this copy follows a database that is no longer the fleet's; demote the node from its Fleet tab to stay a co-worker, then Re-seed now repoints this copy at the current primary; to make it a designated backup instead, re-seed it first, then set BOT_NODE_ROLE=backup-master on this node and restart it.` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it (promoted by hand, or its lane ended), so there is no failback to run; demote the node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.`) : standing.namesThisNode !== true ? `This is the RETURNING MASTER's copy, re-seeded for the failback, but its bot is not registered with the node holding the fleet yet; the failback needs that node reachable, and nothing is adopted or re-seeded meanwhile.` : standing.followsDelivered === false ? `This is the RETURNING MASTER's copy, re-seeded for the failback; this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so.` : slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy, but it follows a database other than the one the node holding the fleet serves (that node reports no slot of its own for it), so the failback cannot promote it; remove the replica and provision it again from the copy block on that node's Database modal.` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, and this node's bot follows that node as a co-worker; promote this node from its Fleet tab once the copy has caught up to take the fleet back.`}</div>`
           : peerFrozen
@@ -3201,7 +3240,7 @@
       // side already.
       const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
       const isCopy = !!(r.live && r.live.inRecovery === true);
-      const transferHtml = (appHooks && isCopy && !runLive) ? `
+      const transferHtml = (appHooks && isCopy && !runLive && !runHeld) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the primary side</div>
           <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old primary's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
@@ -3222,7 +3261,7 @@
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is adopted or removed,
       // and a record too old to probe has no state to re-seed from.
-      const reseedHtml = (appHooks && r.live && live.inRecovery !== false && !standingIn && !peerFrozen && !coveredCopy)
+      const reseedHtml = (appHooks && r.live && live.inRecovery !== false && !standingIn && !peerFrozen && !coveredCopy && !runHeld)
         ? unanswered
           ? `<span class="env-tip" style="color:var(--warning);">Re-seed is unavailable: the app is not answering (${escapeHtml(posture.error || 'no answer')}).</span>`
           : `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
@@ -3230,7 +3269,7 @@
 
       body.innerHTML = `
         ${errHtml}
-        ${transferRunHtml}
+        ${transferRunHtml}${failbackHtml}${declinedHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${stateHtml}
         ${standInBlockHtml}
@@ -3238,7 +3277,7 @@
         ${ledgerHtml}
         <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
-          ${standingIn && standing.live ? '' : `<button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}', ${removeMayHoldWrites ? 'true' : 'false'}, ${unanswered ? 'true' : 'false'})">Remove replica</button>`}
+          ${(standingIn && standing.live) || runHeld ? '' : `<button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}', ${removeMayHoldWrites ? 'true' : 'false'}, ${unanswered ? 'true' : 'false'})">Remove replica</button>`}
           ${reseedHtml}
         </div>
         ${transferHtml}`;
@@ -3367,6 +3406,103 @@
     }
 
 
+    function failbackPhaseText(run) {
+      const who = run.standInNodeId ? run.standInNodeId.slice(0, 8) : 'the node holding the fleet';
+      const texts = run.mode === 'drop-back' ? {
+        'awaiting-block': 'waiting for the new master\'s copy block and the divergence verdict',
+        'wipe-consent': 'waiting for your consent to re-seed this copy',
+        'seeding': `re-seeding this copy as a standby of ${who}'s database`,
+      } : {
+        'awaiting-block': `waiting for the stand-in ${who} to relay its copy block and for the divergence verdict`,
+        'dumping': 'stopping the instance and dumping this database before the wipe',
+        'wipe-consent': 'waiting for your consent to wipe this database',
+        'seeding': `re-seeding this machine as a standby of ${who}'s copy`,
+        'applying': 'starting the instance so the bot holds on the copy',
+        'catching-up': 'waiting for the copy to catch up',
+        'promoting': 'the bot is promoting this node back (the zero-loss transfer)',
+        'adopting': 'filing the promoted copy as this machine\'s database',
+        'restarting': 'restarting the instance onto its database',
+      };
+      return texts[run.phase] || run.phase;
+    }
+    // The failback or drop-back run (20.5, B6-i): its phase, the F5 park (the
+    // consent question is the server's own text, read on the click), its exits.
+    function failbackRunHtml(botId, run, cancelable) {
+      if (!run) return '';
+      const label = run.mode === 'drop-back' ? 'Drop-back' : 'Failback';
+      const secs = Math.round((Date.now() - run.startedAt) / 1000);
+      if (run.parked && run.phase === 'wipe-consent' && !run.consentAt) {
+        return `<div class="error-message">${label} run is waiting for your answer: it is ${escapeHtml(failbackPhaseText(run))}. ${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'} shows exactly what the wipe destroys (the divergence verdict${run.mode === 'drop-back' ? '' : ' and the outcome of the dump taken first'}) and asks you to confirm; Cancel ${run.mode === 'drop-back' ? 'leaves the copy as it is' : 'starts the instance again with the database untouched'} and closes the automatic run for this stand-in episode (${run.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'} on this modal re-arms it).
+             <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+               <button class="btn btn-danger btn-small" onclick="continueFailback('${botId}')">${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}</button>
+               <button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button></div></div>`;
+      }
+      if (run.parked) {
+        // Cancelable is the server's word, from the records that prove whether the wipe began.
+        const beforeWipe = cancelable === true;
+        return `<div class="error-message">${label} run stopped while <b>${escapeHtml(failbackPhaseText(run))}</b>: ${escapeHtml(run.lastError || 'unknown reason')} Continuing picks up from where it stopped.
+             <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+               <button class="btn btn-primary btn-small" onclick="continueFailback('${botId}')">Continue</button>
+               ${beforeWipe ? `<button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button>` : ''}
+               <button class="btn btn-secondary btn-small" onclick="dismissFailback('${botId}')">Dismiss</button></div></div>`;
+      }
+      return `<div class="env-tip">${label} run in progress: <b>${escapeHtml(failbackPhaseText(run))}</b> (${secs}s).${run.phase === 'awaiting-block' ? ` <button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button>` : ''}</div>`;
+    }
+    async function continueFailback(botId) {
+      try {
+        let res = await api('POST', `/bots/${botId}/fleet-failback/continue`, { consent: false });
+        if (!res.success && res.needsConfirm) {
+          if (!confirm(res.error)) return;
+          res = await api('POST', `/bots/${botId}/fleet-failback/continue`, { consent: true });
+        }
+        if (!res.success) { showMessage('error', res.error || 'Failed to continue the run'); return; }
+        showMessage('success', 'Run continued');
+      } catch (err) {
+        showMessage('error', 'Failed to continue the run');
+        return;
+      }
+      renderFleetReplica(botId);
+      renderFleetReplication(botId);
+    }
+    async function cancelFailback(botId) {
+      if (!confirm('Cancel this run? Nothing has been destroyed; if the run stopped the instance, it is started again. The automatic run stays closed for this stand-in episode until you re-arm it (Fail back now, or Drop back now on the copy\'s side).')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-failback/cancel`);
+        if (!res.success) { showMessage('error', res.error || 'Failed to cancel the run'); return; }
+        showMessage(res.error ? 'error' : 'success', res.error || 'Run cancelled');
+      } catch (err) {
+        showMessage('error', 'Failed to cancel the run');
+        return;
+      }
+      renderFleetReplica(botId);
+      renderFleetReplication(botId);
+      loadBots();
+    }
+    async function dismissFailback(botId) {
+      try {
+        const res = await api('DELETE', `/bots/${botId}/fleet-failback`);
+        if (!res.success) { showMessage('error', res.error || 'Failed to dismiss the run'); return; }
+        showMessage('success', res.error || 'Run dismissed');
+      } catch (err) {
+        showMessage('error', 'Failed to dismiss the run');
+        return;
+      }
+      renderFleetReplica(botId);
+      renderFleetReplication(botId);
+    }
+    async function openFailback(botId) {
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-failback`);
+        if (!res.success) { showMessage('error', res.error || 'Failed to open the failback run'); return; }
+        showMessage('success', 'Run opened');
+      } catch (err) {
+        showMessage('error', 'Failed to open the run');
+        return;
+      }
+      renderFleetReplication(botId);
+      renderFleetReplica(botId);
+    }
+
     async function reseedStalePrimary(botId) {
       const primaryDsn = (document.getElementById('reseed-dsn')?.value || '').trim();
       const cert = (document.getElementById('reseed-cert')?.value || '').trim();
@@ -3430,12 +3566,32 @@
       loadBots();
     }
 
-    async function cancelReplicaSeed(botId, parked, committed, purpose) {
+    // A failback run past its wipe consent, or a decline recorded at seeding or
+    // later, means this machine's own database was retired earlier in that run:
+    // a plain provision here is the run's retry seed, not a first standby.
+    function seedAfterRetire(failback, declined) {
+      if (failback) return failback.mode === 'failback' && failback.consentAt != null;
+      if (declined) return declined.mode === 'failback' && ['seeding', 'applying', 'catching-up', 'promoting', 'adopting', 'restarting'].includes(declined.phase);
+      return false;
+    }
+
+    // hint: 'after-retire' (a failback run retired this machine's own database
+    // earlier), 'copy-whole' or 'copy-whole-run' (the re-seed rebuilt the copy
+    // and only its service failed to start; with a run on the instance,
+    // Continue starts it), '' otherwise.
+    async function cancelReplicaSeed(botId, parked, committed, purpose, hint) {
+      const wholeNext = hint === 'copy-whole-run' ? 'Continue on the run card starts its container' : 'rebuilding the instance starts its container';
       const gone = purpose === 'reseed-stale-primary'
-        ? 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.'
+        ? (hint === 'copy-whole-run' || hint === 'copy-whole'
+          ? `This instance's own database has already been retired. The copy from the stand-in is complete; only its container failed to start. Dismissing this note keeps the copy, and ${wholeNext}.`
+          : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
         : purpose === 'reseed-standby'
-          ? 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.'
-          : 'The partial copy is discarded; nothing else on this instance is affected.';
+          ? (hint === 'copy-whole-run' || hint === 'copy-whole'
+            ? `The copy is complete; only its container failed to start. Dismissing this note keeps the copy, and ${wholeNext}.`
+            : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
+          : hint === 'after-retire'
+            ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
+            : 'The partial copy is discarded; nothing else on this instance is affected.';
       const warn = committed ? `\n\n${gone}` : '\n\nNothing has been deleted by this run yet.';
       const question = parked
         ? `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`

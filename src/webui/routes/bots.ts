@@ -37,6 +37,7 @@ import { hasAppHooks } from '../../instance/appHookClient';
 import { findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
 import * as fleetTransfer from '../../instance/fleetTransfer';
+import * as fleetFailback from '../../instance/fleetFailback';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
@@ -1460,10 +1461,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       if (status.enabled && req.query.include === 'block') {
         const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
+        res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
         return;
       }
-      res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null });
+      res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1562,7 +1563,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         if (built.success && built.dsn && built.cert) block = { dsn: built.dsn, cert: built.cert };
         else blockError = built.error ?? 'block unavailable';
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1967,6 +1968,70 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const result = fleetTransfer.dismissTransfer(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /:id/fleet-failback - open the failback run by hand on a returning master (it opens itself on the health tick otherwise). */
+  router.post('/:id/fleet-failback', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetFailback.openFailbackByHand(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /:id/fleet-failback/continue { consent? } - resume a parked run; at the consent park, consent:true is the operator's answer (F5). */
+  router.post('/:id/fleet-failback/continue', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetFailback.continueFailback(bot, { consent: req.body?.consent === true });
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /:id/fleet-failback/cancel - cancel a run before its wipe; the instance is started again if the run stopped it. */
+  router.post('/:id/fleet-failback/cancel', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetFailback.cancelFailback(bot);
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /:id/fleet-failback - dismiss a parked run without touching anything. */
+  router.delete('/:id/fleet-failback', (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = fleetFailback.dismissFailback(bot);
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
       res.json(result);
     } catch (error) {

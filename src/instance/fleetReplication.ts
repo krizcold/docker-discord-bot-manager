@@ -29,7 +29,7 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 
-const REPLICATION_ROLE = 'replicator';
+export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
 const FLEET_SLOT_PREFIX = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;

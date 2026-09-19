@@ -94,6 +94,8 @@ export interface FleetDbReplicaRecord {
   copyCleared?: boolean;
   /** When this copy was last built whole. Absent on records stamped before 2026-09-09. */
   seededAt?: number;
+  /** The seed that last built this copy whole (its startedAt): the run that asked for that seed reads it back as identity. */
+  seededBy?: number;
 }
 
 export interface FleetReplicaAutoReseedLedger {
@@ -142,6 +144,77 @@ export interface FleetTransferRun {
   startedAt: number;
   updatedAt: number;
   retireOldMaster: boolean;
+  parked?: boolean;
+  lastError?: string;
+}
+
+export type FleetFailbackMode = 'failback' | 'drop-back';
+export type FleetFailbackPhase = 'awaiting-block' | 'dumping' | 'wipe-consent' | 'seeding' | 'applying' | 'catching-up' | 'promoting' | 'adopting' | 'restarting';
+
+// The operator's decline of an automatic run (20.5 under F5): the health tick
+// reopens a run from the facts alone, so what Cancel or Dismiss closed must be
+// remembered for as long as the same stand-in episode stands. A later episode
+// reopens on its own; Fail back now (or Drop back now) re-arms this one.
+export interface FleetFailbackDecline {
+  mode: FleetFailbackMode;
+  at: number;
+  standInNodeId: string | null;
+  /** failback: the stand-in's term the hold observed; drop-back: the transfer's term. A later episode carries a higher one. */
+  episode: number | null;
+  /** The phase the run was in when it was declined. */
+  phase: FleetFailbackPhase;
+}
+
+// The bot's divergence proof (B6 map F31), relayed verbatim: whether a node's
+// own database is a prefix of the one it follows, read from postgres's own
+// timeline history. Unknown is neither.
+export interface FleetLineageFact {
+  verdict: 'prefix' | 'diverged' | 'unknown';
+  ownTimeline: number | null;
+  ownLsn: string | null;
+  ownInRecovery: boolean | null;
+  followedTimeline: number | null;
+  switchLsn: string | null;
+  bytesPast: number | null;
+  /** Row changes past the switch point to application tables, by table; empty means bookkeeping only; null when unclassified. */
+  dataChanges: { schema: string; table: string; transactions: number; changes: number }[] | null;
+  reason: string;
+  checkedAt: number;
+}
+
+// The failback run (PLAN_REPLICATION 20.5, B6 map B6-i). failback: the
+// returning master's manager brings this machine back as the master through a
+// re-seed of its own database from the stand-in's copy; drop-back: the
+// superseded stand-in's manager re-seeds its promoted copy as a standby of the
+// new master (F32). Both PARK before their wipe and ask (F5); consentAt is the
+// operator's answer. Its own field, because adopt consumes the transfer's.
+export interface FleetFailbackRun {
+  mode: FleetFailbackMode;
+  phase: FleetFailbackPhase;
+  startedAt: number;
+  updatedAt: number;
+  /** failback: the node whose copy this machine re-seeds from; drop-back: the node that took the fleet back. */
+  standInNodeId: string | null;
+  /** The stand-in episode this run belongs to, the key a decline is remembered under. */
+  episode: number | null;
+  /** The bot's verdict, captured before the instance was stopped. */
+  lineage: FleetLineageFact | null;
+  /** The pre-wipe dump's outcome, named at the consent park. */
+  dump: { ok: boolean; name: string | null; error: string | null; at: number } | null;
+  consentAt: number | null;
+  /** The endpoint the copy block names; the credential stays in the bot's own file. */
+  block: { host: string; port: number } | null;
+  /** This machine's endpoint for the copy it will serve. */
+  serve: { publicHost: string; hostPort: number } | null;
+  /** The run stopped the instance for the dump, so Cancel starts it again. */
+  stoppedByRun: boolean;
+  /** The fleet was handed back to this node (its promote asked, or it was found master already): past this, nothing is cancelable. */
+  handoverAt?: number;
+  /** The adopt completed, enable included; a primary record filed without it is an adopt that stopped at its enable. */
+  adoptedAt?: number;
+  /** The seed this drop-back run started (its startedAt): the copy it files carries the same value. */
+  seedStartedAt?: number;
+  /** No runner owns it: the consent park, a failure, or a manager restart. */
   parked?: boolean;
   lastError?: string;
 }
@@ -231,6 +304,8 @@ export interface InstanceConfig {
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
   fleetTransfer?: FleetTransferRun;    // seed-first transfer in flight or parked (20.19 F21); cleared when the promote is handed to the app
+  fleetFailback?: FleetFailbackRun;    // failback or drop-back run in flight or parked (20.5, B6-i); cleared when it finishes, is cancelled or dismissed
+  fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults

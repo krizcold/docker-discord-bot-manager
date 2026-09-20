@@ -3267,10 +3267,20 @@
           : `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
         : '';
 
+      // The node's own half of active mode (20.5) as its SAVED env holds it
+      // (the container learns it when next recreated, like the standby); the
+      // master's half is enabled on that bot's Fleet tab.
+      const consent = (bots.find(b => b.id === botId) || {}).fleetBackupConsent;
+      const consentHtml = consent === true
+        ? '<div class="env-tip">Backup mode is set to active in this instance\'s env (the bot picks a change up when its container is next recreated, Apply or Restart); the master enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.</div>'
+        : consent === false
+          ? '<div class="env-tip">Backup mode: passive (this node only keeps the copy; taking over is a manual Promote). To let it stand in temporarily, set Backup Mode to active in this instance\'s env, restart it, then enable it on the master\'s Fleet tab.</div>'
+          : '';
       body.innerHTML = `
         ${errHtml}
         ${transferRunHtml}${failbackHtml}${declinedHtml}
         <div class="env-tip">Streaming from <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
+        ${consentHtml}
         ${stateHtml}
         ${standInBlockHtml}
         ${slotHtml}

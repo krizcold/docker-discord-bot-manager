@@ -153,6 +153,13 @@ export interface ControlPlaneSpec {
     dialsOut: string[];
     dialTargetOrder: string[];
   };
+  /**
+   * The node's consent to standing in as an active backup (PLAN_REPLICATION
+   * 20.5): the key and the one value that means consent. Declared so the
+   * manager can locate and read the row without matching a spelling; the
+   * enable itself is the app's own, on its master's fleet config.
+   */
+  modeEnv?: { key: string; active: string };
   /** Key holding the ordered list of peer control URLs this node dials. */
   dialEnv: string;
   /** Key whose shared value marks a set of peers as one deployment. */
@@ -198,6 +205,7 @@ const smdbRoleEnv = {
   dialsOut: ['co-worker', 'backup-master'],
   dialTargetOrder: ['master', 'backup-master'],
 };
+const smdbModeEnv = { key: 'FLEET_BACKUP_MODE', active: 'active' };
 const smdbDialEnv = 'MASTER_URLS';
 const smdbGroupSecretEnv = 'CONTROL_SECRET';
 
@@ -220,6 +228,15 @@ function smdbWizardFields(): WizardEnvVar[] {
         { value: 'backup-master', label: 'Backup Master' },
       ],
       groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
+    },
+    {
+      ...base,
+      key: smdbModeEnv.key,
+      displayLabel: 'Backup Mode',
+      description: 'Passive: this backup only keeps a live copy; taking over is a manual Promote. Active: this backup may STAND IN temporarily while the master is gone, taking the fleet\'s writes on its copy and handing them back when the master returns; the master must also enable it on its Fleet tab. It is not free: while it is on, every write in the fleet waits for this copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.',
+      defaultValue: 'passive',
+      options: [{ value: 'passive', label: 'Passive' }, { value: smdbModeEnv.active, label: 'Active (temporary stand-in)' }],
+      showWhen: { key: smdbRoleEnv.key, equals: 'backup-master' },
     },
     {
       ...base,
@@ -292,6 +309,25 @@ function smdbWizardFields(): WizardEnvVar[] {
   ];
 }
 
+/**
+ * The node's consent to active mode as its env holds it (PLAN_REPLICATION
+ * 20.5): true or false where the declared row applies to this node (its own
+ * display condition, read off the declaration, says which roles it is for),
+ * null where it does not or nothing is declared. The saved env, not the
+ * container's: the caller says so.
+ */
+export function backupModeConsent(record: AppCapabilityManifest | null | undefined, envVars: Record<string, string> | undefined): boolean | null {
+  const cp = record?.controlPlane;
+  if (!cp?.modeEnv) return null;
+  const valueOf = (key: string): string => key === cp.roleEnv.key ? foldedRoleValue(cp.roleEnv, envVars?.[key]) : (envVars?.[key] ?? '');
+  const gate = cp.wizardFields.find(f => f.key === cp.modeEnv?.key)?.showWhen;
+  const applies = gate
+    ? (Array.isArray(gate.equals) ? gate.equals.includes(valueOf(gate.key)) : gate.equals === valueOf(gate.key))
+    : cp.roleEnv.dialsOut.includes(valueOf(cp.roleEnv.key));
+  if (!applies) return null;
+  return (envVars?.[cp.modeEnv.key] ?? '').trim().toLowerCase() === cp.modeEnv.active.toLowerCase();
+}
+
 const superModularDiscordBot: AppCapabilityManifest = {
   match: { urlContains: 'modular-discord-bot' },
   companionDb: {
@@ -315,6 +351,7 @@ const superModularDiscordBot: AppCapabilityManifest = {
     },
     urlScheme: { secure: 'wss', plain: 'ws' },
     roleEnv: smdbRoleEnv,
+    modeEnv: smdbModeEnv,
     dialEnv: smdbDialEnv,
     groupSecretEnv: smdbGroupSecretEnv,
     wizardFields: smdbWizardFields(),

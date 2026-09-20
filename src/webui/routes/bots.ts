@@ -34,7 +34,7 @@ import { readEnvsFromComposeFile } from '../../docker/containerManager';
 import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { hasAppHooks } from '../../instance/appHookClient';
-import { findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
+import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
 import * as fleetTransfer from '../../instance/fleetTransfer';
 import * as fleetFailback from '../../instance/fleetFailback';
@@ -115,6 +115,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
             const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
             return !!cp && cp.roleEnv.dialsOut.includes(foldedRoleValue(cp.roleEnv, bot.envVars?.[cp.roleEnv.key]));
           })(),
+          // The node's consent to active (stand-in) mode as its SAVED env holds
+          // it, read by the key its app declares (20.5, B6-j); null where the
+          // declared row does not apply to this node. The enable is the app's own.
+          fleetBackupConsent: backupModeConsent(findAppCapabilities(bot.sourceUrl), bot.envVars),
           // Whether this app declares lifecycle hooks, so the UI knows if the
           // one-click surfaces can work at all before offering them.
           appHooks: hasAppHooks(bot),

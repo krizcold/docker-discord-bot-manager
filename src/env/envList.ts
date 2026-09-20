@@ -39,8 +39,8 @@ export interface EnvFieldMeta {
    * What this row IS (stamped server-side from the app's capability record),
    * so the browser never matches an env key by spelling.
    */
-  semantic?: 'peer-role' | 'peer-list' | 'peer-secret' | 'db-dsn';
-  /** For 'peer-role': the option values meaning "this node dials a peer". */
+  semantic?: 'peer-role' | 'peer-list' | 'peer-secret' | 'db-dsn' | 'backup-mode';
+  /** For 'peer-role': the option values meaning "this node dials a peer"; for 'backup-mode': the one value meaning consent. */
   semanticValues?: string[];
   /**
    * For 'peer-role': the record's dialTargetOrder - the order a joining node
@@ -205,6 +205,7 @@ export function buildWizardEnvList(
   if (controlPlane) {
     const semanticOf = (key: string): EnvFieldMeta => {
       if (key === controlPlane.roleEnv.key) return { semantic: 'peer-role', semanticValues: controlPlane.roleEnv.dialsOut, semanticTargetOrder: controlPlane.roleEnv.dialTargetOrder };
+      if (controlPlane.modeEnv && key === controlPlane.modeEnv.key) return { semantic: 'backup-mode', semanticValues: [controlPlane.modeEnv.active] };
       if (key === controlPlane.dialEnv) return { semantic: 'peer-list' };
       if (controlPlane.groupSecretEnv && key === controlPlane.groupSecretEnv) return { semantic: 'peer-secret' };
       if (record?.companionDb && key === record.companionDb.env.url) return { semantic: 'db-dsn' };

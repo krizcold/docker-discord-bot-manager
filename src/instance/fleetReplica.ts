@@ -1005,14 +1005,7 @@ export function reseedStalePrimary(
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
-  // Held across the whole run, the way decommission holds it: the dump, the
-  // retire and the seed take minutes, and a restore or the scheduled dump
-  // interleaving with the wipe is what the slot exists to prevent. The lane's
-  // own pre-reseed dump does not claim it.
-  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
-    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
-  }
-  const started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'reseed-stale-primary', async () => {
+  const preflight = async () => {
     throwIfCancelled(instance.id);
     // Stopping the instance took its whole compose project down, so the
     // database has to come back up alone to be dumped at all. Best effort, and
@@ -1049,7 +1042,23 @@ export function reseedStalePrimary(
     // and merely lacks a standby, which beats staying pinned to a database
     // that was just deleted.
     retireFleetDbEnvPins(instance.id);
-  }, () => fleetBackup.releaseFleetBackupBusy(instance.id));
+  };
+  // Held across the whole run, the way decommission holds it: the dump, the
+  // retire and the seed take minutes, and a restore or the scheduled dump
+  // interleaving with the wipe is what the slot exists to prevent. The lane's
+  // own pre-reseed dump does not claim it. A throw out of the synchronous
+  // start (a registry write failing) would otherwise hold the slot until the
+  // manager restarts.
+  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+  }
+  let started: { success: boolean; error?: string };
+  try {
+    started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'reseed-stale-primary', preflight, () => fleetBackup.releaseFleetBackupBusy(instance.id));
+  } catch (err) {
+    fleetBackup.releaseFleetBackupBusy(instance.id);
+    throw err;
+  }
   if (!started.success) {
     fleetBackup.releaseFleetBackupBusy(instance.id);
     return started;

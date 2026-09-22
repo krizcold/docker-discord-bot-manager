@@ -438,6 +438,7 @@ function startProvisioning(
   intake: ValidatedIntake,
   purpose: FleetReplicaSeedPurpose,
   preflight?: () => Promise<void>,
+  onSettled?: () => void,
 ): { success: boolean; error?: string } {
   // The busy check, the record write and the lock claim share one synchronous
   // segment: a second entrant that wrote the record and only then lost the
@@ -501,7 +502,10 @@ function startProvisioning(
     }
     saveSeed(instance.id, { parked: true, lastError: message });
     if (purpose === 'reseed-standby') ledgerFailure(instance.id, message);
-  }).finally(() => containerManager.broadcastBotUpdated(instance.id));
+  }).finally(() => {
+    onSettled?.();
+    containerManager.broadcastBotUpdated(instance.id);
+  });
   return { success: true };
 }
 
@@ -955,10 +959,6 @@ export function reseedStalePrimary(
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (instance.recoveryChannel) return { success: false, error: 'A recovery channel is armed on this database - disarm it first' };
   if (instance.recoveryRescue) return { success: false, error: 'A database rescue is in progress on this instance - finish or cancel it first' };
-  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
-    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
-  }
-  fleetBackup.releaseFleetBackupBusy(instance.id);
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
@@ -1005,6 +1005,13 @@ export function reseedStalePrimary(
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
+  // Held across the whole run, the way decommission holds it: the dump, the
+  // retire and the seed take minutes, and a restore or the scheduled dump
+  // interleaving with the wipe is what the slot exists to prevent. The lane's
+  // own pre-reseed dump does not claim it.
+  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+  }
   const started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'reseed-stale-primary', async () => {
     throwIfCancelled(instance.id);
     // Stopping the instance took its whole compose project down, so the
@@ -1042,8 +1049,11 @@ export function reseedStalePrimary(
     // and merely lacks a standby, which beats staying pinned to a database
     // that was just deleted.
     retireFleetDbEnvPins(instance.id);
-  });
-  if (!started.success) return started;
+  }, () => fleetBackup.releaseFleetBackupBusy(instance.id));
+  if (!started.success) {
+    fleetBackup.releaseFleetBackupBusy(instance.id);
+    return started;
+  }
   return { success: true, started: true };
 }
 

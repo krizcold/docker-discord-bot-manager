@@ -953,6 +953,12 @@ export function reseedStalePrimary(
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
   }
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
+  if (instance.recoveryChannel) return { success: false, error: 'A recovery channel is armed on this database - disarm it first' };
+  if (instance.recoveryRescue) return { success: false, error: 'A database rescue is in progress on this instance - finish or cancel it first' };
+  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+  }
+  fleetBackup.releaseFleetBackupBusy(instance.id);
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };

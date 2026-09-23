@@ -50,6 +50,15 @@ export function isUpdateInProgress(): boolean {
 
 const execFileAsync = promisify(execFile);
 
+async function isAncestor(commit: string, head: string): Promise<boolean> {
+  try {
+    await gitAsync(['merge-base', '--is-ancestor', commit, head]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function gitAsync(args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', timeout: 30000 });
   return stdout.trim();
@@ -141,7 +150,9 @@ async function readManagerVersion(): Promise<ManagerVersion> {
     // The image records the commit it was built from (the self-update passes
     // it); a first build by hand records none, and the checkout stands in.
     const built = (process.env.MANAGER_BUILD_COMMIT || '').trim();
-    const buildStale = built !== '' && built !== head;
+    // Stale means behind: a build the checkout cannot fast-forward to (a
+    // prebuilt image ahead of the clone, or a commit it never fetched) is not.
+    const buildStale = built !== '' && built !== head && await isAncestor(built, head);
     const currentCommit = (built || head).slice(0, 7);
     let updateAvailable = buildStale;
     let behindBy = 0;

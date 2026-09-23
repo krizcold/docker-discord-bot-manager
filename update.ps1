@@ -38,6 +38,7 @@ git -c safe.directory='*' pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE) - resolve the errors above and re-run." }
 
 Write-Host "==> Rebuilding and recreating..."
+$env:BUILD_COMMIT = (git -c safe.directory='*' rev-parse HEAD)
 docker compose -f $compose up -d --build
 if ($LASTEXITCODE -ne 0) { throw "docker compose up failed (exit $LASTEXITCODE) - see the errors above." }
 

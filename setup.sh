@@ -336,7 +336,7 @@ ok "Wrote $ENV_FILE"
 # ── Deploy ────────────────────────────────────────────────────────────────────
 info "Starting the stack (the first build can take a few minutes) ..."
 deploy_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)" docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."
+BUILD_COMMIT="$(git -c safe.directory='*' rev-parse HEAD 2>/dev/null || true)" docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."
 
 if [ "$need_password" -eq 1 ]; then
   # Authelia runs with watch: false and the users file is a bind mount, so a content

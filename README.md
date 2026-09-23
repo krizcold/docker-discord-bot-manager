@@ -39,7 +39,8 @@ The manager runs as a container under Docker Desktop and manages your bots as si
    ```
 2. Start it:
    ```powershell
-   BUILD_COMMIT=$(git rev-parse HEAD) docker compose -f docker-compose.standalone.yml up -d --build
+   $env:BUILD_COMMIT = (git rev-parse HEAD)
+   docker compose -f docker-compose.standalone.yml up -d --build
    ```
 3. Open <http://127.0.0.1:8090> and install a bot (add a repo URL or Docker image -> set env/config -> Install & Run).
 

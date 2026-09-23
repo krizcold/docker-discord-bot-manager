@@ -38,6 +38,7 @@ import { disarmRecoveryChannel } from './recoveryChannel';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
 
 const PGDATA = '/var/lib/postgresql/data';
+const APP_HOOK_WAIT_MS = 90_000;
 const RETRY_DELAY_MS = 30_000;
 const MONITOR_INTERVAL_MS = 30_000;
 const RSYNC_POLL_MS = 10_000;
@@ -598,6 +599,13 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   // explicitly - and the app only serves its hook once it is running. Failure is
   // survivable: opening the Database modal republishes.
   if (started.success) {
+    // The container was just started; its hooks answer once its web server
+    // listens, not when the start returns.
+    const answering = await appLifecycle.waitForAppHook(containerManager.getBot(instance.id) || fresh, APP_HOOK_WAIT_MS);
+    if (!answering.success) {
+      console.warn(`[RecoveryRescue] ${answering.error} on ${instance.displayName}; open the Database panel on this instance to publish the copy block, then clear its role override and restart it`);
+      return;
+    }
     const republished = await appLifecycle.deliverCopyBlock(containerManager.getBot(instance.id) || fresh);
     if (!republished.success) {
       console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);

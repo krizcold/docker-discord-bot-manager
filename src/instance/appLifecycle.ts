@@ -296,3 +296,21 @@ export async function demote(instance: InstanceConfig, confirm: boolean): Promis
 export async function resetRole(instance: InstanceConfig, restart: boolean): Promise<ActionResult> {
   return fromHook(await callAppHook(instance, 'role-reset', 'POST', { restart }));
 }
+
+/**
+ * A container that just started serves its hooks only once its web server
+ * listens; callers that start it and then need it wait here, bounded.
+ */
+export async function waitForAppHook(instance: InstanceConfig, deadlineMs: number): Promise<ActionResult> {
+  const deadline = Date.now() + deadlineMs;
+  let last = 'no answer yet';
+  for (;;) {
+    const facts = await getAppFacts(instance, 5_000);
+    if (facts.success) return { success: true };
+    last = facts.error || last;
+    if (Date.now() >= deadline) {
+      return { success: false, error: `the app did not answer its hooks within ${Math.round(deadlineMs / 1000)} s (${last})` };
+    }
+    await new Promise(resolve => setTimeout(resolve, 2_000));
+  }
+}

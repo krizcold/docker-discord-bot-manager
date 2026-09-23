@@ -11,7 +11,7 @@
 #   2. put an argon2id hash in ./authelia/users_database.yml
 #   3. create a .env with HOST_DATA_DIR, PUBLIC_HOST, AUTHELIA_HOST, COOKIE_DOMAIN, ACME_EMAIL, TZ
 #   4. open inbound TCP 80 + 443 (and Contabo's external firewall if enabled)
-#   5. docker compose -f docker-compose.remote.yml up -d
+#   5. BUILD_COMMIT=$(git rev-parse HEAD) docker compose -f docker-compose.remote.yml up -d
 
 name: discordbotmanager-remote
 

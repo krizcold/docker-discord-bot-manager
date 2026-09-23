@@ -38,9 +38,12 @@ git -c safe.directory='*' pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE) - resolve the errors above and re-run." }
 
 Write-Host "==> Rebuilding and recreating..."
+$prevBuildCommit = $env:BUILD_COMMIT
 $env:BUILD_COMMIT = (git -c safe.directory='*' rev-parse HEAD)
 docker compose -f $compose up -d --build
-if ($LASTEXITCODE -ne 0) { throw "docker compose up failed (exit $LASTEXITCODE) - see the errors above." }
+$composeExit = $LASTEXITCODE
+if ($null -eq $prevBuildCommit) { Remove-Item Env:BUILD_COMMIT -ErrorAction SilentlyContinue } else { $env:BUILD_COMMIT = $prevBuildCommit }
+if ($composeExit -ne 0) { throw "docker compose up failed (exit $composeExit) - see the errors above." }
 
 Write-Host "[ok] Bot Manager updated."
 docker compose -f $compose ps

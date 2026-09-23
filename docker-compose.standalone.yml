@@ -10,10 +10,11 @@
 # resolves a bot's bind-mounts as HOST paths; HOST_DATA_DIR lets the manager rewrite
 # those to live under the shared data folder so manager and bots see the same files.
 #
-#   Windows (PowerShell):  $env:HOST_DATA_DIR = "C:/dbm/data"
-#   Linux:                 export HOST_DATA_DIR=/opt/dbm/data
+#   Windows (PowerShell):  $env:HOST_DATA_DIR = "C:/dbm/data"; $env:BUILD_COMMIT = (git rev-parse HEAD)
+#   Linux:                 export HOST_DATA_DIR=/opt/dbm/data BUILD_COMMIT=$(git rev-parse HEAD)
 #
 #   docker compose -f docker-compose.standalone.yml up -d --build
+#   (BUILD_COMMIT stamps the image with the commit it is built from, which the header's version shows)
 #   open http://127.0.0.1:8090
 
 name: discordbotmanager-standalone

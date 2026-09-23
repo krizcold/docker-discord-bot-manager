@@ -21,6 +21,7 @@ import * as http from 'http';
 import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
+import * as appLifecycle from './appLifecycle';
 import { InstanceConfig } from '../types';
 
 export const RECOVERY_CONTROL_PORT = 8946;
@@ -262,6 +263,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // filters), and quiesce refuses while anything survives. Idempotent:
       // a re-entry finds everything down and just re-captures the LSN.
       if (containerManager.getBot(instance.id)?.status === 'running') {
+        // The source app would return as whatever its own files say (a master
+        // override from its promote); the swap is moving the primary away, so
+        // it is told to return to its configured role and store first. No
+        // restart: the stop follows.
+        const reset = await appLifecycle.resetRole(instance, false);
+        if (!reset.success) console.warn(`[RecoveryControl] The source app did not return to its configured role before the quiesce on ${instance.displayName}: ${reset.error}; demote it after the handback`);
         const stopped = await containerManager.stopBot(instance.id);
         if (!stopped.success && stopped.error !== 'Bot is not running') {
           send(500, { success: false, error: `could not stop the source instance: ${stopped.error}` });

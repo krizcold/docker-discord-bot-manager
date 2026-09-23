@@ -186,6 +186,8 @@ export type AppHookAction =
   | 'promote/continue'
   | 'promote/cancel'
   | 'demote'
+  /** Return the app to its configured role and store after infrastructure moved its primary (the recovery channel's swap). */
+  | 'role-reset'
   | 'confirm-fresh'
   /** Hand the app the copy block for the database it hosts, so it can relay it. */
   | 'copy-block';

@@ -602,5 +602,13 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
     if (!republished.success) {
       console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);
     }
+    // The app booted in whatever role and store its own files last recorded
+    // (a demote's co-worker override, the forms it followed as a co-worker);
+    // the swap made this machine the primary by infrastructure means, so the
+    // app is told to return to its configured role and store, and restarts.
+    const reset = await appLifecycle.resetRole(containerManager.getBot(instance.id) || fresh, true);
+    if (!reset.success) {
+      console.warn(`[RecoveryRescue] The app did not return to its configured role after the swap on ${instance.displayName}: ${reset.error}; clear its role override and restart it`);
+    }
   }
 }

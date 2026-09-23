@@ -285,3 +285,14 @@ export async function transfer(
 export async function demote(instance: InstanceConfig, confirm: boolean): Promise<ActionResult> {
   return fromHook(await callAppHook(instance, 'demote', 'POST', { confirm }));
 }
+
+/**
+ * Return the app to its configured role and store: the recovery channel's swap
+ * moves the primary by infrastructure means, so the role override and the
+ * store forms the app's own files last recorded would otherwise boot it as
+ * what it was before (a demoted co-worker on the receiver, a master on the
+ * source). restart false leaves the child alone for a caller about to stop it.
+ */
+export async function resetRole(instance: InstanceConfig, restart: boolean): Promise<ActionResult> {
+  return fromHook(await callAppHook(instance, 'role-reset', 'POST', { restart }));
+}

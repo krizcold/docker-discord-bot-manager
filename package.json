@@ -8,7 +8,7 @@
     "build": "tsc && rm -rf dist/webui/public && cp -r src/webui/public dist/webui/public",
     "start": "node dist/index.js",
     "cli": "node dist/cli/dbm.js",
-    "docker:build": "docker build -t discord-bot-manager .",
+    "docker:build": "docker build --build-arg BUILD_COMMIT=$(git rev-parse HEAD) -t discord-bot-manager .",
     "docker:run": "docker-compose up -d"
   },
   "dependencies": {

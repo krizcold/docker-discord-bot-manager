@@ -149,7 +149,10 @@ async function readManagerVersion(): Promise<ManagerVersion> {
     const head = await gitAsync(['rev-parse', 'HEAD']);
     // The image records the commit it was built from (the self-update passes
     // it); a first build by hand records none, and the checkout stands in.
-    const built = (process.env.MANAGER_BUILD_COMMIT || '').trim();
+    // Anything but a full sha (a shell that did not expand the argument) counts
+    // as none too.
+    const stamp = (process.env.MANAGER_BUILD_COMMIT || '').trim();
+    const built = /^[0-9a-f]{40}$/.test(stamp) ? stamp : '';
     // Stale means behind: a build the checkout cannot fast-forward to (a
     // prebuilt image ahead of the clone, or a commit it never fetched) is not.
     const buildStale = built !== '' && built !== head && await isAncestor(built, head);

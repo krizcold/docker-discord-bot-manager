@@ -74,6 +74,8 @@ export interface ActionResult {
   error?: string;
   /** The app asked for an explicit confirmation before it will act. */
   needsConfirm?: boolean;
+  /** role-reset: whether the app also dropped the store forms it had persisted (false where its environment pins none). */
+  formsCleared?: boolean;
   /** The app wants the RPO acknowledged before promoting. */
   needsLagConfirm?: boolean;
   /** The app says another designated backup received further than this copy (20.19 F14). */

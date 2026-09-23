@@ -269,6 +269,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // restart: the stop follows.
         const reset = await appLifecycle.resetRole(instance, false);
         if (!reset.success) console.warn(`[RecoveryControl] The source app did not return to its configured role before the quiesce on ${instance.displayName}: ${reset.error}; demote it after the handback`);
+        else if (reset.formsCleared === false) console.log(`[RecoveryControl] The source app on ${instance.displayName} cleared its role override and kept its persisted store forms (its environment pins no database URL); the next delivery replaces them`);
         const stopped = await containerManager.stopBot(instance.id);
         if (!stopped.success && stopped.error !== 'Bot is not running') {
           send(500, { success: false, error: `could not stop the source instance: ${stopped.error}` });

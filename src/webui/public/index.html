@@ -934,7 +934,7 @@
         }
         let html = `<span style="opacity:0.6;">v${v.currentCommit || '?'}</span>`;
         if (v.updateAvailable) {
-          html += ` <span class="update-badge">${v.behindBy} behind</span>`
+          html += ` <span class="update-badge">${v.behindBy > 0 ? `${v.behindBy} behind` : 'build behind the checkout'}</span>`
                 + ` <button class="btn btn-primary btn-small" onclick="updateManager()">Update manager</button>`;
         }
         set(html);

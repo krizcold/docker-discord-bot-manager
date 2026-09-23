@@ -37,6 +37,8 @@ export interface ManagerVersion {
   reason?: string;
   branch?: string;
   currentCommit?: string;
+  repoCommit?: string;
+  buildStale?: boolean;
   updateAvailable?: boolean;
   behindBy?: number;
 }
@@ -135,15 +137,20 @@ async function readManagerVersion(): Promise<ManagerVersion> {
   }
   try {
     const branch = await gitAsync(['rev-parse', '--abbrev-ref', 'HEAD']);
-    const currentCommit = await gitAsync(['rev-parse', '--short', 'HEAD']);
-    let updateAvailable = false;
+    const head = await gitAsync(['rev-parse', 'HEAD']);
+    // The image records the commit it was built from (the self-update passes
+    // it); a first build by hand records none, and the checkout stands in.
+    const built = (process.env.MANAGER_BUILD_COMMIT || '').trim();
+    const buildStale = built !== '' && built !== head;
+    const currentCommit = (built || head).slice(0, 7);
+    let updateAvailable = buildStale;
     let behindBy = 0;
     try {
       await gitAsync(['fetch', '--quiet']);
       behindBy = parseInt(await gitAsync(['rev-list', '--count', 'HEAD..@{u}']) || '0', 10) || 0;
-      updateAvailable = behindBy > 0;
+      updateAvailable = behindBy > 0 || buildStale;
     } catch { /* offline / no upstream: report current commit, no update info */ }
-    return { supported: true, bootId: BOOT_ID, branch, currentCommit, updateAvailable, behindBy };
+    return { supported: true, bootId: BOOT_ID, branch, currentCommit, repoCommit: head.slice(0, 7), buildStale, updateAvailable, behindBy };
   } catch (err) {
     return { supported: false, bootId: BOOT_ID, reason: `Could not read git state: ${err}` };
   }
@@ -181,7 +188,7 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   const newHead = gitOut(['rev-parse', 'HEAD']);
 
   emit('[Update] Rebuilding the stack images...', 'info');
-  await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build'], emit, REPO);
+  await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build', '--build-arg', `BUILD_COMMIT=${newHead}`], emit, REPO);
 
   // A pull that changed neither the manager image nor its compose config makes
   // `compose up -d` a no-op: the process would survive and a blind watchdog would

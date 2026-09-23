@@ -56,6 +56,10 @@ EXPOSE 8080
 ENV NODE_ENV=production
 ENV DATA_DIR=/data/data
 ENV PORT=8080
+# The commit this image was built from: the self-update and CI pass it, so
+# the version surface can tell the running build from the checkout beside it.
+ARG BUILD_COMMIT=
+ENV MANAGER_BUILD_COMMIT=$BUILD_COMMIT
 
 # Start the application
 CMD ["npm", "start"]

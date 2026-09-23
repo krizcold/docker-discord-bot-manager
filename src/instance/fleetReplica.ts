@@ -624,6 +624,16 @@ export async function provisionFleetReplicaFromFacts(
   return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort, confirm);
 }
 
+/**
+ * pg_basebackup ends a failed run with its cleanup notice ("removing contents
+ * of data directory"), so the cause is its error line, never its last line.
+ */
+function seedFailureLine(stderr: string, password: string): string {
+  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const line = lines.find(l => /error:/i.test(l)) || lines[0] || 'pg_basebackup failed';
+  return line.split(password).join('***');
+}
+
 function seedDsnFor(dsn: ParsedDsn): string {
   return `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 }
@@ -778,7 +788,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
     // The slot minted above would retain WAL on the primary for a copy that
     // does not exist; dropped while inactive, and the next attempt mints again.
     await dropInactiveSlot(instance, seedDsn, hostCertPath, record.slot);
-    throw new Error(`pg_basebackup failed: ${seed.stderr.trim().split('\n').pop()}`);
+    throw new Error(`pg_basebackup failed: ${seedFailureLine(seed.stderr, dsn.password)}`);
   }
 
   throwIfCancelled(instance.id);

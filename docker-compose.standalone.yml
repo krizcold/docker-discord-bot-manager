@@ -20,7 +20,10 @@ name: discordbotmanager-standalone
 
 services:
   discordbotmanagerapp:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-}
     # Or pin a published image instead of building locally:
     # image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp

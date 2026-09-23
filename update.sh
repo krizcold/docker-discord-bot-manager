@@ -31,7 +31,7 @@ info "Pulling latest code..."
 git -c safe.directory='*' pull --ff-only || die "git pull failed - resolve it by hand, then re-run."
 
 info "Rebuilding and recreating (the first build can take a few minutes)..."
-docker compose -f "$COMPOSE" up -d --build || die "docker compose up failed."
+BUILD_COMMIT="$(git rev-parse HEAD)" docker compose -f "$COMPOSE" up -d --build || die "docker compose up failed."
 
 ok "Bot Manager updated."
 docker compose -f "$COMPOSE" ps || true

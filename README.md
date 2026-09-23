@@ -39,7 +39,7 @@ The manager runs as a container under Docker Desktop and manages your bots as si
    ```
 2. Start it:
    ```powershell
-   docker compose -f docker-compose.standalone.yml up -d --build
+   BUILD_COMMIT=$(git rev-parse HEAD) docker compose -f docker-compose.standalone.yml up -d --build
    ```
 3. Open <http://127.0.0.1:8090> and install a bot (add a repo URL or Docker image -> set env/config -> Install & Run).
 
@@ -60,7 +60,7 @@ The same `/var/run/docker.sock` mount works as on Windows. Unlike Docker Desktop
    ```bash
    export HOST_DATA_DIR=/opt/dbm/data
    sudo mkdir -p "$HOST_DATA_DIR" && sudo chown 1000:1000 "$HOST_DATA_DIR"
-   docker compose -f docker-compose.standalone.yml up -d --build
+   BUILD_COMMIT=$(git rev-parse HEAD) docker compose -f docker-compose.standalone.yml up -d --build
    ```
 2. Open <http://127.0.0.1:8090>. (To reach it from another machine securely, see **Server on Linux** below.)
 
@@ -140,7 +140,7 @@ You do **not** need any of this if you ran `setup.sh` above - these are the equi
    For a real domain: `PUBLIC_HOST=manager.dbot.example.com`, `AUTHELIA_HOST=auth.dbot.example.com`, `COOKIE_DOMAIN=dbot.example.com`, `BOT_DOMAIN_BASE=dbot.example.com`, and a single wildcard A record `*.dbot.example.com` at the VPS - it covers the manager, the auth portal, and every bot. The whole system lives under the dedicated `dbot.` sub-level, so `example.com`, all its other subdomains, AND the session cookie stay entirely separate from the rest of your domain (`manager` and `auth` are reserved bot names so a bot can never shadow them). You do not edit `authelia/configuration.yml` - it reads these from the env. Caddy issues a **separate** certificate per hostname on demand; there is no wildcard certificate (that would need a DNS-01 challenge, which this stack does not set up), so each bot subdomain triggers its own Let's Encrypt issuance.
 5. **Run** and enroll MFA:
    ```bash
-   docker compose -f docker-compose.remote.yml up -d
+   BUILD_COMMIT=$(git rev-parse HEAD) docker compose -f docker-compose.remote.yml up -d
    # browse https://$PUBLIC_HOST -> log in -> enroll TOTP/WebAuthn.
    # no SMTP, so read the enrollment link from:
    docker exec authelia cat /data/notification.txt

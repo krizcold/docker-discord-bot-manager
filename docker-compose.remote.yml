@@ -17,7 +17,10 @@ name: discordbotmanager-remote
 
 services:
   discordbotmanagerapp:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_COMMIT: ${BUILD_COMMIT:-}
     # Or: image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped

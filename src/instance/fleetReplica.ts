@@ -630,7 +630,7 @@ export async function provisionFleetReplicaFromFacts(
  */
 function seedFailureLine(stderr: string, password: string): string {
   const lines = stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
-  const line = lines.find(l => /error:/i.test(l)) || lines[0] || 'pg_basebackup failed';
+  const line = lines.find(l => /error/i.test(l)) || lines[0] || 'no output (killed or timed out)';
   return line.split(password).join('***');
 }
 

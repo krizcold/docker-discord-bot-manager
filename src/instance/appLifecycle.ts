@@ -80,6 +80,8 @@ export interface ActionResult {
   needsLagConfirm?: boolean;
   /** The app says another designated backup received further than this copy (20.19 F14). */
   needsLineageConfirm?: boolean;
+  /** The app wants it acknowledged that other instances cannot reach this one once it is the primary side. */
+  needsReachabilityConfirm?: boolean;
   lagMs?: number | null;
   restartRequired?: boolean;
   [key: string]: unknown;
@@ -272,13 +274,14 @@ export async function publishCopyBlock(instance: InstanceConfig, block: { dsn: s
  */
 export async function transfer(
   instance: InstanceConfig,
-  opts: { confirmLag?: boolean; confirmLineage?: boolean; retireOldMaster?: boolean } = {},
+  opts: { confirmLag?: boolean; confirmLineage?: boolean; confirmReachability?: boolean; retireOldMaster?: boolean } = {},
 ): Promise<ActionResult> {
   const refusal = capabilityRefusal(instance);
   if (refusal) return { success: false, error: refusal };
   return fromHook(await callAppHook(instance, 'promote', 'POST', {
     confirmLag: opts.confirmLag === true,
     confirmLineage: opts.confirmLineage === true,
+    confirmReachability: opts.confirmReachability === true,
     retireOldMaster: opts.retireOldMaster === true,
   }));
 }

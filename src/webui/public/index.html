@@ -3322,9 +3322,10 @@
       try {
         let body = payload;
         let res = await api('POST', `/bots/${botId}/app-transfer`, body);
-        // The app checks the RPO first and the lineage after it, so either can
-        // arrive on the answer to the other; each is asked once and carried on.
-        for (let round = 0; round < 2 && !res.success; round++) {
+        // The app asks for the RPO, then the lineage, then whether other
+        // instances can reach this one, so each can arrive on the answer to
+        // another; each is asked once and carried on.
+        for (let round = 0; round < 3 && !res.success; round++) {
           if (res.needsLagConfirm && !body.confirmLag) {
             // Show the app's OWN words: it knows things the manager does not,
             // including that a master whose database recovered since its last
@@ -3335,6 +3336,9 @@
           } else if (res.needsLineageConfirm && !body.confirmLineage) {
             if (!confirm(`${res.error || 'Another designated backup received further than this copy.'}\n\nPromote this copy anyway?`)) return;
             body = { ...body, confirmLineage: true };
+          } else if (res.needsReachabilityConfirm && !body.confirmReachability) {
+            if (!confirm(`${res.error || 'The other instances cannot reach this machine.'}\n\nMake this machine the primary side anyway?`)) return;
+            body = { ...body, confirmReachability: true };
           } else {
             break;
           }

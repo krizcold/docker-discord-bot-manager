@@ -3162,7 +3162,7 @@
         : standingIn && standing.holdsWrites
           ? `<div class="env-tip" style="color:var(--warning);">STANDING IN for <b>${who}</b> and holding the fleet's writes: a partial takeover. This copy is the fleet database until the master returns for the failback or this node is promoted by hand; it is neither adopted nor re-seeded while it stands in.</div>`
         : standingIn
-          ? `<div class="env-tip" style="color:var(--warning);">STANDING IN for <b>${who}</b>${live.inRecovery === false ? ': taking the fleet\'s writes now (the copy has been promoted and the bot is restarting onto it)' : ' read-only: a partial takeover. Its primary is gone; writes are taken automatically once the hold expires, if this copy was provably in sync'}.</div>`
+          ? `<div class="env-tip" style="color:var(--warning);">STANDING IN for <b>${who}</b>${live.inRecovery === false ? ': taking the fleet\'s writes now (the copy has been promoted and the bot is restarting onto it)' : ' read-only: a partial takeover. Its primary is gone; ' + (standing.gate ? escapeHtml(standing.gate) : 'writes are taken automatically once the hold expires, if this copy was provably in sync')}.</div>`
         : live.inRecovery === false && unanswered
           ? `<div class="error-message">This copy has left recovery and its app is not answering (${escapeHtml(posture.error || 'no answer')}), so the manager cannot tell a stand-in from a promotion. Nothing is adopted or re-seeded until it answers; removing the replica keeps its volume.</div>`
         : live.inRecovery === false

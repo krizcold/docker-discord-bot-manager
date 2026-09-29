@@ -305,7 +305,7 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
       return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who}: taking the fleet's writes now (the copy has been promoted and the bot is restarting onto it)`, lagSeconds: null };
     }
     const dark = live.receiverStatus === 'streaming' ? '' : '; its primary is gone, so this copy is not streaming';
-    return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who} read-only (a partial takeover)${dark}; writes are taken automatically once the hold expires, if this copy was provably in sync`, lagSeconds: round(live.replayLagSeconds) };
+    return { ...base, standIn: standing, severity: 'warn', message: `Standing in for ${who} read-only (a partial takeover)${dark}; ${standing.gate ?? 'writes are taken automatically once the hold expires, if this copy was provably in sync'}`, lagSeconds: round(live.replayLagSeconds) };
   }
   // The returning master's own copy, re-seeded for the failback (B6 map F28):
   // its bot follows the stand-in as a co-worker, and this copy is the one the

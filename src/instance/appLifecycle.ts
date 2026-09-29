@@ -141,6 +141,8 @@ export interface StandInPosture {
   /** The stand-in's copy has been promoted and takes the fleet's writes; null when this side cannot tell. */
   holdsWrites: boolean | null;
   since: number | null;
+  /** Role 'stand-in' serving read-only: the app's write-step verdict in its words (the hold's countdown, or why writes were not taken); null otherwise. */
+  gate: string | null;
   /** Why an ended lane ended, in the app's words. */
   disarmReason: string | null;
   /** Role 'covered' only: this database is behind the stand-in's copy, or is a copy of it. */
@@ -162,7 +164,10 @@ export function postureFromFacts(facts: AppFacts): StandInPosture | null {
   const covers = !!own && typeof own.coveringNodeId === 'string' && own.coveringNodeId !== '';
   if (own && covers && own.live === true) {
     const promoted = own.phase === 'promoted';
-    return { role: 'stand-in', live: true, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: promoted, since: promoted ? own.promotedAt : own.armedAt, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
+    const text = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v : null);
+    // The bot's own Fleet tab reads the same two fields in this order.
+    const gate = promoted ? null : text(own.writeGate) ?? (text(own.writeRefusal) ? `taking writes was refused: ${own.writeRefusal}` : null);
+    return { role: 'stand-in', live: true, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: promoted, since: promoted ? own.promotedAt : own.armedAt, gate, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
   // A lane that ended AFTER taking the writes (a demote, a step-down) leaves a
   // promoted copy that may hold writes nothing else has; only the manual
@@ -172,7 +177,7 @@ export function postureFromFacts(facts: AppFacts): StandInPosture | null {
   // it holds, and a mid-boot master cannot be told from a demoted co-worker.
   const promotedByHand = own?.disarmReason === 'promoted by hand into the true master';
   if (own && covers && own.phase === 'disarmed' && own.promotedAt !== null && !promotedByHand && !(facts.role === 'master' && facts.initialized === true)) {
-    return { role: 'stand-in', live: false, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: true, since: own.promotedAt, disarmReason: own.disarmReason, holdReason: null, namesThisNode: null, followsDelivered: null };
+    return { role: 'stand-in', live: false, standInNodeId: facts.nodeId ?? null, coveringNodeId: own.coveringNodeId, holdsWrites: true, since: own.promotedAt, gate: null, disarmReason: own.disarmReason, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
   const hold = facts.followerHold;
   if (hold && (hold.reason === 'behind' || hold.reason === 'copy')) {
@@ -182,11 +187,11 @@ export function postureFromFacts(facts: AppFacts): StandInPosture | null {
     // peer fact below: the node it follows names THIS node, which on any
     // other machine would read as a peer.
     const named = typeof hold.standInNodeId === 'string' && hold.standInNodeId !== '' ? hold.standInNodeId : null;
-    return { role: 'covered', live: true, standInNodeId: named, coveringNodeId: facts.nodeId || null, holdsWrites: true, since: Number.isFinite(hold.since) ? hold.since : null, disarmReason: null, holdReason: hold.reason, namesThisNode: typeof hold.namesThisNode === 'boolean' ? hold.namesThisNode : null, followsDelivered: typeof hold.following === 'string' && hold.following !== '' };
+    return { role: 'covered', live: true, standInNodeId: named, coveringNodeId: facts.nodeId || null, holdsWrites: true, since: Number.isFinite(hold.since) ? hold.since : null, gate: null, disarmReason: null, holdReason: hold.reason, namesThisNode: typeof hold.namesThisNode === 'boolean' ? hold.namesThisNode : null, followsDelivered: typeof hold.following === 'string' && hold.following !== '' };
   }
   const served = facts.masterStandingInFor;
   if (typeof served === 'string' && served !== '') {
-    return { role: 'peer', live: true, standInNodeId: null, coveringNodeId: served, holdsWrites: null, since: null, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
+    return { role: 'peer', live: true, standInNodeId: null, coveringNodeId: served, holdsWrites: null, since: null, gate: null, disarmReason: null, holdReason: null, namesThisNode: null, followsDelivered: null };
   }
   return null;
 }

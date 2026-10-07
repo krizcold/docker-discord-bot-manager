@@ -289,8 +289,20 @@ export async function disableFleetReplication(
   if (streaming.stdout.trim() !== '') {
     return { success: false, error: `Standbys are still streaming on slot(s) ${streaming.stdout.trim()}; stop or remove them first (nothing was disabled)` };
   }
-  // Disabling replication leaves no standby to wait for, so an armed setting
-  // could only wedge this database's own next write (B6 map F18). Separate
+  // A live armed setting means the instance's bot is holding writes for a
+  // copy, and only that bot may release them, once it has recorded the relax
+  // on the witness (B7-F23's full partition); relaxing here would release
+  // them with nothing recorded.
+  const posture = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `SELECT current_setting('synchronous_standby_names');`);
+  if (!posture.ok) {
+    return { success: false, error: `could not read the synchronous posture (nothing was disabled): ${posture.stderr.trim()}` };
+  }
+  if (posture.stdout.trim() !== '') {
+    return { success: false, error: `This database still holds its writes for a synchronous standby (${posture.stdout.trim()}), and only the instance's bot may release them, once it has recorded that on the witness: it does so within seconds of the standby leaving, so wait for that, or start the bot if it is stopped, then disable again; if the fleet no longer runs on this database, re-seed it as a standby of the current master or remove it instead (nothing was disabled)` };
+  }
+  // With the live setting empty, this clears what an arm that never reached
+  // its reload may have left in auto.conf, which would wedge this database's
+  // next write (B6 map F18). Separate
   // calls, for the reason the enable above records: ALTER SYSTEM refuses to run
   // inside the implicit transaction a multi-statement psql -c wraps its input in.
   const relax = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');

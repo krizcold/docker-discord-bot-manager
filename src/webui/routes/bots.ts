@@ -2028,15 +2028,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
-  /** DELETE /:id/fleet-failback - dismiss a parked run without touching anything. */
-  router.delete('/:id/fleet-failback', (req: Request, res: Response) => {
+  /** DELETE /:id/fleet-failback - dismiss a parked run, lifting its own write fence and touching nothing else. */
+  router.delete('/:id/fleet-failback', async (req: Request, res: Response) => {
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = fleetFailback.dismissFailback(bot);
+      const result = await fleetFailback.dismissFailback(bot);
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
       res.json(result);
     } catch (error) {

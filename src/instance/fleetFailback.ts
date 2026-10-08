@@ -192,6 +192,54 @@ function lineageText(lineage: FleetLineageFact | null, who: string, subject: str
   return `Whether ${subject} holds writes ${who}'s database lacks could not be proven (${lineage.reason}): treat the wipe as destroying anything written here after the outage began.`;
 }
 
+function fenceText(fence: FleetFailbackRun['fence'], since: string): string {
+  if (!fence) return '';
+  return fence.ok
+    ? ` It is fenced read-only while this waits, so nothing lands on it after ${since}.`
+    : ` It could NOT be fenced read-only (${fence.error}), so a write landing on it before you answer is not in ${since}, and the wipe destroys it.`;
+}
+
+/** The database a run parks on for consent: the primary for a failback, the ended lane's copy for a drop-back. */
+function consentTarget(instance: InstanceConfig, run: FleetFailbackRun): fleetBackup.ConsentFenceTarget | null {
+  if (run.mode === 'failback') return instance.fleetDb ?? null;
+  const copy = instance.fleetDbReplica;
+  return copy && copy.user && copy.db ? { containerName: copy.containerName, user: copy.user, db: copy.db, volume: copy.volume } : null;
+}
+
+type RunFence = NonNullable<FleetFailbackRun['fence']>;
+
+/**
+ * Fence the database the run parks on. The run owns only a fence it set: it
+ * is recorded before it is set, so a crash between the two still lifts it,
+ * and never downgraded. A fence another lane set (a promote fences the old
+ * primary) is that lane's, and the run neither sets nor lifts it.
+ */
+async function fenceConsentPark(botId: string, instance: InstanceConfig, run: FleetFailbackRun): Promise<RunFence> {
+  const target = consentTarget(instance, run);
+  const owned = run.fence?.owned === true;
+  if (!target) return { ok: false, error: run.mode === 'failback' ? 'no database record' : 'the copy\'s record predates its app identity', at: Date.now(), owned };
+  if (!owned) {
+    const prior = await fleetBackup.writeFenced(target);
+    if (prior === null) return { ok: false, error: 'the database did not answer whether it is fenced', at: Date.now(), owned: false };
+    // One a previous run here left stuck is this run's to lift again.
+    if (prior) return { ok: true, error: null, at: Date.now(), owned: fleetBackup.failbackFenceLeft(botId, target.containerName) };
+    saveRun(botId, { fence: { ok: false, error: 'the fence was being set', at: Date.now(), owned: true } });
+  }
+  const fenced = await fleetBackup.fenceForConsent(target);
+  return { ok: fenced.ok, error: fenced.ok ? null : fenced.error, at: Date.now(), owned: true };
+}
+
+/** Lift the run's own fence while its database still stands; the note names a fence left behind. */
+async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Promise<string> {
+  if (run.fence?.owned !== true || destroyedBy(instance, run)) return '';
+  const target = consentTarget(instance, run);
+  if (!target) return '';
+  const lifted = await fleetBackup.liftConsentFence(instance.id, target, run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it');
+  return lifted === 'lifted' ? ''
+    : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY until its container restarts'
+    : '; its write fence could not be lifted, so the database stays READ-ONLY';
+}
+
 function dumpText(dump: FleetFailbackRun['dump']): string {
   if (!dump) return 'No dump was taken.';
   return dump.ok
@@ -203,9 +251,9 @@ function dumpText(dump: FleetFailbackRun['dump']): string {
 export function consentText(run: FleetFailbackRun): string {
   const who = shortId(run.standInNodeId);
   if (run.mode === 'drop-back') {
-    return `Re-seed this copy as a standby of ${who}'s database? ${lineageText(run.lineage, who, 'This copy')} Continue wipes this copy and rebuilds it from that database. Cancel leaves it as it is, out of recovery and holding whatever it holds, and closes the automatic drop-back for this episode (Drop back now on this modal re-arms it).`;
+    return `Re-seed this copy as a standby of ${who}'s database? ${lineageText(run.lineage, who, 'This copy')}${fenceText(run.fence, 'that verdict')} Continue wipes this copy and rebuilds it from that database. Cancel ${run.fence?.ok && run.fence.owned ? 'lifts the fence and ' : ''}leaves it as it is, out of recovery and holding whatever it holds, and closes the automatic drop-back for this episode (Drop back now on this modal re-arms it).`;
   }
-  return `Wipe this machine's database and re-seed it from ${who}'s copy? ${lineageText(run.lineage, who, 'This database')} ${dumpText(run.dump)} Continue deletes the database and rebuilds it as a standby of that copy; the failback then promotes it back once it has caught up. Cancel starts the instance again with the database untouched and closes the automatic failback for this stand-in episode (Fail back now on this modal re-arms it).`;
+  return `Wipe this machine's database and re-seed it from ${who}'s copy? ${lineageText(run.lineage, who, 'This database')} ${dumpText(run.dump)}${fenceText(run.fence, 'the dump')} Continue deletes the database and rebuilds it as a standby of that copy; the failback then promotes it back once it has caught up. Cancel ${run.fence?.ok && run.fence.owned ? 'lifts the fence and ' : ''}starts the instance again with the database untouched and closes the automatic failback for this stand-in episode (Fail back now on this modal re-arms it).`;
 }
 
 /** What a stopped instance's badge says while a failback run owns it. */
@@ -356,6 +404,12 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
       if (!bot) return;
       if (run.mode === 'drop-back') {
         if (run.phase === 'awaiting-block') {
+          // Fenced once the posture shows the lane ended and before the verdict
+          // is read (B7-O19), and only a verdict the bot judged after the fence
+          // is taken, so it covers every row the wipe destroys; Cancel and
+          // Dismiss lift it, the re-seed takes it away.
+          let fencedAt = run.fence?.ok === true ? run.fence.at : null;
+          let fenceTried = run.fence?.ok === true;
           const deadline = Date.now() + BLOCK_WAIT_MS;
           let blockSeenAt: number | null = null;
           for (;;) {
@@ -367,11 +421,23 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
               const posture = postureFromRead(got.bot, got.read);
               const standing = posture.read === 'ok' ? posture.posture : null;
               if (!standing || standing.role !== 'stand-in' || standing.live) {
+                const held = currentRun(botId);
+                if (held?.fence?.owned === true) {
+                  await liftRunFence(got.bot, held);
+                  saveRun(botId, { fence: null });
+                }
                 throw new Error('the bot no longer reports this copy as an ended stand-in lane; nothing has been changed');
+              }
+              if (!fenceTried) {
+                fenceTried = true;
+                const fence = await fenceConsentPark(botId, got.bot, currentRun(botId) ?? run);
+                saveRun(botId, { fence });
+                fencedAt = fence.ok ? fence.at : null;
               }
               if (f.copyBlockFollowed === true && f.copyBlock?.dsn) {
                 if (blockSeenAt === null) blockSeenAt = Date.now();
-                const lineage = f.ownCopyLineage ?? null;
+                const judged = f.ownCopyLineage ?? null;
+                const lineage = judged && (fencedAt === null || judged.checkedAt >= fencedAt) ? judged : null;
                 if (lineage || Date.now() - blockSeenAt >= LINEAGE_WAIT_MS) {
                   saveRun(botId, { phase: 'wipe-consent', parked: true, lineage, block: endpointOf(f.copyBlock.dsn) });
                   return;
@@ -483,6 +549,11 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           const up = await containerManager.startFleetDbSidecar(botId);
           const fresh = containerManager.getBot(botId);
           if (!fresh) return;
+          // Fenced before the dump (B7-O19): writes stop here, so the dump holds
+          // everything the wipe destroys and nothing lands while the run waits
+          // for the consent; Cancel and Dismiss lift it, the wipe takes it
+          // away with the files.
+          saveRun(botId, { fence: up.success ? await fenceConsentPark(botId, fresh, run) : { ok: false, error: up.error ?? 'the database did not start', at: Date.now(), owned: run.fence?.owned === true } });
           const dump = up.success ? await fleetBackup.runFleetDump(fresh, 'pre-failback-') : { success: false as const, error: up.error };
           if (!dump.success) console.warn(`[FleetFailback] ${fresh.displayName}: the pre-failback dump failed: ${dump.error}`);
           saveRun(botId, { phase: 'wipe-consent', parked: true, dump: { ok: dump.success, name: dump.success ? dump.file ?? null : null, error: dump.success ? null : (dump.error ?? 'unknown reason'), at: Date.now() } });
@@ -797,32 +868,35 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
   }
   // Claim the record first so a live awaiting-block runner stops at its next check.
   containerManager.updateInstanceFleetFailback(instance.id, { ...run, parked: true, lastError: 'cancelled by the operator', updatedAt: Date.now() });
+  // The fence goes before the start: the bot must not boot on a database it cannot write.
+  const fenceNote = await liftRunFence(instance, currentRun(instance.id) ?? run);
   if (run.stoppedByRun) {
     const fresh = containerManager.getBot(instance.id);
     if (fresh && fresh.status !== 'running') {
       const started = await containerManager.startBot(instance.id);
       if (!started.success) {
         declineRun(instance.id, run);
-        return { success: true, error: `The run is cancelled with nothing destroyed, but the instance could not be started again: ${started.error}` };
+        return { success: true, error: `The run is cancelled with nothing destroyed, but the instance could not be started again: ${started.error}${fenceNote}` };
       }
     }
   }
   declineRun(instance.id, run);
-  return { success: true };
+  return fenceNote ? { success: true, error: `The run is cancelled with nothing destroyed${fenceNote}` } : { success: true };
 }
 
-/** Dismiss a parked run without touching anything, remembering the decline; the by-hand routes reopen with it gone. */
-export function dismissFailback(instance: InstanceConfig): ActionResult {
+/** Dismiss a parked run, lifting its own fence but touching nothing else, and remember the decline; the by-hand routes reopen with it gone. */
+export async function dismissFailback(instance: InstanceConfig): Promise<ActionResult> {
   const run = instance.fleetFailback;
   if (!run) return { success: false, error: 'No failback run is recorded on this instance' };
   if (!run.parked) return { success: false, error: `The run is live (${failbackPhaseText(run)}); wait for it` };
   if (run.phase === 'wipe-consent' && !run.consentAt) return { success: false, error: 'This run is waiting for your answer: Continue consents to the wipe, Cancel restores the instance' };
+  const fenceNote = await liftRunFence(instance, run);
   declineRun(instance.id, run);
   const fresh = containerManager.getBot(instance.id);
   if (run.stoppedByRun && fresh && fresh.status !== 'running') {
-    return { success: true, error: 'The run is dismissed and stays closed for this stand-in episode. The instance stays stopped, as the run left it: the by-hand re-seed on this modal needs it stopped, and its card starts it again when you are done' };
+    return { success: true, error: `The run is dismissed and stays closed for this stand-in episode. The instance stays stopped, as the run left it: the by-hand re-seed on this modal needs it stopped, and its card starts it again when you are done${fenceNote}` };
   }
-  return { success: true };
+  return fenceNote ? { success: true, error: `The run is dismissed${fenceNote}` } : { success: true };
 }
 
 /** Boot: a run the previous manager process owned has no runner any more; a consent park is not an interruption. */

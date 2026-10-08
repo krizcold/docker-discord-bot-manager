@@ -1066,7 +1066,7 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
     try {
       await execAsync(
         `docker compose -p ${appName} -f "${composePath}" down --remove-orphans`,
-        { timeout: 60000 }
+        { timeout: dockerClient.DOCKER_STOP_CLI_MS }
       );
       console.log(`[ContainerManager] Compose down succeeded for ${appName}`);
     } catch (err) {

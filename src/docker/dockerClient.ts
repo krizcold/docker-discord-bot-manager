@@ -298,11 +298,16 @@ export async function verifyComposeProjectRunning(
   return { allRunning: false, problems: lastProblems };
 }
 
+// A stop waits out each container's own stop grace (its compose service's
+// stop_grace_period; a bot draining its writes declares one); this bound only
+// catches a hung CLI.
+export const DOCKER_STOP_CLI_MS = 180_000;
+
 /**
  * Stop a container
  */
-export async function stopContainer(containerId: string, timeout = 10): Promise<void> {
-  execDocker(['stop', '-t', String(timeout), containerId], { timeout: (timeout + 5) * 1000 });
+export async function stopContainer(containerId: string): Promise<void> {
+  await execDockerAsync(['stop', containerId], { timeout: DOCKER_STOP_CLI_MS });
 }
 
 /**
@@ -701,7 +706,7 @@ export async function composeDown(
   projectName: string
 ): Promise<void> {
   const args = ['compose', '-f', composePath, '-p', projectName, 'down'];
-  await execDockerAsync(args, { timeout: 60000 });
+  await execDockerAsync(args, { timeout: DOCKER_STOP_CLI_MS });
 }
 
 /**

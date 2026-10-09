@@ -324,4 +324,4 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 
 ## License
 
-GNU
+Licensed under the GNU General Public License v3.0 only (GPL-3.0-only). See the [LICENSE](LICENSE) file for the full text.

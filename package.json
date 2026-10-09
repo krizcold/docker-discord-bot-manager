@@ -2,6 +2,7 @@
   "name": "discord-bot-manager",
   "version": "1.0.0",
   "description": "Multi-bot manager with Docker-in-Docker support",
+  "license": "GPL-3.0-only",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

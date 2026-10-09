@@ -14,7 +14,28 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Documentation/process/VERIFY.md: no image is published unless the source
+  # type-checks. The manager's test suite joins this job when it exists.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
   build-and-push:
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: read

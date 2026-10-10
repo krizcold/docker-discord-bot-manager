@@ -155,13 +155,11 @@ export interface ControlPlaneSpec {
   };
   /**
    * The node's consent to standing in as an active backup (PLAN_REPLICATION
-   * 20.5): the key, the value that means consent and, where consent is the
-   * default, the one value that declines it (then any other value, or none,
-   * consents). Declared so the manager can locate and read the row without
-   * matching a spelling; the enable itself is the app's own, on its master's
-   * fleet config.
+   * 20.5): the key and the one value that means consent. Declared so the
+   * manager can locate and read the row without matching a spelling; the
+   * enable itself is the app's own, on its master's fleet config.
    */
-  modeEnv?: { key: string; active: string; declines?: string };
+  modeEnv?: { key: string; active: string };
   /** Key holding the ordered list of peer control URLs this node dials. */
   dialEnv: string;
   /** Key whose shared value marks a set of peers as one deployment. */
@@ -209,7 +207,7 @@ const smdbRoleEnv = {
   dialsOut: ['co-worker', 'backup-master'],
   dialTargetOrder: ['master', 'backup-master'],
 };
-const smdbModeEnv = { key: 'FLEET_BACKUP_MODE', active: 'active', declines: 'passive' };
+const smdbModeEnv = { key: 'FLEET_BACKUP_MODE', active: 'active' };
 const smdbDialEnv = 'MASTER_URLS';
 const smdbGroupSecretEnv = 'CONTROL_SECRET';
 
@@ -237,9 +235,9 @@ function smdbWizardFields(): WizardEnvVar[] {
       ...base,
       key: smdbModeEnv.key,
       displayLabel: 'Backup Mode',
-      description: 'Active (the default): every write in the fleet waits for this copy, so a save is reported only once this backup holds it and none is lost if the master\'s machine dies; and this backup may STAND IN temporarily while the master is gone, taking the fleet\'s writes on its copy and handing them back when the master returns. The master can still set it passive on its Fleet tab. It is not free: losing this copy costs about a second or two of stalled writes before replication drops back to asynchronous. Passive: this backup only keeps a live copy, which can miss the last moments of saves; taking over is a manual Promote.',
-      defaultValue: smdbModeEnv.active,
-      options: [{ value: smdbModeEnv.active, label: 'Active (temporary stand-in)' }, { value: smdbModeEnv.declines, label: 'Passive' }],
+      description: 'Passive: this backup only keeps a live copy; taking over is a manual Promote. Active: this backup may STAND IN temporarily while the master is gone, taking the fleet\'s writes on its copy and handing them back when the master returns; the master must also enable it on its Fleet tab. It is not free: while it is on, every write in the fleet waits for this copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.',
+      defaultValue: 'passive',
+      options: [{ value: 'passive', label: 'Passive' }, { value: smdbModeEnv.active, label: 'Active (temporary stand-in)' }],
       showWhen: { key: smdbRoleEnv.key, equals: 'backup-master' },
     },
     {
@@ -329,8 +327,7 @@ export function backupModeConsent(record: AppCapabilityManifest | null | undefin
     ? (Array.isArray(gate.equals) ? gate.equals.includes(valueOf(gate.key)) : gate.equals === valueOf(gate.key))
     : cp.roleEnv.dialsOut.includes(valueOf(cp.roleEnv.key));
   if (!applies) return null;
-  const value = (envVars?.[cp.modeEnv.key] ?? '').trim().toLowerCase();
-  return cp.modeEnv.declines !== undefined ? value !== cp.modeEnv.declines.toLowerCase() : value === cp.modeEnv.active.toLowerCase();
+  return (envVars?.[cp.modeEnv.key] ?? '').trim().toLowerCase() === cp.modeEnv.active.toLowerCase();
 }
 
 const superModularDiscordBot: AppCapabilityManifest = {

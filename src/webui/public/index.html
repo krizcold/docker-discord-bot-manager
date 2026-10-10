@@ -3272,7 +3272,7 @@
       // master's half is enabled on that bot's Fleet tab.
       const consent = (bots.find(b => b.id === botId) || {}).fleetBackupConsent;
       const consentHtml = consent === true
-        ? '<div class="env-tip">Backup mode is active for this instance (the default; Passive in its env declines it, and the bot picks a change up when its container is next recreated, Apply or Restart): the master waits for this copy on every write and enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.</div>'
+        ? '<div class="env-tip">Backup mode is set to active in this instance\'s env (the bot picks a change up when its container is next recreated, Apply or Restart); the master enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.</div>'
         : consent === false
           ? '<div class="env-tip">Backup mode: passive (this node only keeps the copy; taking over is a manual Promote). To let it stand in temporarily, set Backup Mode to active in this instance\'s env, restart it, then enable it on the master\'s Fleet tab.</div>'
           : '';

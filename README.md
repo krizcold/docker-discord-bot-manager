@@ -210,7 +210,7 @@ A bot never authenticates its own web UI. Authentication lives at the deployment
 
 On Yundera the bot is its own CasaOS app, published at `https://<name>-<APP_DOMAIN>`. Its web UI is guarded by Yundera's [AppShield](https://github.com/Yundera/AppShield) gateway (image `ghcr.io/yundera/appshield`) in credentials mode: the gateway serves its own login form (user `admin`, password `$APP_DEFAULT_PASSWORD` - the platform default app password) and keeps you signed in with a session cookie that persists across restarts. Nothing else to configure. AppShield does not terminate TLS - Yundera fronts it with HTTPS.
 
-The bot's Discord-OAuth member routes (`/guild`, `/auth`) are **public** paths that bypass the admin gateway (AppShield's `ALLOWED_PATHS = /guild,/auth`). That is the separate member-facing Discord login for the bot's own users, not the admin gate.
+The bot's Discord-OAuth member page (`/guild`, its login routes `/auth`, and its own files under `/assets/`) is **public**: those paths bypass the admin gateway (AppShield's `ALLOWED_PATHS = /guild,/auth,/assets`). The bot refuses a raw path holding an encoded slash, backslash, "?", "#", unreserved or control character, a literal backslash or "#", a doubled slash or a dot segment, and its admin catch-all serves the admin page only at a plain path. That is the separate member-facing Discord login for the bot's own users, not the admin gate.
 
 Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway expose both in the **Env** editor; credential edits apply on the bot's next start (no rebuild needed).
 

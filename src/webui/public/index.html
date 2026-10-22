@@ -2328,9 +2328,19 @@
       return storedKeys.filter(k => !rows.some(r => r.key === k && r.originalKey === k));
     }
 
+    // A number input holding text the browser cannot parse reads as ''.
+    function isBadNumber(el) { return !!(el && el.validity && el.validity.badInput); }
+    function refuseBadNumbers(fields) {
+      const bad = fields.filter(([id]) => isBadNumber(document.getElementById(id))).map(([, label]) => label);
+      if (!bad.length) return false;
+      showMessage('error', `Not a number: ${bad.join(', ')}. Fix it, then try again. Nothing was sent.`);
+      return true;
+    }
+
     async function saveEnvEditor() {
       const rows = document.querySelectorAll('#env-editor-rows .env-row');
       const vars = {};
+      const badNumbers = [];
       const rowKeys = [];
       const rowOrigins = [];
       const renamed = {};
@@ -2342,6 +2352,7 @@
         rowOrigins.push({ key, originalKey });
         const valueInput = row.querySelector('.env-value');
         if (!key || !valueInput) return;
+        if (valueInput.validity && valueInput.validity.badInput) { badNumbers.push(key); return; }
         const value = valueInput.value;
         // A blank secret field means "keep the stored value" (it was masked on load).
         // Omit it so the server-side merge preserves the secret; sending the blank
@@ -2356,6 +2367,10 @@
       const dupes = rowKeys.filter((k, i) => rowKeys.indexOf(k) !== i);
       if (dupes.length > 0) {
         showMessage('error', `Two rows hold the same key (${[...new Set(dupes)].join(', ')}); give each row its own key, then save. Nothing was saved.`);
+        return;
+      }
+      if (badNumbers.length > 0) {
+        showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then save. Nothing was saved.`);
         return;
       }
 
@@ -2406,6 +2421,7 @@
 
     // ─── Fleet DB Backups ───
     let fleetBackupBotId = null;
+    let fleetBackupStoredKeep = 7;
 
     function formatBackupSize(bytes) {
       if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
@@ -2441,6 +2457,7 @@
       }
 
       const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+      fleetBackupStoredKeep = fb.keep;
       content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
       let listHtml = '';
@@ -2746,6 +2763,7 @@
       const host = (document.getElementById('fleet-repl-host')?.value || '').trim();
       const portRaw = (document.getElementById('fleet-repl-port')?.value || '').trim();
       const keepRaw = (document.getElementById('fleet-repl-keep')?.value || '').trim();
+      if (refuseBadNumbers([['fleet-repl-port', 'port'], ['fleet-repl-keep', 'WAL bound']])) return;
       if (!host) { showMessage('error', 'Enter the public host or IP other machines will dial'); return; }
       const payload = { enabled: true, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
@@ -2983,6 +3001,7 @@
     async function armRecoveryReceiver(botId) {
       const host = (document.getElementById('rc-recv-host')?.value || '').trim();
       const portRaw = (document.getElementById('rc-recv-port')?.value || '').trim();
+      if (refuseBadNumbers([['rc-recv-port', 'port']])) return;
       if (!host) { showMessage('error', 'Enter the public host or IP the sender will dial'); return; }
       if (!confirm('Arm the recovery channel RECEIVER?\n\nThis consents to the database on THIS machine being replaced by whatever the sender machine sends. Only continue if the other machine holds the good copy.')) return;
       const payload = { mode: 'receiver', publicHost: host };
@@ -3001,6 +3020,7 @@
     async function armRecoverySource(botId) {
       const host = (document.getElementById('rc-src-host')?.value || '').trim();
       const portRaw = (document.getElementById('rc-src-port')?.value || '').trim();
+      if (refuseBadNumbers([['rc-src-port', 'port']])) return;
       let cert = (document.getElementById('rc-src-cert')?.value || '').trim();
       let token = (document.getElementById('rc-src-token')?.value || '').trim();
       let hostVal = host, portVal = portRaw !== '' ? Number(portRaw) : undefined;
@@ -3358,6 +3378,7 @@
       if (seedFirst) {
         const host = (document.getElementById('replica-host')?.value || '').trim();
         const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+        if (refuseBadNumbers([['replica-port', 'port']])) return;
         // A run being continued knows the endpoint it served; only a fresh one
         // has nobody to ask but the operator.
         if (!host && !resuming) { showMessage('error', 'This machine\'s public host is required: the transfer seeds a standby first, and the fleet dials the copy there after the promote'); return; }
@@ -3428,6 +3449,7 @@
     async function provisionFleetReplicaFromFacts(botId) {
       const host = (document.getElementById('replica-host')?.value || '').trim();
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+      if (refuseBadNumbers([['replica-port', 'port']])) return;
       if (!host) { showMessage('error', 'This machine\'s public host is required'); return; }
       const payload = { publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
@@ -3451,6 +3473,7 @@
       const cert = (document.getElementById('replica-cert')?.value || '').trim();
       const host = (document.getElementById('replica-host')?.value || '').trim();
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
+      if (refuseBadNumbers([['replica-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
@@ -3573,6 +3596,7 @@
       const cert = (document.getElementById('reseed-cert')?.value || '').trim();
       const host = (document.getElementById('reseed-host')?.value || '').trim();
       const portRaw = (document.getElementById('reseed-port')?.value || '').trim();
+      if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
@@ -3696,10 +3720,21 @@
     async function saveFleetBackupConfig() {
       const enabled = document.getElementById('fleet-backup-enabled').checked;
       const hour = Number(document.getElementById('fleet-backup-hour').value);
-      const keep = Number(document.getElementById('fleet-backup-keep').value) || 7;
+      const keepEl = document.getElementById('fleet-backup-keep');
+      const keepRaw = (keepEl.value || '').trim();
+      const keep = Number(keepRaw);
+      if (isBadNumber(keepEl) || keepRaw === '' || !Number.isInteger(keep) || keep < 1 || keep > 365) {
+        showMessage('error', 'Keep must be a whole number from 1 to 365. Nothing was saved.');
+        return;
+      }
+      if (keep < fleetBackupStoredKeep && !confirm(`Keep only ${keep} backups?\n\nThe next backup deletes the older dumps beyond the newest ${keep} (now ${fleetBackupStoredKeep} are kept).`)) {
+        keepEl.value = String(fleetBackupStoredKeep);
+        return;
+      }
       try {
         const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, { enabled, hour, keep });
         if (!res.success) showMessage('error', res.error || 'Failed to save backup settings');
+        else if (res.fleetBackup && typeof res.fleetBackup.keep === 'number') fleetBackupStoredKeep = res.fleetBackup.keep;
         loadBots();
       } catch (err) {
         showMessage('error', 'Failed to save backup settings');
@@ -5176,16 +5211,22 @@
       // Collect env vars (skip auto-wired rows; those are injected by the compose generator)
       const rows = document.querySelectorAll('#install-env-rows .env-row');
       const vars = {};
+      const badNumbers = [];
       rows.forEach(row => {
         if (row.classList.contains('env-autowired')) return;
         const key = row.querySelector('.env-key').value.trim();
         const valueInput = row.querySelector('.env-value');
         if (!key || !valueInput) return;
+        if (valueInput.validity && valueInput.validity.badInput) { badNumbers.push(key); return; }
         const value = valueInput.value.trim();
         // Omit a blank secret (masked on load) so it is never stored as empty.
         if (valueInput.dataset.sensitive === 'true' && value === '') return;
         vars[key] = value;
       });
+      if (badNumbers.length > 0) {
+        showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then create. Nothing was created.`);
+        return;
+      }
 
       // Flush any pending guided-form edits into the raw bodies before collecting.
       if (!(await guidedReadyToSave('#install-config-files'))) return;

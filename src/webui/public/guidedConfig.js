@@ -213,7 +213,7 @@
 
   function coerce(type, el) {
     if (type === 'boolean') return el.checked;
-    if (type === 'number') { const v = el.value.trim(); if (v === '') return null; const n = Number(v); return isNaN(n) ? null : n; }
+    if (type === 'number') { if (el.validity && el.validity.badInput) return null; const v = el.value.trim(); if (v === '') return null; const n = Number(v); return isNaN(n) ? null : n; }
     return el.value;
   }
 

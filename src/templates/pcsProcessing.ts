@@ -7,6 +7,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
@@ -1678,26 +1679,121 @@ function dockerEnsureDir(dir: string): void {
   try { fs.chmodSync(dir, 0o777); } catch { /* windows / best effort */ }
 }
 
-function dockerDeliverFile(repoSrc: string, target: string): void {
-  if (fs.existsSync(target)) {
-    const st = fs.statSync(target);
-    if (st.isFile() && st.size > 0) return;   // seed: keep an already-delivered/mutated file
-    fs.rmSync(target, { recursive: true, force: true });
+/**
+ * Seed one repo file at its bind target. Anything already at the target is the
+ * operator's or the app's (an emptied config included) and is kept; the only
+ * thing replaced is an EMPTY directory, which is what Docker creates at a
+ * missing file bind source. The file lands whole or not at all: it is written
+ * to a temp name beside the target, synced, then linked into place, and link(2)
+ * refuses a name that appeared meanwhile. Returns null when delivered, else
+ * the kind of entry that was kept.
+ */
+function seedRepoFile(
+  repoSrc: string,
+  target: string,
+  ensureParent: (dir: string) => void,
+  grant: (fd: number) => void,
+): string | null {
+  const dir = path.dirname(target);
+  const base = path.basename(target);
+  const tmpPrefix = `.${base}.smdb-seed.`;
+  removeStaleSeedTemps(dir, tmpPrefix);
+
+  let st: fs.Stats | null = null;
+  try {
+    st = fs.lstatSync(target);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`could not inspect ${target}, delivered nothing: ${e}`);
   }
-  dockerEnsureDir(path.dirname(target));
-  fs.writeFileSync(target, fs.readFileSync(repoSrc));
-  try { fs.chmodSync(target, 0o644); } catch { /* best effort */ }
+  if (st) {
+    if (st.isSymbolicLink() && !fs.existsSync(target)) {
+      throw new Error(`${target} is a symlink to a missing target; refused to seed through it, left it untouched`);
+    }
+    if (!st.isDirectory()) return entryKind(st);
+    if (fs.readdirSync(target).length) throw new Error(`${target} is a directory that is not empty where the repo ships a file; left it untouched`);
+    fs.rmdirSync(target);
+  }
+  ensureParent(dir);
+  const bytes = fs.readFileSync(repoSrc);
+  const tmpPath = path.join(dir, `${tmpPrefix}${process.pid}.${randomBytes(4).toString('hex')}`);
+  const fd = fs.openSync(tmpPath, 'wx', 0o644);
+  let open = true;
+  try {
+    let off = 0;
+    while (off < bytes.length) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+    try { fs.fchmodSync(fd, 0o644); } catch { /* windows / best effort */ }
+    grant(fd);
+    fs.fsyncSync(fd);
+    open = false;
+    fs.closeSync(fd);
+  } catch (e) {
+    if (open) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+    try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+    throw e;
+  }
+  try {
+    fs.linkSync(tmpPath, target);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+      try { return entryKind(fs.lstatSync(target)); } catch { return 'entry'; }
+    }
+    throw e;
+  }
+  try { fs.unlinkSync(tmpPath); } catch { /* the file is in place; a stray temp file is harmless */ }
+  return null;
 }
 
-function dockerDeliverDir(repoSrc: string, target: string): void {
+// Temp files a killed earlier seed of this exact target left behind.
+function removeStaleSeedTemps(dir: string, tmpPrefix: string): void {
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(tmpPrefix) || !/^\d+\.[0-9a-f]{8}$/.test(name.slice(tmpPrefix.length))) continue;
+    const p = path.join(dir, name);
+    try { if (fs.lstatSync(p).isFile()) fs.unlinkSync(p); } catch { /* best effort */ }
+  }
+}
+
+function entryKind(st: fs.Stats): string {
+  if (st.isFile()) return 'file';
+  if (st.isSymbolicLink()) return 'symlink';
+  if (st.isFIFO()) return 'fifo';
+  if (st.isSocket()) return 'socket';
+  if (st.isBlockDevice() || st.isCharacterDevice()) return 'device';
+  return 'entry';
+}
+
+type SeedCounts = { delivered: number; kept: number };
+
+function seedSummary(target: string, c: SeedCounts): string {
+  if (c.delivered === 0 && c.kept === 0) return `Created empty directory ${target}`;
+  if (c.delivered === 0) return `Kept existing directory ${target} (all ${c.kept} files already present)`;
+  return `Delivered directory ${target} (${c.delivered} files delivered, ${c.kept} existing kept)`;
+}
+
+function dockerDeliverFile(repoSrc: string, target: string): string | null {
+  return seedRepoFile(repoSrc, target, dockerEnsureDir, () => {});
+}
+
+function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) => void): SeedCounts {
+  const counts: SeedCounts = { delivered: 0, kept: 0 };
   dockerEnsureDir(target);
   for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
     if (SKIP_DELIVER.has(entry.name)) continue;
     const cs = path.join(repoSrc, entry.name);
     const ct = path.join(target, entry.name);
-    if (entry.isDirectory()) dockerDeliverDir(cs, ct);
-    else if (entry.isFile()) dockerDeliverFile(cs, ct);
+    if (entry.isDirectory()) {
+      const sub = dockerDeliverDir(cs, ct, log);
+      counts.delivered += sub.delivered;
+      counts.kept += sub.kept;
+    } else if (entry.isFile()) {
+      const kept = dockerDeliverFile(cs, ct);
+      if (kept) { counts.kept++; log(`[Docker] Kept existing ${kept} ${ct}`); }
+      else counts.delivered++;
+    }
   }
+  return counts;
 }
 
 function writeDockerConfig(target: string, body: string): void {
@@ -1793,8 +1889,11 @@ export function prepareDockerBotFiles(
           if (fs.existsSync(cand)) repoSrc = cand;
           else repoSrc = findConfigTemplate(cand);
         }
-        if (repoSrc && fs.statSync(repoSrc).isFile()) { dockerDeliverFile(repoSrc, target); log(`[Docker] Delivered file ${target}`); }
-        else if (repoSrc && fs.statSync(repoSrc).isDirectory()) { dockerDeliverDir(repoSrc, target); log(`[Docker] Delivered dir ${target}`); }
+        if (repoSrc && fs.statSync(repoSrc).isFile()) {
+          const kept = dockerDeliverFile(repoSrc, target);
+          log(kept ? `[Docker] Kept existing ${kept} ${target}` : `[Docker] Delivered file ${target}`);
+        }
+        else if (repoSrc && fs.statSync(repoSrc).isDirectory()) log(`[Docker] ${seedSummary(target, dockerDeliverDir(repoSrc, target, log))}`);
         else dockerEnsureDir(target);
       } catch (err) {
         log(`[Docker] Warning: could not prepare ${target}: ${err}`);
@@ -2013,26 +2112,18 @@ const SKIP_DELIVER = new Set(['node_modules', '.git']);
  * Copy a repo file to its AppData bind target (parent dir created first), so a
  * compose that bind-mounts a config file from the repo (e.g. application.yml)
  * actually delivers it instead of Docker auto-creating an empty directory.
- * Seed semantics: an already-present target is left untouched, so a redeploy
- * never reverts a file the running app has since modified.
+ * Seed semantics (seedRepoFile): an already-present target is left untouched, so
+ * a redeploy never reverts a file the running app or the operator has changed.
  */
-async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
-  if (fs.existsSync(target)) {
-    const st = fs.statSync(target);
-    if (st.isFile() && st.size > 0) return;   // seed: keep an already-delivered/mutated (non-empty) file
-    // Re-deliver over an EMPTY file (e.g. a config blanked by accident) or a
-    // wrong-type target (an empty dir Docker created where a file belongs).
-    try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ }
-  }
-  ensureVolumeDir(path.dirname(target), '755', true, log);
-  fs.writeFileSync(target, fs.readFileSync(repoSrc));
-  grantToApp(target, { mode: '644', log });
+async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<string | null> {
+  return seedRepoFile(repoSrc, target, (dir) => ensureVolumeDir(dir, '755', true, log), (fd) => grantFd(fd, log));
 }
 
 /**
  * Recursively copy a repo directory to its AppData bind target.
  */
-async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<void> {
+async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<SeedCounts> {
+  const counts: SeedCounts = { delivered: 0, kept: 0 };
   // A repo-provided bind dir is app-managed and a foreign-uid container may need
   // to write into it (e.g. Lavalink downloading plugin jars), so make it writable.
   ensureVolumeDir(target, '777', false, log);
@@ -2041,11 +2132,16 @@ async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string
     const childRepo = path.join(repoSrc, entry.name);
     const childTarget = `${target}/${entry.name}`;
     if (entry.isDirectory()) {
-      await deliverRepoDir(childRepo, childTarget, log);
+      const sub = await deliverRepoDir(childRepo, childTarget, log);
+      counts.delivered += sub.delivered;
+      counts.kept += sub.kept;
     } else if (entry.isFile()) {
-      await deliverRepoFile(childRepo, childTarget, log);
+      const kept = await deliverRepoFile(childRepo, childTarget, log);
+      if (kept) { counts.kept++; log(`[PCS] Kept existing ${kept} ${childTarget}`); }
+      else counts.delivered++;
     }
   }
+  return counts;
 }
 
 /**
@@ -2109,11 +2205,10 @@ export async function createVolumeDirectories(
       }
 
       if (repoSrc && fs.statSync(repoSrc).isFile()) {
-        await deliverRepoFile(repoSrc, target, log);
-        log(`[PCS] Delivered file to volume path: ${target}`);
+        const kept = await deliverRepoFile(repoSrc, target, log);
+        log(kept ? `[PCS] Kept existing ${kept} at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
       } else if (repoSrc && fs.statSync(repoSrc).isDirectory()) {
-        await deliverRepoDir(repoSrc, target, log);
-        log(`[PCS] Delivered directory to volume path: ${target}`);
+        log(`[PCS] ${seedSummary(target, await deliverRepoDir(repoSrc, target, log))}`);
       } else {
         ensureVolumeDir(target, '755', true, log);
         log(`[PCS] Created volume directory: ${target}`);

@@ -43,9 +43,20 @@ const lastErrors: Map<string, string> = new Map();
 // A stuck restore write fence, tracked apart from lastErrors: a read-only
 // database still DUMPS successfully, so the nightly dump's success would wipe
 // a warning parked in the shared slot while the fence still stands.
-const fenceStuck: Map<string, string> = new Map();
-// The database a stuck fence sits on when it is not the instance's primary (a drop-back's copy).
-const fenceStuckOn: Map<string, RestoreFleetDb> = new Map();
+// One warning per database (the primary and a drop-back's copy are fenced apart), keyed by container name.
+const fenceStuck: Map<string, Map<string, { text: string; db: RestoreFleetDb }>> = new Map();
+function setStuck(botId: string, db: RestoreFleetDb, text: string): void {
+  const entries = fenceStuck.get(botId) ?? new Map();
+  entries.set(db.containerName, { text, db });
+  fenceStuck.set(botId, entries);
+}
+function clearStuck(botId: string, containerName: string): void {
+  const entries = fenceStuck.get(botId);
+  if (!entries) return;
+  entries.delete(containerName);
+  if (entries.size === 0) fenceStuck.delete(botId);
+}
+const isStuck = (botId: string, containerName: string) => fenceStuck.get(botId)?.has(containerName) === true;
 // The databases whose fence a failback or drop-back run left on: the next run there owns it and retries the lift.
 // Persisted on the instance (fleetConsentFenceLeft) so a manager restart keeps it. This process's word overrides
 // the disk while a save is refused: one it recorded is held here, one it cleared waits here for its clear to land.
@@ -72,7 +83,8 @@ function recordFailbackFence(botId: string, containerName: string, left: boolean
 const busy: Set<string> = new Set();
 
 export function getFleetBackupError(botId: string): string | null {
-  return fenceStuck.get(botId) || lastErrors.get(botId) || null;
+  const stuck = Array.from(fenceStuck.get(botId)?.values() ?? [], e => e.text).join('; ');
+  return stuck || lastErrors.get(botId) || null;
 }
 
 /**
@@ -248,23 +260,16 @@ async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a re
   const failback = lane === 'a failback';
   const result = await liftRestoreFence(fleetDb);
   if (result === 'lifted') {
-    // The warning names one database; a lift on another leaves it.
-    const tracked = fenceStuckOn.get(botId)?.containerName ?? containerManager.getBot(botId)?.fleetDb?.containerName;
-    if (tracked === fleetDb.containerName) {
-      fenceStuck.delete(botId);
-      fenceStuckOn.delete(botId);
-    }
+    clearStuck(botId, fleetDb.containerName);
     recordFailbackFence(botId, fleetDb.containerName, false);
     return result;
   }
   // A run stopped mid-lift is covered by its own run record (fence.owned), so this is saved only once the lift did not land.
   const unsaved = !recordFailbackFence(botId, fleetDb.containerName, failback) && failback;
   const unsavedNote = unsaved ? '; this manager could not save that the failback owns this fence, so after a manager restart the next run there leaves it on' : '';
-  fenceStuck.set(botId, (result === 'stripped'
+  setStuck(botId, fleetDb, (result === 'stripped'
     ? `The database is READ-ONLY (${lane} write fence could not be lifted live); restart the instance to clear it`
     : `The database is READ-ONLY (${lane} write fence could not be lifted or stripped); ${failedRemedy}`) + unsavedNote);
-  if (containerManager.getBot(botId)?.fleetDb?.containerName === fleetDb.containerName) fenceStuckOn.delete(botId);
-  else fenceStuckOn.set(botId, fleetDb);
   return result;
 }
 
@@ -308,6 +313,14 @@ export function failbackFenceLeft(botId: string, containerName: string): boolean
   return (containerManager.getBot(botId)?.fleetConsentFenceLeft ?? []).includes(containerName);
 }
 
+/**
+ * Another lane set its write fence on this database. The fence is one setting, so a failback's stuck one under it
+ * is now that lane's to lift: the record goes, and a refused save is held here until its clear lands.
+ */
+export function foreignFenceSet(botId: string, containerName: string): void {
+  if (failbackFenceLeft(botId, containerName)) recordFailbackFence(botId, containerName, false);
+}
+
 /** Whether the database holds the write fence now; null when it cannot be asked. */
 export async function writeFenced(target: ConsentFenceTarget): Promise<boolean | null> {
   const probe = await execDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
@@ -323,25 +336,24 @@ async function seedStuckFences(): Promise<void> {
   for (const instance of containerManager.getAllBots()) {
     // A failback record whose database is gone or reads unfenced is stale, and must not claim a later lane's fence.
     for (const containerName of instance.fleetConsentFenceLeft ?? []) await checkFailbackRecord(instance.id, containerName);
-    // A parked failback's fence is the run's own, named by its consent.
-    if (fenceStuck.has(instance.id) || instance.fleetFailback?.fence?.ok === true) continue;
+    // A parked failback's fence is the run's own, named by its consent; it sits on the run's database only.
+    const parked = instance.fleetFailback?.fence?.ok === true ? instance.fleetFailback.mode : null;
     // A copy carries no fence of its own (its seed strips the setting), so one
     // reading 'on' is a drop-back's that was never lifted.
     const copy = instance.fleetDbReplica;
-    if (copy?.user && await isContainerRunning(copy.containerName)) {
+    if (parked !== 'drop-back' && copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
       const onCopy = await execDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
       if (onCopy.ok && onCopy.stdout.trim() === 'on') {
-        fenceStuck.set(instance.id, 'The copy is READ-ONLY: a write fence (a drop-back\'s, a promote\'s or a swap\'s) is on; re-seeding this copy on its Database modal clears it');
-        fenceStuckOn.set(instance.id, { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume });
-        continue;
+        setStuck(instance.id, { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume },
+          'The copy is READ-ONLY: a write fence (a drop-back\'s, a promote\'s or a swap\'s) is on; re-seeding this copy on its Database modal clears it');
       }
     }
     const db = instance.fleetDb;
-    if (!db) continue;
+    if (parked === 'failback' || !db || isStuck(instance.id, db.containerName)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
     const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
     if (probe.ok && probe.stdout.trim() === 'on') {
-      fenceStuck.set(instance.id, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it, or run a restore again to retry the lift');
+      setStuck(instance.id, db, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it, or run a restore again to retry the lift');
     }
   }
 }
@@ -376,13 +388,16 @@ async function reprobeStuckFences(): Promise<void> {
     const [botId, containerName] = JSON.parse(key) as [string, string];
     await checkFailbackRecord(botId, containerName);
   }
-  for (const id of Array.from(fenceStuck.keys())) {
+  for (const [id, entries] of Array.from(fenceStuck.entries())) {
     const instance = containerManager.getBot(id);
-    const db = instance ? fenceStuckOn.get(id) ?? instance.fleetDb : undefined;
-    if (!db) { fenceStuck.delete(id); fenceStuckOn.delete(id); continue; }
-    if (!await isContainerRunning(db.containerName)) continue;
-    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-    if (probe.ok && probe.stdout.trim() === 'off') { fenceStuck.delete(id); fenceStuckOn.delete(id); recordFailbackFence(id, db.containerName, false); }
+    if (!instance) { fenceStuck.delete(id); continue; }
+    for (const { db } of Array.from(entries.values())) {
+      // A database the instance no longer records is gone, and its warning with it.
+      if (instance.fleetDb?.containerName !== db.containerName && instance.fleetDbReplica?.containerName !== db.containerName) { clearStuck(id, db.containerName); continue; }
+      if (!await isContainerRunning(db.containerName)) continue;
+      const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
+      if (probe.ok && probe.stdout.trim() === 'off') { clearStuck(id, db.containerName); recordFailbackFence(id, db.containerName, false); }
+    }
   }
 }
 
@@ -682,6 +697,7 @@ export async function restoreFleetBackup(
     // a throw mid-fence still reaches the finally lift.
     fenced = true;
     const fence = await applyWriteFence(fleetDb);
+    foreignFenceSet(botId, fleetDb.containerName);
     if (!fence.ok) {
       // A half-applied fence must not survive the refusal. Only a LIVE lift
       // clears it; 'stripped' cleans the persisted copy alone, so the finally

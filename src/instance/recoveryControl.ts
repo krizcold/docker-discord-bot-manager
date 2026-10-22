@@ -22,6 +22,7 @@ import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
+import { foreignFenceSet } from './fleetBackup';
 import { InstanceConfig } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
@@ -306,6 +307,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         '-c', 'SELECT pg_reload_conf()',
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
       if (!fence.ok) { send(500, { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}` }); return; }
+      foreignFenceSet(instance.id, fleetDb.containerName);
       const lsn = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_current_wal_lsn()']);
       const sourceLsn = lsn.ok ? lsn.stdout.trim() : '';
       if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(sourceLsn)) {

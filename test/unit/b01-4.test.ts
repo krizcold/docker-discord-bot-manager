@@ -42,9 +42,10 @@ const envRow = (key: string, val: any) => ({
 describe('number env rows the browser cannot parse are refused', () => {
   it('the env editor saves nothing and names the row', async () => {
     const sent: any[] = []; const messages: string[][] = [];
-    const ctx = runPage([...helpers, 'envEditorRemovedKeys', 'saveEnvEditor'], common(sent, messages, {
+    const ctx = runPage([...helpers, 'envEditorRemovedKeys', 'saveEnvEditor'], { ...common(sent, messages, {
+      'env-editor-rows': {},
       '#env-editor-rows .env-row': [envRow('PORT', numInput('', true)), envRow('NAME', numInput('x'))],
-    }));
+    }), envEditorSeq: 0 });
     await ctx.saveEnvEditor();
     expect(sent).toHaveLength(0);
     expect(messages).toHaveLength(1);
@@ -58,9 +59,10 @@ describe('number env rows the browser cannot parse are refused', () => {
     const ctx = runPage([...helpers, 'doInstall'], {
       ...common(sent, messages, {
         'install-name': { value: 'bot' },
+        'install-btn': { disabled: false, dataset: {} },
         '#install-env-rows .env-row': [envRow('LIMIT', numInput('', true))],
       }),
-      guidedReadyToSave: async () => true, installBotId: null, installSourceId: 's',
+      guidedReadyToSave: async () => true, installBotId: null, installSourceId: 's', installSeq: 0,
     });
     await ctx.doInstall();
     expect(sent).toHaveLength(0);

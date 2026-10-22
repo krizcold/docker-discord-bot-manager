@@ -392,6 +392,7 @@ describe('review fixes', () => {
     const ctx = runPage(['botLabel', 'reseedStalePrimary'], {
       bots, fleetBackupBotId: 'b1', confirm: () => true, window: { confirm: () => true },
       document: { getElementById: () => ({ value: 'x' }) },
+      refuseBadNumbers: () => false,
       api: async () => d.promise,
       hideFleetBackups: () => { hidden++; }, loadBots: () => {},
       showMessage: (t: string, m: string) => messages.push([t, m]),

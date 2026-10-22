@@ -169,6 +169,7 @@
       align-items: center; justify-content: center; z-index: 1000;
       backdrop-filter: blur(2px);
     }
+    #manager-update-modal { z-index: 1100; }
     .modal {
       background: var(--bg-secondary); border-radius: var(--radius-lg); padding: 24px;
       width: 100%; max-width: 520px; border: 1px solid var(--border);
@@ -644,6 +645,7 @@
       <h2 id="manager-update-title">Updating Bot Manager</h2>
       <pre id="manager-update-log" style="background:#0d0d0d;color:#ddd;padding:12px;border-radius:6px;max-height:55vh;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;line-height:1.45;margin:12px 0;"></pre>
       <div class="modal-actions">
+        <button class="btn btn-primary btn-small hidden" id="manager-update-reload" onclick="window.location.reload()">Reload</button>
         <button class="btn btn-secondary btn-small" id="manager-update-close" onclick="closeManagerUpdateModal()">Close</button>
       </div>
     </div>
@@ -1002,14 +1004,35 @@
       // we cannot confirm the bootId/commit actually changed - don't claim success;
       // just reload once the gateway is back to resync against the running manager.
       if (!base) {
-        appendManagerLog('Reconnected - reloading to resync (no update baseline captured)...');
-        setTimeout(() => window.location.reload(), 800);
+        appendManagerLog('Reconnected (no update baseline captured).');
+        reloadWhenSafe();
         return;
       }
       // New process + new commit: the update took. Reload so the browser fetches the
       // freshly-built SPA (assets may have changed) instead of running stale code.
-      finishManagerUpdate(true, 'Updated - reloading...', 'Bot Manager updated', 'Bot Manager updated');
-      setTimeout(() => window.location.reload(), 800);
+      finishManagerUpdate(true, 'Updated.', 'Bot Manager updated', 'Bot Manager updated');
+      reloadWhenSafe();
+    }
+
+    function pageHasUnsavedInput() {
+      const editors = ['env-modal', 'config-modal', 'files-modal', 'install-modal', 'fleet-backup-modal', 'source-modal', 'edit-source-modal'];
+      if (editors.some(id => { const m = document.getElementById(id); return m && !m.classList.contains('hidden'); })) return true;
+      if (document.querySelector('#vault-list .vault-entry.dirty')) return true;
+      const newKey = document.getElementById('vault-new-key');
+      const newValue = document.getElementById('vault-new-value');
+      return !!((newKey && newKey.value) || (newValue && newValue.value));
+    }
+
+    function reloadWhenSafe() {
+      setTimeout(() => {
+        if (!pageHasUnsavedInput()) {
+          appendManagerLog('Reloading...');
+          window.location.reload();
+          return;
+        }
+        appendManagerLog('This page has an open editor or unsaved input, so it was not reloaded. Reload this page when you have saved.');
+        document.getElementById('manager-update-reload').classList.remove('hidden');
+      }, 800);
     }
 
     async function updateManager() {
@@ -4562,7 +4585,7 @@
         <div class="form-group">
           <label>Bot Name</label>
           <div class="name-input-group">
-            ${!installNameLocked ? `<button class="name-reset-btn" onclick="resetInstallName(${jsArg(defaultName)})" title="Reset to default">&#128260;</button>` : ''}
+            <button class="name-reset-btn" onclick="resetInstallName(${jsArg(defaultName)})" title="Reset to default" style="${installNameLocked ? 'display:none;' : ''}">&#128260;</button>
             <input type="text" id="install-name" value="${escapeHtml(defaultName)}" ${installNameLocked ? 'disabled' : ''} oninput="onNameInput()">
             <button class="name-edit-btn" onclick="toggleNameLock()" title="${installNameLocked ? 'Edit name' : 'Lock name'}">
               ${installNameLocked ? '&#9998;' : '&#128274;'}
@@ -4999,6 +5022,8 @@
       consoleBotId = null;
     }
 
+    window.addEventListener('beforeunload', (e) => { if (pageHasUnsavedInput()) { e.preventDefault(); e.returnValue = ''; } });
+
     window.addEventListener('resize', () => {
       if (consoleFit && !document.getElementById('console-modal').classList.contains('hidden')) {
         try { consoleFit.fit(); } catch (e) {}
@@ -5205,7 +5230,17 @@
       installNameLocked = !installNameLocked;
       const source = sources.find(s => s.id === installSourceId);
       const defaultName = source ? (source.composeName || getRepoName(source.url) || 'My Bot') : 'My Bot';
-      renderInstallModal(defaultName);
+      const input = document.getElementById('install-name');
+      const group = input.closest('.name-input-group');
+      const editBtn = group.querySelector('.name-edit-btn');
+      input.disabled = installNameLocked;
+      group.querySelector('.name-reset-btn').style.display = installNameLocked ? 'none' : '';
+      editBtn.title = installNameLocked ? 'Edit name' : 'Lock name';
+      editBtn.innerHTML = installNameLocked ? '&#9998;' : '&#128274;';
+      if (installNameLocked) {
+        input.value = defaultName;
+        onNameInput();
+      }
     }
 
     function resetInstallName(defaultName) {
@@ -5428,6 +5463,7 @@
     let vaultGroups = [];
     let vaultHealth = {};
     const expandedVaultGroups = new Set(['standalone']);
+    let vaultRenderDeferred = false;
 
     async function loadVault() {
       try {
@@ -5443,6 +5479,50 @@
 
     function renderVault() {
       const list = document.getElementById('vault-list');
+      const edits = captureVaultEdits(list);
+      const lost = edits.rows.find(e => e.dirty && e.focus && !vaultGroups.some(g => g.id === e.groupId && expandedVaultGroups.has(g.id) && g.entries.some(x => x.key === e.originalKey)));
+      if (lost) {
+        if (!vaultRenderDeferred) showMessage('error', `The vault list was not refreshed (it changed elsewhere or a group was toggled), so your unsaved edit to ${lost.originalKey} is kept. Save it or leave the row to refresh.`);
+        vaultRenderDeferred = true;
+        return;
+      }
+      vaultRenderDeferred = false;
+      try { paintVault(list); } finally { restoreVaultEdits(list, edits); }
+    }
+
+    function captureVaultEdits(list) {
+      const active = document.activeElement;
+      const rows = Array.from(list.querySelectorAll('.vault-entry'))
+        .filter(r => r.classList.contains('dirty') || (active && r.contains(active)))
+        .map(r => ({
+          groupId: r.dataset.groupId,
+          originalKey: r.dataset.originalKey,
+          dirty: r.classList.contains('dirty'),
+          key: r.querySelector('.vault-entry-key-input').value,
+          value: r.querySelector('.vault-entry-value-input').value,
+          focus: active && r.contains(active) ? (active.classList.contains('vault-entry-value-input') ? '.vault-entry-value-input' : '.vault-entry-key-input') : null,
+        }));
+      const newKey = document.getElementById('vault-new-key');
+      const newValue = document.getElementById('vault-new-value');
+      return { rows, newKey: newKey ? newKey.value : '', newValue: newValue ? newValue.value : '' };
+    }
+
+    function restoreVaultEdits(list, edits) {
+      for (const e of edits.rows) {
+        const row = Array.from(list.querySelectorAll('.vault-entry')).find(r => r.dataset.groupId === e.groupId && r.dataset.originalKey === e.originalKey);
+        if (!row) continue;
+        row.querySelector('.vault-entry-key-input').value = e.key;
+        row.querySelector('.vault-entry-value-input').value = e.value;
+        if (e.dirty) row.classList.add('dirty');
+        if (e.focus) row.querySelector(e.focus).focus();
+      }
+      const newKey = document.getElementById('vault-new-key');
+      const newValue = document.getElementById('vault-new-value');
+      if (newKey && edits.newKey) newKey.value = edits.newKey;
+      if (newValue && edits.newValue) newValue.value = edits.newValue;
+    }
+
+    function paintVault(list) {
       const health = storeHealthBanner(vaultHealth.vaultBroken, 'vault.json', vaultHealth.corruptCopies, vaultHealth.secretKeyProblem);
       if (vaultGroups.length === 0 || vaultGroups.every(g => g.entries.length === 0 && g.type !== 'standalone')) {
         list.innerHTML = health + '<div class="source-empty">No credentials yet.<br>Install a bot or add standalone entries.</div>';
@@ -5528,6 +5608,7 @@
         keyInput.value = row.dataset.originalKey;
         valueInput.value = row.dataset.origValue;
         row.classList.remove('dirty');
+        if (vaultRenderDeferred) renderVault();
       }, 150);
     }
 
@@ -5586,7 +5667,11 @@
             showMessage('error', 'A bot instance variable cannot be renamed here; rename it in the bot\'s Env editor. Nothing was saved.');
             return;
           }
-          if (newValue) {
+          if (!newValue) {
+            showMessage('error', 'The value is empty, so nothing was saved. To remove a variable, use the bot\'s Env editor.');
+            return;
+          }
+          {
             const res = await api('PUT', `/bots/${groupId}/env`, { vars: { [originalKey]: newValue } });
             if (!res.success) {
               showMessage('error', res.error || 'Failed to save');
@@ -5667,6 +5752,8 @@
       try {
         const res = await api('POST', '/vault/standalone', { key, value, hidden: newVaultHidden });
         if (!res.success) { showMessage('error', res.error || 'Failed to add vault entry'); return; }
+        document.getElementById('vault-new-key').value = '';
+        document.getElementById('vault-new-value').value = '';
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to add vault entry');

@@ -509,18 +509,25 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      res.json({ success: true, message: 'Starting bot' });
+      const refusal = containerManager.startPreflightRefusal(req.params.id);
+      if (refusal) {
+        res.status(409).json(refusal);
+        return;
+      }
+
+      const opId = randomUUID();
+      res.json({ success: true, message: 'Starting bot', opId });
 
       const botId = req.params.id;
       containerManager.startBot(botId).then((result) => {
         const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
-          broadcastToClients(wss, 'bot:started', updatedBot);
+          broadcastToClients(wss, 'bot:started', { ...updatedBot, opId });
         } else {
-          broadcastToClients(wss, 'bot:start-failed', { id: botId, error: result.error });
+          broadcastToClients(wss, 'bot:start-failed', { id: botId, opId, error: result.error });
         }
       }).catch((err) => {
-        broadcastToClients(wss, 'bot:start-failed', { id: botId, error: String(err) });
+        broadcastToClients(wss, 'bot:start-failed', { id: botId, opId, error: String(err) });
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -569,18 +576,25 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      res.json({ success: true, message: 'Restarting bot' });
+      const refusal = containerManager.startPreflightRefusal(req.params.id);
+      if (refusal) {
+        res.status(409).json(refusal);
+        return;
+      }
+
+      const opId = randomUUID();
+      res.json({ success: true, message: 'Restarting bot', opId });
 
       const botId = req.params.id;
       containerManager.restartBot(botId).then((result) => {
         const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
-          broadcastToClients(wss, 'bot:restarted', updatedBot);
+          broadcastToClients(wss, 'bot:restarted', { ...updatedBot, opId });
         } else {
-          broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: result.error });
+          broadcastToClients(wss, 'bot:restart-failed', { id: botId, opId, error: result.error });
         }
       }).catch((err) => {
-        broadcastToClients(wss, 'bot:restart-failed', { id: botId, error: String(err) });
+        broadcastToClients(wss, 'bot:restart-failed', { id: botId, opId, error: String(err) });
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -610,8 +624,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      const refusal = containerManager.updatePreflightRefusal(req.params.id);
+      if (refusal) {
+        res.status(409).json(refusal);
+        return;
+      }
+
       broadcastToClients(wss, 'bot:pulling', { id: req.params.id });
-      res.json({ success: true, message: 'Updating instance from source' });
+      const opId = randomUUID();
+      res.json({ success: true, message: 'Updating instance from source', opId });
 
       const botId = req.params.id;
 
@@ -621,12 +642,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // source itself, so no pre-fetch is needed here.
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(publicBot(containerManager.getBot(botId))));
+          broadcastToClients(wss, 'bot:rebuilt', { ...withActiveOp(publicBot(containerManager.getBot(botId))), opId });
         } else {
-          broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
+          broadcastToClients(wss, 'bot:pull-failed', { id: botId, opId, error: result.error });
         }
       }).catch((err) => {
-        broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: String(err) });
+        broadcastToClients(wss, 'bot:pull-failed', { id: botId, opId, error: String(err) });
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -650,18 +671,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      res.json({ success: true, message: 'Build started' });
+      const opId = randomUUID();
+      res.json({ success: true, message: 'Build started', opId });
 
       const botId = req.params.id;
       containerManager.buildBot(botId).then((result) => {
         const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
-          broadcastToClients(wss, 'bot:built', updatedBot);
+          broadcastToClients(wss, 'bot:built', { ...updatedBot, opId });
         } else {
-          broadcastToClients(wss, 'bot:build-failed', { id: botId, error: result.error });
+          broadcastToClients(wss, 'bot:build-failed', { id: botId, opId, error: result.error });
         }
       }).catch((err) => {
-        broadcastToClients(wss, 'bot:build-failed', { id: botId, error: String(err) });
+        broadcastToClients(wss, 'bot:build-failed', { id: botId, opId, error: String(err) });
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

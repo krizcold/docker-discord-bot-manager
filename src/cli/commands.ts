@@ -6,7 +6,7 @@
 import { Client, CliResponse } from './client';
 import { emit, printJson, fail, table, jsonMode, EXIT_OK, EXIT_ERR, EXIT_TIMEOUT, EXIT_USAGE } from './output';
 import { flagStr, flagInt } from './args';
-import { waitForEvent, pollUntil } from './waiter';
+import { waitForEvent, pollUntil, WaitTimeoutError } from './waiter';
 
 interface Ctx {
   client: Client;
@@ -15,6 +15,7 @@ interface Ctx {
 }
 
 const DEFAULT_WAIT_MS = 120_000;
+const DEFAULT_BUILD_WAIT_MS = 30 * 60_000;
 
 function need(ctx: Ctx, idx: number, label: string): string {
   const v = ctx.args[idx];
@@ -32,51 +33,91 @@ async function simple(ctx: Ctx, method: string, path: string, body?: unknown, hu
   emit(res, ctx.flags, human);
 }
 
-/** Lifecycle POST that either fires-and-reports or blocks on a terminal WS event. */
+/**
+ * Lifecycle POST. Without --wait it reports that the manager accepted the operation,
+ * never that it finished. With --wait it blocks on the terminal WS event of this op.
+ */
 async function lifecycle(
   ctx: Ctx,
   id: string,
   path: string,
   successTypes: string[],
   failTypes: string[],
+  defaultWaitMs = DEFAULT_WAIT_MS,
 ): Promise<void> {
   if (!ctx.flags.wait) {
-    return simple(ctx, 'POST', path);
+    const res = await ctx.client.request('POST', path);
+    const b = res.body as { success?: boolean; message?: string; opId?: string } | null;
+    if (res.ok && b && b.success !== false) {
+      if (jsonMode(ctx.flags)) printJson({ ...b, accepted: true, finished: false });
+      else process.stdout.write(`accepted: ${b.message || 'operation started'}; not finished yet (--wait to block, or dbm bots info ${id})\n`);
+      process.exit(EXIT_OK);
+    }
+    return emit(res, ctx.flags);
   }
+  const waitMs = timeoutMs(ctx, defaultWaitMs);
+  let outcome: Awaited<ReturnType<typeof waitForEvent>>;
   try {
-    const outcome = await waitForEvent(
+    outcome = await waitForEvent(
       ctx.client,
-      { successTypes, failTypes, matchId: id, timeoutMs: timeoutMs(ctx, DEFAULT_WAIT_MS) },
+      { successTypes, failTypes, timeoutMs: waitMs },
       async () => {
         const res = await ctx.client.request('POST', path);
-        const b = res.body as { success?: boolean; error?: string } | null;
+        const b = res.body as { success?: boolean; error?: string; opId?: string } | null;
         if (!res.ok || (b && b.success === false)) throw new Error(b?.error || `HTTP ${res.status}`);
+        if (!b || typeof b.opId !== 'string') throw new Error('the manager accepted the request but named no operation id to wait on');
+        return b.opId;
       },
     );
-    if (jsonMode(ctx.flags)) printJson({ success: outcome.ok, event: outcome.event });
-    else process.stdout.write(`${outcome.event.type}\n`);
-    process.exit(outcome.ok ? EXIT_OK : EXIT_ERR);
   } catch (err) {
-    fail(err instanceof Error ? err.message : String(err), EXIT_ERR);
+    if (err instanceof WaitTimeoutError) {
+      fail(`${err.message}; the operation may still be running (dbm bots info ${id})`, EXIT_TIMEOUT);
+    }
+    return fail(err instanceof Error ? err.message : String(err), EXIT_ERR);
   }
+  if (jsonMode(ctx.flags)) printJson({ success: outcome.ok, event: outcome.event });
+  else process.stdout.write(`${outcome.event.type}\n`);
+  process.exit(outcome.ok ? EXIT_OK : EXIT_ERR);
 }
 
-async function streamSse(ctx: Ctx, path: string): Promise<void> {
+/**
+ * Stream an SSE route. A build-log stream ends on its own terminal frame: done or
+ * idle exits 0, failed exits 1, and a stream that ends or times out without one exits
+ * EXIT_TIMEOUT. A container-log stream has no terminal frame: its own --timeout
+ * ending it exits 0, the server ending it exits EXIT_TIMEOUT (EXIT_ERR after an error frame).
+ */
+async function streamSse(ctx: Ctx, path: string, terminal: boolean): Promise<void> {
   const human = !jsonMode(ctx.flags);
-  await ctx.client.sse(
+  let last: { event: string; data: unknown } | null = null;
+  const how = await ctx.client.sse(
     path,
     (frame) => {
+      last = frame;
       if (human) process.stdout.write(`${JSON.stringify(frame.data)}\n`);
       else printJson(frame);
     },
     { timeoutMs: ctx.flags.follow ? undefined : timeoutMs(ctx, 0) || undefined },
   );
-  process.exit(EXIT_OK);
+  const lastFrame = last as { event: string; data: unknown } | null;
+  if (terminal) {
+    const type = (lastFrame?.data as { type?: string } | null)?.type;
+    if (type === 'done' || type === 'idle') process.exit(EXIT_OK);
+    if (type === 'failed') process.exit(EXIT_ERR);
+    fail(how === 'timeout' ? 'stream timed out before the operation finished' : 'stream ended before the operation finished', EXIT_TIMEOUT);
+  }
+  if (how === 'timeout') process.exit(EXIT_OK);
+  if (lastFrame?.event === 'error') fail('log stream ended with an error', EXIT_ERR);
+  fail('log stream ended by the server', EXIT_TIMEOUT);
 }
 
 /** Resolve a bot by id, displayName, or sanitizedName; returns the bot record. */
 async function resolveBot(ctx: Ctx, idOrName: string): Promise<Record<string, unknown>> {
   const res = await ctx.client.request('GET', '/api/bots');
+  const body = res.body as { success?: boolean; error?: unknown } | null;
+  if (!res.ok || !body || typeof body !== 'object' || body.success === false) {
+    const why = body && typeof body === 'object' && 'error' in body ? String(body.error) : `HTTP ${res.status}`;
+    fail(`could not list bots: ${why}`, EXIT_ERR);
+  }
   const bots = ((res.body as { bots?: Record<string, unknown>[] })?.bots) || [];
   const hit = bots.find((b) => b.id === idOrName || b.displayName === idOrName || b.sanitizedName === idOrName);
   if (!hit) fail(`no bot matching '${idOrName}'`, EXIT_ERR);
@@ -131,11 +172,11 @@ const HANDLERS: Record<string, Handler> = {
   },
   'bots build': (c) => {
     const id = need(c, 0, 'id');
-    return lifecycle(c, id, `/api/bots/${id}/build`, ['bot:built'], ['bot:build-failed']);
+    return lifecycle(c, id, `/api/bots/${id}/build`, ['bot:built'], ['bot:build-failed'], DEFAULT_BUILD_WAIT_MS);
   },
   'bots update': (c) => {
     const id = need(c, 0, 'id');
-    return lifecycle(c, id, `/api/bots/${id}/update`, ['bot:rebuilt'], ['bot:pull-failed']);
+    return lifecycle(c, id, `/api/bots/${id}/update`, ['bot:rebuilt'], ['bot:pull-failed'], DEFAULT_BUILD_WAIT_MS);
   },
   'bots delete': (c) => {
     const id = need(c, 0, 'id');
@@ -148,9 +189,9 @@ const HANDLERS: Record<string, Handler> = {
   'bots containers': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/containers`),
   'bots stats': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/stats`),
   'bots logs': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/logs?tail=${flagInt(c.flags, 'tail', 100)}`),
-  'bots build-logs': (c) => streamSse(c, `/api/bots/${need(c, 0, 'id')}/build-logs`),
+  'bots build-logs': (c) => streamSse(c, `/api/bots/${need(c, 0, 'id')}/build-logs`, true),
   'bots container-logs': (c) =>
-    streamSse(c, `/api/bots/${need(c, 0, 'id')}/containers/${need(c, 1, 'container')}/logs/stream?lines=${flagInt(c.flags, 'lines', 50)}`),
+    streamSse(c, `/api/bots/${need(c, 0, 'id')}/containers/${need(c, 1, 'container')}/logs/stream?lines=${flagInt(c.flags, 'lines', 50)}`, false),
   'bots web-auth': (c) => simple(c, 'PUT', `/api/bots/${need(c, 0, 'id')}/web-auth`, { mode: need(c, 1, 'mode') }),
   'bots port': async (c) => {
     const bot = await resolveBot(c, need(c, 0, 'idOrName'));
@@ -208,7 +249,7 @@ const HANDLERS: Record<string, Handler> = {
     const conn = c.client.openWs((msg) => {
       if (filter && !msg.type.startsWith(filter)) return;
       process.stdout.write(`${JSON.stringify(msg)}\n`);
-    });
+    }, undefined, (reason) => fail(`event channel lost: ${reason}`, EXIT_ERR));
     if (tmo > 0) setTimeout(() => { conn.close(); process.exit(EXIT_OK); }, tmo);
   },
   wait: async (c) => {
@@ -222,7 +263,8 @@ const HANDLERS: Record<string, Handler> = {
       timeoutMs: timeoutMs(c, 60_000),
     });
     printJson(result.body);
-    process.exit(result.ok ? EXIT_OK : EXIT_TIMEOUT);
+    if (!result.ok) fail(`condition not met within the timeout${result.lastError ? `; last answer: ${result.lastError}` : ''}`, EXIT_TIMEOUT);
+    process.exit(EXIT_OK);
   },
 };
 

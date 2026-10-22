@@ -2267,12 +2267,19 @@ export async function startBot(botId: string): Promise<{ success: boolean; error
   return withLoggedBotOp(botId, 'start', () => startBotImpl(botId));
 }
 
+/** The synchronous refusal a start or restart answers before touching anything; null when it may proceed. */
+export function startPreflightRefusal(botId: string): { success: false; error: string } | null {
+  if (getBot(botId)?.recoveryRescue) {
+    return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
+  }
+  return null;
+}
+
 async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  if (instance.recoveryRescue) {
-    return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
-  }
+  const rescueRefusal = startPreflightRefusal(botId);
+  if (rescueRefusal) return rescueRefusal;
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
   if (instance.status === 'running') {
     // Reconcile against live container state: an externally-stopped bot
@@ -2686,6 +2693,8 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<{ success: boo
 
 export async function restartBot(botId: string): Promise<{ success: boolean; error?: string }> {
   return withLoggedBotOp(botId, 'restart', async () => {
+    const rescueRefusal = startPreflightRefusal(botId);
+    if (rescueRefusal) return rescueRefusal;
     const log = logCollectors.get(botId);
     const emit: EmitFn = (msg, type = 'info', key) => {
       console.log(`[Restart ${botId}] ${msg}`);
@@ -2708,7 +2717,19 @@ export async function pullAndRebuild(botId: string): Promise<{ success: boolean;
 async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; error?: string }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
+  const storeRefusal = updatePreflightRefusal(botId);
+  if (storeRefusal) return storeRefusal;
+  // Same preflight for a deployment-mode change: the build refuses on it, and
+  // this lane must not stop the bot and delete its image on the way there.
+  const modeRefusal = await modeMismatchRefusal(instance);
+  if (modeRefusal) {
+    return { success: false, error: modeRefusal };
+  }
+  return pullAndRebuildAfterPreflight(botId, instance);
+}
 
+/** The synchronous store checks an update refuses on, before anything destructive; null when it may proceed. */
+export function updatePreflightRefusal(botId: string): { success: false; error: string } | null {
   // Preflight before anything destructive: the rebuild's env assembly refuses
   // on a broken store, and by then this lane has already stopped the bot and
   // deleted its image - turning a working deployment into an unstartable one.
@@ -2730,13 +2751,10 @@ async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; er
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  // Same preflight for a deployment-mode change: the build refuses on it, and
-  // this lane must not stop the bot and delete its image on the way there.
-  const modeRefusal = await modeMismatchRefusal(instance);
-  if (modeRefusal) {
-    return { success: false, error: modeRefusal };
-  }
+  return null;
+}
 
+async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {

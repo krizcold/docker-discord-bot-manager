@@ -91,7 +91,7 @@ export class Client {
     path: string,
     onFrame: (frame: { event: string; data: unknown }) => void,
     opts: { timeoutMs?: number } = {},
-  ): Promise<void> {
+  ): Promise<'end' | 'timeout'> {
     return new Promise((resolve, reject) => {
       const req = http.request(
         { host: this.target.host, port: this.target.port, method: 'GET', path, headers: { Accept: 'text/event-stream' } },
@@ -126,24 +126,40 @@ export class Client {
               onFrame({ event, data });
             }
           });
-          res.on('end', () => resolve());
+          res.on('end', () => resolve('end'));
+          res.on('close', () => resolve('end'));
         },
       );
       req.on('error', reject);
       if (opts.timeoutMs) {
         req.setTimeout(opts.timeoutMs, () => {
+          resolve('timeout');
           req.destroy();
-          resolve();
         });
       }
       req.end();
     });
   }
 
-  /** Open the /ws broadcast channel; onMessage fires per decoded frame. Returns a closer. */
-  openWs(onMessage: (msg: { type: string; data: unknown }) => void, onOpen?: () => void): { close: () => void } {
+  /**
+   * Open the /ws broadcast channel; onMessage fires per decoded frame. onClose fires
+   * once when the channel fails or closes without the caller closing it. Returns a closer.
+   */
+  openWs(
+    onMessage: (msg: { type: string; data: unknown }) => void,
+    onOpen?: () => void,
+    onClose?: (reason: string) => void,
+  ): { close: () => void } {
     const ws = new WebSocket(`ws://${this.target.host}:${this.target.port}/ws`);
+    let closing = false;
+    const lost = (reason: string) => {
+      if (closing) return;
+      closing = true;
+      onClose?.(reason);
+    };
     ws.on('open', () => onOpen?.());
+    ws.on('error', (err) => lost(err.message));
+    ws.on('close', (code) => lost(`closed (code ${code})`));
     ws.on('message', (raw) => {
       try {
         const parsed = JSON.parse(raw.toString());
@@ -152,6 +168,11 @@ export class Client {
         /* ignore non-JSON frames */
       }
     });
-    return { close: () => ws.close() };
+    return {
+      close: () => {
+        closing = true;
+        ws.close();
+      },
+    };
   }
 }

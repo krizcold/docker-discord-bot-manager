@@ -78,7 +78,7 @@ function standInWho(id: string | null): string {
 }
 
 function sinceText(ms: number | null): string {
-  return ms ? ` since ${new Date(ms).toISOString().slice(11, 16)} UTC` : '';
+  return ms ? ` since ${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC` : '';
 }
 
 /** Postgres size-GUC string ('4GB', '4096MB', '-1') to bytes; null = unbounded or unparsable. */

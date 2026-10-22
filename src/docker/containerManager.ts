@@ -592,6 +592,52 @@ export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetRepli
   return instance;
 }
 
+export function updateInstanceFleetDbPinsWarning(botId: string, warning: string | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (warning) instance.fleetDbPinsWarning = warning;
+  else delete instance.fleetDbPinsWarning;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/**
+ * Every value a deployed compose copy's app service sets for the given keys
+ * (one entry per copy that sets it), or null when a copy could not be read.
+ */
+export function deployedComposeEnvValues(botId: string, keys: string[]): Array<{ key: string; value: string }> | null {
+  const instance = getBot(botId);
+  if (!instance) return [];
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const found: Array<{ key: string; value: string }> = [];
+  for (const composePath of [
+    path.join(getBotDir(botId), 'docker-compose.yml'),
+    path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName, 'docker-compose.yml'),
+  ]) {
+    if (!fs.existsSync(composePath)) continue;
+    try {
+      const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+      const appName = compose?.services && typeof compose.services === 'object' ? getAppServiceName(compose) : null;
+      const env = appName ? compose.services[appName]?.environment : undefined;
+      for (const key of keys) {
+        if (Array.isArray(env)) {
+          for (const e of env) {
+            if (typeof e !== 'string') continue;
+            const eq = e.indexOf('=');
+            if ((eq < 0 ? e : e.slice(0, eq)) === key) found.push({ key, value: eq < 0 ? '' : e.slice(eq + 1) });
+          }
+        } else if (env && typeof env === 'object' && Object.prototype.hasOwnProperty.call(env, key)) {
+          found.push({ key, value: env[key] == null ? '' : String(env[key]) });
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  return found;
+}
+
 export function updateInstanceFleetTransfer(botId: string, run: FleetTransferRun | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -908,10 +954,12 @@ export function removeBotEnvVars(botId: string, keys: string[]): InstanceConfig 
  * Strip a deleted env key from the DEPLOYED compose copies. syncComposeEnvVars
  * deliberately keeps keys it does not manage, so without this the baked
  * literal keeps flowing to the container until the next full rebuild.
+ * Returns the compose files that could not be edited.
  */
-export function removeEnvKeyFromDeployedCompose(botId: string, key: string): void {
+export function removeEnvKeyFromDeployedCompose(botId: string, key: string): string[] {
   const instance = getBot(botId);
-  if (!instance) return;
+  if (!instance) return [];
+  const failed: string[] = [];
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const candidates = [
     path.join(getBotDir(botId), 'docker-compose.yml'),
@@ -926,12 +974,51 @@ export function removeEnvKeyFromDeployedCompose(botId: string, key: string): voi
       const appName = getAppServiceName(compose);
       const svc = appName ? services[appName] : undefined;
       if (!svc?.environment) continue;
-      deleteComposeEnv(svc.environment, key);
+      if (!deleteComposeEnv(svc.environment, key)) continue;
       fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
     } catch (err) {
       console.warn(`[ContainerManager] Failed to strip env key ${key} from ${composePath}: ${err}`);
+      failed.push(composePath);
     }
   }
+  return failed;
+}
+
+/**
+ * Remove one key from the deployed compose copies first, then from the env
+ * store and the record. A compose that could not be edited leaves the key
+ * stored, so a retry repeats the whole removal. Returns the unedited files.
+ */
+export function removeEnvKeyEverywhere(botId: string, key: string): string[] {
+  const unedited = removeEnvKeyFromDeployedCompose(botId, key);
+  if (unedited.length > 0) return unedited;
+  envManager.deleteEnvVar(botId, key);
+  removeBotEnvVars(botId, [key]);
+  if (Object.prototype.hasOwnProperty.call(envManager.getEnvVars(botId), key)) {
+    throw new Error(`The env store still holds ${key} after the removal`);
+  }
+  return [];
+}
+
+/**
+ * removeEnvKeyEverywhere for each given key that is actually stored (the env
+ * store or the record). Answers the keys removed, the keys still stored
+ * because a compose could not be edited, and those files.
+ */
+export function removeStoredEnvKeys(botId: string, keys: string[]): { removed: string[]; stillStored: string[]; composeFailures: string[] } {
+  const stored = envManager.getEnvVars(botId);
+  const record = getBot(botId)?.envVars || {};
+  const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const removed: string[] = [];
+  const stillStored: string[] = [];
+  const composeFailures = new Set<string>();
+  for (const key of new Set(keys)) {
+    if (!has(stored, key) && !has(record, key)) continue;
+    const unedited = removeEnvKeyEverywhere(botId, key);
+    if (unedited.length === 0) removed.push(key);
+    else { stillStored.push(key); for (const file of unedited) composeFailures.add(file); }
+  }
+  return { removed, stillStored, composeFailures: [...composeFailures] };
 }
 
 /**
@@ -1196,8 +1283,18 @@ async function performDockerCleanup(appName: string, composePath: string): Promi
   return { failures };
 }
 
-export async function deleteBot(botId: string, keepData: boolean = false): Promise<boolean> {
-  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData));
+export async function deleteBot(botId: string, keepData: boolean = false, keepEnv: boolean = true): Promise<boolean> {
+  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData, keepEnv));
+}
+
+/**
+ * The manager's env copies inside the bot dir: the store with its write and
+ * corruption siblings, and both .env files. The env folder also holds the
+ * config file store, which is not one of them.
+ */
+export function botEnvCopies(botId: string): string[] {
+  const store = path.join(getEnvPath(botId), 'storage.json');
+  return [store, `${store}.tmp`, `${store}.corrupt`, path.join(getEnvPath(botId), '.env'), path.join(getBotDir(botId), '.env')];
 }
 
 /**
@@ -1211,6 +1308,7 @@ async function listDeleteRemnants(
   appName: string,
   botDir: string,
   keepData: boolean,
+  keepEnv: boolean,
   deploymentMode: DeploymentMode
 ): Promise<string[]> {
   const remnants: string[] = [];
@@ -1270,8 +1368,11 @@ async function listDeleteRemnants(
       else if (state === 'unknown') remnants.push(`volume ${vol} (unverifiable, docker did not answer)`);
     }
     if (fs.existsSync(botDir)) remnants.push(`directory ${botDir}`);
-  } else if (fs.existsSync(path.join(botDir, 'docker-compose.yml'))) {
-    remnants.push(`compose file in ${botDir}`);
+  } else {
+    if (fs.existsSync(path.join(botDir, 'docker-compose.yml'))) remnants.push(`compose file in ${botDir}`);
+    if (!keepEnv) {
+      for (const p of botEnvCopies(instance.id)) if (fs.existsSync(p)) remnants.push(`env ${p}`);
+    }
   }
 
   if (deploymentMode === 'casaos') {
@@ -1299,7 +1400,7 @@ async function rmContainerTolerant(name: string, failures: string[]): Promise<vo
   }
 }
 
-async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean> {
+async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean): Promise<boolean> {
   const instance = getBot(botId);
   if (!instance) return false;
 
@@ -1418,14 +1519,17 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
       }
     }
   } else {
-    // Keep env/ but remove compose (recreated on reinstall)
-    const composePath = path.join(botDir, 'docker-compose.yml');
-    if (fs.existsSync(composePath)) {
-      try { fs.rmSync(composePath, { force: true }); }
+    // Keep the data but remove compose (recreated on reinstall), and the env
+    // copies too unless they are kept.
+    const doomed = [path.join(botDir, 'docker-compose.yml'), ...(keepEnv ? [] : botEnvCopies(botId))];
+    for (const p of doomed) {
+      if (!fs.existsSync(p)) continue;
+      try { fs.rmSync(p, { force: true }); }
       catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`compose file ${composePath}: ${msg}`);
+        failures.push(`${p}: ${msg}`);
       }
+      if (fs.existsSync(p)) failures.push(`${p}: still present after removal`);
     }
   }
 
@@ -1436,7 +1540,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
     // stuck in error forever. Only keep the registry entry when something the
     // delete owns actually remains; then the user retains a Delete button to
     // retry against the listed remnants.
-    const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, deploymentMode);
+    const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, keepEnv, deploymentMode);
     if (remnants.length > 0) {
       updateBotStatus(botId, 'error');
       const summary =
@@ -1455,7 +1559,7 @@ async function deleteBotImpl(botId: string, keepData: boolean): Promise<boolean>
   saveRegistry(registry);
   logCollectors.remove(botId);
 
-  console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData})`);
+  console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData}, keepEnv: ${keepEnv})`);
   return true;
 }
 
@@ -1935,14 +2039,17 @@ function setComposeEnvIfPresent(env: any, key: string, value: string): void {
 }
 
 /** Remove an env KEY from a compose service (array or object form). */
-function deleteComposeEnv(env: any, key: string): void {
+function deleteComposeEnv(env: any, key: string): boolean {
+  let changed = false;
   if (Array.isArray(env)) {
     for (let i = env.length - 1; i >= 0; i--) {
-      if (typeof env[i] === 'string' && env[i].split('=')[0] === key) env.splice(i, 1);
+      if (typeof env[i] === 'string' && env[i].split('=')[0] === key) { env.splice(i, 1); changed = true; }
     }
-  } else if (env && typeof env === 'object') {
+  } else if (env && typeof env === 'object' && Object.prototype.hasOwnProperty.call(env, key)) {
     delete env[key];
+    changed = true;
   }
+  return changed;
 }
 
 /**

@@ -295,6 +295,8 @@ export interface FleetReplicaStatus {
   provisioning?: { phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean };
   /** A seed no runner owns any more (it failed, or a manager restart interrupted it): Retry or Dismiss. */
   parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean };
+  /** A retire of the database env pins left them in a compose it could not edit, and a compose still sets one the store does not hold. */
+  pinsWarning?: string;
   /** The automatic re-seed's attempt ledger, from the standby record. */
   autoReseed?: FleetReplicaAutoReseedLedger;
   /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
@@ -339,6 +341,8 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       copyWhole: !!instance.fleetDbReplica && instance.fleetDbReplica.copyCleared !== true,
     };
   }
+  const pinsWarning = livePinsWarning(instance);
+  if (pinsWarning) status.pinsWarning = pinsWarning;
   const rec = instance.fleetDbReplica;
   if (!rec) return status;
   if (rec.autoReseed) {
@@ -915,12 +919,35 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
  * pin). The mode key goes too, otherwise the next rebuild reads it with no URL
  * beside it and mints a fresh sidecar for a node that just stopped having one.
  */
-function retireFleetDbEnvPins(botId: string): void {
+function retireFleetDbEnvPins(botId: string): string[] {
+  const unedited = new Set<string>();
   for (const key of companionEnvKeys(botId)) {
     envManager.deleteEnvVar(botId, key);
     containerManager.removeBotEnvVars(botId, [key]);
-    containerManager.removeEnvKeyFromDeployedCompose(botId, key);
+    for (const file of containerManager.removeEnvKeyFromDeployedCompose(botId, key)) unedited.add(file);
   }
+  // On the instance, not on a seed record: a Dismiss must not clear it while
+  // the pins remain.
+  containerManager.updateInstanceFleetDbPinsWarning(botId, unedited.size > 0 ? uneditedPinsWarning([...unedited]) : null);
+  return [...unedited];
+}
+
+/**
+ * The recorded pins warning while it still holds: a compose that could not be
+ * read keeps it, and once every value a deployed compose sets for a pin is the
+ * value the store holds (the file was fixed or rewritten), it is no longer shown.
+ */
+function livePinsWarning(instance: InstanceConfig): string | null {
+  if (!instance.fleetDbPinsWarning) return null;
+  const set = containerManager.deployedComposeEnvValues(instance.id, companionEnvKeys(instance.id));
+  if (set === null) return instance.fleetDbPinsWarning;
+  const stored = envManager.getEnvVars(instance.id);
+  const stale = set.some(({ key, value }) => !Object.prototype.hasOwnProperty.call(stored, key) || stored[key] !== value);
+  return stale ? instance.fleetDbPinsWarning : null;
+}
+
+function uneditedPinsWarning(files: string[]): string {
+  return `The database env pins could not be removed from ${files.join(', ')}, which still set them: every start passes them to the bot, pointing it at the retired database, until those files are edited or rewritten`;
 }
 
 /**
@@ -1051,7 +1078,8 @@ export function reseedStalePrimary(
     // that will take the live fleet database from the master's next delivery
     // and merely lacks a standby, which beats staying pinned to a database
     // that was just deleted.
-    retireFleetDbEnvPins(instance.id);
+    const unedited = retireFleetDbEnvPins(instance.id);
+    if (unedited.length > 0) console.error(`[FleetReplica] ${instance.id}: ${uneditedPinsWarning(unedited)}`);
   };
   // Held across the whole run, the way decommission holds it: the dump, the
   // retire and the seed take minutes, and a restore or the scheduled dump
@@ -1088,7 +1116,7 @@ export function reseedStalePrimary(
  */
 export async function decommissionFleetDb(
   botId: string
-): Promise<{ success: boolean; error?: string; dumpFile?: string }> {
+): Promise<{ success: boolean; error?: string; dumpFile?: string; warning?: string }> {
   try {
     // The bot op lock is held for the whole lane so a concurrent Start cannot
     // boot the instance onto the database mid-destroy; the guards re-read a
@@ -1152,16 +1180,20 @@ export async function decommissionFleetDb(
         if (!retired.success) {
           return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}`, dumpFile };
         }
+        let warning: string | undefined;
         try {
-          retireFleetDbEnvPins(instance.id);
+          const unedited = retireFleetDbEnvPins(instance.id);
+          if (unedited.length > 0) warning = uneditedPinsWarning(unedited);
         } catch (err) {
           // The database is already destroyed and the dump kept: a pins
           // failure must not read as a refusal. Leftover pins only mean a
           // later rebuild re-mints a recorded empty sidecar.
           console.error(`[FleetReplica] Decommissioned ${instance.id} but failed to retire its env pins:`, err);
+          warning = `The database env pins could not be removed: ${String((err as Error)?.message || err)}`;
         }
+        if (warning) console.error(`[FleetReplica] ${instance.id}: ${warning}`);
         fleetBackup.clearTermFloor(instance.id);
-        return { success: true, dumpFile };
+        return warning ? { success: true, dumpFile, warning } : { success: true, dumpFile };
       } finally {
         fleetBackup.releaseFleetBackupBusy(instance.id);
       }

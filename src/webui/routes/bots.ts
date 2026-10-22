@@ -133,7 +133,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         };
       }));
 
-      res.json({ success: true, bots: botsWithSource });
+      res.json({ success: true, bots: botsWithSource, deploymentMode: mode });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -470,9 +470,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
       };
 
+      const envCopies = containerManager.botEnvCopies(req.params.id);
       let success: boolean;
       try {
-        success = await containerManager.deleteBot(req.params.id, keepData);
+        success = await containerManager.deleteBot(req.params.id, keepData, keepEnv);
       } catch (err) {
         rollbackVaultGroup();
         throw err;
@@ -483,8 +484,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      const envDeleted = !keepEnv && envCopies.every(p => !fs.existsSync(p));
       broadcastToClients(wss, 'bot:deleted', { id: req.params.id });
-      res.json({ success: true, vaulted: savedGroupId !== null });
+      res.json({ success: true, vaulted: savedGroupId !== null, envDeleted });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -992,19 +994,79 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const { vars } = req.body as { vars: Record<string, string> };
-      if (!vars || typeof vars !== 'object') {
+      const { vars: given, removed, renamed } = req.body as { vars: Record<string, string>; removed?: string[]; renamed?: Record<string, string> };
+      if (!given || typeof given !== 'object') {
         res.status(400).json({ success: false, error: 'vars object is required' });
         return;
+      }
+      if (removed !== undefined && (!Array.isArray(removed) || removed.some(k => typeof k !== 'string'))) {
+        res.status(400).json({ success: false, error: 'removed must be a list of key names' });
+        return;
+      }
+      if (renamed !== undefined && (!renamed || typeof renamed !== 'object' || Array.isArray(renamed) || Object.values(renamed).some(k => typeof k !== 'string'))) {
+        res.status(400).json({ success: false, error: 'renamed must map each new key name to its old one' });
+        return;
+      }
+      const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+      // A renamed secret row arrives blank (the editor never shows a stored
+      // secret), so the stored value is carried to the new name here; when it
+      // cannot be, nothing is saved, or the removal of the old name would
+      // destroy the only copy.
+      const vars: Record<string, string> = { ...given };
+      if (renamed && Object.keys(renamed).length > 0) {
+        const stored = envManager.getEnvVars(req.params.id);
+        // Taken only when this same save does not free it: a stored name that is
+        // neither removed nor itself renamed away (a swap, a chain, or a deleted
+        // row whose name another row takes). Carried values below are read from
+        // the store before anything is written.
+        const sources = new Set(Object.values(renamed));
+        const taken = Object.keys(renamed).filter(to => has(stored, to) && !(removed || []).includes(to) && !sources.has(to));
+        if (taken.length > 0) {
+          res.status(409).json({ success: false, error: `${taken.join(', ')} ${taken.length === 1 ? 'is' : 'are'} already stored, so a rename onto ${taken.length === 1 ? 'it' : 'them'} would overwrite a stored value; nothing was saved. Pick another name, or remove the stored key first.` });
+          return;
+        }
+      }
+      const carry = Object.entries(renamed || {}).filter(([to]) => !has(given, to));
+      if (carry.length > 0) {
+        const { vars: stored, undecryptable, corrupt } = envManager.getEnvVarsWithStatus(req.params.id);
+        for (const [to, from] of carry) {
+          if (corrupt || undecryptable.includes(from) || !has(stored, from)) {
+            res.status(409).json({ success: false, error: `Could not carry the stored value of ${from} to ${to} (${corrupt ? 'the env store cannot be read' : undecryptable.includes(from) ? 'it no longer decrypts' : 'it is not stored'}); nothing was saved. Enter the value for ${to}, then save again.` });
+            return;
+          }
+          vars[to] = stored[from];
+        }
+      }
+      const toRemove = (removed || []).filter(k => !has(vars, k));
+      // Same reason as the single-key removal below: an in-flight start would
+      // re-bake a removed key into the compose from its stale snapshot.
+      if (toRemove.length > 0) {
+        const activeOp = containerManager.isBotBusy(req.params.id);
+        if (activeOp) {
+          res.status(409).json({ success: false, error: `Bot operation in progress (${activeOp}); nothing was saved, retry when it completes` });
+          return;
+        }
       }
 
       // updateBot is the dual-write funnel: the store takes everything
       // (sensitive values encrypted), the record keeps the non-sensitive keys.
       await containerManager.updateBot(req.params.id, { envVars: { ...vars } });
+      const removal = containerManager.removeStoredEnvKeys(req.params.id, toRemove);
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json({ success: true, valid: validation.valid, missing: validation.missing });
+      if (removal.stillStored.length > 0) {
+        res.status(500).json({
+          success: false,
+          removed: removal.removed,
+          stillStored: removal.stillStored,
+          valid: validation.valid,
+          missing: validation.missing,
+          error: `Saved${removal.removed.length ? ` and removed ${removal.removed.join(', ')}` : ''}, but could not edit ${removal.composeFailures.join(', ')}, so ${removal.stillStored.join(', ')} ${removal.stillStored.length === 1 ? 'is' : 'are'} still stored; save again to retry the removal`,
+        });
+        return;
+      }
+      res.json({ success: true, removed: removal.removed, valid: validation.valid, missing: validation.missing });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1027,11 +1089,18 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(409).json({ success: false, error: `Bot operation in progress (${activeOp}); retry when it completes` });
         return;
       }
-      envManager.deleteEnvVar(req.params.id, req.params.key);
-      containerManager.removeBotEnvVars(req.params.id, [req.params.key]);
-      containerManager.removeEnvKeyFromDeployedCompose(req.params.id, req.params.key);
+      const unedited = containerManager.removeEnvKeyEverywhere(req.params.id, req.params.key);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      if (unedited.length > 0) {
+        res.status(500).json({
+          success: false,
+          valid: validation.valid,
+          missing: validation.missing,
+          error: `Could not edit ${unedited.join(', ')}, so ${req.params.key} is still stored; retry the removal`,
+        });
+        return;
+      }
       res.json({ success: true, valid: validation.valid, missing: validation.missing });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

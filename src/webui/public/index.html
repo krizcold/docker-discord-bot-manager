@@ -774,7 +774,7 @@
       <p style="color: var(--text-primary); margin-bottom: 14px; font-size: 0.9rem;">Are you sure you want to remove <strong id="delete-bot-name"></strong>?</p>
 
       <div style="background: var(--bg-tertiary); border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 0.85rem; color: var(--text-secondary); border-left: 3px solid var(--accent);">
-        This will uninstall the app from CasaOS and remove the bot.
+        <span id="delete-uninstall-desc">This will uninstall the app and remove the bot.</span>
       </div>
 
       <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 10px; padding: 12px; background: var(--bg-tertiary); border-radius: var(--radius);">
@@ -789,7 +789,7 @@
         <input type="checkbox" id="delete-also-env" style="margin-top: 3px;">
         <span>
           <strong style="color: var(--text-primary); font-size: 0.88rem;">Also remove environment variables</strong><br>
-          <span style="font-size: 0.8rem; color: var(--text-muted);">Env vars will be preserved in the Credentials Vault for recovery.</span>
+          <span style="font-size: 0.8rem; color: var(--text-muted);">By default, a copy goes to the Credentials Vault for recovery. Check this to delete them, even when data is preserved.</span>
         </span>
       </label>
 
@@ -797,7 +797,7 @@
         <strong style="color: var(--warning);">This action cannot be undone</strong>
         <ul style="margin: 6px 0 0 18px; line-height: 1.7;">
           <li>Bot configuration will be permanently removed</li>
-          <li>Application will be uninstalled from CasaOS</li>
+          <li id="delete-uninstall-step">Application will be uninstalled</li>
           <li id="data-warning">Without data deletion, all settings and user data will be preserved</li>
         </ul>
       </div>
@@ -874,6 +874,8 @@
     let currentLogsBotId = null;
     let envEditorBotId = null;
     let envEditorInitial = {};
+    let envEditorStored = [];
+    let deploymentMode = null;
     let configEditorBotId = null;
     const busyBots = new Set();
     function isTransientStatus(status) {
@@ -1271,6 +1273,7 @@
       try {
         const res = await api('GET', '/bots');
         bots = res.success ? (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
+        if (res.success && res.deploymentMode) deploymentMode = res.deploymentMode;
         if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
         bots = [];
@@ -1732,6 +1735,18 @@
       const envCheckbox = document.getElementById('delete-also-env');
       dataCheckbox.checked = false;
       envCheckbox.checked = false;
+      const desc = document.getElementById('delete-uninstall-desc');
+      const step = document.getElementById('delete-uninstall-step');
+      if (deploymentMode === 'casaos') {
+        desc.textContent = 'This will uninstall the app from CasaOS and remove the bot.';
+        step.textContent = 'Application will be uninstalled from CasaOS';
+      } else if (deploymentMode === 'docker') {
+        desc.textContent = "This will remove the bot's containers and the bot.";
+        step.textContent = "The bot's containers will be removed";
+      } else {
+        desc.textContent = 'This will uninstall the app and remove the bot.';
+        step.textContent = 'Application will be uninstalled';
+      }
       updateDataWarning();
       dataCheckbox.onchange = updateDataWarning;
       document.getElementById('delete-modal').classList.remove('hidden');
@@ -1763,8 +1778,11 @@
       busyBots.add(id); renderBots();
       try {
         const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`);
-        const msg = preserveData ? 'Bot removed (data preserved)' : 'Bot removed';
-        res.success ? showMessage('success', res.vaulted ? msg + ' (env vars moved to vault)' : msg) : showMessage('error', res.error || 'Failed to remove bot');
+        if (!res.success) { showMessage('error', res.error || 'Failed to remove bot'); return; }
+        let msg = preserveData ? 'Bot removed (data preserved)' : 'Bot removed';
+        if (!keepEnv) msg += res.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
+        else if (res.vaulted) msg += '; environment values copied to the vault';
+        showMessage('success', msg);
       } finally { busyBots.delete(id); loadBots(); }
     }
 
@@ -1804,6 +1822,7 @@
 
         // Snapshot rendered values (sensitive fields render blank) so the save
         // flow can detect changed values by key name.
+        envEditorStored = (res.vars || []).filter(v => v.isSet).map(v => v.key);
         envEditorInitial = {};
         document.querySelectorAll('#env-editor-rows .env-row').forEach(row => {
           const k = row.querySelector('.env-key');
@@ -1864,7 +1883,7 @@
       return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row${meta.list ? ' env-row-list' : ''}">
-          <input type="text" value="${escapeHtml(key)}" class="env-key" placeholder="KEY">
+          <input type="text" value="${escapeHtml(key)}" class="env-key" data-original-key="${escapeHtml(key)}" placeholder="KEY">
           ${valueHtml}
           ${genBtn}
           <button class="btn-remove" onclick="this.closest('div').parentElement.remove()" title="Remove">&times;</button>
@@ -2303,20 +2322,42 @@
       container.appendChild(wrapper);
     }
 
+    // Stored keys whose own row was removed or renamed in the editor, even when
+    // another row now holds that name.
+    function envEditorRemovedKeys(storedKeys, rows) {
+      return storedKeys.filter(k => !rows.some(r => r.key === k && r.originalKey === k));
+    }
+
     async function saveEnvEditor() {
       const rows = document.querySelectorAll('#env-editor-rows .env-row');
       const vars = {};
+      const rowKeys = [];
+      const rowOrigins = [];
+      const renamed = {};
       rows.forEach(row => {
-        const key = row.querySelector('.env-key').value.trim();
+        const keyInput = row.querySelector('.env-key');
+        const key = keyInput.value.trim();
+        if (key) rowKeys.push(key);
+        const originalKey = keyInput.dataset.originalKey || '';
+        rowOrigins.push({ key, originalKey });
         const valueInput = row.querySelector('.env-value');
         if (!key || !valueInput) return;
         const value = valueInput.value;
         // A blank secret field means "keep the stored value" (it was masked on load).
         // Omit it so the server-side merge preserves the secret; sending the blank
         // would re-encrypt an empty string and wipe the token.
-        if (valueInput.dataset.sensitive === 'true' && value === '') return;
+        // A renamed blank secret is a rename: the server carries the stored value.
+        if (valueInput.dataset.sensitive === 'true' && value === '') {
+          if (originalKey && originalKey !== key && envEditorStored.includes(originalKey)) renamed[key] = originalKey;
+          return;
+        }
         vars[key] = value;
       });
+      const dupes = rowKeys.filter((k, i) => rowKeys.indexOf(k) !== i);
+      if (dupes.length > 0) {
+        showMessage('error', `Two rows hold the same key (${[...new Set(dupes)].join(', ')}); give each row its own key, then save. Nothing was saved.`);
+        return;
+      }
 
       const saveBtn = document.querySelector('#env-editor-content .btn-primary');
       saveBtn.disabled = true;
@@ -2340,13 +2381,16 @@
           saveBtn.textContent = 'Saving...';
         }
 
-        const res = await api('PUT', `/bots/${envEditorBotId}/env`, { vars });
+        const removed = envEditorRemovedKeys(envEditorStored, rowOrigins);
+        const res = await api('PUT', `/bots/${envEditorBotId}/env`, { vars, removed, renamed });
         if (res.success) {
-          showMessage('success', 'Environment variables saved');
+          const gone = res.removed || [];
+          showMessage('success', gone.length ? `Environment variables saved; removed ${gone.join(', ')}` : 'Environment variables saved');
           hideEnvEditor();
           loadBots();
         } else {
           showMessage('error', res.error || 'Failed to save');
+          if (res.stillStored) { hideEnvEditor(); loadBots(); }
         }
       } catch (err) {
         showMessage('error', 'Failed to save environment variables');
@@ -2483,17 +2527,21 @@
           : p.cancelable
             ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
             : '';
-        still.innerHTML = `<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${cancelHtml}`;
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${cancelHtml}`;
         setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
         return;
       }
       if (r && r.parkedSeed) {
         const k = r.parkedSeed;
-        still.innerHTML = `<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}
           <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}', '${hint}')">Dismiss</button></div></div>`;
         return;
       }
-      still.innerHTML = '';
+      still.innerHTML = seedWarningHtml(r && r.pinsWarning);
+    }
+
+    function seedWarningHtml(warning) {
+      return warning ? `<div class="error-message">${escapeHtml(warning)}</div>` : '';
     }
 
     // ─── Fleet DB Replication (PLAN_REPLICATION.md Stage 1) ───
@@ -2662,6 +2710,7 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
         if (!res.success) { showMessage('error', res.error || 'Decommission refused'); return; }
+        if (res.warning) { showMessage('error', `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}`); return; }
         showMessage('success', res.dumpFile
           ? `Database decommissioned; safety dump kept: ${res.dumpFile}`
           : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list)');
@@ -2754,7 +2803,9 @@
       if (!confirm('Disable replication?\n\nRefused while any standby is still streaming: stop or remove standbys first. Inactive standby slots are dropped, the replication login is revoked, and the published port closes and the database URL reverts on the next restart.')) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
-        if (res.success) {
+        if (res.success && res.warning) {
+          showMessage('error', `${res.warning}. Restart the instance to apply.`);
+        } else if (res.success) {
           showMessage('success', 'Replication disabled. Restart the instance to apply.');
         } else {
           showMessage('error', res.error || 'Failed to disable replication');
@@ -3054,10 +3105,10 @@
       // record with a whole copy is a manager restart in the apply window, and
       // the retire warning is the one to keep.
       const parkedHint = parked && parked.committed && parked.copyWhole === true && parked.purpose !== 'provision' ? (res.failback ? 'copy-whole-run' : 'copy-whole') : hint;
-      const errHtml = parked
+      const errHtml = seedWarningHtml(r.pinsWarning) + (parked
         ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}
              <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}', '${parkedHint}')">Dismiss</button></div></div>`
-        : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '';
+        : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>` : '');
       // A seed-first transfer (20.19 F21) in flight or parked; a live one keeps
       // this panel polling, a parked one shows its reason until dismissed.
       const run = res.transfer || null;

@@ -272,7 +272,7 @@ export async function enableFleetReplication(
  */
 export async function disableFleetReplication(
   instance: InstanceConfig,
-): Promise<{ success: boolean; error?: string; restartRequired?: boolean }> {
+): Promise<{ success: boolean; error?: string; restartRequired?: boolean; warning?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
   const dbPassword = storedDbPassword(instance);
@@ -341,12 +341,16 @@ export async function disableFleetReplication(
   if (!dbEnv) return { success: false, error: 'This app declares no managed database companion' };
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
+  let unedited: string[] = [];
   if (dbEnv.publicUrl) {
     envManager.deleteEnvVar(instance.id, dbEnv.publicUrl);
     containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
-    containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
+    unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
   }
   containerManager.updateInstanceFleetDbReplication(instance.id, null);
+  if (unedited.length > 0) {
+    return { success: true, restartRequired: true, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
+  }
   return { success: true, restartRequired: true };
 }
 

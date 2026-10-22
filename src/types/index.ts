@@ -305,6 +305,7 @@ export interface InstanceConfig {
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
+  fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   fleetTransfer?: FleetTransferRun;    // seed-first transfer in flight or parked (20.19 F21); cleared when the promote is handed to the app
   fleetFailback?: FleetFailbackRun;    // failback or drop-back run in flight or parked (20.5, B6-i); cleared when it finishes, is cancelled or dismissed
   fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it

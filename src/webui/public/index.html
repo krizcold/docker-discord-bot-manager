@@ -1651,7 +1651,7 @@
       try {
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled });
         if (!res.success) showMessage('error', res.error || 'Failed to toggle auto-update');
-        else loadBots();
+        else { if (res.message) showMessage('warning', res.message); loadBots(); }
       } catch (err) {
         showMessage('error', 'Failed to toggle auto-update');
         loadBots();
@@ -1721,7 +1721,8 @@
       try {
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled });
         if (res.success) {
-          showMessage('success', `Auto-update ${enabled ? 'enabled' : 'disabled'}`);
+          if (res.message) showMessage('warning', res.message);
+          else showMessage('success', `Auto-update ${enabled ? 'enabled' : 'disabled'}`);
         } else {
           showMessage('error', res.error || 'Failed to toggle auto-update');
         }

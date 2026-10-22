@@ -38,6 +38,7 @@ import { listCorruptCopies } from '../../config/storeFile';
 import { hasAppHooks } from '../../instance/appHookClient';
 import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
+import { isAutoRebuilding } from '../../instance/instanceUpdater';
 import * as fleetTransfer from '../../instance/fleetTransfer';
 import * as fleetFailback from '../../instance/fleetFailback';
 
@@ -1447,7 +1448,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const updated = containerManager.updateInstanceAutoUpdate(req.params.id, enabled, interval, hour);
       broadcastToClients(wss, 'bot:updated', publicBot(updated));
-      res.json({ success: true, autoUpdate: enabled, autoUpdateInterval: updated?.autoUpdateInterval, autoUpdateHour: updated?.autoUpdateHour });
+      const rebuildInProgress = isAutoRebuilding(req.params.id);
+      res.json({
+        success: true, autoUpdate: enabled, autoUpdateInterval: updated?.autoUpdateInterval, autoUpdateHour: updated?.autoUpdateHour,
+        rebuildInProgress,
+        ...(rebuildInProgress && !enabled ? { message: "Auto-update is off for future checks, but an automatic rebuild had already started and is still running; check the bot's log for its result." } : {}),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

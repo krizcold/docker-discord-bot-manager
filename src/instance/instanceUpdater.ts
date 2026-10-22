@@ -29,6 +29,11 @@ let broadcastFn: ((type: string, data: unknown) => void) | null = null;
 
 // Guard against concurrent rebuild of the same instance
 const rebuildingInstances: Set<string> = new Set();
+let ticking = false;
+
+export function isAutoRebuilding(id: string): boolean {
+  return rebuildingInstances.has(id);
+}
 
 /**
  * Set the WebSocket broadcast function (called from server wiring).
@@ -81,6 +86,9 @@ async function runInstanceUpdateTick(): Promise<void> {
       const fetchResult = await sourceManager.fetchSource(bot.sourceId);
       const source = sourceManager.getSource(bot.sourceId);
 
+      const now = containerManager.getBot(bot.id);
+      if (!now || !now.autoUpdate || now.sourceId !== bot.sourceId || now.lastBuiltCommit !== bot.lastBuiltCommit) continue;
+
       if (!source || !source.lastCommitHash) continue;
       if (!bot.lastBuiltCommit) continue;
       if (bot.lastBuiltCommit === source.lastCommitHash) continue;
@@ -123,9 +131,11 @@ export function startInstanceUpdater(): void {
   console.log(`[InstanceUpdater] Started (tick: ${TICK_INTERVAL_MS / 1000}s)`);
 
   intervalHandle = setInterval(() => {
+    if (ticking) return;
+    ticking = true;
     runInstanceUpdateTick().catch(err => {
       console.error('[InstanceUpdater] Tick error:', err);
-    });
+    }).finally(() => { ticking = false; });
   }, TICK_INTERVAL_MS);
 }
 

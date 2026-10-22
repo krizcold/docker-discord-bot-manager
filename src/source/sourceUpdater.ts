@@ -13,6 +13,7 @@ import * as sourceManager from './sourceManager';
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
+let cycling = false;
 
 // WebSocket broadcast function, set by wiring code
 let broadcastFn: ((type: string, data: unknown) => void) | null = null;
@@ -30,8 +31,9 @@ export function setSourceBroadcast(fn: (type: string, data: unknown) => void): v
 async function runSourceUpdateCycle(): Promise<void> {
   const sources = sourceManager.getAllSources();
 
-  for (const source of sources) {
-    if (!source.autoUpdate) continue;
+  for (const listed of sources) {
+    const source = sourceManager.getSource(listed.id);
+    if (!source || !source.autoUpdate) continue;
 
     // Skip sources that haven't been cloned yet; don't auto-clone default sources
     if (!source.lastChecked) continue;
@@ -66,9 +68,11 @@ export function startSourceUpdater(): void {
   console.log(`[SourceUpdater] Started (interval: ${CHECK_INTERVAL_MS / 60000}min)`);
 
   intervalHandle = setInterval(() => {
+    if (cycling) return;
+    cycling = true;
     runSourceUpdateCycle().catch(err => {
       console.error('[SourceUpdater] Cycle error:', err);
-    });
+    }).finally(() => { cycling = false; });
   }, CHECK_INTERVAL_MS);
 }
 

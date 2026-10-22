@@ -56,16 +56,22 @@ export function parseConfig(format: ConfigFormat, body: string): ParseResult {
   }
 }
 
+export interface SerializeResult {
+  body: string;
+  skipped: string[];   // paths of ops that could not be applied
+}
+
 /**
  * Apply set/delete ops to a body in place. A no-op list returns the body
  * verbatim (byte-stable), so an untouched config is delivered exactly as shipped.
  */
-export function serializeConfig(format: ConfigFormat, body: string, ops: ConfigOp[]): string {
-  if (ops.length === 0) return body;
+export function serializeConfig(format: ConfigFormat, body: string, ops: ConfigOp[]): SerializeResult {
+  const skipped: string[] = [];
+  if (ops.length === 0) return { body, skipped };
 
   if (format === 'yaml') {
     const yamlOps: YamlOp[] = ops.map(o => ({ path: o.path, value: o.value, remove: o.remove }));
-    return applyYamlOps(body, yamlOps, { createMissing: true });
+    return { body: applyYamlOps(body, yamlOps, { createMissing: true, skipped }), skipped };
   }
 
   // json / jsonc: edit in place, preserving comments + formatting. `modify` with
@@ -73,20 +79,21 @@ export function serializeConfig(format: ConfigFormat, body: string, ops: ConfigO
   // (creating missing intermediate objects). Each op is guarded so a
   // non-applicable op (removing an absent node, a parent type mismatch, an
   // out-of-range index) is a no-op instead of throwing out and discarding the
-  // whole batch - matching the YAML branch's resilience.
+  // whole batch - matching the YAML branch's resilience. A skipped op's path is
+  // reported so the caller never treats it as written.
   let out = body;
   const formattingOptions = { insertSpaces: true, tabSize: 2 };
   for (const op of ops) {
     const segments = splitPath(op.path);
-    if (segments.length === 0) continue;
+    if (segments.length === 0) { skipped.push(op.path); continue; }
     const newValue = op.remove ? undefined : op.value;
     try {
       const modOpts = op.insert ? { formattingOptions, isArrayInsertion: true } : { formattingOptions };
       const edits = modify(out, segments, newValue, modOpts);
       out = applyEdits(out, edits);
     } catch {
-      // op did not apply; leave the body unchanged and continue.
+      skipped.push(op.path);
     }
   }
-  return out;
+  return { body: out, skipped };
 }

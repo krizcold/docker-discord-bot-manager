@@ -29,7 +29,7 @@ export function createConfigRoutes(): Router {
     }
   });
 
-  // POST /api/config/serialize { format, body, ops } -> { success, body }
+  // POST /api/config/serialize { format, body, ops } -> { success, body, skipped }
   router.post('/serialize', (req: Request, res: Response) => {
     try {
       const { format, body, ops } = req.body as { format?: unknown; body?: unknown; ops?: unknown };
@@ -37,7 +37,7 @@ export function createConfigRoutes(): Router {
         res.status(400).json({ success: false, error: 'format (json|yaml), body, and ops[] are required' });
         return;
       }
-      res.json({ success: true, body: serializeConfig(format, body, ops as ConfigOp[]) });
+      res.json({ success: true, ...serializeConfig(format, body, ops as ConfigOp[]) });
     } catch (error) {
       console.error('[config route] error:', error);   // detail stays server-side; body may hold a token
       res.status(500).json({ success: false, error: 'Internal error' });

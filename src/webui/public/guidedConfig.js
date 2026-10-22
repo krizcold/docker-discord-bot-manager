@@ -60,7 +60,7 @@
   window.guidedRegister = function (blockId, manifest, format, parsed) {
     let tokenPath = null;
     walkFields(manifest.sections, f => { if (!tokenPath && f.type === 'password' && f.target) tokenPath = f.target.path; });
-    REG[blockId] = { manifest, format: format || 'json', parsed: parsed || {}, tokenPath, pendingOps: [], serializeTimer: null, parseTimer: null, serializing: false, dirty: false, inflight: null, listSpecs: {}, expanded: {} };
+    REG[blockId] = { manifest, format: format || 'json', parsed: parsed || {}, tokenPath, pendingOps: [], serializeTimer: null, parseTimer: null, inflight: null, serializeError: null, parseError: null, skipped: [], envStash: {}, listSpecs: {}, expanded: {} };
   };
 
   function textareaOf(id) { const b = document.getElementById(id); return b ? b.querySelector('.cf-body') : null; }
@@ -73,42 +73,104 @@
     clearTimeout(s.serializeTimer);
     s.serializeTimer = setTimeout(() => flushSerialize(id), 250);
   }
-  // Serialize pending ops into the raw .cf-body. One request in flight per block;
-  // edits that arrive mid-flight are coalesced and re-run, and s.inflight resolves
-  // only when the whole chain settles (so guidedFlushAll can await it).
+  // One badge per block; a failed write outranks a skipped field, which outranks
+  // a raw parse problem.
+  function showBadge(id) {
+    const s = st(id); const badge = document.getElementById(id + '-badge'); if (!s || !badge) return;
+    let text = '';
+    if (s.serializeError) text = 'A form change was not written to the file: ' + s.serializeError;
+    else if (s.unconfirmed) text = 'No answer from the manager yet; could not confirm the form change was written';
+    else if (s.skipped.length) text = 'Could not apply: ' + s.skipped.join(', ') + ' - fix the file in Raw';
+    else if (s.parseError) text = s.parseError;
+    badge.textContent = text;
+    badge.className = text ? 'gc-badge gc-badge-warn' : 'gc-badge';
+  }
+
+  // Serialize pending ops into the raw .cf-body. One loop runs per block; ops
+  // that arrive meanwhile are picked up by it. An answer lands only when the
+  // textarea still holds the body that was sent; after a raw edit the same ops
+  // are re-run on the current body. A failed request puts the ops back and the
+  // chain resolves false, so a save can refuse instead of dropping them.
   function flushSerialize(id) {
-    const s = st(id); if (!s) return Promise.resolve();
+    const s = st(id); if (!s) return Promise.resolve(true);
     clearTimeout(s.serializeTimer);
-    if (s.serializing) { s.dirty = true; return s.inflight || Promise.resolve(); }
-    if (!s.pendingOps.length) return s.inflight || Promise.resolve();
-    const ta = textareaOf(id); if (!ta) { s.pendingOps = []; return Promise.resolve(); }
-    const ops = s.pendingOps; s.pendingOps = [];
-    s.serializing = true;
-    s.inflight = api('POST', '/config/serialize', { format: s.format, body: ta.value, ops })
-      .then(r => {
-        // Never overwrite a textarea the user is actively editing (raw tab).
-        const t = textareaOf(id);
-        if (r && r.success && typeof r.body === 'string' && t && document.activeElement !== t) t.value = r.body;
-      })
-      .catch(() => { })
-      .then(() => { s.serializing = false; if (s.dirty || s.pendingOps.length) { s.dirty = false; return flushSerialize(id); } });
+    if (s.inflight) return s.inflight;
+    if (!s.pendingOps.length) return Promise.resolve(!s.serializeError);
+    s.inflight = runSerialize(id, s).then(ok => { s.inflight = null; return ok; });
     return s.inflight;
+  }
+  async function runSerialize(id, s) {
+    let reparse = false;
+    while (s.pendingOps.length) {
+      const ta = textareaOf(id); if (!ta) return false;
+      const ops = s.pendingOps; s.pendingOps = [];
+      const sent = ta.value;
+      s.parseDuringFlight = false;
+      let r = null;
+      try { r = await api('POST', '/config/serialize', { format: s.format, body: sent, ops }); } catch { r = null; }
+      const t = textareaOf(id);
+      if (!r || !r.success || typeof r.body !== 'string') {
+        s.pendingOps = ops.concat(s.pendingOps);
+        s.serializeError = (r && r.error) || 'the request failed';
+        showBadge(id);
+        return false;
+      }
+      if (!t) return false;
+      if (t.value !== sent) { s.pendingOps = ops.concat(s.pendingOps); reparse = true; continue; }
+      t.value = r.body;
+      s.serializeError = null;
+      s.unconfirmed = false;
+      if (s.parseDuringFlight) reparse = true;
+      const skipped = Array.isArray(r.skipped) ? r.skipped : [];
+      const sentPaths = ops.map(o => o.path);
+      s.skipped = s.skipped.filter(p => sentPaths.indexOf(p) < 0).concat(skipped.filter((p, i) => skipped.indexOf(p) === i));
+      showBadge(id);
+      if (skipped.length) reparse = true;
+    }
+    if (reparse) guidedRawEdit(id, true);
+    return !s.serializeError;
   }
   // Await every block's pending/in-flight serialize so collectors read a current
   // raw body (the install/save buttons call this before reading .cf-body).
-  window.guidedFlushAll = async function () {
+  // Resolves false when any block holds a change that is not in its raw body.
+  // Only blocks inside the modal being saved (rootSel) count; a closed modal keeps its blocks in the DOM.
+  function inScope(id, rootSel) {
+    const block = document.getElementById(id);
+    if (!block) return false;
+    if (!rootSel) return true;
+    const root = document.querySelector(rootSel);
+    return !!root && root.contains(block);
+  }
+  window.guidedFlushAll = async function (rootSel) {
     // Drop entries whose block left the DOM (bounds REG growth across a session).
     for (const id in REG) {
       if (!document.getElementById(id)) { clearTimeout(REG[id].serializeTimer); clearTimeout(REG[id].parseTimer); delete REG[id]; }
     }
-    for (const id in REG) flushSerialize(id);
-    // Await each block's serialize chain, but never block the button forever.
+    let ok = true;
     for (const id in REG) {
-      const s = REG[id]; let guard = 0;
-      while ((s.serializing || s.pendingOps.length) && guard++ < 50) {
-        await Promise.race([s.inflight || Promise.resolve(), new Promise(r => setTimeout(r, 200))]);
+      if (!inScope(id, rootSel)) continue;
+      const s = REG[id];
+      s.serializeError = null;
+      s.unconfirmed = false;
+      const done = await Promise.race([flushSerialize(id), new Promise(r => setTimeout(() => r('timeout'), 10000))]);
+      if (done === 'timeout') { s.unconfirmed = true; showBadge(id); }
+      if (done !== true || s.pendingOps.length || s.inflight || s.skipped.length) ok = false;
+    }
+    return ok;
+  };
+
+  // In-file values that a save would erase because their field moved to From env.
+  window.guidedPendingErasures = function (rootSel) {
+    const out = [];
+    for (const id in REG) {
+      if (!inScope(id, rootSel)) continue;
+      const s = REG[id];
+      for (const path in s.envStash) {
+        const f = findField(s.manifest, path);
+        if (f && envAltMode(s, f) === 'env') out.push({ label: f.label || path, envVar: f.envAlt.var });
       }
     }
+    return out;
   };
 
   // ─── parse (raw body -> guided form) ───
@@ -116,16 +178,18 @@
   window.guidedRawEdit = function (id, immediate) {
     const s = st(id); const ta = textareaOf(id); if (!s || !ta) return;
     clearTimeout(s.parseTimer);
+    if (s.inflight) s.parseDuringFlight = true;
+    if (!immediate && s.skipped.length) { s.skipped = []; showBadge(id); }
     const run = () => {
       api('POST', '/config/parse', { format: s.format, body: ta.value }).then(r => {
-        const badge = document.getElementById(id + '-badge');
         if (r && r.success && r.ok) {
           s.parsed = r.data || {};
-          if (badge) { badge.textContent = ''; badge.className = 'gc-badge'; }
+          s.parseError = null;
           const form = document.getElementById(id + '-form');
           if (form && !form.classList.contains('hidden')) { form.innerHTML = buildGuidedFormHtml(id); guidedValidateAll(id); }
-        } else if (badge) { badge.textContent = 'Raw has errors - form paused'; badge.className = 'gc-badge gc-badge-warn'; }
-      }).catch(() => { });
+        } else s.parseError = (r && r.success) ? 'Raw has errors - form paused' : 'Could not refresh the form; showing earlier values';
+        showBadge(id);
+      }).catch(() => { s.parseError = 'Could not refresh the form; showing earlier values'; showBadge(id); });
     };
     if (immediate) run(); else s.parseTimer = setTimeout(run, 400);
   };
@@ -137,7 +201,7 @@
     const tabs = block.querySelectorAll('.gc-tab');
     tabs.forEach(t => t.classList.toggle('active', t.getAttribute('data-tab') === which));
     if (which === 'raw') { flushSerialize(id); form.classList.add('hidden'); ta.classList.remove('hidden'); }
-    else { ta.classList.add('hidden'); form.classList.remove('hidden'); guidedRawEdit(id, true); }
+    else { ta.classList.add('hidden'); form.classList.remove('hidden'); flushSerialize(id).then(() => guidedRawEdit(id, true)); }
   };
 
   function guidedRefresh(id) {
@@ -153,10 +217,22 @@
     return el.value;
   }
 
+  // An empty or invalid number leaves the body unchanged; the input says so and
+  // shows the kept value again when it loses focus.
+  function flagInvalid(el, kept) {
+    el.classList.add('gc-invalid');
+    el.title = 'Not a number: the file keeps ' + (kept == null ? 'its value' : kept);
+    el.onblur = () => { el.value = kept == null ? '' : kept; el.classList.remove('gc-invalid'); el.title = ''; el.onblur = null; };
+  }
+  function clearInvalid(el) {
+    if (el.classList && el.classList.contains('gc-invalid')) { el.classList.remove('gc-invalid'); el.title = ''; el.onblur = null; }
+  }
+
   window.guidedEdit = function (id, path, type, el) {
     const s = st(id); if (!s) return;
     const val = coerce(type, el);
-    if (val === null) return;   // empty/invalid number: leave body unchanged
+    if (val === null) { flagInvalid(el, getAt(s.parsed, path)); return; }
+    clearInvalid(el);
     setAt(s.parsed, path, val);
     pushOp(s, { path, value: val });
     if (type === 'text') scheduleSerialize(id); else flushSerialize(id);
@@ -179,14 +255,24 @@
 
   // Switch an envAlt field between In file and From env. Writes the body flag
   // (so it round-trips) and, when moving to env, clears the in-file value with
-  // value:'' (not remove) to keep the key + comments intact. The env VALUE is
-  // entered separately in the env-vars section.
+  // value:'' (not remove) to keep the key + comments intact. The cleared value
+  // is kept here and written back on the switch to In file; a save while it is
+  // cleared asks first (guidedPendingErasures). The env VALUE is entered
+  // separately in the env-vars section.
   window.guidedEnvAltMode = function (id, path, mode) {
     const s = st(id); if (!s) return;
     const f = findField(s.manifest, path); if (!f || !f.envAlt) return;
+    if (envAltMode(s, f) === mode) return;
     const toEnv = mode === 'env';
     if (f.envAlt.flagPath) { setAt(s.parsed, f.envAlt.flagPath, toEnv); pushOp(s, { path: f.envAlt.flagPath, value: toEnv }); }
-    if (toEnv) { setAt(s.parsed, path, ''); pushOp(s, { path, value: '' }); }
+    if (toEnv) {
+      const cur = getAt(s.parsed, path);
+      if (cur !== undefined && cur !== '') s.envStash[path] = cur;
+      setAt(s.parsed, path, ''); pushOp(s, { path, value: '' });
+    } else if (Object.prototype.hasOwnProperty.call(s.envStash, path)) {
+      const back = s.envStash[path]; delete s.envStash[path];
+      setAt(s.parsed, path, back); pushOp(s, { path, value: back });
+    }
     flushSerialize(id);
     guidedRefresh(id);
   };
@@ -223,8 +309,10 @@
 
   window.guidedListEdit = function (id, listPath, index, key, type, el) {
     const s = st(id); if (!s) return;
-    const val = coerce(type, el); if (val === null) return;
     const fullPath = elemPath(listPath, index, key);
+    const val = coerce(type, el);
+    if (val === null) { flagInvalid(el, getAt(s.parsed, fullPath)); return; }
+    clearInvalid(el);
     setAt(s.parsed, fullPath, val);
     pushOp(s, { path: fullPath, value: val });
     if (type === 'text') scheduleSerialize(id);        // keep focus while typing
@@ -370,6 +458,10 @@
     return `<div class="gc-field gc-envalt">${label}${sw}${body}${help}</div>`;
   }
 
+  function skipNote(s, path) {
+    return s && s.skipped.indexOf(path) >= 0 ? '<div class="gc-help gc-skip">This change could not be written to the file.</div>' : '';
+  }
+
   // Render one field bound to an absolute path (top-level fields).
   function renderField(id, f, disabled) {
     const path = f.target.path;
@@ -381,13 +473,13 @@
       const val = curVal(s, path, f.default);
       const control = `<label class="gc-bool"><span class="toggle-switch"><input type="checkbox" ${val ? 'checked' : ''} ${dis} onchange="guidedEdit('${id}','${esc(path)}','boolean',this)"><span class="toggle-slider"></span></span></label>`;
       const label = `<div class="gc-label">${esc(f.label)}${f.required ? reqStar : ''}</div>`;
-      return `<div class="gc-field gc-field-inline">${control}${label}</div>`;
+      return `<div class="gc-field gc-field-inline">${control}${label}</div>${skipNote(s, path)}`;
     }
-    if (f.envAlt) return renderEnvAltField(id, s, f, path, dis);
+    if (f.envAlt) return renderEnvAltField(id, s, f, path, dis) + skipNote(s, path);
     const label = `<div class="gc-label">${esc(f.label)}${f.required ? reqStar : ''}</div>`;
     const help = f.help ? `<div class="gc-help">${esc(f.help)}</div>` : '';
     const control = renderScalarControl(id, f, path, curVal(s, path, f.default), dis);
-    return `<div class="gc-field">${label}${control}${help}</div>`;
+    return `<div class="gc-field">${label}${control}${help}${skipNote(s, path)}</div>`;
   }
 
   // Render one element field: a scalar list element, or one object property
@@ -565,6 +657,8 @@
     .gc-tab.active{background:var(--accent,#5865f2);color:#fff;border-color:var(--accent,#5865f2)}
     .gc-badge{font-size:.68rem;color:var(--text-muted,#999)}
     .gc-badge-warn{color:#e0a106}
+    .gc-skip{color:#e0a106}
+    .gc-invalid{outline:1px solid #e0a106}
     .gc-srcswitch{display:inline-flex;gap:4px;margin-bottom:4px}
     .gc-srcswitch button{background:var(--bg-alt,#222);border:1px solid var(--border,#444);color:var(--text-muted,#aaa);border-radius:5px;padding:2px 9px;font-size:.68rem;cursor:pointer}
     .gc-srcswitch button.active{background:var(--accent,#5865f2);color:#fff;border-color:var(--accent,#5865f2)}

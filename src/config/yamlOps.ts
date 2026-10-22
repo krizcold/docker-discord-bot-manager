@@ -23,14 +23,16 @@ export interface YamlOp {
   remove?: boolean;    // true => delete the node at path
 }
 
-export function applyYamlOps(body: string, ops: YamlOp[], opts?: { createMissing?: boolean }): string {
+// opts.skipped, when given, collects the path of every op that failed to apply
+// (not one that createMissing:false leaves alone by policy).
+export function applyYamlOps(body: string, ops: YamlOp[], opts?: { createMissing?: boolean; skipped?: string[] }): string {
   const createMissing = opts?.createMissing ?? false;
   try {
     const doc = parseDocument(body);
     let changed = false;
     for (const op of ops) {
       const keys = splitPath(op.path);
-      if (keys.length === 0) continue;
+      if (keys.length === 0) { opts?.skipped?.push(op.path); continue; }
       try {
         if (op.remove) {
           if (doc.hasIn(keys)) { doc.deleteIn(keys); changed = true; }
@@ -41,12 +43,14 @@ export function applyYamlOps(body: string, ops: YamlOp[], opts?: { createMissing
       } catch (err) {
         // one bad op (e.g. setting a child under a scalar) is skipped, not fatal
         console.warn(`[yamlOps] skipped op for path "${op.path}":`, err instanceof Error ? err.message : err);
+        opts?.skipped?.push(op.path);
       }
     }
     // Only re-serialize when something actually changed, so an op that matched
     // nothing leaves the body byte-for-byte intact (no incidental reformatting).
     return changed ? doc.toString() : body;
   } catch {
+    if (opts?.skipped) for (const op of ops) if (!opts.skipped.includes(op.path)) opts.skipped.push(op.path);
     return body;   // malformed YAML: leave untouched
   }
 }

@@ -1050,7 +1050,7 @@ export function sanitizeSeedRows(manifest: ConfigManifest, body: string): string
     const cleaned = arr.filter(item => !isSeedElement(f.element as ListElement, item));
     if (cleaned.length !== arr.length) ops.push({ path: f.target.path, value: cleaned });
   });
-  return ops.length ? serializeConfig(manifest.format, body, ops) : body;
+  return ops.length ? serializeConfig(manifest.format, body, ops).body : body;
 }
 
 /** True when the manifest configures the BOT token via an in-file field (marked

@@ -4739,8 +4739,21 @@
       document.getElementById('config-editor-rows').insertAdjacentHTML('beforeend', buildConfigFileBlockHtml('', ''));
     }
 
+    // Flush the guided forms and confirm any in-file value a save would erase.
+    // False means nothing may be saved (the reason is already shown).
+    async function guidedReadyToSave(rootSel) {
+      if (window.guidedFlushAll && !(await guidedFlushAll(rootSel))) {
+        showMessage('error', 'A form change could not be written into its file (see the warning on the file). Nothing was saved.');
+        return false;
+      }
+      const erasing = window.guidedPendingErasures ? guidedPendingErasures(rootSel) : [];
+      if (erasing.length && !confirm('Saving clears the value stored in the file for: '
+        + erasing.map(e => e.label + ' (now read from ' + e.envVar + ')').join(', ') + '. Continue?')) return false;
+      return true;
+    }
+
     async function saveConfigEditor() {
-      if (window.guidedFlushAll) await guidedFlushAll();
+      if (!(await guidedReadyToSave('#config-editor-rows'))) return;
       const files = [];
       document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();
@@ -5175,7 +5188,7 @@
       });
 
       // Flush any pending guided-form edits into the raw bodies before collecting.
-      if (window.guidedFlushAll) await guidedFlushAll();
+      if (!(await guidedReadyToSave('#install-config-files'))) return;
 
       // Collect config files (path + verbatim body)
       const configFiles = [];
@@ -5191,29 +5204,35 @@
       const btn = document.getElementById('install-btn');
       btn.disabled = true; btn.textContent = 'Creating...';
 
+      // A retry after a partial failure reuses the instance already created, so a
+      // second press never makes a duplicate.
+      let step = 'create';
       try {
-        const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name });
-        if (res.success) {
+        if (!installBotId) {
+          const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name });
+          if (!res.success) { showMessage('error', res.error || 'Failed to create instance'); return; }
           installBotId = res.bot.id;
-
-          // Save env vars if any were filled
-          const hasVars = Object.keys(vars).some(k => vars[k]);
-          if (hasVars) {
-            await api('PUT', `/bots/${res.bot.id}/env`, { vars });
-          }
-
-          // Save config files if any were supplied
-          if (configFiles.length > 0) {
-            await api('PUT', `/bots/${res.bot.id}/config`, { files: configFiles });
-          }
-
-          showMessage('success', 'Bot instance created. Press Install & Run on the bot card.');
-          hideInstallModal();
-        } else {
-          showMessage('error', res.error || 'Failed to create instance');
         }
+        const botId = installBotId;
+
+        const hasVars = Object.keys(vars).some(k => vars[k]);
+        if (hasVars) {
+          step = 'env';
+          const r = await api('PUT', `/bots/${botId}/env`, { vars });
+          if (!r.success) { showMessage('error', `Instance created, but its environment variables were not saved: ${r.error || 'unknown error'}. Press Save & Install to retry.`); return; }
+        }
+
+        if (configFiles.length > 0) {
+          step = 'config';
+          const r = await api('PUT', `/bots/${botId}/config`, { files: configFiles });
+          if (!r.success) { showMessage('error', `Instance created, but its config files were not saved: ${r.error || 'unknown error'}. Press Save & Install to retry.`); return; }
+        }
+
+        showMessage('success', 'Bot instance created. Press Install & Run on the bot card.');
+        hideInstallModal();
       } catch (err) {
-        showMessage('error', 'Failed to create instance');
+        if (step === 'create') showMessage('error', 'Could not confirm the instance was created; check the bot list before trying again.');
+        else showMessage('error', `Instance created, but could not confirm its ${step === 'env' ? 'environment variables' : 'config files'} were saved. Press Save & Install to retry.`);
       } finally {
         btn.disabled = false; btn.textContent = 'Save & Install';
       }
@@ -5364,13 +5383,25 @@
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
-          await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
+          const res = await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
+          if (!res.success) {
+            showMessage('error', res.error || 'Failed to save');
+            return;
+          }
         } else {
           // Bot instance: update just this one var. The server-side merge preserves
           // every other var, so we must NOT resend the whole set (the others come
           // back with secrets masked to '' and would wipe stored tokens).
+          if (newKey !== originalKey) {
+            showMessage('error', 'A bot instance variable cannot be renamed here; rename it in the bot\'s Env editor. Nothing was saved.');
+            return;
+          }
           if (newValue) {
-            await api('PUT', `/bots/${groupId}/env`, { vars: { [originalKey]: newValue } });
+            const res = await api('PUT', `/bots/${groupId}/env`, { vars: { [originalKey]: newValue } });
+            if (!res.success) {
+              showMessage('error', res.error || 'Failed to save');
+              return;
+            }
           }
         }
         row.classList.remove('dirty');
@@ -5388,7 +5419,8 @@
       // user can't trigger parallel deletes by rapid-clicking.
       const unlock = lockBtns(document.querySelectorAll('#vault-list .vault-entry-btn.delete'));
       try {
-        await api('DELETE', `/vault/standalone/${encodeURIComponent(key)}`);
+        const res = await api('DELETE', `/vault/standalone/${encodeURIComponent(key)}`);
+        if (!res.success) showMessage('error', res.error || 'Failed to delete entry');
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
@@ -5443,7 +5475,8 @@
       if (!key) return;
 
       try {
-        await api('POST', '/vault/standalone', { key, value, hidden: newVaultHidden });
+        const res = await api('POST', '/vault/standalone', { key, value, hidden: newVaultHidden });
+        if (!res.success) { showMessage('error', res.error || 'Failed to add vault entry'); return; }
         loadVault();
       } catch (err) {
         showMessage('error', 'Failed to add vault entry');

@@ -4794,8 +4794,14 @@
     let filesScope = 'host';
     let filesCwd = '';
     let filesBase = '/';
-    let filesEditingPath = null;
+    // The listing the shown rows came from and the file the editor holds. Every
+    // row action and every save uses these, never the current scope and folder,
+    // which may have moved on since.
+    let filesListing = null;
+    let filesEditing = null;
     let filesEntries = [];
+    let filesListSeq = 0;
+    let filesOpenSeq = 0;
 
     function joinPath(base, name) {
       const parts = (base + '/' + name).split('/');
@@ -4804,12 +4810,22 @@
       return '/' + out.join('/');
     }
     function parentPath(p) { const t = p.replace(/\/+$/, ''); const i = t.lastIndexOf('/'); return i <= 0 ? '/' : t.slice(0, i); }
+    function filesScopeLabel(scope) { return scope === 'host' ? 'persistent data (host)' : `container ${scope}`; }
+    function filesEditorIdle() {
+      filesOpenSeq++;
+      filesEditing = null;
+      document.getElementById('files-editor').innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem; padding: 8px;">Select a file to edit.</div>';
+    }
+    async function filesCall(method, endpoint, data) {
+      try { return await api(method, endpoint, data); }
+      catch (e) { return { success: false, unconfirmed: true, error: 'Could not reach the manager, so the result could not be confirmed. Reload to see it.' }; }
+    }
 
     async function showFiles(botId, name) {
       filesBotId = botId;
       document.getElementById('files-bot-name').textContent = name;
       document.getElementById('files-modal').classList.remove('hidden');
-      document.getElementById('files-editor').innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem; padding: 8px;">Select a file to edit.</div>';
+      filesEditorIdle();
 
       const res = await api('GET', `/bots/${botId}/containers`);
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
@@ -4828,33 +4844,48 @@
     function filesChangeScope() {
       filesScope = document.getElementById('files-scope').value;
       filesCwd = '';
-      filesEditingPath = null;
-      document.getElementById('files-editor').innerHTML = '<div style="color: var(--text-muted); font-size: 0.8rem; padding: 8px;">Select a file to edit.</div>';
+      filesEditorIdle();
       filesList().then(() => { filesBase = filesCwd; });
     }
 
     async function filesList() {
-      const res = await api('GET', `/bots/${filesBotId}/fs/list?target=${encodeURIComponent(filesScope)}&path=${encodeURIComponent(filesCwd)}`);
+      const seq = ++filesListSeq;
+      const asked = { botId: filesBotId, scope: filesScope };
       const list = document.getElementById('files-list');
+      filesListing = null;
+      filesEntries = [];
+      list.innerHTML = '<div style="color: var(--text-muted); font-size: 0.78rem; padding: 6px;">Loading...</div>';
+      const res = await filesCall('GET', `/bots/${asked.botId}/fs/list?target=${encodeURIComponent(asked.scope)}&path=${encodeURIComponent(filesCwd)}`);
+      if (seq !== filesListSeq) return;
       if (!res.success) { list.innerHTML = `<div class="error-message" style="margin:4px;">${escapeHtml(res.error || 'Failed to list')}</div>`; return; }
       filesCwd = res.path;
       document.getElementById('files-path').value = res.path;
+      filesListing = { botId: asked.botId, scope: asked.scope, path: res.path };
       filesEntries = res.entries || [];
       const rows = filesEntries.map((e, i) => {
         const icon = e.isDir ? '&#128193;' : '&#128196;';
         return `<div class="files-row" style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-radius:4px;cursor:pointer;">
-          <span style="flex:1;" onclick="filesEntryClick(${i})">${icon} ${escapeHtml(e.name)}${e.isDir ? '/' : ''}</span>
-          <button class="btn-remove" title="Rename" onclick="filesRenameIdx(${i})" style="font-size:0.7rem;">&#9998;</button>
-          <button class="btn-remove" title="Delete" onclick="filesDeleteIdx(${i})">&times;</button>
+          <span style="flex:1;" onclick="filesEntryClick(${seq}, ${i})">${icon} ${escapeHtml(e.name)}${e.isDir ? '/' : ''}</span>
+          <button class="btn-remove" title="Rename" onclick="filesRenameIdx(${seq}, ${i})" style="font-size:0.7rem;">&#9998;</button>
+          <button class="btn-remove" title="Delete" onclick="filesDeleteIdx(${seq}, ${i})">&times;</button>
         </div>`;
       }).join('');
       list.innerHTML = rows || '<div style="color: var(--text-muted); font-size: 0.78rem; padding: 6px;">Empty directory</div>';
     }
 
-    function filesEntryClick(i) { const e = filesEntries[i]; if (!e) return; if (e.isDir) filesOpenDir(e.name); else filesOpenFile(e.name); }
-    function filesRenameIdx(i) { const e = filesEntries[i]; if (e) filesRename(e.name); }
-    function filesDeleteIdx(i) { const e = filesEntries[i]; if (e) filesDelete(e.name); }
-    function filesOpenDir(name) { filesCwd = joinPath(filesCwd, name); filesList(); }
+    // A row acts only on the listing it was drawn from.
+    function filesRow(seq, i) {
+      if (seq !== filesListSeq || !filesListing) return null;
+      const e = filesEntries[i];
+      return e ? { listing: filesListing, entry: e } : null;
+    }
+    function filesEntryClick(seq, i) {
+      const r = filesRow(seq, i); if (!r) return;
+      if (r.entry.isDir) { filesCwd = joinPath(r.listing.path, r.entry.name); filesList(); }
+      else filesOpenFile(r.listing, r.entry.name);
+    }
+    function filesRenameIdx(seq, i) { const r = filesRow(seq, i); if (r) filesRename(r.listing, r.entry.name); }
+    function filesDeleteIdx(seq, i) { const r = filesRow(seq, i); if (r) filesDelete(r.listing, r.entry.name); }
     function filesUp() {
       const parent = parentPath(filesCwd);
       if (filesScope === 'host' && parent !== filesBase && !parent.startsWith(filesBase)) { filesCwd = filesBase; }
@@ -4863,15 +4894,21 @@
     }
     function filesGoto() { filesCwd = document.getElementById('files-path').value.trim() || filesCwd; filesList(); }
     function filesRefresh() { filesList(); }
+    // Redraw only if the folder shown is still the one the action ran in.
+    function filesRelist(listing) {
+      if (filesListing && filesListing.botId === listing.botId && filesListing.scope === listing.scope && filesListing.path === listing.path) filesList();
+    }
 
-    async function filesOpenFile(name) {
-      const full = joinPath(filesCwd, name);
-      const res = await api('GET', `/bots/${filesBotId}/fs/read?target=${encodeURIComponent(filesScope)}&path=${encodeURIComponent(full)}`);
+    async function filesOpenFile(listing, name) {
+      const seq = ++filesOpenSeq;
+      const full = joinPath(listing.path, name);
+      const res = await filesCall('GET', `/bots/${listing.botId}/fs/read?target=${encodeURIComponent(listing.scope)}&path=${encodeURIComponent(full)}`);
+      if (seq !== filesOpenSeq) return;
       const editor = document.getElementById('files-editor');
-      if (!res.success) { editor.innerHTML = `<div class="error-message" style="margin:4px;">${escapeHtml(res.error || 'Cannot open file')}</div>`; return; }
-      filesEditingPath = full;
+      if (!res.success) { filesEditing = null; editor.innerHTML = `<div class="error-message" style="margin:4px;">${escapeHtml(res.error || 'Cannot open file')}</div>`; return; }
+      filesEditing = { botId: listing.botId, scope: listing.scope, path: full, eol: res.eol };
       editor.innerHTML = `
-        <div style="font-family: monospace; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 4px; word-break: break-all;">${escapeHtml(full)}</div>
+        <div style="font-family: monospace; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 4px; word-break: break-all;">${escapeHtml(full)} in ${escapeHtml(filesScopeLabel(listing.scope))}</div>
         <textarea id="files-body" spellcheck="false" style="flex:1; width:100%; min-height: 46vh; font-family: monospace; font-size: 0.78rem; resize: vertical;"></textarea>
         <div style="display:flex; gap:6px; margin-top:6px;">
           <button class="btn btn-primary btn-small" onclick="filesSave()">Save</button>
@@ -4881,46 +4918,71 @@
     }
 
     async function filesSave() {
-      if (!filesEditingPath) return;
+      const editing = filesEditing;
+      if (!editing) return;
       const body = document.getElementById('files-body').value;
       const status = document.getElementById('files-save-status');
       status.textContent = 'Saving...';
-      const res = await api('PUT', `/bots/${filesBotId}/fs/write`, { target: filesScope, path: filesEditingPath, body });
-      status.textContent = res.success ? 'Saved' : (res.error || 'Failed');
+      const res = await filesCall('PUT', `/bots/${editing.botId}/fs/write`, { target: editing.scope, path: editing.path, body, eol: editing.eol });
+      if (filesEditing !== editing) {
+        if (res.success) showMessage('success', `Saved ${editing.path}`);
+        else showMessage('error', `${editing.path}: ${res.error || 'Not saved'}`);
+        return;
+      }
+      status.textContent = res.success ? `Saved ${editing.path}` : (res.error || 'Not saved');
     }
 
     async function filesNewFile() {
-      const name = prompt('New file name:');
+      const listing = filesListing;
+      if (!listing) return;
+      const name = prompt(`New file name in ${listing.path} (${filesScopeLabel(listing.scope)}):`);
       if (!name) return;
-      const res = await api('PUT', `/bots/${filesBotId}/fs/write`, { target: filesScope, path: joinPath(filesCwd, name), body: '' });
-      if (!res.success) showMessage('error', res.error || 'Failed to create file');
-      filesList();
+      const full = joinPath(listing.path, name);
+      const res = await filesCall('POST', `/bots/${listing.botId}/fs/create`, { target: listing.scope, path: full });
+      if (res.success) showMessage('success', `Created ${full}`);
+      else showMessage('error', res.error || 'Failed to create file');
+      filesRelist(listing);
     }
     async function filesNewFolder() {
-      const name = prompt('New folder name:');
+      const listing = filesListing;
+      if (!listing) return;
+      const name = prompt(`New folder name in ${listing.path} (${filesScopeLabel(listing.scope)}):`);
       if (!name) return;
-      const res = await api('POST', `/bots/${filesBotId}/fs/mkdir`, { target: filesScope, path: joinPath(filesCwd, name) });
+      const res = await filesCall('POST', `/bots/${listing.botId}/fs/mkdir`, { target: listing.scope, path: joinPath(listing.path, name) });
       if (!res.success) showMessage('error', res.error || 'Failed to create folder');
-      filesList();
+      filesRelist(listing);
     }
-    async function filesDelete(name) {
-      if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
-      const res = await api('POST', `/bots/${filesBotId}/fs/delete`, { target: filesScope, path: joinPath(filesCwd, name) });
+    async function filesDelete(listing, name) {
+      const full = joinPath(listing.path, name);
+      if (!confirm(`Delete ${full} in ${filesScopeLabel(listing.scope)}? This cannot be undone.`)) return;
+      const res = await filesCall('POST', `/bots/${listing.botId}/fs/delete`, { target: listing.scope, path: full });
       if (!res.success) showMessage('error', res.error || 'Failed to delete');
-      filesList();
+      else showMessage('success', res.removed ? `Deleted ${full}` : `Nothing was at ${full}, so nothing was deleted`);
+      filesRelist(listing);
     }
-    async function filesRename(name) {
-      const to = prompt('Rename to:', name);
+    async function filesRename(listing, name) {
+      const to = prompt(`Rename ${joinPath(listing.path, name)} to:`, name);
       if (!to || to === name) return;
-      const res = await api('POST', `/bots/${filesBotId}/fs/rename`, { target: filesScope, from: joinPath(filesCwd, name), to: joinPath(filesCwd, to) });
+      const from = joinPath(listing.path, name);
+      const dest = joinPath(listing.path, to);
+      const where = filesScopeLabel(listing.scope);
+      const body = { target: listing.scope, from, to: dest };
+      let res = await filesCall('POST', `/bots/${listing.botId}/fs/rename`, body);
+      if (!res.success && res.exists) {
+        if (!confirm(`${dest} already exists in ${where}. Replace it with ${from}? The current ${dest} will be lost.`)) { filesRelist(listing); return; }
+        res = await filesCall('POST', `/bots/${listing.botId}/fs/rename`, { ...body, overwrite: true });
+      }
       if (!res.success) showMessage('error', res.error || 'Failed to rename');
-      filesList();
+      else showMessage('success', `Renamed ${from} to ${dest}`);
+      filesRelist(listing);
     }
 
     function hideFiles() {
       document.getElementById('files-modal').classList.add('hidden');
       filesBotId = null;
-      filesEditingPath = null;
+      filesListSeq++;
+      filesListing = null;
+      filesEditorIdle();
     }
 
     function toggleNameLock() {

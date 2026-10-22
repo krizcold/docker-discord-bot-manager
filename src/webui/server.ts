@@ -20,6 +20,7 @@ import { setInstanceBroadcast } from '../instance/instanceUpdater';
 import { setContainerBroadcast } from '../docker/containerManager';
 import { reconcileNow } from '../docker/stateReconciler';
 import { handleTerminalMessage, closeTerminal } from './terminal';
+import { jsonBodies } from './fsWriteBody';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -70,7 +71,7 @@ export function createServer(): { app: Express; server: http.Server; wss: WebSoc
 
   // Middleware
   app.use(cors());
-  app.use(express.json());
+  app.use(jsonBodies());
 
   // Static files. HTML is served no-cache so a post-update reload always fetches the
   // new SPA; other assets keep ETag/Last-Modified revalidation (304 when unchanged).

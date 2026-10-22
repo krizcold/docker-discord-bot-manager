@@ -8,6 +8,7 @@ import { WebSocketServer } from 'ws';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
+import { fsWriteBody } from '../fsWriteBody';
 import * as dockerClient from '../../docker/dockerClient';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
@@ -1186,14 +1187,24 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
-  router.put('/:id/fs/write', async (req: Request, res: Response) => {
+  router.put('/:id/fs/write', fsWriteBody, async (req: Request, res: Response) => {
     try {
-      const { target, path, body } = req.body as { target?: string; path?: string; body?: string };
+      const { target, path, body, eol } = req.body as { target?: string; path?: string; body?: string; eol?: string };
       if (typeof path !== 'string' || typeof body !== 'string') {
         res.status(400).json({ success: false, error: 'path and body are required' });
         return;
       }
-      res.json(await terminal.fsWrite(req.params.id, target || 'host', path, body));
+      res.json(await terminal.fsWrite(req.params.id, target || 'host', path, body, { eol }));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  router.post('/:id/fs/create', async (req: Request, res: Response) => {
+    try {
+      const { target, path } = req.body as { target?: string; path?: string };
+      if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
+      res.json(await terminal.fsCreate(req.params.id, target || 'host', path));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1221,9 +1232,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   router.post('/:id/fs/rename', async (req: Request, res: Response) => {
     try {
-      const { target, from, to } = req.body as { target?: string; from?: string; to?: string };
+      const { target, from, to, overwrite } = req.body as { target?: string; from?: string; to?: string; overwrite?: boolean };
       if (typeof from !== 'string' || typeof to !== 'string') { res.status(400).json({ success: false, error: 'from and to are required' }); return; }
-      res.json(await terminal.fsRename(req.params.id, target || 'host', from, to));
+      res.json(await terminal.fsRename(req.params.id, target || 'host', from, to, { overwrite: overwrite === true }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

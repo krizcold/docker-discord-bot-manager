@@ -18,7 +18,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from 'child_process';
+import { randomBytes } from 'crypto';
 import { WebSocket } from 'ws';
 import { getBot } from '../docker/containerManager';
 import { getDataPath } from '../git/repoManager';
@@ -29,6 +30,9 @@ const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 
 const MAX_FILE_BYTES = 1024 * 1024;        // 1 MB read/edit cap
 const EXEC_TIMEOUT_MS = 15000;
+// The in-container bound on delete and rename, under the client bound so the
+// operation is dead before the manager stops waiting for it.
+const CONTAINER_OP_BOUND_S = 12;
 
 // ─── Container resolution / validation ──────────────────────────────────────
 
@@ -36,16 +40,23 @@ function spawnCapture(
   cmd: string,
   args: string[],
   opts: { input?: Buffer; timeoutMs?: number } = {}
-): Promise<{ stdout: Buffer; stderr: string; code: number }> {
+): Promise<{ stdout: Buffer; stderr: string; code: number; timedOut: boolean }> {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { windowsHide: true });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(cmd, args, { windowsHide: true });
+    } catch (e) {
+      resolve({ stdout: Buffer.alloc(0), stderr: (e as Error).message || 'spawn failed', code: 1, timedOut: false });
+      return;
+    }
     const out: Buffer[] = [];
     let err = '';
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, opts.timeoutMs || EXEC_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* ignore */ } }, opts.timeoutMs || EXEC_TIMEOUT_MS);
     child.stdout.on('data', (d) => out.push(d as Buffer));
     child.stderr.on('data', (d) => { err += d.toString(); });
-    child.on('error', () => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err || 'spawn failed', code: 1 }); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err, code: code == null ? 1 : code }); });
+    child.on('error', () => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err || 'spawn failed', code: 1, timedOut }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err, code: code == null ? 1 : code, timedOut }); });
     if (opts.input) { child.stdin.write(opts.input); }
     child.stdin.end();
   });
@@ -249,9 +260,215 @@ function resolveAbs(t: FsTarget, reqPath: string, followLast = true): string | n
   return abs;
 }
 
-function execArgs(t: ContainerTarget, argv: string[]): string[] {
-  return ['exec', t.container, ...argv];
+// Without -i docker gives the process no stdin at all, so anything piped in is
+// dropped and a reader such as cat sees an empty input.
+function execArgs(t: ContainerTarget, argv: string[], opts: { stdin?: boolean } = {}): string[] {
+  return ['exec', ...(opts.stdin ? ['-i'] : []), t.container, ...argv];
 }
+
+/**
+ * What the editor can show and save back unchanged: valid UTF-8 with one line
+ * ending style. The browser textarea turns every line break into LF, so a CRLF
+ * file is reported as such and its endings are put back on save; a file with
+ * mixed or bare CR endings cannot be restored and is refused.
+ */
+function editableText(buf: Buffer): { body: string; eol: 'lf' | 'crlf' } | { error: string; binary?: true } {
+  if (buf.includes(0)) return { error: 'Binary file (not editable here)', binary: true };
+  const body = buf.toString('utf8');
+  if (!Buffer.from(body, 'utf8').equals(buf)) return { error: 'Not valid UTF-8 text (not editable here without changing its bytes)' };
+  const cr = (body.match(/\r/g) || []).length;
+  if (cr === 0) return { body, eol: 'lf' };
+  const crlf = (body.match(/\r\n/g) || []).length;
+  const lf = (body.match(/\n/g) || []).length;
+  if (cr === crlf && lf === crlf) return { body, eol: 'crlf' };
+  return { error: 'Mixed line endings (not editable here without changing them)' };
+}
+
+function editableAnswer(abs: string, buf: Buffer): any {
+  const text = editableText(buf);
+  if ('error' in text) return { success: false, path: abs, ...text };
+  return { success: true, path: abs, ...text };
+}
+
+function savedBytes(body: string, eol?: string): Buffer {
+  const text = eol === 'crlf' ? body.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n') : body;
+  return Buffer.from(text, 'utf8');
+}
+
+const TOO_LARGE_TO_SAVE = 'Too large to save here (over 1 MB)';
+
+// Container delete and rename paths whose earlier operation may still be
+// running, mapped to when it is known to be over (Infinity while it runs).
+const containerOpsBusy = new Map<string, number>();
+
+function busyKey(t: ContainerTarget, abs: string): string {
+  return `${t.container}\0${abs}`;
+}
+
+function busyPath(t: ContainerTarget, paths: string[]): string | null {
+  const now = Date.now();
+  for (const p of paths) {
+    const until = containerOpsBusy.get(busyKey(t, p));
+    if (until === undefined) continue;
+    if (until > now) return p;
+    containerOpsBusy.delete(busyKey(t, p));
+  }
+  return null;
+}
+
+// The delete and rename scripts print this first: 1 when they run under the
+// in-container bound, 0 when the image has no timeout of that form.
+const BOUND_MARK = 'SMDB_BOUNDED=';
+
+/**
+ * Run a container delete or rename with its paths marked busy until it is
+ * known to be over. At the client bound the answer is "not confirmed yet"
+ * either way, but the docker CLI is killed only when the script reported the
+ * in-container bound, and the paths then stay busy for that bound. Without it
+ * killing the CLI would not stop the exec, so the CLI is left to finish and
+ * the paths stay busy until it really exits.
+ */
+function boundedContainerOp(t: ContainerTarget, paths: string[], argv: string[]): Promise<{ stdout: string; stderr: string; code: number; timedOut: boolean }> {
+  const keys = paths.map((p) => busyKey(t, p));
+  for (const k of keys) containerOpsBusy.set(k, Infinity);
+  const release = (until: number): void => {
+    for (const k of keys) {
+      if (until) containerOpsBusy.set(k, until);
+      else containerOpsBusy.delete(k);
+    }
+  };
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn('docker', execArgs(t, argv), { windowsHide: true });
+    } catch (e) {
+      release(0);
+      resolve({ stdout: '', stderr: (e as Error).message || 'spawn failed', code: 1, timedOut: false });
+      return;
+    }
+    const out: Buffer[] = [];
+    let err = '';
+    let answered = false;
+    let killed = false;
+    let exited = false;
+    const answer = (code: number, timedOut: boolean): void => {
+      if (answered) return;
+      answered = true;
+      const stdout = Buffer.concat(out).toString('utf8').split('\n').filter((l) => !l.startsWith(BOUND_MARK)).join('\n');
+      resolve({ stdout, stderr: err, code, timedOut });
+    };
+    const timer = setTimeout(() => {
+      if (Buffer.concat(out).toString('utf8').includes(`${BOUND_MARK}1`)) {
+        killed = true;
+        release(Date.now() + CONTAINER_OP_BOUND_S * 1000);
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      }
+      answer(1, true);
+    }, EXEC_TIMEOUT_MS);
+    const done = (code: number | null): void => {
+      if (exited) return;
+      exited = true;
+      clearTimeout(timer);
+      if (!killed) release(0);
+      answer(code == null ? 1 : code, false);
+    };
+    child.stdout?.on('data', (d) => out.push(d as Buffer));
+    child.stderr?.on('data', (d) => { err += d.toString(); });
+    child.on('error', () => { if (!err) err = 'spawn failed'; done(1); });
+    child.on('close', done);
+    child.stdin?.end();
+  });
+}
+
+function stillRunning(p: string): any {
+  return { success: false, error: `An earlier delete or rename of ${p} may still be running in the container. Reload to see its result before trying again.` };
+}
+
+function unconfirmed(what: string): any {
+  return {
+    success: false,
+    unconfirmed: true,
+    error: `The container did not answer within ${EXEC_TIMEOUT_MS / 1000} s, so whether the ${what} happened could not be confirmed yet. Reload to see the result.`,
+  };
+}
+
+// spawn throws on a NUL byte in an argument, and no file name can hold one.
+const NUL_PATH = { success: false, error: 'A path cannot contain a NUL byte' };
+
+function hasNul(...paths: string[]): boolean {
+  return paths.some((p) => p.includes('\0'));
+}
+
+// Runs "$@" under `timeout -s KILL` when the image has a timeout that takes
+// that form, and unbounded otherwise; says which on stdout.
+const BOUNDED = [
+  'if timeout -s KILL 1 true 2>/dev/null; then B=1; else B=0; fi',
+  `echo "${BOUND_MARK}$B"`,
+  `bounded() { if [ "$B" = 1 ]; then timeout -s KILL ${CONTAINER_OP_BOUND_S} "$@"; else "$@"; fi; }`,
+].join('\n');
+
+// $1 target path, $2 expected byte count. The body goes to a temp file beside
+// the target (a copy of it first, so mode and owner carry over), its size is
+// checked, and only then is it moved over the target, so the target holds
+// either the old bytes or the new ones. A symlink is written through to its
+// target. A target mv cannot replace because it is a mount point (a config
+// file bound into the container alone) answers busy; that one is written in
+// place after a backup copy beside it, and put back from the backup when the
+// write does not land whole.
+const CONTAINER_WRITE = [
+  'p=$1; n=$2',
+  'if [ -L "$p" ]; then p=$(readlink -f "$p") || { echo "Cannot resolve the link $1" >&2; exit 1; }; fi',
+  'if [ -e "$p" ] && [ ! -f "$p" ]; then echo "Not a regular file: $p" >&2; exit 1; fi',
+  'tmp="$(dirname "$p")/.$(basename "$p").smdb-save.$$"',
+  'if [ -f "$p" ]; then cp -p "$p" "$tmp" || : > "$tmp"; else : > "$tmp"; fi 2>/dev/null || { echo "Cannot write a temp file in $(dirname "$p"); the file was not changed" >&2; exit 1; }',
+  'cat > "$tmp" || { rm -f "$tmp"; exit 1; }',
+  'got=$(wc -c < "$tmp")',
+  'if [ "$((got))" -ne "$n" ]; then rm -f "$tmp"; echo "Only $((got)) of $n bytes reached the container; the file was not changed" >&2; exit 1; fi',
+  'if ! out=$(mv -f "$tmp" "$p" 2>&1); then',
+  '  case "$out" in',
+  '    *[Bb]usy*) ;;',
+  '    *) rm -f "$tmp"; echo "$out; the file was not changed" >&2; exit 1 ;;',
+  '  esac',
+  '  bak="$(dirname "$p")/.$(basename "$p").smdb-backup.$$"',
+  '  cp -p "$p" "$bak" 2>/dev/null || { rm -f "$tmp" "$bak"; echo "Cannot write a backup in $(dirname "$p"); the file was not changed" >&2; exit 1; }',
+  '  if cat "$tmp" > "$p" && [ "$(($(wc -c < "$p")))" -eq "$n" ]; then rm -f "$tmp" "$bak"; exit 0; fi',
+  '  rm -f "$tmp"',
+  '  if cmp -s "$bak" "$p" 2>/dev/null; then rm -f "$bak"; echo "Cannot write $p in place; the file was not changed" >&2; exit 1; fi',
+  '  if cat "$bak" > "$p" && cmp -s "$bak" "$p" 2>/dev/null; then rm -f "$bak"; echo "Writing $p in place failed; the file was restored" >&2; exit 1; fi',
+  '  echo "Writing $p in place failed and restoring it failed too; the old content is kept in $bak" >&2; exit 1',
+  'fi',
+  'got=$(wc -c < "$p")',
+  'if [ "$((got))" -ne "$n" ]; then echo "The file holds $((got)) bytes after the save, not $n" >&2; exit 1; fi',
+].join('\n');
+
+const EXISTS_CODE = 17;
+const IS_DIR_CODE = 18;
+const KILLED_CODE = 137;
+
+// set -C makes the redirect itself refuse an existing name.
+const CONTAINER_CREATE = [
+  `if [ -e "$1" ] || [ -L "$1" ]; then exit ${EXISTS_CODE}; fi`,
+  `set -C; : > "$1" || { if [ -e "$1" ]; then exit ${EXISTS_CODE}; fi; exit 1; }`,
+].join('\n');
+
+// $1 from, $2 to, $3 "1" when the operator confirmed replacing the target.
+// mv onto a folder would move the source INTO it, so a folder target is
+// always refused.
+const CONTAINER_RENAME = [
+  BOUNDED,
+  'if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo "No such file or directory: $1" >&2; exit 1; fi',
+  `if [ -d "$2" ]; then exit ${IS_DIR_CODE}; fi`,
+  `if [ "$3" != 1 ] && { [ -e "$2" ] || [ -L "$2" ]; }; then exit ${EXISTS_CODE}; fi`,
+  'bounded mv -f -- "$1" "$2"',
+].join('\n');
+
+const CONTAINER_DELETE = [
+  BOUNDED,
+  'if [ ! -e "$1" ] && [ ! -L "$1" ]; then echo absent; exit 0; fi',
+  'bounded rm -rf -- "$1"; c=$?',
+  `if [ -e "$1" ] || [ -L "$1" ]; then if [ $c -eq ${KILLED_CODE} ]; then exit ${KILLED_CODE}; fi; echo "Could not delete $1" >&2; exit 1; fi`,
+  'echo removed',
+].join('\n');
 
 // ─── Local (Node fs) file operations for the host scope ─────────────────────
 
@@ -445,9 +662,7 @@ function localRead(abs: string, realBase: string | null): any {
     if (!st.isFile()) return { success: false, error: 'Not a regular file', path: abs };
     if (st.size > MAX_FILE_BYTES) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
 
-    const body = readAll(fd, st.size);
-    if (body.includes(0)) return { success: false, error: 'Binary file (not editable here)', path: abs, binary: true };
-    return { success: true, path: abs, body: body.toString('utf8') };
+    return editableAnswer(abs, readAll(fd, st.size));
   } catch (e) {
     return { success: false, error: (e as Error).message || 'Failed to read file', path: abs };
   } finally {
@@ -477,57 +692,221 @@ function writeAll(fd: number, buf: Buffer): void {
   }
 }
 
-function localWrite(abs: string, body: string, realBase: string | null): any {
+/**
+ * What a save will replace: the file a name holds now, judged through an fd, or
+ * nothing yet. A symlink is written through to the file it points at, which
+ * must be inside the scope; one whose target does not exist is refused rather
+ * than replaced by a plain file.
+ */
+function judgeSaveTarget(target: string, realBase: string | null): { dest: string; old: fs.Stats | null } | { error: string } {
+  let fd: number;
+  try {
+    fd = fs.openSync(target, fs.constants.O_RDONLY | O_NONBLOCK);
+  } catch (e) {
+    const err = e as NodeJS.ErrnoException;
+    if (err.code === 'EISDIR') return { error: 'Cannot write over a directory' };
+    if (err.code === 'ENXIO' || err.code === 'ELOOP') return { error: 'Not a regular file' };
+    if (err.code !== 'ENOENT') return { error: err.message || 'Failed to write file' };
+    let link = false;
+    try { link = fs.lstatSync(target).isSymbolicLink(); } catch { /* nothing there */ }
+    if (link) return { error: 'The name is a link to a file that does not exist; nothing was saved' };
+    return { dest: target, old: null };
+  }
+  try {
+    const landed = fdRealPath(fd, target);
+    if (!landed || (realBase !== null && !pathInside(realBase, landed))) return { error: OUT_OF_SCOPE };
+    const st = fs.fstatSync(fd);
+    if (st.isDirectory()) return { error: 'Cannot write over a directory' };
+    if (!st.isFile()) return { error: 'Not a regular file' };
+    if (st.size > MAX_FILE_BYTES) return { error: 'File too large to edit (over 1 MB)' };
+    return { dest: toPosix(landed), old: st };
+  } catch (e) {
+    return { error: (e as Error).message || 'Failed to write file' };
+  } finally {
+    try { fs.closeSync(fd); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * The directory a create or a save acts in, pinned by an fd and confirmed to
+ * be inside the scope. `at` names it through /proc/self/fd so no string the
+ * bot can re-point is walked again; without /proc (the native Windows dev rig)
+ * it is the resolved string, best effort there.
+ */
+function pinDir(dir: string, realBase: string | null): { fd: number; at: string } | { error: string } {
+  let fd: number;
+  try {
+    fd = fs.openSync(dir, fs.constants.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK);
+  } catch (e) {
+    return { error: (e as Error).message || 'Failed to open directory' };
+  }
+  const landed = fdRealPath(fd, dir);
+  if (!landed || (realBase !== null && !pathInside(realBase, landed)) || !fs.fstatSync(fd).isDirectory()) {
+    try { fs.closeSync(fd); } catch { /* already gone */ }
+    return { error: OUT_OF_SCOPE };
+  }
+  let at = dir;
+  try { fs.readlinkSync(`/proc/self/fd/${fd}`); at = `/proc/self/fd/${fd}`; } catch { /* not Linux */ }
+  return { fd, at };
+}
+
+// Errors name the path the operator asked about, never the /proc/self/fd one
+// the operation went through.
+function opError(e: unknown, what: string): string {
+  return `${(e as NodeJS.ErrnoException).code || 'Error'}: cannot ${what}`;
+}
+
+/**
+ * Write in place with a fsynced backup beside the file first: truncate, write,
+ * fsync, read the size back, and put the old bytes back from memory on any
+ * failure. The backup is removed only after a confirmed write or a confirmed
+ * restore, so the old content always survives somewhere.
+ */
+function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buffer, old: fs.Stats): { error?: string } {
+  const name = path.posix.basename(dest);
+  let fd: number;
+  try {
+    fd = fs.openSync(`${dir.at}/${name}`, fs.constants.O_RDWR | O_NOFOLLOW | O_NONBLOCK);
+  } catch (e) {
+    return { error: `${opError(e, `open ${dest}`)}; the file was not changed` };
+  }
+  const backupName = `.${name}.smdb-backup.${process.pid}.${randomBytes(4).toString('hex')}`;
+  const backupAt = `${dir.at}/${backupName}`;
+  const backupShown = `${path.posix.dirname(dest)}/${backupName}`;
+  try {
+    const st = fs.fstatSync(fd);
+    if (st.dev !== old.dev || st.ino !== old.ino || !st.isFile()) return { error: 'Path changed during the operation, retry; the file was not changed' };
+    const previous = readAll(fd, st.size);
+    if (previous.length !== st.size) return { error: `Could not read all of ${dest}; the file was not changed` };
+
+    let bfd: number;
+    try {
+      bfd = fs.openSync(backupAt, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o600);
+    } catch (e) {
+      return { error: `${opError(e, `write a backup beside ${dest}`)}; the file was not changed` };
+    }
+    try {
+      writeAll(bfd, previous);
+      fs.fsyncSync(bfd);
+    } catch (e) {
+      try { fs.closeSync(bfd); } catch { /* already gone */ }
+      try { fs.unlinkSync(backupAt); } catch { /* best effort */ }
+      return { error: `${opError(e, `write a backup beside ${dest}`)}; the file was not changed` };
+    }
+    try { fs.closeSync(bfd); } catch { /* already gone */ }
+
+    try {
+      fs.ftruncateSync(fd, 0);
+      writeAll(fd, bytes);
+      fs.fsyncSync(fd);
+      const size = fs.fstatSync(fd).size;
+      if (size !== bytes.length) throw new Error(`short write: ${size} of ${bytes.length} bytes`);
+    } catch (e) {
+      const why = (e as NodeJS.ErrnoException).code ? opError(e, `write ${dest}`) : (e as Error).message;
+      try {
+        fs.ftruncateSync(fd, 0);
+        writeAll(fd, previous);
+        fs.fsyncSync(fd);
+        if (fs.fstatSync(fd).size !== previous.length) throw new Error('short restore');
+      } catch {
+        return { error: `${why}; restoring it failed too, the old content is kept in ${backupShown}` };
+      }
+      try { fs.unlinkSync(backupAt); } catch { /* the restore is confirmed */ }
+      return { error: `${why}; the file was restored` };
+    }
+    try { fs.unlinkSync(backupAt); } catch { /* the save is confirmed; a stray backup is harmless */ }
+    return {};
+  } finally {
+    try { fs.closeSync(fd); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Save an existing file in place, so it keeps its inode: a file bound into the
+ * bot on its own (by the manager or by the repo's own compose) is held by its
+ * inode inside the bot's mount namespace, where the manager cannot see the
+ * bind, and a rename would leave the bot on the old file. A new file is
+ * written to a temp file, size-checked, fsynced and linked into place.
+ */
+function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
+  if (bytes.length > MAX_FILE_BYTES) return { success: false, error: TOO_LARGE_TO_SAVE };
   const made = mkdirInScope(path.posix.dirname(abs), realBase);
   if (made.error) return { success: false, error: made.error };
 
   const safe = safeDir(abs, realBase);
   if ('error' in safe) return { success: false, error: safe.error };
-  const target = `${safe.dir}/${safe.name}`;
+  const judged = judgeSaveTarget(`${safe.dir}/${safe.name}`, realBase);
+  if ('error' in judged) return { success: false, error: judged.error };
+  const { dest, old } = judged;
+  const name = path.posix.basename(dest);
 
-  let fd: number;
+  const dir = pinDir(path.posix.dirname(dest), realBase);
+  if ('error' in dir) return { success: false, error: dir.error };
   try {
-    // No O_TRUNC: nothing is emptied until the fd has been judged. O_CREAT with
-    // no O_EXCL so an in-scope symlink whose target does not exist yet still
-    // gets its target created, which is what the previous writeFileSync did.
-    // O_RDWR rather than O_WRONLY: the current content is read back first so a
-    // failed write can put it back.
-    fd = fs.openSync(target, fs.constants.O_RDWR | fs.constants.O_CREAT | O_NONBLOCK, 0o644);
-  } catch (e) {
-    const err = e as NodeJS.ErrnoException;
-    if (err.code === 'EISDIR') return { success: false, error: 'Cannot write over a directory' };
-    if (err.code === 'ENXIO' || err.code === 'ELOOP') return { success: false, error: 'Not a regular file' };
-    return { success: false, error: err.message || 'Failed to write file' };
-  }
-  try {
-    const landed = fdRealPath(fd, target);
-    if (realBase !== null && (!landed || !pathInside(realBase, landed))) {
-      return { success: false, error: OUT_OF_SCOPE };
+    if (old) {
+      const wrote = writeInPlace(dir, dest, bytes, old);
+      if (wrote.error) return { success: false, error: wrote.error };
+      return { success: true, path: abs, bytes: bytes.length };
     }
-    const st = fs.fstatSync(fd);
-    if (!st.isFile()) return { success: false, error: 'Not a regular file' };
 
-    // A write that fails partway (ENOSPC, EIO) has already emptied the file, so
-    // whatever fit in the editor is kept in memory first and put back on
-    // failure. Best effort: the original occupied the space it needs, and the
-    // truncation has just freed it.
-    const previous = st.size <= MAX_FILE_BYTES ? readAll(fd, st.size) : null;
-    fs.ftruncateSync(fd, 0);
+    const tmpPath = `${dir.at}/.${name}.smdb-save.${process.pid}.${randomBytes(4).toString('hex')}`;
+    let fd: number;
     try {
-      writeAll(fd, Buffer.from(body, 'utf8'));
+      fd = fs.openSync(tmpPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o644);
     } catch (e) {
-      if (previous) {
-        try { fs.ftruncateSync(fd, 0); writeAll(fd, previous); } catch { /* the error below is the one to report */ }
-      }
-      throw e;
+      return { success: false, error: `${opError(e, `write a temp file beside ${dest}`)}; the file was not changed` };
     }
-    // Ownership goes through the fd, so it cannot be aimed elsewhere.
-    grantFd(fd);
-    return { success: true, path: abs };
-  } catch (e) {
-    return { success: false, error: (e as Error).message || 'Failed to write file' };
-  } finally {
+    try {
+      writeAll(fd, bytes);
+      const size = fs.fstatSync(fd).size;
+      if (size !== bytes.length) throw new Error(`short write: ${size} of ${bytes.length} bytes`);
+      grantFd(fd);
+      fs.fsyncSync(fd);
+    } catch (e) {
+      try { fs.closeSync(fd); } catch { /* already gone */ }
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      const why = (e as NodeJS.ErrnoException).code ? opError(e, `write ${dest}`) : (e as Error).message;
+      return { success: false, error: `${why}; the file was not changed` };
+    }
     try { fs.closeSync(fd); } catch { /* already gone */ }
+    // link(2), unlike rename(2), refuses a name that exists, so a file the bot
+    // created after the judge above is never replaced.
+    try {
+      fs.linkSync(tmpPath, `${dir.at}/${name}`);
+    } catch (e) {
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') return { success: false, error: `${dest} appeared meanwhile; nothing was saved` };
+      return { success: false, error: `${opError(e, `create ${dest}`)}; nothing was saved` };
+    }
+    try { fs.unlinkSync(tmpPath); } catch { /* the save is confirmed; a stray temp file is harmless */ }
+    try { fs.fsyncSync(dir.fd); } catch { /* not supported for directories here */ }
+    return { success: true, path: abs, bytes: bytes.length };
+  } finally {
+    try { fs.closeSync(dir.fd); } catch { /* already gone */ }
+  }
+}
+
+// O_EXCL never opens an existing name, and O_NOFOLLOW never follows a link.
+function localCreate(abs: string, realBase: string | null): any {
+  const made = mkdirInScope(path.posix.dirname(abs), realBase);
+  if (made.error) return { success: false, error: made.error };
+  const safe = safeDir(abs, realBase);
+  if ('error' in safe) return { success: false, error: safe.error };
+  const dir = pinDir(safe.dir, realBase);
+  if ('error' in dir) return { success: false, error: dir.error };
+  try {
+    let fd: number;
+    try {
+      fd = fs.openSync(`${dir.at}/${safe.name}`, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o644);
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code === 'EEXIST') return { success: false, exists: true, error: `${abs} already exists; nothing was changed` };
+      return { success: false, error: opError(err, `create ${abs}`) };
+    }
+    try { grantFd(fd); } finally { try { fs.closeSync(fd); } catch { /* already gone */ } }
+    return { success: true, path: abs };
+  } finally {
+    try { fs.closeSync(dir.fd); } catch { /* already gone */ }
   }
 }
 
@@ -540,24 +919,34 @@ function localMkdir(abs: string, realBase: string | null): any {
 function localDelete(abs: string, realBase: string | null): any {
   const safe = safeDir(abs, realBase);
   if ('error' in safe) {
-    if (safe.missing) return { success: true, path: abs };   // rm -f semantics
+    if (safe.missing) return { success: true, path: abs, removed: false };   // rm -f semantics
     return { success: false, error: safe.error };
   }
+  const entry = `${safe.dir}/${safe.name}`;
+  try { fs.lstatSync(entry); } catch { return { success: true, path: abs, removed: false }; }
   try {
     // rm never follows a final symlink, so this removes the entry named in the
     // scope, and the resolved parent keeps the walk inside it.
-    fs.rmSync(`${safe.dir}/${safe.name}`, { recursive: true, force: true });
-    return { success: true, path: abs };
+    fs.rmSync(entry, { recursive: true, force: true });
+    return { success: true, path: abs, removed: true };
   } catch (e) { return { success: false, error: (e as Error).message || 'Failed to delete' }; }
 }
 
-function localRename(absFrom: string, absTo: string, realBase: string | null): any {
+// rename(2) replaces an existing target silently, so the target is judged
+// first: a folder is always refused (a file cannot replace one, and an empty
+// folder would vanish), anything else only with the operator's confirmation.
+function localRename(absFrom: string, absTo: string, realBase: string | null, overwrite: boolean): any {
   const from = safeDir(absFrom, realBase);
   if ('error' in from) return { success: false, error: from.error };
   const to = safeDir(absTo, realBase);
   if ('error' in to) return { success: false, error: to.error };
+  const dest = `${to.dir}/${to.name}`;
+  let there: fs.Stats | null = null;
+  try { there = fs.lstatSync(dest); } catch { /* free */ }
+  if (there?.isDirectory()) return { success: false, error: `${absTo} is a folder; nothing was renamed` };
+  if (there && !overwrite) return { success: false, exists: true, error: `${absTo} already exists; nothing was renamed` };
   try {
-    fs.renameSync(`${from.dir}/${from.name}`, `${to.dir}/${to.name}`);
+    fs.renameSync(`${from.dir}/${from.name}`, dest);
     return { success: true, from: absFrom, to: absTo };
   } catch (e) { return { success: false, error: (e as Error).message || 'Failed to rename' }; }
 }
@@ -565,6 +954,7 @@ function localRename(absFrom: string, absTo: string, realBase: string | null): a
 // ─── File operations ────────────────────────────────────────────────────────
 
 export async function fsList(botId: string, target: string, reqPath: string): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
@@ -583,6 +973,7 @@ export async function fsList(botId: string, target: string, reqPath: string): Pr
 }
 
 export async function fsRead(botId: string, target: string, reqPath: string): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
@@ -593,11 +984,15 @@ export async function fsRead(botId: string, target: string, reqPath: string): Pr
   const { stdout, stderr, code } = await spawnCapture('docker', execArgs(t, ['head', '-c', String(MAX_FILE_BYTES + 1), '--', abs]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to read file', path: abs };
   if (stdout.length > MAX_FILE_BYTES) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
-  if (stdout.includes(0)) return { success: false, error: 'Binary file (not editable here)', path: abs, binary: true };
-  return { success: true, path: abs, body: stdout.toString('utf8') };
+  return editableAnswer(abs, stdout);
 }
 
-export async function fsWrite(botId: string, target: string, reqPath: string, body: string): Promise<any> {
+/**
+ * Save an edited file. `eol: 'crlf'` (as fsRead reported it) puts back the CRLF
+ * line endings the browser editor turned into LF.
+ */
+export async function fsWrite(botId: string, target: string, reqPath: string, body: string, opts: { eol?: string } = {}): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
@@ -608,20 +1003,39 @@ export async function fsWrite(botId: string, target: string, reqPath: string, bo
   if (body.length === 0) {
     return { success: false, error: 'Refusing to save an empty file (this would erase its contents). Use delete if you mean to remove it.' };
   }
+  const bytes = savedBytes(body, opts.eol);
+  if (bytes.length > MAX_FILE_BYTES) return { success: false, error: TOO_LARGE_TO_SAVE };
 
-  if (t.kind === 'local') return localWrite(abs, body, t.jail ? resolvedBase(t.base) : null);
+  if (t.kind === 'local') return localWrite(abs, bytes, t.jail ? resolvedBase(t.base) : null);
 
-  // Pass the path as $1 (argv), never interpolated into the shell.
-  const { stderr, code } = await spawnCapture(
+  // Paths and sizes go in as $1 and $2 (argv), never interpolated into the shell.
+  const { stderr, code, timedOut } = await spawnCapture(
     'docker',
-    execArgs(t, ['sh', '-c', 'cat > "$1"', 'sh', abs]),
-    { input: Buffer.from(body, 'utf8') }
+    execArgs(t, ['sh', '-c', CONTAINER_WRITE, 'sh', abs, String(bytes.length)], { stdin: true }),
+    { input: bytes }
   );
+  if (timedOut) return unconfirmed('save');
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to write file' };
+  return { success: true, path: abs, bytes: bytes.length };
+}
+
+/** New File: creates an empty file and never touches an existing name. */
+export async function fsCreate(botId: string, target: string, reqPath: string): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
+  const t = await resolveTarget(botId, target);
+  if ('error' in t) return { success: false, error: t.error };
+  const abs = resolveAbs(t, reqPath, false);
+  if (!abs || (t.jail && abs === t.base)) return { success: false, error: 'Path outside allowed scope' };
+  if (t.kind === 'local') return localCreate(abs, t.jail ? resolvedBase(t.base) : null);
+  const { stderr, code, timedOut } = await spawnCapture('docker', execArgs(t, ['sh', '-c', CONTAINER_CREATE, 'sh', abs]));
+  if (timedOut) return unconfirmed('create');
+  if (code === EXISTS_CODE) return { success: false, exists: true, error: `${abs} already exists; nothing was changed` };
+  if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to create file' };
   return { success: true, path: abs };
 }
 
 export async function fsMkdir(botId: string, target: string, reqPath: string): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath);
@@ -632,25 +1046,46 @@ export async function fsMkdir(botId: string, target: string, reqPath: string): P
   return { success: true, path: abs };
 }
 
+/** `removed` says whether anything was there to delete. */
 export async function fsDelete(botId: string, target: string, reqPath: string): Promise<any> {
+  if (hasNul(reqPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const abs = resolveAbs(t, reqPath, false);
   if (!abs || (t.jail && abs === t.base)) return { success: false, error: 'Path outside allowed scope' };
   if (t.kind === 'local') return localDelete(abs, t.jail ? resolvedBase(t.base) : null);
-  const { stderr, code } = await spawnCapture('docker', execArgs(t, ['rm', '-rf', '--', abs]));
+  const busy = busyPath(t, [abs]);
+  if (busy) return stillRunning(busy);
+  const { stdout, stderr, code, timedOut } = await boundedContainerOp(t, [abs], ['sh', '-c', CONTAINER_DELETE, 'sh', abs]);
+  if (timedOut) return unconfirmed('delete');
+  if (code === KILLED_CODE) {
+    return { success: false, error: `The delete of ${abs} was stopped after ${CONTAINER_OP_BOUND_S} s; part of it may already be gone. Reload to see what remains.` };
+  }
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to delete' };
-  return { success: true, path: abs };
+  return { success: true, path: abs, removed: stdout.trim().split(/\r?\n/).pop() === 'removed' };
 }
 
-export async function fsRename(botId: string, target: string, fromPath: string, toPath: string): Promise<any> {
+/** Never replaces an existing target unless `overwrite` says the operator confirmed it. */
+export async function fsRename(botId: string, target: string, fromPath: string, toPath: string, opts: { overwrite?: boolean } = {}): Promise<any> {
+  if (hasNul(fromPath, toPath)) return NUL_PATH;
   const t = await resolveTarget(botId, target);
   if ('error' in t) return { success: false, error: t.error };
   const absFrom = resolveAbs(t, fromPath, false);
   const absTo = resolveAbs(t, toPath, false);
   if (!absFrom || !absTo) return { success: false, error: 'Path outside allowed scope' };
-  if (t.kind === 'local') return localRename(absFrom, absTo, t.jail ? resolvedBase(t.base) : null);
-  const { stderr, code } = await spawnCapture('docker', execArgs(t, ['mv', '--', absFrom, absTo]));
+  const overwrite = opts.overwrite === true;
+  if (t.kind === 'local') return localRename(absFrom, absTo, t.jail ? resolvedBase(t.base) : null, overwrite);
+  const busy = busyPath(t, [absFrom, absTo]);
+  if (busy) return stillRunning(busy);
+  const { stderr, code, timedOut } = await boundedContainerOp(
+    t, [absFrom, absTo], ['sh', '-c', CONTAINER_RENAME, 'sh', absFrom, absTo, overwrite ? '1' : '0']
+  );
+  if (timedOut) return unconfirmed('rename');
+  if (code === EXISTS_CODE) return { success: false, exists: true, error: `${absTo} already exists; nothing was renamed` };
+  if (code === IS_DIR_CODE) return { success: false, error: `${absTo} is a folder; nothing was renamed` };
+  if (code === KILLED_CODE) {
+    return { success: false, error: `The rename was stopped after ${CONTAINER_OP_BOUND_S} s, so whether it happened could not be confirmed. Reload to see the result.` };
+  }
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to rename' };
   return { success: true, from: absFrom, to: absTo };
 }

@@ -55,7 +55,7 @@ describe('env editor saves only to the bot whose rows it collected', () => {
         ? { value: 'DB_URL', dataset: { originalKey: 'DB_URL' } }
         : s === '.env-value' ? { value: 'postgres://new', dataset: {} } : null),
     });
-    const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'saveEnvEditor', 'hideEnvEditor'], {
+    const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'saveEnvEditor', 'hideEnvEditor'], {
       bots, envEditorBotId: 'b1', envEditorSeq: 0, envEditorInitial: { DB_URL: 'postgres://old' }, envEditorStored: ['DB_URL'],
       document: {
         querySelectorAll: (s: string) => (s === '#env-editor-rows .env-row' ? [row] : []),
@@ -185,7 +185,7 @@ describe('install modal answers land only in the form they were asked for', () =
   const installGlobals = (api: any, extra: Record<string, any> = {}) => {
     const modal = el(); const content = el(); const btn = el(); const rowsEl = el();
     const messages: string[][] = []; const renders: any[] = [];
-    const ctx = runPage(['botLabel', 'showInstallModal', 'hideInstallModal', 'scanInstallEnvs', 'inspectInstallImage', 'addInstallEnvRow', 'doInstall', 'cloneAndInstallSource'], {
+    const ctx = runPage(['botLabel', 'showInstallModal', 'hideInstallModal', 'scanInstallEnvs', 'inspectInstallImage', 'addInstallEnvRow', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'doInstall', 'cloneAndInstallSource'], {
       bots, sources: [{ id: 's1', url: 'https://x/one.git' }, { id: 's2', url: 'https://x/two.git' }],
       installSourceId: null, installSeq: 0, installBotId: null, installNameLocked: true, installEnvHints: [], installConfigHints: [],
       installInteractiveSetup: null, installIsImage: false, installDetectError: null, cloningSources: new Set(),
@@ -410,7 +410,7 @@ describe('review fixes', () => {
     const r = deferred();
     const sent: any[] = [];
     const modal = el(); const btn = el(); btn.dataset.sourceId = 's1';
-    const ctx = runPage(['botLabel', 'doInstall'], {
+    const ctx = runPage(['botLabel', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'doInstall'], {
       bots, installSourceId: 's1', installSeq: 0, installBotId: null,
       document: {
         getElementById: (id: string) => ({ 'install-modal': modal, 'install-btn': btn, 'install-name': { value: 'My Bot' } } as any)[id] || null,
@@ -429,7 +429,7 @@ describe('review fixes', () => {
 
   it('a guided flush that refuses re-enables Save & Install', async () => {
     const btn = el(); btn.dataset.sourceId = 's1';
-    const ctx = runPage(['doInstall'], {
+    const ctx = runPage(['missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'doInstall'], {
       installSourceId: 's1', installSeq: 0, installBotId: null,
       document: {
         getElementById: (id: string) => ({ 'install-modal': el(), 'install-btn': btn, 'install-name': { value: 'My Bot' } } as any)[id] || null,

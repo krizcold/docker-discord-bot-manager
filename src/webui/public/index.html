@@ -1955,6 +1955,7 @@
       // any real keystroke in the field removes the mark (user-entered values
       // survive role switches).
       input.dataset.generated = '1';
+      delete input.dataset.autofilled;
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
@@ -2098,6 +2099,17 @@
       return value !== '' && semanticValuesOf(container, 'peer-role').includes(value);
     }
 
+    // A dialing role with no candidates has nothing to dial. In the editor a
+    // blank masked row keeps its stored value, so only a visible blank counts.
+    function missingMasterCandidates(container, isEditor) {
+      if (!container || !dialsOutRole(container)) return false;
+      const w = semanticWrapper(container, 'peer-list');
+      const v = w && w.querySelector('.env-row .env-value');
+      if (!v) return true;
+      if (v.value.trim() !== '') return false;
+      return !(isEditor && v.dataset.sensitive === 'true');
+    }
+
     // Every programmatic fill (prefill, vault pick, recovered envs) goes
     // through here: a list row must re-render its visible items, the
     // machine-minted mark must clear (the value is now deliberate), and the
@@ -2124,6 +2136,7 @@
       }
       input.value = value;
       delete input.dataset.generated;
+      delete input.dataset.autofilled;
       const list = input.closest('.env-list');
       if (list) envListRender(list);
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2147,8 +2160,11 @@
       const urlsWrapperEl = semanticWrapper(container, 'peer-list');
       const urlsEl = urlsWrapperEl ? urlsWrapperEl.querySelector('.env-list .env-value') : null;
       // Real typing makes a value user-owned: it then survives every switch.
+      // A list row's typing happens in its visible items; the hidden value
+      // only ever sees synthetic events.
       for (const el of [secretEl, urlsEl]) {
-        if (el) el.addEventListener('input', e => {
+        const target = el && (el.closest('.env-list') || el);
+        if (target) target.addEventListener('input', e => {
           if (!e.isTrusted) return;
           delete el.dataset.generated;
           delete el.dataset.autofilled;
@@ -2246,33 +2262,53 @@
         if (!m) return;
         // Only the row itself, never a fallback element: marking anything else
         // as machine-owned lets the mode switch below wipe an unrelated field.
+        // A value the operator typed, picked or loaded is theirs: never overwritten.
         for (const [sem, value] of [['peer-list', candidatesOf(m).join(',')], ['peer-secret', m.controlSecret]]) {
           const wrapper = semanticWrapper(container, sem);
           const el = wrapper && wrapper.querySelector('.env-row .env-value');
           if (!el) continue;
+          if (el.value.trim() !== '' && el.dataset.autofilled !== '1') continue;
           setEnvInputValue(el, value);
           el.dataset.autofilled = '1';
         }
       };
+      const rowEl = sem => {
+        const wrapper = semanticWrapper(container, sem);
+        return wrapper && wrapper.querySelector('.env-row .env-value');
+      };
+      // A kept operator value stays visible in same-server mode unless it
+      // already equals the selected node's: the form never hides a value it
+      // did not fill or match.
+      const machineOwned = sem => {
+        const el = rowEl(sem);
+        const m = chosen();
+        const want = !m ? null : sem === 'peer-list' ? candidatesOf(m).join(',') : m.controlSecret;
+        return !el || el.dataset.autofilled === '1' || (want !== null && el.value.trim() === String(want ?? ''));
+      };
+
+      let wasLocal = false;
 
       const sync = () => {
         const local = locSel.value === 'local' && workerRole();
-        urlsWrapper.dataset.forceHide = local ? '1' : '';
-        if (secretWrapper) secretWrapper.dataset.forceHide = local ? '1' : '';
-        tip.textContent = locSel.value === 'local'
-          ? 'Connection and secret are filled automatically from the selected node.'
-          : "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker).";
         if (local) {
           fillFromMaster();
-        } else {
+        } else if (wasLocal) {
           // Switched to manual entry: take back what same-server filled in, so
           // the operator edits their own values rather than a hidden fleet's.
           for (const sem of ['peer-list', 'peer-secret']) {
-            const wrapper = semanticWrapper(container, sem);
-            const el = wrapper && wrapper.querySelector('.env-row .env-value');
+            const el = rowEl(sem);
             if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
           }
         }
+        wasLocal = local;
+        const kept = local && !(machineOwned('peer-list') && machineOwned('peer-secret'));
+        urlsWrapper.dataset.forceHide = local && machineOwned('peer-list') ? '1' : '';
+        if (secretWrapper) secretWrapper.dataset.forceHide = local && machineOwned('peer-secret') ? '1' : '';
+        tip.textContent = locSel.value !== 'local'
+          ? "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker)."
+          : kept
+            ? "A value you entered is kept and shown below; clear it to use the selected node's value."
+            : 'Connection and secret are filled automatically from the selected node.';
         updateEnvConditionals(container);
       };
 
@@ -2286,16 +2322,21 @@
       // matches a local master (or a blank fresh install form): an already
       // configured node must never be silently re-pointed at another master
       // just because its editor was opened.
-      const current = semanticEnvValue(container, 'peer-list');
-      const matching = current === '' ? -1 : joinable.findIndex(m => candidatesOf(m).join(',') === current);
-      if (matching >= 0) {
-        masterSel.value = String(matching);
-        locSel.value = 'local';
-      } else if (current !== '' || isEditor) {
-        locSel.value = 'remote';
-      }
+      const deriveMode = () => {
+        const current = semanticEnvValue(container, 'peer-list');
+        const matching = current === '' ? -1 : joinable.findIndex(m => candidatesOf(m).join(',') === current);
+        if (matching >= 0) {
+          masterSel.value = String(matching);
+          locSel.value = 'local';
+        } else if (current !== '' || isEditor) {
+          locSel.value = 'remote';
+        }
+      };
+      deriveMode();
       urlsWrapper.parentElement.insertBefore(block, urlsWrapper);
       sync();
+      // Loaded envs replace the rows the mode was derived from.
+      container.fleetLocationResync = () => { deriveMode(); sync(); };
     }
 
     // Preview of the public URL this node advertises, below the role row.
@@ -2423,6 +2464,10 @@
       }
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then save. Nothing was saved.`);
+        return;
+      }
+      if (missingMasterCandidates(document.getElementById('env-editor-rows'), true)) {
+        showMessage('error', 'A co-worker needs at least one Master Candidate URL. Pick a node on this server or enter the URLs, then save. Nothing was saved.');
         return;
       }
 
@@ -5342,6 +5387,12 @@
           if (seen.has(env.key)) continue;
           addInstallEnvRow(env.key, env.value);
         }
+        // A loaded role crossing into a dialing role must reach the secret
+        // role cache, or a minted master secret survives into the worker.
+        const roleEl = semanticWrapper(container, 'peer-role');
+        const roleInput = roleEl && roleEl.querySelector('.env-row .env-value');
+        if (roleInput) roleInput.dispatchEvent(new Event('change', { bubbles: true }));
+        if (typeof container.fleetLocationResync === 'function') container.fleetLocationResync();
 
         if (detailEl) {
           const sources = res.sources || {};
@@ -5386,6 +5437,10 @@
       });
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then create. Nothing was created.`);
+        return;
+      }
+      if (missingMasterCandidates(document.getElementById('install-env-rows'), false)) {
+        showMessage('error', 'A co-worker needs at least one Master Candidate URL. Pick a node on this server or enter the URLs, then create. Nothing was created.');
         return;
       }
 

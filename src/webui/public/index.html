@@ -4823,7 +4823,7 @@
     // a plain raw textarea. The raw .cf-body stays canonical (collectors read it).
     // Manifest cards and new/empty cards start expanded; existing raw files start
     // collapsed so a multi-file bot shows a tidy list of filenames.
-    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed) {
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable) {
       const writable = readOnly === false;
       const isEnabled = enabled !== false;
       const hasManifest = !!(manifest && window.guidedNextId);
@@ -4834,25 +4834,28 @@
       let inner = '';
       if (hasManifest) {
         blockId = window.guidedNextId();
-        window.guidedRegister(blockId, manifest, manifest.format || format || 'json', parsed || {});
+        const locked = !!undecryptable || (parsed == null && !!(body && body.trim()));
+        const reason = undecryptable ? 'The stored file no longer decrypts (the encryption key changed): restore the key, or enter the file again in Raw' : 'Raw has errors - form paused';
+        window.guidedRegister(blockId, manifest, manifest.format || format || 'json', parsed || {}, locked ? { locked: true, reason, undecryptable: !!undecryptable } : undefined);
         const formHtml = window.buildGuidedFormHtml(blockId);
         inner = `
           <div class="gc-tabs">
-            <button type="button" class="gc-tab active" data-tab="form" onclick="guidedTab('${blockId}','form')">Form</button>
-            <button type="button" class="gc-tab" data-tab="raw" onclick="guidedTab('${blockId}','raw')">Raw</button>
-            <span class="gc-badge" id="${blockId}-badge"></span>
+            <button type="button" class="gc-tab${locked ? '' : ' active'}" data-tab="form" onclick="guidedTab('${blockId}','form')">Form</button>
+            <button type="button" class="gc-tab${locked ? ' active' : ''}" data-tab="raw" onclick="guidedTab('${blockId}','raw')">Raw</button>
+            <span class="gc-badge${locked ? ' gc-badge-warn' : ''}" id="${blockId}-badge">${locked ? escapeHtml(reason) : ''}</span>
           </div>
-          <div class="gc-form" id="${blockId}-form">${formHtml}</div>
-          <textarea class="cf-body hidden" spellcheck="false" oninput="guidedRawEdit('${blockId}')"
+          <div class="gc-form${locked ? ' hidden' : ''}" id="${blockId}-form">${formHtml}</div>
+          <textarea class="cf-body${locked ? '' : ' hidden'}" spellcheck="false" oninput="guidedRawEdit('${blockId}')"
             style="width: 100%; min-height: 200px; font-family: monospace; font-size: 0.75rem; resize: vertical;">${escapeHtml(body || '')}</textarea>`;
       } else {
         const dim = isEnabled ? '1' : '0.45';
-        inner = `<textarea class="cf-body" placeholder="File contents" spellcheck="false"
+        inner = (undecryptable ? '<div class="cf-undecryptable" style="font-size: 0.7rem; color: #b8860b; margin-bottom: 4px;">The stored file no longer decrypts (the encryption key changed). Leave it empty to keep the stored copy, or enter the file again to replace it.</div>' : '')
+          + `<textarea class="cf-body" placeholder="File contents" spellcheck="false"
             style="width: 100%; min-height: 120px; font-family: monospace; font-size: 0.75rem; resize: vertical; opacity: ${dim};">${escapeHtml(body || '')}</textarea>`;
       }
 
       const idAttr = blockId ? ` id="${blockId}"` : '';
-      const guidedAttr = hasManifest ? ' data-guided="1"' : '';
+      const guidedAttr = (hasManifest ? ' data-guided="1"' : '') + (undecryptable ? ' data-undecryptable="1"' : '');
       const pathDim = (!hasManifest && !isEnabled) ? ' opacity: 0.45;' : '';
 
       return `<div class="config-file-block"${idAttr}${guidedAttr} style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
@@ -4914,7 +4917,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -4974,6 +4977,11 @@
       try { ready = await guidedReadyToSave('#config-editor-rows'); } catch (err) { ready = false; }
       if (!ready) { release(); return; }
       if (!stillOpen()) { release(); showMessage('error', `The config editor for ${name} was closed before saving. Nothing was saved.`); return; }
+      const replacing = [];
+      document.querySelectorAll('#config-editor-rows .config-file-block[data-undecryptable="1"]').forEach(block => {
+        if (block.querySelector('.cf-body').value.trim()) replacing.push(block.querySelector('.cf-path').value.trim() || '(no path)');
+      });
+      if (replacing.length && !confirm('The stored copy of ' + replacing.join(', ') + ' no longer decrypts. Saving replaces it with what you entered, and it cannot be recovered by restoring the old key afterwards. Continue?')) { release(); return; }
       const files = [];
       document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();

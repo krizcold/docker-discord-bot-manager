@@ -1241,7 +1241,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         if (manifest) {
           body = sanitizeSeedRows(manifest, body);
           const r = parseConfig(manifest.format, body);
-          if (r.ok) parsed = r.data;
+          if (r.ok) parsed = r.data ?? {};
         }
         return { ...f, body, format, manifest, parsed };
       });

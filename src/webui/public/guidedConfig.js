@@ -57,11 +57,15 @@
 
   window.guidedNextId = function () { return 'cfb' + (++seq); };
 
-  window.guidedRegister = function (blockId, manifest, format, parsed) {
+  // opts.locked: the body did not parse or decrypt, so the form would show
+  // empty values; the block opens on Raw and the form stays off until a parse succeeds.
+  window.guidedRegister = function (blockId, manifest, format, parsed, opts) {
     let tokenPath = null;
     walkFields(manifest.sections, f => { if (!tokenPath && f.type === 'password' && f.target) tokenPath = f.target.path; });
-    REG[blockId] = { manifest, format: format || 'json', parsed: parsed || {}, tokenPath, pendingOps: [], serializeTimer: null, parseTimer: null, inflight: null, serializeError: null, parseError: null, skipped: [], envStash: {}, listSpecs: {}, expanded: {} };
+    REG[blockId] = { manifest, format: format || 'json', parsed: parsed || {}, tokenPath, pendingOps: [], serializeTimer: null, parseTimer: null, inflight: null, serializeError: null, parseError: null, skipped: [], envStash: {}, listSpecs: {}, expanded: {}, formLocked: false, lockReason: null, undecryptable: false };
+    if (opts && opts.locked) { REG[blockId].formLocked = true; REG[blockId].lockReason = opts.reason || null; REG[blockId].undecryptable = !!opts.undecryptable; REG[blockId].parseError = opts.reason || 'Raw has errors - form paused'; }
   };
+  window.guidedFormLocked = function (id) { const s = st(id); return !!(s && s.formLocked); };
 
   function textareaOf(id) { const b = document.getElementById(id); return b ? b.querySelector('.cf-body') : null; }
 
@@ -182,12 +186,16 @@
     if (!immediate && s.skipped.length) { s.skipped = []; showBadge(id); }
     const run = () => {
       api('POST', '/config/parse', { format: s.format, body: ta.value }).then(r => {
-        if (r && r.success && r.ok) {
+        if (r && r.success && r.ok && s.undecryptable && !ta.value.trim()) {
+          s.formLocked = true;
+          s.parseError = s.lockReason;
+        } else if (r && r.success && r.ok) {
           s.parsed = r.data || {};
           s.parseError = null;
+          s.formLocked = false;
           const form = document.getElementById(id + '-form');
           if (form && !form.classList.contains('hidden')) { form.innerHTML = buildGuidedFormHtml(id); guidedValidateAll(id); }
-        } else s.parseError = (r && r.success) ? 'Raw has errors - form paused' : 'Could not refresh the form; showing earlier values';
+        } else s.parseError = (r && r.success) ? (s.lockReason || 'Raw has errors - form paused') : 'Could not refresh the form; showing earlier values';
         showBadge(id);
       }).catch(() => { s.parseError = 'Could not refresh the form; showing earlier values'; showBadge(id); });
     };
@@ -201,6 +209,10 @@
     const tabs = block.querySelectorAll('.gc-tab');
     tabs.forEach(t => t.classList.toggle('active', t.getAttribute('data-tab') === which));
     if (which === 'raw') { flushSerialize(id); form.classList.add('hidden'); ta.classList.remove('hidden'); }
+    else if (st(id) && st(id).formLocked) {
+      tabs.forEach(t => t.classList.toggle('active', t.getAttribute('data-tab') === 'raw'));
+      flushSerialize(id).then(() => guidedRawEdit(id, true));
+    }
     else { ta.classList.add('hidden'); form.classList.remove('hidden'); flushSerialize(id).then(() => guidedRawEdit(id, true)); }
   };
 

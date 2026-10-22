@@ -226,7 +226,7 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
         if (manifest) {
           rawBody = sanitizeSeedRows(manifest, rawBody);   // drop placeholder seed rows so the bot boots
           const r = parseConfig(manifest.format, rawBody);
-          if (r.ok) parsed = r.data;
+          if (r.ok) parsed = r.data ?? {};
         }
         return { ...cf, rawBody, manifest, parsed };
       });

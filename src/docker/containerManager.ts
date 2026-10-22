@@ -622,6 +622,20 @@ export function updateInstanceFleetFailbackDeclined(botId: string, decline: Flee
   saveRegistry(registry);
 }
 
+/** Record or clear that a failback or drop-back run owns the write fence on this database. Throws when the registry cannot be saved. */
+export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, left: boolean): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  const now = instance.fleetConsentFenceLeft ?? [];
+  if (now.includes(containerName) === left) return;
+  const next = left ? [...now, containerName] : now.filter(c => c !== containerName);
+  if (next.length) instance.fleetConsentFenceLeft = next;
+  else delete instance.fleetConsentFenceLeft;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** For modules that change an instance outside a route (the routes broadcast themselves). */
 export function broadcastBotUpdated(botId: string): void {
   if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));

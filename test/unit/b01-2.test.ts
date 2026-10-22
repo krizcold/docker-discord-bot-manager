@@ -24,6 +24,7 @@ vi.mock('../../src/docker/dockerClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/dockerClient')>()),
   composeDown: async () => {},
   imageExists: async () => false,
+  imageState: async () => 'absent',
   removeImage: async () => true,
   listProjectVolumes: () => [],
   removeVolume: () => true,

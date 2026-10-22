@@ -118,33 +118,29 @@ export async function listBotContainers(): Promise<ContainerInfo[]> {
 }
 
 /**
- * List containers for a specific bot by bot-id label
+ * List containers for a specific bot by bot-id label. Throws when docker does
+ * not answer, so a caller never reads an unanswered listing as "none".
  */
 export async function listContainersByBotId(botId: string): Promise<ContainerInfo[]> {
-  try {
-    const output = execDocker([
-      'ps', '-a',
-      '--filter', 'label=managed-by=discord-bot-manager',
-      '--filter', `label=bot-id=${botId}`,
-      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}'
-    ]);
+  const output = execDocker([
+    'ps', '-a',
+    '--filter', 'label=managed-by=discord-bot-manager',
+    '--filter', `label=bot-id=${botId}`,
+    '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}'
+  ]);
 
-    if (!output) return [];
+  if (!output) return [];
 
-    return output.split('\n').filter(line => line.trim()).map(line => {
-      const [id, name, state, status] = line.split('|');
-      return {
-        id,
-        name,
-        state,
-        status,
-        ports: []
-      };
-    });
-  } catch (error) {
-    console.error(`[Docker] Failed to list containers for bot ${botId}:`, error);
-    return [];
-  }
+  return output.split('\n').filter(line => line.trim()).map(line => {
+    const [id, name, state, status] = line.split('|');
+    return {
+      id,
+      name,
+      state,
+      status,
+      ports: []
+    };
+  });
 }
 
 /**
@@ -400,6 +396,16 @@ export async function imageExists(imageName: string): Promise<boolean> {
   }
 }
 
+/** Image presence where absence is only docker saying "no such image". */
+export async function imageState(imageName: string): Promise<'exists' | 'absent' | 'unknown'> {
+  try {
+    await execDockerAsync(['image', 'inspect', imageName]);
+    return 'exists';
+  } catch (err) {
+    return String((err as Error)?.message || err).toLowerCase().includes('no such image') ? 'absent' : 'unknown';
+  }
+}
+
 /**
  * Read an image's declared environment variables (Config.Env) without running it.
  * Returns the raw "KEY=value" lines, or null if the image is absent or inspect fails.
@@ -620,25 +626,22 @@ export function removeVolume(name: string): boolean {
 
 /**
  * List volumes belonging to a compose project
- * Docker compose names volumes as {projectName}_{volumeName}
+ * Docker compose names volumes as {projectName}_{volumeName}. Throws when
+ * docker does not answer, so a caller never reads that as "none".
  */
 export function listProjectVolumes(projectName: string): string[] {
-  try {
-    const output = execDocker([
-      'volume', 'ls',
-      '--filter', `name=${projectName}_`,
-      '--format', '{{.Name}}'
-    ]);
-    if (!output) return [];
-    // The name filter is a SUBSTRING match, so another project whose name
-    // merely contains this one ('musicbot_data' vs project 'bot') leaks into
-    // the list - and a caller removes what this returns. Keep exact-prefix
-    // matches only; sanitized project names cannot contain an underscore.
-    return output.split('\n').filter(line => line.trim())
-      .filter(name => name.startsWith(`${projectName}_`));
-  } catch {
-    return [];
-  }
+  const output = execDocker([
+    'volume', 'ls',
+    '--filter', `name=${projectName}_`,
+    '--format', '{{.Name}}'
+  ]);
+  if (!output) return [];
+  // The name filter is a SUBSTRING match, so another project whose name
+  // merely contains this one ('musicbot_data' vs project 'bot') leaks into
+  // the list - and a caller removes what this returns. Keep exact-prefix
+  // matches only; sanitized project names cannot contain an underscore.
+  return output.split('\n').filter(line => line.trim())
+    .filter(name => name.startsWith(`${projectName}_`));
 }
 
 /**

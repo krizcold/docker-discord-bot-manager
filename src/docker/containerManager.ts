@@ -1154,6 +1154,42 @@ async function withLoggedBotOp(
 
 // ─── Delete ───
 
+/** A path is absent only when stat says ENOENT or ENOTDIR; any other stat
+ * error means its fate cannot be known. */
+function pathState(p: string): 'exists' | 'absent' | 'unknown' {
+  try {
+    fs.lstatSync(p);
+    return 'exists';
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 'absent' : 'unknown';
+  }
+}
+
+function removePathTracked(p: string, label: string, failures: string[]): void {
+  const before = pathState(p);
+  if (before === 'absent') return;
+  if (before === 'unknown') {
+    failures.push(`${label}: cannot be stat-ed, removal unverifiable`);
+    return;
+  }
+  try { fs.rmSync(p, { recursive: true, force: true }); }
+  catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    failures.push(`${label}: ${msg}`);
+    return;
+  }
+  const after = pathState(p);
+  if (after === 'exists') failures.push(`${label}: still present after removal`);
+  else if (after === 'unknown') failures.push(`${label}: cannot be stat-ed, removal unverifiable`);
+}
+
+function pushPathRemnant(p: string, label: string, remnants: string[]): void {
+  const state = pathState(p);
+  if (state === 'exists') remnants.push(label);
+  else if (state === 'unknown') remnants.push(`${label} (unverifiable, cannot be stat-ed)`);
+}
+
 async function performManualCleanup(appName: string, removeData: boolean): Promise<{ failures: string[] }> {
   console.log(`[ContainerManager] Manual cleanup for ${appName} (removeData: ${removeData})`);
 
@@ -1216,26 +1252,12 @@ async function performManualCleanup(appName: string, removeData: boolean): Promi
 
   // 4. Remove CasaOS metadata directory
   const metadataDir = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', appName);
-  if (fs.existsSync(metadataDir)) {
-    try { fs.rmSync(metadataDir, { recursive: true, force: true }); }
-    catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      failures.push(`metadata dir ${metadataDir}: ${msg}`);
-    }
-  }
+  removePathTracked(metadataDir, `metadata dir ${metadataDir}`, failures);
 
   // 5. Remove app data directory if requested
   if (removeData) {
     const appDataDir = path.join(pcsDataRoot, 'AppData', appName);
-    if (fs.existsSync(appDataDir)) {
-      try {
-        fs.rmSync(appDataDir, { recursive: true, force: true });
-        console.log(`[ContainerManager] Removed app data: ${appDataDir}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`app data ${appDataDir}: ${msg}`);
-      }
-    }
+    removePathTracked(appDataDir, `app data ${appDataDir}`, failures);
   }
 
   return { failures };
@@ -1313,11 +1335,8 @@ async function listDeleteRemnants(
   deploymentMode: DeploymentMode
 ): Promise<string[]> {
   const remnants: string[] = [];
-  // One reachability verdict up front: every probe below reads through docker
-  // and the helpers swallow daemon errors into EMPTY lists (listBotContainers,
-  // imageExists, listProjectVolumes all catch internally), so without this an
-  // unreachable daemon read as "nothing remains" and deregistered on blind
-  // faith, orphaning whatever survived with no Delete button left to retry.
+  // One reachability verdict up front; each probe below still tells "none"
+  // from "docker did not answer", since the daemon can stop answering later.
   if (!await dockerClient.checkDockerConnection()) {
     return ['docker unreachable (nothing could be verified)'];
   }
@@ -1346,19 +1365,23 @@ async function listDeleteRemnants(
     `${instance.sanitizedName}-fleet-postgres-replica-data-helper`,
   ]) {
     if (!name) continue;
-    const present = await execAsync(`docker inspect "${name}"`).then(() => true).catch(() => false);
-    if (present) remnants.push(`container ${name}`);
+    const state = await execAsync(`docker inspect "${name}"`).then(() => 'exists' as const).catch((err) =>
+      String(err instanceof Error ? err.message : err).toLowerCase().includes('no such object') ? 'absent' as const : 'unknown' as const);
+    if (state === 'exists') remnants.push(`container ${name}`);
+    else if (state === 'unknown') remnants.push(`container ${name} (unverifiable, docker did not answer)`);
   }
 
-  try {
-    const imageName = getImageName(instance);
-    if (await dockerClient.imageExists(imageName)) remnants.push(`image ${imageName}`);
-  } catch { /* ignore */ }
+  const imageName = getImageName(instance);
+  const image = await dockerClient.imageState(imageName);
+  if (image === 'exists') remnants.push(`image ${imageName}`);
+  else if (image === 'unknown') remnants.push(`image ${imageName} (unverifiable, docker did not answer)`);
 
   if (!keepData) {
     try {
       for (const v of dockerClient.listProjectVolumes(appName)) remnants.push(`volume ${v}`);
-    } catch { /* ignore */ }
+    } catch {
+      remnants.push(`unverified volumes of ${appName} (docker did not answer)`);
+    }
     // Companion volumes carry explicit names without the {project}_ prefix,
     // so the project listing above can never see them; probe each directly
     // and treat an unanswerable probe as a remnant, not as clean.
@@ -1368,22 +1391,18 @@ async function listDeleteRemnants(
       if (state === 'exists') remnants.push(`volume ${vol}`);
       else if (state === 'unknown') remnants.push(`volume ${vol} (unverifiable, docker did not answer)`);
     }
-    if (fs.existsSync(botDir)) remnants.push(`directory ${botDir}`);
+    pushPathRemnant(botDir, `directory ${botDir}`, remnants);
   } else {
-    if (fs.existsSync(path.join(botDir, 'docker-compose.yml'))) remnants.push(`compose file in ${botDir}`);
+    pushPathRemnant(path.join(botDir, 'docker-compose.yml'), `compose file in ${botDir}`, remnants);
     if (!keepEnv) {
-      for (const p of botEnvCopies(instance.id)) if (fs.existsSync(p)) remnants.push(`env ${p}`);
+      for (const p of botEnvCopies(instance.id)) pushPathRemnant(p, `env ${p}`, remnants);
     }
   }
 
   if (deploymentMode === 'casaos') {
     const dataRoot = process.env.DATA_ROOT || '/DATA';
-    if (fs.existsSync(path.join(dataRoot, 'AppData', 'casaos', 'apps', appName))) {
-      remnants.push('CasaOS app metadata');
-    }
-    if (!keepData && fs.existsSync(path.join(dataRoot, 'AppData', appName))) {
-      remnants.push(`AppData/${appName}`);
-    }
+    pushPathRemnant(path.join(dataRoot, 'AppData', 'casaos', 'apps', appName), 'CasaOS app metadata', remnants);
+    if (!keepData) pushPathRemnant(path.join(dataRoot, 'AppData', appName), `AppData/${appName}`, remnants);
   }
   return remnants;
 }
@@ -1438,15 +1457,17 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
   // 2. Remove Docker image
   const imageName = getImageName(instance);
   try {
-    if (await dockerClient.imageExists(imageName)) {
+    const image = await dockerClient.imageState(imageName);
+    if (image === 'unknown') failures.push(`image ${imageName}: docker did not answer, presence unverifiable`);
+    if (image === 'exists') {
       console.log(`[ContainerManager] Removing image ${imageName}...`);
       const ok = await dockerClient.removeImage(imageName);
       if (!ok) failures.push(`image ${imageName}: docker rmi reported failure`);
       // Verify the image is actually gone - rmi can return success in some
       // edge cases (force-removed dangling tag) while another tag of the
       // same image keeps it present. Treat lingering image as a failure.
-      else if (await dockerClient.imageExists(imageName)) {
-        failures.push(`image ${imageName}: still present after rmi`);
+      else if ((await dockerClient.imageState(imageName)) !== 'absent') {
+        failures.push(`image ${imageName}: still present or unverifiable after rmi`);
       }
     }
   } catch (error) {
@@ -1512,26 +1533,12 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
 
   // 4. Remove instance directory
   if (!keepData) {
-    if (fs.existsSync(botDir)) {
-      try { fs.rmSync(botDir, { recursive: true, force: true }); }
-      catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`bot directory ${botDir}: ${msg}`);
-      }
-    }
+    removePathTracked(botDir, `bot directory ${botDir}`, failures);
   } else {
     // Keep the data but remove compose (recreated on reinstall), and the env
     // copies too unless they are kept.
     const doomed = [path.join(botDir, 'docker-compose.yml'), ...(keepEnv ? [] : botEnvCopies(botId))];
-    for (const p of doomed) {
-      if (!fs.existsSync(p)) continue;
-      try { fs.rmSync(p, { force: true }); }
-      catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        failures.push(`${p}: ${msg}`);
-      }
-      if (fs.existsSync(p)) failures.push(`${p}: still present after removal`);
-    }
+    for (const p of doomed) removePathTracked(p, p, failures);
   }
 
   if (failures.length > 0) {

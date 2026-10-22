@@ -108,6 +108,19 @@ function maskValue(value: string): string {
   return value.substring(0, 4) + '****' + value.substring(value.length - 4);
 }
 
+function renameRefused(entries: Array<{ key: string }>, from: string, newKey: unknown, res: Response): boolean {
+  if (newKey === undefined || newKey === from) return false;
+  if (typeof newKey !== 'string' || !newKey.trim()) {
+    res.status(400).json({ success: false, error: 'The new key cannot be blank. Nothing was saved.' });
+    return true;
+  }
+  if (entries.some(e => e.key === newKey)) {
+    res.status(409).json({ success: false, error: `An entry named ${newKey} already exists in this group. Nothing was saved.` });
+    return true;
+  }
+  return false;
+}
+
 export function createVaultRoutes(): Router {
   const router = Router();
 
@@ -251,13 +264,11 @@ export function createVaultRoutes(): Router {
       }
 
       const vault = loadVault();
-      const idx = vault.standalone.findIndex(e => e.key === key);
-      if (idx >= 0) {
-        vault.standalone[idx].value = value || '';
-        if (hidden !== undefined) vault.standalone[idx].hidden = hidden;
-      } else {
-        vault.standalone.push({ key, value: value || '', hidden: hidden !== false });
+      if (vault.standalone.some(e => e.key === key)) {
+        res.status(409).json({ success: false, error: `A vault entry named ${key} already exists; edit that entry instead. Nothing was saved.` });
+        return;
       }
+      vault.standalone.push({ key, value: value || '', hidden: hidden !== false });
       saveVault(vault);
 
       res.json({ success: true });
@@ -278,9 +289,10 @@ export function createVaultRoutes(): Router {
         res.status(404).json({ success: false, error: 'Entry not found' });
         return;
       }
+      if (renameRefused(vault.standalone, entry.key, newKey, res)) return;
       if (value !== undefined) entry.value = value;
       if (hidden !== undefined) entry.hidden = hidden;
-      if (newKey !== undefined && newKey !== entry.key) entry.key = newKey;
+      if (newKey !== undefined) entry.key = newKey;
       saveVault(vault);
       res.json({ success: true });
     } catch (error) {
@@ -339,8 +351,9 @@ export function createVaultRoutes(): Router {
         res.status(404).json({ success: false, error: 'Entry not found' });
         return;
       }
+      if (renameRefused(group!.entries, entry.key, newKey, res)) return;
       if (value !== undefined) entry.value = value;
-      if (newKey !== undefined && newKey !== entry.key) entry.key = newKey;
+      if (newKey !== undefined) entry.key = newKey;
       saveVault(vault);
       res.json({ success: true });
     } catch (error) {

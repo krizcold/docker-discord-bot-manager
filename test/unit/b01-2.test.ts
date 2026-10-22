@@ -261,12 +261,14 @@ const editorPage = (rows: FakeRow[], stored: string[], answer: any) => {
     return { querySelector: (s: string) => (s === '.env-key' ? key : s === '.env-value' ? val : null) };
   });
   const btn = { disabled: false, textContent: 'Save', isConnected: true };
-  const ctx = runPage(['envEditorRemovedKeys', 'saveEnvEditor'], {
-    document: { querySelectorAll: () => els, querySelector: () => btn, getElementById: () => ({}) },
+  const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'saveEnvEditor'], {
+    document: { querySelectorAll: () => els, querySelector: () => btn, getElementById: () => ({ classList: { contains: () => false } }) },
     semanticEnvKey: () => null,
     envEditorInitial: {},
     envEditorStored: stored,
     envEditorBotId: 'b1',
+    envEditorSeq: 0,
+    bots: [],
     api: async (method: string, url: string, body: any) => { sent.push({ method, url, body }); return answer; },
     showMessage: (type: string, text: string) => { messages.push([type, text]); },
     hideEnvEditor: () => {},
@@ -294,7 +296,7 @@ describe('the env editor page', () => {
     expect(page.sent[0].body.vars).toEqual({ A: '1', C2: '3', NEW: 'n' });
     expect(page.sent[0].body.removed).toEqual(['B', 'C']);
     expect(page.sent[0].body.renamed).toEqual({});
-    expect(page.messages).toEqual([['success', 'Environment variables saved; removed B, C']]);
+    expect(page.messages).toEqual([['success', 'Environment variables of b1 saved; removed B, C']]);
   });
 
   it('sends a renamed blank secret as a rename, never as a blank value', async () => {
@@ -312,7 +314,7 @@ describe('the env editor page', () => {
   it('shows the server error when a key stays stored', async () => {
     const page = editorPage([], ['A'], { success: false, removed: [], stillStored: ['A'], error: 'could not edit x, so A is still stored' });
     await page.save();
-    expect(page.messages).toEqual([['error', 'could not edit x, so A is still stored']]);
+    expect(page.messages).toEqual([['error', 'b1: could not edit x, so A is still stored']]);
   });
 });
 

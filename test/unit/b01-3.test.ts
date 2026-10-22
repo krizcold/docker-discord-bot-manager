@@ -257,8 +257,8 @@ const installPage = (answers: Record<string, any[]>, flushOk = true) => {
     querySelector: (s: string) => (s === '.env-key' ? { value: 'K' } : { value: 'v', dataset: {} }),
   };
   const cfBlock = { querySelector: (s: string) => (s === '.cf-path' ? { value: '/app/c.json' } : s === '.cf-body' ? { value: '{}' } : { checked: true }) };
-  const btn = { disabled: false, textContent: '', isConnected: true };
-  const ctx = runPage(['guidedReadyToSave', 'doInstall', 'saveConfigEditor'], {
+  const btn = { disabled: false, textContent: '', isConnected: true, dataset: {}, classList: { contains: () => false } };
+  const ctx = runPage(['botLabel', 'guidedReadyToSave', 'doInstall', 'saveConfigEditor'], {
     document: {
       getElementById: (x: string) => (x === 'install-name' ? { value: 'Bot' } : btn),
       querySelectorAll: (s: string) => (s.includes('env-row') ? [envRow] : [cfBlock]),
@@ -273,7 +273,7 @@ const installPage = (answers: Record<string, any[]>, flushOk = true) => {
     hideInstallModal: () => { hidden++; },
     hideConfigEditor: () => { hidden++; },
     loadBots: () => {},
-    installSourceId: 's1', installBotId: null, configEditorBotId: 'b9',
+    installSourceId: 's1', installBotId: null, configEditorBotId: 'b9', installSeq: 0, configEditorSeq: 0, bots: [],
   });
   return { ctx, sent, messages, hidden: () => hidden };
 };

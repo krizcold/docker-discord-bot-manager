@@ -875,8 +875,14 @@
     let envEditorBotId = null;
     let envEditorInitial = {};
     let envEditorStored = [];
+    let envEditorSeq = 0;
     let deploymentMode = null;
     let configEditorBotId = null;
+    let configEditorSeq = 0;
+    function botLabel(id) {
+      const b = bots.find(x => x.id === id);
+      return (b && b.displayName) || id;
+    }
     const busyBots = new Set();
     function isTransientStatus(status) {
       return status === 'building' || status === 'starting' || status === 'stopping';
@@ -1789,6 +1795,7 @@
     // ─── Environment Editor ───
     async function showEnvEditor(botId) {
       envEditorBotId = botId;
+      const seq = ++envEditorSeq;
       const bot = bots.find(b => b.id === botId);
       const modal = document.getElementById('env-modal');
       const content = document.getElementById('env-editor-content');
@@ -1798,6 +1805,7 @@
 
       try {
         const res = await api('GET', `/bots/${botId}/env`);
+        if (seq !== envEditorSeq) return;
         if (!res.success) {
           content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">${escapeHtml(res.error || 'Failed to load')}</div>
             <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
@@ -1814,7 +1822,7 @@
           <div id="env-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
           <div class="modal-actions">
-            <button class="btn btn-secondary" onclick="hideEnvEditor()">Cancel</button>
+            <button class="btn btn-secondary" id="env-editor-cancel" onclick="hideEnvEditor()">Cancel</button>
             <button class="btn btn-primary" onclick="saveEnvEditor()">Save</button>
           </div>
         `;
@@ -1831,6 +1839,7 @@
           if (k && v && k.value.trim()) envEditorInitial[k.value.trim()] = v.value;
         });
       } catch (err) {
+        if (seq !== envEditorSeq) return;
         content.innerHTML = `<h3>Environment Variables</h3><div class="error-message">Failed to load environment variables</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideEnvEditor()">Close</button></div>`;
       }
@@ -2339,6 +2348,9 @@
     }
 
     async function saveEnvEditor() {
+      const botId = envEditorBotId;
+      const seq = envEditorSeq;
+      if (!botId || !document.getElementById('env-editor-rows')) return;
       const rows = document.querySelectorAll('#env-editor-rows .env-row');
       const vars = {};
       const badNumbers = [];
@@ -2376,8 +2388,13 @@
       }
 
       const saveBtn = document.querySelector('#env-editor-content .btn-primary');
+      const cancelBtn = document.getElementById('env-editor-cancel');
       saveBtn.disabled = true;
       saveBtn.textContent = 'Saving...';
+      if (cancelBtn) cancelBtn.disabled = true;
+      const stillOpen = () => seq === envEditorSeq && envEditorBotId === botId
+        && !document.getElementById('env-modal').classList.contains('hidden');
+      const name = botLabel(botId);
 
       try {
         // A new non-empty database DSN gets a connection test first (the row
@@ -2388,36 +2405,41 @@
         if (dbUrl && dbUrl !== ((dbKey && envEditorInitial[dbKey]) || '').trim()) {
           saveBtn.textContent = 'Testing database...';
           let check = null;
-          try { check = await api('POST', `/bots/${envEditorBotId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; }
+          try { check = await api('POST', `/bots/${botId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; }
+          if (!stillOpen()) { showMessage('error', `The environment editor for ${name} was closed before saving. Nothing was saved.`); return; }
           if (!(check && check.success && check.ok)) {
             const msg = (check && check.error) || 'connection test failed';
             const hint = (check && check.hint) ? `\n\nHint: ${check.hint}` : '';
             if (!confirm(`Database connection test failed:\n${msg}${hint}\n\nSave anyway?`)) return;
+            if (!stillOpen()) { showMessage('error', `The environment editor for ${name} was closed before saving. Nothing was saved.`); return; }
           }
           saveBtn.textContent = 'Saving...';
         }
 
         const removed = envEditorRemovedKeys(envEditorStored, rowOrigins);
-        const res = await api('PUT', `/bots/${envEditorBotId}/env`, { vars, removed, renamed });
+        const res = await api('PUT', `/bots/${botId}/env`, { vars, removed, renamed });
+        const open = stillOpen();
         if (res.success) {
           const gone = res.removed || [];
-          showMessage('success', gone.length ? `Environment variables saved; removed ${gone.join(', ')}` : 'Environment variables saved');
-          hideEnvEditor();
+          showMessage('success', gone.length ? `Environment variables of ${name} saved; removed ${gone.join(', ')}` : `Environment variables of ${name} saved`);
+          if (open) hideEnvEditor();
           loadBots();
         } else {
-          showMessage('error', res.error || 'Failed to save');
-          if (res.stillStored) { hideEnvEditor(); loadBots(); }
+          showMessage('error', `${name}: ${res.error || 'Failed to save'}`);
+          if (res.stillStored) { if (open) hideEnvEditor(); loadBots(); }
         }
       } catch (err) {
-        showMessage('error', 'Failed to save environment variables');
+        showMessage('error', `Could not confirm the environment variables of ${name} were saved`);
       } finally {
         if (saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+        if (cancelBtn && cancelBtn.isConnected) cancelBtn.disabled = false;
       }
     }
 
     function hideEnvEditor() {
       document.getElementById('env-modal').classList.add('hidden');
       envEditorBotId = null;
+      envEditorSeq++;
     }
 
     // ─── Fleet DB Backups ───
@@ -3609,13 +3631,13 @@
           res = await api('POST', `/bots/${botId}/fleet-reseed`, { ...payload, confirm: true });
         }
         // Failure keeps the form (and everything pasted into it) intact.
-        if (!res.success) { showMessage('error', res.error || 'Failed to start re-seeding'); return; }
-        showMessage('success', 'Re-seeding started');
+        if (!res.success) { showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to start re-seeding'}`); return; }
+        showMessage('success', `${botLabel(botId)}: re-seeding started`);
       } catch (err) {
-        showMessage('error', 'Failed to start re-seeding');
+        showMessage('error', `${botLabel(botId)}: could not confirm re-seeding started`);
         return;
       }
-      hideFleetBackups();
+      if (fleetBackupBotId === botId) hideFleetBackups();
       loadBots();
     }
 
@@ -3624,14 +3646,14 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
         if (res.success) {
-          showMessage('success', 'Adopted. Restart the instance to apply, then copy the replica block to the other machine.');
+          showMessage('success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the replica block to the other machine.`);
         } else {
-          showMessage('error', res.error || 'Failed to adopt the database');
+          showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to adopt the database'}`);
         }
       } catch (err) {
-        showMessage('error', 'Failed to adopt the database');
+        showMessage('error', `${botLabel(botId)}: could not confirm the database was adopted`);
       }
-      hideFleetBackups();
+      if (fleetBackupBotId === botId) hideFleetBackups();
       loadBots();
     }
     async function removeFleetReplica(botId, holdsOutageWrites, appSilent) {
@@ -4270,7 +4292,12 @@
         if (res.success) {
           cloningSources.delete(id);
           await loadSources();
-          // Now open install modal
+          if (!document.getElementById('install-modal').classList.contains('hidden')) {
+            const src = sources.find(s => s.id === id);
+            showMessage('success', `Source ${(src && (src.composeName || getRepoName(src.url) || src.url)) || id} cloned. Finish or close the open install form, then press Add Bot on it.`);
+            renderSourceSidebar();
+            return;
+          }
           showInstallModal(id);
         } else {
           showMessage('error', res.error || 'Failed to clone source');
@@ -4393,14 +4420,18 @@
     let installInteractiveSetup = null;
     let installBotId = null;
     let installIsImage = false;
+    let installSeq = 0;
+    let installDetectError = null;
 
     async function showInstallModal(sourceId) {
       installSourceId = sourceId;
+      const seq = ++installSeq;
       installNameLocked = true;
       installEnvHints = [];
       installConfigHints = [];
       installInteractiveSetup = null;
       installBotId = null;
+      installDetectError = null;
 
       const source = sources.find(s => s.id === sourceId);
       installIsImage = !!(source && source.sourceType === 'docker-image');
@@ -4413,8 +4444,11 @@
       document.getElementById('install-modal').classList.remove('hidden');
 
       // Detect env vars from the source repo (Tier 1; Tier 2 auto-runs when no .env.example)
+      let detectError = null;
       try {
         const res = await api('GET', `/sources/${sourceId}/envs`);
+        if (seq !== installSeq) return;
+        if (!res.success) detectError = res.error || 'the source could not be read';
         if (res.success && Array.isArray(res.vars)) {
           installEnvHints = res.vars;
         }
@@ -4424,14 +4458,28 @@
         if (res.success && res.interactiveSetup) {
           installInteractiveSetup = res.interactiveSetup;
         }
-      } catch (e) { /* non-fatal */ }
+      } catch (e) {
+        if (seq !== installSeq) return;
+        detectError = 'the source could not be reached';
+      }
 
+      installDetectError = detectError;
       renderInstallModal(defaultName);
+    }
+
+    function installContinueManually() {
+      installDetectError = null;
+      const banner = document.getElementById('install-detect-error');
+      if (banner) banner.remove();
+      const btn = document.getElementById('install-btn');
+      if (btn) btn.disabled = false;
     }
 
     function hideInstallModal() {
       document.getElementById('install-modal').classList.add('hidden');
+      installSeq++;
       installSourceId = null;
+      installDetectError = null;
       installBotId = null;
       installEnvHints = [];
       installConfigHints = [];
@@ -4441,7 +4489,15 @@
     }
 
     function renderInstallModal(defaultName) {
+      const detectError = installDetectError;
       const el = document.getElementById('install-modal-content');
+      const source = sources.find(s => s.id === installSourceId);
+      const sourceName = (source && (source.composeName || getRepoName(source.url) || source.url)) || installSourceId;
+      const detectErrorHtml = detectError
+        ? `<div class="error-message" id="install-detect-error">Could not read this source's variables and config files: ${escapeHtml(detectError)}. Nothing below was detected.
+            <div class="modal-actions"><button class="btn btn-secondary btn-small" onclick="showInstallModal(${jsArg(installSourceId)})">Retry</button>
+            <button class="btn btn-secondary btn-small" onclick="installContinueManually()">Continue manually</button></div></div>`
+        : '';
 
       // Build env rows
       let envRowsHtml = '';
@@ -4474,7 +4530,8 @@
         .join('');
 
       el.innerHTML = `
-        <h3>Install from Source</h3>
+        <h3>Install from Source: ${escapeHtml(sourceName)}</h3>
+        ${detectErrorHtml}
         ${interactiveSetupHtml}
         <div class="form-group">
           <label>Bot Name</label>
@@ -4513,8 +4570,8 @@
           <button class="btn btn-secondary btn-small" style="margin-top: 4px;" onclick="addConfigFileRow()">+ Add config file</button>
         </div>
         <div class="modal-actions">
-          <button class="btn btn-secondary" onclick="hideInstallModal()">Cancel</button>
-          <button class="btn btn-primary" id="install-btn" onclick="doInstall()">Save &amp; Install</button>
+          <button class="btn btn-secondary" id="install-cancel" onclick="hideInstallModal()">Cancel</button>
+          <button class="btn btn-primary" id="install-btn" data-source-id="${escapeHtml(installSourceId)}" onclick="doInstall()"${detectError ? ' disabled' : ''}>Save &amp; Install</button>
         </div>
       `;
       onNameInput();
@@ -4527,6 +4584,7 @@
 
     function addInstallEnvRow(key, value) {
       const container = document.getElementById('install-env-rows');
+      if (!container) return;
       const wrapper = document.createElement('div');
       wrapper.innerHTML = `<div class="env-row">
         <input type="text" placeholder="KEY" value="${escapeHtml(key || '')}" class="env-key">
@@ -4598,9 +4656,12 @@
     }
 
     async function scanInstallEnvs() {
-      if (!installSourceId) return;
+      const sourceId = installSourceId;
+      const seq = installSeq;
+      if (!sourceId) return;
       try {
-        const res = await api('GET', `/sources/${installSourceId}/envs?scan=true`);
+        const res = await api('GET', `/sources/${sourceId}/envs?scan=true`);
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         if (!res.success || !Array.isArray(res.vars)) { showMessage('error', 'Scan failed'); return; }
         const existing = new Set(
           Array.from(document.querySelectorAll('#install-env-rows .env-key')).map(i => i.value.trim())
@@ -4614,6 +4675,7 @@
         }
         showMessage('success', added > 0 ? `Found ${added} additional variable(s)` : 'No new variables found');
       } catch (e) {
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         showMessage('error', 'Scan failed');
       }
     }
@@ -4621,11 +4683,14 @@
     // Docker-image sources: pull (if needed) + inspect the image's declared env vars
     // and merge any new ones in. Curated hints already render on modal open.
     async function inspectInstallImage(btn) {
-      if (!installSourceId) return;
+      const sourceId = installSourceId;
+      const seq = installSeq;
+      if (!sourceId) return;
       const orig = btn ? btn.textContent : '';
       if (btn) { btn.disabled = true; btn.textContent = 'Inspecting...'; }
       try {
-        const res = await api('GET', `/sources/${installSourceId}/envs?inspect=true`);
+        const res = await api('GET', `/sources/${sourceId}/envs?inspect=true`);
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         if (!res.success || !Array.isArray(res.vars)) { showMessage('error', 'Image inspect failed'); return; }
         const container = document.getElementById('install-env-rows');
         if (container && !container.querySelector('.env-key')) container.innerHTML = '';   // drop the placeholder note
@@ -4641,6 +4706,7 @@
         }
         showMessage('success', added > 0 ? `Found ${added} variable(s) from the image` : 'No new variables found in the image');
       } catch (e) {
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         showMessage('error', 'Image inspect failed');
       } finally {
         if (btn) { btn.disabled = false; btn.textContent = orig; }
@@ -4733,6 +4799,7 @@
     // ─── Config File Editor (post-install) ───
     async function showConfigEditor(botId) {
       configEditorBotId = botId;
+      const seq = ++configEditorSeq;
       const bot = bots.find(b => b.id === botId);
       const modal = document.getElementById('config-modal');
       const content = document.getElementById('config-editor-content');
@@ -4742,6 +4809,7 @@
 
       try {
         const res = await api('GET', `/bots/${botId}/config`);
+        if (seq !== configEditorSeq) return;
         if (!res.success) {
           content.innerHTML = `<h3>Config Files</h3><div class="error-message">${escapeHtml(res.error || 'Failed to load')}</div>
             <div class="modal-actions"><button class="btn btn-secondary" onclick="hideConfigEditor()">Close</button></div>`;
@@ -4761,12 +4829,13 @@
           <div id="config-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addConfigEditorRow()" style="margin-bottom: 4px;">+ Add config file</button>
           <div class="modal-actions">
-            <button class="btn btn-secondary" onclick="hideConfigEditor()">Cancel</button>
+            <button class="btn btn-secondary" id="config-editor-cancel" onclick="hideConfigEditor()">Cancel</button>
             <button class="btn btn-primary" onclick="saveConfigEditor()">Save</button>
           </div>
         `;
         if (window.guidedInitAll) guidedInitAll();
       } catch (err) {
+        if (seq !== configEditorSeq) return;
         content.innerHTML = `<h3>Config Files</h3><div class="error-message">Failed to load config files</div>
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideConfigEditor()">Close</button></div>`;
       }
@@ -4790,7 +4859,24 @@
     }
 
     async function saveConfigEditor() {
-      if (!(await guidedReadyToSave('#config-editor-rows'))) return;
+      const botId = configEditorBotId;
+      const seq = configEditorSeq;
+      if (!botId || !document.getElementById('config-editor-rows')) return;
+      const name = botLabel(botId);
+      const stillOpen = () => seq === configEditorSeq && configEditorBotId === botId
+        && !document.getElementById('config-modal').classList.contains('hidden');
+      const saveBtn = document.querySelector('#config-editor-content .btn-primary');
+      const cancelBtn = document.getElementById('config-editor-cancel');
+      const release = () => {
+        if (saveBtn && saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+        if (cancelBtn && cancelBtn.isConnected) cancelBtn.disabled = false;
+      };
+      if (saveBtn) saveBtn.disabled = true;
+      if (cancelBtn) cancelBtn.disabled = true;
+      let ready = false;
+      try { ready = await guidedReadyToSave('#config-editor-rows'); } catch (err) { ready = false; }
+      if (!ready) { release(); return; }
+      if (!stillOpen()) { release(); showMessage('error', `The config editor for ${name} was closed before saving. Nothing was saved.`); return; }
       const files = [];
       document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();
@@ -4802,28 +4888,28 @@
         if (path && (body.trim() || !enabled)) files.push({ path, body, readOnly, enabled });
       });
 
-      const saveBtn = document.querySelector('#config-editor-content .btn-primary');
-      if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = 'Saving...'; }
+      if (saveBtn) saveBtn.textContent = 'Saving...';
 
       try {
-        const res = await api('PUT', `/bots/${configEditorBotId}/config`, { files });
+        const res = await api('PUT', `/bots/${botId}/config`, { files });
         if (res.success) {
-          showMessage('success', 'Config files saved. Press Start (or Update) to apply.');
-          hideConfigEditor();
+          showMessage('success', `Config files of ${name} saved. Press Start (or Update) to apply.`);
+          if (stillOpen()) hideConfigEditor();
           loadBots();
         } else {
-          showMessage('error', res.error || 'Failed to save');
+          showMessage('error', `${name}: ${res.error || 'Failed to save'}`);
         }
       } catch (err) {
-        showMessage('error', 'Failed to save config files');
+        showMessage('error', `Could not confirm the config files of ${name} were saved`);
       } finally {
-        if (saveBtn && saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = 'Save'; }
+        release();
       }
     }
 
     function hideConfigEditor() {
       document.getElementById('config-modal').classList.add('hidden');
       configEditorBotId = null;
+      configEditorSeq++;
     }
 
     // ─── Console (interactive terminal) ───
@@ -5148,6 +5234,7 @@
     async function loadPreviousEnvs() {
       const name = document.getElementById('install-name').value.trim();
       if (!name) return;
+      const sourceId = installSourceId, seq = installSeq;
       const btn = document.getElementById('install-reuse-btn');
       const detailEl = document.getElementById('install-reuse-detail');
       const row = document.getElementById('install-reuse-row');
@@ -5155,6 +5242,7 @@
 
       try {
         const res = await api('GET', `/recover-envs?name=${encodeURIComponent(name)}`);
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         if (!res.success) {
           if (detailEl) detailEl.textContent = res.error || 'Failed to load previous envs';
           if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
@@ -5201,12 +5289,19 @@
         if (row) row.classList.add('loaded');
         if (btn) { btn.disabled = true; btn.textContent = 'Loaded'; }
       } catch (err) {
+        if (seq !== installSeq || sourceId !== installSourceId) return;
         if (detailEl) detailEl.textContent = 'Failed to load previous envs';
         if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
       }
     }
 
     async function doInstall() {
+      const sourceId = installSourceId;
+      const seq = installSeq;
+      const btn = document.getElementById('install-btn');
+      if (!sourceId || !btn || btn.disabled || (btn.dataset.sourceId && btn.dataset.sourceId !== sourceId)) return;
+      const stillOpen = () => seq === installSeq && sourceId === installSourceId
+        && !document.getElementById('install-modal').classList.contains('hidden');
       const name = document.getElementById('install-name').value.trim();
       if (!name) { showMessage('error', 'Name is required'); return; }
 
@@ -5231,7 +5326,9 @@
       }
 
       // Flush any pending guided-form edits into the raw bodies before collecting.
-      if (!(await guidedReadyToSave('#install-config-files'))) return;
+      btn.disabled = true;
+      if (!(await guidedReadyToSave('#install-config-files'))) { btn.disabled = false; return; }
+      if (!stillOpen()) { btn.disabled = false; showMessage('error', 'The install form was closed before installing. Nothing was created.'); return; }
 
       // Collect config files (path + verbatim body)
       const configFiles = [];
@@ -5244,40 +5341,47 @@
         if (path && (body.trim() || !enabled)) configFiles.push({ path, body, readOnly, enabled });
       });
 
-      const btn = document.getElementById('install-btn');
+      const cancelBtn = document.getElementById('install-cancel');
       btn.disabled = true; btn.textContent = 'Creating...';
+      if (cancelBtn) cancelBtn.disabled = true;
 
       // A retry after a partial failure reuses the instance already created, so a
-      // second press never makes a duplicate.
+      // second press never makes a duplicate. The collected rows always go to the
+      // instance this form created, even if the form was closed meanwhile.
       let step = 'create';
+      let botId = installBotId;
+      const retry = () => (stillOpen() ? 'Press Save & Install to retry.' : 'Set them in its editor on the bot card.');
       try {
-        if (!installBotId) {
-          const res = await api('POST', '/bots', { sourceId: installSourceId, displayName: name });
+        if (!botId) {
+          const res = await api('POST', '/bots', { sourceId, displayName: name });
           if (!res.success) { showMessage('error', res.error || 'Failed to create instance'); return; }
-          installBotId = res.bot.id;
+          botId = res.bot.id;
+          if (stillOpen()) installBotId = botId;
         }
-        const botId = installBotId;
+        const label = `${name} (${botId})`;
 
         const hasVars = Object.keys(vars).some(k => vars[k]);
         if (hasVars) {
           step = 'env';
           const r = await api('PUT', `/bots/${botId}/env`, { vars });
-          if (!r.success) { showMessage('error', `Instance created, but its environment variables were not saved: ${r.error || 'unknown error'}. Press Save & Install to retry.`); return; }
+          if (!r.success) { showMessage('error', `Instance ${label} created, but its environment variables were not saved: ${r.error || 'unknown error'}. ${retry()}`); return; }
         }
 
         if (configFiles.length > 0) {
           step = 'config';
           const r = await api('PUT', `/bots/${botId}/config`, { files: configFiles });
-          if (!r.success) { showMessage('error', `Instance created, but its config files were not saved: ${r.error || 'unknown error'}. Press Save & Install to retry.`); return; }
+          if (!r.success) { showMessage('error', `Instance ${label} created, but its config files were not saved: ${r.error || 'unknown error'}. ${retry()}`); return; }
         }
 
-        showMessage('success', 'Bot instance created. Press Install & Run on the bot card.');
-        hideInstallModal();
+        showMessage('success', `Bot instance ${label} created. Press Install & Run on the bot card.`);
+        if (stillOpen()) hideInstallModal();
+        else loadBots();
       } catch (err) {
         if (step === 'create') showMessage('error', 'Could not confirm the instance was created; check the bot list before trying again.');
-        else showMessage('error', `Instance created, but could not confirm its ${step === 'env' ? 'environment variables' : 'config files'} were saved. Press Save & Install to retry.`);
+        else showMessage('error', `Instance ${name} (${botId}) created, but could not confirm its ${step === 'env' ? 'environment variables' : 'config files'} were saved. ${retry()}`);
       } finally {
-        btn.disabled = false; btn.textContent = 'Save & Install';
+        if (btn.isConnected !== false) { btn.disabled = false; btn.textContent = 'Save & Install'; }
+        if (cancelBtn && cancelBtn.isConnected !== false) cancelBtn.disabled = false;
       }
     }
 

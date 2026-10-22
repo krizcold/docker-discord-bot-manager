@@ -24,6 +24,7 @@ import { spawn, execFile } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -154,7 +155,7 @@ function readTermFloor(botId: string): number | null {
 
 function writeTermFloor(botId: string, term: number): void {
   try {
-    fs.mkdirSync(backupDir(botId), { recursive: true });
+    ensurePrivateDir(backupDir(botId));
     fs.writeFileSync(termFloorPath(botId), JSON.stringify({ term }));
   } catch (err: any) {
     console.error(`[FleetBackup] Could not persist the term floor for ${botId}: ${err?.message || err}`);
@@ -387,7 +388,7 @@ export async function runFleetDump(
   }
 
   const dir = backupDir(instance.id);
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateDir(dir);
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const fileName = `${prefix}${stamp}.dump`;
@@ -396,7 +397,7 @@ export async function runFleetDump(
 
   return new Promise(resolve => {
     const child = spawn('docker', ['exec', fleetDb.containerName, 'pg_dump', '-U', fleetDb.user, '-Fc', fleetDb.db]);
-    const out = fs.createWriteStream(tmpPath);
+    const out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
     let stderr = '';
     let killed = false;
     let settled = false;

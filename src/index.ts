@@ -23,6 +23,7 @@ import { startRecoveryControlServer, stopRecoveryControlServer } from './instanc
 import { resumeRecoveryRescues } from './instance/recoveryRescue';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
+import { warnOnOpenDataRoot } from './config/fileModes';
 
 /**
  * Tell git to trust repositories under the bot manager's bind-mounted data dirs.
@@ -89,6 +90,8 @@ async function main(): Promise<void> {
   }
 
   console.log('[Init] Docker connection OK');
+
+  await warnOnOpenDataRoot();
 
   // Shared manager<->bot network (docker mode only; no-op on CasaOS/Yundera)
   await ensureInternalNetwork();

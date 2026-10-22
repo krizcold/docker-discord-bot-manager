@@ -106,9 +106,9 @@ Semi-automated: it still asks you the choices that matter - a **data directory**
 
 You do **not** need any of this if you ran `setup.sh` above - these are the equivalent steps, by hand (one difference: setup.sh registers the TOTP device server-side and prints a QR, while this path enrolls it in the web UI via the notification.txt link) (sslip.io example for VPS IP `203.0.113.5`):
 
-1. **Host prep:** create the data dir owned by the bot UID (`1000`), and open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled; don't publish the manager/Authelia ports). Allow SSH **before** enabling the firewall so you are not locked out:
+1. **Host prep:** create the data dir owned by the bot UID (`1000`) and private to it (it holds bot tokens and database dumps), and open inbound TCP **80** and **443** (Contabo's external firewall too, if enabled; don't publish the manager/Authelia ports). Allow SSH **before** enabling the firewall so you are not locked out:
    ```bash
-   sudo mkdir -p /opt/dbm/data && sudo chown 1000:1000 /opt/dbm/data
+   sudo mkdir -p /opt/dbm/data && sudo chown 1000:1000 /opt/dbm/data && sudo chmod 700 /opt/dbm/data
    sudo ufw allow OpenSSH                      # or: sudo ufw allow <your-ssh-port>/tcp
    sudo ufw allow 80,443/tcp && sudo ufw allow 443/udp
    sudo ufw enable
@@ -309,6 +309,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 - A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway's login form. On the remote stack, public bot vhosts sit behind Authelia MFA by default - a gateway the bot's compose ships is stripped there (the boundary is the auth, not a per-bot gateway); setting the bot's Auth to Public keeps its own gateway instead. Standalone binds to `127.0.0.1` with no gateway and no login. See **How bots are reached**.
 - On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
 - Stored secrets - sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault - are encrypted with AES-256-GCM under a scrypt-derived key (`ENV_ENCRYPTION_KEY`, or a random key file generated under the data dir on first run). Know what this layer does and does not cover: it protects against exposure of the stored files themselves (a leaked vault or storage file alone is useless without the key), but anyone with access to the host or the full data volume can read the key file beside it, and running containers necessarily receive their env in plain form (compose files, `docker inspect`). The real boundary is host access and the deployment's auth layer, same as the bots' unencrypted databases.
+- Keep the data dir private to its owner (mode `700`): `setup.sh` creates it that way, and outside CasaOS the manager logs a warning at boot when other local accounts can enter it. The bot composes and docker `.env` files the manager writes there are mode `600`, and fleet database dumps are mode `600` in a mode `700` directory.
 
 </details>
 

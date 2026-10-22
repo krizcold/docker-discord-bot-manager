@@ -13,6 +13,7 @@ import { parseDocument, stringify } from 'yaml';
 import { BotConfig, DetectionResult, DeploymentMode } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
 import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
+import { writePrivateFile } from '../config/fileModes';
 export { extractAppName } from './pcsProcessing';
 
 export interface ComposeResult {
@@ -502,7 +503,7 @@ function formatComposeYaml(compose: ComposeFile): string {
  */
 export function writeComposeFile(botDir: string, content: string): void {
   const composePath = path.join(botDir, 'docker-compose.yml');
-  fs.writeFileSync(composePath, content);
+  writePrivateFile(composePath, content);
   console.log(`[Compose] Wrote docker-compose.yml to ${composePath}`);
 }
 

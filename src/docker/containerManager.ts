@@ -83,6 +83,7 @@ import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { writePrivateFile } from '../config/fileModes';
 import { getDeploymentMode, isModeExplicit } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
@@ -1702,7 +1703,7 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
  * services resolve in docker mode. Mirrors writeComposeEnvFile, but under the
  * manager data dir rather than /DATA.
  */
-function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
+export function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
   try {
     const lines = Object.entries(env)
       .filter(([k]) => k)
@@ -1712,7 +1713,7 @@ function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
         const val = needsQuote ? '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"' : s;
         return `${k}=${val}`;
       });
-    fs.writeFileSync(path.join(botDir, '.env'), lines.join('\n') + '\n');
+    writePrivateFile(path.join(botDir, '.env'), lines.join('\n') + '\n');
   } catch (err) {
     console.warn(`[ContainerManager] Failed to write .env file: ${err}`);
   }
@@ -1935,8 +1936,10 @@ function deleteComposeEnv(env: any, key: string): void {
  * edits made while the bot was stopped take effect without a rebuild. The app
  * service gets the bot's env; any service that already declares USER/PASSWORD (the
  * AppShield gateway) has them refreshed from the current WEBUI_USER/WEBUI_PASSWORD.
+ * `privateFile` is for the manager's own bot-dir copy; the CasaOS metadata copy
+ * keeps the platform's mode.
  */
-function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void {
+export function syncComposeEnvVars(instance: InstanceConfig, composePath: string, privateFile = false): void {
   if (!fs.existsSync(composePath)) return;
 
   // Outside the catch-all: an undecryptable store must refuse the start before
@@ -2040,7 +2043,9 @@ function syncComposeEnvVars(instance: InstanceConfig, composePath: string): void
       replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
     }
 
-    fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+    const yaml = YAML.stringify(compose, { lineWidth: 0 });
+    if (privateFile) writePrivateFile(composePath, yaml);
+    else fs.writeFileSync(composePath, yaml);
   } catch (err) {
     console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
   }
@@ -2280,7 +2285,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
 
       // Sync env into the compose (covers post-build env edits) + a .env file for
       // ${VAR} / env_file services, then deploy the full compose (multi-service).
-      syncComposeEnvVars(latestInstance, composePath);
+      syncComposeEnvVars(latestInstance, composePath, true);
       writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
 
       // Re-apply edited config files so changes made while stopped take effect.
@@ -2407,7 +2412,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
-      syncComposeEnvVars(instance, composePath);
+      syncComposeEnvVars(instance, composePath, true);
       writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
 
       const cfgFiles = reapplyableConfigFiles(botId, emit);

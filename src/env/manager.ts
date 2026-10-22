@@ -12,6 +12,7 @@ import * as crypto from 'crypto';
 import { parseDocument } from 'yaml';
 import { getEnvPath, getDataDir } from '../git/repoManager';
 import { APP_CAPABILITIES } from '../config/appCapabilities';
+import { writePrivateFile } from '../config/fileModes';
 
 /**
  * Resolve the AES key used to encrypt sensitive env/config values. It MUST be
@@ -335,7 +336,7 @@ export function writeEnvFile(botId: string): string {
   const envFilePath = path.join(envPath, '.env');
 
   const lines = Object.entries(vars).map(([key, value]) => `${key}=${value}`);
-  fs.writeFileSync(envFilePath, lines.join('\n'));
+  writePrivateFile(envFilePath, lines.join('\n'));
 
   return envFilePath;
 }

@@ -190,7 +190,7 @@ On Yundera/CasaOS the platform updates the manager. On a standalone (Windows or 
   ./update.ps1              # Windows (set $env:HOST_DATA_DIR first for the standalone stack)
   ```
 
-Both keep your local admin hash and `.env` and recreate the whole stack, so the auth layer is patched too (the manager image is rebuilt; Caddy/Authelia are pinned images that `compose up -d` recreates only when their config changed). Managed bots are separate compose projects, so they keep running.
+Both keep your local admin hash and `.env` and recreate the whole stack (the manager image is rebuilt; Caddy/Authelia are pinned images that `compose up -d` recreates only when their image or compose config changed). When an update changes Authelia's `configuration.yml` or `users_database.yml`, the update also restarts Authelia so the new settings apply; that restart logs every admin session out. Managed bots are separate compose projects, so they keep running.
 
 ---
 

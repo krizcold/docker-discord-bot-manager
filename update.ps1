@@ -33,6 +33,14 @@ $ErrorActionPreference = 'Continue'
 git -c safe.directory='*' update-index --skip-worktree authelia/users_database.yml 2>$null
 $ErrorActionPreference = $prevEap
 
+function Get-AuthHash {
+  $text = foreach ($f in 'authelia/configuration.yml', 'authelia/users_database.yml') {
+    if (Test-Path $f) { (Get-FileHash -Algorithm SHA256 -Path $f).Hash } else { 'missing' }
+  }
+  $text -join ','
+}
+$oldAuth = Get-AuthHash
+
 Write-Host "==> Pulling latest code..."
 git -c safe.directory='*' pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE) - resolve the errors above and re-run." }
@@ -44,6 +52,21 @@ docker compose -f $compose up -d --build
 $composeExit = $LASTEXITCODE
 if ($null -eq $prevBuildCommit) { Remove-Item Env:BUILD_COMMIT -ErrorAction SilentlyContinue } else { $env:BUILD_COMMIT = $prevBuildCommit }
 if ($composeExit -ne 0) { throw "docker compose up failed (exit $composeExit) - see the errors above." }
+
+# compose recreates Authelia only when its image or compose config changed, not when its
+# bind-mounted files did, so restart it when the pull changed them.
+if ((Get-AuthHash) -ne $oldAuth) {
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $services = docker compose -f $compose config --services 2>$null
+  $ErrorActionPreference = $prevEap
+  if ($services -contains 'authelia') {
+    Write-Host "==> Authelia's configuration changed - restarting Authelia (this logs every admin session out)..."
+    docker compose -f $compose restart authelia
+    if ($LASTEXITCODE -ne 0) { throw "Restarting Authelia failed (exit $LASTEXITCODE) - run:  docker compose -f $compose restart authelia" }
+    Write-Host "[ok] Authelia restarted."
+  }
+}
 
 Write-Host "[ok] Bot Manager updated."
 docker compose -f $compose ps

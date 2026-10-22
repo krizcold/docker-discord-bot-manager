@@ -6,12 +6,15 @@
  * mounted at /repo. The manager rebuilds itself by: git pull -> `docker compose
  * build` (streamed live) -> a detached one-shot container (the manager's OWN image,
  * which bundles docker-cli-compose) runs `docker compose up -d` to recreate the
- * whole stack (manager + Caddy/Authelia), so the auth layer is patched too.
+ * whole stack (manager + Caddy/Authelia). compose recreates Caddy/Authelia only when
+ * their image or compose config changed; when the pull changed Authelia's bind-mounted
+ * configuration.yml or users_database.yml, the helper also restarts Authelia.
  * Authelia secrets (*_FILE / gitignored) and its named data volume survive the
- * recreate untouched, so logins/MFA seeds/sessions are preserved.
+ * recreate untouched, so users and MFA seeds are preserved. Sessions are not: they
+ * live in Authelia's memory, so a restart or recreate of Authelia logs admins out.
  */
 import { spawn, execFile, execSync, spawnSync } from 'child_process';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -109,6 +112,29 @@ function preserveLocalUsersDb(): void {
   try { gitOut(['update-index', '--skip-worktree', 'authelia/users_database.yml']); } catch { /* best effort */ }
 }
 
+const AUTHELIA_FILES = ['configuration.yml', 'users_database.yml'];
+
+export function autheliaConfigHash(repoDir: string): string {
+  const h = createHash('sha256');
+  for (const name of AUTHELIA_FILES) {
+    h.update(name + '\0');
+    try { h.update(fs.readFileSync(path.join(repoDir, 'authelia', name))); } catch { h.update('(missing)'); }
+    h.update('\0');
+  }
+  return h.digest('hex');
+}
+
+export function recreateScript(project: string, composeFile: string, restartAuthelia: boolean): string {
+  const compose = `docker compose -p '${project}' -f '${composeFile}'`;
+  const up = `sleep 2; ${compose} up -d --remove-orphans`;
+  return restartAuthelia ? `${up} && { ${compose} restart authelia || exit 3; }` : up;
+}
+
+function composeHasService(self: SelfInfo, service: string): boolean {
+  const r = spawnSync('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'config', '--services'], { cwd: REPO, encoding: 'utf-8', timeout: 10000 });
+  return r.status === 0 && (r.stdout || '').split('\n').map((l) => l.trim()).includes(service);
+}
+
 /** Stream a child process's stdout+stderr to emit(), line by line. */
 function streamProc(cmd: string, args: string[], emit: Emit, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -199,8 +225,10 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   emit('[Update] Fetching latest code...', 'info');
   preserveLocalUsersDb();
   const oldHead = gitOut(['rev-parse', 'HEAD']);
+  const oldAuthHash = autheliaConfigHash(REPO);
   await streamProc('git', ['-c', 'safe.directory=*', '-C', REPO, 'pull', '--ff-only'], emit);
   const newHead = gitOut(['rev-parse', 'HEAD']);
+  const restartAuthelia = autheliaConfigHash(REPO) !== oldAuthHash && composeHasService(self, 'authelia');
 
   emit('[Update] Rebuilding the stack images...', 'info');
   await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build', '--build-arg', `BUILD_COMMIT=${newHead}`], emit, REPO);
@@ -227,7 +255,7 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   // case (no .env). The same-path trick is Linux-only - on Windows the host path is not
   // a valid Linux mount target, so `docker run` fails at launch and we fall back.
   spawnSync('docker', ['rm', '-f', 'dbm-self-update'], { encoding: 'utf-8' });   // free the name (keeps the previous run's logs until now)
-  const script = `sleep 2; docker compose -p '${self.project}' -f '${self.composeFile}' up -d --remove-orphans`;
+  const script = recreateScript(self.project, self.composeFile, restartAuthelia);
   const r = spawnSync('docker', [
     'run', '-d', '--name', 'dbm-self-update', ...LOG_CAP_RUN_ARGS,
     '-e', `HOST_DATA_DIR=${process.env.HOST_DATA_DIR || ''}`,
@@ -244,6 +272,10 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
     );
   }
   emit('[Update] Recreate launched - waiting for the manager to restart...', 'info');
+  if (restartAuthelia) {
+    emit("[Update] Authelia's configuration changed, so the recreate also restarts Authelia; that logs every admin session out. " +
+      `This page cannot confirm the restart. If the new Authelia settings do not apply, run on the host:  docker compose -f ${self.composeFile} restart authelia`, 'warning');
+  }
   onRestarting?.();
 
   // `docker run -d` reports only the LAUNCH, not the inner `compose up` result. Poll
@@ -269,6 +301,14 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
       exitCode = Number(parts[1]);
     } catch { continue; }
     if (status !== 'exited') continue;
+    if (exitCode === 3) {
+      throw new Error(
+        `The stack was recreated, but restarting Authelia failed, so its new settings have not applied.
+${helperLogs() || '(no recreate output)'}
+` +
+        `Restart it from the host with:  docker compose -f ${self.composeFile} restart authelia`,
+      );
+    }
     if (exitCode !== 0) throw new Error(failMsg(helperLogs()));
     await sleep(6000);   // grace tick: a real recreate kills this process during it
     if (runningImageId() === newImageId) {

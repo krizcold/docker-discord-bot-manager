@@ -27,11 +27,22 @@ fi
 # Keep the locally-written admin hash; otherwise the tracked-file change blocks the pull.
 git -c safe.directory='*' update-index --skip-worktree authelia/users_database.yml 2>/dev/null || true
 
+auth_hash() { cat authelia/configuration.yml authelia/users_database.yml 2>/dev/null | sha256sum; }
+old_auth="$(auth_hash)"
+
 info "Pulling latest code..."
 git -c safe.directory='*' pull --ff-only || die "git pull failed - resolve it by hand, then re-run."
 
 info "Rebuilding and recreating (the first build can take a few minutes)..."
 BUILD_COMMIT="$(git -c safe.directory='*' rev-parse HEAD)" docker compose -f "$COMPOSE" up -d --build || die "docker compose up failed."
+
+# compose recreates Authelia only when its image or compose config changed, not when its
+# bind-mounted files did, so restart it when the pull changed them.
+if [ "$(auth_hash)" != "$old_auth" ] && docker compose -f "$COMPOSE" config --services 2>/dev/null | grep -qx authelia; then
+  info "Authelia's configuration changed - restarting Authelia (this logs every admin session out)..."
+  docker compose -f "$COMPOSE" restart authelia || die "Restarting Authelia failed - run:  docker compose -f $COMPOSE restart authelia"
+  ok "Authelia restarted."
+fi
 
 ok "Bot Manager updated."
 docker compose -f "$COMPOSE" ps || true

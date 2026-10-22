@@ -886,6 +886,23 @@
       return (b && b.displayName) || id;
     }
     const busyBots = new Set();
+    // Three idle reconcile intervals: older than this, the status is not current.
+    const STATUS_CHECK_STALE_MS = 90000;
+    function statusCheckedLine(bot) {
+      const up = bot.servicesUp && bot.servicesUp.length ? ` (up: ${bot.servicesUp.join(', ')})` : '';
+      if (!bot.statusCheckedAt) return `<div class="status-checked" data-bot-id="${escapeHtml(bot.id)}" style="font-size:11px;opacity:.7;text-align:right">status unknown: not yet checked</div>`;
+      const age = Date.now() - Date.parse(bot.statusCheckedAt);
+      const when = new Date(bot.statusCheckedAt).toLocaleTimeString();
+      const text = age > STATUS_CHECK_STALE_MS ? `status unknown: last checked ${when}` : `last checked ${when}`;
+      return `<div class="status-checked" data-bot-id="${escapeHtml(bot.id)}" style="font-size:11px;opacity:.7;text-align:right">${escapeHtml(text + up)}</div>`;
+    }
+    function redrawStatusChecked() {
+      for (const el of document.querySelectorAll('.status-checked[data-bot-id]')) {
+        const bot = bots.find(b => b.id === el.dataset.botId);
+        if (bot) el.outerHTML = statusCheckedLine(bot);
+      }
+    }
+    setInterval(redrawStatusChecked, 15000);
     function isTransientStatus(status) {
       return status === 'building' || status === 'starting' || status === 'stopping';
     }
@@ -1087,6 +1104,10 @@
           case 'bot:status':
             setBotStatus(payload.id, payload.status, payload.activeOp);
             redraw();
+            break;
+          case 'bots:checked':
+            for (const [botId, read] of Object.entries(payload || {})) mergeBotState({ id: botId, ...read });
+            redrawStatusChecked();
             break;
 
           // Operation success - payload is the full bot object (with activeOp).
@@ -1480,7 +1501,8 @@
                   ${sourceTag}
                   ${commitInfo}
                 </div>
-                <span class="status-badge status-${bot.status}">${bot.activeOp ? escapeHtml(bot.activeOp) : (busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status)}</span>
+                <div style="text-align:right"><span class="status-badge status-${bot.status}">${bot.activeOp ? escapeHtml(bot.activeOp) : (busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status)}</span>
+                ${statusCheckedLine(bot)}</div>
               </div>
               ${(isGit || webAuthControl || fleetBackupControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}${fleetBackupControl}</div>` : ''}
               <div class="bot-card-actions">
@@ -5037,6 +5059,7 @@
       document.getElementById('console-modal').classList.remove('hidden');
 
       const res = await api('GET', `/bots/${botId}/containers`);
+      if (!res.success) { showMessage('error', res.error || 'Could not read the containers from docker'); return; }
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
       const sel = document.getElementById('console-container');
       sel.innerHTML = running.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
@@ -5122,6 +5145,7 @@
       filesEditorIdle();
 
       const res = await api('GET', `/bots/${botId}/containers`);
+      if (!res.success) showMessage('error', res.error || 'Could not read the containers from docker');
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
       // Persistent data first (the point of the Files view); containers at the end.
       const opts = `<option value="host">Persistent data (host)</option>`

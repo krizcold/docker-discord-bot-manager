@@ -385,7 +385,8 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
 async function runTick(): Promise<void> {
   const instances = containerManager.getAllBots();
   const live = new Set<string>();
-  for (const instance of instances) {
+  for (const record of instances) {
+    const { instance, unanswered } = await containerManager.withServingStatus(record);
     // A seed has no standby record for two of its three purposes, so it would
     // fall through the role gate unreported. A LIVE primary still outranks it;
     // a stopped one is not making a live claim, and only the replica sample
@@ -401,6 +402,10 @@ async function runTick(): Promise<void> {
     // provisioned before the first start and only compose down removes it), so
     // its standby is sampled regardless - a dead standby must never hide
     // behind a stopped instance (drill R-5, finding F2).
+    if (isPrimary && unanswered) {
+      cache.set(instance.id, { role: 'primary', severity: 'warn', message: 'could not confirm whether the instance runs: docker did not answer', lagSeconds: null, checkedAt: Date.now() });
+      continue;
+    }
     if (isPrimary && instance.status !== 'running') {
       // A primary stopped while parked behind a stand-in (20.5) keeps that
       // word: stopping is the first step of the re-seed its verdict asks for,

@@ -124,6 +124,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           fleetBackup: fleetBackupInfo,
           hasDbBackups,
+          ...(containerManager.getReconcileRead(bot.id) ?? { statusCheckedAt: null, servicesUp: null }),
           // Cached verdict from the background sampler: null when this instance
           // has no replication role. Never probed inline - the list is polled.
           replicationHealth: getReplicationHealth(bot.id),
@@ -810,7 +811,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const tail = parseInt(req.query.tail as string) || 100;
       const result = await containerManager.getBotLogs(req.params.id, tail);
       if (!result.success) {
-        res.status(400).json(result);
+        res.status(result.unanswered ? 503 : 400).json({ success: false, error: result.error });
         return;
       }
       res.json({ success: true, logs: result.logs });
@@ -899,7 +900,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     try {
       const result = await containerManager.getBotStats(req.params.id);
       if (!result.success) {
-        res.status(400).json(result);
+        res.status(result.unanswered ? 503 : 400).json({ success: false, error: result.error });
         return;
       }
       res.json({ success: true, stats: result.stats });

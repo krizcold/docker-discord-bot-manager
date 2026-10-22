@@ -201,7 +201,8 @@ export type FactsRead = Awaited<ReturnType<typeof getAppFacts>>;
 /** The posture from an answer already in hand, so one facts read serves every verdict taken from it. */
 export function postureFromRead(instance: InstanceConfig, read: FactsRead | null): StandInRead {
   if (!hasAppHooks(instance)) return { read: 'none' };
-  if (instance.status !== 'running') return { read: 'unanswered', error: 'the instance is not running' };
+  // A facts answer in hand came from a running app, which a build or start lane may be driving.
+  if (instance.status !== 'running' && instance.status !== 'building' && instance.status !== 'starting') return { read: 'unanswered', error: 'the instance is not running' };
   if (!read || !read.success || !read.facts) return { read: 'unanswered', error: read?.error || 'no facts' };
   // The stand-in fact lives in the bot process; the parent answers the hook
   // while that process is down, and a null there is silence, not a verdict.
@@ -209,8 +210,10 @@ export function postureFromRead(instance: InstanceConfig, read: FactsRead | null
   return { read: 'ok', posture: postureFromFacts(read.facts) };
 }
 
-export async function readStandInPosture(instance: InstanceConfig, timeoutMs?: number): Promise<StandInRead> {
-  if (!hasAppHooks(instance)) return { read: 'none' };
+export async function readStandInPosture(record: InstanceConfig, timeoutMs?: number): Promise<StandInRead> {
+  if (!hasAppHooks(record)) return { read: 'none' };
+  const { instance, unanswered } = await containerManager.withServingStatus(record);
+  if (unanswered) return { read: 'unanswered', error: 'could not confirm whether the instance runs: docker did not answer' };
   if (instance.status !== 'running') return { read: 'unanswered', error: 'the instance is not running' };
   return postureFromRead(instance, await getAppFacts(instance, timeoutMs));
 }

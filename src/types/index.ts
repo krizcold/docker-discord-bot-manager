@@ -462,6 +462,8 @@ export interface ContainerInfo {
   project?: string;
   /** bot-id ownership label; absent on containers from before it was stamped. */
   botId?: string;
+  /** com.docker.compose.service label. */
+  service?: string;
 }
 
 export interface PortBinding {

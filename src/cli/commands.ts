@@ -147,7 +147,7 @@ const HANDLERS: Record<string, Handler> = {
   // --- bots ---
   'bots list': (c) =>
     simple(c, 'GET', '/api/bots', undefined, (b) =>
-      table(((b as { bots?: Record<string, unknown>[] }).bots) || [], ['id', 'displayName', 'status', 'hostPort', 'updateAvailable']),
+      table(((b as { bots?: Record<string, unknown>[] }).bots) || [], ['id', 'displayName', 'status', 'statusCheckedAt', 'hostPort', 'updateAvailable']),
     ),
   'bots info': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}`),
   'bots create': async (c) => {

@@ -87,20 +87,21 @@ export function isBuildxAvailable(): boolean {
 }
 
 /**
- * List all bot containers managed by this application
+ * List all bot containers managed by this application; null when docker did
+ * not answer, which is evidence of nothing.
  */
-export async function listBotContainers(): Promise<ContainerInfo[]> {
+export async function listBotContainers(): Promise<ContainerInfo[] | null> {
   try {
     const output = execDocker([
       'ps', '-a',
       '--filter', 'label=managed-by=discord-bot-manager',
-      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}|{{.Label "com.docker.compose.project"}}|{{.Label "bot-id"}}'
+      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}|{{.Label "com.docker.compose.project"}}|{{.Label "bot-id"}}|{{.Label "com.docker.compose.service"}}'
     ]);
 
     if (!output) return [];
 
     return output.split('\n').filter(line => line.trim()).map(line => {
-      const [id, name, state, status, project, botId] = line.split('|');
+      const [id, name, state, status, project, botId, service] = line.split('|');
       return {
         id,
         name,
@@ -108,12 +109,13 @@ export async function listBotContainers(): Promise<ContainerInfo[]> {
         status,
         ports: [],
         ...(project ? { project } : {}),
-        ...(botId ? { botId } : {})
+        ...(botId ? { botId } : {}),
+        ...(service ? { service } : {})
       };
     });
   } catch (error) {
     console.error('[Docker] Failed to list containers:', error);
-    return [];
+    return null;
   }
 }
 
@@ -266,6 +268,9 @@ export async function waitForContainerRunning(containerId: string, timeoutMs = 5
   return false;
 }
 
+/** How long every container must stay up, unrestarted, before a start counts as running. */
+export const VERIFY_SETTLE_MS = 3000;
+
 /**
  * Verify every container in a compose project reaches 'running' state
  * within the timeout. Returns { allRunning: boolean, problems: string[] }
@@ -279,9 +284,11 @@ export async function waitForContainerRunning(containerId: string, timeoutMs = 5
 export async function verifyComposeProjectRunning(
   appName: string,
   timeoutMs = 5000,
+  settleMs = VERIFY_SETTLE_MS,
 ): Promise<{ allRunning: boolean; problems: string[] }> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + Math.max(timeoutMs, settleMs + 1000);
   let lastProblems: string[] = ['no containers found yet'];
+  let settled: { fingerprint: string; since: number } | null = null;
   while (Date.now() < deadline) {
     try {
       const output = execDocker([
@@ -297,10 +304,21 @@ export async function verifyComposeProjectRunning(
           .map(l => l.split('|'))
           .filter(parts => parts[1] !== 'running')
           .map(([name, state, status]) => `${name}: ${state} (${status})`);
-        if (problems.length === 0) return { allRunning: true, problems: [] };
-        lastProblems = problems;
+        if (problems.length === 0) {
+          // A crash-looping container reads 'running' between restarts, so a
+          // start counts only once every container kept its start (restart
+          // count and start time) across the settle window.
+          const names = lines.map(l => l.split('|')[0]);
+          const fingerprint = execDocker(['inspect', '--format', '{{.Name}}|{{.RestartCount}}|{{.State.StartedAt}}', ...names]);
+          if (!settled || settled.fingerprint !== fingerprint) settled = { fingerprint, since: Date.now() };
+          if (Date.now() - settled.since >= settleMs) return { allRunning: true, problems: [] };
+          lastProblems = [`containers running but not yet up for ${Math.round(settleMs / 1000)}s without a restart`];
+        } else {
+          settled = null;
+          lastProblems = problems;
+        }
       }
-    } catch { /* docker call hiccup; retry */ }
+    } catch { settled = null; /* docker call hiccup; retry */ }
     await new Promise(r => setTimeout(r, 200));
   }
   return { allRunning: false, problems: lastProblems };
@@ -329,12 +347,12 @@ export async function removeContainer(containerId: string, force = false): Promi
 }
 
 /**
- * Get container logs
+ * Get container logs; a failure says whether docker answered that the container is gone.
  */
 export async function getContainerLogs(
   containerId: string,
   tail = 100
-): Promise<LogEntry[]> {
+): Promise<LogEntry[] | DockerReadFailure> {
   try {
     const output = execDocker(['logs', '--tail', String(tail), '--timestamps', containerId]);
 
@@ -357,8 +375,8 @@ export async function getContainerLogs(
         stream: 'stdout' as const
       };
     });
-  } catch {
-    return [];
+  } catch (error) {
+    return dockerReadFailure(error);
   }
 }
 
@@ -565,14 +583,22 @@ export async function pullImage(
   });
 }
 
+/** A read docker refused: gone when docker answered that the container no longer exists, error otherwise. */
+export type DockerReadFailure = { gone: true } | { error: string };
+
+function dockerReadFailure(error: unknown): DockerReadFailure {
+  const text = String((error as any)?.message || error).replace(/^Docker command failed:\s*/, '').trim();
+  return /no such container/i.test(text) ? { gone: true } : { error: text || 'docker did not answer' };
+}
+
 /**
- * Get container stats (CPU, memory usage)
+ * Get container stats (CPU, memory usage); a failure as getContainerLogs.
  */
 export async function getContainerStats(containerId: string): Promise<{
   cpuPercent: number;
   memoryUsageMB: number;
   memoryLimitMB: number;
-}> {
+} | DockerReadFailure> {
   try {
     const output = execDocker([
       'stats', '--no-stream',
@@ -605,8 +631,8 @@ export async function getContainerStats(containerId: string): Promise<{
       memoryUsageMB: Math.round(memoryUsageMB * 100) / 100,
       memoryLimitMB: Math.round(memoryLimitMB * 100) / 100
     };
-  } catch {
-    return { cpuPercent: 0, memoryUsageMB: 0, memoryLimitMB: 0 };
+  } catch (error) {
+    return dockerReadFailure(error);
   }
 }
 

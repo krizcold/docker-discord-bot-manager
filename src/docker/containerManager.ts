@@ -2361,6 +2361,18 @@ async function runningAppContainerId(botId: string, appName: string): Promise<st
   }
 }
 
+function containerCountText(ids: string[] | null): string {
+  return ids ? `${ids.length} containers` : 'container count unknown: docker did not answer';
+}
+
+/** The record as the health and posture readers see it: a 'building' or 'starting' record whose app docker says runs reads as running; unanswered when docker could not say. */
+export async function withServingStatus(instance: InstanceConfig): Promise<{ instance: InstanceConfig; unanswered?: true }> {
+  if (instance.status !== 'building' && instance.status !== 'starting') return { instance };
+  const appId = await runningAppContainerId(instance.id, instance.sanitizedName);
+  if (appId === undefined) return { instance, unanswered: true };
+  return { instance: typeof appId === 'string' ? { ...instance, status: 'running' } : instance };
+}
+
 async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
   // A docker query that failed keeps the conservative refusal.
   return await runningAppContainerId(botId, appName) !== null;
@@ -2417,8 +2429,8 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
       // recreates only what changed, so this is the one start that proceeds
       // on a running instance. Only on a concrete answer: an unanswered
       // probe is evidence of nothing, and compose could not act on it either.
-      if (instance.pendingApply !== true) return { success: false, error: 'Bot is already running' };
       if (appId === undefined) return { success: false, error: 'Docker could not confirm whether the bot is running; retry in a moment' };
+      if (instance.pendingApply !== true) return { success: false, error: 'Bot is already running' };
       applyInPlace = {
         projectIds: await runningProjectContainerIds(instance.sanitizedName),
         webUiReady: instance.webUiReady,
@@ -2456,7 +2468,7 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
   // which only a concrete answer proves.
   const appId = await runningAppContainerId(botId, instance.sanitizedName);
   if (typeof appId === 'string') {
-    updateBotStatus(botId, 'running', await getContainerIdsForBot(botId));
+    updateBotStatus(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
     const project = await projectAfter();
     logCollectors.get(botId).addLog(project === 'same'
       ? '[Start] The apply failed; the previous build keeps running and the new one stays unapplied'
@@ -2540,8 +2552,8 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds);
-      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
+      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
 
@@ -2574,8 +2586,8 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds);
-      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
+      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
@@ -2687,8 +2699,8 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds);
-      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
+      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
       syncComposeEnvVars(instance, composePath, true);
@@ -2715,8 +2727,8 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
         throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
       }
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds);
-      emit(`[Done] Bot deployed (${containerIds.length} containers)`, 'success');
+      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
@@ -2747,8 +2759,10 @@ function ownedBotContainers(containers: ContainerInfo[], botId: string, appName:
   });
 }
 
-async function getContainerIdsForBot(botId: string): Promise<string[]> {
+/** The bot's container ids; null when docker did not answer the listing. */
+async function getContainerIdsForBot(botId: string): Promise<string[] | null> {
   const containers = await dockerClient.listBotContainers();
+  if (!containers) return null;
   const appName = resolveAppName(botId);
   return ownedBotContainers(containers, botId, appName).map(c => c.id);
 }
@@ -3036,9 +3050,9 @@ async function stampBuildOutcome(botId: string, emit: EmitFn, statusBefore: BotS
   const running = appId === undefined ? statusBefore === 'running' : appId !== null;
   if (running) {
     setPendingApply(botId, true);
-    // Ids are refreshed only from an answer; a failed listing reads as [].
+    // Ids are refreshed only from an answer; an unanswered listing keeps them.
     if (appId === undefined) updateBotStatus(botId, 'running');
-    else updateBotStatus(botId, 'running', await getContainerIdsForBot(botId));
+    else updateBotStatus(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
     emit('[Build] The running project was not recreated; Start (applies in place) or Restart applies this build', 'warning');
     return;
   }
@@ -3635,19 +3649,28 @@ async function buildGitInstance(
 
 // ─── Logs & Stats ───
 
-export async function getBotLogs(botId: string, tail = 100): Promise<{ success: boolean; logs?: string[]; error?: string }> {
+export async function getBotLogs(botId: string, tail = 100): Promise<{ success: boolean; logs?: string[]; error?: string; unanswered?: true }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 
-  const containerIds = instance.containerIds || [];
+  // The recorded ids keep a stopped container's logs; docker adds the ones an
+  // in-place apply or an external recreate started since.
+  const live = await runningProjectContainerIds(instance.sanitizedName);
+  if (live === undefined) return { success: false, unanswered: true, error: 'could not read logs from docker: docker did not answer' };
+  const containerIds = [...new Set([...(instance.containerIds || []), ...live])];
   if (containerIds.length === 0) return { success: false, error: 'Bot has no containers' };
 
   try {
     const allLogs: string[] = [];
+    const unread: string[] = [];
+    let read = 0;
     for (const containerId of containerIds) {
       try {
         const logEntries = await dockerClient.getContainerLogs(containerId, Math.ceil(tail / containerIds.length));
         const containerName = containerId.substring(0, 12);
+        if ('gone' in logEntries) continue;
+        if ('error' in logEntries) { unread.push(`${containerName}: ${logEntries.error}`); continue; }
+        read++;
         for (const e of logEntries) {
           allLogs.push(`[${e.timestamp}] [${containerName}] ${e.message}`);
         }
@@ -3655,6 +3678,10 @@ export async function getBotLogs(botId: string, tail = 100): Promise<{ success: 
         console.warn(`[ContainerManager] Failed to get logs from container ${containerId}:`, err);
       }
     }
+    if (unread.length > 0) {
+      return { success: false, unanswered: true, error: `could not read logs from docker: ${unread.join('; ')}` };
+    }
+    if (read === 0) return { success: false, error: 'the recorded containers no longer exist and docker runs none for this bot' };
     allLogs.sort();
     return { success: true, logs: allLogs.slice(-tail) };
   } catch (error) {
@@ -3662,14 +3689,18 @@ export async function getBotLogs(botId: string, tail = 100): Promise<{ success: 
   }
 }
 
-export async function getBotStats(botId: string): Promise<{ success: boolean; stats?: { cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }; error?: string }> {
+export async function getBotStats(botId: string): Promise<{ success: boolean; stats?: { cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }; error?: string; unanswered?: true }> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 
-  const containerIds = instance.containerIds || [];
-  if (containerIds.length === 0 || instance.status !== 'running') {
-    return { success: false, error: 'Bot is not running' };
-  }
+  // Docker, not the record, says whether the app runs: a 'building' record
+  // may be serving, and a 'running' one may have crashed.
+  const appId = await runningAppContainerId(botId, instance.sanitizedName);
+  if (appId === undefined) return { success: false, unanswered: true, error: 'could not read stats from docker: docker did not answer' };
+  if (appId === null) return { success: false, error: 'Bot is not running' };
+  const containerIds = await runningProjectContainerIds(instance.sanitizedName);
+  if (containerIds === undefined) return { success: false, unanswered: true, error: 'could not read stats from docker: docker did not answer' };
+  if (containerIds.length === 0) return { success: false, error: 'Bot is not running' };
 
   try {
     let totalCpuPercent = 0;
@@ -3679,6 +3710,10 @@ export async function getBotStats(botId: string): Promise<{ success: boolean; st
     for (const containerId of containerIds) {
       try {
         const stats = await dockerClient.getContainerStats(containerId);
+        if ('gone' in stats) continue;
+        if ('error' in stats) {
+          return { success: false, unanswered: true, error: `could not read stats from docker: ${stats.error}` };
+        }
         totalCpuPercent += stats.cpuPercent;
         totalMemoryUsageMB += stats.memoryUsageMB;
         totalMemoryLimitMB += stats.memoryLimitMB;
@@ -3733,7 +3768,9 @@ export async function syncContainerStates(): Promise<void> {
   if (fault) { console.warn(`[Reconciler] Skipped: ${fault}`); return; }
   const registry = loadRegistry();
   const containers = await dockerClient.listBotContainers();
+  if (!containers) { console.warn('[Reconciler] Skipped: docker did not answer the container listing'); return; }
 
+  const checked: Record<string, { statusCheckedAt: string; servicesUp: string[] }> = {};
   for (const instance of Object.values(registry.instances)) {
     if (instance.status !== 'running' && instance.status !== 'stopped' && instance.status !== 'error') {
       continue;
@@ -3757,11 +3794,23 @@ export async function syncContainerStates(): Promise<void> {
       .filter(c => !standalone.has(c.name));
     const runningContainers = botContainers.filter(c => c.state === 'running');
     const runningIds = runningContainers.map(c => c.id);
+    // The bot runs when its app service runs; a redis or status-page sibling
+    // up beside a crash-looping app is not the bot running.
+    const appService = reconcileAppService(instance.id, appName);
+    const appRunning = appService && botContainers.some(c => c.service)
+      ? runningContainers.some(c => c.service === appService)
+      : runningContainers.length > 0;
+    checked[instance.id] = { statusCheckedAt: new Date().toISOString(), servicesUp: runningContainers.map(c => c.service || c.name) };
+    reconcileReads.set(instance.id, checked[instance.id]);
 
     if (instance.status === 'running' && runningContainers.length === 0) {
       console.log(`[Reconciler] ${instance.id} registry=running but no running containers - marking stopped`);
       updateBotStatus(instance.id, 'stopped', []);
-    } else if (instance.status !== 'running' && runningContainers.length > 0) {
+    } else if (instance.status === 'running' && !appRunning) {
+      const up = runningContainers.map(c => c.service || c.name).join(', ');
+      console.log(`[Reconciler] ${instance.id} registry=running but its app service is down (still up: ${up}) - marking error`);
+      updateBotStatus(instance.id, 'error', runningIds);
+    } else if (instance.status !== 'running' && appRunning) {
       console.log(`[Reconciler] ${instance.id} registry=${instance.status} but containers are running - marking running`);
       updateBotStatus(instance.id, 'running', runningIds);
     } else if (instance.status === 'running') {
@@ -3771,6 +3820,25 @@ export async function syncContainerStates(): Promise<void> {
         updateBotStatus(instance.id, 'running', runningIds);
       }
     }
+  }
+  if (broadcastFn && Object.keys(checked).length > 0) broadcastFn('bots:checked', checked);
+}
+
+const reconcileReads = new Map<string, { statusCheckedAt: string; servicesUp: string[] }>();
+
+/** When the reconciler last read this bot's containers from docker and which services were up; null before its first read. */
+export function getReconcileRead(botId: string): { statusCheckedAt: string; servicesUp: string[] } | null {
+  return reconcileReads.get(botId) ?? null;
+}
+
+/** The app service the reconciler keys on; null when the compose cannot say. */
+function reconcileAppService(botId: string, appName: string): string | null {
+  try {
+    const composePath = resolveComposePath(botId, appName);
+    if (!fs.existsSync(composePath)) return null;
+    return getAppServiceName(YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON());
+  } catch {
+    return null;
   }
 }
 

@@ -1,0 +1,18 @@
+{
+  "name": "smdb-manager-tests",
+  "private": true,
+  "description": "Verification suite for the manager (Documentation/process/VERIFY.md). Kept out of the root package so the production image never installs test tooling.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "node run.cjs",
+    "typecheck": "node ../node_modules/typescript/bin/tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vitest": "5.0.3"
+  },
+  "overrides": {
+    "@types/node": "^22.13.5"
+  }
+}

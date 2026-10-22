@@ -14,3 +14,6 @@ authelia/secrets
 
 # Runtime bot data - never send to the build context
 data/
+
+# Test tooling - never part of the image
+test

@@ -196,7 +196,7 @@ Both keep your local admin hash and `.env` and recreate the whole stack, so the 
 
 ## How bots are reached
 
-When a bot exposes a web UI, the manager publishes it on a host port (auto-assigned from `20000-29999`, override with `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE`) and shows an **Open** link. Ports bind to `127.0.0.1` by default - a published port bypasses host firewalls, so this avoids exposing bots on a server; set `BOT_PORT_BIND=0.0.0.0` for trusted-LAN access. On a server with the remote stack, bots are instead reached via their HTTPS subdomain (see **Server on Linux**).
+When a bot exposes a web UI, the manager publishes it on a host port (auto-assigned from `20000-29999`, override with `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE`) and shows an **Open** link. Ports bind to `127.0.0.1` by default - a published port bypasses host firewalls, so this avoids exposing bots on a server; set `BOT_PORT_BIND=0.0.0.0` for trusted-LAN access. In a containerized manager these settings take effect only when added to the manager service's `environment:` block in the compose file (the shipped composes do not forward them, and a value only in `.env` is not passed in). On a server with the remote stack, bots are instead reached via their HTTPS subdomain (see **Server on Linux**).
 
 ### Bot web-UI access
 
@@ -226,7 +226,7 @@ Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway ex
 - **Multi-service stacks** - auto-wires PostgreSQL/MongoDB/MariaDB/Redis + Lavalink; status-page sidecar for port-less bots (CasaOS).
 - **Environment management** - encrypted env storage + an in-UI editor + a reusable Credentials Vault.
 - **Per-bot Console & Files** - interactive shell + a file browser/editor.
-- **`dbm` console** - a loopback CLI with full parity to the web-UI API (see [Documentation/BotManager/Console.md](../Documentation/BotManager/Console.md)).
+- **`dbm` console** - a loopback CLI with full parity to the web-UI API (run it with `--help` for its commands; in the container it is `/app/dist/cli/dbm.js`).
 - **Live logs**, **non-blocking lifecycle** (start/stop/restart/update/delete) with WebSocket status, and **opt-in auto-updates**.
 - **CasaOS / PCS integration** and **standalone Docker** (this README).
 
@@ -274,6 +274,8 @@ WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:
 <details>
 <summary><b>Environment variables</b></summary>
 
+In a containerized manager, only the keys listed in the compose file's `environment:` block reach it; `.env` beside the compose only fills `${VAR}` placeholders. Add any other row below to that block to set it. The shipped composes do not forward `BOT_PORT_BIND`, `BOT_HOST_PORT_BASE`/`BOT_HOST_PORT_RANGE` or `ENV_ENCRYPTION_KEY`. Set `ENV_ENCRYPTION_KEY` only before the first run: setting or changing it on an existing data dir leaves every stored secret undecryptable, and bots refuse to start until the old key is restored or each secret is entered again.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8080` | Web server port (inside the container) |
@@ -283,7 +285,7 @@ WebSocket events include: `bot:status`, `bot:created`/`updated`/`deleted`, `bot:
 | `BOT_PORT_BIND` | `127.0.0.1` | Interface bots' host ports bind to (`0.0.0.0` for LAN) |
 | `BOT_HOST_PORT_BASE` / `BOT_HOST_PORT_RANGE` | `20000` / `10000` | Host-port auto-assign range |
 | `BOT_DOMAIN_BASE` | (unset) | Base for per-bot HTTPS subdomains (remote mode) |
-| `ENV_ENCRYPTION_KEY` | (generated) | Key material for the encrypted secret storage; use a long random value if set. When unset, a random key file is generated under the data dir on first run |
+| `ENV_ENCRYPTION_KEY` | (generated) | Key material for the encrypted secret storage; use a long random value if set. When unset, a random key file is generated under the data dir on first run. Set it before the first run only: setting or changing it on an existing data dir leaves every stored secret undecryptable until the old key is restored |
 | `NODE_ENV` | `production` | Node environment |
 
 Remote mode adds `PUBLIC_HOST`, `AUTHELIA_HOST`, `COOKIE_DOMAIN`, `ACME_EMAIL`, `TZ`, `MANAGER_GATEWAY_SECRET` (see **Server on Linux**). On Yundera the platform supplies `PUID`/`PGID`/`TZ`/`APP_*`/`REF_*`/`DATA_ROOT`.
@@ -308,7 +310,7 @@ Most public Discord bot repos work unmodified. The smoothest path is a repo that
 - Standalone binds the UI to `127.0.0.1` and has no built-in login - reach it remotely only via a tunnel/VPN or the **Server on Linux** stack (Caddy + Authelia MFA).
 - A bot never authenticates its own web UI; authentication lives at the deployment boundary. On Yundera, each bot is its own CasaOS app guarded by its AppShield gateway's login form. On the remote stack, public bot vhosts sit behind Authelia MFA by default - a gateway the bot's compose ships is stripped there (the boundary is the auth, not a per-bot gateway); setting the bot's Auth to Public keeps its own gateway instead. Standalone binds to `127.0.0.1` with no gateway and no login. See **How bots are reached**.
 - On the remote stack, `MANAGER_GATEWAY_SECRET` makes the manager accept only Caddy-proxied (Authelia-passed) HTTP and WebSocket traffic; loopback and the token-authenticated bot update endpoints are exempt.
-- Stored secrets - sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault - are encrypted with AES-256-GCM under a scrypt-derived key (`ENV_ENCRYPTION_KEY`, or a random key file generated under the data dir on first run). Know what this layer does and does not cover: it protects against exposure of the stored files themselves (a leaked vault or storage file alone is useless without the key), but anyone with access to the host or the full data volume can read the key file beside it, and running containers necessarily receive their env in plain form (compose files, `docker inspect`). The real boundary is host access and the deployment's auth layer, same as the bots' unencrypted databases.
+- Stored secrets - sensitive per-bot env values (tokens, keys, passwords), user config-file bodies, and the credentials vault - are encrypted with AES-256-GCM under a scrypt-derived key (`ENV_ENCRYPTION_KEY` when it reaches the manager process, see **Environment variables**; otherwise a random key file generated under the data dir on first run). Know what this layer does and does not cover: it protects against exposure of the stored files themselves (a leaked vault or storage file alone is useless without the key), but anyone with access to the host or the full data volume can read the key file beside it, and running containers necessarily receive their env in plain form (compose files, `docker inspect`). The real boundary is host access and the deployment's auth layer, same as the bots' unencrypted databases.
 - Keep the data dir private to its owner (mode `700`): `setup.sh` creates it that way, and outside CasaOS the manager logs a warning at boot when other local accounts can enter it. The bot composes and docker `.env` files the manager writes there are mode `600`, and fleet database dumps are mode `600` in a mode `700` directory.
 
 </details>

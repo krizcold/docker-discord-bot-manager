@@ -24,6 +24,11 @@ services:
     # Or: image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       NODE_ENV: production
       DATA_DIR: /data/data
@@ -58,6 +63,11 @@ services:
     image: lucaslorentz/caddy-docker-proxy:2.12-alpine
     container_name: caddy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "80:80"        # ACME HTTP-01 + HTTP->HTTPS redirect
       - "443:443"      # public HTTPS
@@ -76,6 +86,11 @@ services:
     image: authelia/authelia:4.39.20
     container_name: authelia
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       X_AUTHELIA_CONFIG: /config/configuration.yml
       X_AUTHELIA_CONFIG_FILTERS: template          # render {{ env "..." }} in configuration.yml

@@ -36,6 +36,7 @@ import { runFleetDump } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
+import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
 const PGDATA = '/var/lib/postgresql/data';
 const APP_HOOK_WAIT_MS = 90_000;
@@ -337,7 +338,7 @@ async function rsyncPass(instance: InstanceConfig, pass: 'bulk' | 'consistent'):
     const net = network.ok ? network.stdout.split('\n').map(s => s.trim()).filter(Boolean)[0] : '';
     if (!net) throw new Error('could not resolve the relay network for the rsync client');
     if (!containerManager.getBot(instance.id)?.recoveryRescue) throw new Error('rescue cancelled');
-    const run = await docker(['run', '-d', '--name', name,
+    const run = await docker(['run', '-d', '--name', name, ...LOG_CAP_RUN_ARGS,
       '--label', `rescue-pass=${pass}`,
       '--network', net,
       '-v', `${fleetDb.volume}:/pgdata`,

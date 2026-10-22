@@ -6,6 +6,11 @@ services:
     container_name: discordbotmanager
     hostname: discordbotmanager
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     cpu_shares: 80
     healthcheck:
       test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:80/ | grep -qE '(200|301|302|403)'"]
@@ -51,6 +56,11 @@ services:
     image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     user: "root"
     environment:
       NODE_ENV: production

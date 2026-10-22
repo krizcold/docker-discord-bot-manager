@@ -7,6 +7,7 @@
  * - Generates compose only when repo doesn't have one
  */
 
+import { LOG_MAX_FILE, LOG_MAX_SIZE } from './logCaps';
 import * as fs from 'fs';
 import * as path from 'path';
 import { parseDocument, stringify } from 'yaml';
@@ -366,6 +367,11 @@ function formatComposeYaml(compose: ComposeFile): string {
 
     lines.push(`    container_name: ${service.container_name}`);
     lines.push(`    restart: ${service.restart}`);
+    lines.push('    logging:');
+    lines.push('      driver: json-file');
+    lines.push('      options:');
+    lines.push(`        max-size: "${LOG_MAX_SIZE}"`);
+    lines.push(`        max-file: "${LOG_MAX_FILE}"`);
 
     if (service.cpu_shares !== undefined) {
       lines.push(`    cpu_shares: ${service.cpu_shares}`);

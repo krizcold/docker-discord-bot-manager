@@ -16,6 +16,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDeploymentMode } from '../casaos/detector';
+import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
 const REPO = '/repo';
 // Regenerated on every process start; lets the UI tell "server restarted" apart
@@ -228,7 +229,7 @@ async function doManagerUpdate(emit: Emit, onRestarting?: () => void): Promise<v
   spawnSync('docker', ['rm', '-f', 'dbm-self-update'], { encoding: 'utf-8' });   // free the name (keeps the previous run's logs until now)
   const script = `sleep 2; docker compose -p '${self.project}' -f '${self.composeFile}' up -d --remove-orphans`;
   const r = spawnSync('docker', [
-    'run', '-d', '--name', 'dbm-self-update',
+    'run', '-d', '--name', 'dbm-self-update', ...LOG_CAP_RUN_ARGS,
     '-e', `HOST_DATA_DIR=${process.env.HOST_DATA_DIR || ''}`,
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
     '-v', `${self.hostRepoDir}:${self.hostRepoDir}`,

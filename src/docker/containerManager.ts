@@ -91,6 +91,7 @@ import * as sourceManager from '../source/sourceManager';
 import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
+import { capServiceLogs } from '../templates/logCaps';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
@@ -2164,6 +2165,7 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
       replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
     }
 
+    capServiceLogs(services);
     const yaml = YAML.stringify(compose, { lineWidth: 0 });
     if (privateFile) writePrivateFile(composePath, yaml);
     else fs.writeFileSync(composePath, yaml);
@@ -2471,6 +2473,22 @@ function reapplyableConfigFiles(botId: string, emit: EmitFn): configFileManager.
   return enabled;
 }
 
+// A compose written before the log caps existed gets them on its next start; the file is rewritten only when a cap
+// was added, and keeps the mode it has.
+function capComposeFileLogs(composePath: string): void {
+  if (!fs.existsSync(composePath)) return;
+  try {
+    const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+    const services = compose?.services;
+    if (!services || typeof services !== 'object') return;
+    const before = JSON.stringify(services);
+    capServiceLogs(services);
+    if (JSON.stringify(services) !== before) fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+  } catch (err) {
+    console.warn(`[ContainerManager] Failed to cap container logs in compose: ${err}`);
+  }
+}
+
 async function startDockerImageBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
@@ -2502,6 +2520,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
 
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
+      capComposeFileLogs(composePath);
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 

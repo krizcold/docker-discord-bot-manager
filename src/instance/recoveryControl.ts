@@ -23,6 +23,7 @@ import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
 import { InstanceConfig } from '../types';
+import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
 export const RECOVERY_CONTROL_PORT = 8946;
 const RECOVERY_SLOT = 'recovery_channel';
@@ -128,7 +129,7 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
   await docker(['rm', '-f', name]);
   // The config rides an env var: a real multi-line value survives argv+env
   // verbatim, where printf-escape games do not (POSIX %s never expands \n).
-  const run = await docker(['run', '-d', '--name', name, '--restart', 'unless-stopped',
+  const run = await docker(['run', '-d', '--name', name, '--restart', 'unless-stopped', ...LOG_CAP_RUN_ARGS,
     '--network', network,
     '-v', `${fleetDb.volume}:/pgdata:ro`,
     '-e', `RSYNCD_CONF=${RSYNCD_CONF}`,

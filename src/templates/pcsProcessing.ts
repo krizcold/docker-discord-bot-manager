@@ -11,6 +11,7 @@ import { randomBytes } from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
+import { capServiceLogs, cappedLogging } from './logCaps';
 import { BotConfig, DeploymentMode } from '../types';
 import { buildStatusPageService } from './statusPage';
 import { findConfigTemplate } from '../config/configTemplates';
@@ -646,6 +647,8 @@ export function processComposeForCasaOS(
     }
   }
 
+  capServiceLogs(services);
+
   // ── Single stringify ──
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected };
 }
@@ -999,6 +1002,7 @@ export function processComposeForDocker(
     }
   }
 
+  capServiceLogs(services);
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
 }
 
@@ -1518,6 +1522,7 @@ export function addFleetPostgresService(
     container_name: db.containerName,
     restart: 'unless-stopped',
     cpu_shares: 10,
+    logging: cappedLogging(),
     environment: {
       POSTGRES_USER: db.user,
       POSTGRES_DB: db.db,
@@ -1595,6 +1600,7 @@ export function addFleetPostgresReplicaService(
     container_name: replica.containerName,
     restart: 'unless-stopped',
     cpu_shares: 10,
+    logging: cappedLogging(),
     ports: [`${replica.hostPort}:5432`],
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {

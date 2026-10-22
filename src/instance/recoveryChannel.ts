@@ -26,6 +26,7 @@ import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
 import { ensureRsyncDaemon, RECOVERY_CONTROL_PORT } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
+import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
 const DEFAULT_TUNNEL_PORT = 15433;
 const TUNNEL_CONTAINER_PORT = 9450;
@@ -106,7 +107,7 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
   if (!network.ok) return { ok: false, error: network.error };
   const identity = JSON.stringify(await databaseIdentity(instance));
 
-  const args = ['run', '-d', '--name', record.containerName, '--restart', 'unless-stopped',
+  const args = ['run', '-d', '--name', record.containerName, '--restart', 'unless-stopped', ...LOG_CAP_RUN_ARGS,
     '--network', network.network!,
     '-e', `RELAY_TOKEN=${record.token}`,
     '-e', `RELAY_SELF_IDENTITY=${identity}`];

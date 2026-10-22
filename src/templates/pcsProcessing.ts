@@ -847,7 +847,10 @@ export function processComposeForDocker(
   // boundary is the localhost bind or the bundled Authelia, so a shipped gateway
   // would only double-gate the web UI - drop it and repoint the web entry at its
   // backend. webAuth=public pins the bot to its own gate and keeps it.
-  if (bot.webAuth !== 'public') stripFrontingGateway(compose);
+  // A non-loopback BOT_PORT_BIND with no domain route publishes the port to other
+  // hosts with nothing in front of it, so the shipped gateway stays as the boundary.
+  const lanExposed = !isLoopbackBind(botPortBind()) && !process.env.BOT_DOMAIN_BASE;
+  if (bot.webAuth !== 'public' && !lanExposed) stripFrontingGateway(compose);
 
   const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
 
@@ -1070,6 +1073,35 @@ export function getWebUiIndexPath(composeContent: string): string | null {
   return index;
 }
 
+export function botPortBind(): string {
+  return process.env.BOT_PORT_BIND || '127.0.0.1';
+}
+
+export function isLoopbackBind(bind: string): boolean {
+  const b = bind.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return b === 'localhost' || b === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(b);
+}
+
+/**
+ * True when publishing on an off-loopback BOT_PORT_BIND would put the kept gateway's
+ * login on the public 'casaos' fallback: the main service carries a PASSWORD env and
+ * neither the bot's WEBUI_PASSWORD nor APP_DEFAULT_PASSWORD sets it.
+ */
+export function gatewayOnDefaultPassword(composeContent: string, webuiPasswordSet: boolean): boolean {
+  if (isLoopbackBind(botPortBind()) || webuiPasswordSet || process.env.APP_DEFAULT_PASSWORD) return false;
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return true;
+  }
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  const mainName = getMainServiceName(compose);
+  const env = mainName && services?.[mainName]?.environment;
+  if (Array.isArray(env)) return env.some(e => typeof e === 'string' && /^PASSWORD(=|$)/.test(e));
+  return !!env && typeof env === 'object' && 'PASSWORD' in env;
+}
+
 /**
  * Ensure the main web service publishes containerPort on hostPort (docker mode).
  * A mapping that already targets containerPort is left untouched.
@@ -1098,7 +1130,10 @@ export function publishHostPort(
     // (Docker writes its own nat/FORWARD rules), so 0.0.0.0 would expose the bot
     // to the internet on a VPS. Reach it via the bundled proxy or a tunnel.
     // Set BOT_PORT_BIND=0.0.0.0 to opt into all-interfaces (trusted LAN only).
-    const bind = process.env.BOT_PORT_BIND || '127.0.0.1';
+    const bind = botPortBind();
+    if (!isLoopbackBind(bind)) {
+      console.warn(`[Docker] Publishing host port ${hostPort} on ${bind} (BOT_PORT_BIND): reachable from other hosts, not only this machine`);
+    }
     const mapping = (bind && bind !== '0.0.0.0') ? `${bind}:${hostPort}:${containerPort}` : `${hostPort}:${containerPort}`;
     ports.push(mapping);
   }

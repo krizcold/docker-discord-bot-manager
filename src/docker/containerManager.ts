@@ -47,6 +47,8 @@ import {
   getMainServiceWebPort,
   getWebUiIndexPath,
   publishHostPort,
+  gatewayOnDefaultPassword,
+  botPortBind,
   attachBotToProxy,
   mainServiceSelfAuths,
   getFleetControlPort,
@@ -1777,7 +1779,7 @@ function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerP
  * persist it on the instance. A bot keeps its port across rebuilds. Headless bots
  * (no detectable web port) get no host port. Returns the updated compose content.
  */
-function applyDockerHostPort(composeContent: string, instance: InstanceConfig): string {
+export function applyDockerHostPort(composeContent: string, instance: InstanceConfig): string {
   const info = getMainServiceWebPort(composeContent);
   let content = composeContent;
   let webUiPath: string | undefined;
@@ -1845,7 +1847,9 @@ function applyDockerHostPort(composeContent: string, instance: InstanceConfig): 
         used: portsClaimedByOthers(),
         hostBound: portsBoundOnHost(),
       });
-      if (allocated !== null) {
+      if (allocated !== null && gatewayOnDefaultPassword(content, !!mergedEnvVars(instance)['WEBUI_PASSWORD'])) {
+        console.warn(`[Docker] ${instance.sanitizedName}: web UI not published on ${botPortBind()}: its gateway would use the default password; set WEBUI_PASSWORD or APP_DEFAULT_PASSWORD, then rebuild the bot`);
+      } else if (allocated !== null) {
         hostPort = allocated;
         content = publishHostPort(content, allocated, info.containerPort);
       }

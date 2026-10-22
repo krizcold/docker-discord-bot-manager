@@ -1381,7 +1381,9 @@ async function listDeleteRemnants(
   botDir: string,
   keepData: boolean,
   keepEnv: boolean,
-  deploymentMode: DeploymentMode
+  deploymentMode: DeploymentMode,
+  ownVolumes: string[],
+  volumesVerified: boolean
 ): Promise<string[]> {
   const remnants: string[] = [];
   // One reachability verdict up front; each probe below still tells "none"
@@ -1426,15 +1428,10 @@ async function listDeleteRemnants(
   else if (image === 'unknown') remnants.push(`image ${imageName} (unverifiable, docker did not answer)`);
 
   if (!keepData) {
-    try {
-      for (const v of dockerClient.listProjectVolumes(appName)) remnants.push(`volume ${v}`);
-    } catch {
-      remnants.push(`unverified volumes of ${appName} (docker did not answer)`);
-    }
-    // Companion volumes carry explicit names without the {project}_ prefix,
-    // so the project listing above can never see them; probe each directly
-    // and treat an unanswerable probe as a remnant, not as clean.
-    for (const vol of [instance.fleetDb?.volume, instance.fleetDbReplica?.volume]) {
+    if (!volumesVerified) remnants.push(`unverified volumes of ${appName} (a compose file of this instance could not be read)`);
+    // Companion volumes carry explicit names without the {project}_ prefix;
+    // probe each directly and treat an unanswerable probe as a remnant.
+    for (const vol of [...ownVolumes, instance.fleetDb?.volume, instance.fleetDbReplica?.volume]) {
       if (!vol) continue;
       const state = dockerClient.volumeState(vol);
       if (state === 'exists') remnants.push(`volume ${vol}`);
@@ -1469,6 +1466,35 @@ async function rmContainerTolerant(name: string, failures: string[]): Promise<vo
   }
 }
 
+/**
+ * The project-prefixed volumes this instance's deployed compose declares, or
+ * null when that compose exists but cannot be read. A kept volume of an
+ * earlier install under the same name shares the {project}_ prefix, so the
+ * prefix alone never proves a volume belongs to this instance.
+ */
+function ownProjectVolumes(botId: string, appName: string): string[] | null {
+  const composePath = resolveComposePath(botId, appName);
+  let compose: any;
+  try {
+    compose = YAML.parse(fs.readFileSync(composePath, 'utf-8'));
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? [] : null;
+  }
+  if (compose === null || compose === undefined) return [];
+  if (typeof compose !== 'object') return null;
+  const volumes = compose.volumes;
+  if (volumes === undefined || volumes === null) return [];
+  if (typeof volumes !== 'object' || Array.isArray(volumes)) return null;
+  return Object.entries(volumes)
+    .filter(([, v]) => !(v && typeof v === 'object' && ((v as any).external || (v as any).name)))
+    .map(([key]) => `${appName}_${key}`);
+}
+
+function recordProjectVolumes(instance: InstanceConfig, declared: string[] | null): void {
+  if (declared === null) instance.projectVolumesUnverified = true;
+  else instance.projectVolumes = [...new Set([...(instance.projectVolumes ?? []), ...declared])];
+}
+
 async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean): Promise<boolean> {
   const instance = getBot(botId);
   if (!instance) return false;
@@ -1476,6 +1502,26 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
   const deploymentMode = await getDeploymentMode();
   const appName = resolveAppName(botId);
   const botDir = getBotDir(botId);
+  // Resolved and stored before step 1, which can remove the compose file, so a
+  // retry after a partial Remove still knows every volume this instance made.
+  let ownVolumes: string[] = [];
+  let volumesVerified = true;
+  if (!keepData) {
+    const registry = loadRegistry();
+    const record = registry.instances[botId];
+    if (record) {
+      recordProjectVolumes(record, ownProjectVolumes(botId, appName));
+      saveRegistry(registry);
+      const claimed = (v: string): boolean => Object.values(registry.instances).some(other =>
+        other.id !== botId && ((other.projectVolumes ?? []).includes(v) || v.startsWith(`${other.sanitizedName}_`)));
+      ownVolumes = (record.projectVolumes ?? []).filter(v => {
+        if (!claimed(v)) return true;
+        console.log(`[ContainerManager] Left volume ${v}: another instance uses it`);
+        return false;
+      });
+      volumesVerified = !record.projectVolumesUnverified;
+    }
+  }
 
   // Transient status: the reconciler only touches terminal states, so the bot
   // can't be flipped back to running/stopped while containers go down.
@@ -1526,17 +1572,18 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
 
   // 3. Remove named volumes
   if (!keepData) {
-    try {
-      const volumes = dockerClient.listProjectVolumes(appName);
-      for (const volumeName of volumes) {
-        console.log(`[ContainerManager] Removing volume ${volumeName}...`);
-        const ok = dockerClient.removeVolume(volumeName);
-        if (!ok) failures.push(`volume ${volumeName}: docker volume rm reported failure`);
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      failures.push(`volumes for ${botId}: ${msg}`);
+    if (!volumesVerified) {
+      failures.push(`volumes for ${botId}: a compose file of this instance was unreadable, so its volume list could not be confirmed complete`);
     }
+    for (const volumeName of ownVolumes) {
+      if (dockerClient.volumeState(volumeName) === 'absent') continue;
+      console.log(`[ContainerManager] Removing volume ${volumeName}...`);
+      if (!dockerClient.removeVolume(volumeName)) failures.push(`volume ${volumeName}: docker volume rm reported failure`);
+    }
+    try {
+      const others = dockerClient.listProjectVolumes(appName).filter(v => !ownVolumes.includes(v));
+      if (others.length) console.log(`[ContainerManager] Left volumes ${others.join(', ')}: they carry the ${appName}_ prefix but are not among this instance's known volumes`);
+    } catch { /* informational only */ }
   }
 
   // 3a. The managed fleet database volume is custom-named too (never project-
@@ -1597,7 +1644,7 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
     // stuck in error forever. Only keep the registry entry when something the
     // delete owns actually remains; then the user retains a Delete button to
     // retry against the listed remnants.
-    const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, keepEnv, deploymentMode);
+    const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, keepEnv, deploymentMode, ownVolumes, volumesVerified);
     if (remnants.length > 0) {
       updateBotStatus(botId, 'error');
       const summary =
@@ -1638,6 +1685,7 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
     if (status === 'starting') {
       instance.webUiReady = false;
       instance.lastStartAt = Date.now();
+      recordProjectVolumes(instance, ownProjectVolumes(botId, resolveAppName(botId)));
     }
     if (containerIds !== undefined) {
       instance.containerIds = containerIds || [];

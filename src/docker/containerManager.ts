@@ -61,6 +61,7 @@ import {
   addFleetPostgresService,
   addFleetPostgresReplicaService,
   removeFleetPostgresReplicaService,
+  addAppDependsOn,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
   fixDockerBotOwnership,
@@ -778,6 +779,23 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
     delete live.fleetTransfer;
+  }
+  // A standby deployed before the app depended on it: order compose down now,
+  // so the restart this adopt asks for stops the app before its database.
+  try {
+    const composePath = resolveComposePath(botId, resolveAppName(botId));
+    if (fs.existsSync(composePath)) {
+      const content = fs.readFileSync(composePath, 'utf-8');
+      const compose = YAML.parseDocument(content).toJSON();
+      const key = Object.entries((compose?.services || {}) as Record<string, any>)
+        .find(([, svc]) => svc?.container_name === replica.containerName)?.[0];
+      if (key) {
+        const updated = addAppDependsOn(content, key);
+        if (updated !== content) fs.writeFileSync(composePath, updated);
+      }
+    }
+  } catch (err) {
+    console.error(`[ContainerManager] Adopt could not order the deployed compose for ${botId}: ${err}`);
   }
   return { success: true };
 }

@@ -1552,21 +1552,53 @@ export function addFleetPostgresService(
     if (!nets[sharedNet]) nets[sharedNet] = { name: sharedNet, external: true };
   }
 
-  const appSvc = appSvcName && appSvcName !== serviceName ? services[appSvcName] : undefined;
-  if (appSvc) {
-    if (Array.isArray(appSvc.depends_on)) {
-      if (!(appSvc.depends_on as unknown[]).includes(serviceName)) {
-        (appSvc.depends_on as unknown[]).push(serviceName);
-      }
-    } else if (appSvc.depends_on && typeof appSvc.depends_on === 'object') {
-      const deps = appSvc.depends_on as Record<string, unknown>;
-      if (!(serviceName in deps)) deps[serviceName] = { condition: 'service_started' };
-    } else {
-      appSvc.depends_on = [serviceName];
-    }
-  }
+  addAppDependency(services, appSvcName, serviceName);
 
   return stringify(compose, { lineWidth: 0 });
+}
+
+/** Make the app service depend on serviceKey (list or map form, idempotent). */
+export function addAppDependsOn(composeContent: string, serviceKey: string): string {
+  let compose: Record<string, unknown>;
+  try {
+    compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  } catch {
+    return composeContent;
+  }
+  const services = compose?.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services || !services[serviceKey]) return composeContent;
+  const before = JSON.stringify(services);
+  addAppDependency(services, getAppServiceName(compose), serviceKey);
+  if (JSON.stringify(services) === before) return composeContent;
+  return stringify(compose, { lineWidth: 0 });
+}
+
+function addAppDependency(services: Record<string, Record<string, unknown>>, appSvcName: string | null | undefined, serviceName: string): void {
+  const appSvc = appSvcName && appSvcName !== serviceName ? services[appSvcName] : undefined;
+  if (!appSvc) return;
+  if (Array.isArray(appSvc.depends_on)) {
+    if (!(appSvc.depends_on as unknown[]).includes(serviceName)) {
+      (appSvc.depends_on as unknown[]).push(serviceName);
+    }
+  } else if (appSvc.depends_on && typeof appSvc.depends_on === 'object') {
+    const deps = appSvc.depends_on as Record<string, unknown>;
+    if (!(serviceName in deps)) deps[serviceName] = { condition: 'service_started' };
+  } else {
+    appSvc.depends_on = [serviceName];
+  }
+}
+
+function dropDependency(services: Record<string, Record<string, unknown>>, serviceName: string): void {
+  for (const svc of Object.values(services)) {
+    if (!svc || typeof svc !== 'object') continue;
+    if (Array.isArray(svc.depends_on)) {
+      svc.depends_on = (svc.depends_on as unknown[]).filter(d => d !== serviceName);
+      if ((svc.depends_on as unknown[]).length === 0) delete svc.depends_on;
+    } else if (svc.depends_on && typeof svc.depends_on === 'object') {
+      delete (svc.depends_on as Record<string, unknown>)[serviceName];
+      if (Object.keys(svc.depends_on as Record<string, unknown>).length === 0) delete svc.depends_on;
+    }
+  }
 }
 
 /**
@@ -1628,6 +1660,10 @@ export function addFleetPostgresReplicaService(
     if (!nets[sharedNet]) nets[sharedNet] = { name: sharedNet, external: true };
   }
 
+  // After an adopt this copy is the database the app writes to; compose down
+  // must stop the app before it.
+  addAppDependency(services, getAppServiceName(compose), serviceName);
+
   return stringify(compose, { lineWidth: 0 });
 }
 
@@ -1649,16 +1685,7 @@ export function removeFleetPostgresService(composeContent: string): string {
   delete services['fleet-postgres'];
   const volumes = compose.volumes as Record<string, unknown> | undefined;
   if (volumes) delete volumes['fleet-postgres-data'];
-  for (const svc of Object.values(services)) {
-    if (!svc || typeof svc !== 'object') continue;
-    if (Array.isArray(svc.depends_on)) {
-      svc.depends_on = (svc.depends_on as unknown[]).filter(d => d !== 'fleet-postgres');
-      if ((svc.depends_on as unknown[]).length === 0) delete svc.depends_on;
-    } else if (svc.depends_on && typeof svc.depends_on === 'object') {
-      delete (svc.depends_on as Record<string, unknown>)['fleet-postgres'];
-      if (Object.keys(svc.depends_on as Record<string, unknown>).length === 0) delete svc.depends_on;
-    }
-  }
+  dropDependency(services, 'fleet-postgres');
   return stringify(compose, { lineWidth: 0 });
 }
 
@@ -1670,11 +1697,12 @@ export function removeFleetPostgresReplicaService(composeContent: string): strin
   } catch {
     return composeContent;
   }
-  const services = compose.services as Record<string, unknown> | undefined;
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services || !services['fleet-postgres-replica']) return composeContent;
   delete services['fleet-postgres-replica'];
   const volumes = compose.volumes as Record<string, unknown> | undefined;
   if (volumes) delete volumes['fleet-postgres-replica-data'];
+  dropDependency(services, 'fleet-postgres-replica');
   return stringify(compose, { lineWidth: 0 });
 }
 

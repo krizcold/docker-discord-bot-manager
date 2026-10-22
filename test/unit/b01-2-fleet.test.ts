@@ -14,7 +14,7 @@ const tmp = vi.hoisted(() => {
 vi.mock('fs', async (importOriginal) => {
   const real = await importOriginal<typeof import('fs')>();
   const writeFileSync = (file: any, ...rest: any[]) => {
-    if (tmp.refuseWrite && String(file) === tmp.refuseWrite) {
+    if (tmp.refuseWrite && (String(file) === tmp.refuseWrite || String(file) === `${tmp.refuseWrite}.tmp`)) {
       throw Object.assign(new Error(`EACCES: permission denied, open '${file}'`), { code: 'EACCES' });
     }
     return (real.writeFileSync as any)(file, ...rest);

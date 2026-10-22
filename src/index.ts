@@ -103,11 +103,16 @@ async function main(): Promise<void> {
 
   // Sync container states on startup (ops interrupted by a restart first)
   console.log('[Init] Syncing container states...');
-  resetTransientStatuses();
-  await syncContainerStates();
-  await parkInterruptedReplicaSeeds();
-  parkInterruptedTransfers();
-  parkInterruptedFailbacks();
+  // Each pass is best effort: a DATA_DIR that refuses writes must not keep the
+  // manager (and the web UI that names the problem) from starting.
+  const bootPass = async (name: string, pass: () => unknown): Promise<void> => {
+    try { await pass(); } catch (err: any) { console.warn(`[Init] ${name} did not complete: ${err?.message || err}`); }
+  };
+  await bootPass('Transient status reset', resetTransientStatuses);
+  await bootPass('Container state sync', syncContainerStates);
+  await bootPass('Replica seed park', parkInterruptedReplicaSeeds);
+  await bootPass('Transfer park', parkInterruptedTransfers);
+  await bootPass('Failback park', parkInterruptedFailbacks);
 
   // Start web server
   console.log('[Init] Starting web server...');

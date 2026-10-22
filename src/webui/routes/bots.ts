@@ -542,7 +542,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       containerManager.startBot(botId).then((result) => {
         const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
-          broadcastToClients(wss, 'bot:started', { ...updatedBot, opId });
+          broadcastToClients(wss, 'bot:started', { ...updatedBot, opId, ...(result.warning ? { warning: result.warning } : {}) });
         } else {
           broadcastToClients(wss, 'bot:start-failed', { id: botId, opId, error: result.error });
         }
@@ -573,7 +573,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const bot = withActiveOp(publicBot(containerManager.getBot(req.params.id)));
       broadcastToClients(wss, 'bot:stopped', bot);
-      res.json({ success: true, bot });
+      res.json(result.warning ? { success: true, bot, warning: result.warning } : { success: true, bot });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -609,7 +609,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       containerManager.restartBot(botId).then((result) => {
         const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
         if (result.success) {
-          broadcastToClients(wss, 'bot:restarted', { ...updatedBot, opId });
+          broadcastToClients(wss, 'bot:restarted', { ...updatedBot, opId, warning: result.warning });
         } else {
           broadcastToClients(wss, 'bot:restart-failed', { id: botId, opId, error: result.error });
         }

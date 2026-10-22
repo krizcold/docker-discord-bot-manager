@@ -1,20 +1,16 @@
 import * as fs from 'fs';
 import { getDeploymentMode } from '../casaos/detector';
+import { writeFileKeepingOwner } from './storeFile';
 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIR_MODE = 0o700;
 
 /**
- * Write a file only the manager's user can read. The mode option applies only
- * when the file is created, so a file already there is tightened as well.
+ * Write a file only its owner can read, whole (tmp plus rename) so an
+ * interrupted write never leaves it torn; a replaced file keeps its owner.
  */
 export function writePrivateFile(filePath: string, data: string): void {
-  fs.writeFileSync(filePath, data, { mode: PRIVATE_FILE_MODE });
-  try {
-    fs.chmodSync(filePath, PRIVATE_FILE_MODE);
-  } catch (err) {
-    console.warn(`[Files] Could not restrict ${filePath} to mode 600: ${err}`);
-  }
+  writeFileKeepingOwner(filePath, data, PRIVATE_FILE_MODE);
 }
 
 /** mkdir -p whose created levels and target are private to the manager's user. */

@@ -202,7 +202,8 @@ export type FactsRead = Awaited<ReturnType<typeof getAppFacts>>;
 export function postureFromRead(instance: InstanceConfig, read: FactsRead | null): StandInRead {
   if (!hasAppHooks(instance)) return { read: 'none' };
   // A facts answer in hand came from a running app, which a build or start lane may be driving.
-  if (instance.status !== 'running' && instance.status !== 'building' && instance.status !== 'starting') return { read: 'unanswered', error: 'the instance is not running' };
+  const stored = instance.status === 'error' ? containerManager.storedStatus(instance) : instance.status;
+  if (stored !== 'running' && stored !== 'building' && stored !== 'starting') return { read: 'unanswered', error: 'the instance is not running' };
   if (!read || !read.success || !read.facts) return { read: 'unanswered', error: read?.error || 'no facts' };
   // The stand-in fact lives in the bot process; the parent answers the hook
   // while that process is down, and a null there is silence, not a verdict.

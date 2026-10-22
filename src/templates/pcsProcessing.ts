@@ -17,6 +17,7 @@ import { buildStatusPageService } from './statusPage';
 import { findConfigTemplate } from '../config/configTemplates';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { isCasaOSAvailable } from '../casaos/detector';
+import { writeFileKeepingOwner } from '../config/storeFile';
 
 const execAsync = promisify(exec);
 
@@ -2310,9 +2311,10 @@ export async function saveToCasaOSMetadata(
   mkdirForApp(metadataDir, log);
   grantToApp(metadataDir, { recursive: true, log });
 
-  // Write compose file
-  fs.writeFileSync(composePath, composeContent);
-  grantToApp(composePath, { mode: '644', log });
+  // Write compose file whole, so an interrupted write never leaves it torn
+  const existed = fs.existsSync(composePath);
+  writeFileKeepingOwner(composePath, composeContent);
+  if (!existed) grantToApp(composePath, { mode: '644', log });
 
   log(`[PCS] Saved CasaOS metadata compose to ${composePath}`);
   return composePath;

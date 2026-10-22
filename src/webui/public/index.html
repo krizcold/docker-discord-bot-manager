@@ -1123,7 +1123,7 @@
             redraw();
             break;
           case 'bot:restarted':
-            showMessage('success', 'Bot restarted');
+            payload.warning ? showMessage('error', payload.warning) : showMessage('success', 'Bot restarted');
             mergeBotState(payload);
             busyBots.delete(id);
             redraw();
@@ -1684,7 +1684,7 @@
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/stop`);
-        res.success ? showMessage('success', 'Bot stopped') : showMessage('error', res.error || 'Failed to stop bot');
+        res.success ? (res.warning ? showMessage('error', res.warning) : showMessage('success', 'Bot stopped')) : showMessage('error', res.error || 'Failed to stop bot');
       } finally { busyBots.delete(id); loadBots(); }
     }
 

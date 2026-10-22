@@ -95,7 +95,7 @@ import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName 
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 import { capServiceLogs } from '../templates/logCaps';
-import { storeFileState, preserveCorruptCopy, corruptCopyNote, listCorruptCopies, writeFileAtomic } from '../config/storeFile';
+import { storeFileState, preserveCorruptCopy, corruptCopyNote, listCorruptCopies, writeFileAtomic, writeFileKeepingOwner } from '../config/storeFile';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
@@ -320,14 +320,30 @@ export function isBotWebUiReady(inst: InstanceConfig): boolean {
   return true; // never (re)started under readiness tracking: do not gate
 }
 
+export type LaneResult = { success: boolean; error?: string; warning?: string };
+
+// A transient status with no live op was left by an op whose closing write was
+// refused, or one that died with the manager while the boot reset could not
+// write: served as error so the card's controls stay live.
+function servedStatus(inst: InstanceConfig): InstanceConfig {
+  const transient = inst.status === 'building' || inst.status === 'starting' || inst.status === 'stopping';
+  return transient && !activeOps.has(inst.id) ? { ...inst, status: 'error' } : inst;
+}
+
+/** The status as stored, before a transient with no live op is served as error. */
+export function storedStatus(inst: InstanceConfig): InstanceConfig['status'] {
+  return loadRegistry().instances[inst.id]?.status ?? inst.status;
+}
+
 export function getAllBots(): InstanceConfig[] {
   const registry = loadRegistry();
-  return Object.values(registry.instances);
+  return Object.values(registry.instances).map(servedStatus);
 }
 
 export function getBot(botId: string): InstanceConfig | null {
   const registry = loadRegistry();
-  return registry.instances[botId] || null;
+  const inst = registry.instances[botId];
+  return inst ? servedStatus(inst) : null;
 }
 
 // Aliases
@@ -726,16 +742,20 @@ export function broadcastBotUpdated(botId: string): void {
  * up; the running app service is untouched). Used by the provisioning flow;
  * rebuilds re-inject via buildGitInstance.
  */
-export async function applyFleetDbReplicaService(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function applyFleetDbReplicaService(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance?.fleetDbReplica) return { success: false, error: 'No standby record' };
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found (install the instance first)' };
   const mode = await getDeploymentMode();
-  const content = fs.readFileSync(composePath, 'utf-8');
-  const updated = addFleetPostgresReplicaService(content, instance as any, instance.fleetDbReplica, { mode });
-  fs.writeFileSync(composePath, updated);
+  let content: string;
+  try {
+    content = fs.readFileSync(composePath, 'utf-8');
+    rewriteComposeFile(composePath, addFleetPostgresReplicaService(content, instance as any, instance.fleetDbReplica, { mode }));
+  } catch (err) {
+    return { success: false, error: `The standby service could not be written into the deployed compose, so nothing was started: ${err instanceof Error ? err.message : String(err)}` };
+  }
   try {
     await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d fleet-postgres-replica`);
     return { success: true };
@@ -744,10 +764,20 @@ export async function applyFleetDbReplicaService(botId: string): Promise<{ succe
     // (up runs --remove-orphans and fails on the same cause): revert the file
     // so a failed apply leaves no trace.
     try {
-      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
-    } catch { /* the original content write below the error is best effort */ }
+      rewriteComposeFile(composePath, content);
+    } catch (revertErr) {
+      return { success: false, error: `${String(err)}; the deployed compose still names the standby service, because restoring it failed: ${revertErr instanceof Error ? revertErr.message : String(revertErr)}` };
+    }
     return { success: false, error: String(err) };
   }
+}
+
+/**
+ * Replace a deployed compose whole (tmp plus rename), so a manager killed
+ * mid-write never leaves a torn file; the old file's mode and owner carry over.
+ */
+function rewriteComposeFile(composePath: string, content: string): void {
+  writeFileKeepingOwner(composePath, content);
 }
 
 /** True when the instance has a deployed compose to attach services to. */
@@ -807,7 +837,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
         .find(([, svc]) => svc?.container_name === replica.containerName)?.[0];
       if (key) {
         const updated = addAppDependsOn(content, key);
-        if (updated !== content) fs.writeFileSync(composePath, updated);
+        if (updated !== content) rewriteComposeFile(composePath, updated);
       }
     }
   } catch (err) {
@@ -822,7 +852,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
  * the stale-primary re-seed (PLAN_REPLICATION.md Stage 5) has no database to
  * dump until this runs; the app service is deliberately left down.
  */
-export async function startFleetDbSidecar(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function startFleetDbSidecar(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
@@ -863,7 +893,7 @@ export async function startFleetDbSidecar(botId: string): Promise<{ success: boo
  * a kept volume with no record naming it is debris no UI could ever clear.
  * The caller has already dumped whatever it wanted to keep.
  */
-export async function retireFleetDbSidecar(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function retireFleetDbSidecar(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
@@ -881,7 +911,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<{ success: bo
     const appName = resolveAppName(botId);
     const composePath = resolveComposePath(botId, appName);
     if (fs.existsSync(composePath)) {
-      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8'))));
+      rewriteComposeFile(composePath, removeFleetPostgresReplicaService(removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8'))));
     }
     const registry = loadRegistry();
     const stored = registry.instances[botId];
@@ -898,12 +928,12 @@ export async function retireFleetDbSidecar(botId: string): Promise<{ success: bo
 }
 
 /** Remove the standby service from the deployed compose and its container; the volume stays. */
-export async function removeFleetDbReplicaService(botId: string, containerName: string): Promise<{ success: boolean; error?: string }> {
+export async function removeFleetDbReplicaService(botId: string, containerName: string): Promise<LaneResult> {
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   try {
     if (fs.existsSync(composePath)) {
-      fs.writeFileSync(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
+      rewriteComposeFile(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
     }
     await execAsync(`docker rm -f "${containerName}"`).catch(() => { /* already gone */ });
     return { success: true };
@@ -1026,7 +1056,7 @@ export function removeEnvKeyFromDeployedCompose(botId: string, key: string): str
       const svc = appName ? services[appName] : undefined;
       if (!svc?.environment) continue;
       if (!deleteComposeEnv(svc.environment, key)) continue;
-      fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+      rewriteComposeFile(composePath, YAML.stringify(compose, { lineWidth: 0 }));
     } catch (err) {
       console.warn(`[ContainerManager] Failed to strip env key ${key} from ${composePath}: ${err}`);
       failed.push(composePath);
@@ -1180,8 +1210,8 @@ type EmitFn = (msg: string, type?: BuildLogEntry['type'], key?: string) => void;
 async function withLoggedBotOp(
   botId: string,
   op: string,
-  fn: () => Promise<{ success: boolean; error?: string }>
-): Promise<{ success: boolean; error?: string }> {
+  fn: () => Promise<LaneResult>
+): Promise<LaneResult> {
   const current = activeOps.get(botId);
   if (current) {
     throw new Error(`Operation '${current}' is already in progress for this bot`);
@@ -1648,7 +1678,7 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
     // retry against the listed remnants.
     const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, keepEnv, deploymentMode, ownVolumes, volumesVerified);
     if (remnants.length > 0) {
-      updateBotStatus(botId, 'error');
+      stampErrorBestEffort(botId);
       const summary =
         `Bot ${botId} uninstall incomplete - still present: ${remnants.join(', ')}\n` +
         `Step errors:\n  - ${failures.join('\n  - ')}`;
@@ -1660,9 +1690,19 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
 
   // Cleanup succeeded: remove the registry entry LAST. Fresh load - the
   // snapshot from function entry is stale after the status updates above.
-  const registry = loadRegistry();
-  delete registry.instances[botId];
-  saveRegistry(registry);
+  try {
+    const registry = loadRegistry();
+    delete registry.instances[botId];
+    saveRegistry(registry);
+  } catch (err) {
+    stampErrorBestEffort(botId);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[ContainerManager] Instance ${botId} uninstalled but its record could not be cleared: ${msg}`);
+    const removed = keepData
+      ? `The containers, image and compose file${keepEnv ? '' : ' and env copies'} were removed (the data and volumes were kept${keepEnv ? ', env values kept' : ''})`
+      : 'The containers, image, volumes, bot directory and data were removed';
+    throw new Error(`${removed}, but its record could not be cleared: ${msg} Delete it again once the registry can be written.`);
+  }
   logCollectors.remove(botId);
 
   console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData}, keepEnv: ${keepEnv})`);
@@ -1705,6 +1745,31 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
         if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
       }, WEBUI_READY_GRACE_MS).unref();
     }
+  }
+}
+
+/**
+ * A status written after a docker step took effect. A refused write never
+ * replaces the lane's own answer: the card is told the docker-read status and
+ * the refusal comes back for the lane to word.
+ */
+function recordStatusAfterDockerStep(botId: string, status: BotStatus, containerIds?: string[] | null): string | null {
+  try {
+    updateBotStatus(botId, status, containerIds);
+    return null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[ContainerManager] ${botId}: status '${status}' could not be recorded: ${msg}`);
+    if (broadcastFn) broadcastFn('bot:status', { id: botId, status, activeOp: isBotBusy(botId) });
+    return msg;
+  }
+}
+
+function stampErrorBestEffort(botId: string): void {
+  try {
+    updateBotStatus(botId, 'error');
+  } catch (err) {
+    console.error(`[ContainerManager] ${botId}: status 'error' could not be recorded: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -2304,7 +2369,7 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     capServiceLogs(services);
     const yaml = YAML.stringify(compose, { lineWidth: 0 });
     if (privateFile) writePrivateFile(composePath, yaml);
-    else fs.writeFileSync(composePath, yaml);
+    else rewriteComposeFile(composePath, yaml);
   } catch (err) {
     console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
   }
@@ -2371,7 +2436,8 @@ function containerCountText(ids: string[] | null): string {
 
 /** The record as the health and posture readers see it: a 'building' or 'starting' record whose app docker says runs reads as running; unanswered when docker could not say. */
 export async function withServingStatus(instance: InstanceConfig): Promise<{ instance: InstanceConfig; unanswered?: true }> {
-  if (instance.status !== 'building' && instance.status !== 'starting') return { instance };
+  const stored = storedStatus(instance);
+  if (stored !== 'building' && stored !== 'starting') return { instance };
   const appId = await runningAppContainerId(instance.id, instance.sanitizedName);
   if (appId === undefined) return { instance, unanswered: true };
   return { instance: typeof appId === 'string' ? { ...instance, status: 'running' } : instance };
@@ -2400,11 +2466,16 @@ function restoreWebUiReadiness(botId: string, snapshot: { webUiReady?: boolean; 
   instance.webUiReady = snapshot.webUiReady;
   instance.lastStartAt = snapshot.lastStartAt;
   instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
+  try {
+    saveRegistry(registry);
+  } catch (err) {
+    console.error(`[ContainerManager] ${botId}: web UI readiness could not be restored: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
   if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
 }
 
-export async function startBot(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function startBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'start', () => startBotImpl(botId));
 }
 
@@ -2416,7 +2487,7 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   return null;
 }
 
-async function startBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
+async function startBotImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   const rescueRefusal = startPreflightRefusal(botId);
@@ -2443,7 +2514,7 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
       logCollectors.get(botId).addLog('[Start] Applying the last build to the running project; only containers whose definition changed are recreated', 'info');
     } else {
       console.warn(`[ContainerManager] ${botId} marked running but no container is up; correcting to stopped`);
-      updateBotStatus(botId, 'stopped');
+      recordStatusAfterDockerStep(botId, 'stopped');
     }
   }
 
@@ -2451,7 +2522,15 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
   const result = sourceType === 'docker-image' ? await startDockerImageBot(instance) : await startGitBot(instance);
   // Any successful start deploys the current compose and image, whichever way
   // the project was reached (Restart, Stop then Start, Update).
-  if (result.success) setPendingApply(botId, false);
+  if (result.success) {
+    try {
+      setPendingApply(botId, false);
+    } catch (err) {
+      const msg = `The deployed build is applied, but that could not be recorded: ${err instanceof Error ? err.message : String(err)}`;
+      logCollectors.get(botId).addLog(`[Start] ${msg}`, 'warning');
+      result.warning = result.warning ? `${result.warning}; ${msg}` : msg;
+    }
+  }
   if (!applyInPlace) return result;
 
   // The lane stamps 'starting' before compose up, which gates the Open button
@@ -2472,7 +2551,7 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
   // which only a concrete answer proves.
   const appId = await runningAppContainerId(botId, instance.sanitizedName);
   if (typeof appId === 'string') {
-    updateBotStatus(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
+    recordStatusAfterDockerStep(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
     const project = await projectAfter();
     logCollectors.get(botId).addLog(project === 'same'
       ? '[Start] The apply failed; the previous build keeps running and the new one stays unapplied'
@@ -2486,7 +2565,7 @@ async function startBotImpl(botId: string): Promise<{ success: boolean; error?: 
   return result;
 }
 
-async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
 
@@ -2494,6 +2573,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
     console.log(`[Start ${botId}] ${msg}`);
     log.addLog(msg, type, key);
   };
+  let unrecorded: string | null = null;
 
   try {
     emit(`[Start] Starting ${instance.displayName}...`, 'system');
@@ -2556,7 +2636,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
@@ -2590,18 +2670,23 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
+    if (unrecorded) {
+      const warning = `The bot is running, but its status could not be recorded: ${unrecorded}`;
+      emit(`[Warning] ${warning}`, 'warning');
+      return { success: true, warning };
+    }
     return { success: true };
   } catch (error) {
     const msg = String(error);
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start instance ${botId}:`, error);
-    updateBotStatus(botId, 'error');
+    stampErrorBestEffort(botId);
     return { success: false, error: msg };
   }
 }
@@ -2638,13 +2723,13 @@ function capComposeFileLogs(composePath: string): void {
     if (!services || typeof services !== 'object') return;
     const before = JSON.stringify(services);
     capServiceLogs(services);
-    if (JSON.stringify(services) !== before) fs.writeFileSync(composePath, YAML.stringify(compose, { lineWidth: 0 }));
+    if (JSON.stringify(services) !== before) rewriteComposeFile(composePath, YAML.stringify(compose, { lineWidth: 0 }));
   } catch (err) {
     console.warn(`[ContainerManager] Failed to cap container logs in compose: ${err}`);
   }
 }
 
-async function startDockerImageBot(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
 
@@ -2656,6 +2741,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
   if (!instance.imageRef) {
     return { success: false, error: 'imageRef is required for docker-image source type' };
   }
+  let unrecorded: string | null = null;
 
   try {
     emit(`[Start] Starting ${instance.displayName}...`, 'system');
@@ -2703,7 +2789,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
       await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
@@ -2731,18 +2817,23 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<{ success:
         throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
       }
       const containerIds = await getContainerIdsForBot(botId);
-      updateBotStatus(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
+    if (unrecorded) {
+      const warning = `The bot is running, but its status could not be recorded: ${unrecorded}`;
+      emit(`[Warning] ${warning}`, 'warning');
+      return { success: true, warning };
+    }
     return { success: true };
   } catch (error) {
     const msg = String(error);
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start docker-image instance ${botId}:`, error);
-    updateBotStatus(botId, 'error');
+    stampErrorBestEffort(botId);
     return { success: false, error: msg };
   }
 }
@@ -2773,11 +2864,11 @@ async function getContainerIdsForBot(botId: string): Promise<string[] | null> {
 
 // ─── Stop ───
 
-export async function stopBot(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function stopBot(botId: string): Promise<LaneResult> {
   return withBotOp(botId, 'stop', () => stopBotImpl(botId));
 }
 
-async function stopBotImpl(botId: string, emit?: EmitFn): Promise<{ success: boolean; error?: string }> {
+async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   if (instance.status !== 'running') return { success: false, error: 'Bot is not running' };
@@ -2822,19 +2913,24 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<{ success: boo
       }
     }
 
-    updateBotStatus(botId, 'stopped', []);
+    const unrecorded = recordStatusAfterDockerStep(botId, 'stopped', []);
     emit?.('[Stop] Containers stopped', 'info');
+    if (unrecorded) {
+      const warning = `The containers were stopped, but the status could not be recorded: ${unrecorded}`;
+      emit?.(`[Stop] Warning: ${warning}`, 'warning');
+      return { success: true, warning };
+    }
     return { success: true };
   } catch (error) {
     console.error(`[ContainerManager] Failed to stop instance ${botId}:`, error);
-    updateBotStatus(botId, 'error');
+    stampErrorBestEffort(botId);
     return { success: false, error: String(error) };
   }
 }
 
 // ─── Restart ───
 
-export async function restartBot(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function restartBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'restart', async () => {
     const rescueRefusal = startPreflightRefusal(botId);
     if (rescueRefusal) return rescueRefusal;
@@ -2853,11 +2949,11 @@ export async function restartBot(botId: string): Promise<{ success: boolean; err
 
 // ─── Pull & Rebuild (Instance Update) ───
 
-export async function pullAndRebuild(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function pullAndRebuild(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'update', () => pullAndRebuildImpl(botId));
 }
 
-async function pullAndRebuildImpl(botId: string): Promise<{ success: boolean; error?: string }> {
+async function pullAndRebuildImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
   const storeRefusal = updatePreflightRefusal(botId);
@@ -2897,7 +2993,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   return null;
 }
 
-async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceConfig): Promise<LaneResult> {
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {
@@ -2937,7 +3033,7 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
       return startBotImpl(botId);
     }
 
-    return { success: true };
+    return buildResult.warning ? { success: true, warning: buildResult.warning } : { success: true };
   } catch (error) {
     console.error(`[ContainerManager] Failed to rebuild instance ${botId}:`, error);
     return { success: false, error: String(error) };
@@ -3035,7 +3131,7 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
   return `This instance was deployed under ${deployed} mode, but the manager auto-detected ${current} mode. Building would re-author its data bind, so it would start on the ${current} path while its current data stays under the ${deployed} one. Declare the mode and build again: PUT /api/system/deployment {"mode":"${deployed}"} keeps this instance where its data already is, and {"mode":"${current}"} accepts the detected mode for the whole manager, after which this instance moves on its next build.`;
 }
 
-export async function buildBot(botId: string): Promise<{ success: boolean; error?: string }> {
+export async function buildBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'build', () => buildBotImpl(botId));
 }
 
@@ -3046,26 +3142,35 @@ export async function buildBot(botId: string): Promise<{ success: boolean; error
  * refused it, the reconciler flipped it back, Start refused it as already
  * running, and only an Update issued after the flip applied anything.
  */
-async function stampBuildOutcome(botId: string, emit: EmitFn, statusBefore: BotStatus): Promise<void> {
+async function stampBuildOutcome(botId: string, emit: EmitFn, statusBefore: BotStatus): Promise<string | null> {
   const appId = await runningAppContainerId(botId, resolveAppName(botId));
   // Docker not answering is evidence of nothing: what was known before the
   // build stands.
   if (appId === undefined) emit('[Build] Could not check whether the project is running; keeping what was known before the build', 'warning');
   const running = appId === undefined ? statusBefore === 'running' : appId !== null;
-  if (running) {
-    setPendingApply(botId, true);
-    // Ids are refreshed only from an answer; an unanswered listing keeps them.
-    if (appId === undefined) updateBotStatus(botId, 'running');
-    else updateBotStatus(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
-    emit('[Build] The running project was not recreated; Start (applies in place) or Restart applies this build', 'warning');
-    return;
-  }
+  // Ids are refreshed only from an answer; an unanswered listing keeps them.
+  const ids = running && appId !== undefined ? (await getContainerIdsForBot(botId)) ?? undefined : undefined;
+  if (running) emit('[Build] The running project was not recreated; Start (applies in place) or Restart applies this build', 'warning');
   // Nothing runs that the next Start would not deploy whole.
-  setPendingApply(botId, false);
-  updateBotStatus(botId, 'stopped');
+  try {
+    setPendingApply(botId, running);
+  } catch (err) {
+    recordStatusAfterDockerStep(botId, running ? 'running' : 'stopped', ids);
+    return err instanceof Error ? err.message : String(err);
+  }
+  return recordStatusAfterDockerStep(botId, running ? 'running' : 'stopped', ids);
 }
 
-async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: string }> {
+async function finishBuild(botId: string, emit: EmitFn, statusBefore: BotStatus, displayName: string, commitUnrecorded: string | null): Promise<LaneResult> {
+  const unrecorded = [commitUnrecorded, await stampBuildOutcome(botId, emit, statusBefore)].filter((m): m is string => !!m);
+  emit(`[Success] Build completed for ${displayName}`, 'success');
+  if (unrecorded.length === 0) return { success: true };
+  const warning = `The build completed, but its outcome could not be recorded: ${unrecorded.join('; ')}`;
+  emit(`[Warning] ${warning}`, 'warning');
+  return { success: true, warning };
+}
+
+async function buildBotImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
 
@@ -3101,7 +3206,7 @@ async function buildBotImpl(botId: string): Promise<{ success: boolean; error?: 
     emit(`[Error] Build failed: ${msg}`, 'error');
     emit('[Fatal] Build process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to build instance ${botId}:`, error);
-    updateBotStatus(botId, 'error');
+    stampErrorBestEffort(botId);
     return { success: false, error: msg };
   }
 }
@@ -3110,7 +3215,7 @@ async function buildDockerImageInstance(
   instance: InstanceConfig,
   emit: EmitFn,
   isCasaOS: boolean,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<LaneResult> {
   const botId = instance.id;
 
   if (!instance.imageRef) {
@@ -3182,9 +3287,7 @@ async function buildDockerImageInstance(
     }
   }
 
-  await stampBuildOutcome(botId, emit, instance.status);
-  emit(`[Success] Build completed for ${instance.displayName}`, 'success');
-  return { success: true };
+  return finishBuild(botId, emit, instance.status, instance.displayName, null);
 }
 
 // Safe defaults for build args a Dockerfile commonly declares WITHOUT a default
@@ -3305,8 +3408,9 @@ async function buildGitInstance(
   instance: InstanceConfig,
   emit: EmitFn,
   isCasaOS: boolean,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<LaneResult> {
   const botId = instance.id;
+  let commitUnrecorded: string | null = null;
 
   // Resolve source repo path: fetch from origin first so build uses latest commits
   let repoPath: string;
@@ -3325,12 +3429,12 @@ async function buildGitInstance(
     }
     if (!fs.existsSync(repoPath)) {
       emit('[Error] Source repository not found', 'error');
-      updateBotStatus(botId, 'error');
+      stampErrorBestEffort(botId);
       return { success: false, error: 'Source repository not found' };
     }
   } else {
     emit('[Error] Git instance has no sourceId', 'error');
-    updateBotStatus(botId, 'error');
+    stampErrorBestEffort(botId);
     return { success: false, error: 'Git instance has no sourceId' };
   }
 
@@ -3351,7 +3455,7 @@ async function buildGitInstance(
       if (owner.kind === 'unknown') {
         const refusal = `cannot tell who owns ${earlyAppName}: ${owner.reason}`;
         emit(`[Error] ${refusal}`, 'error');
-        updateBotStatus(botId, 'error');
+        stampErrorBestEffort(botId);
         return { success: false, error: refusal };
       }
       if (owner.kind === 'other') {
@@ -3643,12 +3747,16 @@ async function buildGitInstance(
         recordCommit = sourceManager.getSource(instance.sourceId)?.lastCommitHash || null;
       }
     }
-    if (recordCommit) updateLastBuiltCommit(botId, recordCommit);
+    if (recordCommit) {
+      try {
+        updateLastBuiltCommit(botId, recordCommit);
+      } catch (err) {
+        commitUnrecorded = `the built commit: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
   }
 
-  await stampBuildOutcome(botId, emit, instance.status);
-  emit(`[Success] Build completed successfully for ${instance.displayName}`, 'success');
-  return { success: true };
+  return finishBuild(botId, emit, instance.status, instance.displayName, commitUnrecorded);
 }
 
 // ─── Logs & Stats ───
@@ -3749,7 +3857,7 @@ export function resetTransientStatuses(): void {
   for (const instance of Object.values(registry.instances)) {
     if (instance.status === 'building' || instance.status === 'starting' || instance.status === 'stopping') {
       console.log(`[Init] ${instance.id} was '${instance.status}' when the manager stopped - marking error`);
-      updateBotStatus(instance.id, 'error');
+      stampErrorBestEffort(instance.id);
     }
   }
 }
@@ -3776,7 +3884,8 @@ export async function syncContainerStates(): Promise<void> {
 
   const checked: Record<string, { statusCheckedAt: string; servicesUp: string[] }> = {};
   for (const instance of Object.values(registry.instances)) {
-    if (instance.status !== 'running' && instance.status !== 'stopped' && instance.status !== 'error') {
+    const status = servedStatus(instance).status;
+    if (status !== 'running' && status !== 'stopped' && status !== 'error') {
       continue;
     }
 
@@ -3807,21 +3916,21 @@ export async function syncContainerStates(): Promise<void> {
     checked[instance.id] = { statusCheckedAt: new Date().toISOString(), servicesUp: runningContainers.map(c => c.service || c.name) };
     reconcileReads.set(instance.id, checked[instance.id]);
 
-    if (instance.status === 'running' && runningContainers.length === 0) {
+    if (status === 'running' && runningContainers.length === 0) {
       console.log(`[Reconciler] ${instance.id} registry=running but no running containers - marking stopped`);
-      updateBotStatus(instance.id, 'stopped', []);
-    } else if (instance.status === 'running' && !appRunning) {
+      recordStatusAfterDockerStep(instance.id, 'stopped', []);
+    } else if (status === 'running' && !appRunning) {
       const up = runningContainers.map(c => c.service || c.name).join(', ');
       console.log(`[Reconciler] ${instance.id} registry=running but its app service is down (still up: ${up}) - marking error`);
-      updateBotStatus(instance.id, 'error', runningIds);
-    } else if (instance.status !== 'running' && appRunning) {
+      recordStatusAfterDockerStep(instance.id, 'error', runningIds);
+    } else if (status !== 'running' && appRunning) {
       console.log(`[Reconciler] ${instance.id} registry=${instance.status} but containers are running - marking running`);
-      updateBotStatus(instance.id, 'running', runningIds);
-    } else if (instance.status === 'running') {
+      recordStatusAfterDockerStep(instance.id, 'running', runningIds);
+    } else if (status === 'running') {
       const currentIds = (instance.containerIds || []).slice().sort().join(',');
       const newIds = runningIds.slice().sort().join(',');
       if (currentIds !== newIds) {
-        updateBotStatus(instance.id, 'running', runningIds);
+        recordStatusAfterDockerStep(instance.id, 'running', runningIds);
       }
     }
   }

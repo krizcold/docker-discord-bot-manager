@@ -67,6 +67,10 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   getDeploymentMode: async () => 'docker',
 }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
+  hasAppHooks: () => true,
+}));
 vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
   return { ...real, syncContainerStates: async () => { h.syncs++; return real.syncContainerStates(); } };
@@ -77,6 +81,7 @@ import * as path from 'path';
 import * as dockerClient from '../../src/docker/dockerClient';
 import * as containerManager from '../../src/docker/containerManager';
 import * as reconciler from '../../src/docker/stateReconciler';
+import * as appLifecycle from '../../src/instance/appLifecycle';
 
 const registryPath = path.join(h.dir, 'instances.json');
 const statusOf = (id: string): string => JSON.parse(fs.readFileSync(registryPath, 'utf-8')).instances[id].status;
@@ -300,9 +305,19 @@ describe('B07-1 health readers and the status stamp', () => {
     const rec = containerManager.getBot('b1')!;
     expect((await (containerManager as any).withServingStatus(rec)).instance.status).toBe('running');
     h.appId = '';
-    expect((await (containerManager as any).withServingStatus(rec)).instance.status).toBe('building');
+    expect((await (containerManager as any).withServingStatus(rec)).instance.status).toBe('error');
     h.down = true;
     expect((await (containerManager as any).withServingStatus(rec)).unanswered).toBe(true);
+  });
+
+  it('a facts answer in hand on a building record with no live op reads as a posture, not as not running', () => {
+    writeRecord({ status: 'building' });
+    const rec = containerManager.getBot('b1')!;
+    expect(rec.status).toBe('error');
+    const read = { success: true, facts: { running: true } } as any;
+    expect(appLifecycle.postureFromRead(rec, read).read).toBe('ok');
+    writeRecord({ status: 'error' });
+    expect(appLifecycle.postureFromRead(containerManager.getBot('b1')!, read).read).toBe('unanswered');
   });
 
   it('the reconciler broadcasts each read so an open card follows it', async () => {

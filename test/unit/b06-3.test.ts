@@ -80,9 +80,9 @@ describe('R19-J4: a bot compose is private to the manager', () => {
 
     writeComposeFile(botDir, 'services: {}\n');
 
-    const write = writeCalls().find(c => c[0] === composePath);
+    const write = writeCalls().find(c => c[0] === `${composePath}.tmp`);
     expect(modeOf(write?.[2])).toBe(0o600);
-    expect(chmodCalls()).toContainEqual([composePath, 0o600]);
+    expect(chmodCalls()).toContainEqual([`${composePath}.tmp`, 0o600]);
     if (!onWindows) expect(fs.statSync(composePath).mode & 0o777).toBe(0o600);
   });
 
@@ -92,7 +92,7 @@ describe('R19-J4: a bot compose is private to the manager', () => {
     vi.clearAllMocks();
     writePrivateFile(p, 'A=2\n');
     expect(modeOf(writeCalls()[0]?.[2])).toBe(0o600);
-    expect(chmodCalls()).toContainEqual([p, 0o600]);
+    expect(chmodCalls()).toContainEqual([`${p}.tmp`, 0o600]);
     expect(fs.readFileSync(p, 'utf-8')).toBe('A=2\n');
     if (!onWindows) expect(fs.statSync(p).mode & 0o777).toBe(0o600);
   });
@@ -109,8 +109,8 @@ describe('R19-J4: the docker-mode .env and compose rewrite are private', () => {
     writeDockerEnvFile(botDir, { TOKEN: 'x' });
 
     expect(fs.readFileSync(envFile, 'utf-8')).toBe('TOKEN=x\n');
-    expect(modeOf(writeCalls().find(c => c[0] === envFile)?.[2])).toBe(0o600);
-    expect(chmodCalls()).toContainEqual([envFile, 0o600]);
+    expect(modeOf(writeCalls().find(c => c[0] === `${envFile}.tmp`)?.[2])).toBe(0o600);
+    expect(chmodCalls()).toContainEqual([`${envFile}.tmp`, 0o600]);
     if (!onWindows) expect(fs.statSync(envFile).mode & 0o777).toBe(0o600);
   });
 
@@ -128,17 +128,18 @@ describe('R19-J4: the docker-mode .env and compose rewrite are private', () => {
     const composePath = seedCompose('b4');
     syncComposeEnvVars(instanceFor('b4'), composePath, true);
     expect(fs.readFileSync(composePath, 'utf-8')).toContain('TOKEN');
-    expect(modeOf(writeCalls().find(c => c[0] === composePath)?.[2])).toBe(0o600);
-    expect(chmodCalls()).toContainEqual([composePath, 0o600]);
+    expect(modeOf(writeCalls().find(c => c[0] === `${composePath}.tmp`)?.[2])).toBe(0o600);
+    expect(chmodCalls()).toContainEqual([`${composePath}.tmp`, 0o600]);
     if (!onWindows) expect(fs.statSync(composePath).mode & 0o777).toBe(0o600);
   });
 
   it('syncComposeEnvVars leaves the CasaOS metadata copy at the mode it has', () => {
     const composePath = seedCompose('b5');
+    const before = realStat(composePath).mode & 0o7777;
     syncComposeEnvVars(instanceFor('b5'), composePath);
     expect(fs.readFileSync(composePath, 'utf-8')).toContain('TOKEN');
-    expect(modeOf(writeCalls().find(c => c[0] === composePath)?.[2])).toBeUndefined();
-    expect(chmodCalls().some(c => c[0] === composePath)).toBe(false);
+    expect(modeOf(writeCalls().find(c => c[0] === `${composePath}.tmp`)?.[2])).toBe(before);
+    expect(chmodCalls().some(c => c[0] === `${composePath}.tmp` && c[1] !== before)).toBe(false);
   });
 });
 
@@ -152,9 +153,9 @@ describe('R19-J4: the env store .env is private to the manager', () => {
 
     expect(writeEnvFile('b2')).toBe(envFile);
 
-    const write = writeCalls().find(c => c[0] === envFile);
+    const write = writeCalls().find(c => c[0] === `${envFile}.tmp`);
     expect(modeOf(write?.[2])).toBe(0o600);
-    expect(chmodCalls()).toContainEqual([envFile, 0o600]);
+    expect(chmodCalls()).toContainEqual([`${envFile}.tmp`, 0o600]);
     if (!onWindows) expect(fs.statSync(envFile).mode & 0o777).toBe(0o600);
   });
 });

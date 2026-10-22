@@ -347,20 +347,20 @@ describe('review fixes', () => {
 
   it('the name edit pencil after a failed detection keeps the banner and the disabled Save & Install', async () => {
     const content = el();
-    const ctx = runPage(['showInstallModal', 'renderInstallModal', 'toggleNameLock'], renderGlobals(content));
+    const ctx = runPage(['showInstallModal', 'renderInstallModal'], renderGlobals(content));
     await ctx.showInstallModal('s1');
     expect(content.innerHTML).toMatch(/install-detect-error/);
-    ctx.toggleNameLock();
+    ctx.renderInstallModal('repo');
     expect(content.innerHTML).toMatch(/install-detect-error/);
     expect(content.innerHTML).toMatch(/id="install-btn"[^>]*disabled/);
   });
 
   it('Continue manually then a re-render keeps Save & Install enabled', async () => {
     const content = el();
-    const ctx = runPage(['showInstallModal', 'renderInstallModal', 'toggleNameLock', 'installContinueManually'], renderGlobals(content));
+    const ctx = runPage(['showInstallModal', 'renderInstallModal', 'installContinueManually'], renderGlobals(content));
     await ctx.showInstallModal('s1');
     ctx.installContinueManually();
-    ctx.toggleNameLock();
+    ctx.renderInstallModal('repo');
     expect(content.innerHTML).not.toMatch(/install-detect-error/);
     expect(content.innerHTML).not.toMatch(/id="install-btn"[^>]*disabled/);
   });

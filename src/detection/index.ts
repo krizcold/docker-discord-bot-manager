@@ -78,7 +78,7 @@ export function detectBotType(repoPath: string): DetectionResult {
   result.configFiles = detectConfigFiles(repoPath);
   result.interactiveSetup = detectManualSetup(repoPath, result.configFiles);
 
-  console.log(`[Detection] type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
+  console.log(`[Detection] hints (guessed from the repo files): type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
   return result;
 }
 

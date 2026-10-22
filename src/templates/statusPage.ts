@@ -80,7 +80,7 @@ export function generateStatusPageHtml(bot: BotConfig): string {
   <div class="card">
     <h1>${title}</h1>
     <div class="status">Running</div>
-    <p>This Discord bot has no web interface. It runs in the background and connects directly to Discord.</p>
+    <p>Bot Manager did not publish a web port for this bot. It runs in the background and connects directly to Discord.</p>
     <p>${managerLink}</p>
   </div>
 </body>

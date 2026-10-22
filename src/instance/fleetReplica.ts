@@ -945,9 +945,9 @@ function companionEnvKeys(botId: string): string[] {
  * ordinary standby of the new primary, so the whole fleet is back to one
  * database with one copy and failback is the normal planned handover.
  *
- * Re-seed rather than pg_rewind: a rewind needs data checksums or
- * wal_log_hints on the target, and a managed sidecar is initdb'd with neither,
- * so the lane would be dead code. Both paths discard the diverged tail anyway
+ * Re-seed rather than pg_rewind: enable turns wal_log_hints on, so a rewind
+ * is possible on any cluster that has run enable, but no code calls pg_rewind
+ * and a re-seed needs no such precondition. Both paths discard the diverged tail anyway
  * (R6 calls the whole re-seed a convenience over the bot-side fence).
  *
  * The instance must be STOPPED: this deletes the database it is running on.

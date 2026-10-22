@@ -26,7 +26,12 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
    */
   router.get('/', async (req: Request, res: Response) => {
     try {
-      const sources = sourceManager.getAllSources();
+      const registryFault = sourceManager.sourceRegistryFault();
+      if (registryFault) {
+        res.status(503).json({ success: false, broken: true, error: registryFault });
+        return;
+      }
+      const sources = sourceManager.getAllSources().map(s => ({ ...s, isCloned: sourceManager.isSourceCloned(s) }));
       res.json({ success: true, sources });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -172,16 +177,22 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
         const imageRef = source.imageRef || '';
         const curated = findImageEnvHints(imageRef);
         let imageReady = !!imageRef && await dockerClient.imageExists(imageRef);
+        let pullError: string | undefined;
+        let inspectError: string | undefined;
         if (imageRef && !imageReady && req.query.inspect === 'true') {
           try {
             await dockerClient.pullImage(imageRef);
             imageReady = await dockerClient.imageExists(imageRef);
-          } catch { /* pull failed; curated hints are still returned */ }
+            if (!imageReady) pullError = 'the pull finished but the image is still not present';
+          } catch (err: any) {
+            pullError = String(err?.message || err);
+          }
         }
         let inspected: DetectedEnvVar[] = [];
         if (imageReady) {
           const env = dockerClient.inspectImageEnv(imageRef);
           if (env) inspected = envVarsFromImageConfig(env);
+          else inspectError = 'the image environment could not be read';
         }
         const seen = new Set(curated.map(v => v.key.toUpperCase()));
         const vars = [...curated];
@@ -189,13 +200,14 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
           const k = v.key.toUpperCase();
           if (!seen.has(k)) { seen.add(k); vars.push(v); }
         }
-        res.json({ success: true, vars, configFiles: [], interactiveSetup: null, isImage: true, imageReady });
+        res.json({ success: true, vars, configFiles: [], interactiveSetup: null, isImage: true, imageReady, ...(pullError ? { pullError } : {}), ...(inspectError ? { inspectError } : {}) });
         return;
       }
 
       const repoPath = sourceManager.getSourceRepoPath(req.params.id);
-      if (!fs.existsSync(repoPath)) {
-        res.json({ success: true, vars: [], tier2Ran: false, hasEnvExample: false, notCloned: true });
+      if (!sourceManager.isSourceCloned(source)) {
+        const why = source.cloneError ? `: the last clone failed (${source.cloneError})` : '';
+        res.status(409).json({ success: false, notCloned: true, error: `The source repository is not cloned${why}. Fetch or Install the source first.` });
         return;
       }
 

@@ -133,10 +133,11 @@ async function fetchGuildLists(token: string, guildId: string): Promise<GuildLis
     }
     if (rolesResp.status !== 200 || !Array.isArray(rolesResp.json)) return httpErr(rolesResp.status);   // transient: uncached
     const channelsResp = await discordGet(token, `/guilds/${guildId}/channels`);
+    if (channelsResp.status !== 200 || !Array.isArray(channelsResp.json)) return httpErr(channelsResp.status);   // transient: uncached
     const roles = new Map<string, any>();
     for (const r of rolesResp.json) roles.set(r.id, r);
     const channels = new Map<string, any>();
-    if (Array.isArray(channelsResp.json)) for (const ch of channelsResp.json) channels.set(ch.id, ch);
+    for (const ch of channelsResp.json) channels.set(ch.id, ch);
     const value: GuildLists = { roles, channels };
     guildListCache.set(key, { at: Date.now(), value });
     return value;

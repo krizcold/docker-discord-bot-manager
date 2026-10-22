@@ -532,6 +532,8 @@ async function runScheduledDump(instance: InstanceConfig): Promise<void> {
 }
 
 async function runFleetBackupTick(): Promise<void> {
+  const fault = containerManager.registryFault();
+  if (fault) { console.warn(`[FleetBackup] Tick skipped: ${fault}`); return; }
   await reprobeStuckFences();
   const currentHour = new Date().getHours();
   for (const instance of containerManager.getAllBots()) {

@@ -11,6 +11,7 @@ const st = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/docker/containerManager', () => ({
+  registryFault: () => null,
   getAllBots: () => [...st.bots.values()].map(b => ({ ...b })),
   getBot: (id: string) => (st.bots.has(id) ? { ...st.bots.get(id) } : null),
   withoutRecordSecrets: (b: unknown) => b,

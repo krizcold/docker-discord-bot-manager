@@ -70,6 +70,8 @@ function isDueForCheck(bot: { id: string; autoUpdateInterval?: number; autoUpdat
  * Run a single tick: check all instances with autoUpdate enabled.
  */
 async function runInstanceUpdateTick(): Promise<void> {
+  const fault = containerManager.registryFault();
+  if (fault) { console.warn(`[InstanceUpdater] Tick skipped: ${fault}`); return; }
   const bots = containerManager.getAllBots();
 
   for (const bot of bots) {

@@ -1275,14 +1275,17 @@
     const updateCache = {}; // { botId: { hasUpdates, behindBy, message, checking, error } }
 
     // ─── Load & Render Bots ───
+    let botsLoadError = null;
     async function loadBots() {
       try {
         const res = await api('GET', '/bots');
+        botsLoadError = res.success ? null : (res.error || 'Failed to load bots');
         bots = res.success ? (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
         if (res.success && res.deploymentMode) deploymentMode = res.deploymentMode;
         if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
         bots = [];
+        botsLoadError = 'Failed to load bots: the manager could not be reached';
         showMessage('error', 'Failed to load bots');
       }
       // Clear busy state for bots that have reached a terminal state
@@ -1300,6 +1303,16 @@
     function renderBots() {
       const container = document.getElementById('bots-container');
       const isLocalBrowser = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+
+      if (bots.length === 0 && botsLoadError) {
+        container.innerHTML = `
+          <div class="empty-state">
+            <h3>The bot list could not be loaded</h3>
+            <p>${escapeHtml(botsLoadError)}</p>
+          </div>
+        `;
+        return;
+      }
 
       if (bots.length === 0) {
         container.innerHTML = `
@@ -1333,7 +1346,9 @@
                 return `<option value="${s.id}"${selected}>${escapeHtml(sName)}</option>`;
               }).join('');
               const notFoundOpt = (!bot.sourceId || !sources.find(s => s.id === bot.sourceId))
-                ? `<option value="" selected style="color:var(--danger)">[Not Found]</option>` : '';
+                ? (sourcesLoadError
+                  ? `<option value="" selected style="color:var(--danger)">Sources could not be loaded</option>`
+                  : `<option value="" selected style="color:var(--danger)">[Not Found]</option>`) : '';
               sourceTag = `<div class="source-tag">
                 <select class="source-select" onchange="changeSource('${bot.id}', this.value)" title="Change source">${notFoundOpt}${opts}</select>
               </div>`;
@@ -4131,12 +4146,15 @@
     }
 
     // ─── Source Sidebar ───
+    let sourcesLoadError = null;
     async function loadSources() {
       try {
         const res = await api('GET', '/sources');
         sources = res.success ? sortSources(res.sources || []) : [];
+        sourcesLoadError = res.success ? null : (res.error || 'Failed to load sources');
       } catch (err) {
         sources = [];
+        sourcesLoadError = 'Failed to load sources: the manager could not be reached';
       }
       renderSourceSidebar();
     }
@@ -4151,7 +4169,7 @@
     const SOURCE_FETCH_POLL_MS = 2500;
     const SOURCE_FETCH_MAX_MS = 120000;
     function isSourceFetching(s) {
-      return !!(s && s.sourceType !== 'docker-image' && s.lastChecked && !s.lastCommitHash);
+      return !!(s && s.sourceType !== 'docker-image' && s.lastChecked && !s.lastCommitHash && !s.cloneError);
     }
     function ensureSourceFetchPolling() {
       const anyFetching = sources.some(isSourceFetching);
@@ -4174,6 +4192,10 @@
     function renderSourceSidebar() {
       const list = document.getElementById('source-list');
       ensureSourceFetchPolling();
+      if (sources.length === 0 && sourcesLoadError) {
+        list.innerHTML = `<div class="source-empty">${escapeHtml(sourcesLoadError)}</div>`;
+        return;
+      }
       if (sources.length === 0) {
         list.innerHTML = '<div class="source-empty">No sources yet.<br>Click + Add to import a repository.</div>';
         return;
@@ -4192,7 +4214,7 @@
         const star = pres.featured ? ' <span class="source-featured-star" title="Featured">&#9733;</span>' : '';
         const cardClass = pres.featured ? 'source-card featured' : 'source-card';
         const collapsed = collapsedSources.has(s.id);
-        const isCloned = !!s.lastChecked;
+        const isCloned = isImage || !!s.isCloned;
         const isCloning = cloningSources.has(s.id);
 
         // Header action button: Install (not cloned) / Cloning... / Add Bot (cloned)
@@ -4260,11 +4282,13 @@
           ${isImage
             ? `<div class="source-card-url" style="margin-left:26px;">Image: <span style="font-family:monospace;">${escapeHtml(s.imageRef || '')}</span> ${instanceBadge}</div>`
             : `<div class="source-card-url" style="margin-left:26px;">${escapeHtml(getDisplayUrl(s.url))} ${instanceBadge}</div>
-          <div class="source-card-meta" style="margin-left:26px;">${s.lastChecked && !s.lastCommitHash
+          <div class="source-card-meta" style="margin-left:26px;">${s.cloneError && !isCloned
+            ? `${escapeHtml(s.branch)} &middot; <span style="color:var(--danger);">Re-clone failed: ${escapeHtml(s.cloneError)}; Fetch retries</span>`
+            : s.lastChecked && !s.lastCommitHash && !isCloned
             ? `${escapeHtml(s.branch)} &middot; <span class="source-fetching-label">Fetching...</span><div class="source-fetch-bar"><div class="source-fetch-bar-fill"></div></div>`
             : `${escapeHtml(s.branch)} @ ${commit} &middot; ${lastChecked}`}</div>`}
           <div class="source-card-actions" style="margin-left:26px;">
-            ${!isImage && isCloned ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
+            ${!isImage && (isCloned || s.cloneError) ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${s.id}')">Fetch</button>
             <button class="btn btn-secondary btn-small" onclick="showEditSourceModal('${s.id}')">Edit</button>` : ''}
             <button class="btn btn-danger btn-small" onclick="deleteSource('${s.id}')">Remove</button>
           </div>
@@ -4363,6 +4387,7 @@
           loadBots();
         } else {
           showMessage('error', res.error || 'Fetch failed');
+          loadSources();
         }
       } catch (err) { showMessage('error', 'Fetch failed'); }
     }
@@ -4705,6 +4730,9 @@
           existing.add(v.key);
           added++;
         }
+        if (res.pullError) { showMessage('error', `Image pull failed: ${res.pullError}`); return; }
+        if (!res.imageReady) { showMessage('error', 'The image is not present locally, so its variables could not be read'); return; }
+        if (res.inspectError) { showMessage('error', `Image inspect failed: ${res.inspectError}`); return; }
         showMessage('success', added > 0 ? `Found ${added} variable(s) from the image` : 'No new variables found in the image');
       } catch (e) {
         if (seq !== installSeq || sourceId !== installSourceId) return;

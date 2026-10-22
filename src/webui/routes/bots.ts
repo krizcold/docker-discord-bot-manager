@@ -58,6 +58,15 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
 
+  router.use((req: Request, res: Response, next) => {
+    const registryFault = containerManager.registryFault();
+    if (registryFault) {
+      res.status(503).json({ success: false, broken: true, error: registryFault });
+      return;
+    }
+    next();
+  });
+
   /**
    * GET /api/bots - List all bot instances
    * Joins source info for each instance.

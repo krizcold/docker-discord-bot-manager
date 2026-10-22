@@ -35,6 +35,8 @@ export interface SourceMeta {
   lastChecked: string | null;          // ISO timestamp of last fetch
   autoUpdate: boolean;                 // default true
   composeName: string | null;          // original "name:" from repo compose, or null
+  cloneError?: string | null;          // why the last clone failed, cleared by a successful clone
+  cloneFailedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

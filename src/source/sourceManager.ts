@@ -49,6 +49,17 @@ export function loadSourceRegistry(): SourceRegistry {
   }
 }
 
+/** Why sources.json cannot be read right now, or null when it reads (or is absent). */
+export function sourceRegistryFault(): string | null {
+  if (!brokenSourceLoads.has(loadSourceRegistry())) return null;
+  return `The source registry (sources.json) cannot be read, so the source list is unknown and every change is refused. Repair or replace sources.json (${corruptCopyNote(REGISTRY_FILE)}).`;
+}
+
+/** Whether a git source's clone is on disk (image sources need none). */
+export function isSourceCloned(source: SourceMeta): boolean {
+  return source.sourceType === 'docker-image' || fs.existsSync(path.join(getSourceRepoPath(source.id), '.git'));
+}
+
 // Synchronous atomic write: each mutator's load -> mutate -> save runs to completion
 // on the single JS thread (a deferred/queued write let a stale snapshot revert another
 // writer's change), and temp+rename means a crash mid-write cannot truncate the file.
@@ -266,6 +277,8 @@ export function updateSource(sourceId: string, update: UpdateSourceRequest): Sou
     source.lastCommitHash = null;
     source.lastCommitMessage = null;
     source.lastCommitDate = null;
+    source.cloneError = null;
+    source.cloneFailedAt = null;
     console.log(`[SourceManager] Source ${sourceId} url/branch changed, clone wiped for re-clone`);
   }
 
@@ -291,7 +304,13 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     console.log(`[SourceManager] Source ${sourceId} not cloned yet, cloning...`);
     const sourceDir = getSourceDir(sourceId);
     fs.mkdirSync(sourceDir, { recursive: true });
-    const actualBranch = await cloneRepo(source.url, repoPath, source.branch);
+    let actualBranch: string;
+    try {
+      actualBranch = await cloneRepo(source.url, repoPath, source.branch);
+    } catch (err: any) {
+      recordCloneFailure(sourceId, getDisplayUrl(String(err?.message || err)));
+      throw err;
+    }
     createSourceRawBackup(sourceId);
 
     // Save original compose if exists
@@ -311,6 +330,8 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
       s.lastCommitDate = headCommit?.date || null;
       s.lastChecked = new Date().toISOString();
       s.composeName = extractComposeName(repoPath);
+      s.cloneError = null;
+      s.cloneFailedAt = null;
       s.updatedAt = new Date().toISOString();
       saveSourceRegistry(registry);
     }
@@ -370,6 +391,19 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
   }
 
   return { hasUpdates: behindBy > 0, behindBy };
+}
+
+function recordCloneFailure(sourceId: string, reason: string): void {
+  try {
+    const registry = loadSourceRegistry();
+    const s = registry.sources[sourceId];
+    if (!s) return;
+    s.cloneError = reason.trim() || 'the clone failed';
+    s.cloneFailedAt = new Date().toISOString();
+    saveSourceRegistry(registry);
+  } catch (err) {
+    console.warn(`[SourceManager] Could not record the clone failure of ${sourceId}:`, err);
+  }
 }
 
 /**
@@ -507,6 +541,8 @@ const DEFAULT_SOURCES: Array<{ url?: string; branch?: string; imageRef?: string;
  * The repo is cloned on-demand when the user clicks Install or Fetch.
  */
 export function seedDefaultSources(): void {
+  const fault = sourceRegistryFault();
+  if (fault) throw new Error(fault);
   const registry = loadSourceRegistry();
   if (Object.keys(registry.sources).length > 0) return; // Already has sources
 

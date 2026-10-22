@@ -93,7 +93,7 @@ import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName 
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 import { capServiceLogs } from '../templates/logCaps';
-import { storeFileState, preserveCorruptCopy, corruptCopyNote, listCorruptCopies } from '../config/storeFile';
+import { storeFileState, preserveCorruptCopy, corruptCopyNote, listCorruptCopies, writeFileAtomic } from '../config/storeFile';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
@@ -264,6 +264,16 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfi
   return out;
 }
 
+/** Why instances.json cannot be read right now, or null when it reads (or is absent). */
+export function registryFault(): string | null {
+  if (!brokenRegistryLoads.has(loadRegistry())) return null;
+  return `The instance registry (instances.json) cannot be read, so the bot list is unknown and every change is refused. Repair or replace instances.json (${corruptCopyNote(REGISTRY_FILE)}).`;
+}
+
+function refuseBrokenRegistry(registry: InstanceRegistry): void {
+  if (brokenRegistryLoads.has(registry)) throw new Error(registryFault() || `The instance registry (instances.json) cannot be read, so nothing was saved. Repair or replace instances.json (${corruptCopyNote(REGISTRY_FILE)}).`);
+}
+
 function saveRegistrySync(registry: InstanceRegistry): void {
   const state = storeFileState(REGISTRY_FILE);
   if (brokenRegistryLoads.has(registry) || state.kind === 'broken') {
@@ -375,6 +385,9 @@ export function readEnvsFromComposeFile(composePath: string): Record<string, str
  */
 export async function createInstance(request: CreateInstanceRequest): Promise<InstanceConfig> {
   const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const sourceFault = sourceManager.sourceRegistryFault();
+  if (sourceFault) throw new Error(sourceFault);
 
   const source = sourceManager.getSource(request.sourceId);
   if (!source) {
@@ -456,6 +469,7 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
  */
 export async function createDockerImageInstance(request: CreateDockerImageInstanceRequest): Promise<InstanceConfig> {
   const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
 
   // Auto-uniquify a reserved or already-used name ("Bot" -> "Bot 2").
   const existing = Object.values(registry.instances);
@@ -1903,16 +1917,14 @@ function updateInstanceDetection(botId: string, detection: DetectionResult): voi
  *
  * Location: /DATA/AppData/{appName}/.botmanager
  */
-function writeBotManagerMarker(instance: InstanceConfig, appName: string, isCasaOS: boolean): void {
+export function writeBotManagerMarker(instance: InstanceConfig, appName: string, isCasaOS: boolean): void {
   // CasaOS: marker lives in the platform AppData folder (folder-reuse detection).
   // Docker: no /DATA; keep the marker inside the bot's own data dir.
   const appDataPath = isCasaOS
     ? path.join(process.env.DATA_ROOT || '/DATA', 'AppData', appName)
     : getBotDir(instance.id);
 
-  try {
-    fs.mkdirSync(appDataPath, { recursive: true });
-    const marker = {
+  const marker = {
       managedBy: 'docker-discord-bot-manager',
       instanceId: instance.id,
       displayName: instance.displayName,
@@ -1921,21 +1933,15 @@ function writeBotManagerMarker(instance: InstanceConfig, appName: string, isCasa
       sourceType: instance.sourceType || 'git',
       createdAt: instance.createdAt,
       lastBuildAt: new Date().toISOString()
-    };
-    fs.writeFileSync(
-      path.join(appDataPath, '.botmanager'),
-      JSON.stringify(marker, null, 2)
-    );
-  } catch (err) {
-    console.warn(`[ContainerManager] Failed to write .botmanager marker: ${err}`);
+  };
+  try {
+    writeFileAtomic(path.join(appDataPath, '.botmanager'), JSON.stringify(marker, null, 2));
+  } catch (err: any) {
+    throw new Error(`Could not write the .botmanager marker in ${appDataPath}: ${err?.message || err}`);
   }
 }
 
-/**
- * Read the .botmanager marker from an AppData folder.
- * Returns the parsed marker or null if not found/invalid.
- */
-export function readBotManagerMarker(appName: string): {
+export interface BotManagerMarker {
   managedBy: string;
   instanceId: string;
   displayName: string;
@@ -1944,16 +1950,52 @@ export function readBotManagerMarker(appName: string): {
   sourceType: string;
   createdAt: string;
   lastBuildAt: string;
-} | null {
+}
+
+export type BotManagerMarkerRead =
+  | { state: 'absent' }
+  | { state: 'unreadable'; error: string }
+  | { state: 'ok'; marker: BotManagerMarker };
+
+/** Read the .botmanager marker from an AppData folder. */
+export function readBotManagerMarker(appName: string): BotManagerMarkerRead {
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const markerPath = path.join(dataRoot, 'AppData', appName, '.botmanager');
-
+  const state = storeFileState(markerPath);
+  if (state.kind === 'absent') return { state: 'absent' };
+  if (state.kind === 'broken') return { state: 'unreadable', error: state.error };
   try {
-    if (!fs.existsSync(markerPath)) return null;
-    return JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
-  } catch {
-    return null;
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.instanceId !== 'string' || !parsed.instanceId) {
+      return { state: 'unreadable', error: '.botmanager names no instance' };
+    }
+    return { state: 'ok', marker: parsed as BotManagerMarker };
+  } catch (err: any) {
+    return { state: 'unreadable', error: `.botmanager cannot be read (${err?.code || err?.message || err})` };
   }
+}
+
+/**
+ * Who owns an existing compose project: another instance (a ghost to tear
+ * down), this one, nobody (no containers), or unknown (the build refuses).
+ */
+export async function composeProjectOwner(appName: string, botId: string): Promise<{ kind: 'other'; evidence: string } | { kind: 'self' | 'none' } | { kind: 'unknown'; reason: string }> {
+  const read = readBotManagerMarker(appName);
+  if (read.state === 'ok') {
+    return read.marker.instanceId === botId ? { kind: 'self' } : { kind: 'other', evidence: `marker instanceId=${read.marker.instanceId}` };
+  }
+  const markerReason = read.state === 'absent' ? 'no .botmanager marker' : read.error;
+  let ids: string[];
+  try {
+    ids = await dockerClient.listProjectBotIds(appName);
+  } catch (err: any) {
+    return { kind: 'unknown', reason: `${markerReason}, and docker did not list the project's containers (${err?.message || err})` };
+  }
+  if (ids.length === 0) return { kind: 'none' };
+  const other = ids.find(id => id && id !== botId);
+  if (other) return { kind: 'other', evidence: `container bot-id=${other}` };
+  if (ids.every(id => id === botId)) return { kind: 'self' };
+  return { kind: 'unknown', reason: `${markerReason}, and a container of the project carries no bot-id label` };
 }
 
 /**
@@ -3239,9 +3281,15 @@ async function buildGitInstance(
     const pcsDataRoot = process.env.DATA_ROOT || '/DATA';
     const metadataComposePath = path.join(pcsDataRoot, 'AppData', 'casaos', 'apps', earlyAppName, 'docker-compose.yml');
     if (fs.existsSync(metadataComposePath)) {
-      const marker = readBotManagerMarker(earlyAppName);
-      if (!marker || marker.instanceId !== botId) {
-        emit(`[Cleanup] Stale compose found at ${metadataComposePath} (instanceId=${marker?.instanceId || 'none'}, current=${botId}), tearing down ghost containers`, 'warning');
+      const owner = await composeProjectOwner(earlyAppName, botId);
+      if (owner.kind === 'unknown') {
+        const refusal = `cannot tell who owns ${earlyAppName}: ${owner.reason}`;
+        emit(`[Error] ${refusal}`, 'error');
+        updateBotStatus(botId, 'error');
+        return { success: false, error: refusal };
+      }
+      if (owner.kind === 'other') {
+        emit(`[Cleanup] Stale compose found at ${metadataComposePath} (${owner.evidence}, current=${botId}), tearing down ghost containers`, 'warning');
         try {
           const downResult = await casaosApi.composeDown(earlyAppName, metadataComposePath, (msg) => emit(`[Compose down] ${msg}`, 'info'));
           if (!downResult.success) {
@@ -3608,6 +3656,8 @@ export async function getBotStats(botId: string): Promise<{ success: boolean; st
  * syncContainerStates then corrects bots whose containers are actually up.
  */
 export function resetTransientStatuses(): void {
+  const fault = registryFault();
+  if (fault) { console.warn(`[Init] Transient statuses not reset: ${fault}`); return; }
   const registry = loadRegistry();
   for (const instance of Object.values(registry.instances)) {
     if (instance.status === 'building' || instance.status === 'starting' || instance.status === 'stopping') {
@@ -3631,6 +3681,8 @@ export function resetTransientStatuses(): void {
  * in-flight operations the manager is driving itself.
  */
 export async function syncContainerStates(): Promise<void> {
+  const fault = registryFault();
+  if (fault) { console.warn(`[Reconciler] Skipped: ${fault}`); return; }
   const registry = loadRegistry();
   const containers = await dockerClient.listBotContainers();
 

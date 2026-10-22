@@ -91,13 +91,15 @@ async function main(): Promise<void> {
 
   console.log('[Init] Docker connection OK');
 
-  await warnOnOpenDataRoot();
+  // A store that cannot be read (config.json, sources.json) refuses these
+  // steps; the manager still starts so the web UI can name the problem.
+  try { await warnOnOpenDataRoot(); } catch (err: any) { console.warn(`[Init] ${err?.message || err}`); }
 
   // Shared manager<->bot network (docker mode only; no-op on CasaOS/Yundera)
-  await ensureInternalNetwork();
+  try { await ensureInternalNetwork(); } catch (err: any) { console.warn(`[Init] ${err?.message || err}`); }
 
   // Seed default sources on first run
-  seedDefaultSources();
+  try { seedDefaultSources(); } catch (err: any) { console.warn(`[Init] Default sources not seeded: ${err?.message || err}`); }
 
   // Sync container states on startup (ops interrupted by a restart first)
   console.log('[Init] Syncing container states...');

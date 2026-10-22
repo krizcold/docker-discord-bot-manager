@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getEnvPath } from '../git/repoManager';
 import { encrypt, decryptOrNull } from '../env/manager';
+import { storeFileState, preserveCorruptCopy } from './storeFile';
 
 export interface BotConfigFile {
   path: string;       // in-container mount path, e.g. /app/config.json
@@ -27,16 +28,21 @@ function storageFile(botId: string): string {
 }
 
 /**
- * Load the store. A missing file is legitimately empty; a file that EXISTS but
- * cannot be read, parsed, or does not have the store's shape is reported
- * corrupt (and preserved as .corrupt before any later save can overwrite the
- * only copy of the ciphertext) so delivery can refuse instead of silently
- * writing nothing over the bot's real configs.
+ * Load the store. Only a definitely missing file (ENOENT) is legitimately
+ * empty; a file that cannot be checked, read, parsed, or does not have the
+ * store's shape is reported corrupt (with a timestamped copy kept beside it)
+ * so delivery and saves refuse instead of writing nothing over the bot's real
+ * configs or overwriting the only copy of the ciphertext.
  */
 function load(botId: string): { storage: ConfigFileStorage; corrupt: boolean } {
   const p = storageFile(botId);
+  const state = storeFileState(p);
+  if (state.kind === 'broken') {
+    console.error(`[ConfigFiles] Failed to load for bot ${botId}: ${state.error}`);
+    return { storage: { files: [] }, corrupt: true };
+  }
   try {
-    if (fs.existsSync(p)) {
+    if (state.kind === 'present') {
       const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
         || !Array.isArray(parsed.files)
@@ -45,18 +51,11 @@ function load(botId: string): { storage: ConfigFileStorage; corrupt: boolean } {
           && typeof (f as { body?: unknown }).body === 'string')) {
         throw new Error('configFiles.json is not a config-file store');
       }
-      // Healthy again: clear a preserved copy left by an earlier incident so a
-      // LATER corruption preserves its own bytes instead of being shadowed.
-      try { fs.rmSync(`${p}.corrupt`, { force: true }); } catch { /* best effort */ }
       return { storage: { files: parsed.files }, corrupt: false };
     }
   } catch (error) {
     console.error(`[ConfigFiles] Failed to load for bot ${botId}:`, error);
-    // Preserve once: re-copying on every failed load could clobber the
-    // preserved copy while the operator performs the documented restore.
-    try {
-      if (!fs.existsSync(`${p}.corrupt`)) fs.copyFileSync(p, `${p}.corrupt`);
-    } catch { /* best effort */ }
+    preserveCorruptCopy(p);
     return { storage: { files: [] }, corrupt: true };
   }
   return { storage: { files: [] }, corrupt: false };
@@ -95,7 +94,7 @@ export function getConfigFiles(botId: string): BotConfigFile[] {
 export function getConfigFilesStrict(botId: string): BotConfigFile[] {
   const { files, undecryptable, corrupt } = getConfigFilesWithStatus(botId);
   if (corrupt) {
-    throw new Error(`The config-file store for bot ${botId} cannot be read (the damaged original is preserved as configFiles.json.corrupt), so its files cannot be delivered. Repair or replace configFiles.json, or delete it to deliberately start with an empty store and re-enter the files.`);
+    throw new Error(`The config-file store for bot ${botId} cannot be read (a copy of the damaged file is kept beside it as configFiles.json.corrupt-<time> when it could be read), so its files cannot be delivered. Repair or replace configFiles.json, or delete it to deliberately start with an empty store and re-enter the files.`);
   }
   const blocking = files.filter(f => f.enabled !== false && undecryptable.includes(f.path)).map(f => f.path);
   if (blocking.length > 0) {
@@ -114,7 +113,7 @@ export function getConfigFilesStrict(botId: string): BotConfigFile[] {
 export function setConfigFiles(botId: string, files: BotConfigFile[]): void {
   const { storage: current, corrupt } = load(botId);
   if (corrupt) {
-    throw new Error(`The config-file store for bot ${botId} exists but cannot be read; refusing to overwrite it. Repair or replace configFiles.json (the damaged original is preserved as configFiles.json.corrupt), or delete configFiles.json to deliberately start with an empty store and re-enter the files.`);
+    throw new Error(`The config-file store for bot ${botId} exists but cannot be read; refusing to overwrite it. Repair or replace configFiles.json (a copy of the damaged file is kept beside it as configFiles.json.corrupt-<time> when it could be read), or delete configFiles.json to deliberately start with an empty store and re-enter the files.`);
   }
 
   const envPath = getEnvPath(botId);

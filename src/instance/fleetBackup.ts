@@ -543,7 +543,7 @@ async function runFleetBackupTick(): Promise<void> {
     const scopeCheck = backupScopeUnverifiable(instance);
     if (scopeCheck.corrupt || scopeCheck.urlUndecryptable) {
       lastErrors.set(instance.id, scopeCheck.corrupt
-        ? 'the env store cannot be read (preserved as storage.json.corrupt), so the scheduled dump cannot verify its scope'
+        ? 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope'
         : 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope');
       console.error(`[FleetBackup] Skipping the scheduled dump for ${instance.displayName} (${instance.id}): env store unreadable or the database URL undecryptable`);
       continue;
@@ -592,7 +592,7 @@ export async function restoreFleetBackup(
   // would steer the operator toward re-provisioning instead of the repair.
   const store = envManager.getEnvVarsWithStatus(botId);
   if (store.corrupt) {
-    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before restoring a dump', steps };
+    return { success: false, error: 'The env store for this instance cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); restore it before restoring a dump', steps };
   }
   const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
   if (urlKey && store.undecryptable.includes(urlKey)) {

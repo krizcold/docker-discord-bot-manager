@@ -13,37 +13,75 @@ import { parseDocument } from 'yaml';
 import { getEnvPath, getDataDir } from '../git/repoManager';
 import { APP_CAPABILITIES } from '../config/appCapabilities';
 import { writePrivateFile } from '../config/fileModes';
+import { storeFileState, preserveCorruptCopy, writeFileAtomic } from '../config/storeFile';
+
+/**
+ * Why secret writes are refused, or null when the key material is healthy.
+ * Set at boot when the key or salt file exists but cannot be read or is
+ * damaged (never overwritten: it may be the only way back to every stored
+ * secret), or when a newly generated one could not be saved (values written
+ * under it would not survive a restart).
+ */
+let keyProblem: string | null = null;
+
+export class SecretKeyUnavailableError extends Error {
+  constructor(reason: string) {
+    super(`Secrets cannot be saved: ${reason}. Nothing was written.`);
+    this.name = 'SecretKeyUnavailableError';
+  }
+}
+
+export function secretKeyProblem(): string | null {
+  return keyProblem;
+}
+
+function noteKeyProblem(problem: string): void {
+  console.error(`[EnvManager] ${problem}; secret writes are refused until it is fixed and the manager restarted`);
+  if (!keyProblem) keyProblem = problem;
+}
+
+/**
+ * Load a persisted key-material file, or generate and save it when it is
+ * definitely absent. A present file must hold exactly the hex the manager
+ * writes: a torn write (empty or short) is damage, not absence.
+ */
+function loadOrCreateKeyMaterial(fileName: string, bytes: number): string {
+  const filePath = path.join(getDataDir(), fileName);
+  const state = storeFileState(filePath);
+  const inMemory = () => crypto.randomBytes(bytes).toString('hex');
+  if (state.kind === 'broken') {
+    noteKeyProblem(state.error);
+    return inMemory();
+  }
+  if (state.kind === 'present') {
+    try {
+      const existing = fs.readFileSync(filePath, 'utf-8').trim();
+      if (new RegExp(`^[0-9a-f]{${bytes * 2}}$`).test(existing)) return existing;
+      noteKeyProblem(`${fileName} exists but is empty or damaged`);
+    } catch (error: any) {
+      noteKeyProblem(`${fileName} exists but cannot be read (${error?.code || error?.message || error})`);
+    }
+    return inMemory();
+  }
+  const generated = inMemory();
+  try {
+    writeFileAtomic(filePath, generated, 0o600);
+  } catch (error: any) {
+    noteKeyProblem(`${fileName} could not be saved (${error?.code || error?.message || error})`);
+  }
+  return generated;
+}
 
 /**
  * Resolve the AES key used to encrypt sensitive env/config values. It MUST be
  * stable across manager restarts, otherwise every previously-encrypted value
- * (bot tokens, stored config files) becomes undecryptable on the next boot and
- * the bot reads as "missing required token". Precedence: an explicit
- * ENV_ENCRYPTION_KEY, else a key persisted under the data volume (generated once
- * on first run). Only an in-memory fallback (lost on restart) if persistence
- * fails, with a loud warning.
+ * (bot tokens, stored config files) becomes undecryptable on the next boot.
+ * Precedence: an explicit ENV_ENCRYPTION_KEY, else a key persisted under the
+ * data volume (generated once on first run).
  */
 function loadOrCreateEncryptionKey(): string {
   if (process.env.ENV_ENCRYPTION_KEY) return process.env.ENV_ENCRYPTION_KEY;
-
-  const keyPath = path.join(getDataDir(), 'env-encryption.key');
-  try {
-    if (fs.existsSync(keyPath)) {
-      const existing = fs.readFileSync(keyPath, 'utf-8').trim();
-      if (existing) return existing;
-    }
-  } catch (error) {
-    console.error('[EnvManager] Failed to read persisted encryption key:', error);
-  }
-
-  const generated = crypto.randomBytes(32).toString('hex');
-  try {
-    fs.mkdirSync(getDataDir(), { recursive: true });
-    fs.writeFileSync(keyPath, generated, { mode: 0o600 });
-  } catch (error) {
-    console.error('[EnvManager] Could not persist encryption key; stored tokens will NOT survive a restart:', error);
-  }
-  return generated;
+  return loadOrCreateKeyMaterial('env-encryption.key', 32);
 }
 
 const ENCRYPTION_KEY = loadOrCreateEncryptionKey();
@@ -54,24 +92,7 @@ const ENCRYPTION_KEY = loadOrCreateEncryptionKey();
  * precomputed tables, and it must be stable for the same reason the key must.
  */
 function loadOrCreateKdfSalt(): string {
-  const saltPath = path.join(getDataDir(), 'env-encryption.salt');
-  try {
-    if (fs.existsSync(saltPath)) {
-      const existing = fs.readFileSync(saltPath, 'utf-8').trim();
-      if (existing) return existing;
-    }
-  } catch (error) {
-    console.error('[EnvManager] Failed to read persisted KDF salt:', error);
-  }
-
-  const generated = crypto.randomBytes(16).toString('hex');
-  try {
-    fs.mkdirSync(getDataDir(), { recursive: true });
-    fs.writeFileSync(saltPath, generated, { mode: 0o600 });
-  } catch (error) {
-    console.error('[EnvManager] Could not persist KDF salt; stored secrets will NOT survive a restart:', error);
-  }
-  return generated;
+  return loadOrCreateKeyMaterial('env-encryption.salt', 16);
 }
 
 // Derived once at boot: scrypt is deliberately slow, and getEnvVars decrypts on
@@ -107,6 +128,7 @@ export function isSensitive(key: string): boolean {
  * "v2:<iv>:<authTag>:<ciphertext>" hex fields.
  */
 export function encrypt(text: string): string {
+  if (keyProblem) throw new SecretKeyUnavailableError(keyProblem);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', DERIVED_KEY, iv);
   const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
@@ -143,18 +165,23 @@ export function decrypt(encrypted: string): string {
 }
 
 /**
- * Load env storage for a bot. A missing file is a legitimately empty store; a
- * file that EXISTS but cannot be read or parsed is reported corrupt (and
- * preserved as .corrupt before any later save can overwrite the only copy of
- * the secrets) so container env assembly can refuse instead of silently
- * starting secretless.
+ * Load env storage for a bot. Only a definitely missing file (ENOENT) is a
+ * legitimately empty store; a file that cannot be checked, read or parsed is
+ * reported corrupt (with a timestamped copy kept beside it) so container env
+ * assembly and every write refuse instead of starting secretless or
+ * overwriting the only copy of the secrets.
  */
 function loadEnvStorage(botId: string): { storage: EnvStorage; corrupt: boolean } {
   const envPath = getEnvPath(botId);
   const storagePath = path.join(envPath, 'storage.json');
 
+  const state = storeFileState(storagePath);
+  if (state.kind === 'broken') {
+    console.error(`[EnvManager] Failed to load env storage for bot ${botId}: ${state.error}`);
+    return { storage: { vars: {}, encrypted: {} }, corrupt: true };
+  }
   try {
-    if (fs.existsSync(storagePath)) {
+    if (state.kind === 'present') {
       const content = fs.readFileSync(storagePath, 'utf-8');
       const parsed = JSON.parse(content);
       // Shape check: valid JSON that is not an EnvStorage (null, an array,
@@ -174,21 +201,11 @@ function loadEnvStorage(botId: string): { storage: EnvStorage; corrupt: boolean 
       }
       const vars: Record<string, string> = {};
       for (const [k, v] of Object.entries((parsed.vars ?? {}) as Record<string, unknown>)) vars[k] = v === null ? '' : String(v);
-      // The store reads healthy again: clear a preserved copy left by an
-      // earlier incident, so a LATER corruption preserves its own bytes
-      // instead of being shadowed by stale secrets the refusal messages
-      // would then misdirect the operator to restore.
-      try { fs.rmSync(`${storagePath}.corrupt`, { force: true }); } catch { /* best effort */ }
       return { storage: { vars, encrypted: parsed.encrypted ?? {} }, corrupt: false };
     }
   } catch (error) {
     console.error(`[EnvManager] Failed to load env storage for bot ${botId}:`, error);
-    // Preserve once: loads run continuously, and re-copying on every failed
-    // load could clobber the preserved copy with a half-restored snapshot
-    // while the operator performs the documented live restore.
-    try {
-      if (!fs.existsSync(`${storagePath}.corrupt`)) fs.copyFileSync(storagePath, `${storagePath}.corrupt`);
-    } catch { /* best effort */ }
+    preserveCorruptCopy(storagePath);
     return { storage: { vars: {}, encrypted: {} }, corrupt: true };
   }
 
@@ -200,12 +217,12 @@ function loadEnvStorage(botId: string): { storage: EnvStorage; corrupt: boolean 
  * store holding only the keys just written - disarming the corrupt-store
  * refusal and losing every other secret as a side effect of any save (an
  * editor save, a key delete, a fleet lane's repoint). Refuse instead; the
- * remedy is deliberate: restore storage.json from storage.json.corrupt, or
+ * remedy is deliberate: restore storage.json from a kept copy, or
  * delete storage.json to start over empty on purpose.
  */
 function refuseCorrupt(botId: string, corrupt: boolean): void {
   if (!corrupt) return;
-  throw new Error(`The env store for bot ${botId} exists but cannot be read; refusing to overwrite it. Repair or replace storage.json (the damaged original is preserved as storage.json.corrupt), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
+  throw new Error(`The env store for bot ${botId} exists but cannot be read; refusing to overwrite it. Repair or replace storage.json (a copy of the damaged file is kept beside it as storage.json.corrupt-<time> when it could be read), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
 }
 
 /**
@@ -289,7 +306,7 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
  */
 export function storeBrokenDiagnosis(botId: string): string | null {
   const { corrupt, undecryptable } = getEnvVarsWithStatus(botId);
-  if (corrupt) return 'the env store cannot be read (preserved as storage.json.corrupt); restore it first';
+  if (corrupt) return 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); restore it first';
   if (undecryptable.length > 0) return `the env store holds values that no longer decrypt (${undecryptable.join(', ')}); re-enter them or restore the encryption key first`;
   return null;
 }

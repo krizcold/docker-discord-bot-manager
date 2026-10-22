@@ -12,6 +12,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../docker/containerManager';
 import * as envManager from '../../env/manager';
+import { storeFileState, preserveCorruptCopy, listCorruptCopies, corruptCopyNote, writeFileAtomic } from '../../config/storeFile';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const VAULT_FILE = path.join(DATA_DIR, 'vault.json');
@@ -37,75 +38,69 @@ export interface VaultConfig {
 
 let warnedUnreadableVault = false;
 
-export function loadVault(): VaultConfig {
+// Configs handed out by a load that could not read vault.json: they look
+// empty, so a save built on one would destroy every vaulted group, even when
+// the file reads again by save time.
+const brokenVaultLoads = new WeakSet<VaultConfig>();
+
+type VaultLoad = { state: 'absent' | 'ok'; config: VaultConfig } | { state: 'broken'; config: VaultConfig; error: string };
+
+/**
+ * Read vault.json. Only a definitely missing file is an empty vault; a file
+ * that cannot be checked, read or decrypted is broken (a timestamped copy is
+ * kept beside it) and loads as an empty vault no save may build on.
+ */
+export function readVault(): VaultLoad {
+  const state = storeFileState(VAULT_FILE);
+  if (state.kind === 'absent') return { state: 'absent', config: { standalone: [], deletedBots: [] } };
   try {
-    if (!fs.existsSync(VAULT_FILE)) return { standalone: [], deletedBots: [] };
+    if (state.kind === 'broken') throw new Error(state.error);
     const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
     if (!wrapper || typeof wrapper.data !== 'string') throw new Error('unrecognized vault format');
-    const raw = JSON.parse(envManager.decrypt(wrapper.data));
-    // Healthy again: clear a preserved copy left by an earlier incident so a
-    // later corruption preserves its own bytes.
-    try { fs.rmSync(`${VAULT_FILE}.corrupt`, { force: true }); } catch { /* best effort */ }
-    return {
-      standalone: raw.standalone || [],
-      deletedBots: raw.deletedBots || [],
-    };
-  } catch {
+    const plain = envManager.decryptOrNull(wrapper.data);
+    if (plain === null) throw new Error('vault.json cannot be decrypted');
+    const raw = JSON.parse(plain);
+    warnedUnreadableVault = false;
+    return { state: 'ok', config: { standalone: raw.standalone || [], deletedBots: raw.deletedBots || [] } };
+  } catch (error: any) {
     if (!warnedUnreadableVault) {
       warnedUnreadableVault = true;
-      console.warn('[Vault] vault.json is unreadable or cannot be decrypted; starting with an empty vault');
+      console.warn(`[Vault] vault.json is unreadable or cannot be decrypted (${error?.message || error}); it reads as empty and saves are refused`);
     }
-    // Preserve once: the broken file is the only copy of every vaulted group.
-    try {
-      if (!fs.existsSync(`${VAULT_FILE}.corrupt`)) fs.copyFileSync(VAULT_FILE, `${VAULT_FILE}.corrupt`);
-    } catch { /* best effort */ }
-    return { standalone: [], deletedBots: [] };
+    preserveCorruptCopy(VAULT_FILE);
+    const config: VaultConfig = { standalone: [], deletedBots: [] };
+    brokenVaultLoads.add(config);
+    return { state: 'broken', config, error: String(error?.message || error) };
   }
+}
+
+export function loadVault(): VaultConfig {
+  return readVault().config;
 }
 
 /**
- * True when vault.json EXISTS but cannot be read/decrypted. loadVault degrades
- * that state to an empty vault (so the UI still renders), which means any
- * save layered on such a load would overwrite every previously vaulted group.
- * Lanes that write on behalf of a preservation promise probe this first and
- * refuse instead.
+ * True when vault.json cannot be read, checked or decrypted. Lanes that write
+ * on behalf of a preservation promise probe this first and refuse instead.
  */
 export function vaultFileBroken(): boolean {
-  let broken = false;
-  try {
-    if (!fs.existsSync(VAULT_FILE)) return false;
-    const wrapper = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
-    if (!wrapper || typeof wrapper.data !== 'string') broken = true;
-    else JSON.parse(envManager.decrypt(wrapper.data));
-  } catch {
-    broken = true;
-  }
-  if (broken) {
-    // The refusals this probe drives name vault.json.corrupt as the preserved
-    // evidence, so the probe itself must have created it: a refusal can be the
-    // process's first vault touch.
-    try {
-      if (!fs.existsSync(`${VAULT_FILE}.corrupt`)) fs.copyFileSync(VAULT_FILE, `${VAULT_FILE}.corrupt`);
-    } catch { /* best effort */ }
-  }
-  return broken;
+  return readVault().state === 'broken';
+}
+
+/** The incident copies of vault.json kept beside it, oldest first. */
+export function vaultCorruptCopies(): string[] {
+  return listCorruptCopies(VAULT_FILE);
 }
 
 export function saveVault(config: VaultConfig): void {
-  // Refuse to overwrite a broken vault: the config being saved was loaded as
-  // empty from it, so the write would destroy every previously vaulted group.
   // Guarded here so every caller (vault routes, delete lane, rollbacks) is
-  // covered.
-  if (vaultFileBroken()) {
-    throw new Error('vault.json exists but cannot be read; refusing to overwrite it (the save would destroy every previously vaulted group). Repair or remove vault.json first (the damaged original is preserved as vault.json.corrupt).');
+  // covered: a config loaded from a broken vault, or a vault broken now.
+  if (brokenVaultLoads.has(config) || vaultFileBroken()) {
+    throw new Error(`vault.json could not be read, so nothing was saved: the save would destroy every previously vaulted group. Repair or remove vault.json first (${corruptCopyNote(VAULT_FILE)}).`);
   }
-  fs.mkdirSync(DATA_DIR, { recursive: true });
   const wrapper = { v: 1, data: envManager.encrypt(JSON.stringify(config)) };
   // Atomic: this file is the only home of the vaulted groups, so a kill
   // mid-save must not leave it truncated.
-  const tmp = `${VAULT_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(wrapper, null, 2));
-  fs.renameSync(tmp, VAULT_FILE);
+  writeFileAtomic(VAULT_FILE, JSON.stringify(wrapper, null, 2));
 }
 
 function maskValue(value: string): string {
@@ -123,7 +118,8 @@ export function createVaultRoutes(): Router {
   router.get('/', (req: Request, res: Response) => {
     try {
       const instances = containerManager.getAllBots();
-      const vault = loadVault();
+      const loaded = readVault();
+      const vault = loaded.config;
 
       // Build groups: one per bot instance + standalone + one per deleted bot
       const groups: Array<{
@@ -189,7 +185,14 @@ export function createVaultRoutes(): Router {
         } catch { /* instance may not have env storage */ }
       }
 
-      res.json({ success: true, groups });
+      res.json({
+        success: true,
+        groups,
+        vaultBroken: loaded.state === 'broken',
+        vaultError: loaded.state === 'broken' ? loaded.error : undefined,
+        corruptCopies: vaultCorruptCopies(),
+        secretKeyProblem: envManager.secretKeyProblem(),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

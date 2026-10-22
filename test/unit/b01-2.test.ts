@@ -177,7 +177,7 @@ describe('Remove with env removal', () => {
     fs.writeFileSync(path.join(botDir, '.env'), 'OLD_FLAG=yes\n');
     fs.writeFileSync(path.join(envDir, '.env'), 'OLD_FLAG=yes\n');
     fs.writeFileSync(path.join(envDir, 'storage.json.tmp'), '{}');
-    fs.writeFileSync(path.join(envDir, 'storage.json.corrupt'), 'x');
+    fs.writeFileSync(path.join(envDir, 'storage.json.corrupt-2026-10-22T00-00-00-000Z'), 'x');
     fs.writeFileSync(path.join(envDir, 'configFiles.json'), '{"files":[]}');
     fs.mkdirSync(path.join(botDir, 'data'));
     fs.writeFileSync(path.join(botDir, 'data', 'user.db'), 'fake data');

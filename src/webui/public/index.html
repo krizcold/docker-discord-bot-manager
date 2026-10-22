@@ -1810,6 +1810,7 @@
         content.innerHTML = `
           <h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3>
           ${!res.valid ? `<div class="error-message">Missing required: ${escapeHtml(res.missing.join(', '))}</div>` : ''}
+          ${storeHealthBanner(res.storeBroken, 'storage.json', res.corruptCopies, res.secretKeyProblem)}
           <div id="env-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
           <div class="modal-actions">
@@ -4756,6 +4757,7 @@
             Files bind-mounted into the container. Saved changes are applied the next time the bot
             starts, so press Start (or Update / Install &amp; Run) after saving.
           </div>
+          ${storeHealthBanner(res.storeBroken, 'configFiles.json', res.corruptCopies, res.secretKeyProblem)}
           <div id="config-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addConfigEditorRow()" style="margin-bottom: 4px;">+ Add config file</button>
           <div class="modal-actions">
@@ -5279,28 +5281,42 @@
       }
     }
 
+    // A store that cannot be read refuses every save; say so, and name the
+    // kept copies of damaged bytes so the operator knows what can be restored.
+    function storeHealthBanner(broken, fileName, copies, keyProblem) {
+      const parts = [];
+      if (keyProblem) parts.push(`Secrets cannot be saved: ${escapeHtml(keyProblem)}. Fix the key file and restart the manager.`);
+      if (broken) parts.push(`${escapeHtml(fileName)} cannot be read, so saves are refused until it is repaired or replaced.`);
+      if (copies && copies.length) parts.push(`Copies of damaged ${escapeHtml(fileName)} kept beside it: ${copies.map(escapeHtml).join(', ')}.`);
+      return parts.length ? `<div class="error-message">${parts.join('<br>')}</div>` : '';
+    }
+
     // ─── Credentials Vault ───
     let vaultGroups = [];
+    let vaultHealth = {};
     const expandedVaultGroups = new Set(['standalone']);
 
     async function loadVault() {
       try {
         const res = await api('GET', '/vault');
         vaultGroups = res.success ? res.groups : [];
+        vaultHealth = res.success ? res : { vaultBroken: false };
       } catch {
         vaultGroups = [];
+        vaultHealth = {};
       }
       renderVault();
     }
 
     function renderVault() {
       const list = document.getElementById('vault-list');
+      const health = storeHealthBanner(vaultHealth.vaultBroken, 'vault.json', vaultHealth.corruptCopies, vaultHealth.secretKeyProblem);
       if (vaultGroups.length === 0 || vaultGroups.every(g => g.entries.length === 0 && g.type !== 'standalone')) {
-        list.innerHTML = '<div class="source-empty">No credentials yet.<br>Install a bot or add standalone entries.</div>';
+        list.innerHTML = health + '<div class="source-empty">No credentials yet.<br>Install a bot or add standalone entries.</div>';
         return;
       }
 
-      list.innerHTML = vaultGroups.map(g => {
+      list.innerHTML = health + vaultGroups.map(g => {
         // Skip empty instance groups
         if (g.type === 'instance' && g.entries.length === 0) return '';
         const isExpanded = expandedVaultGroups.has(g.id);

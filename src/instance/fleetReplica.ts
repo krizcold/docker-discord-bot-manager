@@ -1014,7 +1014,7 @@ export function reseedStalePrimary(
   // throw AFTER the stale database is destroyed, leaving the node pinned to a
   // database that no longer exists and the lane not re-runnable.
   if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
-    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before re-seeding' };
+    return { success: false, error: 'The env store for this instance cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); restore it before re-seeding' };
   }
 
   const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
@@ -1063,7 +1063,7 @@ export function reseedStalePrimary(
     // minutes, and a store that corrupted meanwhile would make the pins
     // retire below throw AFTER the database was destroyed.
     if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
-      throw new Error('the env store corrupted while the safety dump ran (preserved as storage.json.corrupt); nothing was destroyed - restore it and retry');
+      throw new Error('the env store corrupted while the safety dump ran (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); nothing was destroyed - restore it and retry');
     }
     // The dump above takes minutes, so a cancel filed during it is honoured
     // here, with the sidecar running and the record intact.
@@ -1351,7 +1351,7 @@ export async function adoptPromotedReplica(
   // throw after the standby record is already consumed, leaving a half-done
   // adopt no lane can finish. Refusing here keeps the adopt retryable.
   if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
-    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before adopting' };
+    return { success: false, error: 'The env store for this instance cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); restore it before adopting' };
   }
 
   // A worker's manager env store carries no database URL, so the managed-lane

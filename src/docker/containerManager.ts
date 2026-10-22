@@ -92,6 +92,7 @@ import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName 
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 import { capServiceLogs } from '../templates/logCaps';
+import { storeFileState, preserveCorruptCopy, corruptCopyNote, listCorruptCopies } from '../config/storeFile';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const REGISTRY_FILE = path.join(DATA_DIR, 'instances.json');
@@ -115,26 +116,37 @@ export function setContainerBroadcast(fn: BroadcastFn): void {
   broadcastFn = fn;
 }
 
+// Registries handed out by a load that could not read instances.json: they
+// look empty, so a save built on one would erase every bot.
+const brokenRegistryLoads = new WeakSet<InstanceRegistry>();
+let warnedBrokenRegistry = false;
+
 /**
- * Load instance registry from disk
+ * Load instance registry from disk. Only a definitely missing file is an
+ * empty registry; a file that cannot be checked, read or parsed loads empty
+ * for the readers but every save refuses until it reads again.
  */
 function loadRegistry(): InstanceRegistry {
+  const state = storeFileState(REGISTRY_FILE);
+  if (state.kind === 'absent') return { instances: {} };
   try {
-    if (fs.existsSync(REGISTRY_FILE)) {
-      const content = fs.readFileSync(REGISTRY_FILE, 'utf-8');
-      const registry: InstanceRegistry = JSON.parse(content);
-      for (const inst of Object.values(registry.instances || {})) decryptRecordSecrets(inst);
-      return registry;
-    }
+    if (state.kind === 'broken') throw new Error(state.error);
+    const content = fs.readFileSync(REGISTRY_FILE, 'utf-8');
+    const registry: InstanceRegistry = JSON.parse(content);
+    if (!registry || typeof registry !== 'object' || Array.isArray(registry)) throw new Error('instances.json is not a registry');
+    for (const inst of Object.values(registry.instances || {})) decryptRecordSecrets(inst);
+    warnedBrokenRegistry = false;
+    return registry;
   } catch (error) {
-    console.error('[ContainerManager] Failed to load registry:', error);
-    // Preserve a corrupt registry instead of letting the next save overwrite it with
-    // an empty one - keeps the bots recoverable rather than silently lost.
-    try {
-      if (fs.existsSync(REGISTRY_FILE)) fs.copyFileSync(REGISTRY_FILE, `${REGISTRY_FILE}.corrupt`);
-    } catch { /* best effort */ }
+    if (!warnedBrokenRegistry) {
+      warnedBrokenRegistry = true;
+      console.error('[ContainerManager] Failed to load registry; saves are refused until instances.json reads again:', error);
+    }
+    preserveCorruptCopy(REGISTRY_FILE);
+    const empty: InstanceRegistry = { instances: {} };
+    brokenRegistryLoads.add(empty);
+    return empty;
   }
-  return { instances: {} };
 }
 
 /**
@@ -252,6 +264,10 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfi
 }
 
 function saveRegistrySync(registry: InstanceRegistry): void {
+  const state = storeFileState(REGISTRY_FILE);
+  if (brokenRegistryLoads.has(registry) || state.kind === 'broken') {
+    throw new Error(`The instance registry (instances.json) cannot be read, so nothing was saved: a save would erase every bot it lists. Repair or replace instances.json (${corruptCopyNote(REGISTRY_FILE)}).`);
+  }
   try {
     fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
     const instances: InstanceRegistry['instances'] = {};
@@ -1317,7 +1333,8 @@ export async function deleteBot(botId: string, keepData: boolean = false, keepEn
  */
 export function botEnvCopies(botId: string): string[] {
   const store = path.join(getEnvPath(botId), 'storage.json');
-  return [store, `${store}.tmp`, `${store}.corrupt`, path.join(getEnvPath(botId), '.env'), path.join(getBotDir(botId), '.env')];
+  const copies = listCorruptCopies(store).map(n => path.join(getEnvPath(botId), n));
+  return [store, `${store}.tmp`, ...copies, path.join(getEnvPath(botId), '.env'), path.join(getBotDir(botId), '.env')];
 }
 
 /**
@@ -1936,7 +1953,7 @@ export function readBotManagerMarker(appName: string): {
 export function mergedEnvVars(instance: InstanceConfig): Record<string, string> {
   const { vars, undecryptable, corrupt } = envManager.getEnvVarsWithStatus(instance.id);
   if (corrupt) {
-    throw new Error(`The env store for ${instance.displayName} exists but cannot be read. Repair or replace storage.json (the damaged original is preserved as storage.json.corrupt), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
+    throw new Error(`The env store for ${instance.displayName} exists but cannot be read. Repair or replace storage.json (a copy of the damaged file is kept beside it as storage.json.corrupt-<time> when it could be read), or delete storage.json to deliberately start with an empty store and re-enter the values.`);
   }
   if (undecryptable.length > 0) {
     throw new Error(`The encrypted env store for ${instance.displayName} holds values that no longer decrypt (${undecryptable.join(', ')}). The encryption key or salt changed; re-enter them in the env editor.`);
@@ -2475,7 +2492,7 @@ async function startGitBot(instance: InstanceConfig): Promise<{ success: boolean
 function reapplyableConfigFiles(botId: string, emit: EmitFn): configFileManager.BotConfigFile[] {
   const { files, undecryptable, corrupt } = configFileManager.getConfigFilesWithStatus(botId);
   if (corrupt) {
-    emit('[Config] The config-file store cannot be read (the damaged original is preserved as configFiles.json.corrupt); keeping the previously delivered config files', 'warning');
+    emit('[Config] The config-file store cannot be read (a copy of the damaged file is kept beside it as configFiles.json.corrupt-<time> when it could be read); keeping the previously delivered config files', 'warning');
     return [];
   }
   const enabled = files.filter(c => c.enabled !== false);
@@ -2735,7 +2752,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   // deleted its image - turning a working deployment into an unstartable one.
   const envStatus = envManager.getEnvVarsWithStatus(botId);
   if (envStatus.corrupt) {
-    return { success: false, error: 'The env store for this instance cannot be read (preserved as storage.json.corrupt); restore it before updating' };
+    return { success: false, error: 'The env store for this instance cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); restore it before updating' };
   }
   if (envStatus.undecryptable.length > 0) {
     return { success: false, error: `The env store holds values that no longer decrypt (${envStatus.undecryptable.join(', ')}); re-enter them or restore the encryption key before updating` };
@@ -2745,7 +2762,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   // stripped of its image on the way to that refusal.
   const cfgStatus = configFileManager.getConfigFilesWithStatus(botId);
   if (cfgStatus.corrupt) {
-    return { success: false, error: 'The config-file store for this instance cannot be read (preserved as configFiles.json.corrupt); repair or replace it before updating' };
+    return { success: false, error: 'The config-file store for this instance cannot be read (a copy is kept beside it as configFiles.json.corrupt-<time> when it could be read); repair or replace it before updating' };
   }
   const cfgBroken = cfgStatus.files.filter(f => f.enabled !== false && cfgStatus.undecryptable.includes(f.path)).map(f => f.path);
   if (cfgBroken.length > 0) {

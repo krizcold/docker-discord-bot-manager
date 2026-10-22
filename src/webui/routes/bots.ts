@@ -24,7 +24,7 @@ import * as recoveryChannel from '../../instance/recoveryChannel';
 import * as recoveryRescue from '../../instance/recoveryRescue';
 import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, saveVault, vaultFileBroken } from './vault';
-import { getDeploymentInfo, setDeploymentMode, getDeploymentMode } from '../../casaos/detector';
+import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
 import { logCollectors } from '../../build/logCollector';
@@ -34,6 +34,7 @@ import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
 import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
+import { listCorruptCopies } from '../../config/storeFile';
 import { hasAppHooks } from '../../instance/appHookClient';
 import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
 import * as appLifecycle from '../../instance/appLifecycle';
@@ -63,7 +64,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/', async (req: Request, res: Response) => {
     try {
       const bots = containerManager.getAllBots();
-      const mode = await getDeploymentMode();
+      // The mode only builds the CasaOS Open link: an undecided mode must not
+      // hide the bots, so the list carries on without it.
+      let mode: Awaited<ReturnType<typeof getDeploymentMode>> | null = null;
+      let deploymentModeError: string | undefined;
+      try {
+        mode = await getDeploymentMode();
+      } catch (error: any) {
+        deploymentModeError = String(error?.message || error);
+      }
 
       // Join source info + compute commits-behind for bots that are behind
       const botsWithSource = await Promise.all(bots.map(async bot => {
@@ -133,7 +142,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         };
       }));
 
-      res.json({ success: true, bots: botsWithSource, deploymentMode: mode });
+      res.json({ success: true, bots: botsWithSource, deploymentMode: mode, ...(deploymentModeError ? { deploymentModeError } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -403,13 +412,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       if (keepEnv) {
         // A corrupt store would vault NOTHING, and undecryptable values would
         // vault as empty strings, while the deletion goes on to destroy the
-        // bot dir including the last recoverable copy (storage.json.corrupt,
+        // bot dir including the last recoverable copy (a storage.json.corrupt-<time> copy,
         // or ciphertext a restored key file would decrypt again) - on the very
         // lane that promises preservation. Refuse; unchecking the env-preserve
         // option is the explicit consent path for deleting anyway.
         const { corrupt, undecryptable } = envManager.getEnvVarsWithStatus(req.params.id);
         if (corrupt) {
-          res.status(409).json({ success: false, error: 'The env store for this bot cannot be read (preserved as storage.json.corrupt), so its values cannot be vaulted. Restore the store first, or delete again without preserving env values to proceed.' });
+          res.status(409).json({ success: false, error: 'The env store for this bot cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so its values cannot be vaulted. Restore the store first, or delete again without preserving env values to proceed.' });
           return;
         }
         if (undecryptable.length > 0) {
@@ -427,7 +436,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
             // group. Probed only when there is something to vault: an empty
             // env store must not block the delete.
             if (vaultFileBroken()) {
-              res.status(409).json({ success: false, error: 'The credentials vault (vault.json) exists but cannot be read, so preserving this bot\'s env values would overwrite every previously vaulted group. Repair or remove vault.json first (the damaged original is preserved as vault.json.corrupt), or delete again without preserving env values to proceed.' });
+              res.status(409).json({ success: false, error: 'The credentials vault (vault.json) exists but cannot be read, so preserving this bot\'s env values would overwrite every previously vaulted group. Repair or remove vault.json first (a copy of the damaged file is kept beside it as vault.json.corrupt-<time> when it could be read), or delete again without preserving env values to proceed.' });
               return;
             }
             const vault = loadVault();
@@ -992,13 +1001,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.sourceUrl || undefined);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
+      const storePath = path.join(getEnvPath(req.params.id), 'storage.json');
 
       res.json({
         success: true,
         vars,
         tokenVarName: bot.tokenVarName,
         valid: validation.valid,
-        missing: validation.missing
+        missing: validation.missing,
+        storeBroken: envManager.getEnvVarsWithStatus(req.params.id).corrupt,
+        corruptCopies: listCorruptCopies(storePath),
+        secretKeyProblem: envManager.secretKeyProblem(),
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1222,7 +1235,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
         return { ...f, body, format, manifest, parsed };
       });
-      res.json({ success: true, files });
+      res.json({
+        success: true,
+        files,
+        storeBroken: configFileManager.getConfigFilesWithStatus(req.params.id).corrupt,
+        corruptCopies: listCorruptCopies(path.join(getEnvPath(req.params.id), 'configFiles.json')),
+        secretKeyProblem: envManager.secretKeyProblem(),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2290,7 +2309,16 @@ export function createSystemRoutes(): Router {
         res.status(400).json({ success: false, error: 'Invalid mode' });
         return;
       }
-      setDeploymentMode(mode);
+      try {
+        setDeploymentMode(mode);
+      } catch (error) {
+        if (error instanceof DeploymentModeForcedError) {
+          res.status(409).json({ success: false, error: error.message });
+          return;
+        }
+        res.status(500).json({ success: false, error: `The deployment mode could not be saved, so it was not changed: ${(error as Error)?.message || error}` });
+        return;
+      }
       const info = await getDeploymentInfo();
       res.json({ success: true, ...info });
     } catch (error) {

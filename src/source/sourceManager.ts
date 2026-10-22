@@ -13,6 +13,7 @@ import simpleGit, { SimpleGit } from 'simple-git';
 import { SourceMeta, SourceRegistry, CreateSourceRequest, UpdateSourceRequest } from '../types';
 import { hasExistingCompose, extractAppName } from '../templates/compose';
 import { isSensitive } from '../env/manager';
+import { storeFileState, preserveCorruptCopy, corruptCopyNote } from '../config/storeFile';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
@@ -20,28 +21,41 @@ const REGISTRY_FILE = path.join(DATA_DIR, 'sources.json');
 
 // ─── Registry Operations ───
 
+// Registries handed out by a load that could not read sources.json: they look
+// empty, so a save built on one (boot seeding included) would erase every source.
+const brokenSourceLoads = new WeakSet<SourceRegistry>();
+let warnedBrokenSources = false;
+
 export function loadSourceRegistry(): SourceRegistry {
+  const state = storeFileState(REGISTRY_FILE);
+  if (state.kind === 'absent') return { sources: {} };
   try {
-    if (fs.existsSync(REGISTRY_FILE)) {
-      const data = fs.readFileSync(REGISTRY_FILE, 'utf-8');
-      return JSON.parse(data) as SourceRegistry;
+    if (state.kind === 'broken') throw new Error(state.error);
+    const parsed = JSON.parse(fs.readFileSync(REGISTRY_FILE, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || !parsed.sources || typeof parsed.sources !== 'object') {
+      throw new Error('sources.json is not a source registry');
     }
+    warnedBrokenSources = false;
+    return parsed as SourceRegistry;
   } catch (err) {
-    console.warn('[SourceManager] sources.json is unreadable, continuing with an empty registry:', err);
-    // Preserve the corrupt file (first copy wins) so the sources stay recoverable
-    // instead of the next save overwriting them with an empty registry.
-    try {
-      const corruptFile = `${REGISTRY_FILE}.corrupt`;
-      if (!fs.existsSync(corruptFile)) fs.copyFileSync(REGISTRY_FILE, corruptFile);
-    } catch { /* best effort */ }
+    if (!warnedBrokenSources) {
+      warnedBrokenSources = true;
+      console.warn('[SourceManager] sources.json is unreadable; it reads as empty and saves are refused until it reads again:', err);
+    }
+    preserveCorruptCopy(REGISTRY_FILE);
+    const empty: SourceRegistry = { sources: {} };
+    brokenSourceLoads.add(empty);
+    return empty;
   }
-  return { sources: {} };
 }
 
 // Synchronous atomic write: each mutator's load -> mutate -> save runs to completion
 // on the single JS thread (a deferred/queued write let a stale snapshot revert another
 // writer's change), and temp+rename means a crash mid-write cannot truncate the file.
 function saveSourceRegistry(registry: SourceRegistry): void {
+  if (brokenSourceLoads.has(registry) || storeFileState(REGISTRY_FILE).kind === 'broken') {
+    throw new Error(`The source registry (sources.json) cannot be read, so nothing was saved: a save would erase every source it lists. Repair or replace sources.json (${corruptCopyNote(REGISTRY_FILE)}).`);
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const tmp = `${REGISTRY_FILE}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));

@@ -221,7 +221,7 @@ describe('B12-2 review 2: the note and rows match the deployment', () => {
         else if (html[i] === '}' && --depth === 0) return html.slice(start, i + 1);
       }
     };
-    expect(html).toMatch(/f\.bodyUndecryptable, f\.inactive\)/);
+    expect(html).toMatch(/f\.bodyUndecryptable, f\.inactive[,)]/);
     const ctx: any = vm.createContext({ window: {} });
     vm.runInContext([fn('escapeHtml'), fn('buildConfigFileBlockHtml')].join('\n'), ctx);
     const out: string = ctx.buildConfigFileBlockHtml('/app/app.yml', 'a: 1\n', true, true, null, 'yaml', null, false, 'Not used: <gw> removed');

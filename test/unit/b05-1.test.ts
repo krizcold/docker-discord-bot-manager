@@ -137,8 +137,8 @@ describe('config editor saves only to the bot whose rows it collected', () => {
         '.cf-writable': { checked: false }, '.cf-enabled': { checked: true },
       } as any)[s],
     });
-    const ctx = runPage(['botLabel', 'saveConfigEditor', 'hideConfigEditor'], {
-      bots, configEditorBotId: 'b1', configEditorSeq: 0,
+    const ctx = runPage(['botLabel', 'collectConfigFiles', 'saveConfigEditor', 'hideConfigEditor'], {
+      bots, configEditorBotId: 'b1', configEditorSeq: 0, cfTemplateOrig: new Map(),
       document: {
         querySelectorAll: (s: string) => (withRows && s === '#config-editor-rows .config-file-block' ? [block] : []),
         querySelector: (s: string) => (s === '#config-editor-content .btn-primary' ? saveBtn : null),

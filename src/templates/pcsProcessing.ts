@@ -1873,11 +1873,69 @@ function fileHash(p: string): string | null {
  * override files it wrote (local path -> body hash), so a later build can tell
  * a file it wrote from one the bot or the operator changed since.
  */
-/** unbound: config files the deployed compose does not mount (only a build adds the bind). */
-export interface DeliveryReport { failed: string[]; delivered: Record<string, string>; unbound: string[] }
+/** unbound: config files the deployed compose does not mount (only a build adds the bind). seeded: files this build copied from the repo. */
+export interface DeliveryReport { failed: string[]; delivered: Record<string, string>; unbound: string[]; seeded?: string[] }
 
 export function newDeliveryReport(): DeliveryReport {
   return { failed: [], delivered: {}, unbound: [] };
+}
+
+const CONFIG_SOURCE_DIR = '.smdb-config';
+
+/**
+ * Host sources for config files the manager binds itself, relative to the
+ * bot's folder (/DATA/AppData/<app> in CasaOS mode, bots/<id> in docker mode):
+ * one per in-container path, derived from the whole path.
+ * A path that is not clean and absolute, that shares its source with another
+ * or nests under another, or whose source overlaps a bind source the compose
+ * already declares (`taken`, relative to that folder; '' is the folder itself)
+ * is refused with the reason.
+ */
+export function configFileSources(paths: string[], taken: string[]): Map<string, { rel: string } | { refused: string }> {
+  const out = new Map<string, { rel: string } | { refused: string }>();
+  const rels = new Map<string, string>();
+  const overlaps = (a: string, b: string) => b === '' || a === b || a.startsWith(b + '/') || b.startsWith(a + '/');
+  for (const p of paths) {
+    const segs = p.split('/').slice(1);
+    if (!p.startsWith('/') || segs.some(s => s === '' || s === '.' || s === '..' || s.includes('\\'))) {
+      out.set(p, { refused: 'the in-container path is not a clean absolute path' });
+      continue;
+    }
+    const rel = `${CONFIG_SOURCE_DIR}/${segs.join('/')}`;
+    const bound = taken.find(t => overlaps(rel, t.replace(/\/+$/, '')));
+    if (bound !== undefined) {
+      out.set(p, { refused: `its host file would sit inside a directory the compose already binds (${bound || 'the whole bot folder'})` });
+      continue;
+    }
+    rels.set(p, rel);
+    out.set(p, { rel });
+  }
+  for (const [p, rel] of rels) {
+    const other = [...rels].find(([q, r]) => q !== p && overlaps(rel, r));
+    if (other) out.set(p, { refused: `it would share a host file or directory with ${other[0]}` });
+  }
+  return out;
+}
+
+/**
+ * Why an existing entry at a manager-bound config source must be kept, or null
+ * when the body may be written: nothing is there, an empty directory (what
+ * Docker creates at a missing file source), the same body, or the exact body
+ * the manager recorded delivering there. A kept file whose stored body is the
+ * one last delivered there has nothing new to receive, so it is not a failure.
+ */
+function keepExistingConfig(local: string, body: string, delivered: Record<string, string>): { why: string; failed: boolean } | null {
+  let st: fs.Stats;
+  try { st = fs.lstatSync(local); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    return { why: `could not inspect it (${e})`, failed: true };
+  }
+  if (st.isDirectory()) return fs.readdirSync(local).length ? { why: 'a directory with content is there', failed: true } : null;
+  if (!st.isFile()) return { why: `a ${entryKind(st)} is there`, failed: true };
+  const h = fileHash(local);
+  if (h === bodyHash(body) || (h !== null && h === delivered[local])) return null;
+  if (!delivered[local]) return { why: 'it holds content the manager has no record of delivering', failed: true };
+  return { why: 'it changed since the manager delivered it', failed: delivered[local] !== bodyHash(body) };
 }
 
 // Temp files a killed earlier seed of this exact target left behind.
@@ -2093,6 +2151,10 @@ export function prepareDockerBotFiles(
     const declared = dockerDeclaredBinds(services, prefix);
     const targetName = getAppServiceName(compose);
     const targetSvc = targetName && targetName !== STATUS_PAGE_SERVICE ? services[targetName] : undefined;
+    const sources = configFileSources(
+      configFiles.filter(cf => !declared.has(cf.path) && !droppedGatewayBinds.includes(cf.path)).map(cf => cf.path),
+      [...declared.values()].map(s => s.slice(prefix.length)),
+    );
     for (const cf of configFiles) {
       if (droppedGatewayBinds.includes(cf.path)) {
         log(`[Docker] Skipped config ${cf.path}: its gateway service is not deployed`);
@@ -2111,10 +2173,29 @@ export function prepareDockerBotFiles(
           report.failed.push(cf.path);
         }
       } else if (targetSvc) {
-        const base = path.basename(cf.path);
-        const hostSrc = `${prefix}config/${base}`;
-        try { writeDockerConfig(path.join(containerBotDir, 'config', base), cf.body); }
-        catch (err) {
+        const src = sources.get(cf.path);
+        if (!src || 'refused' in src) {
+          log(`[Docker] Warning: config ${cf.path} not bound: ${src && 'refused' in src ? src.refused : 'no host file for it'}`);
+          report.failed.push(cf.path);
+          continue;
+        }
+        const hostSrc = `${prefix}${src.rel}`;
+        const local = path.join(containerBotDir, src.rel);
+        try {
+          const keep = keepExistingConfig(local, cf.body, restore);
+          if (keep?.failed) {
+            log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}. Move it away or copy it into the config editor, then build again`);
+            report.failed.push(cf.path);
+            continue;
+          }
+          if (keep) {
+            log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}`);
+            report.delivered[local] = restore[local];
+          } else {
+            writeDockerConfig(local, cf.body);
+            report.delivered[local] = bodyHash(cf.body);
+          }
+        } catch (err) {
           log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
           report.failed.push(cf.path);
           continue;
@@ -2420,8 +2501,16 @@ export async function createVolumeDirectories(
 
       if (repoSrc && fs.statSync(repoSrc).isFile()) {
         const kept = await deliverRepoFile(repoSrc, target, log, restore[target]);
-        if (kept) log(`[PCS] Kept existing ${kept} at volume path: ${target}`);
-        else log(restore[target] ? `[PCS] Restored the repo template at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
+        if (kept) {
+          log(`[PCS] Kept existing ${kept} at volume path: ${target}`);
+          const h = fileHash(target);
+          if (h && h === fileHash(repoSrc)) report.delivered[target] = h;
+        } else {
+          (report.seeded ??= []).push(target);
+          const h = fileHash(target);
+          if (h) report.delivered[target] = h;
+          log(restore[target] ? `[PCS] Restored the repo template at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
+        }
       } else if (repoSrc && fs.statSync(repoSrc).isDirectory()) {
         log(`[PCS] ${seedSummary(target, await deliverRepoDir(repoSrc, target, log))}`);
       } else {
@@ -2534,13 +2623,34 @@ export function addConfigFileBinds(
   }
   const volumes = service.volumes as unknown[];
 
+  const appDir = `${pcs.DATA_ROOT}/AppData/${appName}`;
+  const taken: string[] = [];
+  for (const svc of Object.values(services)) {
+    if (!Array.isArray(svc.volumes)) continue;
+    for (const v of svc.volumes as unknown[]) {
+      let src: string | null = null;
+      if (typeof v === 'string') { const s = splitDockerVolume(v); if (s) src = s.source; }
+      else if (v && typeof v === 'object') { const o = v as Record<string, unknown>; if (typeof o.source === 'string' && o.type !== 'volume') src = o.source; }
+      if (src === null) continue;
+      const clean = src.replace(/\/+$/, '');
+      if (clean === appDir || appDir.startsWith(clean + '/')) taken.push('');
+      else if (clean.startsWith(appDir + '/')) taken.push(clean.slice(appDir.length + 1));
+    }
+  }
+  const sources = configFileSources(files.map(f => f.path), taken);
+
   for (const f of files) {
-    const base = path.basename(f.path);
-    const source = `${pcs.DATA_ROOT}/AppData/${appName}/config/${base}`;
     const exists = volumes.some(
       (v) => v && typeof v === 'object' && (v as Record<string, unknown>).target === f.path
     );
     if (exists) continue;
+    const src = sources.get(f.path);
+    if (!src || 'refused' in src) {
+      log(`[PCS] Warning: config ${f.path} not bound: ${src && 'refused' in src ? src.refused : 'no host file for it'}`);
+      report.failed.push(f.path);
+      continue;
+    }
+    const source = `${appDir}/${src.rel}`;
     volumes.push({ type: 'bind', source, target: f.path, read_only: f.readOnly !== false });
     log(`[PCS] Bound config ${f.path} on service ${targetName}`);
   }
@@ -2557,25 +2667,34 @@ export async function writeConfigFiles(
   files: Array<{ path: string; body: string }>,
   logFn?: (msg: string) => void,
   report: DeliveryReport = newDeliveryReport(),
+  delivered: Record<string, string> = {},
 ): Promise<DeliveryReport> {
   if (!files.length) return report;
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
-  const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'config');
-
-  try {
-    mkdirForApp(dir, log);
-    grantToApp(dir, { recursive: true, log });
-  } catch (err) {
-    log(`[PCS] Warning: could not create ${dir}: ${err}`);
-    report.failed.push(...files.map(f => f.path));
-    return report;
-  }
+  const appDir = `${pcs.DATA_ROOT}/AppData/${appName}`;
+  const sources = configFileSources(files.map(f => f.path), []);
 
   for (const f of files) {
-    const filePath = path.join(dir, path.basename(f.path));
+    const src = sources.get(f.path);
+    if (!src || 'refused' in src) {
+      log(`[PCS] Warning: config ${f.path} not written: ${src && 'refused' in src ? src.refused : 'no host file for it'}`);
+      report.failed.push(f.path);
+      continue;
+    }
+    const filePath = `${appDir}/${src.rel}`;
     try {
+      const keep = keepExistingConfig(filePath, f.body, delivered);
+      if (keep) {
+        log(`[PCS] Kept existing ${filePath} for config ${f.path}: ${keep.why}${keep.failed ? '. Move it away or copy it into the config editor, then build again' : ''}`);
+        if (keep.failed) report.failed.push(f.path);
+        else report.delivered[filePath] = delivered[filePath];
+        continue;
+      }
+      mkdirForApp(path.dirname(filePath), log);
+      if (fs.lstatSync(filePath, { throwIfNoEntry: false })?.isDirectory()) fs.rmdirSync(filePath);
       fs.writeFileSync(filePath, f.body);
+      report.delivered[filePath] = bodyHash(f.body);
       grantToApp(filePath, { mode: '644', log });
       log(`[PCS] Wrote config file to ${filePath}`);
     } catch (err) {
@@ -2599,9 +2718,10 @@ export async function redeliverConfigFiles(
   configFiles: Array<{ path: string; body: string }>,
   logFn?: (msg: string) => void,
   report: DeliveryReport = newDeliveryReport(),
+  delivered: Record<string, string> = {},
 ): Promise<DeliveryReport> {
   if (!configFiles.length) return report;
-  const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, logFn, report);
+  const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, logFn, report, delivered);
   // A file with no bind in the deployed compose was added after the build: only Update mounts it.
   const unbound = configFiles.filter(c => !handled.has(c.path));
   if (unbound.length) {
@@ -2624,6 +2744,7 @@ export async function applyUserConfigOverrides(
   configFiles: Array<{ path: string; body: string }>,
   logFn?: (msg: string) => void,
   report: DeliveryReport = newDeliveryReport(),
+  delivered: Record<string, string> = {},
 ): Promise<Set<string>> {
   const handled = new Set<string>();
   if (!configFiles.length) return handled;
@@ -2660,15 +2781,21 @@ export async function applyUserConfigOverrides(
     }
   }
 
+  const known = { ...delivered, ...report.delivered };
   for (const cf of configFiles) {
     const source = destToSource.get(cf.path);
     if (!source) continue;   // not a compose-declared bind -> caller adds a bind instead
     handled.add(cf.path);
     try {
+      const keep = report.seeded?.includes(source) ? null : keepExistingConfig(source, cf.body, known);
+      if (keep) {
+        log(`[PCS] Kept existing ${source} for config ${cf.path}: ${keep.why}${keep.failed ? '. Move it away or copy it into the config editor, then build again' : ''}`);
+        if (keep.failed) report.failed.push(cf.path);
+        else report.delivered[source] = known[source];
+        continue;
+      }
       ensureVolumeDir(path.dirname(source), '755', true, log);
-      // The user's stored config is authoritative for this bind: replace whatever
-      // createVolumeDirectories delivered (the repo template) with the user's body.
-      try { fs.rmSync(source, { recursive: true, force: true }); } catch { /* best effort */ }
+      if (fs.lstatSync(source, { throwIfNoEntry: false })?.isDirectory()) fs.rmdirSync(source);
       fs.writeFileSync(source, cf.body);
       report.delivered[source] = bodyHash(cf.body);
       grantToApp(source, { mode: '644', log });

@@ -407,11 +407,11 @@ export function buildBotConfigList(
   botId: string,
   sourceUrl?: string,
   gateway?: GatewayDeploy
-): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string }> {
+): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string; fromTemplate?: boolean }> {
   const { files: stored, undecryptable } = configFileManager.getConfigFilesWithStatus(botId);
   const storedByPath = new Map(stored.map(s => [s.path, s]));
   const seen = new Set<string>();
-  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string }> = [];
+  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string; fromTemplate?: boolean }> = [];
 
   const allDetected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
   const gatewayPaths = new Set(gateway?.dropped ? composeGatewayBindTargets(repoPath) : []);
@@ -427,6 +427,7 @@ export function buildBotConfigList(
       readOnly: s ? s.readOnly !== false : true,
       enabled: s ? s.enabled !== false : true,
       ...(s && undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
+      ...(s ? {} : { fromTemplate: true }),
     });
   }
 

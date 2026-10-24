@@ -108,11 +108,12 @@ describe('B05-4: a save over an undecryptable body asks first', () => {
     const puts: any[] = [];
     const confirms: string[] = [];
     const block = {
+      dataset: {},
       querySelector: (s: string) => ({ '.cf-path': { value: '/app/config.json' }, '.cf-body': { value: body }, '.cf-writable': { checked: false }, '.cf-enabled': { checked: true } } as any)[s],
     };
     const modal = { classList: { contains: () => false } };
     const ctx: any = vm.createContext({
-      configEditorBotId: 'b1', configEditorSeq: 1, console,
+      configEditorBotId: 'b1', configEditorSeq: 1, console, cfTemplateOrig: new Map(),
       botLabel: () => 'bot', guidedReadyToSave: async () => true, showMessage() {}, hideConfigEditor() {}, loadBots() {},
       confirm: (t: string) => { confirms.push(t); return confirmAnswer; },
       api: async (m: string, u: string, b: any) => { puts.push(b); return { success: true }; },
@@ -122,7 +123,7 @@ describe('B05-4: a save over an undecryptable body asks first', () => {
         querySelectorAll: (s: string) => (s.includes('[data-undecryptable="1"]') || s === '#config-editor-rows .config-file-block' ? [block] : []),
       },
     });
-    vm.runInContext(pageFunction('saveConfigEditor'), ctx);
+    vm.runInContext(pageFunction('collectConfigFiles') + '\n' + pageFunction('saveConfigEditor'), ctx);
     return { ctx, puts, confirms };
   };
 

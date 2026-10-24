@@ -5123,6 +5123,7 @@
             Config files this bot reads, prefilled from its template. Tweak them here before installing;
             each is delivered into the container and persists across updates.
           </div>
+          <div class="env-tip" id="install-config-reuse-note" style="display:none;">A data folder kept under this name may hold edited copies of these files, so they start off and the kept copies stay. Turn a file on only after moving its kept copy away: a build keeps a file it did not deliver and stops, naming it.</div>
           <div id="install-config-files">${configBlocksHtml}</div>
           <button class="btn btn-secondary btn-small" style="margin-top: 4px;" onclick="addConfigFileRow()">+ Add config file</button>
         </div>
@@ -5308,7 +5309,11 @@
     // a plain raw textarea. The raw .cf-body stays canonical (collectors read it).
     // Manifest cards and new/empty cards start expanded; existing raw files start
     // collapsed so a multi-file bot shows a tidy list of filenames.
-    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable, inactive) {
+    // Loaded values of repo-template cards, keyed by data-template: Save sends such a card only when it differs.
+    const cfTemplateOrig = new Map();
+    let cfTemplateSeq = 0;
+
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable, inactive, fromTemplate) {
       const writable = readOnly === false;
       const isEnabled = enabled !== false;
       const hasManifest = !!(manifest && window.guidedNextId);
@@ -5340,7 +5345,8 @@
       }
 
       const idAttr = blockId ? ` id="${blockId}"` : '';
-      const guidedAttr = (hasManifest ? ' data-guided="1"' : '') + (undecryptable ? ' data-undecryptable="1"' : '');
+      const guidedAttr = (hasManifest ? ' data-guided="1"' : '') + (undecryptable ? ' data-undecryptable="1"' : '')
+        + (fromTemplate ? ` data-template="${registerTemplateOrig(containerPath, body, readOnly, enabled)}"` : '');
       const pathDim = (!hasManifest && !isEnabled) ? ' opacity: 0.45;' : '';
 
       return `<div class="config-file-block"${idAttr}${guidedAttr} style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
@@ -5352,6 +5358,7 @@
           <button class="btn-remove" onclick="this.closest('.config-file-block').remove()" title="Remove">&times;</button>
         </div>
         ${inactive ? `<div class="env-tip cf-inactive">${escapeHtml(inactive)}</div>` : ''}
+        ${fromTemplate ? '<div class="env-tip cf-template">Repo default, not saved yet: Save keeps it only if you change it.</div>' : ''}
         <div class="cf-collapse${expanded ? '' : ' hidden'}">
           ${inner}
           <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
@@ -5366,6 +5373,29 @@
           </div>
         </div>
       </div>`;
+    }
+
+    function registerTemplateOrig(containerPath, body, readOnly, enabled) {
+      const key = String(++cfTemplateSeq);
+      cfTemplateOrig.set(key, { path: (containerPath || '').trim(), body: body || '', readOnly: readOnly !== false, enabled: enabled !== false });
+      return key;
+    }
+
+    // Path, body, mode and on/off of every card under rootSel; a repo-template card the operator left as loaded is skipped.
+    function collectConfigFiles(rootSel) {
+      const files = [];
+      document.querySelectorAll(rootSel + ' .config-file-block').forEach(block => {
+        const path = block.querySelector('.cf-path').value.trim();
+        const body = block.querySelector('.cf-body').value;
+        const readOnly = !block.querySelector('.cf-writable').checked;
+        const enabled = block.querySelector('.cf-enabled').checked;
+        const orig = block.dataset.template ? cfTemplateOrig.get(block.dataset.template) : null;
+        if (orig && orig.path === path && orig.body === body && orig.readOnly === readOnly && orig.enabled === enabled) return;
+        // Persist disabled rows even with an empty body so the off choice sticks;
+        // an enabled row needs real content or it is dropped (never deliver empty).
+        if (path && (body.trim() || !enabled)) files.push({ path, body, readOnly, enabled });
+      });
+      return files;
     }
 
     function onConfigEnabledToggle(input) {
@@ -5403,7 +5433,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable, f.inactive)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable, f.inactive, f.fromTemplate)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -5468,16 +5498,7 @@
         if (block.querySelector('.cf-body').value.trim()) replacing.push(block.querySelector('.cf-path').value.trim() || '(no path)');
       });
       if (replacing.length && !confirm('The stored copy of ' + replacing.join(', ') + ' no longer decrypts. Saving replaces it with what you entered, and it cannot be recovered by restoring the old key afterwards. Continue?')) { release(); return; }
-      const files = [];
-      document.querySelectorAll('#config-editor-rows .config-file-block').forEach(block => {
-        const path = block.querySelector('.cf-path').value.trim();
-        const body = block.querySelector('.cf-body').value;
-        const readOnly = !block.querySelector('.cf-writable').checked;
-        const enabled = block.querySelector('.cf-enabled').checked;
-        // Persist disabled rows even with an empty body so the off choice sticks;
-        // an enabled row needs real content or it is dropped (never deliver empty).
-        if (path && (body.trim() || !enabled)) files.push({ path, body, readOnly, enabled });
-      });
+      const files = collectConfigFiles('#config-editor-rows');
 
       if (saveBtn) saveBtn.textContent = 'Saving...';
 
@@ -5861,13 +5882,27 @@
             preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>${note}`;
             setInstallValidatedName(res.sanitizedName);
             if (reuseRow) reuseRow.style.display = res.reuseAvailable || res.envsAvailable === true || res.envsAvailable === 'unknown' ? 'flex' : 'none';
+            setInstallConfigReuse(!!res.reuseAvailable);
           } else {
+            setInstallConfigReuse(false);
             error.textContent = res.errors.join(', ');
             preview.innerHTML = '';
             if (reuseRow) reuseRow.style.display = 'none';
           }
         } catch (err) { /* ignore */ }
       }, 300);
+    }
+
+    // Over a kept data folder the wizard's template cards start off, so the first build keeps the kept files.
+    function setInstallConfigReuse(reuse) {
+      const note = document.getElementById('install-config-reuse-note');
+      if (note) note.style.display = reuse ? '' : 'none';
+      document.querySelectorAll('#install-config-files .config-file-block').forEach(block => {
+        const box = block.querySelector('.cf-enabled');
+        if (!box) return;
+        if (reuse && box.checked && !block.dataset.reuseOff) { box.checked = false; block.dataset.reuseOff = '1'; onConfigEnabledToggle(box); }
+        else if (!reuse && block.dataset.reuseOff) { delete block.dataset.reuseOff; if (!box.checked) { box.checked = true; onConfigEnabledToggle(box); } }
+      });
     }
 
     function reuseDetailText(res) {

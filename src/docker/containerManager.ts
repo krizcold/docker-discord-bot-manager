@@ -2014,12 +2014,13 @@ function startedResult(emit: EmitFn, unrecorded: string | null, notApplied: stri
 }
 
 /**
- * Store which override files a delivery wrote. A build replaces the record (it
- * re-authored every bind), a start adds to it. Returns why it failed, or null.
+ * Store which override files a delivery wrote. A build replaces the record with
+ * `carry` (the record it started from) plus what it wrote, so a file the build
+ * did not rewrite keeps its entry; a start adds to it. Returns why it failed, or null.
  */
-function recordDeliveredOverrides(botId: string, report: DeliveryReport, replace: boolean, emit: EmitFn): string | null {
+function recordDeliveredOverrides(botId: string, report: DeliveryReport, replace: boolean, emit: EmitFn, carry: Record<string, string> = {}): string | null {
   try {
-    const record = replace ? {} : configFileManager.getDeliveredOverrides(botId);
+    const record = replace ? carry : configFileManager.getDeliveredOverrides(botId);
     configFileManager.setDeliveredOverrides(botId, { ...record, ...report.delivered });
     return null;
   } catch (err) {
@@ -3181,7 +3182,7 @@ async function reapplyConfigFilesCasaOS(botId: string, appName: string, composeP
   const report = newDeliveryReport();
   try {
     emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
-    await redeliverConfigFiles(fs.readFileSync(composePath, 'utf-8'), appName, cfgFiles, (msg) => emit(msg, 'info'), report);
+    await redeliverConfigFiles(fs.readFileSync(composePath, 'utf-8'), appName, cfgFiles, (msg) => emit(msg, 'info'), report, configFileManager.getDeliveredOverrides(botId));
   } catch (err) {
     emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
     notApplied.push(`config files (${err})`);
@@ -3781,8 +3782,9 @@ async function buildDockerImageInstance(
     }
   } else {
     // Docker mode: align the ./data bind + deliver/bind config files locally.
-    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), null, configFiles, (msg) => emit(msg, 'info'), delivery);
-    recordDeliveredOverrides(botId, delivery, true, emit);
+    const restore = configFileManager.getDeliveredOverrides(botId);
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), null, configFiles, (msg) => emit(msg, 'info'), delivery, restore);
+    recordDeliveredOverrides(botId, delivery, true, emit, restore);
   }
   refuseUndelivered(delivery);
 
@@ -3815,7 +3817,10 @@ async function buildDockerImageInstance(
     }
     if (configFiles.length > 0) {
       emit('[PCS] Writing config files...', 'info');
-      refuseUndelivered(await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info')));
+      const restore = configFileManager.getDeliveredOverrides(botId);
+      const written = await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info'), newDeliveryReport(), restore);
+      recordDeliveredOverrides(botId, written, true, emit, restore);
+      refuseUndelivered(written);
     }
   }
 
@@ -4169,7 +4174,7 @@ async function buildGitInstanceHeld(
     await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'), delivery, restore);
     // A config whose path matches a bind the compose already declares is delivered
     // over that existing bind (no second bind). The rest fall through to a fresh bind.
-    const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'), delivery);
+    const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'), delivery, restore);
     bindOnlyConfigs = configFiles.filter(c => !handled.has(c.path));
     const declared = configFiles.filter(c => handled.has(c.path));
     if (declared.length > 0) composeContent = setDeclaredBindModes(composeContent, declared);
@@ -4185,7 +4190,7 @@ async function buildGitInstanceHeld(
     emit('[Docker] Preparing volumes and config files...', 'info');
     composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'), delivery, restore, droppedGatewayBinds);
   }
-  recordDeliveredOverrides(botId, delivery, true, emit);
+  recordDeliveredOverrides(botId, delivery, true, emit, restore);
   refuseUndelivered(delivery);
 
   // Write .botmanager marker (CasaOS AppData folder, or the bot dir in docker mode)
@@ -4293,7 +4298,9 @@ async function buildGitInstanceHeld(
     }
     if (bindOnlyConfigs.length > 0) {
       emit('[PCS] Writing config files...', 'info');
-      refuseUndelivered(await writeConfigFiles(appName, bindOnlyConfigs, (msg) => emit(msg, 'info')));
+      const written = await writeConfigFiles(appName, bindOnlyConfigs, (msg) => emit(msg, 'info'), newDeliveryReport(), restore);
+      recordDeliveredOverrides(botId, written, false, emit);
+      refuseUndelivered(written);
     }
   }
 

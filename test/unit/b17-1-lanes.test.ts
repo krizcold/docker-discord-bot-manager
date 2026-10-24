@@ -108,7 +108,7 @@ describe('B17-1 lanes: Start and Build apply what they report', () => {
     writeRegistry({ sourceType: 'docker-image', imageRef: 'example/bot:1' });
     configFileManager.setConfigFiles('b1', [{ path: '/app/settings.json', body: '{}' }]);
     // A folder where the config file goes makes its write fail.
-    fs.mkdirSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', 'config', 'settings.json'), { recursive: true });
+    fs.mkdirSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', '.smdb-config', 'app', 'settings.json', 'kept'), { recursive: true });
     const r = await containerManager.buildBot('b1');
     expect(r.success).toBe(false);
     expect(r.error).toContain('/app/settings.json');
@@ -118,10 +118,10 @@ describe('B17-1 lanes: Start and Build apply what they report', () => {
     writeRegistry({ sourceType: 'docker-image', imageRef: 'example/bot:1' });
     configFileManager.setConfigFiles('b1', [{ path: '/app/settings.json', body: '{}', readOnly: false }]);
     configFileManager.setBuiltMounts('b1', ['/app/settings.json:ro']);
-    fs.mkdirSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', 'config', 'settings.json'), { recursive: true });
+    fs.mkdirSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', '.smdb-config', 'app', 'settings.json', 'kept'), { recursive: true });
     expect((await containerManager.buildBot('b1')).success).toBe(false);
     expect(fs.existsSync(path.join(botDir, 'env', 'builtMounts.json'))).toBe(false);
-    fs.rmSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', 'config', 'settings.json'), { recursive: true, force: true });
+    fs.rmSync(path.join(h.dir, 'DATA', 'AppData', 'bot1', '.smdb-config', 'app', 'settings.json'), { recursive: true, force: true });
     writeRegistry({ sourceType: 'docker-image', imageRef: 'example/bot:1' });
     const r = await containerManager.startBot('b1');
     expect(r.warning).toContain('no record of the mounts the last build authored');

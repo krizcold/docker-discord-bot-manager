@@ -358,7 +358,7 @@ export function isBotWebUiReady(inst: InstanceConfig): boolean {
   return true; // never (re)started under readiness tracking: do not gate
 }
 
-export type LaneResult = { success: boolean; error?: string; warning?: string };
+export type LaneResult = { success: boolean; error?: string; warning?: string; notApplied?: string[] };
 
 // A transient status with no live op was left by an op whose closing write was
 // refused, or one that died with the manager while the boot reset could not
@@ -993,7 +993,7 @@ export function setLastFleetBackupAt(botId: string, at: number): void {
 }
 
 /**
- * Update the instance's public URL auth mode (applies on next start).
+ * Update the instance's public URL auth mode (applies on the next Update or Build).
  */
 export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'managed' | 'public'): InstanceConfig | null {
   const registry = loadRegistry();
@@ -1859,6 +1859,16 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
   }
 }
 
+function startedResult(emit: EmitFn, unrecorded: string | null, notApplied: string[]): LaneResult {
+  const warnings: string[] = [];
+  if (notApplied.length > 0) warnings.push(`The bot is running, but these changes were not applied: ${notApplied.join('; ')}. Apply or Restart to retry`);
+  if (unrecorded) warnings.push(`The bot is running, but its status could not be recorded: ${unrecorded}`);
+  for (const w of warnings) emit(`[Warning] ${w}`, 'warning');
+  return warnings.length > 0
+    ? { success: true, warning: warnings.join('; '), ...(notApplied.length > 0 ? { notApplied } : {}) }
+    : { success: true };
+}
+
 function setPendingApply(botId: string, pending: boolean): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -2335,10 +2345,10 @@ function deleteComposeEnv(env: any, key: string): boolean {
  * service gets the bot's env; any service that already declares USER/PASSWORD (the
  * AppShield gateway) has them refreshed from the current WEBUI_USER/WEBUI_PASSWORD.
  * `privateFile` is for the manager's own bot-dir copy; the CasaOS metadata copy
- * keeps the platform's mode.
+ * keeps the platform's mode. Returns why the sync failed, or null.
  */
-export function syncComposeEnvVars(instance: InstanceConfig, composePath: string, privateFile = false): void {
-  if (!fs.existsSync(composePath)) return;
+export function syncComposeEnvVars(instance: InstanceConfig, composePath: string, privateFile = false): string | null {
+  if (!fs.existsSync(composePath)) return null;
 
   // Outside the catch-all: an undecryptable store must refuse the start before
   // this rewrites the compose, not degrade into a sync warning.
@@ -2350,7 +2360,7 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     const compose = doc.toJSON();
 
     const services = compose?.services;
-    if (!services || typeof services !== 'object') return;
+    if (!services || typeof services !== 'object') return null;
 
     // App service (x-casaos.build, else first non-infra) gets the bot's env, MINUS
     // substitution-only inputs - a repo compose whose first service is a database
@@ -2445,8 +2455,10 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     const yaml = YAML.stringify(compose, { lineWidth: 0 });
     if (privateFile) writePrivateFile(composePath, yaml);
     else rewriteComposeFile(composePath, yaml);
+    return null;
   } catch (err) {
     console.warn(`[ContainerManager] Failed to sync env vars into compose: ${err}`);
+    return String(err);
   }
 }
 
@@ -2599,7 +2611,7 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
   // the project was reached (Restart, Stop then Start, Update).
   if (result.success) {
     try {
-      setPendingApply(botId, false);
+      setPendingApply(botId, !!result.notApplied);
     } catch (err) {
       const msg = `The deployed build is applied, but that could not be recorded: ${err instanceof Error ? err.message : String(err)}`;
       logCollectors.get(botId).addLog(`[Start] ${msg}`, 'warning');
@@ -2646,6 +2658,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
     log.addLog(msg, type, key);
   };
   let unrecorded: string | null = null;
+  const notApplied: string[] = [];
 
   try {
     emit(`[Start] Starting ${instance.displayName}...`, 'system');
@@ -2670,13 +2683,14 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       const composePath = resolveComposePath(botId, appName);
 
       // Sync env vars into compose before deploy (env changes after build)
-      syncComposeEnvVars(latestInstance, composePath);
+      const envErr = syncComposeEnvVars(latestInstance, composePath);
+      if (envErr) notApplied.push(`environment variables (${envErr})`);
       await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
 
       // Re-apply edited config files so config changes made while stopped take
       // effect on start (mirrors the env re-sync above). Binds already exist from
       // the build, so this only rewrites the bind-mounted host files.
-      const cfgFiles = reapplyableConfigFiles(botId, emit);
+      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
       if (cfgFiles.length > 0) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
@@ -2684,6 +2698,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
           await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
         } catch (err) {
           emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+          notApplied.push(`config files (${err})`);
         }
       }
 
@@ -2715,16 +2730,18 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
 
       // Sync env into the compose (covers post-build env edits) + a .env file for
       // ${VAR} / env_file services, then deploy the full compose (multi-service).
-      syncComposeEnvVars(latestInstance, composePath, true);
+      const envErr = syncComposeEnvVars(latestInstance, composePath, true);
+      if (envErr) notApplied.push(`environment variables (${envErr})`);
       writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
 
       // Re-apply edited config files so changes made while stopped take effect.
-      const cfgFiles = reapplyableConfigFiles(botId, emit);
+      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
       if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
         try {
           redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
         } catch (err) {
           emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+          notApplied.push(`config files (${err})`);
         }
       }
 
@@ -2747,12 +2764,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
-    if (unrecorded) {
-      const warning = `The bot is running, but its status could not be recorded: ${unrecorded}`;
-      emit(`[Warning] ${warning}`, 'warning');
-      return { success: true, warning };
-    }
-    return { success: true };
+    return startedResult(emit, unrecorded, notApplied);
   } catch (error) {
     const msg = String(error);
     emit(`[Error] Start failed: ${msg}`, 'error');
@@ -2770,16 +2782,18 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
  * can proceed. The build lanes, which author the host files fresh, refuse
  * instead (getConfigFilesStrict).
  */
-function reapplyableConfigFiles(botId: string, emit: EmitFn): configFileManager.BotConfigFile[] {
+function reapplyableConfigFiles(botId: string, emit: EmitFn, notApplied: string[]): configFileManager.BotConfigFile[] {
   const { files, undecryptable, corrupt } = configFileManager.getConfigFilesWithStatus(botId);
   if (corrupt) {
     emit('[Config] The config-file store cannot be read (a copy of the damaged file is kept beside it as configFiles.json.corrupt-<time> when it could be read); keeping the previously delivered config files', 'warning');
+    notApplied.push('config files (the config-file store cannot be read)');
     return [];
   }
   const enabled = files.filter(c => c.enabled !== false);
   const blocking = enabled.filter(f => undecryptable.includes(f.path));
   if (blocking.length > 0) {
     emit(`[Config] Stored config file bodies no longer decrypt (${blocking.map(f => f.path).join(', ')}); keeping the previously delivered config files`, 'warning');
+    notApplied.push(`config files (${blocking.map(f => f.path).join(', ')} no longer decrypt)`);
     return [];
   }
   return enabled;
@@ -2814,6 +2828,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
     return { success: false, error: 'imageRef is required for docker-image source type' };
   }
   let unrecorded: string | null = null;
+  const notApplied: string[] = [];
 
   try {
     emit(`[Start] Starting ${instance.displayName}...`, 'system');
@@ -2838,7 +2853,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
       updateBotStatus(botId, 'starting');
 
       // Re-apply edited config files so config changes take effect on start.
-      const cfgFiles = reapplyableConfigFiles(botId, emit);
+      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
       if (cfgFiles.length > 0) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
@@ -2846,6 +2861,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
           await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
         } catch (err) {
           emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+          notApplied.push(`config files (${err})`);
         }
       }
 
@@ -2865,16 +2881,18 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
-      syncComposeEnvVars(instance, composePath, true);
+      const envErr = syncComposeEnvVars(instance, composePath, true);
+      if (envErr) notApplied.push(`environment variables (${envErr})`);
       writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
 
-      const cfgFiles = reapplyableConfigFiles(botId, emit);
+      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
       if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
         try {
           emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
           redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
         } catch (err) {
           emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+          notApplied.push(`config files (${err})`);
         }
       }
 
@@ -2894,12 +2912,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
     }
 
     emit(`[Success] ${instance.displayName} is now running!`, 'success');
-    if (unrecorded) {
-      const warning = `The bot is running, but its status could not be recorded: ${unrecorded}`;
-      emit(`[Warning] ${warning}`, 'warning');
-      return { success: true, warning };
-    }
-    return { success: true };
+    return startedResult(emit, unrecorded, notApplied);
   } catch (error) {
     const msg = String(error);
     emit(`[Error] Start failed: ${msg}`, 'error');

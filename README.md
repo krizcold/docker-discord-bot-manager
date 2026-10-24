@@ -147,7 +147,7 @@ You do **not** need any of this if you ran `setup.sh` above - these are the equi
    docker exec authelia cat /data/notification.txt
    ```
 
-With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. By default each bot vhost sits behind the same Authelia MFA login as the manager; a bot whose main web service ships its own auth gateway (e.g. AppShield) is detected automatically and left to protect itself. Override per bot with the card's **Auth** selector (Auto / Managed / Public) or `PUT /api/bots/:id/web-auth`; the change applies on the bot's next start.
+With `BOT_DOMAIN_BASE` set, a bot's web UI is published at `https://<bot-name>.<BOT_DOMAIN_BASE>` with its own cert (so Discord-OAuth bots work without a domain); the **Open** link uses that URL. By default each bot vhost sits behind the same Authelia MFA login as the manager; a bot whose main web service ships its own auth gateway (e.g. AppShield) is detected automatically and left to protect itself. Override per bot with the card's **Auth** selector (Auto / Managed / Public) or `PUT /api/bots/:id/web-auth`; the change applies on the bot's next Update or Build.
 
 **Prefer no public surface?** Keep the manager private and reach it over a tunnel/VPN instead:
 - **Tailscale** (recommended): `tailscale up` on the VPS + your devices; reach the UI over the tailnet, optionally with a real `*.ts.net` cert via `tailscale serve`. No open ports, no domain.

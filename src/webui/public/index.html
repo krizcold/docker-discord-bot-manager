@@ -1149,6 +1149,7 @@
           // The terminal popup is SSE-driven now; these only refresh card state.
           case 'bot:started':
             mergeBotState(payload);
+            if (payload.warning) showMessage('error', payload.warning);
             busyBots.delete(id);
             redraw();
             break;
@@ -1167,7 +1168,7 @@
           // Rebuild/build change lastBuiltCommit, which flips updateAvailable.
           // Refetch so enriched fields (updateAvailable, behindBy) stay accurate.
           case 'bot:rebuilt':
-            showMessage('success', 'Code updated and rebuilt');
+            payload?.warning ? showMessage('error', payload.warning) : showMessage('success', 'Code updated and rebuilt');
             busyBots.delete(id);
             delete updateCache[id];
             loadBots();
@@ -1447,7 +1448,7 @@
               ? '<span class="update-badge">Update available</span>'
               : '';
             const pendingBadge = bot.pendingApply
-              ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached) and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
+              ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached), or a start could not apply env or config changes, and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
               : '';
 
             // Fleet DB backup warning (failed or stale sidecar dump)
@@ -1520,7 +1521,7 @@
             // Public URL auth mode (only when the bot has a public https URL)
             const webAuthMode = bot.webAuth || 'auto';
             const webAuthControl = bot.publicUrl ? `
-              <select class="auto-update-interval" title="Public URL access: Auto detects self-authenticating bots, Managed puts the bot behind the stack's Authelia SSO login (optional MFA), Public disables auth. Applies on the bot's next start." onchange="setBotWebAuth('${bot.id}', this.value)">
+              <select class="auto-update-interval" title="Public URL access: Auto detects self-authenticating bots, Managed puts the bot behind the stack's Authelia SSO login (optional MFA), Public disables auth. Applies on the bot's next Update or Build." onchange="setBotWebAuth('${bot.id}', this.value)">
                 <option value="auto" ${webAuthMode === 'auto' ? 'selected' : ''}>Auth: Auto</option>
                 <option value="managed" ${webAuthMode === 'managed' ? 'selected' : ''}>Auth: Managed</option>
                 <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
@@ -1787,7 +1788,7 @@
       try {
         const res = await api('PUT', `/bots/${id}/web-auth`, { mode });
         if (!res.success) showMessage('error', res.error || 'Failed to set web auth mode');
-        else showMessage('success', 'Web auth mode saved: applies on next start');
+        else showMessage('success', 'Web auth mode saved: applies on the next Update or Build');
       } catch (err) {
         showMessage('error', 'Failed to set web auth mode');
       }

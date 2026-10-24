@@ -663,7 +663,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // source itself, so no pre-fetch is needed here.
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', { ...withActiveOp(publicBot(containerManager.getBot(botId))), opId });
+          broadcastToClients(wss, 'bot:rebuilt', { ...withActiveOp(publicBot(containerManager.getBot(botId))), opId, ...(result.warning ? { warning: result.warning } : {}) });
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, opId, error: result.error });
         }
@@ -1403,7 +1403,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       containerManager.pullAndRebuild(botId).then((result) => {
         if (result.success) {
-          broadcastToClients(wss, 'bot:rebuilt', withActiveOp(publicBot(containerManager.getBot(botId))));
+          broadcastToClients(wss, 'bot:rebuilt', { ...withActiveOp(publicBot(containerManager.getBot(botId))), ...(result.warning ? { warning: result.warning } : {}) });
         } else {
           broadcastToClients(wss, 'bot:pull-failed', { id: botId, error: result.error });
         }
@@ -1986,7 +1986,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * PUT /api/bots/:id/web-auth - Set the public URL auth mode on the INSTANCE.
-   * Applies on the bot's next start.
+   * Applies on the bot's next Update or Build, which author the proxy labels.
    */
   router.put('/:id/web-auth', async (req: Request, res: Response) => {
     try {

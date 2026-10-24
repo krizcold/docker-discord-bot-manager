@@ -303,7 +303,7 @@ export interface InstanceConfig {
   webContainerPort?: number;           // docker mode: the container port hostPort maps to
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"
-  webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on next start; 'auto' detects self-authenticating bots
+  webAuth?: 'auto' | 'managed' | 'public';   // web-UI auth mode, applies on the next Update or Build; 'auto' detects self-authenticating bots
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss

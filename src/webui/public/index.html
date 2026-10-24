@@ -5851,7 +5851,8 @@
       if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
 
       try {
-        const res = await api('GET', `/recover-envs?name=${encodeURIComponent(name)}`);
+        const sourceQuery = sourceId ? `&sourceId=${encodeURIComponent(sourceId)}` : '';
+        const res = await api('GET', `/recover-envs?name=${encodeURIComponent(name)}${sourceQuery}`);
         if (seq !== installSeq || sourceId !== installSourceId) return;
         if (!res.success) {
           if (detailEl) detailEl.textContent = res.error || 'Failed to load previous envs';
@@ -5878,20 +5879,29 @@
         for (const env of envs) loadedByKey[env.key] = env.value;
 
         const seen = new Set();
+        const autoKept = [];
+        const applied = { vault: 0, compose: 0 };
+        const countApplied = (key) => {
+          const env = envs.find(e => e.key === key);
+          if (env && (env.source === 'vault' || env.source === 'compose')) applied[env.source]++;
+        };
         for (const row of existingRows) {
           const keyInput = row.querySelector('.env-key');
           const valueInput = row.querySelector('.env-value');
           if (!keyInput) continue;
           const key = keyInput.value.trim();
           if (key && Object.prototype.hasOwnProperty.call(loadedByKey, key)) {
-            setEnvInputValue(valueInput, loadedByKey[key]);
             seen.add(key);
+            if (row.classList.contains('env-autowired')) { autoKept.push(key); continue; }
+            setEnvInputValue(valueInput, loadedByKey[key]);
+            countApplied(key);
           }
         }
         // Add any keys not already shown in the form
         for (const env of envs) {
           if (seen.has(env.key)) continue;
           addInstallEnvRow(env.key, env.value);
+          countApplied(env.key);
         }
         // A loaded role crossing into a dialing role must reach the secret
         // role cache, or a minted master secret survives into the worker.
@@ -5901,11 +5911,12 @@
         if (typeof container.fleetLocationResync === 'function') container.fleetLocationResync();
 
         if (detailEl) {
-          const sources = res.sources || {};
           const parts = [];
-          if (sources.vault) parts.push(`${sources.vault} from vault`);
-          if (sources.compose) parts.push(`${sources.compose} from compose`);
-          detailEl.textContent = `Loaded ${envs.length} env(s) into the form (${parts.join(', ') || 'recovered'}). Review before saving.`
+          if (applied.vault) parts.push(`${applied.vault} from vault`);
+          if (applied.compose) parts.push(`${applied.compose} from compose`);
+          const loadedCount = applied.vault + applied.compose;
+          detailEl.textContent = `Loaded ${loadedCount} env(s) into the form${parts.length ? ` (${parts.join(', ')})` : ''}. Review before saving.`
+            + (autoKept.length ? ` Not loaded, set automatically by the manager: ${autoKept.join(', ')}.` : '')
             + (res.vaultBroken ? ' vault.json cannot be read, so envs kept from a removed bot were not checked.' : '');
         }
         if (row) row.classList.add('loaded');

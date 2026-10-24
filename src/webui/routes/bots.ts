@@ -2295,7 +2295,7 @@ function installSourceFor(sourceId: string | undefined, imageRef: string | undef
  * win over compose when the same key exists in both; the keys the manager
  * injects are left out.
  */
-function recoverableEnvs(name: string): {
+function recoverableEnvs(name: string, existingInstances: InstanceConfig[]): {
   envs: Array<{ key: string; value: string; sensitive: boolean; source: 'vault' | 'compose' }>;
   sources: { vault: number; compose: number };
   vaultBroken: boolean;
@@ -2315,7 +2315,8 @@ function recoverableEnvs(name: string): {
 
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const composePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', targetSanitized, 'docker-compose.yml');
-  const fromCompose = readEnvsFromComposeFile(composePath) || {};
+  const ownedByInstance = existingInstances.some(i => i.sanitizedName === targetSanitized);
+  const fromCompose = ownedByInstance ? {} : readEnvsFromComposeFile(composePath) || {};
 
   const merged: Record<string, { value: string; source: 'vault' | 'compose' }> = {};
   for (const [k, v] of Object.entries(fromCompose)) {
@@ -2325,11 +2326,26 @@ function recoverableEnvs(name: string): {
     merged[k] = { value: v, source: 'vault' };
   }
 
+  const envs = Object.entries(merged).map(([key, { value, source }]) => ({ key, value, sensitive: isSensitive(key), source }));
   return {
-    envs: Object.entries(merged).map(([key, { value, source }]) => ({ key, value, sensitive: isSensitive(key), source })),
-    sources: { vault: Object.keys(fromVault).length, compose: Object.keys(fromCompose).length },
+    envs,
+    sources: { vault: envs.filter(e => e.source === 'vault').length, compose: envs.filter(e => e.source === 'compose').length },
     vaultBroken: vaultLoad.state === 'broken',
   };
+}
+
+/**
+ * The name an install under `name` will save: a reserved or already-used name is
+ * auto-uniquified on install rather than rejected.
+ */
+async function resolveInstallTarget(name: string, req: Request) {
+  const excludeId = req.query.excludeId as string;
+  const existingInstances = containerManager.getAllBots();
+  const source = installSourceFor(req.query.sourceId as string | undefined, req.query.imageRef as string | undefined);
+  const foreignProjects = await containerManager.foreignDockerProjects(existingInstances.map(i => i.id));
+  const uniqueName = makeUniqueName(name, existingInstances, excludeId, { foreignProjects, source });
+  const conflicts = uniqueName !== name.trim() ? validateName(name, existingInstances, excludeId, { foreignProjects, source }).errors : [];
+  return { uniqueName, conflicts, existingInstances, source };
 }
 
 /**
@@ -2347,25 +2363,17 @@ export function createValidationRoutes(): Router {
         return;
       }
 
-      const excludeId = req.query.excludeId as string;
-      const existingInstances = containerManager.getAllBots();
-      const source = installSourceFor(req.query.sourceId as string | undefined, req.query.imageRef as string | undefined);
-
-      // A reserved or already-used name is auto-uniquified on install rather than
-      // rejected, so report the name we would actually use instead of an error.
-      let uniqueName: string;
-      let conflicts: string[] = [];
+      let target: Awaited<ReturnType<typeof resolveInstallTarget>>;
       try {
-        const foreignProjects = await containerManager.foreignDockerProjects(existingInstances.map(i => i.id));
-        uniqueName = makeUniqueName(name, existingInstances, excludeId, { foreignProjects, source });
-        if (uniqueName !== name.trim()) conflicts = validateName(name, existingInstances, excludeId, { foreignProjects, source }).errors;
+        target = await resolveInstallTarget(name, req);
       } catch (err) {
         res.json({ valid: false, errors: [err instanceof Error ? err.message : String(err)] });
         return;
       }
+      const { uniqueName, conflicts, existingInstances, source } = target;
       const names = resolveNames(uniqueName);
       const reuse = checkFolderReuse(names.sanitizedName, existingInstances, source);
-      const recoverable = recoverableEnvs(uniqueName);
+      const recoverable = recoverableEnvs(uniqueName, existingInstances);
       const envsAvailable: boolean | 'unknown' = recoverable.envs.length > 0 ? true : recoverable.vaultBroken ? 'unknown' : false;
 
       res.json({ valid: true, errors: [], ...names, ...reuse, envsAvailable, conflicts, adjusted: uniqueName !== name, requestedName: name });
@@ -2375,10 +2383,11 @@ export function createValidationRoutes(): Router {
   });
 
   /**
-   * GET /api/recover-envs?name=<displayName>
+   * GET /api/recover-envs?name=<displayName>&sourceId=... (or &imageRef=...)
+   * Reads the envs for the name the install will save, the same name validate-name answers.
    * Returns recoverable plaintext env vars for a name, pulled from:
    *   1. newest deleted-bot vault group matching sanitizedName
-   *   2. CasaOS compose file at /DATA/AppData/casaos/apps/<sanitizedName>/docker-compose.yml
+   *   2. CasaOS compose file at /DATA/AppData/casaos/apps/<sanitizedName>/docker-compose.yml, unless an instance owns that name
    * Vault entries win over compose when the same key exists in both.
    * Bot-manager-injected keys (BOT_ID, BOT_MANAGER_UPDATE_TOKEN, BOT_MANAGER_INTERNAL_URL) are stripped.
    * Frontend calls this when the user clicks "Load envs from previous installation".
@@ -2391,7 +2400,14 @@ export function createValidationRoutes(): Router {
         return;
       }
 
-      res.json({ success: true, ...recoverableEnvs(name) });
+      let target: Awaited<ReturnType<typeof resolveInstallTarget>>;
+      try {
+        target = await resolveInstallTarget(name, req);
+      } catch (err) {
+        res.json({ success: false, error: err instanceof Error ? err.message : String(err), envs: [] });
+        return;
+      }
+      res.json({ success: true, name: target.uniqueName, ...recoverableEnvs(target.uniqueName, target.existingInstances) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error), envs: [] });
     }

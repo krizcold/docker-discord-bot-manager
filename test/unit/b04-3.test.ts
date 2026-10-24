@@ -149,6 +149,7 @@ describe('B04-3 a record write refused after the docker step', () => {
   });
 
   it('a build whose closing stamp is refused answers success with a warning', async () => {
+    seed({ status: 'error' }); // the build lane record is written while the status is still error
     h.refuseStatus = 'stopped';
     const res = await containerManager.buildBot('b1');
     expect(res.success).toBe(true);

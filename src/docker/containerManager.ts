@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
-  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig,
+  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig, InstanceLane,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -303,6 +303,7 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfi
   // Explicit either way: the browser merges pushed records over what it holds,
   // and an absent key cannot clear a flag it already shows.
   out.pendingApply = inst.pendingApply === true;
+  out.lane = inst.lane ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
   }
@@ -1306,6 +1307,23 @@ function getImageName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-${instance.id}:latest`;
 }
 
+/** True when an image the manager built for this compose is gone; pulled images and an unreadable compose answer false. */
+async function builtImageMissing(instance: InstanceConfig, composePath: string): Promise<boolean> {
+  let services: Record<string, any> = {};
+  try {
+    services = YAML.parse(fs.readFileSync(composePath, 'utf-8'))?.services ?? {};
+  } catch {
+    return false;
+  }
+  const prefix = `${instance.sanitizedName}-${instance.id}`;
+  for (const svc of Object.values(services)) {
+    const image = svc?.image;
+    if (typeof image !== 'string' || !(image.startsWith(`${prefix}:`) || image.startsWith(`${prefix}-`))) continue;
+    if ((await dockerClient.imageState(image)) === 'absent') return true;
+  }
+  return false;
+}
+
 // ─── Per-Bot Operation Lock ───
 
 // Server-side guard: the UI's busy tracking is client-only, so two tabs or a
@@ -1344,6 +1362,50 @@ async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Pr
     activeOps.delete(botId);
     broadcastOpReleased(botId);
   }
+}
+
+/** Throws when the registry cannot be written; the lane must then not start. */
+function writeLane(botId: string, lane: InstanceLane | undefined): void {
+  const registry = loadRegistry();
+  const inst = registry.instances[botId];
+  if (!inst) return;
+  if (lane) inst.lane = lane;
+  else if (!inst.lane) return;
+  else delete inst.lane;
+  inst.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+function newLane(op: InstanceLane['op'], wasRunning: boolean, keepData?: boolean): InstanceLane {
+  return { op, wasRunning, ...(keepData === undefined ? {} : { keepData }), startedAt: new Date().toISOString() };
+}
+
+/** Clears an update, restart or build record once its obligation is met; a delete record stands. */
+function clearFinishedLane(botId: string): string | null {
+  if (getBot(botId)?.lane?.op === 'delete') return null;
+  try {
+    writeLane(botId, undefined);
+    return null;
+  } catch (err) {
+    const msg = `the record of the earlier lane could not be cleared: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[ContainerManager] ${botId}: ${msg}`);
+    return msg;
+  }
+}
+
+function deleteLaneRefusal(botId: string, action: string): { success: false; error: string } | null {
+  const lane = getBot(botId)?.lane;
+  if (lane?.op !== 'delete') return null;
+  return { success: false, error: `A Delete of this instance${lane.keepData ? ' (keeping its data)' : ''} did not finish, so its containers, image or compose may already be gone; ${action} is refused until Delete is run again` };
+}
+
+function laneRecordRefusal(op: string, err: unknown): { success: false; error: string } {
+  return { success: false, error: `The ${op} did not start: the manager could not record it before changing anything (${err instanceof Error ? err.message : String(err)})` };
+}
+
+function withWarning(result: LaneResult, extra: string | null): LaneResult {
+  if (!extra || !result.success) return result;
+  return { ...result, warning: result.warning ? `${result.warning}; ${extra}` : extra };
 }
 
 /** Op-lock for long-running work owned by other modules (e.g. replica seeding):
@@ -1750,6 +1812,12 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
       });
       volumesVerified = !record.projectVolumesUnverified;
     }
+  }
+
+  try {
+    writeLane(botId, newLane('delete', instance.status === 'running', keepData));
+  } catch (err) {
+    throw new Error(laneRecordRefusal('delete', err).error);
   }
 
   // Transient status: the reconciler only touches terminal states, so the bot
@@ -3077,7 +3145,7 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   if (getBot(botId)?.recoveryRescue) {
     return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
   }
-  return null;
+  return deleteLaneRefusal(botId, 'Start');
 }
 
 async function startBotImpl(botId: string): Promise<LaneResult> {
@@ -3123,6 +3191,8 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
       logCollectors.get(botId).addLog(`[Start] ${msg}`, 'warning');
       result.warning = result.warning ? `${result.warning}; ${msg}` : msg;
     }
+    const laneUncleared = clearFinishedLane(botId);
+    if (laneUncleared) result.warning = result.warning ? `${result.warning}; ${laneUncleared}` : laneUncleared;
   }
   if (!applyInPlace) return result;
 
@@ -3173,9 +3243,9 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
     const botDir = getBotDir(botId);
     const localComposePath = path.join(botDir, 'docker-compose.yml');
 
-    // Build if compose doesn't exist
-    if (!fs.existsSync(localComposePath)) {
-      emit('[Build] No compose file found, running build first...', 'info');
+    const imageMissing = fs.existsSync(localComposePath) && (await builtImageMissing(latestInstance, localComposePath));
+    if (!fs.existsSync(localComposePath) || imageMissing) {
+      emit(imageMissing ? '[Build] The bot image is missing, running build first...' : '[Build] No compose file found, running build first...', 'info');
       const buildResult = await buildBotImpl(botId);
       if (!buildResult.success) {
         throw new Error(`Build failed: ${buildResult.error || 'unknown error'}`);
@@ -3499,7 +3569,10 @@ async function getContainerIdsForBot(botId: string): Promise<string[] | null> {
 // ─── Stop ───
 
 export async function stopBot(botId: string): Promise<LaneResult> {
-  return withBotOp(botId, 'stop', () => stopBotImpl(botId));
+  return withBotOp(botId, 'stop', async () => {
+    const result = await stopBotImpl(botId);
+    return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
+  });
 }
 
 async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
@@ -3590,6 +3663,11 @@ export async function restartBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'restart', async () => {
     const rescueRefusal = startPreflightRefusal(botId);
     if (rescueRefusal) return rescueRefusal;
+    try {
+      writeLane(botId, newLane('restart', true));
+    } catch (err) {
+      return laneRecordRefusal('restart', err);
+    }
     const log = logCollectors.get(botId);
     const emit: EmitFn = (msg, type = 'info', key) => {
       console.log(`[Restart ${botId}] ${msg}`);
@@ -3646,7 +3724,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  return null;
+  return deleteLaneRefusal(botId, 'Update');
 }
 
 /** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
@@ -3668,7 +3746,10 @@ async function sourceClonePreflight(instance: InstanceConfig): Promise<string | 
 }
 
 async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceConfig): Promise<LaneResult> {
-  const wasRunning = instance.status === 'running';
+  // An update or restart that a manager restart cut short owed a start.
+  const prior = instance.lane;
+  const owedStart = (prior?.op === 'update' || prior?.op === 'restart') && prior.wasRunning;
+  const wasRunning = instance.status === 'running' || owedStart;
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {
     console.log(`[Update ${botId}] ${msg}`);
@@ -3684,7 +3765,13 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
         return { success: false, error: cloneRefusal };
       }
     }
-    if (wasRunning) {
+    try {
+      writeLane(botId, newLane('update', wasRunning));
+    } catch (err) {
+      return laneRecordRefusal('update', err);
+    }
+    if (owedStart) emit('[Update] An earlier update or restart of this running bot did not finish; it is started again after this build', 'warning');
+    if (instance.status === 'running') {
       const stopResult = await stopBotImpl(botId, emit);
       if (!stopResult.success) return { success: false, error: `Update stopped before rebuilding: ${stopResult.error}` };
     }
@@ -3706,7 +3793,7 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
       return startBotImpl(botId);
     }
 
-    return buildResult.warning ? { success: true, warning: buildResult.warning } : { success: true };
+    return withWarning(buildResult.warning ? { success: true, warning: buildResult.warning } : { success: true }, clearFinishedLane(botId));
   } catch (error) {
     console.error(`[ContainerManager] Failed to rebuild instance ${botId}:`, error);
     return { success: false, error: String(error) };
@@ -3805,7 +3892,23 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
 }
 
 export async function buildBot(botId: string): Promise<LaneResult> {
-  return withLoggedBotOp(botId, 'build', () => buildBotImpl(botId));
+  return withLoggedBotOp(botId, 'build', async () => {
+    const refusal = deleteLaneRefusal(botId, 'Build');
+    if (refusal) return refusal;
+    const instance = getBot(botId);
+    if (!instance) return { success: false, error: 'Bot not found' };
+    // A Build does not start the bot, so the start an earlier update or restart owes stays recorded.
+    const owesStart = instance.lane && instance.lane.op !== 'build';
+    if (!owesStart) {
+      try {
+        writeLane(botId, newLane('build', false));
+      } catch (err) {
+        return laneRecordRefusal('build', err);
+      }
+    }
+    const result = await buildBotImpl(botId);
+    return result.success && !owesStart ? withWarning(result, clearFinishedLane(botId)) : result;
+  });
 }
 
 /**
@@ -4578,6 +4681,18 @@ export function resetTransientStatuses(): void {
   const fault = registryFault();
   if (fault) { console.warn(`[Init] Transient statuses not reset: ${fault}`); return; }
   const registry = loadRegistry();
+  const cut = Object.values(registry.instances).filter(i => i.lane && !i.lane.interrupted);
+  if (cut.length > 0) {
+    for (const instance of cut) {
+      instance.lane!.interrupted = true;
+      console.warn(`[Init] ${instance.id}: its ${instance.lane!.op} (started ${instance.lane!.startedAt}${instance.lane!.wasRunning ? ', the bot was running' : ''}) did not finish before the manager stopped`);
+    }
+    try {
+      saveRegistry(registry);
+    } catch (err) {
+      console.error(`[Init] The interrupted lanes could not be marked: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   for (const instance of Object.values(registry.instances)) {
     if (instance.status === 'building' || instance.status === 'starting' || instance.status === 'stopping') {
       console.log(`[Init] ${instance.id} was '${instance.status}' when the manager stopped - marking error`);

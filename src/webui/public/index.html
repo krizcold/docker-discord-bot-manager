@@ -1481,6 +1481,15 @@
               ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached, or env was saved while it ran), or a start could not apply env or config changes, and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
               : '';
 
+            const lane = bot.lane;
+            const laneVerb = lane && { update: 'Update', restart: 'Restart', build: 'Build', delete: 'Delete' }[lane.op];
+            const laneBadge = !lane ? ''
+              : lane.op === 'delete'
+                ? `<span class="update-badge danger" title="${escapeHtml(`A Delete${lane.keepData ? ' that keeps the data' : ''} started ${lane.startedAt} did not finish. Its containers, image or compose may already be gone. Start, Update and Build are refused until Delete is run again.`)}">Delete unfinished</span>`
+                : lane.interrupted
+                  ? `<span class="update-badge danger" title="${escapeHtml(`The last ${laneVerb} (started ${lane.startedAt}) did not finish before the manager last restarted.${lane.wasRunning && bot.status !== 'running' ? ' The bot was running before it; Update or Start brings it back.' : ''}`)}">${laneVerb} unfinished</span>`
+                  : '';
+
             // Fleet DB backup warning (failed or stale sidecar dump)
             const fb = bot.fleetBackup;
             const fbWarnBadge = fb && (fb.lastError || fb.stale)
@@ -1576,7 +1585,7 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${replWarnBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${laneBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${replWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
@@ -1965,6 +1974,9 @@
         if (!keepEnv) msg += res.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
         else if (res.vaulted) msg += '; environment values copied to the vault';
         showMessage('success', msg);
+      } catch (err) {
+        if (err && err.noAnswer) showNoAnswer('delete');
+        else showMessage('error', `Can't confirm the delete: ${err && err.message ? err.message : err}`);
       } finally { busyBots.delete(id); loadBots(); }
     }
 

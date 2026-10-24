@@ -340,6 +340,7 @@ export interface InstanceConfig {
   webUiReady?: boolean;                // true once the bot's web UI pinged back reachable after its last (re)start
   lastStartAt?: number;                // epoch ms of the last (re)start; drives the Open-button grace fallback
   pendingApply?: boolean;              // a build finished while the project ran; Start (in place) or Restart applies it
+  lane?: InstanceLane | null;          // a destructive lane in flight or cut short; null in a browser copy once cleared
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
@@ -352,6 +353,19 @@ export interface InstanceConfig {
   // Metadata
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Written before a lane's first destructive step. An update, restart or build
+ * clears it when it succeeds, as does a successful Start or Stop; a delete's
+ * stands until the record itself is removed. Boot marks a standing one interrupted.
+ */
+export interface InstanceLane {
+  op: 'update' | 'restart' | 'build' | 'delete';
+  wasRunning: boolean;
+  keepData?: boolean;
+  startedAt: string;
+  interrupted?: boolean;
 }
 
 export interface InstanceRegistry {

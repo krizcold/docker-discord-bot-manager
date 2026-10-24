@@ -961,6 +961,8 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  const shared = sharedVolumeReason(fleetDb.volume, botId);
+  if (shared) return { success: false, error: `database volume ${fleetDb.volume} kept: ${shared}; nothing was removed` };
   try {
     // Container and volume go FIRST: if either fails, the compose service is
     // still declared and the record kept, so a retry can start the sidecar
@@ -1644,6 +1646,51 @@ function ownProjectVolumes(botId: string, appName: string): string[] | null {
     .map(([key]) => `${appName}_${key}`);
 }
 
+/** Every volume name a deployed compose declares; [] when there is none, null when it cannot be read. */
+function composeVolumeNames(botId: string, appName: string): string[] | null {
+  let compose: any;
+  try {
+    compose = YAML.parse(fs.readFileSync(resolveComposePath(botId, appName), 'utf-8'));
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? [] : null;
+  }
+  if (compose === null || compose === undefined) return [];
+  if (typeof compose !== 'object') return null;
+  const volumes = compose.volumes;
+  if (volumes === undefined || volumes === null) return [];
+  if (typeof volumes !== 'object' || Array.isArray(volumes)) return null;
+  return Object.entries(volumes).map(([key, v]: [string, any]) => {
+    if (v && typeof v === 'object') {
+      if (typeof v.name === 'string') return v.name;
+      if (v.external) return typeof v.external?.name === 'string' ? v.external.name : key;
+    }
+    return `${appName}_${key}`;
+  });
+}
+
+/**
+ * Why a custom-named volume of `botId` must be kept, or null when no other
+ * instance declares it. The names are derived, so two records can name one
+ * volume (a keep-data delete and a reinstall under the same name, a restored
+ * record); removing it then destroys the other bot's data.
+ */
+function sharedVolumeReason(volume: string, botId: string): string | null {
+  const registry = loadRegistry();
+  if (brokenRegistryLoads.has(registry)) return `the manager can't confirm no other bot uses it (the instance registry cannot be read)`;
+  const others = Object.entries(registry.instances).filter(([id, other]) => id !== botId && other.id !== botId);
+  for (const [id, other] of others) {
+    if (other.fleetDb?.volume === volume || other.fleetDbReplica?.volume === volume || (other.projectVolumes ?? []).includes(volume)) {
+      return `instance ${other.displayName || id} (${id}) uses it`;
+    }
+  }
+  for (const [id, other] of others) {
+    const declared = composeVolumeNames(id, other.sanitizedName);
+    if (declared === null) return `the manager can't confirm no other bot uses it (the compose of instance ${id} cannot be read)`;
+    if (declared.includes(volume)) return `instance ${other.displayName || id} (${id}) declares it in its compose`;
+  }
+  return null;
+}
+
 function recordProjectVolumes(instance: InstanceConfig, declared: string[] | null): void {
   if (declared === null) instance.projectVolumesUnverified = true;
   else instance.projectVolumes = [...new Set([...(instance.projectVolumes ?? []), ...declared])];
@@ -1745,8 +1792,10 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
   // container is compose-managed and went down with the project in step 1.
   if (instance.fleetDb) {
     await rmContainerTolerant(instance.fleetDb.containerName, failures);
-    if (!keepData && !dockerClient.removeVolume(instance.fleetDb.volume)) {
-      failures.push(`database volume ${instance.fleetDb.volume}: docker volume rm reported failure`);
+    if (!keepData) {
+      const shared = sharedVolumeReason(instance.fleetDb.volume, botId);
+      if (shared) failures.push(`database volume ${instance.fleetDb.volume} kept: ${shared}`);
+      else if (!dockerClient.removeVolume(instance.fleetDb.volume)) failures.push(`database volume ${instance.fleetDb.volume}: docker volume rm reported failure`);
     }
   }
 
@@ -1756,8 +1805,10 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
   // PRIMARY's replication slot, which retains WAL over there - warn loudly.
   if (instance.fleetDbReplica) {
     await rmContainerTolerant(instance.fleetDbReplica.containerName, failures);
-    if (!keepData && !dockerClient.removeVolume(instance.fleetDbReplica.volume)) {
-      failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
+    if (!keepData) {
+      const shared = sharedVolumeReason(instance.fleetDbReplica.volume, botId);
+      if (shared) failures.push(`replica volume ${instance.fleetDbReplica.volume} kept: ${shared}`);
+      else if (!dockerClient.removeVolume(instance.fleetDbReplica.volume)) failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
     }
     console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps replication slot ${instance.fleetDbReplica.slot}, which retains WAL until it is dropped there (its Database modal lists the slot with a Drop action once nothing streams on it)`);
   }

@@ -1367,18 +1367,19 @@
 
     // ─── Load & Render Bots ───
     let botsLoadError = null;
+    let botsRetryTimer = null;
     async function loadBots() {
       try {
         const res = await api('GET', '/bots');
         botsLoadError = res.success ? null : (res.error || 'Failed to load bots');
-        bots = res.success ? (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
+        if (res.success) bots = (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
         if (res.success && res.deploymentMode) deploymentMode = res.deploymentMode;
         if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
-        bots = [];
         botsLoadError = 'Failed to load bots: the manager could not be reached';
         showMessage('error', 'Failed to load bots');
       }
+      if (botsLoadError && !botsRetryTimer) botsRetryTimer = setTimeout(() => { botsRetryTimer = null; loadBots(); }, 10000);
       // Clear busy state for bots that have reached a terminal state
       // (safety net in case a WebSocket event was missed)
       for (const bot of bots) {
@@ -1416,6 +1417,7 @@
       }
 
       container.innerHTML = `
+        ${botsLoadError ? `<div class="error-message">Could not load the bot list: ${escapeHtml(botsLoadError)}; retrying. The list below is from the last successful load.</div>` : ''}
         <div class="bot-grid">
           ${bots.map(bot => {
             const botName = bot.displayName || 'Unnamed';
@@ -1926,7 +1928,8 @@
 
         content.innerHTML = `
           <h3>Environment Variables: ${escapeHtml(bot?.displayName || botId)}</h3>
-          ${!res.valid ? `<div class="error-message">Missing required: ${escapeHtml(res.missing.join(', '))}</div>` : ''}
+          ${(res.missing || []).length ? `<div class="error-message">Missing required: ${escapeHtml(res.missing.join(', '))}</div>` : ''}
+          ${(res.undecryptable || []).length ? `<div class="error-message">Stored but cannot be decrypted: ${escapeHtml(res.undecryptable.join(', '))}. Enter the value again, or restore the encryption key.</div>` : ''}
           ${storeHealthBanner(res.storeBroken, 'storage.json', res.corruptCopies, res.secretKeyProblem)}
           <div id="env-editor-rows">${rowsHtml}</div>
           <button class="btn btn-secondary btn-small" onclick="addEnvEditorRow()" style="margin-bottom: 4px;">+ Add Variable</button>
@@ -2637,8 +2640,17 @@
       try {
         const res = await api('GET', `/bots/${botId}/fleet-backups`);
         const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
-        listHtml = backups.length === 0
-          ? '<div class="env-tip">No backups yet. The first dump runs at the scheduled hour.</div>'
+        const emptyText = !fb.enabled
+          ? 'No backups. Daily backup is off, so none will be taken until it is turned on.'
+          : fb.scoped === false
+            ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
+            : fb.scoped === null
+            ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
+            : 'No backups yet. The first dump runs at the scheduled hour.';
+        listHtml = !res.success
+          ? `<div class="error-message">Could not list the backups: ${escapeHtml(res.error || 'unknown error')}</div>`
+          : backups.length === 0
+          ? `<div class="env-tip">${emptyText}</div>`
           : backups.map(b => `
             <div class="env-row" style="align-items:center;">
               <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
@@ -2646,7 +2658,7 @@
               <button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>
             </div>`).join('');
       } catch (err) {
-        listHtml = '<div class="error-message">Failed to load backups</div>';
+        listHtml = '<div class="error-message">Could not list the backups: the manager could not be reached</div>';
       }
 
       const hourOptions = Array.from({ length: 24 }, (_, h) =>
@@ -3265,11 +3277,18 @@
       const body = document.getElementById('fleet-past-backups');
       if (!body || fleetBackupBotId !== botId) return;
       let backups = [];
+      let failure = null;
       try {
         const res = await api('GET', `/bots/${botId}/fleet-backups`);
         if (res.success && Array.isArray(res.backups)) backups = res.backups;
-      } catch (err) { return; }
-      if (!body.isConnected || fleetBackupBotId !== botId || backups.length === 0) return;
+        else failure = res.error || 'unknown error';
+      } catch (err) { failure = 'the manager could not be reached'; }
+      if (!body.isConnected || fleetBackupBotId !== botId) return;
+      if (failure) {
+        body.innerHTML = `<div class="error-message" style="margin-top:14px;">Could not list the earlier database backups: ${escapeHtml(failure)}</div>`;
+        return;
+      }
+      if (backups.length === 0) return;
       body.innerHTML = `
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Earlier database backups</div>
@@ -4169,7 +4188,10 @@
       // Fetch containers for this bot
       try {
         const res = await api('GET', `/bots/${botId}/containers`);
-        if (res.success && res.containers.length > 0) {
+        if (!res.success) {
+          document.getElementById('slp-service-list').innerHTML = `<div style="padding:14px;color:var(--text-muted);font-size:0.82rem;">${escapeHtml(res.error || 'Could not list the containers')}</div>`;
+          document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Could not list the containers, so their state is unknown.</div>';
+        } else if (res.containers.length > 0) {
           logsState.containers = res.containers;
           renderServiceSidebar();
           selectContainer(res.containers[0].name);
@@ -4178,7 +4200,7 @@
           document.getElementById('slp-viewer').innerHTML = '<div class="log-line system">No containers running.</div>';
         }
       } catch (err) {
-        document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Failed to load containers.</div>';
+        document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Could not list the containers: the manager could not be reached.</div>';
       }
 
       // Wire up toolbar buttons
@@ -4305,15 +4327,16 @@
 
     // ─── Source Sidebar ───
     let sourcesLoadError = null;
+    let sourcesRetryTimer = null;
     async function loadSources() {
       try {
         const res = await api('GET', '/sources');
-        sources = res.success ? sortSources(res.sources || []) : [];
+        if (res.success) sources = sortSources(res.sources || []);
         sourcesLoadError = res.success ? null : (res.error || 'Failed to load sources');
       } catch (err) {
-        sources = [];
         sourcesLoadError = 'Failed to load sources: the manager could not be reached';
       }
+      if (sourcesLoadError && !sourcesRetryTimer) sourcesRetryTimer = setTimeout(() => { sourcesRetryTimer = null; loadSources(); }, 10000);
       renderSourceSidebar();
     }
 
@@ -4351,9 +4374,11 @@
       const list = document.getElementById('source-list');
       ensureSourceFetchPolling();
       if (sources.length === 0 && sourcesLoadError) {
-        list.innerHTML = `<div class="source-empty">${escapeHtml(sourcesLoadError)}</div>`;
+        list.innerHTML = `<div class="source-empty">${escapeHtml(sourcesLoadError)}; retrying</div>`;
         return;
       }
+      const sourcesErrorHtml = sourcesLoadError
+        ? `<div class="error-message">Could not load the sources: ${escapeHtml(sourcesLoadError)}; retrying. The list below is from the last successful load.</div>` : '';
       if (sources.length === 0) {
         list.innerHTML = '<div class="source-empty">No sources yet.<br>Click + Add to import a repository.</div>';
         return;
@@ -4365,7 +4390,7 @@
         }
       }
 
-      list.innerHTML = sources.map(s => {
+      list.innerHTML = sourcesErrorHtml + sources.map(s => {
         const isImage = s.sourceType === 'docker-image';
         const pres = sourcePresentation(s);
         const repoName = pres.name;
@@ -4801,10 +4826,15 @@
       if (e.autoWired) return buildAutoWiredRowHtml(e.key, label);
       const current = (e.value !== undefined && e.value !== null) ? e.value : (e.defaultValue || '');
       const value = e.sensitive ? '' : current;
-      const placeholder = e.sensitive
+      const placeholder = e.undecryptable
+        ? 'Stored value cannot be decrypted; enter it again'
+        : e.sensitive
         ? (e.isSet ? 'Sensitive - leave blank to keep current' : 'Sensitive value')
         : (e.placeholder || current || 'Value');
-      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, e.description || '', !!e.sensitive, e);
+      const description = e.undecryptable
+        ? ['The stored value cannot be decrypted.', e.description || ''].join(' ').trim()
+        : (e.description || '');
+      return buildEnvRowHtml(e.key, value, label, !!e.required, placeholder, description, !!e.sensitive, e);
     }
 
     // Consecutive entries sharing a `group` render inside a titled section; rows
@@ -5463,6 +5493,11 @@
         }
 
         const envs = Array.isArray(res.envs) ? res.envs : [];
+        if (envs.length === 0 && res.vaultBroken) {
+          if (detailEl) detailEl.textContent = 'vault.json cannot be read, so envs kept from a removed bot could not be checked. Repair vault.json and try again.';
+          if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
+          return;
+        }
         if (envs.length === 0) {
           if (detailEl) detailEl.textContent = 'No recoverable envs found for this name.';
           if (btn) { btn.disabled = true; btn.textContent = 'None found'; }
@@ -5503,7 +5538,8 @@
           const parts = [];
           if (sources.vault) parts.push(`${sources.vault} from vault`);
           if (sources.compose) parts.push(`${sources.compose} from compose`);
-          detailEl.textContent = `Loaded ${envs.length} env(s) into the form (${parts.join(', ') || 'recovered'}). Review before saving.`;
+          detailEl.textContent = `Loaded ${envs.length} env(s) into the form (${parts.join(', ') || 'recovered'}). Review before saving.`
+            + (res.vaultBroken ? ' vault.json cannot be read, so envs kept from a removed bot were not checked.' : '');
         }
         if (row) row.classList.add('loaded');
         if (btn) { btn.disabled = true; btn.textContent = 'Loaded'; }
@@ -5621,18 +5657,20 @@
     // ─── Credentials Vault ───
     let vaultGroups = [];
     let vaultHealth = {};
+    let vaultLoadError = null;
+    let vaultRetryTimer = null;
     const expandedVaultGroups = new Set(['standalone']);
     let vaultRenderDeferred = false;
 
     async function loadVault() {
       try {
         const res = await api('GET', '/vault');
-        vaultGroups = res.success ? res.groups : [];
-        vaultHealth = res.success ? res : { vaultBroken: false };
+        if (res.success) { vaultGroups = res.groups; vaultHealth = res; }
+        vaultLoadError = res.success ? null : (res.error || 'Failed to load the vault');
       } catch {
-        vaultGroups = [];
-        vaultHealth = {};
+        vaultLoadError = 'the manager could not be reached';
       }
+      if (vaultLoadError && !vaultRetryTimer) vaultRetryTimer = setTimeout(() => { vaultRetryTimer = null; loadVault(); }, 10000);
       renderVault();
     }
 
@@ -5682,7 +5720,12 @@
     }
 
     function paintVault(list) {
-      const health = storeHealthBanner(vaultHealth.vaultBroken, 'vault.json', vaultHealth.corruptCopies, vaultHealth.secretKeyProblem);
+      const health = (vaultLoadError ? `<div class="error-message">Could not load the vault: ${escapeHtml(vaultLoadError)}; retrying.${vaultGroups.length ? ' The list below is from the last successful load.' : ''}</div>` : '')
+        + storeHealthBanner(vaultHealth.vaultBroken, 'vault.json', vaultHealth.corruptCopies, vaultHealth.secretKeyProblem);
+      if (vaultLoadError && vaultGroups.length === 0) {
+        list.innerHTML = health;
+        return;
+      }
       if (vaultGroups.length === 0 || vaultGroups.every(g => g.entries.length === 0 && g.type !== 'standalone')) {
         list.innerHTML = health + '<div class="source-empty">No credentials yet.<br>Install a bot or add standalone entries.</div>';
         return;

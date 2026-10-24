@@ -330,17 +330,25 @@ export function deleteEnvVar(botId: string, key: string): void {
 export function hasRequiredEnvVars(botId: string, tokenVarName?: string): {
   valid: boolean;
   missing: string[];
+  undecryptable: string[];
+  storeBroken: boolean;
 } {
-  const vars = getEnvVars(botId);
+  const { vars, undecryptable, corrupt } = getEnvVarsWithStatus(botId);
+  if (corrupt) return { valid: false, missing: [], undecryptable: [], storeBroken: true };
   const missing: string[] = [];
+  const unreadable: string[] = [];
 
-  if (tokenVarName && (!vars[tokenVarName] || vars[tokenVarName].trim() === '')) {
+  if (tokenVarName && undecryptable.includes(tokenVarName)) {
+    unreadable.push(tokenVarName);
+  } else if (tokenVarName && (!vars[tokenVarName] || vars[tokenVarName].trim() === '')) {
     missing.push(tokenVarName);
   }
 
   return {
-    valid: missing.length === 0,
-    missing
+    valid: missing.length === 0 && unreadable.length === 0,
+    missing,
+    undecryptable: unreadable,
+    storeBroken: false
   };
 }
 

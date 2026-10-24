@@ -14,7 +14,7 @@ import { manifestDeclaredConfigFiles } from '../config/installManifests';
 import {
   detectEnvVars,
   normalizeEnvLabel,
-  getEnvVars,
+  getEnvVarsWithStatus,
   isSensitive,
   DetectedEnvVar,
 } from './manager';
@@ -255,6 +255,7 @@ export interface EditorEnvVar extends EnvFieldMeta {
   sensitive: boolean;
   value: string;   // current value; blank for sensitive (a stored secret never leaves the server)
   isSet: boolean;  // whether a value is currently stored
+  undecryptable?: boolean;  // stored, but the ciphertext no longer decrypts
 }
 
 /**
@@ -269,7 +270,9 @@ export function buildBotEnvList(
   tokenVarName?: string,
   sourceUrl?: string
 ): EditorEnvVar[] {
-  const stored = getEnvVars(botId);
+  const { vars: stored, undecryptable } = getEnvVarsWithStatus(botId);
+  for (const key of undecryptable) stored[key] = '';
+  const unreadable = (key: string) => (undecryptable.includes(key) ? { undecryptable: true } : {});
   const result: EditorEnvVar[] = [];
   const seen = new Set<string>();
 
@@ -290,6 +293,7 @@ export function buildBotEnvList(
       sensitive,
       value: sensitive ? '' : (isSet ? stored[d.key] : d.defaultValue),
       isSet,
+      ...unreadable(d.key),
     });
   }
 
@@ -310,6 +314,7 @@ export function buildBotEnvList(
       sensitive,
       value: sensitive ? '' : value,
       isSet: true,
+      ...unreadable(key),
     });
   }
 

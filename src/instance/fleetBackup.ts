@@ -144,6 +144,13 @@ function backupScopeUnverifiable(instance: InstanceConfig): { corrupt: boolean; 
   return { corrupt, urlUndecryptable: !!urlKey && undecryptable.includes(urlKey) };
 }
 
+/** Null when the stored URL cannot be read, so its scope was never checked. */
+export function fleetBackupScopeState(instance: InstanceConfig): boolean | null {
+  const { corrupt, urlUndecryptable } = backupScopeUnverifiable(instance);
+  if (corrupt || urlUndecryptable) return null;
+  return isFleetBackupScoped(instance);
+}
+
 /**
  * Stale when enabled + in scope and no successful dump within 36h. A never-
  * dumped instance is measured from its creation so a fresh install does not
@@ -409,8 +416,9 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
   let names: string[];
   try {
     names = fs.readdirSync(dir);
-  } catch {
-    return [];
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return [];
+    throw new Error(`The backup folder for ${botId} could not be read: ${err?.message || err}`);
   }
   const out: Array<{ file: string; size: number; mtime: number }> = [];
   for (const name of names) {
@@ -430,7 +438,13 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
  */
 function trimFleetBackups(botId: string, keep: number): void {
   const dir = backupDir(botId);
-  const trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-'));
+  let trimmable: Array<{ file: string }>;
+  try {
+    trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-'));
+  } catch (err) {
+    console.warn(`[FleetBackup] Kept every dump for ${botId}: ${err}`);
+    return;
+  }
   for (const f of trimmable.slice(keep)) {
     try {
       fs.unlinkSync(path.join(dir, f.file));

@@ -218,7 +218,8 @@ export function createVaultRoutes(): Router {
   router.get('/all-values', (req: Request, res: Response) => {
     try {
       const instances = containerManager.getAllBots();
-      const vault = loadVault();
+      const loaded = readVault();
+      const vault = loaded.config;
 
       const values: Array<{ key: string; value: string; source: string }> = [];
 
@@ -246,7 +247,12 @@ export function createVaultRoutes(): Router {
         } catch { /* ignore */ }
       }
 
-      res.json({ success: true, values });
+      res.json({
+        success: true,
+        values,
+        vaultBroken: loaded.state === 'broken',
+        vaultError: loaded.state === 'broken' ? loaded.error : undefined,
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

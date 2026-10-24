@@ -116,7 +116,7 @@ describe('vault re-render keeps a row being edited', () => {
     });
     const ctx = runPage(['renderVault', 'captureVaultEdits', 'restoreVaultEdits', 'paintVault'], {
       vaultGroups: [{ id: 'b1', type: 'instance', name: 'Bot', entries: newKeys.map(k => ({ key: k, value: '', hidden: true, masked: '***' })) }],
-      vaultHealth: {}, expandedVaultGroups: new Set(['b1']), vaultRenderDeferred: false,
+      vaultHealth: {}, vaultLoadError: null, expandedVaultGroups: new Set(['b1']), vaultRenderDeferred: false,
       storeHealthBanner: () => '', escapeHtml: (s: string) => s, jsArg: (s: string) => JSON.stringify(s),
       showMessage: (t: string, m: string) => messages.push([t, m]),
       document: { getElementById: (id: string) => (id === 'vault-list' ? list : addRow[id] || null), activeElement: active },
@@ -152,7 +152,7 @@ describe('vault edits after review', () => {
     const list = el({ querySelectorAll: (s: string) => (s === '.vault-entry' ? [row] : []) });
     const ctx = runPage(['renderVault', 'captureVaultEdits', 'restoreVaultEdits', 'paintVault'], {
       vaultGroups: [{ id: 'b1', type: 'instance', name: 'Bot', entries: [{ key: 'TOKEN', value: '', hidden: true, masked: '***' }] }],
-      vaultHealth: {}, expandedVaultGroups: new Set(), vaultRenderDeferred: false,
+      vaultHealth: {}, vaultLoadError: null, expandedVaultGroups: new Set(), vaultRenderDeferred: false,
       storeHealthBanner: () => '', escapeHtml: (s: string) => s, jsArg: (s: string) => JSON.stringify(s),
       showMessage: (t: string, m: string) => messages.push([t, m]),
       document: { getElementById: (id: string) => (id === 'vault-list' ? list : null), activeElement: null },
@@ -167,7 +167,7 @@ describe('vault edits after review', () => {
     const doc = { getElementById: (id: string) => (id === 'vault-list' ? list : id === 'vault-new-key' ? newKey : id === 'vault-new-value' ? newValue : null), activeElement: null };
     const ctx: any = runPage(['addVaultEntry', 'renderVault', 'captureVaultEdits', 'restoreVaultEdits', 'paintVault'], {
       vaultGroups: [{ id: 's', type: 'standalone', name: 'Standalone', entries: [{ key: 'NEWKEY', value: 'v1', hidden: false }] }],
-      vaultHealth: {}, expandedVaultGroups: new Set(['s']), vaultRenderDeferred: false, newVaultHidden: false,
+      vaultHealth: {}, vaultLoadError: null, expandedVaultGroups: new Set(['s']), vaultRenderDeferred: false, newVaultHidden: false,
       storeHealthBanner: () => '', escapeHtml: (s: string) => s, jsArg: (s: string) => JSON.stringify(s),
       showMessage: () => {}, api: async () => ({ success: true }), document: doc,
     });

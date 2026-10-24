@@ -23,7 +23,7 @@ import * as fleetReplica from '../../instance/fleetReplica';
 import * as recoveryChannel from '../../instance/recoveryChannel';
 import * as recoveryRescue from '../../instance/recoveryRescue';
 import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
-import { loadVault, saveVault, vaultFileBroken } from './vault';
+import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode } from '../../types';
@@ -112,11 +112,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           lastAt: bot.lastFleetBackupAt || null,
           stale: fleetBackup.isFleetBackupStale(bot),
           lastError: fleetBackup.getFleetBackupError(bot.id),
+          scoped: fleetBackup.fleetBackupScopeState(bot),
           ...fleetBackup.effectiveFleetBackup(bot),
         } : null;
         // A decommissioned database's safety dump must stay reachable: this
         // is the Database button's only reason to render once fleetDb is gone.
-        const hasDbBackups = bot.fleetDb ? undefined : fleetBackup.listFleetBackups(bot.id).length > 0;
+        let hasDbBackups: boolean | undefined;
+        if (!bot.fleetDb) {
+          try { hasDbBackups = fleetBackup.listFleetBackups(bot.id).length > 0; } catch { hasDbBackups = true; }
+        }
 
         return {
           ...publicBot(bot)!,
@@ -834,6 +838,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const appName = bot.sanitizedName;
       const containers = await dockerClient.listProjectContainers(appName);
+      if (!containers) {
+        res.status(503).json({ success: false, error: 'Docker did not answer, so the containers of this bot could not be listed' });
+        return;
+      }
       res.json({ success: true, containers, appName });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1021,6 +1029,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         tokenVarName: bot.tokenVarName,
         valid: validation.valid,
         missing: validation.missing,
+        undecryptable: validation.undecryptable,
         storeBroken: envManager.getEnvVarsWithStatus(req.params.id).corrupt,
         corruptCopies: listCorruptCopies(storePath),
         secretKeyProblem: envManager.secretKeyProblem(),
@@ -2236,7 +2245,8 @@ export function createValidationRoutes(): Router {
 
       // Source 1: newest deleted-bot vault group matching this name
       const fromVault: Record<string, string> = {};
-      const matchingGroup = loadVault().deletedBots
+      const vaultLoad = readVault();
+      const matchingGroup = vaultLoad.config.deletedBots
         .filter(g => g.sanitizedName === targetSanitized)
         .sort((a, b) => b.deletedAt - a.deletedAt)[0];
       for (const entry of matchingGroup?.entries || []) {
@@ -2271,6 +2281,7 @@ export function createValidationRoutes(): Router {
           vault: Object.keys(fromVault).length,
           compose: Object.keys(fromCompose).length,
         },
+        vaultBroken: vaultLoad.state === 'broken',
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error), envs: [] });

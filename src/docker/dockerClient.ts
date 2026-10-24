@@ -761,7 +761,7 @@ export async function composeDown(
  */
 export async function listProjectContainers(
   projectName: string
-): Promise<Array<{ name: string; state: string; status: string }>> {
+): Promise<Array<{ name: string; state: string; status: string }> | null> {
   const format = '{{.Names}}\t{{.State}}\t{{.Status}}';
   let output = '';
   try {
@@ -776,7 +776,7 @@ export async function listProjectContainers(
         { timeout: 10000 }
       );
     } catch {
-      output = '';
+      return null;
     }
   }
   return output

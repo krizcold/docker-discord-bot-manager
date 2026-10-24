@@ -93,7 +93,8 @@ async function runInstanceUpdateTick(): Promise<void> {
 
       if (!source || !source.lastCommitHash) continue;
       if (!bot.lastBuiltCommit) continue;
-      if (bot.lastBuiltCommit === source.lastCommitHash) continue;
+      const head = await sourceManager.readSourceHead(bot.sourceId);
+      if (!head || bot.lastBuiltCommit === head) continue;
 
       // Mismatch detected: auto-rebuild
       console.log(`[InstanceUpdater] Instance ${bot.displayName} (${bot.id}) is behind source; triggering auto-rebuild`);

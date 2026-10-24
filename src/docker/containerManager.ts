@@ -3503,13 +3503,19 @@ function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord): void {
   instance.fleetDb = record;
 }
 
-async function buildGitInstance(
+function buildGitInstance(instance: InstanceConfig, emit: EmitFn, isCasaOS: boolean): Promise<LaneResult> {
+  if (!instance.sourceId) return buildGitInstanceHeld(instance, emit, isCasaOS);
+  return sourceManager.withSourceLock(instance.sourceId, () => buildGitInstanceHeld(instance, emit, isCasaOS));
+}
+
+async function buildGitInstanceHeld(
   instance: InstanceConfig,
   emit: EmitFn,
   isCasaOS: boolean,
 ): Promise<LaneResult> {
   const botId = instance.id;
   let commitUnrecorded: string | null = null;
+  let pinnedCommit: string | null = null;
 
   // Resolve source repo path: fetch from origin first so build uses latest commits
   let repoPath: string;
@@ -3517,15 +3523,17 @@ async function buildGitInstance(
     repoPath = sourceManager.getSourceRepoPath(instance.sourceId);
     emit('[Fetch] Pulling latest commits from origin...', 'info');
     try {
-      const fetchResult = await sourceManager.fetchSource(instance.sourceId);
+      const fetchResult = await sourceManager.fetchSourceHeld(instance.sourceId);
       if (fetchResult.hasUpdates) {
         emit(`[Fetch] Source updated with ${fetchResult.behindBy} new commit(s)`, 'success');
       } else {
         emit('[Fetch] Source already up to date', 'info');
       }
+      if (fetchResult.copyError) emit(`[Fetch] Warning: ${fetchResult.copyError}`, 'warning');
     } catch (err: any) {
       emit(`[Fetch] Warning: could not fetch from origin (${err?.message || err}); building from local repo`, 'warning');
     }
+    pinnedCommit = await sourceManager.readSourceHead(instance.sourceId);
     if (!fs.existsSync(repoPath)) {
       emit('[Error] Source repository not found', 'error');
       await stampFailureFromDocker(botId, instance.status);
@@ -3770,8 +3778,7 @@ async function buildGitInstance(
       try {
         const simpleGit = require('simple-git').simpleGit;
         const git = simpleGit(repoPath);
-        const log = await git.log({ maxCount: 1 });
-        if (log.latest?.hash) resolvedCommit = log.latest.hash;
+        resolvedCommit = pinnedCommit;
         const br = await git.revparse(['--abbrev-ref', 'HEAD']);
         resolvedBranch = (br || '').trim() || null;
       } catch {
@@ -3836,15 +3843,13 @@ async function buildGitInstance(
   // baked badge agree. Prefer the value baked into the image; otherwise (no
   // build target) read the repo, then the source registry.
   if (instance.sourceId) {
-    let recordCommit = resolvedCommit;
-    if (!recordCommit) {
-      try {
-        const simpleGit = require('simple-git').simpleGit;
-        const log = await simpleGit(repoPath).log({ maxCount: 1 });
-        recordCommit = log.latest?.hash || null;
-      } catch {
-        recordCommit = sourceManager.getSource(instance.sourceId)?.lastCommitHash || null;
-      }
+    let recordCommit = pinnedCommit;
+    const headNow = await sourceManager.readSourceHead(instance.sourceId);
+    if (!pinnedCommit) {
+      commitUnrecorded = 'the built commit: the commit of the source checkout could not be read';
+    } else if (headNow !== pinnedCommit) {
+      commitUnrecorded = `the built commit: the source moved from ${pinnedCommit.substring(0, 7)} to ${headNow ? headNow.substring(0, 7) : 'an unreadable commit'} during the build; build again`;
+      recordCommit = null;
     }
     if (recordCommit) {
       try {

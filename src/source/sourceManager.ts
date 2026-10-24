@@ -152,7 +152,9 @@ function copyDirSync(src: string, dest: string): void {
   for (const entry of entries) {
     const srcPath = path.join(src, entry.name);
     const destPath = path.join(dest, entry.name);
-    if (entry.isDirectory()) {
+    if (entry.isSymbolicLink()) {
+      fs.symlinkSync(fs.readlinkSync(srcPath), destPath);
+    } else if (entry.isDirectory()) {
       if (entry.name === '.git') continue;
       copyDirSync(srcPath, destPath);
     } else {
@@ -340,10 +342,68 @@ export function updateSource(sourceId: string, update: UpdateSourceRequest): Sou
 
 // ─── Git Operations ───
 
+const sourceLocks = new Map<string, Promise<unknown>>();
+
+/**
+ * Run fn while no other holder can fetch, reset or build from this source's checkout.
+ */
+export function withSourceLock<T>(sourceId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = sourceLocks.get(sourceId) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  sourceLocks.set(sourceId, tail);
+  tail.then(() => { if (sourceLocks.get(sourceId) === tail) sourceLocks.delete(sourceId); });
+  return run;
+}
+
+/** The checkout's HEAD commit, or null when it cannot be read. */
+export async function readSourceHead(sourceId: string): Promise<string | null> {
+  const repoPath = getSourceRepoPath(sourceId);
+  if (!fs.existsSync(path.join(repoPath, '.git'))) return null;
+  try {
+    const hash = String(await simpleGit(repoPath).revparse(['HEAD'])).trim();
+    return /^[0-9a-f]{7,64}$/i.test(hash) ? hash : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface FetchResult {
+  hasUpdates: boolean;
+  behindBy: number;
+  /** Set when the checkout moved but its raw or compose copy failed. */
+  copyError?: string;
+}
+
+function refreshSourceCopies(sourceId: string, repoPath: string, headHash: string | null): string | undefined {
+  const at = headHash ? headHash.substring(0, 7) : 'an unread commit';
+  const faults: string[] = [];
+  try {
+    createSourceRawBackup(sourceId);
+  } catch (err: any) {
+    faults.push(`the raw copy of the source at ${at} failed: ${err?.message || err}`);
+  }
+  try {
+    const composePath = hasExistingCompose(repoPath);
+    if (composePath) fs.writeFileSync(getOriginalComposePath(sourceId), fs.readFileSync(composePath, 'utf-8'));
+  } catch (err: any) {
+    faults.push(`the compose copy of the source at ${at} failed: ${err?.message || err}`);
+  }
+  if (faults.length === 0) return undefined;
+  const copyError = `The source moved to ${at}, but ${faults.join('; ')}`;
+  console.error(`[SourceManager] Source ${sourceId}: ${copyError}`);
+  return copyError;
+}
+
 /**
  * Fetch source repo and pull if behind. Returns whether updates were found.
  */
-export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boolean; behindBy: number }> {
+export function fetchSource(sourceId: string): Promise<FetchResult> {
+  return withSourceLock(sourceId, () => fetchSourceHeld(sourceId));
+}
+
+/** fetchSource for a caller that already holds withSourceLock for this source. */
+export async function fetchSourceHeld(sourceId: string): Promise<FetchResult> {
   const source = getSource(sourceId);
   if (!source) throw new Error(`Source ${sourceId} not found`);
 
@@ -361,15 +421,7 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
       recordCloneFailure(sourceId, withoutCredential(String(err?.message || err), source.url));
       throw err;
     }
-    createSourceRawBackup(sourceId);
 
-    // Save original compose if exists
-    const composePath = hasExistingCompose(repoPath);
-    if (composePath) {
-      fs.writeFileSync(getOriginalComposePath(sourceId), fs.readFileSync(composePath, 'utf-8'));
-    }
-
-    // Update registry with initial commit info
     const headCommit = await readHeadCommit(repoPath);
     const registry = loadSourceRegistry();
     const s = registry.sources[sourceId];
@@ -386,7 +438,8 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
       saveSourceRegistry(registry);
     }
 
-    return { hasUpdates: false, behindBy: 0 };
+    const copyError = refreshSourceCopies(sourceId, repoPath, headCommit?.hash || null);
+    return copyError ? { hasUpdates: false, behindBy: 0, copyError } : { hasUpdates: false, behindBy: 0 };
   }
 
   const git: SimpleGit = gitFor(source.url, repoPath);
@@ -405,24 +458,14 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     await git.raw(['reset', '--hard', `origin/${source.branch}`]);
     await git.raw(['clean', '-fd']);
 
-    // Update raw backup
-    createSourceRawBackup(sourceId);
-
-    // Update original compose if exists
-    const composePath = hasExistingCompose(repoPath);
-    if (composePath) {
-      const composeContent = fs.readFileSync(composePath, 'utf-8');
-      fs.writeFileSync(getOriginalComposePath(sourceId), composeContent);
-    }
-
-    // Update registry
+    // Recorded before the copies, which can throw, so the registry never names a commit the checkout left.
     const headCommit = await readHeadCommit(repoPath);
     const registry = loadSourceRegistry();
     const s = registry.sources[sourceId];
     if (s) {
-      s.lastCommitHash = headCommit?.hash || s.lastCommitHash;
-      s.lastCommitMessage = headCommit?.message || s.lastCommitMessage;
-      s.lastCommitDate = headCommit?.date || s.lastCommitDate;
+      s.lastCommitHash = headCommit?.hash || null;
+      s.lastCommitMessage = headCommit?.message || null;
+      s.lastCommitDate = headCommit?.date || null;
       s.lastChecked = new Date().toISOString();
       s.composeName = extractComposeName(repoPath);
       s.updatedAt = new Date().toISOString();
@@ -430,6 +473,8 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     }
 
     console.log(`[SourceManager] Source ${sourceId} updated to ${headCommit?.hash?.substring(0, 7) || 'unknown'}`);
+    const copyError = refreshSourceCopies(sourceId, repoPath, headCommit?.hash || null);
+    if (copyError) return { hasUpdates: behindBy > 0, behindBy, copyError };
   } else {
     // Just update lastChecked
     const registry = loadSourceRegistry();

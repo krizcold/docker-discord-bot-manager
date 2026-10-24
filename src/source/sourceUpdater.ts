@@ -40,6 +40,9 @@ async function runSourceUpdateCycle(): Promise<void> {
 
     try {
       const result = await sourceManager.fetchSource(source.id);
+      if (result.copyError && broadcastFn) {
+        broadcastFn('source:copy-failed', { id: source.id, error: result.copyError });
+      }
 
       if (result.hasUpdates) {
         console.log(`[SourceUpdater] Source ${source.id} updated (${result.behindBy} new commits pulled)`);

@@ -22,6 +22,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 vi.mock('../../src/source/sourceManager', () => ({
   getAllSources: () => [...st.sources.values()].map(s => ({ ...s })),
   getSource: (id: string) => (st.sources.has(id) ? { ...st.sources.get(id) } : null),
+  readSourceHead: async (id: string) => st.sources.get(id)?.lastCommitHash ?? null,
   fetchSource: async (id: string) => {
     st.fetched.push(id);
     if (st.fetchGate) await st.fetchGate;

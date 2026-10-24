@@ -1230,6 +1230,14 @@
             showMessage('error', `Source fetch failed for ${failedName}: ${payload?.error || 'unknown error'}`);
             break;
           }
+          case 'source:copy-failed': {
+            const copySource = sources.find(s => s.id === id);
+            const copyName = copySource ? sourcePresentation(copySource).name : (id || 'unknown source');
+            showMessage('error', `${copyName}: ${payload?.error || 'the copy of the source failed'}`);
+            loadSources();
+            loadBots();
+            break;
+          }
 
           // Interactive console (multiplexed on this socket)
           case 'terminal:data':
@@ -4505,7 +4513,11 @@
     async function fetchSource(id) {
       try {
         const res = await api('POST', `/sources/${id}/fetch`);
-        if (res.success) {
+        if (res.success && res.copyError) {
+          showMessage('error', res.copyError);
+          loadSources();
+          loadBots();
+        } else if (res.success) {
           showMessage('success', res.hasUpdates ? 'Source updated with new commits' : 'Source is up to date');
           loadSources();
           loadBots();

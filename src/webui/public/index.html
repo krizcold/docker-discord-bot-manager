@@ -955,16 +955,23 @@
         if (!v || !v.success) { set(''); return; }
         lastManagerVersion = v;
         if (!v.supported) {
-          set(v.currentCommit ? `<span style="opacity:0.6;">v${v.currentCommit}</span>` : '');
+          set(v.currentCommit ? `<span style="opacity:0.6;">${v.stamped === false ? 'unstamped build' : `v${v.currentCommit}`}</span>` : '');
           if (v.reason) el.title = v.reason;
           return;
         }
-        let html = `<span style="opacity:0.6;">v${v.currentCommit || '?'}</span>`;
-        if (v.updateAvailable) {
-          html += ` <span class="update-badge">${v.behindBy > 0 ? `${v.behindBy} behind` : 'build behind the checkout'}</span>`
+        let html = v.stamped
+          ? `<span style="opacity:0.6;">v${v.currentCommit || '?'}</span>`
+          : `<span style="opacity:0.6;" title="This build carries no commit stamp; the checkout is at ${escapeHtml(v.repoCommit || '?')}">unstamped build</span>`;
+        if (v.checked === false) {
+          html += ` <span style="opacity:0.6;">could not check for updates: ${escapeHtml(v.fetchError || 'git fetch failed')}</span>`;
+        }
+        if (v.updateAvailable && !v.updateInProgress) {
+          const why = v.behindBy > 0 ? `${v.behindBy} behind` : v.buildStale ? 'build behind the checkout' : 'stack not applied';
+          html += ` <span class="update-badge">${why}</span>`
                 + ` <button class="btn btn-primary btn-small" onclick="updateManager()">Update manager</button>`;
         }
         set(html);
+        if (v.updateInProgress && !managerUpdating) joinManagerUpdate('An update is running; following it...');
       } catch { set(''); }
     }
 
@@ -990,44 +997,73 @@
       document.getElementById('manager-update-title').textContent = title;
       document.getElementById('manager-update-close').disabled = false;
       managerUpdating = false;
+      clearInterval(managerUpdatePoll);
+      managerUpdatePoll = null;
       document.getElementById('manager-updating-pill').classList.add('hidden');
       showMessage(ok ? 'success' : 'error', toast);
     }
 
-    // A ws reconnect during an update can mean three things; the server's bootId
-    // (new per process) and commit tell them apart.
-    async function resolveManagerReconnect() {
+    let managerUpdatePoll = null;
+    function startManagerUpdatePoll() {
+      if (managerUpdatePoll) return;
+      managerUpdatePoll = setInterval(() => { if (managerUpdating) resolveManagerReconnect(true); }, 5000);
+    }
+
+    function joinManagerUpdate(line) {
+      managerUpdating = true;
+      managerUpdateBaseline = lastManagerVersion ? { bootId: lastManagerVersion.bootId, opId: null } : null;
+      document.getElementById('manager-update-log').textContent = '';
+      document.getElementById('manager-update-title').textContent = 'Updating Bot Manager';
+      openManagerUpdateModal();
+      appendManagerLog(line);
+      startManagerUpdatePoll();
+    }
+
+    // The outcome of an update comes from the server's lastUpdate: a process that
+    // restarted judges the recorded target against its own build stamp.
+    function finishFromLastUpdate(lu) {
+      if (lu.state === 'applied') {
+        finishManagerUpdate(true, lu.message || 'Updated.', 'Bot Manager updated', 'Bot Manager updated');
+        reloadWhenSafe();
+      } else if (lu.state === 'noop') {
+        finishManagerUpdate(true, lu.message || 'Nothing to apply.', 'Nothing to apply', 'Bot Manager: nothing to apply');
+      } else if (lu.state === 'unstamped' || lu.state === 'unknown') {
+        finishManagerUpdate(false, lu.message, 'Update outcome unknown', 'Manager update: outcome unknown');
+        reloadWhenSafe();
+      } else {
+        finishManagerUpdate(false, lu.message || 'The update did not finish.', 'Update did not apply', 'Manager update did not apply');
+      }
+    }
+
+    // Called on a ws reconnect and by the poll while an update runs.
+    async function resolveManagerReconnect(quiet) {
       let v = null;
       try { v = await api('GET', '/manager/version'); } catch { /* gateway may still be bouncing */ }
       const base = managerUpdateBaseline;
       // A full-stack update recreates Caddy/Authelia too, so the version probe can
-      // hit a 502 before the gateway is back. Don't conclude anything yet - the ws
-      // onclose backoff keeps retrying and will call us again once it answers.
+      // hit a 502 before the gateway is back; the poll and the ws retry call again.
       if (!v || !v.success) {
-        appendManagerLog('Reconnected - waiting for the gateway to come back...');
+        if (!quiet) appendManagerLog('Reconnected - waiting for the gateway to come back...');
         return;
       }
+      const lu = v.lastUpdate;
+      const ours = lu && (!base || !base.opId || lu.opId === base.opId);
       if (base && v.bootId === base.bootId) {
-        appendManagerLog('Reconnected - update still in progress...');
+        if (!v.updateInProgress && ours && ['applied', 'noop', 'failed', 'unknown'].includes(lu.state)) finishFromLastUpdate(lu);
+        else if (!quiet) appendManagerLog('Reconnected - update still in progress...');
         return;
       }
-      if (base && v.currentCommit === base.commit) {
-        finishManagerUpdate(false,
-          'Manager restarted but the version did not change - the update may not have applied',
-          'Update failed', 'Manager update failed');
+      if (ours && ['running', 'restarting', 'pending'].includes(lu.state)) {
+        if (!quiet) appendManagerLog(lu.message || 'Reconnected - update still in progress...');
         return;
       }
-      // No baseline captured (the version probe never succeeded before the update), so
-      // we cannot confirm the bootId/commit actually changed - don't claim success;
-      // just reload once the gateway is back to resync against the running manager.
-      if (!base) {
-        appendManagerLog('Reconnected (no update baseline captured).');
-        reloadWhenSafe();
+      if (ours) {
+        finishFromLastUpdate(lu);
         return;
       }
-      // New process + new commit: the update took. Reload so the browser fetches the
-      // freshly-built SPA (assets may have changed) instead of running stale code.
-      finishManagerUpdate(true, 'Updated.', 'Bot Manager updated', 'Bot Manager updated');
+      finishManagerUpdate(false,
+        'The manager restarted but recorded no outcome for this update, so whether it applied cannot be confirmed.',
+        'Update outcome unknown', 'Manager update: outcome unknown');
       reloadWhenSafe();
     }
 
@@ -1055,25 +1091,24 @@
     async function updateManager() {
       if (managerUpdating) return;
       if (!confirm('Update the Bot Manager now? It will rebuild and restart - the UI will briefly disconnect and reconnect.')) return;
-      managerUpdating = true;
-      managerUpdateBaseline = lastManagerVersion
-        ? { commit: lastManagerVersion.currentCommit, bootId: lastManagerVersion.bootId }
-        : null;
+      joinManagerUpdate('Starting update...');
       const title = document.getElementById('manager-update-title');
-      document.getElementById('manager-update-log').textContent = '';
-      title.textContent = 'Updating Bot Manager';
-      openManagerUpdateModal();
-      appendManagerLog('Starting update...');
       try {
         const res = await api('POST', '/manager/update');
-        if (!res || !res.success) {
-          appendManagerLog('Error: ' + ((res && res.error) || 'could not start update'));
-          title.textContent = 'Update failed';
-          managerUpdating = false;
+        if (res && res.success) {
+          if (managerUpdateBaseline) managerUpdateBaseline.opId = res.opId;
+          return;
         }
+        if (res && res.inProgress) {
+          appendManagerLog('An update is already running; following it.');
+          return;
+        }
+        appendManagerLog('Error: ' + ((res && res.error) || 'could not start update'));
+        title.textContent = 'Update not started';
+        finishManagerUpdate(false, 'Nothing was changed.', 'Update not started', 'Manager update not started');
       } catch (err) {
         appendManagerLog('Error: ' + err);
-        managerUpdating = false;
+        finishManagerUpdate(false, 'Whether the update started cannot be confirmed; check the version again.', 'Update outcome unknown', 'Manager update: outcome unknown');
       }
     }
 
@@ -1214,14 +1249,8 @@
           case 'manager:update-started':
             // In the initiating tab managerUpdating is set before the POST, so this only fires elsewhere
             if (managerUpdating) break;
-            managerUpdating = true;
-            managerUpdateBaseline = lastManagerVersion
-              ? { commit: lastManagerVersion.currentCommit, bootId: lastManagerVersion.bootId }
-              : null;
-            document.getElementById('manager-update-log').textContent = '';
-            document.getElementById('manager-update-title').textContent = 'Updating Bot Manager';
-            openManagerUpdateModal();
-            appendManagerLog('Update started from another session...');
+            joinManagerUpdate('Update started from another session...');
+            if (managerUpdateBaseline) managerUpdateBaseline.opId = payload?.opId || null;
             break;
           case 'manager:log':
             appendManagerLog(payload?.line || '');
@@ -1230,8 +1259,13 @@
             appendManagerLog('Manager restarting - waiting for it to come back...');
             document.getElementById('manager-update-title').textContent = 'Restarting Bot Manager...';
             break;
+          case 'manager:update-pending':
+            appendManagerLog(payload?.message || 'The recreate is still running; this page reconnects when it finishes.');
+            document.getElementById('manager-update-title').textContent = 'Recreate still running';
+            break;
           case 'manager:update-complete':
-            finishManagerUpdate(true, payload?.message || 'Update complete.', 'Up to date', 'Bot Manager is up to date');
+            if (payload?.state === 'applied') finishManagerUpdate(true, payload.message || 'Update applied.', 'Bot Manager updated', 'Bot Manager updated');
+            else finishManagerUpdate(true, payload?.message || 'Nothing to apply.', 'Nothing to apply', 'Bot Manager: nothing to apply');
             loadManagerVersion();
             break;
           case 'manager:update-failed':

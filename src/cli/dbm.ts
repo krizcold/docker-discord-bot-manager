@@ -21,7 +21,7 @@ Bots:     bots list | info <id> | create (--source <id>|--image <ref> --name N) 
 Env:      env get <id> | set <id> KEY=VAL [KEY=VAL ...] | unset <id> KEY
 Config:   config get <id> | set <id> --body '{"files":[...]}'
 Vault:    vault list | values | set <key> <value> | update <key> <value> | rm <key>
-Manager:  manager version | manager update | deployment | health
+Manager:  manager version | manager update [--wait] | deployment | health
 Raw:      api <METHOD> <path> [--body JSON]
           events [--filter PREFIX] [--timeout S]
           wait --get <path> --until <expr> [--interval MS] [--timeout S]

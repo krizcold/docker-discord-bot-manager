@@ -80,6 +80,84 @@ async function lifecycle(
   process.exit(outcome.ok ? EXIT_OK : EXIT_ERR);
 }
 
+interface ManagerVersionBody { bootId?: string; lastUpdate?: { opId?: string; state?: string; message?: string } | null }
+
+/**
+ * Manager self-update. Without --wait it reports only that the manager accepted the
+ * update. With --wait it waits for this update's terminal event, or, when the
+ * manager restarts, for a new bootId whose lastUpdate judges this update.
+ */
+export async function managerUpdate(ctx: Ctx, pollMs = 3000): Promise<void> {
+  if (!ctx.flags.wait) {
+    const res = await ctx.client.request('POST', '/api/manager/update');
+    const b = res.body as { success?: boolean; message?: string } | null;
+    if (res.ok && b && b.success !== false) {
+      if (jsonMode(ctx.flags)) printJson({ ...b, accepted: true, finished: false });
+      else process.stdout.write(`accepted: ${b.message || 'manager update started'}; not finished yet (--wait to block, or dbm manager version)\n`);
+      process.exit(EXIT_OK);
+    }
+    return emit(res, ctx.flags);
+  }
+  const before = await ctx.client.request('GET', '/api/manager/version');
+  const bootId = (before.body as ManagerVersionBody | null)?.bootId;
+  if (!before.ok || !bootId) fail('could not read the manager version before the update', EXIT_ERR);
+  const deadline = Date.now() + timeoutMs(ctx, 15 * 60_000);
+  const done = (ok: boolean, type: string, data: { message?: string; error?: string } | null): never => {
+    if (jsonMode(ctx.flags)) printJson({ success: ok, event: { type, data } });
+    else process.stdout.write(`${type}${data?.message || data?.error ? `: ${data.message || data.error}` : ''}\n`);
+    process.exit(ok ? EXIT_OK : EXIT_ERR);
+  };
+  let opId = '';
+  let post: 'none' | 'sent' | 'answered' = 'none';
+  const dropped = await new Promise<boolean>((resolve) => {
+    const conn = ctx.client.openWs(
+      (msg) => {
+        const d = msg.data as { opId?: string; state?: string; message?: string; error?: string } | null;
+        if (!opId || !d || d.opId !== opId) return;
+        if (msg.type === 'manager:update-complete') { conn.close(); done(d.state !== 'failed', msg.type, d); }
+        if (msg.type === 'manager:update-failed') { conn.close(); done(false, msg.type, d); }
+        if (msg.type === 'manager:update-pending') { conn.close(); resolve(true); }
+      },
+      () => {
+        post = 'sent';
+        ctx.client.request('POST', '/api/manager/update').then((res) => {
+          post = 'answered';
+          const b = res.body as { success?: boolean; error?: string; opId?: string } | null;
+          if (!res.ok || !b || b.success === false || typeof b.opId !== 'string') {
+            conn.close();
+            fail(b?.error || `HTTP ${res.status}`, EXIT_ERR);
+          }
+          opId = b.opId as string;
+        }, (err) => { conn.close(); fail(String(err), EXIT_ERR); });
+      },
+      (reason) => {
+        if (post === 'none') fail(`could not open the event stream (${reason}); no update was started`, EXIT_ERR);
+        if (post === 'sent') fail(`the event stream closed (${reason}) before the manager answered, so whether the update started cannot be confirmed (dbm manager version)`, EXIT_ERR);
+        resolve(opId !== '');
+      },
+    );
+    setTimeout(() => { conn.close(); resolve(false); }, Math.max(0, deadline - Date.now()));
+  });
+  if (!dropped) fail('no outcome before the timeout; the update may still be running (dbm manager version)', EXIT_TIMEOUT);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, pollMs));
+    let v: ManagerVersionBody | null = null;
+    try { v = (await ctx.client.request('GET', '/api/manager/version')).body as ManagerVersionBody | null; } catch { continue; }
+    if (!v || !v.bootId) continue;
+    const lu = v.lastUpdate;
+    if (v.bootId === bootId) {
+      if (lu && lu.opId === opId && ['applied', 'noop', 'failed', 'unknown'].includes(lu.state || '')) done(lu.state === 'applied' || lu.state === 'noop', `manager:${lu.state}`, lu);
+      continue;
+    }
+    if (!lu || lu.opId !== opId) {
+      return done(false, 'manager:restarted', { error: 'the manager restarted but recorded no outcome for this update, so whether it applied cannot be confirmed' });
+    }
+    if (lu.state === 'running' || lu.state === 'restarting' || lu.state === 'pending') continue;
+    done(lu.state === 'applied', `manager:${lu.state}`, lu);
+  }
+  fail('the manager did not come back with an outcome before the timeout (dbm manager version)', EXIT_TIMEOUT);
+}
+
 /**
  * Stream an SSE route. A build-log stream ends on its own terminal frame: done or
  * idle exits 0, failed exits 1, and a stream that ends or times out without one exits
@@ -231,8 +309,16 @@ const HANDLERS: Record<string, Handler> = {
   'vault rm': (c) => simple(c, 'DELETE', `/api/vault/standalone/${encodeURIComponent(need(c, 0, 'key'))}`),
 
   // --- manager ---
-  'manager version': (c) => simple(c, 'GET', '/api/manager/version'),
-  'manager update': (c) => simple(c, 'POST', '/api/manager/update'),
+  'manager version': async (c) => {
+    const res = await c.client.request('GET', '/api/manager/version');
+    const b = res.body as { success?: boolean; checked?: boolean; fetchError?: string } | null;
+    if (res.ok && b && b.success !== false && b.checked === false) {
+      printJson(b);
+      fail(`could not check for updates: ${b.fetchError || 'git fetch failed'}`, EXIT_ERR);
+    }
+    emit(res, c.flags);
+  },
+  'manager update': (c) => managerUpdate(c),
   deployment: (c) => simple(c, 'GET', '/api/system/deployment'),
   health: (c) => simple(c, 'GET', '/api/health'),
 

@@ -47,6 +47,7 @@ describe('manager self-update never reloads over an open editor', () => {
       managerUpdateBaseline: { commit: 'a', bootId: '1' },
       api: async () => ({ success: true, bootId: '2', currentCommit: 'b' }),
       showMessage: () => {},
+      clearInterval: () => {}, managerUpdatePoll: null,
       setTimeout: (f: Function) => timers.push(f),
       window: { location: { reload: () => reloads.push(1) } },
       document: {

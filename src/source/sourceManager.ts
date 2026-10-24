@@ -134,7 +134,7 @@ function gitFor(url: string, repoPath?: string): SimpleGit {
 }
 
 /** An error text with the URL's credential, raw or encoded, replaced by ***. */
-function withoutCredential(text: string, url: string): string {
+export function withoutCredential(text: string, url: string): string {
   let user = '';
   let pass = '';
   try {

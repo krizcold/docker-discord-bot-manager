@@ -422,6 +422,7 @@ export interface DetectionResult {
   systemDeps: SystemDep[];
   tokenVarName: string;
   tokenVarDetected: boolean;    // true when a real token var was found; false when tokenVarName is just the fallback guess
+  tokenVarUnchecked?: { scanned: number; total: number };   // the fallback guess came from a source scan that stopped at its file cap
   isTypeScript: boolean;
   packageName?: string;         // Rust binary name / C# assembly name
   webPort?: number;             // detected web dashboard port, if any

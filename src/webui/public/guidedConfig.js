@@ -373,9 +373,17 @@
       return;
     }
     if (r.status === 'invalid') { setChip(chip, 'bad', 'Invalid ' + (kind === 'member' ? 'ID' : kind)); return; }
-    if (r.status === 'bot_not_in_guild') { setChip(chip, 'warn', 'Bot not in server yet'); return; }
+    if (r.status === 'bot_not_in_guild') { setChip(chip, 'warn', 'Bot not in this server, or it cannot read it'); return; }
     if (r.status === 'cannot_access') { setChip(chip, 'warn', 'Can\'t access (check perms)'); return; }
-    setChip(chip, 'warn', r.reason === 'token' ? 'Set token to validate' : (r.reason === 'missing_guild' ? 'Set Server ID first' : 'Can\'t validate'));
+    const why = {
+      token: 'Set token to validate',
+      token_rejected: 'Discord rejected this token (401): check or regenerate it',
+      forbidden: 'Discord refused access (403)',
+      missing_guild: 'Set Server ID first',
+      rate_limit: 'Can\'t validate: Discord rate limit',
+      network: 'Can\'t validate: Discord did not answer',
+    };
+    setChip(chip, 'warn', why[r.reason] || 'Can\'t validate');
   }
 
   window.guidedValidateField = function (id, el) {

@@ -599,10 +599,12 @@ const SOURCE_SCAN_FILE_CAP = 400;
 // Common process-level vars that are not bot configuration; excluded from scan results.
 const ENV_SCAN_DENYLIST = new Set(['NODE_ENV', 'PATH', 'PWD', 'HOME', 'PORT', 'HOSTNAME', 'TERM', 'LANG', 'TZ', 'PUID', 'PGID']);
 
-function walkSourceFiles(root: string): string[] {
+/** The first SOURCE_SCAN_FILE_CAP source files under root, and how many it holds in all. */
+function walkSourceFiles(root: string): { files: string[]; seen: number } {
   const out: string[] = [];
+  let seen = 0;
   const stack: string[] = [root];
-  while (stack.length > 0 && out.length < SOURCE_SCAN_FILE_CAP) {
+  while (stack.length > 0) {
     const dir = stack.pop() as string;
     let entries: fs.Dirent[];
     try {
@@ -611,17 +613,23 @@ function walkSourceFiles(root: string): string[] {
       continue;
     }
     for (const entry of entries) {
-      if (out.length >= SOURCE_SCAN_FILE_CAP) break;
       if (entry.isDirectory()) {
         if (!SOURCE_SCAN_SKIP.has(entry.name) && !entry.name.startsWith('.')) {
           stack.push(path.join(dir, entry.name));
         }
       } else if (SOURCE_SCAN_EXTS.has(path.extname(entry.name))) {
-        out.push(path.join(dir, entry.name));
+        seen++;
+        if (out.length < SOURCE_SCAN_FILE_CAP) out.push(path.join(dir, entry.name));
       }
     }
   }
-  return out;
+  return { files: out, seen };
+}
+
+export interface SourceScan {
+  vars: string[];
+  scanned: number;
+  total: number;
 }
 
 const ENV_REF_PATTERNS: RegExp[] = [
@@ -639,15 +647,18 @@ const ENV_REF_PATTERNS: RegExp[] = [
  * Scan source files for env var references. Used by the wizard's Tier 2 detection
  * and by token-variable detection.
  */
-export function scanSourceForEnvVars(repoPath: string): string[] {
+export function scanSourceForEnvVars(repoPath: string): SourceScan {
   const found = new Set<string>();
-  for (const file of walkSourceFiles(repoPath)) {
+  const walk = walkSourceFiles(repoPath);
+  let scanned = 0;
+  for (const file of walk.files) {
     let content: string;
     try {
       content = fs.readFileSync(file, 'utf-8');
     } catch {
       continue;
     }
+    scanned++;
     for (const pattern of ENV_REF_PATTERNS) {
       pattern.lastIndex = 0;
       let m: RegExpExecArray | null;
@@ -656,7 +667,7 @@ export function scanSourceForEnvVars(repoPath: string): string[] {
       }
     }
   }
-  return [...found];
+  return { vars: [...found], scanned, total: walk.seen };
 }
 
 function findComposeFile(repoPath: string): string | null {
@@ -744,7 +755,7 @@ function findMandatoryComposeKeys(repoPath: string): Set<string> {
  */
 export function detectEnvVars(
   repoPath: string,
-  options?: { scanSource?: boolean }
+  options?: { scanSource?: boolean; onSourceScan?: (scan: SourceScan) => void }
 ): DetectedEnvVar[] {
   const byKey = new Map<string, DetectedEnvVar>();
 
@@ -785,7 +796,9 @@ export function detectEnvVars(
 
   // Tier 2 source scan: explicit opt-in only, always optional
   if (options?.scanSource) {
-    for (const key of scanSourceForEnvVars(repoPath)) add(key, '', 'source', false);
+    const scan = scanSourceForEnvVars(repoPath);
+    options.onSourceScan?.(scan);
+    for (const key of scan.vars) add(key, '', 'source', false);
   }
 
   // Author-curated vars (.env.example + compose) always show, required-flagged or

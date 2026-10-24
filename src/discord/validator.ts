@@ -28,7 +28,7 @@ export interface ValidateResult {
   avatarUrl?: string;
   resolvedKind?: 'user' | 'role' | 'channel' | 'guild';   // what it actually resolved as (for 'member')
   extra?: { color?: string; channelType?: number };
-  reason?: 'token' | 'rate_limit' | 'network' | 'missing_guild';
+  reason?: 'token' | 'token_rejected' | 'forbidden' | 'rate_limit' | 'network' | 'missing_guild';
 }
 
 const API = 'https://discord.com/api/v10';
@@ -69,7 +69,8 @@ async function discordGet(token: string, p: string): Promise<{ status: number; j
 }
 
 function httpErr(status: number): ValidateResult {
-  if (status === 401) return { status: 'cannot_validate', reason: 'token' };
+  if (status === 401) return { status: 'cannot_validate', reason: 'token_rejected' };
+  if (status === 403) return { status: 'cannot_validate', reason: 'forbidden' };
   if (status === 429) return { status: 'cannot_validate', reason: 'rate_limit' };
   if (status === 0) return { status: 'cannot_validate', reason: 'network' };
   return { status: 'cannot_validate' };
@@ -171,7 +172,7 @@ export async function validateDiscordId(
   guildId?: string,
 ): Promise<ValidateResult> {
   if (!token) return { status: 'cannot_validate', reason: 'token' };
-  if (isBadToken(token)) return { status: 'cannot_validate', reason: 'token' };
+  if (isBadToken(token)) return { status: 'cannot_validate', reason: 'token_rejected' };
   if (!ID_RE.test(id)) return { status: 'invalid' };
 
   if (kind === 'user') return validateUser(token, id);

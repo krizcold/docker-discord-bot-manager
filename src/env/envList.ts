@@ -104,7 +104,7 @@ function isAdvancedEnv(v: WizardEnvVar): boolean {
 export function buildWizardEnvList(
   repoPath: string,
   options?: { scanSource?: boolean; sourceUrl?: string }
-): { vars: WizardEnvVar[]; detection: DetectionResult } {
+): { vars: WizardEnvVar[]; detection: DetectionResult; sourceScan?: { scanned: number; total: number } } {
   const scanSource = !!options?.scanSource;
   const detection = detectBotType(repoPath);
 
@@ -122,7 +122,9 @@ export function buildWizardEnvList(
     }
   }
 
-  const vars: WizardEnvVar[] = detectEnvVars(repoPath, { scanSource }).map(v =>
+  let sourceScan: { scanned: number; total: number } | undefined;
+  const onSourceScan = (s: { scanned: number; total: number }) => { sourceScan = { scanned: s.scanned, total: s.total }; };
+  const vars: WizardEnvVar[] = detectEnvVars(repoPath, { scanSource, onSourceScan }).map(v =>
     autoWiredKeys.has(v.key) ? { ...v, autoWired: true } : v
   );
 
@@ -226,7 +228,7 @@ export function buildWizardEnvList(
   const surfaced = vars
     .filter(v => !injected.has(v.key.toUpperCase()))
     .map(v => (!v.group && v.advanced === undefined && isAdvancedEnv(v)) ? { ...v, advanced: true } : v);
-  return { vars: surfaced, detection };
+  return sourceScan ? { vars: surfaced, detection, sourceScan } : { vars: surfaced, detection };
 }
 
 /**

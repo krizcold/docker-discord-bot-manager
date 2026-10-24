@@ -3100,6 +3100,24 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   return null;
 }
 
+/** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
+async function sourceClonePreflight(instance: InstanceConfig): Promise<string | null> {
+  const kept = 'the bot was not stopped and its image was kept';
+  if (!instance.sourceId) return `Update refused: this instance has no source; ${kept}`;
+  const source = sourceManager.getSource(instance.sourceId);
+  if (!source) return `Update refused: the source of this instance was not found; ${kept}`;
+  try {
+    await sourceManager.fetchSource(instance.sourceId);
+  } catch (err: any) {
+    const why = sourceManager.withoutCredential(String(err?.message || err), source.url);
+    return `Update refused: the source could not be fetched (${why}); ${kept}`;
+  }
+  if (!fs.existsSync(path.join(sourceManager.getSourceRepoPath(instance.sourceId), '.git'))) {
+    return `Update refused: the source has no usable clone; ${kept}`;
+  }
+  return null;
+}
+
 async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceConfig): Promise<LaneResult> {
   const wasRunning = instance.status === 'running';
   const log = logCollectors.get(botId);
@@ -3110,18 +3128,16 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
 
   try {
     emit(`[Update] Updating ${instance.displayName}...`, 'system');
+    if (instance.sourceType !== 'docker-image') {
+      const cloneRefusal = await sourceClonePreflight(instance);
+      if (cloneRefusal) {
+        emit(`[Error] ${cloneRefusal}`, 'error');
+        return { success: false, error: cloneRefusal };
+      }
+    }
     if (wasRunning) {
       const stopResult = await stopBotImpl(botId, emit);
       if (!stopResult.success) return { success: false, error: `Update stopped before rebuilding: ${stopResult.error}` };
-    }
-
-    // For source-backed instances, the source repo is already up to date
-    // (updated by sourceUpdater or manual fetch). Just rebuild.
-    if (instance.sourceId) {
-      const source = sourceManager.getSource(instance.sourceId);
-      if (!source) {
-        return { success: false, error: 'Source not found, cannot rebuild' };
-      }
     }
 
     // Remove old image

@@ -4891,7 +4891,13 @@
           existing.add(v.key);
           added++;
         }
-        showMessage('success', added > 0 ? `Found ${added} additional variable(s)` : 'No new variables found');
+        const found = added > 0 ? `Found ${added} additional variable(s)` : 'No new variables found';
+        const sc = res.sourceScan;
+        if (sc && sc.scanned < sc.total) {
+          showMessage('warning', `${found}. Scanned ${sc.scanned} of ${sc.total} source files; variables used only in the rest were not checked`);
+        } else {
+          showMessage('success', found);
+        }
       } catch (e) {
         if (seq !== installSeq || sourceId !== installSourceId) return;
         showMessage('error', 'Scan failed');

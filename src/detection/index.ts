@@ -75,10 +75,11 @@ export function detectBotType(repoPath: string): DetectionResult {
   const token = detectTokenVarName(repoPath);
   result.tokenVarName = token.name;
   result.tokenVarDetected = token.detected;
+  if (token.unchecked) result.tokenVarUnchecked = token.unchecked;
   result.configFiles = detectConfigFiles(repoPath);
   result.interactiveSetup = detectManualSetup(repoPath, result.configFiles);
 
-  console.log(`[Detection] hints (guessed from the repo files): type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
+  console.log(`[Detection] hints (guessed from the repo files): type=${result.type} pm=${result.packageManager || '-'} databases=[${result.databases.join(',')}] music=${result.hasMusic} lavalink=${result.needsLavalink} web=${result.hasWebDashboard} token=${result.tokenVarName}${result.tokenVarUnchecked ? ` (not checked: the source scan read ${result.tokenVarUnchecked.scanned} of ${result.tokenVarUnchecked.total} files)` : ''} configFiles=[${result.configFiles.map(c => c.targetName).join(',')}]`);
   return result;
 }
 
@@ -299,7 +300,7 @@ function pickLooseTokenVar(keys: string[]): string | null {
  * Returns detected=false when nothing matched and the name is just the fallback
  * guess, so callers can avoid surfacing a token field the bot never reads.
  */
-function detectTokenVarName(repoPath: string): { name: string; detected: boolean } {
+function detectTokenVarName(repoPath: string): { name: string; detected: boolean; unchecked?: { scanned: number; total: number } } {
   const TOKEN_RE = /^(DISCORD_)?(BOT_|CLIENT_)?TOKEN$/i;
 
   for (const f of ['.env.example', '.env.sample', 'example.env']) {
@@ -334,13 +335,14 @@ function detectTokenVarName(repoPath: string): { name: string; detected: boolean
 
   // Source scan: a strictly-named token var wins; otherwise fall back to a loosely
   // named one the code actually reads (e.g. MUSICBOT_TOKEN) before defaulting.
-  const scanned = scanSourceForEnvVars(repoPath);
-  for (const key of scanned) {
+  const scan = scanSourceForEnvVars(repoPath);
+  for (const key of scan.vars) {
     if (TOKEN_RE.test(key)) return { name: key, detected: true };
   }
-  const loose = pickLooseTokenVar(scanned);
+  const loose = pickLooseTokenVar(scan.vars);
   if (loose) return { name: loose, detected: true };
 
+  if (scan.scanned < scan.total) return { name: 'DISCORD_TOKEN', detected: false, unchecked: { scanned: scan.scanned, total: scan.total } };
   return { name: 'DISCORD_TOKEN', detected: false };
 }
 

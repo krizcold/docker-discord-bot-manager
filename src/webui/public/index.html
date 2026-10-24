@@ -1607,7 +1607,7 @@
                   ${isGit ? (showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
-                ` : bot.hasBeenStarted ? `
+                ` : (bot.hasBeenStarted || bot.lastStartAt) ? `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
                   ${showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
@@ -5314,11 +5314,11 @@
         <div class="cf-collapse${expanded ? '' : ' hidden'}">
           ${inner}
           <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
-            <label class="toggle-row" title="When off, the manager does not apply your edits to this file - the bot keeps its default configuration.">
+            <label class="toggle-row" title="When off, the next Update puts the repo default back in place of your edits (a file the bot has changed since is kept).">
               <span class="toggle-switch"><input type="checkbox" class="cf-enabled" ${isEnabled ? 'checked' : ''} onchange="onConfigEnabledToggle(this)"><span class="toggle-slider"></span></span>
               Enabled
             </label>
-            <label class="toggle-row" title="Let the bot modify this file at runtime; default is read-only.">
+            <label class="toggle-row" title="Mount the file writable so the bot can change it; off mounts it read-only. Takes effect at the next Update.">
               <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}><span class="toggle-slider"></span></span>
               Writable
             </label>
@@ -5443,7 +5443,7 @@
       try {
         const res = await api('PUT', `/bots/${botId}/config`, { files });
         if (res.success) {
-          showMessage('success', `Config files of ${name} saved. Press Start (or Update) to apply.`);
+          showMessage('success', res.needsUpdate ? `Config files of ${name} saved. Press Update to apply: files were added, removed, turned on or off, or changed mode.` : res.mountsUnknown ? `Config files of ${name} saved. The manager has no record of the mounts the last build made, so it can't tell whether Start is enough: press Update to be sure.` : `Config files of ${name} saved. Press Start (or Update) to apply.`);
           if (stillOpen()) hideConfigEditor();
           loadBots();
         } else {

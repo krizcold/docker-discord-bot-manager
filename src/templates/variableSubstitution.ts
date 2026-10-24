@@ -94,13 +94,15 @@ export function applyVariableSubstitution(compose: string, bot: BotConfig): stri
   let result = compose;
 
   // Replace both $VAR and ${VAR} formats
-  for (const [key, value] of Object.entries(vars)) {
+  for (const [key, raw] of Object.entries(vars)) {
+    // compose interpolates every string in the file, so a literal '$' is written '$$'
+    const value = String(raw ?? '').replace(/\$/g, '$$$$');
     // Replace ${VAR} format first (more specific)
     result = result.split(`\${${key}}`).join(value);
     // Replace $VAR format (at word boundary to avoid partial matches)
     // Use regex for word boundary matching
     const dollarPattern = new RegExp(`\\$${key}(?![A-Za-z0-9_])`, 'g');
-    result = result.replace(dollarPattern, value);
+    result = result.replace(dollarPattern, () => value);
   }
 
   return result;

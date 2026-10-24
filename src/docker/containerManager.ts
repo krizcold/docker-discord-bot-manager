@@ -66,6 +66,12 @@ import {
   addAppDependsOn,
   prepareDockerBotFiles,
   redeliverDockerConfigFiles,
+  composeEnvValue,
+  composeEnvLiteral,
+  formatDotenvValue,
+  newDeliveryReport,
+  DeliveryReport,
+  setDeclaredBindModes,
   fixDockerBotOwnership,
   getAppServiceName,
   extractAppName,
@@ -418,12 +424,12 @@ export function readEnvsFromComposeFile(composePath: string): Record<string, str
         const eq = entry.indexOf('=');
         if (eq < 0) continue;
         const key = entry.slice(0, eq);
-        const value = entry.slice(eq + 1);
+        const value = composeEnvLiteral(entry.slice(eq + 1));
         if (key && !BOT_MANAGER_ENV_KEYS.has(key)) out[key] = value;
       }
     } else if (env && typeof env === 'object') {
       for (const [key, value] of Object.entries(env)) {
-        if (!BOT_MANAGER_ENV_KEYS.has(key)) out[key] = String(value ?? '');
+        if (!BOT_MANAGER_ENV_KEYS.has(key)) out[key] = composeEnvLiteral(String(value ?? ''));
       }
     }
 
@@ -727,10 +733,10 @@ export function deployedComposeEnvValues(botId: string, keys: string[], activeOn
           for (const e of env) {
             if (typeof e !== 'string') continue;
             const eq = e.indexOf('=');
-            if ((eq < 0 ? e : e.slice(0, eq)) === key) found.push({ key, value: eq < 0 ? '' : e.slice(eq + 1) });
+            if ((eq < 0 ? e : e.slice(0, eq)) === key) found.push({ key, value: eq < 0 ? '' : composeEnvLiteral(e.slice(eq + 1)) });
           }
         } else if (env && typeof env === 'object' && Object.prototype.hasOwnProperty.call(env, key)) {
-          found.push({ key, value: env[key] == null ? '' : String(env[key]) });
+          found.push({ key, value: env[key] == null ? '' : composeEnvLiteral(String(env[key])) });
         }
       }
     } catch {
@@ -1887,14 +1893,12 @@ export const deleteInstance = deleteBot;
 
 // ─── Status Updates ───
 
-function updateBotStatus(botId: string, status: BotStatus, containerIds?: string[] | null): void {
+function updateBotStatus(botId: string, status: BotStatus, containerIds?: string[] | null, started = false): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (instance) {
     instance.status = status;
-    if (status === 'running') {
-      instance.hasBeenStarted = true;
-    }
+    if (started) instance.hasBeenStarted = true;
     // A (re)start means the bot is booting again and its web UI is not reachable
     // until it pings back ready (or the grace period elapses); gate Open on that.
     if (status === 'starting') {
@@ -1926,9 +1930,9 @@ function updateBotStatus(botId: string, status: BotStatus, containerIds?: string
  * replaces the lane's own answer: the card is told the docker-read status and
  * the refusal comes back for the lane to word.
  */
-function recordStatusAfterDockerStep(botId: string, status: BotStatus, containerIds?: string[] | null): string | null {
+function recordStatusAfterDockerStep(botId: string, status: BotStatus, containerIds?: string[] | null, started = false): string | null {
   try {
-    updateBotStatus(botId, status, containerIds);
+    updateBotStatus(botId, status, containerIds, started);
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1981,12 +1985,35 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
 
 function startedResult(emit: EmitFn, unrecorded: string | null, notApplied: string[]): LaneResult {
   const warnings: string[] = [];
-  if (notApplied.length > 0) warnings.push(`The bot is running, but these changes were not applied: ${notApplied.join('; ')}. Apply or Restart to retry`);
+  const retry = notApplied.some(n => !n.includes('press Update')) ? '. Apply or Restart to retry' : '';
+  if (notApplied.length > 0) warnings.push(`The bot is running, but these changes were not applied: ${notApplied.join('; ')}${retry}`);
   if (unrecorded) warnings.push(`The bot is running, but its status could not be recorded: ${unrecorded}`);
   for (const w of warnings) emit(`[Warning] ${w}`, 'warning');
   return warnings.length > 0
     ? { success: true, warning: warnings.join('; '), ...(notApplied.length > 0 ? { notApplied } : {}) }
     : { success: true };
+}
+
+/**
+ * Store which override files a delivery wrote. A build replaces the record (it
+ * re-authored every bind), a start adds to it. Returns why it failed, or null.
+ */
+function recordDeliveredOverrides(botId: string, report: DeliveryReport, replace: boolean, emit: EmitFn): string | null {
+  try {
+    const record = replace ? {} : configFileManager.getDeliveredOverrides(botId);
+    configFileManager.setDeliveredOverrides(botId, { ...record, ...report.delivered });
+    return null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(`[Config] Warning: could not record which config files were delivered (${msg}); a later build keeps them instead of restoring the repo template`, 'warning');
+    return msg;
+  }
+}
+
+/** A build refuses to finish when a bind or config file it authored was not delivered. */
+function refuseUndelivered(report: DeliveryReport): void {
+  if (report.failed.length === 0) return;
+  throw new Error(`${report.failed.length} file(s) not delivered: ${report.failed.join(', ')}. The build stopped there; fix the cause shown in the log above and build again`);
 }
 
 function setPendingApply(botId: string, pending: boolean): void {
@@ -2204,12 +2231,7 @@ export function writeDockerEnvFile(botDir: string, env: Record<string, string>):
   try {
     const lines = Object.entries(env)
       .filter(([k]) => k)
-      .map(([k, v]) => {
-        const s = (v == null ? '' : String(v)).replace(/[\r\n]+/g, ' ');
-        const needsQuote = s === '' || /[\s#"'$=]/.test(s);
-        const val = needsQuote ? '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"' : s;
-        return `${k}=${val}`;
-      });
+      .map(([k, v]) => `${k}=${formatDotenvValue(v)}`);
     writePrivateFile(path.join(botDir, '.env'), lines.join('\n') + '\n');
   } catch (err) {
     console.warn(`[ContainerManager] Failed to write .env file: ${err}`);
@@ -2682,6 +2704,7 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     if (targetName && services[targetName]) {
       const allEnv = buildEffectiveEnv(instance);
       for (const k of SUBSTITUTION_ONLY_ENV) delete allEnv[k];
+      for (const k of Object.keys(allEnv)) allEnv[k] = composeEnvValue(allEnv[k]);
 
       const service = services[targetName];
       const env = service.environment;
@@ -2737,8 +2760,8 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     const webPass = merged['WEBUI_PASSWORD'] || '';
     for (const svc of Object.values(services) as any[]) {
       if (!svc || !svc.environment) continue;
-      if (webUser) setComposeEnvIfPresent(svc.environment, 'USER', webUser);
-      if (webPass) setComposeEnvIfPresent(svc.environment, 'PASSWORD', webPass);
+      if (webUser) setComposeEnvIfPresent(svc.environment, 'USER', composeEnvValue(webUser));
+      if (webPass) setComposeEnvIfPresent(svc.environment, 'PASSWORD', composeEnvValue(webPass));
       for (const k of SUBSTITUTION_ONLY_ENV) deleteComposeEnv(svc.environment, k);
     }
 
@@ -3003,17 +3026,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       // Re-apply edited config files so config changes made while stopped take
       // effect on start (mirrors the env re-sync above). Binds already exist from
       // the build, so this only rewrites the bind-mounted host files.
-      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
-      if (cfgFiles.length > 0) {
-        try {
-          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
-          const composeForCfg = fs.readFileSync(composePath, 'utf-8');
-          await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
-        } catch (err) {
-          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
-          notApplied.push(`config files (${err})`);
-        }
-      }
+      await reapplyConfigFilesCasaOS(botId, appName, composePath, emit, notApplied);
 
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
@@ -3030,13 +3043,15 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       emit('[PCS] Fixing post-deploy ownership...', 'info');
       await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
+      let postInstallFailed = false;
       if (!latestInstance.hasBeenStarted) {
         const composeContent = fs.readFileSync(composePath, 'utf-8');
-        await executeInstallCommand('post', composeContent, (msg) => emit(msg, 'info'));
+        postInstallFailed = !(await executeInstallCommand('post', composeContent, (msg) => emit(msg, 'info')));
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined, !postInstallFailed);
+      if (postInstallFailed) notApplied.push('the post-install command (it runs again at the next start)');
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
@@ -3048,15 +3063,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
 
       // Re-apply edited config files so changes made while stopped take effect.
-      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
-      if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
-        try {
-          redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
-        } catch (err) {
-          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
-          notApplied.push(`config files (${err})`);
-        }
-      }
+      reapplyConfigFilesDocker(botId, botDir, composePath, emit, notApplied);
 
       // Re-assert ownership of manager-delivered files (written root) to the bot's
       // PUID:GID before the container starts; mirrors casaos fixPostDeployOwnership.
@@ -3072,7 +3079,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       }
 
       const containerIds = await getContainerIdsForBot(botId);
-      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined, true);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
@@ -3110,6 +3117,74 @@ function reapplyableConfigFiles(botId: string, emit: EmitFn, notApplied: string[
     return [];
   }
   return enabled;
+}
+
+function noteUndelivered(report: DeliveryReport, emit: EmitFn, notApplied: string[]): void {
+  if (report.unbound.length > 0) notApplied.push(`config files not mounted yet (press Update to mount): ${report.unbound.join(', ')}`);
+  if (report.failed.length === 0) return;
+  emit(`[Config] Warning: ${report.failed.length} config file(s) not re-applied: ${report.failed.join(', ')}`, 'warning');
+  notApplied.push(`config files (${report.failed.length} not delivered: ${report.failed.join(', ')})`);
+}
+
+/** A start never edits the compose: a mount added, removed or flipped since the last build waits for Update. */
+function noteMountsChanged(botId: string, notApplied: string[]): void {
+  const { files, corrupt } = configFileManager.getConfigFilesWithStatus(botId);
+  if (corrupt) return;
+  let built: string[] | null;
+  try { built = configFileManager.getBuiltMounts(botId); } catch (err) {
+    notApplied.push(`config file mounts (can't confirm they match the last build: ${err instanceof Error ? err.message : String(err)}; press Update)`);
+    return;
+  }
+  if (built === null) {
+    if (!configFileManager.hasConfigStore(botId)) return;
+    notApplied.push('config file mounts (no record of the mounts the last build authored; press Update to be sure)');
+    return;
+  }
+  const now = files.filter(f => f.enabled !== false).map(configFileManager.mountKey).sort();
+  if (now.join('\n') !== [...built].sort().join('\n')) notApplied.push('config file mounts changed since the last build (press Update)');
+}
+
+/** A build in progress or failed leaves no record, so the next start reads "no record" until a build finishes. */
+function forgetBuiltMounts(botId: string): void {
+  configFileManager.clearBuiltMounts(botId);
+}
+
+/** Store the config file mounts a build authored, for noteMountsChanged at the next start. */
+function recordBuiltMounts(botId: string, configFiles: configFileManager.BotConfigFile[], emit: EmitFn): void {
+  try { configFileManager.setBuiltMounts(botId, configFiles.map(configFileManager.mountKey)); }
+  catch (err) { emit(`[Config] Warning: could not record the config file mounts of this build (${err}); the next start can't confirm they are current`, 'warning'); }
+}
+
+async function reapplyConfigFilesCasaOS(botId: string, appName: string, composePath: string, emit: EmitFn, notApplied: string[]): Promise<void> {
+  noteMountsChanged(botId, notApplied);
+  const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
+  if (cfgFiles.length === 0) return;
+  const report = newDeliveryReport();
+  try {
+    emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
+    await redeliverConfigFiles(fs.readFileSync(composePath, 'utf-8'), appName, cfgFiles, (msg) => emit(msg, 'info'), report);
+  } catch (err) {
+    emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+    notApplied.push(`config files (${err})`);
+  }
+  noteUndelivered(report, emit, notApplied);
+  recordDeliveredOverrides(botId, report, false, emit);
+}
+
+function reapplyConfigFilesDocker(botId: string, botDir: string, composePath: string, emit: EmitFn, notApplied: string[]): void {
+  noteMountsChanged(botId, notApplied);
+  const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
+  if (cfgFiles.length === 0 || !fs.existsSync(composePath)) return;
+  const report = newDeliveryReport();
+  try {
+    emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
+    redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles, report);
+  } catch (err) {
+    emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
+    notApplied.push(`config files (${err})`);
+  }
+  noteUndelivered(report, emit, notApplied);
+  recordDeliveredOverrides(botId, report, false, emit);
 }
 
 // A compose written before the log caps existed gets them on its next start; the file is rewritten only when a cap
@@ -3162,21 +3237,21 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
       capComposeFileLogs(composePath);
+
+      const latestInstance = getBot(botId) || instance;
+      const envErr = syncComposeEnvVars(latestInstance, composePath);
+      if (envErr) notApplied.push(`environment variables (${envErr})`);
+      try {
+        await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
+      } catch (err) {
+        notApplied.push(`the .env file (${err instanceof Error ? err.message : String(err)})`);
+      }
+
       emit(`[Start] Starting containers (${appName})...`, 'info');
       updateBotStatus(botId, 'starting');
 
       // Re-apply edited config files so config changes take effect on start.
-      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
-      if (cfgFiles.length > 0) {
-        try {
-          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
-          const composeForCfg = fs.readFileSync(composePath, 'utf-8');
-          await redeliverConfigFiles(composeForCfg, appName, cfgFiles, (msg) => emit(msg, 'info'));
-        } catch (err) {
-          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
-          notApplied.push(`config files (${err})`);
-        }
-      }
+      await reapplyConfigFilesCasaOS(botId, appName, composePath, emit, notApplied);
 
       const deployResult = await casaosApi.deployApp(appName, composePath, (msg, key) => {
         emit(`[Compose] ${msg}`, 'info', key);
@@ -3190,7 +3265,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
       await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
       const containerIds = await getContainerIdsForBot(botId);
-      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined, true);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
@@ -3198,16 +3273,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
       if (envErr) notApplied.push(`environment variables (${envErr})`);
       writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
 
-      const cfgFiles = reapplyableConfigFiles(botId, emit, notApplied);
-      if (cfgFiles.length > 0 && fs.existsSync(composePath)) {
-        try {
-          emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
-          redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles);
-        } catch (err) {
-          emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
-          notApplied.push(`config files (${err})`);
-        }
-      }
+      reapplyConfigFilesDocker(botId, botDir, composePath, emit, notApplied);
 
       // Re-assert ownership of manager-delivered files (written root) to the bot's
       // PUID:GID before the container starts; mirrors casaos fixPostDeployOwnership.
@@ -3220,7 +3286,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
         throw new Error(`Containers did not reach running state: ${verify.problems.join('; ')}`);
       }
       const containerIds = await getContainerIdsForBot(botId);
-      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined);
+      unrecorded = recordStatusAfterDockerStep(botId, 'running', containerIds ?? undefined, true);
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     }
 
@@ -3687,15 +3753,19 @@ async function buildDockerImageInstance(
 
   // Config files: deliver/bind user-supplied config files (mode-aware).
   const configFiles = configFileManager.getConfigFilesStrict(botId).filter(c => c.enabled !== false);
+  forgetBuiltMounts(botId);
+  const delivery = newDeliveryReport();
   if (isCasaOS) {
     if (configFiles.length > 0) {
       emit(`[Config] Delivering ${configFiles.length} config file(s)`, 'info');
-      composeContent = addConfigFileBinds(composeContent, appName, configFiles);
+      composeContent = addConfigFileBinds(composeContent, appName, configFiles, (msg) => emit(msg, 'info'), delivery);
     }
   } else {
     // Docker mode: align the ./data bind + deliver/bind config files locally.
-    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), null, configFiles, (msg) => emit(msg, 'info'));
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), null, configFiles, (msg) => emit(msg, 'info'), delivery);
+    recordDeliveredOverrides(botId, delivery, true, emit);
   }
+  refuseUndelivered(delivery);
 
   // Docker mode: publish the bot's web UI on a host port (no gateway).
   if (!isCasaOS) composeContent = applyDockerHostPort(composeContent, instance);
@@ -3726,10 +3796,11 @@ async function buildDockerImageInstance(
     }
     if (configFiles.length > 0) {
       emit('[PCS] Writing config files...', 'info');
-      await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info'));
+      refuseUndelivered(await writeConfigFiles(appName, configFiles, (msg) => emit(msg, 'info')));
     }
   }
 
+  recordBuiltMounts(botId, configFiles, emit);
   return finishBuild(botId, emit, instance.status, instance.displayName, null);
 }
 
@@ -4069,26 +4140,34 @@ async function buildGitInstanceHeld(
 
   // Deliver volume dirs + user-edited config files (mode-aware).
   const configFiles = configFileManager.getConfigFilesStrict(botId).filter(c => c.enabled !== false);
+  forgetBuiltMounts(botId);
   let bindOnlyConfigs: typeof configFiles = [];
+  const delivery = newDeliveryReport();
+  // Overrides an earlier build wrote: one disabled or removed since gets the repo template back.
+  const restore = configFileManager.getDeliveredOverrides(botId);
   if (isCasaOS) {
     emit('[PCS] Creating volume directories...', 'info');
-    await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'));
+    await createVolumeDirectories(composeContent, appName, repoPath, (msg) => emit(msg, 'info'), delivery, restore);
     // A config whose path matches a bind the compose already declares is delivered
     // over that existing bind (no second bind). The rest fall through to a fresh bind.
-    const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'));
+    const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, (msg) => emit(msg, 'info'), delivery);
     bindOnlyConfigs = configFiles.filter(c => !handled.has(c.path));
+    const declared = configFiles.filter(c => handled.has(c.path));
+    if (declared.length > 0) composeContent = setDeclaredBindModes(composeContent, declared);
     // Config files the compose does NOT already mount: bind them in. Injected AFTER
     // createVolumeDirectories so the file path is not created as a directory.
     if (bindOnlyConfigs.length > 0) {
       emit(`[Config] Delivering ${bindOnlyConfigs.length} config file(s)`, 'info');
-      composeContent = addConfigFileBinds(composeContent, appName, bindOnlyConfigs);
+      composeContent = addConfigFileBinds(composeContent, appName, bindOnlyConfigs, (msg) => emit(msg, 'info'), delivery);
     }
   } else if (repoPath || configFiles.length > 0) {
     // Docker mode: create bind dirs, deliver repo files, and deliver/bind config
     // files directly to the bot's local data dir (no /DATA, no casaos container).
     emit('[Docker] Preparing volumes and config files...', 'info');
-    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'), droppedGatewayBinds);
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'), delivery, restore, droppedGatewayBinds);
   }
+  recordDeliveredOverrides(botId, delivery, true, emit);
+  refuseUndelivered(delivery);
 
   // Write .botmanager marker (CasaOS AppData folder, or the bot dir in docker mode)
   writeBotManagerMarker(instance, appName, isCasaOS);
@@ -4195,7 +4274,7 @@ async function buildGitInstanceHeld(
     }
     if (bindOnlyConfigs.length > 0) {
       emit('[PCS] Writing config files...', 'info');
-      await writeConfigFiles(appName, bindOnlyConfigs, (msg) => emit(msg, 'info'));
+      refuseUndelivered(await writeConfigFiles(appName, bindOnlyConfigs, (msg) => emit(msg, 'info')));
     }
   }
 
@@ -4220,6 +4299,7 @@ async function buildGitInstanceHeld(
     }
   }
 
+  recordBuiltMounts(botId, configFiles, emit);
   return finishBuild(botId, emit, instance.status, instance.displayName, commitUnrecorded);
 }
 

@@ -183,7 +183,7 @@ describe('B12-2 review: the login rows and gateway files follow the gateway that
     const processed = pcs.processComposeForDocker(COMPOSE, 'b122d', bot, '/host/bot');
     expect(processed.droppedGatewayBinds).toEqual(expect.arrayContaining(['/etc/shield/config.json', '/etc/shield/shield.yml']));
     const out = pcs.prepareDockerBotFiles(processed.content, path.join(repo, 'botdir'), '/host/bot', null,
-      [{ path: '/etc/shield/config.json', body: '{}' }, { path: '/app/extra.json', body: '{}' }], () => {}, processed.droppedGatewayBinds);
+      [{ path: '/etc/shield/config.json', body: '{}' }, { path: '/app/extra.json', body: '{}' }], () => {}, undefined, undefined, processed.droppedGatewayBinds);
     const vols = JSON.stringify(parse(out).services.app.volumes || []);
     expect(vols).not.toContain('/etc/shield/config.json');
     expect(vols).toContain('/app/extra.json');

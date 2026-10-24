@@ -1344,8 +1344,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       configFileManager.setConfigFiles(req.params.id, files);
+      const after = configFileManager.getConfigFiles(req.params.id).filter(f => f.enabled !== false).map(configFileManager.mountKey).sort().join('\n');
+      let built: string[] | null = null;
+      try { built = configFileManager.getBuiltMounts(req.params.id); } catch { /* unreadable: mounts unknown */ }
       broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json({ success: true });
+      // Start only rewrites the bodies of mounted files; a mount set unlike the last build's needs a build.
+      const mountsUnknown = built === null;
+      res.json({ success: true, needsUpdate: !mountsUnknown && [...built!].sort().join('\n') !== after, mountsUnknown });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

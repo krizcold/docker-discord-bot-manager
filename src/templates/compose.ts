@@ -13,7 +13,7 @@ import * as path from 'path';
 import { parseDocument, stringify } from 'yaml';
 import { BotConfig, DetectionResult, DeploymentMode } from '../types';
 import { applyVariableSubstitution } from './variableSubstitution';
-import { processComposeForCasaOS, extractAppName } from './pcsProcessing';
+import { processComposeForCasaOS, extractAppName, composeEnvValue, composeEnvLiteral } from './pcsProcessing';
 import { writePrivateFile } from '../config/fileModes';
 export { extractAppName } from './pcsProcessing';
 
@@ -103,7 +103,7 @@ export function generateCompose(
   const envMap: Record<string, string> = {};
   if (bot.envVars) {
     for (const [key, value] of Object.entries(bot.envVars)) {
-      envMap[key] = value;
+      envMap[key] = composeEnvValue(value);
     }
   }
 
@@ -590,7 +590,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
   const envMap: Record<string, string> = {};
   if (bot.envVars) {
     for (const [key, value] of Object.entries(bot.envVars)) {
-      envMap[key] = value;
+      envMap[key] = composeEnvValue(value);
     }
   }
   // Add Bot Manager update token
@@ -684,12 +684,13 @@ function resolveBuildArgValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
   const s = String(value).trim();
   if (s === '') return null;
-  if (s.startsWith('$')) {
+  // docker build gets the value as is, so compose's '$$' escape is undone here.
+  if (s.startsWith('$') && !s.startsWith('$$')) {
     const m = s.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-|-)?([^}]*)\}$/);
-    if (m && m[2]) return m[2];
+    if (m && m[2]) return composeEnvLiteral(m[2]);
     return null;
   }
-  return s;
+  return composeEnvLiteral(s);
 }
 
 function extractArgsFromBuild(build: any): Record<string, string> {

@@ -15,7 +15,7 @@ import { storeFileState, preserveCorruptCopy } from './storeFile';
 export interface BotConfigFile {
   path: string;       // in-container mount path, e.g. /app/config.json
   body: string;       // verbatim file contents
-  readOnly?: boolean; // default true; false lets the bot write back to the file
+  readOnly?: boolean; // default true; the build mounts the file read-only, false mounts it writable
   enabled?: boolean;  // default true; false = keep the user's choice but do not deliver/override (bot uses its baked-in copy)
 }
 
@@ -25,6 +25,11 @@ interface ConfigFileStorage {
 
 function storageFile(botId: string): string {
   return path.join(getEnvPath(botId), 'configFiles.json');
+}
+
+/** True when the bot has a config-file store on disk, empty or not. */
+export function hasConfigStore(botId: string): boolean {
+  return fs.existsSync(storageFile(botId));
 }
 
 /**
@@ -147,4 +152,67 @@ export function setConfigFiles(botId: string, files: BotConfigFile[]): void {
   fs.writeFileSync(tmp, JSON.stringify(storage, null, 2));
   fs.renameSync(tmp, p);
   console.log(`[ConfigFiles] Saved ${storage.files.length} config file(s) for bot ${botId}`);
+}
+
+function builtMountsFile(botId: string): string {
+  return path.join(getEnvPath(botId), 'builtMounts.json');
+}
+
+/** A config file's mount as the build authors it: 'path:ro' or 'path:rw'. */
+export function mountKey(f: { path: string; readOnly?: boolean }): string {
+  return `${f.path}:${f.readOnly !== false ? 'ro' : 'rw'}`;
+}
+
+/** The config file mounts the last finished build authored; null when no build recorded them. Throws when the record is unreadable. */
+export function getBuiltMounts(botId: string): string[] | null {
+  let raw: string;
+  try { raw = fs.readFileSync(builtMountsFile(botId), 'utf-8'); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
+  }
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.some(k => typeof k !== 'string')) throw new Error('the record is not a list of mounts');
+  return parsed;
+}
+
+export function clearBuiltMounts(botId: string): void {
+  fs.rmSync(builtMountsFile(botId), { force: true });
+}
+
+export function setBuiltMounts(botId: string, mounts: string[]): void {
+  const p = builtMountsFile(botId);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify([...mounts].sort(), null, 2));
+  fs.renameSync(tmp, p);
+}
+
+function deliveredFile(botId: string): string {
+  return path.join(getEnvPath(botId), 'deliveredConfig.json');
+}
+
+/**
+ * The override files the manager last wrote over repo-declared binds, as local
+ * path -> body hash. A build restores the repo template only on a file that
+ * still holds exactly that body; an unreadable record restores nothing.
+ */
+export function getDeliveredOverrides(botId: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(deliveredFile(botId), 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(parsed)) if (typeof v === 'string') out[k] = v;
+    return out;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') console.error(`[ConfigFiles] Could not read the delivered-file record for bot ${botId}: ${err}`);
+    return {};
+  }
+}
+
+export function setDeliveredOverrides(botId: string, record: Record<string, string>): void {
+  const p = deliveredFile(botId);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
+  fs.renameSync(tmp, p);
 }

@@ -7,7 +7,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { parseDocument, stringify } from 'yaml';
@@ -482,13 +482,13 @@ export function processComposeForCasaOS(
         const envArr = targetService.environment as string[];
         for (const [key, value] of Object.entries(envVars)) {
           const idx = envArr.findIndex((e: string) => e.startsWith(`${key}=`));
-          if (idx >= 0) envArr[idx] = `${key}=${value}`;
-          else envArr.push(`${key}=${value}`);
+          if (idx >= 0) envArr[idx] = `${key}=${composeEnvValue(value)}`;
+          else envArr.push(`${key}=${composeEnvValue(value)}`);
         }
       } else if (typeof targetService.environment === 'object') {
         const envObj = targetService.environment as Record<string, string>;
         for (const [key, value] of Object.entries(envVars)) {
-          envObj[key] = value;
+          envObj[key] = composeEnvValue(value);
         }
       }
     }
@@ -970,12 +970,12 @@ export function processComposeForDocker(
         const envArr = targetService.environment as string[];
         for (const [key, value] of Object.entries(bot.envVars)) {
           const idx = envArr.findIndex((e: string) => e.startsWith(`${key}=`));
-          if (idx >= 0) envArr[idx] = `${key}=${value}`;
-          else envArr.push(`${key}=${value}`);
+          if (idx >= 0) envArr[idx] = `${key}=${composeEnvValue(value)}`;
+          else envArr.push(`${key}=${composeEnvValue(value)}`);
         }
       } else if (typeof targetService.environment === 'object') {
         const envObj = targetService.environment as Record<string, string>;
-        for (const [key, value] of Object.entries(bot.envVars)) envObj[key] = value;
+        for (const [key, value] of Object.entries(bot.envVars)) envObj[key] = composeEnvValue(value);
       }
     }
   }
@@ -1797,6 +1797,7 @@ function seedRepoFile(
   target: string,
   ensureParent: (dir: string) => void,
   grant: (fd: number) => void,
+  replaceIfHash?: string,
 ): string | null {
   const dir = path.dirname(target);
   const base = path.basename(target);
@@ -1813,9 +1814,11 @@ function seedRepoFile(
     if (st.isSymbolicLink() && !fs.existsSync(target)) {
       throw new Error(`${target} is a symlink to a missing target; refused to seed through it, left it untouched`);
     }
-    if (!st.isDirectory()) return entryKind(st);
-    if (fs.readdirSync(target).length) throw new Error(`${target} is a directory that is not empty where the repo ships a file; left it untouched`);
-    fs.rmdirSync(target);
+    if (!st.isDirectory() && !(replaceIfHash && st.isFile() && fileHash(target) === replaceIfHash)) return entryKind(st);
+    if (st.isDirectory()) {
+      if (fs.readdirSync(target).length) throw new Error(`${target} is a directory that is not empty where the repo ships a file; left it untouched`);
+      fs.rmdirSync(target);
+    }
   }
   ensureParent(dir);
   const bytes = fs.readFileSync(repoSrc);
@@ -1835,6 +1838,15 @@ function seedRepoFile(
     try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
     throw e;
   }
+  if (st && st.isFile()) {
+    // Replace an override the manager delivered only while it still holds exactly what was delivered.
+    if (fileHash(target) !== replaceIfHash) {
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      return 'file';
+    }
+    fs.renameSync(tmpPath, target);
+    return null;
+  }
   try {
     fs.linkSync(tmpPath, target);
   } catch (e) {
@@ -1846,6 +1858,26 @@ function seedRepoFile(
   }
   try { fs.unlinkSync(tmpPath); } catch { /* the file is in place; a stray temp file is harmless */ }
   return null;
+}
+
+export function bodyHash(body: string | Buffer): string {
+  return createHash('sha256').update(body).digest('hex');
+}
+
+function fileHash(p: string): string | null {
+  try { return bodyHash(fs.readFileSync(p)); } catch { return null; }
+}
+
+/**
+ * What a delivery step did: the paths it could not prepare or write, and the
+ * override files it wrote (local path -> body hash), so a later build can tell
+ * a file it wrote from one the bot or the operator changed since.
+ */
+/** unbound: config files the deployed compose does not mount (only a build adds the bind). */
+export interface DeliveryReport { failed: string[]; delivered: Record<string, string>; unbound: string[] }
+
+export function newDeliveryReport(): DeliveryReport {
+  return { failed: [], delivered: {}, unbound: [] };
 }
 
 // Temp files a killed earlier seed of this exact target left behind.
@@ -1876,8 +1908,8 @@ function seedSummary(target: string, c: SeedCounts): string {
   return `Delivered directory ${target} (${c.delivered} files delivered, ${c.kept} existing kept)`;
 }
 
-function dockerDeliverFile(repoSrc: string, target: string): string | null {
-  return seedRepoFile(repoSrc, target, dockerEnsureDir, () => {});
+function dockerDeliverFile(repoSrc: string, target: string, replaceIfHash?: string): string | null {
+  return seedRepoFile(repoSrc, target, dockerEnsureDir, () => {}, replaceIfHash);
 }
 
 function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) => void): SeedCounts {
@@ -1926,6 +1958,48 @@ export function splitDockerVolume(vol: string): { source: string; dest: string }
   return { source: vol.slice(0, i), dest: vol.slice(i + 1).split(':')[0] };
 }
 
+const STATUS_PAGE_SERVICE = 'status-page';
+
+/**
+ * Author the mode of every bind mounted at `target`: read_only on the object
+ * form, a ro option on the string form. Returns the services it changed.
+ */
+export function setBindMode(services: Record<string, Record<string, unknown>>, target: string, readOnly: boolean): string[] {
+  const touched: string[] = [];
+  for (const [name, service] of Object.entries(services)) {
+    if (!service || !Array.isArray(service.volumes)) continue;
+    const vols = service.volumes as unknown[];
+    for (let i = 0; i < vols.length; i++) {
+      const vol = vols[i];
+      if (typeof vol === 'string') {
+        const s = splitDockerVolume(vol);
+        if (!s || s.dest !== target) continue;
+        const head = `${s.source}:${s.dest}`;
+        if (!vol.startsWith(head)) continue;
+        const opts = vol.slice(head.length).replace(/^:/, '').split(',').filter(o => o && o !== 'ro' && o !== 'rw');
+        if (readOnly) opts.push('ro');
+        vols[i] = opts.length ? `${head}:${opts.join(',')}` : head;
+        touched.push(name);
+      } else if (vol && typeof vol === 'object') {
+        const v = vol as Record<string, unknown>;
+        if (v.type === 'volume' || v.target !== target) continue;
+        v.read_only = readOnly;
+        touched.push(name);
+      }
+    }
+  }
+  return touched;
+}
+
+/** Author each config file's read-only choice on the binds the compose declares for it. */
+export function setDeclaredBindModes(composeContent: string, files: Array<{ path: string; readOnly?: boolean }>): string {
+  const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return composeContent;
+  for (const f of files) setBindMode(services, f.path, f.readOnly !== false);
+  return stringify(compose, { lineWidth: 0 });
+}
+
 /** Collect declared bind {target -> hostSource} pairs whose source is under prefix. */
 function dockerDeclaredBinds(services: Record<string, Record<string, unknown>>, prefix: string): Map<string, string> {
   const map = new Map<string, string>();
@@ -1953,6 +2027,8 @@ function dockerDeclaredBinds(services: Record<string, Record<string, unknown>>, 
  * dir (no /DATA). Expects a compose whose relative binds were
  * already rewritten to absolute host paths under hostBotDir (processComposeForDocker).
  * Returns the (possibly modified) compose content with config-file binds added.
+ * `restore` maps local paths of overrides an earlier build delivered to their
+ * body hash: such a file still holding that body gets the repo template again.
  */
 export function prepareDockerBotFiles(
   composeContent: string,
@@ -1961,13 +2037,17 @@ export function prepareDockerBotFiles(
   repoPath: string | null,
   configFiles: Array<{ path: string; body: string; readOnly?: boolean }>,
   logFn?: (msg: string) => void,
-  droppedGatewayBinds: string[] = []
+  report: DeliveryReport = newDeliveryReport(),
+  restore: Record<string, string> = {},
+  droppedGatewayBinds: string[] = [],
 ): string {
   const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
   let compose: Record<string, unknown>;
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
-  } catch {
+  } catch (err) {
+    log(`[Docker] Warning: could not parse the compose to prepare its files: ${err}`);
+    report.failed.push('the compose file (unparseable)');
     return composeContent;
   }
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
@@ -1995,13 +2075,15 @@ export function prepareDockerBotFiles(
           else repoSrc = findConfigTemplate(cand);
         }
         if (repoSrc && fs.statSync(repoSrc).isFile()) {
-          const kept = dockerDeliverFile(repoSrc, target);
-          log(kept ? `[Docker] Kept existing ${kept} ${target}` : `[Docker] Delivered file ${target}`);
+          const kept = dockerDeliverFile(repoSrc, target, restore[target]);
+          if (kept) log(`[Docker] Kept existing ${kept} ${target}`);
+          else log(restore[target] ? `[Docker] Restored the repo template at ${target}` : `[Docker] Delivered file ${target}`);
         }
         else if (repoSrc && fs.statSync(repoSrc).isDirectory()) log(`[Docker] ${seedSummary(target, dockerDeliverDir(repoSrc, target, log))}`);
         else dockerEnsureDir(target);
       } catch (err) {
         log(`[Docker] Warning: could not prepare ${target}: ${err}`);
+        report.failed.push(target);
       }
     }
   }
@@ -2009,8 +2091,8 @@ export function prepareDockerBotFiles(
   // 2. Config files: overwrite an existing declared bind, else add a new bind.
   if (configFiles.length) {
     const declared = dockerDeclaredBinds(services, prefix);
-    const targetName = getAppServiceName(compose) || getMainServiceName(compose);
-    const targetSvc = targetName ? services[targetName] : undefined;
+    const targetName = getAppServiceName(compose);
+    const targetSvc = targetName && targetName !== STATUS_PAGE_SERVICE ? services[targetName] : undefined;
     for (const cf of configFiles) {
       if (droppedGatewayBinds.includes(cf.path)) {
         log(`[Docker] Skipped config ${cf.path}: its gateway service is not deployed`);
@@ -2018,16 +2100,31 @@ export function prepareDockerBotFiles(
       }
       const existing = declared.get(cf.path);
       if (existing) {
-        try { writeDockerConfig(hostSrcToLocal(existing, prefix, containerBotDir), cf.body); log(`[Docker] Applied config ${cf.path}`); }
-        catch (err) { log(`[Docker] Warning: could not write config ${cf.path}: ${err}`); }
+        const local = hostSrcToLocal(existing, prefix, containerBotDir);
+        try {
+          writeDockerConfig(local, cf.body);
+          report.delivered[local] = bodyHash(cf.body);
+          setBindMode(services, cf.path, cf.readOnly !== false);
+          log(`[Docker] Applied config ${cf.path}`);
+        } catch (err) {
+          log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
+          report.failed.push(cf.path);
+        }
       } else if (targetSvc) {
         const base = path.basename(cf.path);
         const hostSrc = `${prefix}config/${base}`;
         try { writeDockerConfig(path.join(containerBotDir, 'config', base), cf.body); }
-        catch (err) { log(`[Docker] Warning: could not write config ${cf.path}: ${err}`); }
+        catch (err) {
+          log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
+          report.failed.push(cf.path);
+          continue;
+        }
         if (!Array.isArray(targetSvc.volumes)) targetSvc.volumes = targetSvc.volumes ? [targetSvc.volumes] : [];
         (targetSvc.volumes as unknown[]).push({ type: 'bind', source: hostSrc, target: cf.path, read_only: cf.readOnly !== false });
-        log(`[Docker] Bound config ${cf.path}`);
+        log(`[Docker] Bound config ${cf.path} on service ${targetName}`);
+      } else {
+        log(`[Docker] Warning: config ${cf.path} not bound: the compose has no app service to mount it on`);
+        report.failed.push(cf.path);
       }
     }
   }
@@ -2045,20 +2142,25 @@ export function redeliverDockerConfigFiles(
   composeContent: string,
   containerBotDir: string,
   hostBotDir: string,
-  configFiles: Array<{ path: string; body: string }>
-): void {
-  if (!configFiles.length) return;
+  configFiles: Array<{ path: string; body: string }>,
+  report: DeliveryReport = newDeliveryReport(),
+): DeliveryReport {
+  if (!configFiles.length) return report;
   let compose: Record<string, unknown>;
-  try { compose = parseDocument(composeContent).toJSON() as Record<string, unknown>; } catch { return; }
-  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-  if (!services) return;
+  try { compose = parseDocument(composeContent).toJSON() as Record<string, unknown>; } catch {
+    report.failed.push(...configFiles.map(c => c.path));
+    return report;
+  }
+  const services = (compose.services || {}) as Record<string, Record<string, unknown>>;
   const prefix = hostBotDir.replace(/\/+$/, '') + '/';
   const declared = dockerDeclaredBinds(services, prefix);
   for (const cf of configFiles) {
     const src = declared.get(cf.path);
-    if (!src) continue;
-    try { writeDockerConfig(hostSrcToLocal(src, prefix, containerBotDir), cf.body); } catch { /* best effort */ }
+    if (!src) { report.unbound.push(cf.path); continue; }
+    const local = hostSrcToLocal(src, prefix, containerBotDir);
+    try { writeDockerConfig(local, cf.body); report.delivered[local] = bodyHash(cf.body); } catch { report.failed.push(cf.path); }
   }
+  return report;
 }
 
 /**
@@ -2224,8 +2326,8 @@ const SKIP_DELIVER = new Set(['node_modules', '.git']);
  * Seed semantics (seedRepoFile): an already-present target is left untouched, so
  * a redeploy never reverts a file the running app or the operator has changed.
  */
-async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void): Promise<string | null> {
-  return seedRepoFile(repoSrc, target, (dir) => ensureVolumeDir(dir, '755', true, log), (fd) => grantFd(fd, log));
+async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void, replaceIfHash?: string): Promise<string | null> {
+  return seedRepoFile(repoSrc, target, (dir) => ensureVolumeDir(dir, '755', true, log), (fd) => grantFd(fd, log), replaceIfHash);
 }
 
 /**
@@ -2263,8 +2365,10 @@ export async function createVolumeDirectories(
   composeContent: string,
   appName: string,
   repoPath: string | null,
-  logFn?: (msg: string) => void
-): Promise<void> {
+  logFn?: (msg: string) => void,
+  report: DeliveryReport = newDeliveryReport(),
+  restore: Record<string, string> = {},
+): Promise<DeliveryReport> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
 
@@ -2273,11 +2377,12 @@ export async function createVolumeDirectories(
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
   } catch {
     log('[PCS] Failed to parse compose for volume directory creation');
-    return;
+    report.failed.push('the compose file (unparseable)');
+    return report;
   }
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-  if (!services) return;
+  if (!services) return report;
 
   const appDataPrefix = `${pcs.DATA_ROOT}/AppData`;
   const appDir = `${appDataPrefix}/${appName}`;
@@ -2314,8 +2419,9 @@ export async function createVolumeDirectories(
       }
 
       if (repoSrc && fs.statSync(repoSrc).isFile()) {
-        const kept = await deliverRepoFile(repoSrc, target, log);
-        log(kept ? `[PCS] Kept existing ${kept} at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
+        const kept = await deliverRepoFile(repoSrc, target, log, restore[target]);
+        if (kept) log(`[PCS] Kept existing ${kept} at volume path: ${target}`);
+        else log(restore[target] ? `[PCS] Restored the repo template at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
       } else if (repoSrc && fs.statSync(repoSrc).isDirectory()) {
         log(`[PCS] ${seedSummary(target, await deliverRepoDir(repoSrc, target, log))}`);
       } else {
@@ -2324,8 +2430,10 @@ export async function createVolumeDirectories(
       }
     } catch (err) {
       log(`[PCS] Warning: could not prepare volume path ${target}: ${err}`);
+      report.failed.push(target);
     }
   }
+  return report;
 }
 
 // ─── CasaOS Metadata File Management ───────────────────────────────────────
@@ -2393,26 +2501,32 @@ export async function writeStatusPage(
 export function addConfigFileBinds(
   composeContent: string,
   appName: string,
-  files: Array<{ path: string; readOnly?: boolean }>
+  files: Array<{ path: string; readOnly?: boolean }>,
+  logFn?: (msg: string) => void,
+  report: DeliveryReport = newDeliveryReport(),
 ): string {
   if (!files.length) return composeContent;
+  const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
+  const refuse = (why: string): string => {
+    log(`[PCS] Warning: config files not bound (${files.map(f => f.path).join(', ')}): ${why}`);
+    report.failed.push(...files.map(f => f.path));
+    return composeContent;
+  };
 
   let compose: Record<string, unknown>;
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
   } catch {
-    return composeContent;
+    return refuse('the compose could not be parsed');
   }
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
-  if (!services) return composeContent;
+  if (!services) return refuse('the compose has no services');
 
-  const xcBuild = (compose['x-casaos'] as Record<string, unknown> | undefined)?.build;
-  const targetName = (typeof xcBuild === 'string' && services[xcBuild])
-    ? xcBuild
-    : getMainServiceName(compose);
-  if (!targetName || !services[targetName]) return composeContent;
+  const targetName = getAppServiceName(compose);
+  if (!targetName || !services[targetName]) return refuse('the compose has no app service');
+  if (targetName === STATUS_PAGE_SERVICE) return refuse('the only app service is the status page');
 
   const service = services[targetName];
   if (!Array.isArray(service.volumes)) {
@@ -2428,6 +2542,7 @@ export function addConfigFileBinds(
     );
     if (exists) continue;
     volumes.push({ type: 'bind', source, target: f.path, read_only: f.readOnly !== false });
+    log(`[PCS] Bound config ${f.path} on service ${targetName}`);
   }
 
   return stringify(compose, { lineWidth: 0 });
@@ -2440,22 +2555,35 @@ export function addConfigFileBinds(
 export async function writeConfigFiles(
   appName: string,
   files: Array<{ path: string; body: string }>,
-  logFn?: (msg: string) => void
-): Promise<void> {
-  if (!files.length) return;
+  logFn?: (msg: string) => void,
+  report: DeliveryReport = newDeliveryReport(),
+): Promise<DeliveryReport> {
+  if (!files.length) return report;
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
   const pcs = getPCSEnvironment();
   const dir = path.join(pcs.DATA_ROOT, 'AppData', appName, 'config');
 
-  mkdirForApp(dir, log);
-  grantToApp(dir, { recursive: true, log });
+  try {
+    mkdirForApp(dir, log);
+    grantToApp(dir, { recursive: true, log });
+  } catch (err) {
+    log(`[PCS] Warning: could not create ${dir}: ${err}`);
+    report.failed.push(...files.map(f => f.path));
+    return report;
+  }
 
   for (const f of files) {
     const filePath = path.join(dir, path.basename(f.path));
-    fs.writeFileSync(filePath, f.body);
-    grantToApp(filePath, { mode: '644', log });
-    log(`[PCS] Wrote config file to ${filePath}`);
+    try {
+      fs.writeFileSync(filePath, f.body);
+      grantToApp(filePath, { mode: '644', log });
+      log(`[PCS] Wrote config file to ${filePath}`);
+    } catch (err) {
+      log(`[PCS] Warning: could not write config file ${filePath}: ${err}`);
+      report.failed.push(f.path);
+    }
   }
+  return report;
 }
 
 /**
@@ -2470,11 +2598,17 @@ export async function redeliverConfigFiles(
   appName: string,
   configFiles: Array<{ path: string; body: string }>,
   logFn?: (msg: string) => void,
-): Promise<void> {
-  if (!configFiles.length) return;
-  const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, logFn);
-  const bindOnly = configFiles.filter(c => !handled.has(c.path));
-  if (bindOnly.length) await writeConfigFiles(appName, bindOnly, logFn);
+  report: DeliveryReport = newDeliveryReport(),
+): Promise<DeliveryReport> {
+  if (!configFiles.length) return report;
+  const handled = await applyUserConfigOverrides(composeContent, appName, configFiles, logFn, report);
+  // A file with no bind in the deployed compose was added after the build: only Update mounts it.
+  const unbound = configFiles.filter(c => !handled.has(c.path));
+  if (unbound.length) {
+    (logFn || console.log)(`[PCS] Warning: ${unbound.map(c => c.path).join(', ')} not mounted yet; press Update to mount`);
+    report.unbound.push(...unbound.map(c => c.path));
+  }
+  return report;
 }
 
 /**
@@ -2489,6 +2623,7 @@ export async function applyUserConfigOverrides(
   appName: string,
   configFiles: Array<{ path: string; body: string }>,
   logFn?: (msg: string) => void,
+  report: DeliveryReport = newDeliveryReport(),
 ): Promise<Set<string>> {
   const handled = new Set<string>();
   if (!configFiles.length) return handled;
@@ -2500,6 +2635,8 @@ export async function applyUserConfigOverrides(
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
   } catch {
+    log('[PCS] Warning: could not parse the compose to deliver config files');
+    report.failed.push('the compose file (unparseable)');
     return handled;
   }
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
@@ -2533,21 +2670,40 @@ export async function applyUserConfigOverrides(
       // createVolumeDirectories delivered (the repo template) with the user's body.
       try { fs.rmSync(source, { recursive: true, force: true }); } catch { /* best effort */ }
       fs.writeFileSync(source, cf.body);
+      report.delivered[source] = bodyHash(cf.body);
       grantToApp(source, { mode: '644', log });
       log(`[PCS] Delivered user config to ${source} (bind ${cf.path})`);
     } catch (err) {
       log(`[PCS] Warning: could not deliver user config for ${cf.path}: ${err}`);
+      report.failed.push(cf.path);
     }
   }
   return handled;
 }
 
-function formatDotenvValue(value: string): string {
+/**
+ * A value as compose must hold it to deliver it literally: compose interpolates
+ * every '$' in an environment value, and '$$' is its escape for one '$'.
+ */
+export function composeEnvValue(value: string): string {
+  return (value == null ? '' : String(value)).replace(/\$/g, '$$$$');
+}
+
+/** The value docker compose delivers for an environment value the compose holds. */
+export function composeEnvLiteral(value: string): string {
+  return (value == null ? '' : String(value)).replace(/\$\$/g, '$');
+}
+
+/**
+ * A .env value that compose reads literally. Single quotes turn off
+ * interpolation; a value holding a single quote is double-quoted with '\', '"'
+ * and '$' escaped.
+ */
+export function formatDotenvValue(value: string): string {
   const s = (value == null ? '' : String(value)).replace(/[\r\n]+/g, ' ');
-  if (s === '' || /[\s#"'$=]/.test(s)) {
-    return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-  }
-  return s;
+  if (s !== '' && !/[\s#"'$=\\]/.test(s)) return s;
+  if (!s.includes("'")) return `'${s}'`;
+  return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$') + '"';
 }
 
 /**
@@ -2654,13 +2810,14 @@ export async function fixPostDeployOwnership(
 
 /**
  * Execute pre-install or post-install command from x-casaos metadata.
- * Pre-install throws on failure; post-install warns but continues.
+ * Pre-install throws on failure; post-install warns but continues. Returns
+ * false when a declared command did not run to success.
  */
 export async function executeInstallCommand(
   type: 'pre' | 'post',
   composeContent: string,
   logFn?: (msg: string) => void
-): Promise<void> {
+): Promise<boolean> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
 
   let compose: Record<string, unknown>;
@@ -2668,15 +2825,15 @@ export async function executeInstallCommand(
     const doc = parseDocument(composeContent);
     compose = doc.toJSON() as Record<string, unknown>;
   } catch {
-    return;
+    return false;
   }
 
   const xcasaos = compose['x-casaos'] as Record<string, unknown> | undefined;
-  if (!xcasaos) return;
+  if (!xcasaos) return true;
 
   const cmdKey = type === 'pre' ? 'pre-install-cmd' : 'post-install-cmd';
   const cmd = xcasaos[cmdKey];
-  if (!cmd || typeof cmd !== 'string') return;
+  if (!cmd || typeof cmd !== 'string') return true;
 
   // This is the APP's own shell, so it runs in the platform's container and
   // never in the manager, which holds the docker socket. A host without that
@@ -2686,7 +2843,7 @@ export async function executeInstallCommand(
     const need = `needs the platform's casaos container, which this host does not run`;
     if (type === 'pre') throw new Error(`The ${type}-install command ${need}`);
     log(`[PCS] Warning: skipped the ${type}-install command because it ${need}`);
-    return;
+    return false;
   }
 
   const scriptId = Date.now().toString(36);
@@ -2705,11 +2862,13 @@ export async function executeInstallCommand(
     if (stdout) log(`[PCS] ${type}-install stdout: ${stdout.trim()}`);
     if (stderr) log(`[PCS] ${type}-install stderr: ${stderr.trim()}`);
     log(`[PCS] ${type}-install command completed`);
+    return true;
   } catch (error) {
     if (type === 'pre') {
       throw new Error(`Pre-install command failed: ${error}`);
     } else {
       log(`[PCS] Warning: Post-install command failed (non-fatal): ${error}`);
+      return false;
     }
   }
 }

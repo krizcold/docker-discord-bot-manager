@@ -74,14 +74,14 @@ describe('number env rows the browser cannot parse are refused', () => {
 describe('fleet backup Keep', () => {
   const page = (keep: any, storedKeep = 7, confirmAnswer = true) => {
     const sent: any[] = []; const messages: string[][] = []; const asked: string[] = [];
-    const ctx = runPage([...helpers, 'saveFleetBackupConfig'], {
+    const ctx = runPage([...helpers, 'saveFleetBackupConfig', 'showFleetBackupControls'], {
       ...common(sent, messages, {
         'fleet-backup-enabled': { checked: true },
         'fleet-backup-hour': { value: '4' },
         'fleet-backup-keep': keep,
       }),
       fleetBackupBotId: 'b1',
-      fleetBackupStoredKeep: storedKeep,
+      fleetBackupStored: { enabled: true, hour: 4, keep: storedKeep },
       confirm: (t: string) => { asked.push(t); return confirmAnswer; },
     });
     return { ctx, sent, messages, asked };

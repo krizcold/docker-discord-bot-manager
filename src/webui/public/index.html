@@ -418,6 +418,10 @@
       background: var(--success-bg); border: 1px solid var(--success); color: var(--success);
       padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
     }
+    .info-message {
+      background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-secondary);
+      padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
+    }
     .tooltip {
       font-size: 0.72rem; color: var(--text-muted); font-style: italic;
     }
@@ -1310,7 +1314,7 @@
 
     function showMessage(type, text) {
       const el = document.getElementById('message');
-      el.className = type === 'error' ? 'error-message' : 'success-message';
+      el.className = type === 'error' ? 'error-message' : type === 'info' ? 'info-message' : 'success-message';
       el.textContent = text;
       setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000);
     }
@@ -1754,11 +1758,11 @@
       try {
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled });
         if (!res.success) showMessage('error', res.error || 'Failed to toggle auto-update');
-        else { if (res.message) showMessage('warning', res.message); loadBots(); }
+        else if (res.message) showMessage('warning', res.message);
       } catch (err) {
         showMessage('error', 'Failed to toggle auto-update');
-        loadBots();
       }
+      loadBots();
     }
 
     async function setBotAutoUpdateInterval(id, interval) {
@@ -1767,10 +1771,10 @@
         const enabled = bot?.autoUpdate || false;
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, interval });
         if (!res.success) showMessage('error', res.error || 'Failed to set interval');
-        else loadBots(); // re-render to show/hide hour picker
       } catch (err) {
         showMessage('error', 'Failed to set auto-update interval');
       }
+      loadBots();
     }
 
     async function setBotAutoUpdateHour(id, hour) {
@@ -1778,9 +1782,10 @@
         const bot = bots.find(b => b.id === id);
         const enabled = bot?.autoUpdate || false;
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, hour });
-        if (!res.success) showMessage('error', res.error || 'Failed to set hour');
+        if (!res.success) { showMessage('error', res.error || 'Failed to set hour'); loadBots(); }
       } catch (err) {
         showMessage('error', 'Failed to set auto-update hour');
+        loadBots();
       }
     }
 
@@ -2457,11 +2462,7 @@
       nameInput.addEventListener('input', update);
       container.addEventListener('change', update);
       const btn = el.querySelector('button');
-      btn.addEventListener('click', () => {
-        navigator.clipboard.writeText(urlOf());
-        btn.textContent = 'Copied';
-        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-      });
+      btn.addEventListener('click', () => copyToClipboard(btn, urlOf(), 'Copy'));
       roleWrapper.insertAdjacentElement('afterend', el);
       updateEnvConditionals(container);
     }
@@ -2593,7 +2594,7 @@
 
     // ─── Fleet DB Backups ───
     let fleetBackupBotId = null;
-    let fleetBackupStoredKeep = 7;
+    let fleetBackupStored = { enabled: true, hour: 4, keep: 7 };
 
     function formatBackupSize(bytes) {
       if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
@@ -2629,7 +2630,7 @@
       }
 
       const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
-      fleetBackupStoredKeep = fb.keep;
+      fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
       content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
       let listHtml = '';
@@ -3230,20 +3231,28 @@
       renderRecoveryChannel(botId);
     }
 
+    async function copyToClipboard(btn, text, label) {
+      try {
+        if (!navigator.clipboard) throw new Error('no clipboard');
+        await navigator.clipboard.writeText(text);
+      } catch (err) {
+        showMessage('error', 'Not copied: the browser blocked the clipboard (it needs https or localhost)');
+        return;
+      }
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = label; }, 1500);
+    }
+
     function copyFleetReplBlock(btn, id) {
       const el = document.getElementById(id || 'fleet-repl-dsn');
       if (!el) return;
-      navigator.clipboard.writeText(el.value);
-      btn.textContent = 'Copied';
-      setTimeout(() => { btn.textContent = 'Copy DSN'; }, 1500);
+      return copyToClipboard(btn, el.value, 'Copy DSN');
     }
 
     function copyFleetReplCert(btn, id) {
       const el = document.getElementById(id || 'fleet-repl-cert');
       if (!el) return;
-      navigator.clipboard.writeText(el.value);
-      btn.textContent = 'Copied';
-      setTimeout(() => { btn.textContent = 'Copy certificate'; }, 1500);
+      return copyToClipboard(btn, el.value, 'Copy certificate');
     }
 
     // ─── Fleet DB standby replica (worker side, PLAN_REPLICATION.md Stage 2) ───
@@ -3742,7 +3751,7 @@
       try {
         const res = await api('DELETE', `/bots/${botId}/fleet-failback`);
         if (!res.success) { showMessage('error', res.error || 'Failed to dismiss the run'); return; }
-        showMessage('success', res.error || 'Run dismissed');
+        showMessage(res.error ? 'error' : 'success', res.error || 'Run dismissed');
       } catch (err) {
         showMessage('error', 'Failed to dismiss the run');
         return;
@@ -3899,18 +3908,34 @@
         showMessage('error', 'Keep must be a whole number from 1 to 365. Nothing was saved.');
         return;
       }
-      if (keep < fleetBackupStoredKeep && !confirm(`Keep only ${keep} backups?\n\nThe next backup deletes the older dumps beyond the newest ${keep} (now ${fleetBackupStoredKeep} are kept).`)) {
-        keepEl.value = String(fleetBackupStoredKeep);
+      if (keep < fleetBackupStored.keep && !confirm(`Keep only ${keep} backups?\n\nThe next backup deletes the older dumps beyond the newest ${keep} (now ${fleetBackupStored.keep} are kept).`)) {
+        showFleetBackupControls(fleetBackupStored);
         return;
       }
       try {
         const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, { enabled, hour, keep });
-        if (!res.success) showMessage('error', res.error || 'Failed to save backup settings');
-        else if (res.fleetBackup && typeof res.fleetBackup.keep === 'number') fleetBackupStoredKeep = res.fleetBackup.keep;
-        loadBots();
+        const fb = res.success && res.fleetBackup;
+        if (fb && typeof fb.enabled === 'boolean' && typeof fb.hour === 'number' && typeof fb.keep === 'number') {
+          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+        } else if (res.success) {
+          showMessage('error', 'Can\'t confirm the backup settings: the manager did not return them. Reopen this window to see what is stored.');
+        } else {
+          showMessage('error', res.error || 'Failed to save backup settings');
+        }
       } catch (err) {
         showMessage('error', 'Failed to save backup settings');
       }
+      showFleetBackupControls(fleetBackupStored);
+      loadBots();
+    }
+
+    function showFleetBackupControls(fb) {
+      const enabledEl = document.getElementById('fleet-backup-enabled');
+      const hourEl = document.getElementById('fleet-backup-hour');
+      const keepEl = document.getElementById('fleet-backup-keep');
+      if (enabledEl) enabledEl.checked = fb.enabled;
+      if (hourEl) hourEl.value = String(fb.hour);
+      if (keepEl) keepEl.value = String(fb.keep);
     }
 
     async function restoreFleetBackupFile(botId, file) {
@@ -3918,7 +3943,7 @@
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);
-      showMessage('success', 'Restore started; instances on this database are being stopped...');
+      showMessage('info', 'Requesting restore...');
       try {
         const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
         if (res.success) {

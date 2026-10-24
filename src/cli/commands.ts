@@ -161,8 +161,9 @@ export async function managerUpdate(ctx: Ctx, pollMs = 3000): Promise<void> {
 /**
  * Stream an SSE route. A build-log stream ends on its own terminal frame: done or
  * idle exits 0, failed exits 1, and a stream that ends or times out without one exits
- * EXIT_TIMEOUT. A container-log stream has no terminal frame: its own --timeout
- * ending it exits 0, the server ending it exits EXIT_TIMEOUT (EXIT_ERR after an error frame).
+ * EXIT_TIMEOUT. A container-log stream ends on an end frame when docker logs exits:
+ * exit code 0 exits 0, any other EXIT_ERR. Its own --timeout ending it exits 0, and
+ * the server ending it without an end frame exits EXIT_TIMEOUT.
  */
 async function streamSse(ctx: Ctx, path: string, terminal: boolean): Promise<void> {
   const human = !jsonMode(ctx.flags);
@@ -184,6 +185,11 @@ async function streamSse(ctx: Ctx, path: string, terminal: boolean): Promise<voi
     fail(how === 'timeout' ? 'stream timed out before the operation finished' : 'stream ended before the operation finished', EXIT_TIMEOUT);
   }
   if (how === 'timeout') process.exit(EXIT_OK);
+  if (lastFrame?.event === 'end') {
+    const end = lastFrame.data as { code?: number | null; error?: string } | null;
+    if (end?.code === 0) process.exit(EXIT_OK);
+    fail(`docker logs ended: ${end?.error ?? `exit code ${end?.code ?? 'unknown'}`}`, EXIT_ERR);
+  }
   if (lastFrame?.event === 'error') fail('log stream ended with an error', EXIT_ERR);
   fail('log stream ended by the server', EXIT_TIMEOUT);
 }
@@ -269,7 +275,7 @@ const HANDLERS: Record<string, Handler> = {
   'bots logs': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/logs?tail=${flagInt(c.flags, 'tail', 100)}`),
   'bots build-logs': (c) => streamSse(c, `/api/bots/${need(c, 0, 'id')}/build-logs`, true),
   'bots container-logs': (c) =>
-    streamSse(c, `/api/bots/${need(c, 0, 'id')}/containers/${need(c, 1, 'container')}/logs/stream?lines=${flagInt(c.flags, 'lines', 50)}`, false),
+    streamSse(c, `/api/bots/${need(c, 0, 'id')}/containers/${need(c, 1, 'container')}/logs/stream?lines=${flagInt(c.flags, 'lines', 50)}${c.flags.follow ? '' : '&follow=0'}`, false),
   'bots web-auth': (c) => simple(c, 'PUT', `/api/bots/${need(c, 0, 'id')}/web-auth`, { mode: need(c, 1, 'mode') }),
   'bots port': async (c) => {
     const bot = await resolveBot(c, need(c, 0, 'idOrName'));

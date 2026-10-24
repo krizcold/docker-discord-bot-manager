@@ -4307,8 +4307,9 @@
 
       es.addEventListener('log', (event) => {
         const data = JSON.parse(event.data);
-        const time = new Date(data.timestamp).toLocaleTimeString();
-        const html = `<div class="log-line"><span style="color:var(--text-muted);font-size:0.68rem;">[${time}]</span> ${escapeHtml(data.log)}</div>`;
+        const when = data.timestamp ? new Date(data.timestamp) : null;
+        const time = when && !isNaN(when.getTime()) ? `${when.toLocaleDateString()} ${when.toLocaleTimeString()}` : 'time unknown';
+        const html = `<div class="log-line"><span style="color:var(--text-muted);font-size:0.68rem;">[${escapeHtml(time)}]</span> ${escapeHtml(data.log)}</div>`;
 
         // Always save to history
         if (!logsState.logHistory[containerName]) logsState.logHistory[containerName] = [];
@@ -4346,7 +4347,42 @@
         }
       });
 
+      es.addEventListener('end', (event) => {
+        es.close();
+        if (logsState.eventSource === es) logsState.eventSource = null;
+        let end = {};
+        try { end = JSON.parse(event.data) || {}; } catch {}
+        const why = end.error ? end.error : `exit code ${end.code ?? 'unknown'}`;
+        if (logsState.selectedContainer === containerName) {
+          viewer.insertAdjacentHTML('beforeend', `<div class="log-line system">Log stream ended: docker logs stopped (${escapeHtml(String(why))}). It resumes when ${escapeHtml(containerName)} runs again.</div>`);
+          if (logsState.autoScroll) viewer.scrollTop = viewer.scrollHeight;
+        }
+        waitForContainerRunning(logsState.botId, containerName);
+      });
+
       es.addEventListener('ping', () => {});
+    }
+
+    async function waitForContainerRunning(botId, containerName) {
+      const stillWaiting = () => logsState.botId === botId && logsState.selectedContainer === containerName && !logsState.eventSource;
+      while (stillWaiting()) {
+        await new Promise(r => setTimeout(r, 3000));
+        if (!stillWaiting()) return;
+        try {
+          const res = await api('GET', `/bots/${botId}/containers`);
+          if (!stillWaiting()) return;
+          if (res.success) {
+            logsState.containers = res.containers;
+            renderServiceSidebar();
+            const c = res.containers.find(x => x.name === containerName);
+            if (c && c.state === 'running') {
+              logsState.logHistory[containerName] = [];
+              selectContainer(containerName);
+              return;
+            }
+          }
+        } catch {}
+      }
     }
 
     function closeLogsPopup() {

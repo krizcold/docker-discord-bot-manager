@@ -347,6 +347,15 @@ export async function removeContainer(containerId: string, force = false): Promi
 }
 
 /**
+ * Split a `docker logs --timestamps` line into docker's stored time and the message;
+ * a line without the prefix has no known time (null), never the read time.
+ */
+export function parseDockerLogLine(line: string): { timestamp: string | null; message: string } {
+  const m = line.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})) (.*)$/s);
+  return m ? { timestamp: m[1], message: m[2] } : { timestamp: null, message: line };
+}
+
+/**
  * Get container logs; a failure says whether docker answered that the container is gone.
  */
 export async function getContainerLogs(

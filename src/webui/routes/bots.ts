@@ -5,10 +5,10 @@
 
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
-import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
 import { fsWriteBody } from '../fsWriteBody';
+import { pipeContainerLogs } from '../logStream';
 import * as dockerClient from '../../docker/dockerClient';
 import * as envManager from '../../env/manager';
 import { buildBotEnvList, buildBotConfigList } from '../../env/envList';
@@ -909,40 +909,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     res.write(`event: connected\ndata: ${JSON.stringify({ message: `Connected to ${containerName} logs` })}\n\n`);
 
-    // One follow process serves both history (--tail N) and live tail, so no
-    // synchronous history fetch blocks the event loop.
-    const logsProcess = spawn('docker', ['logs', '-f', '--tail', String(lines), containerName]);
-
-    const handleData = (data: Buffer) => {
-      if (!res.writable) return;
-      const lines = data.toString().split('\n').filter((l: string) => l.trim().length > 0);
-      for (const logLine of lines) {
-        res.write(`event: log\ndata: ${JSON.stringify({ log: logLine, timestamp: new Date().toISOString() })}\n\n`);
-      }
-    };
-
-    logsProcess.stdout.on('data', handleData);
-    logsProcess.stderr.on('data', handleData);
-    logsProcess.on('error', (error) => {
-      if (res.writable) {
-        res.write(`event: error\ndata: ${JSON.stringify({ error: error.message })}\n\n`);
-      }
-    });
-
-    const keepAlive = setInterval(() => {
-      if (res.writable) {
-        res.write(`event: ping\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
-      }
-    }, 30000);
-
-    const cleanup = () => {
-      clearInterval(keepAlive);
-      logsProcess.kill('SIGTERM');
-    };
-
-    req.on('close', cleanup);
-    req.on('error', cleanup);
-    res.on('close', cleanup);
+    pipeContainerLogs(req, res, containerName, lines, req.query.follow !== '0');
   });
 
   /**

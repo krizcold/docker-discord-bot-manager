@@ -1276,8 +1276,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.json({ success: true, ok: true });
         return;
       }
-      const hint = sslModeHint(target);
-      res.json({ success: true, ok: false, error: result.error, ...(hint ? { hint } : {}) });
+      const hint = result.notTested ? null : sslModeHint(target);
+      res.json({ success: true, ok: false, error: result.error, ...(result.notTested ? { notTested: true } : {}), ...(hint ? { hint } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

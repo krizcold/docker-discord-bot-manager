@@ -56,7 +56,7 @@ vi.mock('child_process', async (importOriginal) => {
     setTimeout(() => {
       child.stdout.end();
       child.stderr.end(h.spawnStderr);
-      setTimeout(() => child.emit('close', h.spawnCode), 1);
+      setTimeout(() => child.emit('close', args[0] === 'run' ? h.spawnCode : 0), 1);
     }, 2);
     return child;
   };
@@ -138,7 +138,7 @@ describe('the database URL test', () => {
   it('gives psql the URL without its password and the password by environment', async () => {
     const res = await probeDatabaseUrl(`postgresql://smdb:${TOKEN}@db.invalid:5432/smdb?sslmode=no-verify`, 'smdb-net');
     expect(res.ok).toBe(true);
-    const run = h.spawns[0];
+    const run = h.spawns.find(sp => sp.args[0] === 'run')!;
     expect(run.args.join(' ')).not.toContain(TOKEN);
     expect(run.args).toContain('postgresql://smdb@db.invalid:5432/smdb?sslmode=require');
     expect(run.args).toContain('PGPASSWORD');
@@ -154,9 +154,9 @@ describe('the database URL test', () => {
     await layer.route.stack[layer.route.stack.length - 1].handle(
       { params: { id: 'b1' }, query: {}, body: { url: `postgresql://smdb:${TOKEN}@db.invalid:5432/smdb` } }, res);
     expect(out.body).toEqual({ success: true, ok: true });
-    expect(h.spawns).toHaveLength(1);
+    expect(h.spawns.map(sp => sp.args[0])).toEqual(['image', 'run']);
     expect(JSON.stringify(h.spawns.map(sp => sp.args))).not.toContain(TOKEN);
-    expect(h.spawns[0].env.PGPASSWORD).toBe(TOKEN);
+    expect(h.spawns[1].env.PGPASSWORD).toBe(TOKEN);
   });
 
   it('reports a failure with the password redacted', async () => {

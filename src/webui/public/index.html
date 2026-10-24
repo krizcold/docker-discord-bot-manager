@@ -2654,7 +2654,9 @@
             const hint = (check && check.hint) ? `\n\nHint: ${check.hint}` : '';
             const question = unanswered
               ? 'The database connection test got no answer from the manager, so whether this URL works is unknown.\n\nSave anyway?'
-              : `Database connection test failed:\n${msg}${hint}\n\nSave anyway?`;
+              : (check && check.notTested)
+                ? `The database could not be tested:\n${msg}\n\nSave anyway?`
+                : `Database connection test failed:\n${msg}${hint}\n\nSave anyway?`;
             if (!confirm(question)) return;
             if (!stillOpen()) { showMessage('error', `The environment editor for ${name} was closed before saving. Nothing was saved.`); return; }
           }

@@ -2892,8 +2892,12 @@
       let res = null;
       try { res = await api('GET', `/bots/${botId}/fleet-replication?include=block`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== renderFleetReplication.seq) return;
-      // A live failback run moves on its own; the panel follows it.
-      if (res && res.success && res.failback && !res.failback.parked) setTimeout(() => { if (seq === renderFleetReplication.seq) renderFleetReplication(botId); }, 3000);
+      // A live failback run moves on its own, and a tick may open one at any
+      // time while replication is on; the panel follows both.
+      if (res && res.success && ((res.replication && res.replication.enabled) || (res.failback && !res.failback.parked))) {
+        const tick = () => { if (seq !== renderFleetReplication.seq || !body.isConnected) return; if (panelHasEntry(body)) setTimeout(tick, 3000); else renderFleetReplication(botId); };
+        setTimeout(tick, 3000);
+      }
       if (!res || !res.success) {
         // One unreadable answer must not take the run card away until the modal is reopened.
         body.innerHTML = '<div class="error-message">Failed to load replication status; retrying...</div>';
@@ -3551,6 +3555,12 @@
       return `<div class="env-tip" style="color:var(--warning);">Backup mode is ${mode(saved)} in this instance's saved env, but the running bot still uses ${mode(running)}; it picks up the saved value when its container is next recreated (Apply or Restart).${howTo}</div>`;
     }
 
+    // A poll must not wipe what the operator is typing into the panel.
+    function panelHasEntry(body) {
+      return Array.from(body.querySelectorAll('input:not([type=hidden]), textarea, select')).some(el => el === document.activeElement
+        || (el.type === 'checkbox' || el.type === 'radio' ? el.checked !== el.defaultChecked : el.tagName === 'SELECT' ? false : el.value !== el.defaultValue));
+    }
+
     async function renderFleetReplica(botId) {
       const body = document.getElementById('fleet-replica-body');
       if (!body || fleetBackupBotId !== botId) return;
@@ -3601,8 +3611,6 @@
       const declinedHtml = !declined ? '' : declined.mode === 'drop-back'
         ? (standingNow && standingNow.role === 'stand-in' && !standingNow.live ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '')
         : (standingNow && standingNow.role === 'covered' ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '');
-      if ((runLive || (failback && !failback.parked)) && !r.provisioning) setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
-
       if (r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
@@ -3633,6 +3641,13 @@
           else factsError = (f && f.success) ? 'the bot process is not running' : ((f && f.error) || 'no answer');
         } catch (err) { factsError = String((err && err.message) || err); }
         if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
+      }
+
+      // A shown record polls too: an automatic re-seed or a failback can start on it at any time.
+      // It is armed after the facts read, so a slow hook server never starves the draw.
+      if (runLive || (failback && !failback.parked) || r.record) {
+        const tick = () => { if (seq !== replicaPollSeq || !body.isConnected) return; if (panelHasEntry(body)) setTimeout(tick, 3000); else renderFleetReplica(botId); };
+        setTimeout(tick, 3000);
       }
 
       if (!r.record) {
@@ -4058,8 +4073,8 @@
     async function openFailback(botId) {
       try {
         const res = await api('POST', `/bots/${botId}/fleet-failback`);
-        if (!res.success) { showMessage('error', res.error || 'Failed to open the failback run'); return; }
-        showMessage('success', 'Run opened');
+        if (!res.success) showMessage('error', res.error || 'Failed to open the failback run');
+        else showMessage('success', 'Run opened');
       } catch (err) {
         showNoAnswer('failback run');
       }

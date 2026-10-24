@@ -1485,6 +1485,9 @@
             const fbWarnBadge = fb && (fb.lastError || fb.stale)
               ? `<span class="update-badge" title="${escapeHtml(fb.lastError ? `Last database backup failed: ${fb.lastError}` : 'No database backup in over 36 hours')}">DB backup ${fb.lastError ? 'failed' : 'stale'}</span>`
               : '';
+            const restoreBadge = fb && fb.restoreError
+              ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
+              : '';
             const fenceBadge = bot.fenceStuck
               ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database READ-ONLY</span>`
               : '';
@@ -1572,7 +1575,7 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${pendingBadge}${fbWarnBadge}${fenceBadge}${replWarnBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${replWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
@@ -2726,7 +2729,22 @@
     }
 
     function fleetBackupErrorHtml(fb) {
-      return fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '';
+      const restore = fb?.restoreError
+        ? `<div class="error-message">${escapeHtml(fb.restoreError)}. <button class="btn btn-secondary btn-small" onclick="dismissFleetRestoreError('${fleetBackupBotId}')">Dismiss</button></div>`
+        : '';
+      return restore + (fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '');
+    }
+
+    async function dismissFleetRestoreError(botId) {
+      try {
+        const res = await api('DELETE', `/bots/${botId}/fleet-backups/restore-error`);
+        if (!res.success) showMessage('error', res.error || 'Could not dismiss the restore notice');
+      } catch (err) {
+        showNoAnswer('dismiss');
+      } finally {
+        await loadBots();
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
     }
 
     async function fleetBackupListHtml(botId, fb) {
@@ -3599,7 +3617,9 @@
       const standInWho = standing && standing.standInNodeId ? escapeHtml(standing.standInNodeId.slice(0, 8)) : 'the node holding the fleet';
       const unanswered = !!(posture && posture.read === 'unanswered');
       const who = standing && standing.coveringNodeId ? escapeHtml(standing.coveringNodeId.slice(0, 8)) : 'the master';
-      const lagText = live.caughtUp === true ? ', caught up'
+      // caughtUp compares this copy's received and replayed positions, never the primary's: it means caught up only while streaming.
+      const lagText = live.caughtUp === true
+        ? (live.receiverStatus === 'streaming' ? ', caught up' : '; it replayed everything received before the link dropped')
         : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
       // Every branch above the last means this copy has stopped protecting the
       // fleet, which must not read as an ordinary status line. An absent live

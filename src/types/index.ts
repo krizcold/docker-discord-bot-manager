@@ -313,6 +313,7 @@ export interface InstanceConfig {
   fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
+  fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it
   fleetConsentFenceLeft?: string[];    // containers whose write fence a failback or drop-back run set and has not seen lifted; the next run there owns it
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts

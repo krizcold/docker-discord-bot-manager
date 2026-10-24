@@ -770,6 +770,18 @@ export function updateInstanceFleetFailbackDeclined(botId: string, decline: Flee
   saveRegistry(registry);
 }
 
+/** Set or clear a failed restore's notice. Throws when the registry cannot be saved. */
+export function updateInstanceFleetRestoreError(botId: string, notice: { file: string; text: string } | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!notice && !instance.fleetRestoreError) return;
+  if (notice) instance.fleetRestoreError = notice;
+  else delete instance.fleetRestoreError;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** Record or clear that a failback or drop-back run owns the write fence on this database. Throws when the registry cannot be saved. */
 export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, left: boolean): void {
   const registry = loadRegistry();

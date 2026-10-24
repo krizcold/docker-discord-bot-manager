@@ -39,7 +39,7 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
 
 // Last dump attempt per instance (in-memory; persisted success lives on the record)
 const lastAttempts: Map<string, number> = new Map();
-// Last dump/restore error per instance (in-memory, surfaced on the bot card)
+// Last dump error per instance (in-memory, surfaced on the bot card)
 const lastErrors: Map<string, string> = new Map();
 // A stuck restore write fence, tracked apart from lastErrors: a read-only
 // database still DUMPS successfully, so the nightly dump's success would wipe
@@ -85,6 +85,36 @@ const busy: Set<string> = new Set();
 
 export function getFleetBackupError(botId: string): string | null {
   return lastErrors.get(botId) || null;
+}
+
+/** The last failed restore's notice; only a successful restore or a dismiss clears it. */
+export function getFleetRestoreError(botId: string): string | null {
+  return restoreNotice(botId)?.text || null;
+}
+
+/** False when there was no notice to dismiss. */
+export function dismissFleetRestoreError(botId: string): boolean {
+  if (!restoreNotice(botId)) return false;
+  if (containerManager.getBot(botId)?.fleetRestoreError) containerManager.updateInstanceFleetRestoreError(botId, null);
+  unsavedRestoreErrors.delete(botId);
+  return true;
+}
+
+// Notices the registry could not save; read after the record.
+const unsavedRestoreErrors: Map<string, { file: string; text: string }> = new Map();
+
+function restoreNotice(botId: string): { file: string; text: string } | null {
+  return containerManager.getBot(botId)?.fleetRestoreError || unsavedRestoreErrors.get(botId) || null;
+}
+
+function setRestoreError(botId: string, file: string, reason: string, consequence: string): void {
+  const text = `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`;
+  try {
+    containerManager.updateInstanceFleetRestoreError(botId, { file, text });
+  } catch (err) {
+    console.error(`[FleetBackup] Could not save the restore notice for ${botId}: ${err}`);
+    unsavedRestoreErrors.set(botId, { file, text: `${text} (this notice is not saved and a manager restart drops it)` });
+  }
 }
 
 /** The write fences a restore, drop-back or failback left on, one text per database; null when none. */
@@ -453,12 +483,14 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
  * Keep the newest `keep` dumps; every pre-*.dump safety file is exempt
  * (pre-restore-, pre-reseed-, pre-rescue-, pre-decommission-): each one is
  * some destructive lane's recovery copy and must never age out under it.
+ * So is the dump a failed restore targeted, while its notice stands.
  */
 function trimFleetBackups(botId: string, keep: number): void {
   const dir = backupDir(botId);
   let trimmable: Array<{ file: string }>;
   try {
-    trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-'));
+    const target = restoreNotice(botId)?.file;
+    trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-') && f.file !== target);
   } catch (err) {
     console.warn(`[FleetBackup] Kept every dump for ${botId}: ${err}`);
     return;
@@ -760,7 +792,7 @@ export async function restoreFleetBackup(
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
     if (!recreate.ok) {
-      lastErrors.set(botId, `Restore failed: could not recreate the database: ${recreate.stderr.trim().split('\n').pop()}`);
+      setRestoreError(botId, file, `could not recreate the database: ${recreate.stderr.trim().split('\n').pop()}`, 'The database may be missing, or unchanged if the drop itself failed');
       const cleared = await liftAndTrack(botId, fleetDb);
       fenced = cleared !== 'lifted';
       for (const id of steps.stopped) {
@@ -824,6 +856,12 @@ export async function restoreFleetBackup(
     if (restore.success) {
       steps.restored = true;
       lastErrors.delete(botId);
+      unsavedRestoreErrors.delete(botId);
+      try {
+        containerManager.updateInstanceFleetRestoreError(botId, null);
+      } catch (err) {
+        console.error(`[FleetBackup] Could not clear the restore notice for ${botId}: ${err}`);
+      }
       if (liveTerm !== null) {
         // RETURNING-counted: a psql exit 0 with zero rows updated (a dump
         // whose term table exists but is empty) must warn, not report success.
@@ -838,7 +876,7 @@ export async function restoreFleetBackup(
         }
       }
     } else {
-      lastErrors.set(botId, `Restore failed: ${restore.error}`);
+      setRestoreError(botId, file, restore.error || 'unknown error', 'The database may hold a partial restore');
     }
 
     // 7. On a failed restore, terminate any surviving session BEFORE lifting:

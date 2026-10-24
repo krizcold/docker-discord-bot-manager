@@ -64,6 +64,7 @@ function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> 
       lastAt: bot.lastFleetBackupAt || null,
       stale: fleetBackup.isFleetBackupStale(bot),
       lastError: fleetBackup.getFleetBackupError(bot.id),
+      restoreError: fleetBackup.getFleetRestoreError(bot.id),
       scoped: fleetBackup.fleetBackupScopeState(bot),
       ...fleetBackup.effectiveFleetBackup(bot),
     } : null,
@@ -1573,6 +1574,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
+  });
+
+  /** DELETE /api/bots/:id/fleet-backups/restore-error - Dismiss a failed restore's notice. */
+  router.delete('/:id/fleet-backups/restore-error', (req: Request, res: Response) => {
+    if (!containerManager.getBot(req.params.id)) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+    res.json({ success: true, dismissed: fleetBackup.dismissFleetRestoreError(req.params.id) });
   });
 
   /**

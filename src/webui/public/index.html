@@ -928,7 +928,7 @@
     function setBotStatus(id, status, activeOp) {
       const bot = bots.find(b => b.id === id);
       if (bot) {
-        bot.status = status;
+        if (status !== undefined) bot.status = status;
         if (activeOp !== undefined) bot.activeOp = activeOp;
       }
     }

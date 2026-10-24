@@ -1221,6 +1221,19 @@ export function isBotBusy(botId: string): string | null {
   return activeOps.get(botId) || null;
 }
 
+// Status pushes sent inside an op carry its activeOp; once the lock is gone
+// every tab is told, whatever path the op ended on.
+function broadcastOpReleased(botId: string): void {
+  if (!broadcastFn) return;
+  const registry = loadRegistry();
+  if (brokenRegistryLoads.has(registry)) {
+    broadcastFn('bot:status', { id: botId, activeOp: null });
+    return;
+  }
+  const inst = registry.instances[botId];
+  if (inst) broadcastFn('bot:status', { id: botId, status: servedStatus(inst).status, activeOp: null });
+}
+
 async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Promise<T> {
   const current = activeOps.get(botId);
   if (current) {
@@ -1231,6 +1244,7 @@ async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Pr
     return await fn();
   } finally {
     activeOps.delete(botId);
+    broadcastOpReleased(botId);
   }
 }
 
@@ -1267,6 +1281,7 @@ async function withLoggedBotOp(
     throw err;
   } finally {
     activeOps.delete(botId);
+    broadcastOpReleased(botId);
   }
 }
 

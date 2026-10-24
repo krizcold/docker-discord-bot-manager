@@ -205,7 +205,7 @@ describe('B09-2 review: an unreadable store is not a missing value', () => {
       renderSeedBanner: () => {}, renderFleetReplication: () => {}, renderRecoveryChannel: () => {},
       api: async () => ({ success: true, backups: [] }),
     });
-    vm.runInContext(pageFunction('showFleetBackups'), ctx);
+    for (const fn of ['showFleetBackups', 'fleetBackupListHtml', 'fleetBackupErrorHtml']) vm.runInContext(pageFunction(fn), ctx);
     await ctx.showFleetBackups('b1');
     return content.innerHTML as string;
   };

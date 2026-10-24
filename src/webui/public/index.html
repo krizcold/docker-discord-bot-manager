@@ -921,6 +921,7 @@
     // Bot lifecycle events merge the incoming bot into bots[] by id (preserving
     // enriched fields like updateAvailable). Only events that change bots[]'s
     // shape (created/deleted) or enrichment (source/rebuilt) refetch.
+    // bot:health carries the backup status and replication verdict by id.
     let ws = null;
     let hasConnectedBefore = false;
 
@@ -1214,11 +1215,21 @@
           case 'bot:update-requested':
             break;
 
+          // Backup status and replication verdict, merged by id
+          case 'bot:health':
+            mergeBotState(payload);
+            redraw();
+            refreshFleetBackupStatus(id);
+            break;
+
           // Structural changes or edits that can touch env/vault - refetch
           case 'bot:created':
           case 'bot:deleted':
-          case 'bot:updated':
             loadBots();
+            loadVault();
+            break;
+          case 'bot:updated':
+            loadBots().then(() => refreshFleetBackupStatus(id));
             loadVault();
             break;
 
@@ -2636,30 +2647,8 @@
       fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
       content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
-      let listHtml = '';
-      try {
-        const res = await api('GET', `/bots/${botId}/fleet-backups`);
-        const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
-        const emptyText = !fb.enabled
-          ? 'No backups. Daily backup is off, so none will be taken until it is turned on.'
-          : fb.scoped === false
-            ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
-            : fb.scoped === null
-            ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
-            : 'No backups yet. The first dump runs at the scheduled hour.';
-        listHtml = !res.success
-          ? `<div class="error-message">Could not list the backups: ${escapeHtml(res.error || 'unknown error')}</div>`
-          : backups.length === 0
-          ? `<div class="env-tip">${emptyText}</div>`
-          : backups.map(b => `
-            <div class="env-row" style="align-items:center;">
-              <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
-              <span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">${formatBackupSize(b.size)} - ${new Date(b.mtime).toLocaleString()}</span>
-              <button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>
-            </div>`).join('');
-      } catch (err) {
-        listHtml = '<div class="error-message">Could not list the backups: the manager could not be reached</div>';
-      }
+      const listHtml = await fleetBackupListHtml(botId, fb);
+      if (fleetBackupBotId !== botId) return;
 
       const hourOptions = Array.from({ length: 24 }, (_, h) =>
         `<option value="${h}" ${h === fb.hour ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`
@@ -2668,7 +2657,7 @@
       content.innerHTML = `
         <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
         <div id="fleet-seed-banner"></div>
-        ${fb.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : ''}
+        <div id="fleet-backup-error">${fleetBackupErrorHtml(bots.find(b => b.id === botId)?.fleetBackup || fb)}</div>
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
           <label class="toggle-switch">
             <input type="checkbox" id="fleet-backup-enabled" ${fb.enabled ? 'checked' : ''} onchange="saveFleetBackupConfig()">
@@ -2696,6 +2685,52 @@
       renderSeedBanner(botId);
       renderFleetReplication(botId);
       renderRecoveryChannel(botId);
+      if (bots.find(b => b.id === botId)?.fleetBackup !== bot?.fleetBackup) refreshFleetBackupStatus(botId);
+    }
+
+    function fleetBackupErrorHtml(fb) {
+      return fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '';
+    }
+
+    async function fleetBackupListHtml(botId, fb) {
+      try {
+        const res = await api('GET', `/bots/${botId}/fleet-backups`);
+        const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
+        const emptyText = !fb.enabled
+          ? 'No backups. Daily backup is off, so none will be taken until it is turned on.'
+          : fb.scoped === false
+            ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
+            : fb.scoped === null
+            ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
+            : 'No backups yet. The first dump runs at the scheduled hour.';
+        return !res.success
+          ? `<div class="error-message">Could not list the backups: ${escapeHtml(res.error || 'unknown error')}</div>`
+          : backups.length === 0
+          ? `<div class="env-tip">${emptyText}</div>`
+          : backups.map(b => `
+            <div class="env-row" style="align-items:center;">
+              <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
+              <span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">${formatBackupSize(b.size)} - ${new Date(b.mtime).toLocaleString()}</span>
+              <button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>
+            </div>`).join('');
+      } catch (err) {
+        return '<div class="error-message">Could not list the backups: the manager could not be reached</div>';
+      }
+    }
+
+    let fleetBackupRefreshSeq = 0;
+    // A push for the open modal's bot redraws only its error line and dump list.
+    async function refreshFleetBackupStatus(botId) {
+      if (fleetBackupBotId !== botId) return;
+      const bot = bots.find(b => b.id === botId);
+      const errorBox = document.getElementById('fleet-backup-error');
+      const listBox = document.getElementById('fleet-backup-list');
+      if (!bot?.fleetDb || !bot.fleetBackup || !errorBox || !listBox) return;
+      const seq = ++fleetBackupRefreshSeq;
+      errorBox.innerHTML = fleetBackupErrorHtml(bot.fleetBackup);
+      const html = await fleetBackupListHtml(botId, bot.fleetBackup);
+      if (fleetBackupBotId !== botId || seq !== fleetBackupRefreshSeq || !listBox.isConnected) return;
+      listBox.innerHTML = html;
     }
 
     let seedBannerSeq = 0;

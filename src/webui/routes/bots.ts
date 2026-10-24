@@ -26,7 +26,7 @@ import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
-import { DeploymentMode } from '../../types';
+import { DeploymentMode, InstanceConfig } from '../../types';
 import { logCollectors } from '../../build/logCollector';
 import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
 import * as fs from 'fs';
@@ -56,8 +56,60 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
   return { ...bot, activeOp: containerManager.isBotBusy(bot.id) };
 }
 
+// The computed health keys every bot record carries to the page, so a push
+// never replaces them with the raw record's fleetBackup config.
+function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; replicationHealth: ReturnType<typeof getReplicationHealth> } {
+  return {
+    fleetBackup: bot.fleetDb ? {
+      lastAt: bot.lastFleetBackupAt || null,
+      stale: fleetBackup.isFleetBackupStale(bot),
+      lastError: fleetBackup.getFleetBackupError(bot.id),
+      scoped: fleetBackup.fleetBackupScopeState(bot),
+      ...fleetBackup.effectiveFleetBackup(bot),
+    } : null,
+    replicationHealth: getReplicationHealth(bot.id),
+  };
+}
+
+function withHealth<T extends { id: string } | null | undefined>(bot: T): T {
+  const record = bot ? containerManager.getBot(bot.id) : null;
+  return record ? { ...bot, ...botHealth(record) } : bot;
+}
+
+type HealthPush = { id: string } & ReturnType<typeof botHealth>;
+
+/** Pushes for the bots whose verdict or backup status changed since the last call. */
+export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
+  const changed: HealthPush[] = [];
+  const live = new Set<string>();
+  for (const bot of containerManager.getAllBots()) {
+    live.add(bot.id);
+    let health: ReturnType<typeof botHealth>;
+    try { health = botHealth(bot); } catch { continue; }
+    const rh = health.replicationHealth;
+    const key = JSON.stringify([health.fleetBackup, rh ? { ...rh, checkedAt: undefined } : null]);
+    if (seen.get(bot.id) === key) continue;
+    seen.set(bot.id, key);
+    changed.push({ id: bot.id, ...health });
+  }
+  for (const id of [...seen.keys()]) if (!live.has(id)) seen.delete(id);
+  return changed;
+}
+
+const HEALTH_PUSH_MS = 15000;
+
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
+
+  const healthSeen = new Map<string, string>();
+  setInterval(() => {
+    try {
+      if (containerManager.registryFault()) return;
+      for (const push of collectHealthChanges(healthSeen)) broadcastToClients(wss, 'bot:health', push);
+    } catch (err) {
+      console.error('[HealthPush] Health read failed:', err);
+    }
+  }, HEALTH_PUSH_MS).unref();
 
   router.use((req: Request, res: Response, next) => {
     const registryFault = containerManager.registryFault();
@@ -107,14 +159,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           ? casaosWebOpenUrl(bot.sanitizedName, bot.id)
           : null;
 
-        // Sidecar backup status: null for instances without a managed fleet DB.
-        const fleetBackupInfo = bot.fleetDb ? {
-          lastAt: bot.lastFleetBackupAt || null,
-          stale: fleetBackup.isFleetBackupStale(bot),
-          lastError: fleetBackup.getFleetBackupError(bot.id),
-          scoped: fleetBackup.fleetBackupScopeState(bot),
-          ...fleetBackup.effectiveFleetBackup(bot),
-        } : null;
         // A decommissioned database's safety dump must stay reachable: this
         // is the Database button's only reason to render once fleetDb is gone.
         let hasDbBackups: boolean | undefined;
@@ -127,12 +171,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdate: bot.autoUpdate || false,
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
-          fleetBackup: fleetBackupInfo,
           hasDbBackups,
           ...(containerManager.getReconcileRead(bot.id) ?? { statusCheckedAt: null, servicesUp: null }),
-          // Cached verdict from the background sampler: null when this instance
-          // has no replication role. Never probed inline - the list is polled.
-          replicationHealth: getReplicationHealth(bot.id),
+          // Sidecar backup status (null without a managed fleet DB) and the
+          // sampler's cached verdict; changes reach open tabs as bot:health.
+          ...botHealth(bot),
           // Fleet-worker marker: drives the Database button's replica surface.
           // A node that dials out per its app's own record; the default fold
           // keeps an absent role out of the dial-out set (R7), and an app
@@ -545,7 +588,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.startBot(botId).then((result) => {
-        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
+        const updatedBot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
         if (result.success) {
           broadcastToClients(wss, 'bot:started', { ...updatedBot, opId, ...(result.warning ? { warning: result.warning } : {}) });
         } else {
@@ -576,7 +619,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const bot = withActiveOp(publicBot(containerManager.getBot(req.params.id)));
+      const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(req.params.id))));
       broadcastToClients(wss, 'bot:stopped', bot);
       res.json(result.warning ? { success: true, bot, warning: result.warning } : { success: true, bot });
     } catch (error) {
@@ -612,7 +655,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.restartBot(botId).then((result) => {
-        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
+        const updatedBot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
         if (result.success) {
           broadcastToClients(wss, 'bot:restarted', { ...updatedBot, opId, warning: result.warning });
         } else {
@@ -701,7 +744,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const botId = req.params.id;
       containerManager.buildBot(botId).then((result) => {
-        const updatedBot = withActiveOp(publicBot(containerManager.getBot(botId)));
+        const updatedBot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
         if (result.success) {
           broadcastToClients(wss, 'bot:built', { ...updatedBot, opId });
         } else {

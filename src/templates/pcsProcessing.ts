@@ -237,7 +237,7 @@ export function processComposeForCasaOS(
   appName: string,
   bot: BotConfig,
   opts: { mode?: DeploymentMode; hostBotDir?: string } = {}
-): { content: string; sidecarInjected: boolean } {
+): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[] } {
   if ((opts.mode ?? 'casaos') === 'docker') {
     return processComposeForDocker(composeContent, appName, bot, opts.hostBotDir);
   }
@@ -781,24 +781,46 @@ function envValueOf(env: unknown, key: string): string | null {
 }
 
 /**
+ * A fronting auth gateway: a main service whose env names another compose
+ * service via BACKEND_HOST/BACKEND_PORT. Null when the shape doesn't match (no
+ * gateway, or the backend lives outside this compose).
+ */
+export function frontingGateway(compose: Record<string, unknown>): { gateway: string; backend: string; backendPort: number } | null {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services) return null;
+  const mainName = getMainServiceName(compose);
+  if (!mainName || !services[mainName]) return null;
+  const backendHost = envValueOf(services[mainName].environment, 'BACKEND_HOST');
+  const backendPort = parseInt(envValueOf(services[mainName].environment, 'BACKEND_PORT') || '', 10);
+  if (!backendHost || isNaN(backendPort)) return null;
+  const backendName = services[backendHost]
+    ? backendHost
+    : Object.keys(services).find(n => services[n]?.container_name === backendHost);
+  if (!backendName || backendName === mainName) return null;
+  return { gateway: mainName, backend: backendName, backendPort };
+}
+
+/**
+ * Whether a deploy in this mode with this webAuth drops a fronting gateway. On
+ * the docker stack the boundary is the localhost bind or the bundled Authelia;
+ * webAuth=public keeps the bot's own gate, and a non-loopback BOT_PORT_BIND with
+ * no domain route keeps it as the only boundary. CasaOS always keeps it.
+ */
+export function frontingGatewayDropped(mode: DeploymentMode, webAuth: BotConfig['webAuth']): boolean {
+  if (mode !== 'docker' || webAuth === 'public') return false;
+  return isLoopbackBind(botPortBind()) || !!process.env.BOT_DOMAIN_BASE;
+}
+
+/**
  * Remove a fronting auth-gateway main service and repoint the compose's web entry
- * (x-casaos main + webui_port) at the backend service it proxied. Purely structural:
- * the gateway contract is a main service whose env names another compose service via
- * BACKEND_HOST/BACKEND_PORT. No-op when the shape doesn't match (no gateway, or the
- * backend lives outside this compose).
+ * (x-casaos main + webui_port) at the backend service it proxied.
  */
 function stripFrontingGateway(compose: Record<string, unknown>): void {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return;
-  const mainName = getMainServiceName(compose);
-  if (!mainName || !services[mainName]) return;
-  const backendHost = envValueOf(services[mainName].environment, 'BACKEND_HOST');
-  const backendPort = parseInt(envValueOf(services[mainName].environment, 'BACKEND_PORT') || '', 10);
-  if (!backendHost || isNaN(backendPort)) return;
-  const backendName = services[backendHost]
-    ? backendHost
-    : Object.keys(services).find(n => services[n]?.container_name === backendHost);
-  if (!backendName) return;
+  const found = frontingGateway(compose);
+  if (!found) return;
+  const { gateway: mainName, backend: backendName, backendPort } = found;
 
   delete services[mainName];
   for (const svc of Object.values(services)) {
@@ -831,7 +853,7 @@ export function processComposeForDocker(
   appName: string,
   bot: BotConfig,
   hostBotDir?: string
-): { content: string; sidecarInjected: boolean } {
+): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[] } {
   const pcs = getPCSEnvironment();
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
 
@@ -843,15 +865,13 @@ export function processComposeForDocker(
     return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
   }
 
-  // A fronting auth gateway (main service proxying a backend via BACKEND_HOST/
-  // BACKEND_PORT, e.g. AppShield) is the YUNDERA boundary. On this stack the
-  // boundary is the localhost bind or the bundled Authelia, so a shipped gateway
-  // would only double-gate the web UI - drop it and repoint the web entry at its
-  // backend. webAuth=public pins the bot to its own gate and keeps it.
-  // A non-loopback BOT_PORT_BIND with no domain route publishes the port to other
-  // hosts with nothing in front of it, so the shipped gateway stays as the boundary.
-  const lanExposed = !isLoopbackBind(botPortBind()) && !process.env.BOT_DOMAIN_BASE;
-  if (bot.webAuth !== 'public' && !lanExposed) stripFrontingGateway(compose);
+  // A fronting auth gateway (e.g. AppShield) is the YUNDERA boundary; here it
+  // would only double-gate the web UI.
+  let droppedGatewayBinds: string[] = [];
+  if (frontingGatewayDropped('docker', bot.webAuth)) {
+    droppedGatewayBinds = frontingGatewayBindTargets(compose);
+    stripFrontingGateway(compose);
+  }
 
   const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
 
@@ -1007,7 +1027,21 @@ export function processComposeForDocker(
   }
 
   capServiceLogs(services);
-  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false };
+  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false, droppedGatewayBinds };
+}
+
+/** The in-container targets of the fronting gateway's volumes; empty when there is no gateway. */
+export function frontingGatewayBindTargets(compose: Record<string, unknown>): string[] {
+  const found = frontingGateway(compose);
+  if (!found) return [];
+  const service = (compose.services as Record<string, Record<string, unknown>>)[found.gateway];
+  if (!service || !Array.isArray(service.volumes)) return [];
+  const out: string[] = [];
+  for (const vol of service.volumes as unknown[]) {
+    if (typeof vol === 'string') { const s = splitDockerVolume(vol); if (s?.dest) out.push(s.dest); }
+    else if (vol && typeof vol === 'object' && typeof (vol as Record<string, unknown>).target === 'string') out.push((vol as Record<string, unknown>).target as string);
+  }
+  return out;
 }
 
 /**
@@ -1926,7 +1960,8 @@ export function prepareDockerBotFiles(
   hostBotDir: string,
   repoPath: string | null,
   configFiles: Array<{ path: string; body: string; readOnly?: boolean }>,
-  logFn?: (msg: string) => void
+  logFn?: (msg: string) => void,
+  droppedGatewayBinds: string[] = []
 ): string {
   const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
   let compose: Record<string, unknown>;
@@ -1977,6 +2012,10 @@ export function prepareDockerBotFiles(
     const targetName = getAppServiceName(compose) || getMainServiceName(compose);
     const targetSvc = targetName ? services[targetName] : undefined;
     for (const cf of configFiles) {
+      if (droppedGatewayBinds.includes(cf.path)) {
+        log(`[Docker] Skipped config ${cf.path}: its gateway service is not deployed`);
+        continue;
+      }
       const existing = declared.get(cf.path);
       if (existing) {
         try { writeDockerConfig(hostSrcToLocal(existing, prefix, containerBotDir), cf.body); log(`[Docker] Applied config ${cf.path}`); }

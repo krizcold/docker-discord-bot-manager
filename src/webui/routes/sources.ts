@@ -10,6 +10,8 @@ import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
 import { buildWizardEnvList } from '../../env/envList';
+import { getDeploymentMode } from '../../casaos/detector';
+import { frontingGatewayDropped } from '../../templates/pcsProcessing';
 import { applyTemplateModifiers } from '../../config/templateModifiers';
 import { findManifest, sanitizeSeedRows, manifestHasInFileToken } from '../../config/installManifests';
 import { parseConfig } from '../../config/configSerializer';
@@ -217,7 +219,9 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
 
       const scanSource = req.query.scan === 'true';
       const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
-      const { vars, detection, sourceScan } = buildWizardEnvList(repoPath, { scanSource, sourceUrl: source.url });
+      // A new bot starts with the default Auth mode.
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), undefined), publicUrl: !!process.env.BOT_DOMAIN_BASE, domainBase: !!process.env.BOT_DOMAIN_BASE };
+      const { vars, detection, sourceScan } = buildWizardEnvList(repoPath, { scanSource, sourceUrl: source.url, gateway });
 
       // Apply any per-source template modifier to the prefilled config defaults
       // (data-driven; the user can still tweak/revert in the wizard). When a

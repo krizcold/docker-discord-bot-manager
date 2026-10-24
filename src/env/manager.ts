@@ -13,6 +13,7 @@ import { parseDocument } from 'yaml';
 import { getEnvPath, getDataDir } from '../git/repoManager';
 import { APP_CAPABILITIES } from '../config/appCapabilities';
 import { writePrivateFile } from '../config/fileModes';
+import { frontingGateway } from '../templates/pcsProcessing';
 import { storeFileState, preserveCorruptCopy, writeFileAtomic } from '../config/storeFile';
 
 /**
@@ -684,7 +685,8 @@ function isSubstitutionValue(value: string): boolean {
 
 /**
  * Read compose `environment:` keys, skipping $-substituted entries (those are
- * auto-filled by the platform / variable substitution and are never user input).
+ * auto-filled by the platform / variable substitution and are never user input)
+ * and a fronting gateway's literals (the gateway's own settings, never the bot's).
  */
 function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: string }> {
   const result: Array<{ key: string; defaultValue: string }> = [];
@@ -696,8 +698,10 @@ function parseComposeEnv(repoPath: string): Array<{ key: string; defaultValue: s
     const services = compose?.services as Record<string, any> | undefined;
     if (!services) return result;
 
+    const gateway = frontingGateway(compose)?.gateway;
     const seen = new Set<string>();
-    for (const service of Object.values(services)) {
+    for (const [name, service] of Object.entries(services)) {
+      if (name === gateway) continue;
       const env = service?.environment;
       if (Array.isArray(env)) {
         for (const entry of env) {

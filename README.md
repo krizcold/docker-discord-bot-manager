@@ -213,7 +213,7 @@ On Yundera the bot is its own CasaOS app, published at `https://<name>-<APP_DOMA
 
 The bot's Discord-OAuth member page (`/guild`, its login routes `/auth`, and its own files under `/assets/`) is **public**: those paths bypass the admin gateway (AppShield's `ALLOWED_PATHS = /guild,/auth,/assets`). The bot refuses a raw path holding an encoded slash, backslash, "?", "#", unreserved or control character, a literal backslash or "#", a doubled slash or a dot segment, and its admin catch-all serves the admin page only at a plain path. That is the separate member-facing Discord login for the bot's own users, not the admin gate.
 
-Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway expose both in the **Env** editor; credential edits apply on the bot's next start (no rebuild needed). On a start or restart a blank keeps the current login; at install or rebuild a blank leaves the gateway without a login.
+Bots whose compose feeds `$WEBUI_USER` / `$WEBUI_PASSWORD` into their gateway expose both in the **Env** editor. They set the login on Yundera, on a bot whose Auth is Public, and in Docker mode with `BOT_PORT_BIND` off loopback and no `BOT_DOMAIN_BASE`; otherwise Docker mode removes the gateway, and when only the gateway takes the login the two rows show as not used (a stored value stays editable). To keep the gateway, set Auth to Public: on the bot card when the bot has a public URL, else with `bots web-auth <id> public`. A config file bound only into that gateway is not offered and not delivered. Credential edits apply on the bot's next start (no rebuild needed). On a start or restart a blank keeps the current login; at install or rebuild a blank leaves the gateway without a login.
 
 ---
 

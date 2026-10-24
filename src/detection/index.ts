@@ -9,6 +9,7 @@ import { parseDocument } from 'yaml';
 import { BotType, DatabaseKind, DetectedConfigFile, DetectionResult, PackageManager, SystemDep } from '../types';
 import { configFileFormat, extractConfigKeys, scanSourceForEnvVars } from '../env/manager';
 import { findConfigTemplate } from '../config/configTemplates';
+import { frontingGateway } from '../templates/pcsProcessing';
 
 /**
  * Detect bot type from repository path
@@ -426,7 +427,7 @@ const CONFIG_NAME_RE = /^(config|configuration|creds|credentials|settings)/i;
 
 /**
  * Best-effort in-container mount path for a config file: reuse a matching bind
- * from the repo's own compose, else default under /app.
+ * from the repo's own compose (never a fronting gateway's), else default under /app.
  */
 function findInContainerPath(repoPath: string, targetName: string): string | null {
   for (const f of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
@@ -436,8 +437,9 @@ function findInContainerPath(repoPath: string, targetName: string): string | nul
       const compose = parseDocument(text).toJSON() as Record<string, any>;
       const services = compose?.services as Record<string, any> | undefined;
       if (!services) return null;
-      for (const service of Object.values(services)) {
-        if (!Array.isArray(service?.volumes)) continue;
+      const gateway = frontingGateway(compose)?.gateway;
+      for (const [name, service] of Object.entries(services)) {
+        if (name === gateway || !Array.isArray(service?.volumes)) continue;
         for (const vol of service.volumes) {
           let target: string | null = null;
           if (typeof vol === 'string') {
@@ -478,7 +480,8 @@ function detectComposeConfigFiles(repoPath: string): DetectedConfigFile[] {
     }
     const services = compose?.services as Record<string, any> | undefined;
     if (!services) return out;
-    for (const service of Object.values(services)) {
+    const gateway = frontingGateway(compose)?.gateway;
+    for (const [serviceName, service] of Object.entries(services)) {
       if (!Array.isArray(service?.volumes)) continue;
       for (const vol of service.volumes) {
         let src: string | null = null;
@@ -517,6 +520,8 @@ function detectComposeConfigFiles(repoPath: string): DetectedConfigFile[] {
           inContainerPath: dest,
           keys: extractConfigKeys(rawBody, format),
           rawBody,
+          ...(serviceName === gateway ? { gatewayService: serviceName } : {}),
+          service: serviceName,
         });
       }
     }

@@ -3889,6 +3889,7 @@ async function buildGitInstanceHeld(
   let appName: string;
   let buildTarget: string | null = null;
   let sidecarInjected = false;
+  let droppedGatewayBinds: string[] = [];
   let composeBuildArgs: Record<string, string> = {};
   let usedGeneratedDockerfile = false;
 
@@ -3941,6 +3942,7 @@ async function buildGitInstanceHeld(
       const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
+      droppedGatewayBinds = processed.droppedGatewayBinds || [];
     }
 
     if (fleetDb) {
@@ -4034,7 +4036,7 @@ async function buildGitInstanceHeld(
     // Docker mode: create bind dirs, deliver repo files, and deliver/bind config
     // files directly to the bot's local data dir (no /DATA, no casaos container).
     emit('[Docker] Preparing volumes and config files...', 'info');
-    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'));
+    composeContent = prepareDockerBotFiles(composeContent, getBotDir(botId), hostBotDirFor(botId), repoPath, configFiles, (msg) => emit(msg, 'info'), droppedGatewayBinds);
   }
 
   // Write .botmanager marker (CasaOS AppData folder, or the bot dir in docker mode)

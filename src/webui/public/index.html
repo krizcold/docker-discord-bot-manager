@@ -203,6 +203,7 @@
     }
     .env-row input:focus { outline: none; border-color: var(--border-focus); }
     .env-row.env-autowired input { opacity: 0.55; cursor: not-allowed; }
+    .env-inactive input { width: 100%; opacity: 0.55; cursor: not-allowed; }
     .env-row .btn-remove {
       padding: 6px; background: none; border: none; color: var(--danger);
       cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
@@ -5123,9 +5124,20 @@
     // Shared env-row rendering for the install wizard AND the post-install env
     // editor, so labels, comment tips, required flags, and sensitive masking match.
     // Entries accept either {defaultValue} (wizard hints) or {value,isSet} (editor).
+    // Outside .env-row on purpose: the install and save collectors skip it.
+    function buildInactiveRowHtml(key, label, reason) {
+      const labelHtml = label ? `<div class="env-label">${escapeHtml(label)}</div>` : '';
+      return `<div>
+        ${labelHtml}
+        <div class="env-inactive"><input type="text" value="${escapeHtml(key)}" disabled></div>
+        <div class="env-tip">${escapeHtml(reason)}</div>
+      </div>`;
+    }
+
     function renderEnvRow(e) {
       const label = e.label || e.displayLabel || getEnvLabel(e.key) || '';
       if (e.autoWired) return buildAutoWiredRowHtml(e.key, label);
+      if (e.inactive) return buildInactiveRowHtml(e.key, label, e.inactive);
       const current = (e.value !== undefined && e.value !== null) ? e.value : (e.defaultValue || '');
       const value = e.sensitive ? '' : current;
       const placeholder = e.undecryptable
@@ -5255,7 +5267,7 @@
     // a plain raw textarea. The raw .cf-body stays canonical (collectors read it).
     // Manifest cards and new/empty cards start expanded; existing raw files start
     // collapsed so a multi-file bot shows a tidy list of filenames.
-    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable) {
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable, inactive) {
       const writable = readOnly === false;
       const isEnabled = enabled !== false;
       const hasManifest = !!(manifest && window.guidedNextId);
@@ -5298,6 +5310,7 @@
             title="In-container path the bot reads" style="flex: 1;${pathDim}">
           <button class="btn-remove" onclick="this.closest('.config-file-block').remove()" title="Remove">&times;</button>
         </div>
+        ${inactive ? `<div class="env-tip cf-inactive">${escapeHtml(inactive)}</div>` : ''}
         <div class="cf-collapse${expanded ? '' : ' hidden'}">
           ${inner}
           <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
@@ -5349,7 +5362,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable, f.inactive)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>

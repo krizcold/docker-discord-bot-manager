@@ -451,6 +451,8 @@ export interface DetectedConfigFile {
   inContainerPath: string;      // best-effort mount path, e.g. "/app/config.json"
   keys: Array<{ key: string; defaultValue: string; sensitive: boolean }>;
   rawBody: string;              // verbatim template contents (prefills the wizard)
+  service?: string;             // the compose service that binds it, when found from a compose bind
+  gatewayService?: string;      // set when that service is a fronting gateway a deploy may drop
 }
 
 // ─── Docker ───

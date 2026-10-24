@@ -19,6 +19,8 @@ import {
   DetectedEnvVar,
 } from './manager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { frontingGateway, frontingGatewayBindTargets } from '../templates/pcsProcessing';
+import { parseDocument } from 'yaml';
 
 /**
  * General presentation metadata an env row may carry (any bot, any var). The
@@ -47,13 +49,39 @@ export interface EnvFieldMeta {
    * lists dialable peers, position 0 being the primary target.
    */
   semanticTargetOrder?: string[];
+  /** Why this row has no effect on this deployment; the row renders read-only and is never saved. */
+  inactive?: string;
+}
+
+/** Whether this deployment drops the compose's fronting gateway, and the bot's Auth mode. */
+export interface GatewayDeploy {
+  dropped: boolean;
+  webAuth?: string;
+  /** The bot has a public URL (BOT_DOMAIN_BASE set), so the bot card shows its Auth select. */
+  publicUrl?: boolean;
+  /** BOT_DOMAIN_BASE is set, so the bind does not keep the gateway. */
+  domainBase?: boolean;
+}
+
+function gatewayDroppedNote(gateway: GatewayDeploy): string {
+  const mode = gateway.webAuth || 'auto';
+  const keep = gateway.publicUrl
+    ? 'With Auth set to Public on the bot card, the gateway and this login stay.'
+    : gateway.domainBase
+      ? 'The gateway and this login stay when Auth is Public (`bots web-auth <id> public`).'
+      : 'The gateway and this login stay when Auth is Public (`bots web-auth <id> public`) or when BOT_PORT_BIND is off loopback.';
+  return `Not used: this deployment removes the bot's own login gateway (Auth: ${mode.charAt(0).toUpperCase()}${mode.slice(1)}). ${keep}`;
+}
+
+function gatewayFileNote(gateway: GatewayDeploy): string {
+  return gatewayDroppedNote(gateway).replace('this login', 'this file');
 }
 
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder };
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder, inactive } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder, inactive };
 }
 
 // Keys the manager authors on this app's service at deploy time, per the app's
@@ -103,10 +131,14 @@ function isAdvancedEnv(v: WizardEnvVar): boolean {
  */
 export function buildWizardEnvList(
   repoPath: string,
-  options?: { scanSource?: boolean; sourceUrl?: string }
+  options?: { scanSource?: boolean; sourceUrl?: string; gateway?: GatewayDeploy }
 ): { vars: WizardEnvVar[]; detection: DetectionResult; sourceScan?: { scanned: number; total: number } } {
   const scanSource = !!options?.scanSource;
   const detection = detectBotType(repoPath);
+  const gatewayDropped = !!options?.gateway?.dropped;
+  if (gatewayDropped && detection.configFiles) {
+    detection.configFiles = detection.configFiles.filter(cf => !cf.gatewayService);
+  }
 
   const autoWiredKeys = new Set<string>();
   if (!detection.hasCompose) {
@@ -182,7 +214,9 @@ export function buildWizardEnvList(
   // default fields when the bot's gateway uses them. They can't be named USER/
   // PASSWORD directly (USER is a reserved/hidden platform var), and detection skips
   // them because their compose value is a $-substitution.
-  if (composeReferencesCredentials(repoPath)) {
+  const credentialServices = composeCredentialServices(repoPath);
+  if (credentialServices.services.length) {
+    const loginDropped = gatewayDropped && !!credentialServices.gateway && credentialServices.services.every(s => s === credentialServices.gateway);
     for (const key of ['WEBUI_USER', 'WEBUI_PASSWORD']) {
       if (vars.some(v => v.key === key)) continue;
       vars.push({
@@ -194,6 +228,7 @@ export function buildWizardEnvList(
         source: 'compose',
         sensitive: isSensitive(key),
         autoWired: false,
+        ...(loginDropped ? { inactive: gatewayDroppedNote(options!.gateway!) } : {}),
       });
     }
   }
@@ -232,21 +267,40 @@ export function buildWizardEnvList(
 }
 
 /**
- * Whether the bot's source compose opts into AppShield login credentials by
- * referencing WEBUI_USER / WEBUI_PASSWORD. Keeps the credential fields general
- * (any bot using the convention) rather than tied to a specific bot.
+ * The services of the bot's source compose that take WEBUI_USER / WEBUI_PASSWORD
+ * in their environment, and the compose's fronting gateway when it has one. Keeps
+ * the credential fields general (any bot using the convention).
  */
-function composeReferencesCredentials(repoPath: string | null): boolean {
-  if (!repoPath) return false;
+function composeCredentialServices(repoPath: string | null): { services: string[]; gateway?: string } {
+  if (!repoPath) return { services: [] };
   for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
     try {
       const p = path.join(repoPath, name);
-      if (fs.existsSync(p) && /WEBUI_USER|WEBUI_PASSWORD/.test(fs.readFileSync(p, 'utf-8'))) return true;
+      if (!fs.existsSync(p)) continue;
+      const compose = parseDocument(fs.readFileSync(p, 'utf-8')).toJSON() as Record<string, unknown> | null;
+      const services = (compose?.services || {}) as Record<string, Record<string, unknown>>;
+      const using = Object.keys(services).filter(n => /WEBUI_USER|WEBUI_PASSWORD/.test(JSON.stringify(services[n]?.environment ?? '')));
+      return { services: using, gateway: compose ? frontingGateway(compose)?.gateway : undefined };
     } catch {
       // ignore unreadable compose
     }
   }
-  return false;
+  return { services: [] };
+}
+
+function composeGatewayBindTargets(repoPath: string | null): string[] {
+  if (!repoPath) return [];
+  for (const name of ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']) {
+    try {
+      const p = path.join(repoPath, name);
+      if (!fs.existsSync(p)) continue;
+      const compose = parseDocument(fs.readFileSync(p, 'utf-8')).toJSON() as Record<string, unknown> | null;
+      return compose ? frontingGatewayBindTargets(compose) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 }
 
 export interface EditorEnvVar extends EnvFieldMeta {
@@ -270,7 +324,8 @@ export function buildBotEnvList(
   repoPath: string | null,
   botId: string,
   tokenVarName?: string,
-  sourceUrl?: string
+  sourceUrl?: string,
+  gateway?: GatewayDeploy
 ): EditorEnvVar[] {
   const { vars: stored, undecryptable } = getEnvVarsWithStatus(botId);
   for (const key of undecryptable) stored[key] = '';
@@ -280,17 +335,21 @@ export function buildBotEnvList(
 
   // WEBUI_USER/WEBUI_PASSWORD are surfaced via buildWizardEnvList (below) so they
   // appear in both the wizard and the editor without duplication.
-  const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath, { sourceUrl }).vars : [];
+  const detected = repoPath && fs.existsSync(repoPath) ? buildWizardEnvList(repoPath, { sourceUrl, gateway }).vars : [];
   for (const d of detected) {
     if (d.autoWired) continue;   // deploy-injected, not user-editable
     seen.add(d.key);
     const isSet = stored[d.key] !== undefined;
     const sensitive = d.sensitive || isSensitive(d.key);
+    // A stored value keeps an editable row: a read-only row is not saved, and
+    // the save would then remove the stored key.
+    const keepEditable = isSet && !!d.inactive;
     result.push({
       ...envFieldMeta(d),
+      ...(keepEditable ? { inactive: undefined } : {}),
       key: d.key,
       displayLabel: d.displayLabel,
-      description: d.description,
+      description: keepEditable ? `${d.inactive} ${d.description}`.trim() : d.description,
       required: d.required,
       sensitive,
       value: sensitive ? '' : (isSet ? stored[d.key] : d.defaultValue),
@@ -346,14 +405,17 @@ export function buildBotEnvList(
 export function buildBotConfigList(
   repoPath: string | null,
   botId: string,
-  sourceUrl?: string
-): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean }> {
+  sourceUrl?: string,
+  gateway?: GatewayDeploy
+): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string }> {
   const { files: stored, undecryptable } = configFileManager.getConfigFilesWithStatus(botId);
   const storedByPath = new Map(stored.map(s => [s.path, s]));
   const seen = new Set<string>();
-  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean }> = [];
+  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string }> = [];
 
-  const detected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
+  const allDetected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
+  const gatewayPaths = new Set(gateway?.dropped ? composeGatewayBindTargets(repoPath) : []);
+  const detected = allDetected.filter(cf => !gatewayPaths.has(cf.inContainerPath));
   const declared = (repoPath && fs.existsSync(repoPath) && sourceUrl)
     ? manifestDeclaredConfigFiles(sourceUrl, repoPath, detected) : [];
   for (const cf of [...detected, ...declared]) {
@@ -374,6 +436,7 @@ export function buildBotConfigList(
     result.push({
       path: s.path, body: s.body, readOnly: s.readOnly !== false, enabled: s.enabled !== false,
       ...(undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
+      ...(gatewayPaths.has(s.path) ? { inactive: gatewayFileNote(gateway!) } : {}),
     });
   }
 

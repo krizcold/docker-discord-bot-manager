@@ -32,7 +32,7 @@ import { makeUniqueName, validateName, resolveNames, checkFolderReuse, sanitizeN
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
+import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName, frontingGatewayDropped } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
@@ -1086,7 +1086,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
 
-      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.sourceUrl || undefined);
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl, domainBase: !!process.env.BOT_DOMAIN_BASE };
+      const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.sourceUrl || undefined, gateway);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       const storePath = path.join(getEnvPath(req.params.id), 'storage.json');
 
@@ -1296,9 +1297,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
       const source = bot.sourceId ? sourceManager.getSource(bot.sourceId) : null;
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl, domainBase: !!process.env.BOT_DOMAIN_BASE };
       // Attach a guided install manifest + parsed body per file when one exists,
       // so the post-install editor renders the same guided form as the wizard.
-      const files = buildBotConfigList(repoPath, req.params.id, source?.url).map(f => {
+      const files = buildBotConfigList(repoPath, req.params.id, source?.url, gateway).map(f => {
         const targetName = path.basename(f.path);
         const manifest = (source?.url ? findManifest(source.url, targetName) : undefined) || null;
         const format = envManager.configFileFormat(targetName);

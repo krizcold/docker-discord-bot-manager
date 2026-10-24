@@ -92,7 +92,7 @@ import { getDeploymentMode, isModeExplicit } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
 import * as sourceManager from '../source/sourceManager';
-import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName } from '../naming';
+import { sanitizeName, titleizeName, resolveNames, makeUniqueName, validateName, sameSource, describeSource } from '../naming';
 import { substituteComposeNames } from '../compose/nameSubstitution';
 import YAML from 'yaml';
 import { capServiceLogs } from '../templates/logCaps';
@@ -440,8 +440,7 @@ export function readEnvsFromComposeFile(composePath: string): Record<string, str
  * Create a new bot instance from a source.
  */
 export async function createInstance(request: CreateInstanceRequest): Promise<InstanceConfig> {
-  const registry = loadRegistry();
-  refuseBrokenRegistry(registry);
+  refuseBrokenRegistry(loadRegistry());
   const sourceFault = sourceManager.sourceRegistryFault();
   if (sourceFault) throw new Error(sourceFault);
 
@@ -460,10 +459,17 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
   }
 
   // Derive names. A reserved or already-used name is auto-uniquified
-  // ("Bot" -> "Bot 2") rather than rejected.
-  const existing = Object.values(registry.instances);
+  // ("Bot" -> "Bot 2") rather than rejected. The docker listing runs before the
+  // load, so nothing awaits between the load and the save.
   const defaultName = source.composeName || extractRepoName(source.url);
-  const displayName = makeUniqueName(request.displayName || defaultName, existing);
+  const foreignProjects = await foreignDockerProjects(Object.keys(loadRegistry().instances));
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const existing = Object.values(registry.instances);
+  const displayName = makeUniqueName(request.displayName || defaultName, existing, undefined, {
+    foreignProjects,
+    source: { sourceUrl: source.url, sourceType: 'git' },
+  });
   const names = resolveNames(displayName);
 
   const instanceId = uuidv4();
@@ -524,12 +530,17 @@ export async function createInstance(request: CreateInstanceRequest): Promise<In
  * Create a new bot instance from a Docker image (no source needed).
  */
 export async function createDockerImageInstance(request: CreateDockerImageInstanceRequest): Promise<InstanceConfig> {
+  refuseBrokenRegistry(loadRegistry());
+  const foreignProjects = await foreignDockerProjects(Object.keys(loadRegistry().instances));
   const registry = loadRegistry();
   refuseBrokenRegistry(registry);
 
   // Auto-uniquify a reserved or already-used name ("Bot" -> "Bot 2").
   const existing = Object.values(registry.instances);
-  const names = resolveNames(makeUniqueName(request.displayName, existing));
+  const names = resolveNames(makeUniqueName(request.displayName, existing, undefined, {
+    foreignProjects,
+    source: { sourceUrl: null, sourceType: 'docker-image', imageRef: request.imageRef },
+  }));
 
   const instanceId = uuidv4();
   const now = new Date().toISOString();
@@ -1011,7 +1022,37 @@ export function updateInstanceWebAuth(botId: string, mode: 'auto' | 'managed' | 
 
 // ─── Instance Update ───
 
+/**
+ * What a deployed instance left under its compose name: a compose file, CasaOS
+ * metadata, a data folder or recorded volumes. A path that cannot be checked
+ * counts as present.
+ */
+function deployedTraces(instance: InstanceConfig): string[] {
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const traces: string[] = [];
+  const candidates = [
+    path.join(getBotDir(instance.id), 'docker-compose.yml'),
+    path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName),
+    path.join(dataRoot, 'AppData', instance.sanitizedName),
+  ];
+  for (const p of candidates) {
+    try {
+      fs.statSync(p);
+      traces.push(`${p} exists`);
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') traces.push(`${p} cannot be checked (${err?.code || err?.message || err})`);
+    }
+  }
+  if (instance.projectVolumes?.length) traces.push(`volumes ${instance.projectVolumes.join(', ')}`);
+  return traces;
+}
+
 export async function updateBot(botId: string, update: UpdateInstanceRequest): Promise<InstanceConfig | null> {
+  const before = loadRegistry();
+  if (!before.instances[botId]) return null;
+  const foreignProjects = update.displayName && resolveNames(update.displayName).sanitizedName !== before.instances[botId].sanitizedName
+    ? await foreignDockerProjects(Object.keys(before.instances))
+    : null;
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
@@ -1022,7 +1063,19 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     // two instances one sanitizedName, colliding the compose project, the
     // AppData folder and the primary vhost. Excluding this instance keeps
     // cosmetic self-renames allowed.
-    const check = validateName(update.displayName, Object.values(registry.instances), botId);
+    const renamesProject = names.sanitizedName !== instance.sanitizedName;
+    if (renamesProject) {
+      const deployed = deployedTraces(instance);
+      if (deployed.length > 0) {
+        throw new Error(`Cannot rename: the new name changes the compose name from ${instance.sanitizedName} to ${names.sanitizedName}, and the old name still has a deployment or data on this host (${deployed.join('; ')}). Only a display name with the same compose name can be set`);
+      }
+    }
+    if (renamesProject && !foreignProjects) {
+      throw new Error('Cannot rename: the bot changed while the name was being checked; try again');
+    }
+    const check = validateName(update.displayName, Object.values(registry.instances), botId, renamesProject && foreignProjects
+      ? { foreignProjects }
+      : {});
     if (!check.valid) {
       throw new Error(`Cannot rename: ${check.errors.join('; ')}`);
     }
@@ -2129,15 +2182,40 @@ export function writeBotManagerMarker(instance: InstanceConfig, appName: string,
     ? path.join(process.env.DATA_ROOT || '/DATA', 'AppData', appName)
     : getBotDir(instance.id);
 
-  const marker = {
+  // A folder adopted from an earlier instance keeps the record of whose data
+  // it held (refuseUnownedStorage admitted only the same source).
+  let lineage: BotManagerMarkerLineage[] = [];
+  if (isCasaOS) {
+    const prior = readBotManagerMarker(appName);
+    if (prior.state === 'unreadable') {
+      throw new Error(`The .botmanager marker in ${appDataPath} cannot be read (${prior.error}), so it was not replaced`);
+    }
+    if (prior.state === 'ok') {
+      lineage = Array.isArray(prior.marker.lineage) ? prior.marker.lineage : [];
+      if (prior.marker.instanceId !== instance.id) {
+        lineage = [...lineage, {
+          instanceId: prior.marker.instanceId,
+          displayName: prior.marker.displayName,
+          sourceUrl: prior.marker.sourceUrl ?? null,
+          sourceType: prior.marker.sourceType,
+          imageRef: prior.marker.imageRef ?? null,
+          lastBuildAt: prior.marker.lastBuildAt,
+        }];
+      }
+    }
+  }
+
+  const marker: BotManagerMarker = {
       managedBy: 'docker-discord-bot-manager',
       instanceId: instance.id,
       displayName: instance.displayName,
       sanitizedName: instance.sanitizedName,
       sourceUrl: instance.sourceUrl || null,
       sourceType: instance.sourceType || 'git',
+      imageRef: instance.imageRef || null,
       createdAt: instance.createdAt,
-      lastBuildAt: new Date().toISOString()
+      lastBuildAt: new Date().toISOString(),
+      ...(lineage.length ? { lineage } : {}),
   };
   try {
     writeFileAtomic(path.join(appDataPath, '.botmanager'), JSON.stringify(marker, null, 2));
@@ -2153,7 +2231,19 @@ export interface BotManagerMarker {
   sanitizedName: string;
   sourceUrl: string | null;
   sourceType: string;
+  imageRef?: string | null;
   createdAt: string;
+  lastBuildAt: string;
+  lineage?: BotManagerMarkerLineage[];
+}
+
+/** An earlier instance whose data folder this instance adopted. */
+export interface BotManagerMarkerLineage {
+  instanceId: string;
+  displayName: string;
+  sourceUrl: string | null;
+  sourceType: string;
+  imageRef: string | null;
   lastBuildAt: string;
 }
 
@@ -2201,6 +2291,162 @@ export async function composeProjectOwner(appName: string, botId: string): Promi
   if (other) return { kind: 'other', evidence: `container bot-id=${other}` };
   if (ids.every(id => id === botId)) return { kind: 'self' };
   return { kind: 'unknown', reason: `${markerReason}, and a container of the project carries no bot-id label` };
+}
+
+/**
+ * Compose projects on this docker host that hold a container of no registered
+ * bot, with those containers' names. Throws when docker does not answer, so a
+ * name check never reads silence as "no such project".
+ */
+export async function foreignDockerProjects(registeredIds: Iterable<string>): Promise<Map<string, string[]>> {
+  const known = new Set(registeredIds);
+  let rows: Array<{ project: string; botId: string; name: string }>;
+  try {
+    rows = await dockerClient.listComposeContainers();
+  } catch (err: any) {
+    throw new Error(`docker did not list its compose projects (${err?.message || err}), so the name could not be checked against them`);
+  }
+  const foreign = new Map<string, string[]>();
+  for (const row of rows) {
+    if (!row.project || (row.botId && known.has(row.botId))) continue;
+    foreign.set(row.project, [...(foreign.get(row.project) ?? []), row.name]);
+  }
+  return foreign;
+}
+
+/**
+ * A repo compose that binds $AppID paths: earlier builds resolved $AppID to
+ * bot-<id>, so their data is in AppData/bot-<id>, which this build no longer mounts.
+ */
+export function appIdFolderRefusal(instance: InstanceConfig, rawCompose: string): string | null {
+  if (!/\$\{?AppID(?![A-Za-z0-9_])/.test(rawCompose)) return null;
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const oldDir = path.join(dataRoot, 'AppData', `bot-${instance.id}`);
+  if (!fs.existsSync(oldDir)) return null;
+  return `This compose binds $AppID paths, which now resolve to ${path.join(dataRoot, 'AppData', instance.sanitizedName)}; the data of earlier builds is in ${oldDir}. Move it there by hand, then build again`;
+}
+
+/**
+ * Refuses a build that would mount storage this instance does not own: a CasaOS
+ * data folder kept from another source, or a volume or data folder that another
+ * instance's deployed compose declares.
+ */
+export function refuseUnownedStorage(instance: InstanceConfig, appName: string, composeContent: string, isCasaOS: boolean): void {
+  if (isCasaOS) {
+    const refusal = keptFolderRefusal(instance, appName);
+    if (refusal) throw new Error(refusal);
+  }
+  const conflicts = sharedStorageConflicts(instance.id, composeContent);
+  if (conflicts.length > 0) throw new Error(`Storage shared with another bot: ${conflicts.join('; ')}`);
+}
+
+export function keptFolderRefusal(instance: InstanceConfig, appName: string): string | null {
+  const folder = path.join(process.env.DATA_ROOT || '/DATA', 'AppData', appName);
+  const read = readBotManagerMarker(appName);
+  if (read.state === 'absent') return null;
+  if (read.state === 'unreadable') {
+    return `${folder} holds a .botmanager marker that cannot be read (${read.error}), so whose data the folder holds cannot be checked; repair or remove the marker, then build again`;
+  }
+  if (read.marker.instanceId === instance.id) return null;
+  const source = { sourceUrl: instance.sourceUrl || null, sourceType: instance.sourceType || 'git', imageRef: instance.imageRef || null };
+  if (sameSource(read.marker, source)) return null;
+  return `${folder} holds data kept from ${describeSource(read.marker)}; this bot is built from ${describeSource(source)}, so it would mount that data and its Remove could delete it`;
+}
+
+interface StorageClaims {
+  volumes: string[];
+  binds: string[];
+}
+
+function normalizeHostPath(p: string): string {
+  return path.posix.normalize(p.replace(/\\/g, '/')).replace(/\/+$/, '');
+}
+
+/** Folders that hold bot data: a bind under one of them is never shared. */
+function dataFolderRoots(): string[] {
+  const hostRoot = hostBotDirFor('x').replace(/\/x$/, '');
+  return [`${normalizeHostPath(process.env.DATA_ROOT || '/DATA')}/AppData/`, `${normalizeHostPath(hostRoot)}/`];
+}
+
+/**
+ * The storage a compose names outside its own project: explicitly named or
+ * external volumes, and bind sources under the data roots. Null when the
+ * compose cannot be parsed.
+ */
+function storageClaims(composeContent: string): StorageClaims | null {
+  const parsed = YAML.parseDocument(composeContent);
+  if (parsed.errors.length > 0) return null;
+  const doc: any = parsed.toJSON();
+  const claims: StorageClaims = { volumes: [], binds: [] };
+  if (!doc || typeof doc !== 'object') return claims;
+  if (doc.volumes && typeof doc.volumes === 'object') {
+    for (const [key, v] of Object.entries(doc.volumes) as Array<[string, any]>) {
+      if (v && typeof v === 'object' && v.external) {
+        claims.volumes.push(typeof v.name === 'string' ? v.name
+          : (typeof v.external === 'object' && typeof v.external.name === 'string') ? v.external.name : key);
+      } else if (v && typeof v === 'object' && typeof v.name === 'string') {
+        claims.volumes.push(v.name);
+      }
+    }
+  }
+  const roots = dataFolderRoots();
+  for (const service of Object.values(doc.services && typeof doc.services === 'object' ? doc.services : {}) as any[]) {
+    for (const vol of Array.isArray(service?.volumes) ? service.volumes : []) {
+      let source: string | null = null;
+      if (typeof vol === 'string') {
+        const parts = vol.split(':');
+        if (parts.length > 1) source = parts[0];
+      } else if (vol && typeof vol === 'object' && typeof vol.source === 'string' && vol.type !== 'volume') {
+        source = vol.source;
+      }
+      if (!source || !source.startsWith('/')) continue;
+      const normalized = normalizeHostPath(source);
+      if (roots.some(root => `${normalized}/`.startsWith(root) && `${normalized}/` !== root)) claims.binds.push(normalized);
+    }
+  }
+  return claims;
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+/**
+ * What this compose would share with another instance's deployed compose:
+ * a named or external volume, or a bind source under the data roots. An
+ * unreadable compose of another instance is a conflict too, since its
+ * storage cannot be checked.
+ */
+export function sharedStorageConflicts(botId: string, composeContent: string): string[] {
+  const own = storageClaims(composeContent);
+  if (own === null) return ['the compose about to be written cannot be parsed, so its storage could not be checked against other bots'];
+  if (own.volumes.length === 0 && own.binds.length === 0) return [];
+  const conflicts: string[] = [];
+  for (const other of Object.values(loadRegistry().instances)) {
+    if (other.id === botId) continue;
+    const composePath = resolveComposePath(other.id, other.sanitizedName);
+    let body: string;
+    try {
+      body = fs.readFileSync(composePath, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') continue;
+      conflicts.push(`${other.displayName}'s compose (${composePath}) cannot be read (${err?.code || err?.message || err}), so its storage could not be checked`);
+      continue;
+    }
+    const theirs = storageClaims(body);
+    if (theirs === null) {
+      conflicts.push(`${other.displayName}'s compose (${composePath}) cannot be parsed, so its storage could not be checked`);
+      continue;
+    }
+    for (const v of own.volumes) {
+      if (theirs.volumes.includes(v)) conflicts.push(`volume ${v} is already used by ${other.displayName}`);
+    }
+    for (const b of own.binds) {
+      const hit = theirs.binds.find(t => pathsOverlap(b, t));
+      if (hit) conflicts.push(`folder ${b} is already used by ${other.displayName} (${hit})`);
+    }
+  }
+  return conflicts;
 }
 
 /**
@@ -3399,6 +3645,8 @@ async function buildDockerImageInstance(
     emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
 
+  refuseUnownedStorage(instance, appName, composeContent, isCasaOS);
+
   writeComposeFile(botDir, composeContent);
   emit('[Done] Compose file written', 'success');
 
@@ -3648,8 +3896,15 @@ async function buildGitInstanceHeld(
 
     // Apply name substitution if we have an original compose name to replace
     if (originalComposeName && originalComposeName !== appName) {
-      emit(`[Info] Substituting compose name: ${originalComposeName} -> ${appName}`, 'info');
-      rawCompose = substituteComposeNames(rawCompose, originalComposeName, appName, instance.titleName);
+      let substituted;
+      try {
+        substituted = substituteComposeNames(rawCompose, originalComposeName, appName, instance.titleName);
+      } catch (err: any) {
+        throw new Error(`Name substitution refused: ${err?.message || err}`);
+      }
+      rawCompose = substituted.content;
+      emit(`[Info] Substituted compose name: ${originalComposeName} -> ${appName}`, 'info');
+      for (const note of substituted.notes) emit(note, 'info');
       // Substitution renamed the build-target service (its key and x-casaos.build),
       // so re-derive buildTarget from the substituted compose. Otherwise the image
       // swap below matches the old service name, no-ops, and the container keeps the
@@ -3658,6 +3913,11 @@ async function buildGitInstanceHeld(
       if (buildTarget) {
         buildTarget = extractBuildTarget(rawCompose) || buildTarget;
       }
+    }
+
+    if (isCasaOS) {
+      const refusal = appIdFolderRefusal(instance, rawCompose);
+      if (refusal) throw new Error(refusal);
     }
 
     // Apply variable substitution
@@ -3738,6 +3998,8 @@ async function buildGitInstanceHeld(
   } else if (instance.fleetDbReplica) {
     emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
+
+  refuseUnownedStorage(instance, appName, composeContent, isCasaOS);
 
   // Deliver volume dirs + user-edited config files (mode-aware).
   const configFiles = configFileManager.getConfigFilesStrict(botId).filter(c => c.enabled !== false);

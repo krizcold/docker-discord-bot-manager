@@ -186,6 +186,7 @@ describe('the wizard previews the route of the name the manager will save', () =
       sanitizeNamePreview: (n: string) => n.toLowerCase(),
       escapeHtml: (s: string) => s,
       nameValidationTimeout: null,
+      installSourceId: null,
       setTimeout: (f: () => Promise<void>) => { timers.push(f); return timers.length; },
       clearTimeout() {},
       api: async (_m: string, url: string) => answers[decodeURIComponent(url.split('name=')[1])],

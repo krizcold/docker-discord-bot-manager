@@ -60,7 +60,7 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
     APP_DEFAULT_PASSWORD: env.APP_DEFAULT_PASSWORD || 'casaos',
     APP_DOMAIN: env.APP_DOMAIN || '',
     APP_PUBLIC_IP_DASH: env.APP_PUBLIC_IP_DASH || '',
-    AppID: `bot-${bot.id}`,
+    AppID: bot.sanitizedName,
 
     // SMTP
     SMTP_HOST: env.SMTP_HOST || '',

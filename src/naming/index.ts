@@ -53,6 +53,36 @@ export function isReservedName(sanitized: string): boolean {
   return RESERVED_NAMES.includes(sanitized);
 }
 
+/** What an instance is built from, as the .botmanager marker records it. */
+export interface InstallSource {
+  sourceUrl: string | null;
+  sourceType: string;
+  imageRef?: string | null;
+}
+
+/** Facts a name check needs from outside the registry. */
+export interface NameChecks {
+  /** Compose projects on the docker host holding containers of no registered bot, with those containers' names. */
+  foreignProjects?: Map<string, string[]>;
+  /** The install's source: a data folder kept from another source then refuses the name. */
+  source?: InstallSource;
+}
+
+export function sameSource(marker: Partial<InstallSource> | null | undefined, source: InstallSource): boolean {
+  return (marker?.sourceType || 'git') === (source.sourceType || 'git')
+    && (marker?.sourceUrl || null) === (source.sourceUrl || null)
+    && (marker?.imageRef || null) === (source.imageRef || null);
+}
+
+export function describeSource(source: Partial<InstallSource> | null | undefined): string {
+  if (source?.sourceType === 'docker-image') return `image ${source.imageRef || '(not recorded)'}`;
+  return source?.sourceUrl || '(source not recorded)';
+}
+
+function appDataDisplayPath(sanitized: string): string {
+  return `${(process.env.DATA_ROOT || '/DATA').replace(/\\/g, '/').replace(/\/+$/, '')}/AppData/${sanitized}/`;
+}
+
 /**
  * Check if /DATA/AppData/{sanitized} exists and is NOT managed by Bot Manager.
  * Uses the .botmanager marker file inside the AppData folder itself,
@@ -84,6 +114,7 @@ export function validateName(
   displayName: string,
   existingInstances: InstanceConfig[],
   excludeInstanceId?: string,
+  checks: NameChecks = {},
 ): { valid: boolean; errors: string[] } {
   const errors: string[] = [];
 
@@ -122,6 +153,20 @@ export function validateName(
     errors.push(`/DATA/AppData/${sanitizedName}/ exists and is not managed by Bot Manager`);
   }
 
+  const foreign = checks.foreignProjects?.get(sanitizedName);
+  if (foreign) {
+    errors.push(`a docker project named "${sanitizedName}" already exists on this host (containers: ${foreign.join(', ')}); pick another name`);
+  }
+
+  if (checks.source) {
+    const reuse = checkFolderReuse(sanitizedName, existingInstances, checks.source);
+    if (reuse.markerUnreadable) {
+      errors.push(`${appDataDisplayPath(sanitizedName)}.botmanager cannot be read, so whose data that folder holds cannot be checked`);
+    } else if (reuse.sourceMatches === false) {
+      errors.push(`${appDataDisplayPath(sanitizedName)} holds data kept from ${reuse.keptSource}; this install is from ${describeSource(checks.source)}`);
+    }
+  }
+
   return { valid: errors.length === 0, errors };
 }
 
@@ -135,6 +180,7 @@ export function makeUniqueName(
   displayName: string,
   existingInstances: InstanceConfig[],
   excludeInstanceId?: string,
+  checks: NameChecks = {},
 ): string {
   const base = (displayName || '').trim();
   if (!base) {
@@ -147,7 +193,7 @@ export function makeUniqueName(
 
   let candidate = base;
   for (let suffix = 2; suffix < 1000; suffix++) {
-    if (validateName(candidate, existingInstances, excludeInstanceId).valid) {
+    if (validateName(candidate, existingInstances, excludeInstanceId, checks).valid) {
       return candidate;
     }
     candidate = `${base} ${suffix}`;
@@ -158,33 +204,41 @@ export function makeUniqueName(
 /**
  * Check if a sanitized name has reusable data from a previous bot manager instance.
  * Returns reuseAvailable=true when an AppData folder exists at that name and no
- * active instance currently owns it. The .botmanager marker is returned when present.
+ * active instance currently owns it. The .botmanager marker is returned when present,
+ * with the source it records and, given the install's source, whether the two match.
  */
-export function checkFolderReuse(sanitizedName: string, existingInstances: InstanceConfig[]): {
+export function checkFolderReuse(sanitizedName: string, existingInstances: InstanceConfig[], source?: InstallSource): {
   reuseAvailable: boolean;
   marker: any | null;
+  markerUnreadable: boolean;
+  keptSource: string | null;
+  sourceMatches: boolean | null;
 } {
+  const none = { reuseAvailable: false, marker: null, markerUnreadable: false, keptSource: null, sourceMatches: null };
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const appDataPath = path.join(dataRoot, 'AppData', sanitizedName);
 
-  if (!fs.existsSync(appDataPath)) {
-    return { reuseAvailable: false, marker: null };
-  }
-
-  const activeOwner = existingInstances.find(i => i.sanitizedName === sanitizedName);
-  if (activeOwner) {
-    return { reuseAvailable: false, marker: null };
-  }
+  if (!fs.existsSync(appDataPath)) return none;
+  if (existingInstances.some(i => i.sanitizedName === sanitizedName)) return none;
 
   const markerPath = path.join(appDataPath, '.botmanager');
-  if (fs.existsSync(markerPath)) {
-    try {
-      const marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
-      return { reuseAvailable: true, marker };
-    } catch {
-      return { reuseAvailable: true, marker: null };
-    }
+  if (!fs.existsSync(markerPath)) {
+    return { reuseAvailable: true, marker: null, markerUnreadable: false, keptSource: null, sourceMatches: null };
   }
-
-  return { reuseAvailable: true, marker: null };
+  let marker: any;
+  try {
+    marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+  } catch {
+    marker = null;
+  }
+  if (!marker || typeof marker !== 'object') {
+    return { reuseAvailable: true, marker: null, markerUnreadable: true, keptSource: null, sourceMatches: null };
+  }
+  return {
+    reuseAvailable: true,
+    marker,
+    markerUnreadable: false,
+    keptSource: describeSource(marker),
+    sourceMatches: source ? sameSource(marker, source) : null,
+  };
 }

@@ -158,6 +158,21 @@ export async function listProjectBotIds(projectName: string): Promise<string[]> 
 }
 
 /**
+ * Every container that belongs to a compose project, with its project and its
+ * bot-id label ('' when it has none). Throws when docker does not answer.
+ */
+export async function listComposeContainers(): Promise<Array<{ project: string; botId: string; name: string }>> {
+  const output = await execDockerAsync(
+    ['ps', '-a', '--filter', 'label=com.docker.compose.project', '--format', '{{.Label "com.docker.compose.project"}}\t{{.Label "bot-id"}}\t{{.Names}}'],
+    { timeout: 10000 }
+  );
+  return output.split('\n').filter(line => line.trim()).map(line => {
+    const [project, botId, name] = line.split('\t');
+    return { project: (project || '').trim(), botId: (botId || '').trim(), name: (name || '').trim() };
+  });
+}
+
+/**
  * Host ports currently published by any container (`0.0.0.0:18080->...`,
  * `127.0.0.1:18080->...`, `:::18080->...`), keyed to the publishing container
  * names. Used to avoid colliding when auto-assigning a bot's host port in

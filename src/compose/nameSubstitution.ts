@@ -6,41 +6,64 @@
  *
  * Replacements:
  *   name: field, service keys, container_name, depends_on, hostname,
- *   env values referencing sibling services, Caddy labels, volume paths
- *   (first segment after /AppData/), x-casaos.main, x-casaos.build,
- *   x-casaos.store_app_id, x-casaos.title
+ *   env values, labels, volume references and container paths, working_dir,
+ *   command, entrypoint, healthcheck test, volume and network keys with their
+ *   service references (an external one keeps the docker object it names),
+ *   x-casaos.main, x-casaos.build, x-casaos.store_app_id, x-casaos.title
  */
 
 import YAML from 'yaml';
 
+export interface NameSubstitutionResult {
+  content: string;
+  /** Build-log lines naming each env value the substitution changed. */
+  notes: string[];
+}
+
 /**
  * Substitute all occurrences of originalName with newSanitizedName in a compose file.
- * Optionally sets x-casaos.title to a titleName.
+ * Optionally sets x-casaos.title to a titleName. Throws when the compose cannot be
+ * parsed: a build that went on with the original names would share containers and
+ * data folders with the instance that owns them.
  */
 export function substituteComposeNames(
   composeContent: string,
   originalName: string,
   newSanitizedName: string,
   titleName?: string,
-): string {
+): NameSubstitutionResult {
+  const notes: string[] = [];
   if (!originalName || originalName === newSanitizedName) {
-    return composeContent;
+    return { content: composeContent, notes };
   }
 
-  let doc: any;
-  try {
-    doc = YAML.parse(composeContent);
-  } catch (err) {
-    console.warn('[NameSubstitution] Failed to parse compose YAML, returning unmodified:', err);
-    return composeContent;
+  const parsed = YAML.parseDocument(composeContent);
+  if (parsed.errors.length > 0) {
+    throw new Error(`the compose file cannot be parsed, so ${originalName} could not be renamed to ${newSanitizedName}: ${parsed.errors[0].message.split('\n')[0]}`);
+  }
+  const doc: any = parsed.toJSON();
+  if (!doc || typeof doc !== 'object') {
+    throw new Error(`the compose file holds no mapping, so ${originalName} could not be renamed to ${newSanitizedName}`);
   }
 
-  if (!doc || typeof doc !== 'object') return composeContent;
+  const rename = (s: string): string => replaceInString(s, originalName, newSanitizedName);
+  const renameList = (list: unknown[]): unknown[] => list.map(part => typeof part === 'string' ? rename(part) : part);
 
   // 1. name: field
   if (doc.name && typeof doc.name === 'string') {
-    doc.name = replaceInString(doc.name, originalName, newSanitizedName);
+    doc.name = rename(doc.name);
   }
+
+  const volumeKeyMap: Record<string, string> = {};
+  if (doc.volumes && typeof doc.volumes === 'object') {
+    for (const key of Object.keys(doc.volumes)) {
+      const renamed = rename(key);
+      if (renamed !== key) volumeKeyMap[key] = renamed;
+    }
+  }
+  const renameSource = (source: string): string => isNamedVolumeSource(source)
+    ? (volumeKeyMap[source] || source)
+    : replaceAppDataPath(source, originalName, newSanitizedName);
 
   // 2. Rename service keys and update all internal references
   if (doc.services && typeof doc.services === 'object') {
@@ -56,18 +79,11 @@ export function substituteComposeNames(
     doc.services = newServices;
 
     // Update references within each service
-    for (const service of Object.values(doc.services) as any[]) {
+    for (const [serviceName, service] of Object.entries(doc.services) as Array<[string, any]>) {
       if (!service || typeof service !== 'object') continue;
 
-      // container_name
-      if (typeof service.container_name === 'string') {
-        service.container_name = replaceInString(service.container_name, originalName, newSanitizedName);
-      }
-
-      // hostname
-      if (typeof service.hostname === 'string') {
-        service.hostname = replaceInString(service.hostname, originalName, newSanitizedName);
-      }
+      if (typeof service.container_name === 'string') service.container_name = rename(service.container_name);
+      if (typeof service.hostname === 'string') service.hostname = rename(service.hostname);
 
       // depends_on (array or object form)
       if (Array.isArray(service.depends_on)) {
@@ -83,55 +99,63 @@ export function substituteComposeNames(
 
       // environment (array or object form)
       if (Array.isArray(service.environment)) {
-        service.environment = service.environment.map((entry: string) =>
-          replaceInString(entry, originalName, newSanitizedName)
-        );
+        service.environment = service.environment.map((entry: unknown) => {
+          if (typeof entry !== 'string') return entry;
+          const renamed = rename(entry);
+          if (renamed !== entry) notes.push(`[Info] Substituted the compose name in ${serviceName} env ${entry.split('=')[0]}`);
+          return renamed;
+        });
       } else if (service.environment && typeof service.environment === 'object') {
         for (const [key, value] of Object.entries(service.environment)) {
-          if (typeof value === 'string') {
-            service.environment[key] = replaceInString(value, originalName, newSanitizedName);
-          }
+          if (typeof value !== 'string') continue;
+          const renamed = rename(value);
+          if (renamed === value) continue;
+          service.environment[key] = renamed;
+          notes.push(`[Info] Substituted the compose name in ${serviceName} env ${key}`);
         }
       }
 
       // labels (Caddy labels and others)
-      if (service.labels && typeof service.labels === 'object') {
-        if (Array.isArray(service.labels)) {
-          service.labels = service.labels.map((label: string) =>
-            replaceInString(label, originalName, newSanitizedName)
-          );
-        } else {
-          for (const [key, value] of Object.entries(service.labels)) {
-            if (typeof value === 'string') {
-              service.labels[key] = replaceInString(value, originalName, newSanitizedName);
-            }
-          }
+      if (Array.isArray(service.labels)) {
+        service.labels = renameList(service.labels);
+      } else if (service.labels && typeof service.labels === 'object') {
+        for (const [key, value] of Object.entries(service.labels)) {
+          if (typeof value === 'string') service.labels[key] = rename(value);
         }
       }
 
-      // volumes: replace first segment after /AppData/
+      // volumes: a named volume follows its renamed key, an AppData source
+      // follows the name, and the container path gets the same rename as the
+      // env values that point at it.
       if (Array.isArray(service.volumes)) {
         service.volumes = service.volumes.map((vol: any) => {
-          if (typeof vol === 'string') {
-            return replaceAppDataPath(vol, originalName, newSanitizedName);
-          }
-          if (vol && typeof vol === 'object' && typeof vol.source === 'string') {
-            vol.source = replaceAppDataPath(vol.source, originalName, newSanitizedName);
+          if (typeof vol === 'string') return renameShortVolume(vol, renameSource, rename);
+          if (vol && typeof vol === 'object') {
+            if (typeof vol.source === 'string') vol.source = renameSource(vol.source);
+            if (typeof vol.target === 'string') vol.target = rename(vol.target);
           }
           return vol;
         });
       }
 
+      if (typeof service.working_dir === 'string') service.working_dir = rename(service.working_dir);
+      for (const field of ['command', 'entrypoint'] as const) {
+        if (typeof service[field] === 'string') service[field] = rename(service[field]);
+        else if (Array.isArray(service[field])) service[field] = renameList(service[field]);
+      }
+      if (service.healthcheck && typeof service.healthcheck === 'object') {
+        const test = service.healthcheck.test;
+        if (typeof test === 'string') service.healthcheck.test = rename(test);
+        else if (Array.isArray(test)) service.healthcheck.test = renameList(test);
+      }
+
       // networks: replace name references
       if (Array.isArray(service.networks)) {
-        service.networks = service.networks.map((net: string) =>
-          replaceInString(net, originalName, newSanitizedName)
-        );
+        service.networks = renameList(service.networks);
       } else if (service.networks && typeof service.networks === 'object') {
         const newNets: Record<string, any> = {};
         for (const [netKey, netValue] of Object.entries(service.networks)) {
-          const newNetKey = replaceInString(netKey, originalName, newSanitizedName);
-          newNets[newNetKey] = netValue;
+          newNets[rename(netKey)] = netValue;
         }
         service.networks = newNets;
       }
@@ -146,16 +170,11 @@ export function substituteComposeNames(
         ? buildServiceNameMap(Object.keys(doc.services), originalName, newSanitizedName)
         : {};
       // main might have already been renamed, check both forms
-      xcasaos.main = serviceNameMap[xcasaos.main] || replaceInString(xcasaos.main, originalName, newSanitizedName);
+      xcasaos.main = serviceNameMap[xcasaos.main] || rename(xcasaos.main);
     }
 
-    if (typeof xcasaos.build === 'string') {
-      xcasaos.build = replaceInString(xcasaos.build, originalName, newSanitizedName);
-    }
-
-    if (typeof xcasaos.store_app_id === 'string') {
-      xcasaos.store_app_id = replaceInString(xcasaos.store_app_id, originalName, newSanitizedName);
-    }
+    if (typeof xcasaos.build === 'string') xcasaos.build = rename(xcasaos.build);
+    if (typeof xcasaos.store_app_id === 'string') xcasaos.store_app_id = rename(xcasaos.store_app_id);
 
     // Title: set to titleName if provided
     if (titleName && xcasaos.title && typeof xcasaos.title === 'object') {
@@ -164,9 +183,7 @@ export function substituteComposeNames(
       }
     } else if (xcasaos.title && typeof xcasaos.title === 'object') {
       for (const lang of Object.keys(xcasaos.title)) {
-        if (typeof xcasaos.title[lang] === 'string') {
-          xcasaos.title[lang] = replaceInString(xcasaos.title[lang], originalName, newSanitizedName);
-        }
+        if (typeof xcasaos.title[lang] === 'string') xcasaos.title[lang] = rename(xcasaos.title[lang]);
       }
     }
 
@@ -174,39 +191,33 @@ export function substituteComposeNames(
     for (const field of ['tagline', 'description'] as const) {
       if (xcasaos[field] && typeof xcasaos[field] === 'object') {
         for (const lang of Object.keys(xcasaos[field])) {
-          if (typeof xcasaos[field][lang] === 'string') {
-            xcasaos[field][lang] = replaceInString(xcasaos[field][lang], originalName, newSanitizedName);
-          }
+          if (typeof xcasaos[field][lang] === 'string') xcasaos[field][lang] = rename(xcasaos[field][lang]);
         }
       }
     }
   }
 
-  // 4. Top-level volumes: rename keys
-  if (doc.volumes && typeof doc.volumes === 'object') {
-    const newVolumes: Record<string, any> = {};
-    for (const [key, value] of Object.entries(doc.volumes)) {
-      const newKey = replaceInString(key, originalName, newSanitizedName);
-      newVolumes[newKey] = value;
-    }
-    doc.volumes = newVolumes;
-  }
-
-  // 5. Top-level networks: rename keys
-  if (doc.networks && typeof doc.networks === 'object') {
-    const newNetworks: Record<string, any> = {};
-    for (const [key, value] of Object.entries(doc.networks)) {
-      const newKey = replaceInString(key, originalName, newSanitizedName);
-      const netValue = value as any;
-      if (netValue && typeof netValue === 'object' && typeof netValue.name === 'string') {
-        netValue.name = replaceInString(netValue.name, originalName, newSanitizedName);
+  // 4. Top-level volumes and networks: rename keys. An external entry keeps the
+  // docker object it names. A declared volume name stays, so a volume another
+  // instance already runs on is refused as shared instead of replaced by an empty one.
+  for (const section of ['volumes', 'networks'] as const) {
+    if (!doc[section] || typeof doc[section] !== 'object') continue;
+    const renamed: Record<string, any> = {};
+    for (const [key, value] of Object.entries(doc[section])) {
+      const newKey = rename(key);
+      let entry = value as any;
+      if (entry && typeof entry === 'object' && entry.external) {
+        const named = typeof entry.name === 'string' || (entry.external && typeof entry.external === 'object' && typeof entry.external.name === 'string');
+        if (newKey !== key && !named) entry = { ...entry, name: key };
+      } else if (section === 'networks' && entry && typeof entry === 'object' && typeof entry.name === 'string') {
+        entry.name = rename(entry.name);
       }
-      newNetworks[newKey] = netValue;
+      renamed[newKey] = entry;
     }
-    doc.networks = newNetworks;
+    doc[section] = renamed;
   }
 
-  return YAML.stringify(doc, { lineWidth: 0 });
+  return { content: YAML.stringify(doc, { lineWidth: 0 }), notes };
 }
 
 // ─── Internal Helpers ───
@@ -218,7 +229,6 @@ export function substituteComposeNames(
  */
 function replaceInString(str: string, originalName: string, newName: string): string {
   if (!str.includes(originalName)) return str;
-  // Replace all occurrences
   return str.split(originalName).join(newName);
 }
 
@@ -227,12 +237,24 @@ function replaceInString(str: string, originalName: string, newName: string): st
  * e.g. "/AppData/coolmusicbot/data/redis" -> "/AppData/mycoolbot/data/redis"
  */
 function replaceAppDataPath(volumeStr: string, originalName: string, newName: string): string {
-  // Handle both bind mount strings "source:target" and plain paths
   const appDataPattern = `/AppData/${originalName}`;
   if (volumeStr.includes(appDataPattern)) {
     return volumeStr.split(appDataPattern).join(`/AppData/${newName}`);
   }
   return volumeStr;
+}
+
+function isNamedVolumeSource(source: string): boolean {
+  return source !== '' && !/^[./~$]/.test(source);
+}
+
+/** "source:target[:mode]", or a bare container path for an anonymous volume. */
+function renameShortVolume(vol: string, renameSource: (s: string) => string, rename: (s: string) => string): string {
+  const parts = vol.split(':');
+  if (parts.length === 1) return rename(vol);
+  parts[0] = renameSource(parts[0]);
+  parts[1] = rename(parts[1]);
+  return parts.join(':');
 }
 
 /**

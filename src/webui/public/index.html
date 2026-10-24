@@ -1889,7 +1889,9 @@
         warn.textContent = 'All settings and user data will be permanently deleted';
         warn.style.color = 'var(--danger)';
       } else {
-        warn.textContent = 'Without data deletion, all settings and user data will be preserved';
+        warn.textContent = deploymentMode === 'docker'
+          ? "Without data deletion, all settings and user data will be preserved in this bot's own folder on the host; a new install does not reuse that folder"
+          : 'Without data deletion, all settings and user data will be preserved';
         warn.style.color = 'var(--success)';
       }
     }
@@ -1910,7 +1912,9 @@
       try {
         const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`);
         if (!res.success) { showMessage('error', res.error || 'Failed to remove bot'); return; }
-        let msg = preserveData ? 'Bot removed (data preserved)' : 'Bot removed';
+        let msg = !preserveData ? 'Bot removed'
+          : res.keptDataDir ? `Bot removed; its data stays in ${res.keptDataDir}, and a new install does not reuse that folder`
+          : 'Bot removed (data preserved)';
         if (!keepEnv) msg += res.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
         else if (res.vaulted) msg += '; environment values copied to the vault';
         showMessage('success', msg);
@@ -4919,7 +4923,7 @@
           <div class="install-reuse-row" id="install-reuse-row" style="display:none;">
             <span class="reuse-text">
               <span class="reuse-title">Previous installation detected</span>
-              <span class="reuse-detail" id="install-reuse-detail">Envs from a prior install are available. Click to load them into the fields below.</span>
+              <span class="reuse-detail" id="install-reuse-detail"></span>
             </span>
             <button type="button" class="btn btn-small install-reuse-btn" id="install-reuse-btn" onclick="loadPreviousEnvs()">Load envs</button>
           </div>
@@ -5643,25 +5647,27 @@
       clearTimeout(nameValidationTimeout);
       nameValidationTimeout = setTimeout(async () => {
         try {
-          const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}`);
+          const sourceQuery = installSourceId ? `&sourceId=${encodeURIComponent(installSourceId)}` : '';
+          const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}${sourceQuery}`);
           if (document.getElementById('install-name').value.trim() !== name) return;
           const reuseRow = document.getElementById('install-reuse-row');
           if (reuseRow) {
             // Clear any "loaded" state when name changes
             reuseRow.classList.remove('loaded');
             const detailEl = document.getElementById('install-reuse-detail');
-            if (detailEl) detailEl.textContent = 'Envs from a prior install are available. Click to load them into the fields below.';
+            if (detailEl) detailEl.textContent = reuseDetailText(res);
             const btn = document.getElementById('install-reuse-btn');
-            if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; }
+            if (btn) { btn.disabled = false; btn.textContent = 'Load envs'; btn.style.display = res.envsAvailable === true ? '' : 'none'; }
           }
           if (res.valid) {
             error.textContent = '';
+            const why = Array.isArray(res.conflicts) && res.conflicts.length ? `: ${res.conflicts.join('; ')}` : '';
             const note = res.adjusted
-              ? ` <span style="opacity:0.7">(saved as "${escapeHtml(res.displayName)}" to keep it unique)</span>`
+              ? ` <span style="opacity:0.7">(saved as "${escapeHtml(res.displayName)}"${escapeHtml(why)})</span>`
               : '';
             preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>${note}`;
             setInstallValidatedName(res.sanitizedName);
-            if (reuseRow) reuseRow.style.display = res.reuseAvailable ? 'flex' : 'none';
+            if (reuseRow) reuseRow.style.display = res.reuseAvailable || res.envsAvailable === true || res.envsAvailable === 'unknown' ? 'flex' : 'none';
           } else {
             error.textContent = res.errors.join(', ');
             preview.innerHTML = '';
@@ -5669,6 +5675,18 @@
           }
         } catch (err) { /* ignore */ }
       }, 300);
+    }
+
+    function reuseDetailText(res) {
+      const parts = [];
+      if (res.reuseAvailable) {
+        parts.push(res.keptSource
+          ? `A data folder kept from an earlier install of ${res.keptSource} exists under this name; this install will use it.`
+          : 'A data folder from an earlier install exists under this name; this install will use it.');
+      }
+      if (res.envsAvailable === true) parts.push('Envs from an earlier install are available. Click to load them into the fields below.');
+      else if (res.envsAvailable === 'unknown') parts.push('vault.json cannot be read, so envs kept from a removed bot could not be checked.');
+      return parts.join(' ');
     }
 
     async function loadPreviousEnvs() {

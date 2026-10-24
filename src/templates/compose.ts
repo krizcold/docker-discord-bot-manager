@@ -91,7 +91,7 @@ export function generateCompose(
   const appName = `bot-${bot.id}`;
 
   const compose: ComposeFile = {
-    name: appName,
+    name: bot.sanitizedName,
     services: {},
     networks: {
       internal: { driver: 'bridge' },
@@ -599,7 +599,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
   }
 
   const compose: ComposeFile = {
-    name: appName,
+    name: bot.sanitizedName,
     services: {
       bot: {
         image: bot.imageRef,

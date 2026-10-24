@@ -28,7 +28,7 @@ import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentMode
 import { broadcastToClients } from '../server';
 import { DeploymentMode, InstanceConfig } from '../../types';
 import { logCollectors, LOG_BOOT_ID } from '../../build/logCollector';
-import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
+import { makeUniqueName, validateName, resolveNames, checkFolderReuse, sanitizeName, InstallSource } from '../../naming';
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
@@ -490,6 +490,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
+      // Docker mode keys a bot's data folder by its id, so a later install
+      // under the same name starts on a new, empty folder.
+      const keptDataDir = keepData && (await getDeploymentMode()) === 'docker'
+        ? containerManager.hostBotDirFor(req.params.id)
+        : undefined;
+
       // When keepEnv=true (default), preserve env vars in vault for recovery.
       // When keepEnv=false, user explicitly wants them gone; don't save.
       // Every removal creates a new group so repeated removals of a same-named
@@ -582,7 +588,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const envDeleted = !keepEnv && envCopies.every(p => !fs.existsSync(p));
       broadcastToClients(wss, 'bot:deleted', { id: req.params.id });
-      res.json({ success: true, vaulted: savedGroupId !== null, envDeleted });
+      res.json({ success: true, vaulted: savedGroupId !== null, envDeleted, ...(keptDataDir ? { keptDataDir } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2258,9 +2264,65 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   return router;
 }
 
+/** The source an install would build from, as the .botmanager marker records it. */
+function installSourceFor(sourceId: string | undefined, imageRef: string | undefined): InstallSource | undefined {
+  if (imageRef) return { sourceUrl: null, sourceType: 'docker-image', imageRef };
+  if (!sourceId) return undefined;
+  const source = sourceManager.getSource(sourceId);
+  if (!source) return undefined;
+  if (source.sourceType === 'docker-image' && source.imageRef) {
+    return { sourceUrl: null, sourceType: 'docker-image', imageRef: source.imageRef };
+  }
+  return { sourceUrl: source.url, sourceType: 'git' };
+}
+
+/**
+ * Env values recoverable for a name: the newest deleted-bot vault group with
+ * that sanitized name, then the CasaOS compose file left at
+ * /DATA/AppData/casaos/apps/<sanitizedName>/docker-compose.yml. Vault entries
+ * win over compose when the same key exists in both; the keys the manager
+ * injects are left out.
+ */
+function recoverableEnvs(name: string): {
+  envs: Array<{ key: string; value: string; sensitive: boolean; source: 'vault' | 'compose' }>;
+  sources: { vault: number; compose: number };
+  vaultBroken: boolean;
+} {
+  const targetSanitized = sanitizeName(name);
+  const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
+  const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
+
+  const fromVault: Record<string, string> = {};
+  const vaultLoad = readVault();
+  const matchingGroup = vaultLoad.config.deletedBots
+    .filter(g => g.sanitizedName === targetSanitized)
+    .sort((a, b) => b.deletedAt - a.deletedAt)[0];
+  for (const entry of matchingGroup?.entries || []) {
+    fromVault[entry.key] = entry.value;
+  }
+
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const composePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', targetSanitized, 'docker-compose.yml');
+  const fromCompose = readEnvsFromComposeFile(composePath) || {};
+
+  const merged: Record<string, { value: string; source: 'vault' | 'compose' }> = {};
+  for (const [k, v] of Object.entries(fromCompose)) {
+    if (!BOT_MANAGER_KEYS.has(k)) merged[k] = { value: v, source: 'compose' };
+  }
+  for (const [k, v] of Object.entries(fromVault)) {
+    merged[k] = { value: v, source: 'vault' };
+  }
+
+  return {
+    envs: Object.entries(merged).map(([key, { value, source }]) => ({ key, value, sensitive: isSensitive(key), source })),
+    sources: { vault: Object.keys(fromVault).length, compose: Object.keys(fromCompose).length },
+    vaultBroken: vaultLoad.state === 'broken',
+  };
+}
+
 /**
  * GET /api/validate-name - Validate a bot name
- * Query: ?name=...&excludeId=...
+ * Query: ?name=...&excludeId=...&sourceId=... (or &imageRef=...)
  */
 export function createValidationRoutes(): Router {
   const router = Router();
@@ -2275,20 +2337,26 @@ export function createValidationRoutes(): Router {
 
       const excludeId = req.query.excludeId as string;
       const existingInstances = containerManager.getAllBots();
+      const source = installSourceFor(req.query.sourceId as string | undefined, req.query.imageRef as string | undefined);
 
       // A reserved or already-used name is auto-uniquified on install rather than
       // rejected, so report the name we would actually use instead of an error.
       let uniqueName: string;
+      let conflicts: string[] = [];
       try {
-        uniqueName = makeUniqueName(name, existingInstances, excludeId);
+        const foreignProjects = await containerManager.foreignDockerProjects(existingInstances.map(i => i.id));
+        uniqueName = makeUniqueName(name, existingInstances, excludeId, { foreignProjects, source });
+        if (uniqueName !== name.trim()) conflicts = validateName(name, existingInstances, excludeId, { foreignProjects, source }).errors;
       } catch (err) {
         res.json({ valid: false, errors: [err instanceof Error ? err.message : String(err)] });
         return;
       }
       const names = resolveNames(uniqueName);
-      const reuse = checkFolderReuse(names.sanitizedName, existingInstances);
+      const reuse = checkFolderReuse(names.sanitizedName, existingInstances, source);
+      const recoverable = recoverableEnvs(uniqueName);
+      const envsAvailable: boolean | 'unknown' = recoverable.envs.length > 0 ? true : recoverable.vaultBroken ? 'unknown' : false;
 
-      res.json({ valid: true, errors: [], ...names, ...reuse, adjusted: uniqueName !== name, requestedName: name });
+      res.json({ valid: true, errors: [], ...names, ...reuse, envsAvailable, conflicts, adjusted: uniqueName !== name, requestedName: name });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2311,50 +2379,7 @@ export function createValidationRoutes(): Router {
         return;
       }
 
-      const targetSanitized = sanitizeName(name);
-      const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
-      const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
-
-      // Source 1: newest deleted-bot vault group matching this name
-      const fromVault: Record<string, string> = {};
-      const vaultLoad = readVault();
-      const matchingGroup = vaultLoad.config.deletedBots
-        .filter(g => g.sanitizedName === targetSanitized)
-        .sort((a, b) => b.deletedAt - a.deletedAt)[0];
-      for (const entry of matchingGroup?.entries || []) {
-        fromVault[entry.key] = entry.value;
-      }
-
-      // Source 2: surviving compose file at CasaOS metadata path
-      const dataRoot = process.env.DATA_ROOT || '/DATA';
-      const composePath = path.join(dataRoot, 'AppData', 'casaos', 'apps', targetSanitized, 'docker-compose.yml');
-      const fromCompose = readEnvsFromComposeFile(composePath) || {};
-
-      // Merge: vault wins over compose
-      const merged: Record<string, { value: string; source: 'vault' | 'compose' }> = {};
-      for (const [k, v] of Object.entries(fromCompose)) {
-        if (!BOT_MANAGER_KEYS.has(k)) merged[k] = { value: v, source: 'compose' };
-      }
-      for (const [k, v] of Object.entries(fromVault)) {
-        merged[k] = { value: v, source: 'vault' };
-      }
-
-      const envs = Object.entries(merged).map(([key, { value, source }]) => ({
-        key,
-        value,
-        sensitive: isSensitive(key),
-        source,
-      }));
-
-      res.json({
-        success: true,
-        envs,
-        sources: {
-          vault: Object.keys(fromVault).length,
-          compose: Object.keys(fromCompose).length,
-        },
-        vaultBroken: vaultLoad.state === 'broken',
-      });
+      res.json({ success: true, ...recoverableEnvs(name) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error), envs: [] });
     }

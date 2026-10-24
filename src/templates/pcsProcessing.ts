@@ -1848,6 +1848,7 @@ function seedRepoFile(
       throw new Error(`${target} is a symlink to a missing target; refused to seed through it, left it untouched`);
     }
     if (!st.isDirectory() && !(replaceIfHash && st.isFile() && fileHash(target) === replaceIfHash)) return entryKind(st);
+    if (st.isFile() && replaceIfHash === bodyHash(fs.readFileSync(repoSrc))) return 'file';
     if (st.isDirectory()) {
       if (fs.readdirSync(target).length) throw new Error(`${target} is a directory that is not empty where the repo ships a file; left it untouched`);
       fs.rmdirSync(target);
@@ -1877,7 +1878,11 @@ function seedRepoFile(
       try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
       return 'file';
     }
-    fs.renameSync(tmpPath, target);
+    try {
+      overwriteInPlace(target, bytes);
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+    }
     return null;
   }
   try {
@@ -2023,11 +2028,101 @@ function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) =>
   return counts;
 }
 
+// What a config target holds: absent, an empty directory, or a file and its hash. Anything else is kept.
+function configTargetState(target: string): string {
+  let st: fs.Stats;
+  try { st = fs.lstatSync(target); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw new Error(`could not inspect ${target} (${e}); it was kept`);
+  }
+  if (st.isDirectory()) {
+    if (fs.readdirSync(target).length) throw new Error(`${target} is a directory; it was kept`);
+    return 'empty-dir';
+  }
+  if (!st.isFile()) throw new Error(`${target} is a ${entryKind(st)}; it was kept`);
+  return `file:${fileHash(target)}`;
+}
+
+/**
+ * Rewrite an existing file through its own inode: a running container's
+ * single-file bind follows the inode, and the file keeps its owner. The caller
+ * has already written the same bytes to a synced temp file beside it, so the
+ * disk had room for them. If a write fails, the old bytes are put back.
+ */
+function overwriteInPlace(target: string, bytes: Buffer): void {
+  const old = fs.readFileSync(target);
+  const fd = fs.openSync(target, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!fs.fstatSync(fd).isFile()) throw new Error(`${target} is no longer a file; it was kept`);
+    const put = (b: Buffer): void => {
+      let off = 0;
+      while (off < b.length) off += fs.writeSync(fd, b, off, b.length - off, off);
+      fs.ftruncateSync(fd, b.length);
+      fs.fsyncSync(fd);
+    };
+    try {
+      put(bytes);
+    } catch (e) {
+      try { put(old); } catch { /* the error below still reports the file as not written */ }
+      throw e;
+    }
+    try { fs.fchmodSync(fd, 0o644); } catch { /* windows / best effort */ }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Write a config body at `target` (mode 0644) whole or not at all: a temp file
+ * beside it, synced, then put in place only while the target still holds what
+ * it held when the write began. An existing file is rewritten in place (same
+ * inode and owner) and is not touched when it already holds the body. Nothing
+ * at the target is removed except an empty directory, which is what Docker
+ * creates at a missing file source. On a failed write the target keeps its old
+ * body and the temp file is removed.
+ */
+function writeConfigBody(target: string, body: string): void {
+  const dir = path.dirname(target);
+  const tmpPrefix = `.${path.basename(target)}.smdb-config.`;
+  removeStaleSeedTemps(dir, tmpPrefix);
+  const before = configTargetState(target);
+  if (before === `file:${bodyHash(body)}`) return;
+  const tmpPath = path.join(dir, `${tmpPrefix}${process.pid}.${randomBytes(4).toString('hex')}`);
+  const bytes = Buffer.from(body);
+  const fd = fs.openSync(tmpPath, 'wx', 0o644);
+  try {
+    try {
+      let off = 0;
+      while (off < bytes.length) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+      try { fs.fchmodSync(fd, 0o644); } catch { /* windows / best effort */ }
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    if (configTargetState(target) !== before) throw new Error(`${target} changed during the write; it was kept`);
+    if (before.startsWith('file:')) {
+      overwriteInPlace(target, bytes);
+      return;
+    }
+    if (before === 'empty-dir') {
+      try { fs.rmdirSync(target); } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === 'ENOTEMPTY' || code === 'EEXIST') throw new Error(`${target} is a directory; it was kept`);
+        throw e;
+      }
+    }
+    try { fs.linkSync(tmpPath, target); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`${target} appeared during the write; it was kept`);
+      throw e;
+    }
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch { /* renamed into place, or already gone */ }
+  }
+}
+
 function writeDockerConfig(target: string, body: string): void {
   dockerEnsureDir(path.dirname(target));
-  try { if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); } catch { /* best effort */ }
-  fs.writeFileSync(target, body);
-  try { fs.chmodSync(target, 0o644); } catch { /* best effort */ }
+  writeConfigBody(target, body);
 }
 
 /** Map a host bind source under hostBotDir back to the manager's local path. */
@@ -2167,8 +2262,16 @@ export function prepareDockerBotFiles(
         }
         if (repoSrc && fs.statSync(repoSrc).isFile()) {
           const kept = dockerDeliverFile(repoSrc, target, restore[target]);
-          if (kept) log(`[Docker] Kept existing ${kept} ${target}`);
-          else log(restore[target] ? `[Docker] Restored the repo template at ${target}` : `[Docker] Delivered file ${target}`);
+          if (kept) {
+            log(`[Docker] Kept existing ${kept} ${target}`);
+            const h = fileHash(target);
+            if (h && h === fileHash(repoSrc)) report.delivered[target] = h;
+          } else {
+            (report.seeded ??= []).push(target);
+            const h = fileHash(target);
+            if (h) report.delivered[target] = h;
+            log(restore[target] ? `[Docker] Restored the repo template at ${target}` : `[Docker] Delivered file ${target}`);
+          }
         }
         else if (repoSrc && fs.statSync(repoSrc).isDirectory()) log(`[Docker] ${seedSummary(target, dockerDeliverDir(repoSrc, target, log))}`);
         else dockerEnsureDir(target);
@@ -2197,10 +2300,22 @@ export function prepareDockerBotFiles(
       if (existing) {
         const local = hostSrcToLocal(existing, prefix, containerBotDir);
         try {
-          writeDockerConfig(local, cf.body);
-          report.delivered[local] = bodyHash(cf.body);
+          const known = { ...restore, ...report.delivered };
+          const keep = report.seeded?.includes(local) ? null : keepExistingConfig(local, cf.body, known);
+          if (keep?.failed) {
+            log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}. Move it away or copy it into the config editor, then build again`);
+            report.failed.push(cf.path);
+            continue;
+          }
+          if (keep) {
+            log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}`);
+            report.delivered[local] = known[local];
+          } else {
+            writeDockerConfig(local, cf.body);
+            report.delivered[local] = bodyHash(cf.body);
+            log(`[Docker] Applied config ${cf.path}`);
+          }
           setBindMode(services, cf.path, cf.readOnly !== false);
-          log(`[Docker] Applied config ${cf.path}`);
         } catch (err) {
           log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
           report.failed.push(cf.path);
@@ -2258,8 +2373,11 @@ export function redeliverDockerConfigFiles(
   hostBotDir: string,
   configFiles: Array<{ path: string; body: string }>,
   report: DeliveryReport = newDeliveryReport(),
+  delivered: Record<string, string> = {},
+  logFn?: (msg: string) => void,
 ): DeliveryReport {
   if (!configFiles.length) return report;
+  const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
   let compose: Record<string, unknown>;
   try { compose = parseDocument(composeContent).toJSON() as Record<string, unknown>; } catch {
     report.failed.push(...configFiles.map(c => c.path));
@@ -2272,7 +2390,20 @@ export function redeliverDockerConfigFiles(
     const src = declared.get(cf.path);
     if (!src) { report.unbound.push(cf.path); continue; }
     const local = hostSrcToLocal(src, prefix, containerBotDir);
-    try { writeDockerConfig(local, cf.body); report.delivered[local] = bodyHash(cf.body); } catch { report.failed.push(cf.path); }
+    try {
+      const keep = keepExistingConfig(local, cf.body, delivered);
+      if (keep) {
+        log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}${keep.failed ? '. Move it away or copy it into the config editor, then start again' : ''}`);
+        if (keep.failed) report.failed.push(cf.path);
+        else report.delivered[local] = delivered[local];
+        continue;
+      }
+      writeDockerConfig(local, cf.body);
+      report.delivered[local] = bodyHash(cf.body);
+    } catch (err) {
+      log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
+      report.failed.push(cf.path);
+    }
   }
   return report;
 }
@@ -2725,8 +2856,7 @@ export async function writeConfigFiles(
         continue;
       }
       mkdirForApp(path.dirname(filePath), log);
-      if (fs.lstatSync(filePath, { throwIfNoEntry: false })?.isDirectory()) fs.rmdirSync(filePath);
-      fs.writeFileSync(filePath, f.body);
+      writeConfigBody(filePath, f.body);
       report.delivered[filePath] = bodyHash(f.body);
       grantToApp(filePath, { mode: '644', log });
       log(`[PCS] Wrote config file to ${filePath}`);
@@ -2828,8 +2958,7 @@ export async function applyUserConfigOverrides(
         continue;
       }
       ensureVolumeDir(path.dirname(source), '755', true, log);
-      if (fs.lstatSync(source, { throwIfNoEntry: false })?.isDirectory()) fs.rmdirSync(source);
-      fs.writeFileSync(source, cf.body);
+      writeConfigBody(source, cf.body);
       report.delivered[source] = bodyHash(cf.body);
       grantToApp(source, { mode: '644', log });
       log(`[PCS] Delivered user config to ${source} (bind ${cf.path})`);

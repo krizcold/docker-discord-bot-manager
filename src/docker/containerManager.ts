@@ -3420,7 +3420,7 @@ function reapplyConfigFilesDocker(botId: string, botDir: string, composePath: st
   const report = newDeliveryReport();
   try {
     emit(`[Config] Re-applying ${cfgFiles.length} config file(s)`, 'info');
-    redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles, report);
+    redeliverDockerConfigFiles(fs.readFileSync(composePath, 'utf-8'), botDir, hostBotDirFor(botId), cfgFiles, report, configFileManager.getDeliveredOverrides(botId), (msg) => emit(msg, 'info'));
   } catch (err) {
     emit(`[Config] Warning: could not re-apply config files: ${err}`, 'warning');
     notApplied.push(`config files (${err})`);

@@ -188,7 +188,7 @@ export function buildWizardEnvList(
       vars.push({
         key,
         displayLabel: key === 'WEBUI_USER' ? 'Web UI Username' : 'Web UI Password',
-        description: "Login for this bot's web UI gateway (blank disables the login form).",
+        description: "Login for this bot's web UI gateway. A blank at install or rebuild leaves the login off; a blank on a later start keeps the current login.",
         defaultValue: '',
         required: false,
         source: 'compose',

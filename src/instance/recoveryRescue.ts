@@ -65,9 +65,10 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Control lane client (the receiver drives the source through the tunnel) ───
 
-async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST'): Promise<{ ok: boolean; body?: any; error?: string }> {
+/** answered: an HTTP reply came back from the source (a refusal carries its reason); false when the call failed or timed out before any reply. */
+async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST'): Promise<{ ok: boolean; answered: boolean; body?: any; error?: string }> {
   const record = instance.recoveryChannel;
-  if (!record || record.mode !== 'receiver') return { ok: false, error: 'no armed receiver channel' };
+  if (!record || record.mode !== 'receiver') return { ok: false, answered: false, error: 'no armed receiver channel' };
   // The listener helper's control lane; both this manager and the helper sit
   // on the shared docker network. The shared channel token authenticates the
   // request AND selects the armed source on the far side (this machine's
@@ -81,12 +82,40 @@ async function control(instance: InstanceConfig, action: string, method: 'GET' |
     });
     const body: any = await res.json().catch(() => null);
     if (!res.ok || !body || body.success !== true) {
-      return { ok: false, error: String(body?.error || `control ${action} returned ${res.status}`) };
+      return { ok: false, answered: true, body, error: String(body?.error || `control ${action} returned ${res.status}`) };
     }
-    return { ok: true, body };
+    return { ok: true, answered: true, body };
   } catch (err) {
-    return { ok: false, error: `control ${action} unreachable: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, answered: false, error: `control ${action} unreachable: ${err instanceof Error ? err.message : String(err)}` };
   }
+}
+
+function controlFailure(result: { answered: boolean; error?: string }): string {
+  return result.answered
+    ? `The source refused: ${result.error}`
+    : `The source did not answer through the tunnel: ${result.error}`;
+}
+
+/**
+ * One streaming-monitor reading. Caught up needs the source to report its
+ * recovery slot active (a walsender attached): replay matching a source LSN
+ * says nothing about whether anything is still being received.
+ */
+export function streamingVerdict(
+  status: { ok: boolean; answered: boolean; body?: any; error?: string },
+  probe: { ok: boolean; stdout: string; stderr: string } | null,
+): { caughtUp: boolean; senderAttached: boolean | null; lagBytes?: number; lastError?: string } {
+  if (!status.ok) {
+    return { caughtUp: false, senderAttached: null, lastError: status.answered ? `the source answered the status read with an error: ${status.error}` : `the source did not answer the status read: ${status.error}` };
+  }
+  const senderAttached = status.body.slotActive === true;
+  if (!probe) return { caughtUp: false, senderAttached, lastError: 'the source reported no end-of-WAL position' };
+  if (!probe.ok) return { caughtUp: false, senderAttached, lastError: `standby unreachable: ${probe.stderr.trim().split('\n').pop()}` };
+  const [inRecovery, lag] = probe.stdout.trim().split('|');
+  const lagBytes = Number(lag) || 0;
+  if (inRecovery === 'f') return { caughtUp: false, senderAttached, lagBytes, lastError: 'the rescued copy left recovery unexpectedly' };
+  if (!senderAttached) return { caughtUp: false, senderAttached, lagBytes, lastError: 'Standby is up but not receiving from the sender' };
+  return { caughtUp: inRecovery === 't' && Number(lag) === 0, senderAttached, lagBytes, lastError: undefined };
 }
 
 // ─── Volume plumbing ───
@@ -141,7 +170,7 @@ export async function startRescue(
   }
 
   const prepared = await control(instance, 'prepare');
-  if (!prepared.ok) return { success: false, error: `The source did not answer through the tunnel: ${prepared.error}` };
+  if (!prepared.ok) return { success: false, error: controlFailure(prepared) };
   const outdated = await volumeHasDatabase(instance.fleetDb.volume);
   if (!confirm) {
     // FRESH vs OUTDATED is a prompt difference by design (Section 15): the
@@ -173,6 +202,7 @@ export function startSwap(
   if (rescue.parked) return { success: false, error: 'The rescue is parked; fix the cause and Continue it first' };
   if (rescue.phase !== 'streaming') return { success: false, error: `The rescue is at phase ${rescue.phase}; the swap starts from a caught-up streaming standby` };
   if (!rescue.caughtUp) return { success: false, error: 'The copy has not caught up yet; the swap starts from a caught-up standby to keep the downtime window short' };
+  if (rescue.senderAttached !== true) return { success: false, error: 'The source does not report this standby attached to its recovery slot; the swap starts only while the copy is receiving' };
   if (!structurallySound(instance)) return { success: false, error: 'The channel or the database record is gone; the rescue will park' };
   if (!confirm) return { success: false, needsConfirm: true };
   saveRescue(instance.id, {
@@ -404,7 +434,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   const fleetDb = instance.fleetDb!;
   const channel = instance.recoveryChannel!;
   const prepared = await control(instance, 'prepare');
-  if (!prepared.ok) throw new Error(prepared.error);
+  if (!prepared.ok) throw new Error(controlFailure(prepared));
   const replicator = prepared.body.replicator;
   // sslmode=disable is safe here: the wire is plaintext only between local
   // containers on each machine; the cross-host leg is the tunnel's TLS.
@@ -450,22 +480,17 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
       return;
     }
     const sourceLsn = status.ok ? String(status.body.sourceLsn || '') : '';
-    if (sourceLsn) {
-      const probe = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
-        `SELECT pg_is_in_recovery(), GREATEST(pg_wal_lsn_diff('${sourceLsn}', pg_last_wal_replay_lsn()), 0)`]);
-      if (probe.ok) {
-        const [inRecovery, lag] = probe.stdout.trim().split('|');
-        saveRescue(instance.id, {
-          caughtUp: inRecovery === 't' && Number(lag) === 0,
-          lagBytes: Number(lag) || 0,
-          lastError: inRecovery === 'f' ? 'the rescued copy left recovery unexpectedly' : undefined,
-        });
-      } else {
-        saveRescue(instance.id, { caughtUp: false, lastError: `standby unreachable: ${probe.stderr.trim().split('\n').pop()}` });
-      }
-    } else {
-      saveRescue(instance.id, { caughtUp: false, lastError: status.error });
-    }
+    const probe = sourceLsn && /^[0-9A-F]+\/[0-9A-F]+$/i.test(sourceLsn)
+      ? await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+        `SELECT pg_is_in_recovery(), GREATEST(pg_wal_lsn_diff('${sourceLsn}', pg_last_wal_replay_lsn()), 0)`])
+      : null;
+    const verdict = streamingVerdict(status, probe);
+    saveRescue(instance.id, {
+      caughtUp: verdict.caughtUp,
+      senderAttached: verdict.senderAttached,
+      ...(verdict.lagBytes !== undefined ? { lagBytes: verdict.lagBytes } : {}),
+      lastError: verdict.lastError,
+    });
     await sleep(MONITOR_INTERVAL_MS);
   }
 }
@@ -473,6 +498,7 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
 // ─── Swap phases (RC-4) ───
 
 const CATCHUP_POLL_MS = 5_000;
+const CATCHUP_NO_SENDER_PARK_MS = 10 * 60_000;
 
 /** The source bot stops (its database keeps serving the tunnel) and hands back its end-of-WAL: everything before that LSN is the database, everything after quiesce is nothing. Idempotent, so a re-entry just re-captures the LSN. */
 async function phaseQuiesce(instance: InstanceConfig): Promise<void> {
@@ -509,7 +535,21 @@ async function phaseCatchup(instance: InstanceConfig): Promise<void> {
       saveRescue(instance.id, { parked: true, lastError: 'the recovery slot on the source was invalidated during catchup; cancel and re-run the rescue to seed fresh' });
       return;
     }
-    saveRescue(instance.id, { lagBytes: Number(lag) || 0, lastError: status.ok ? undefined : `replay waiting on the source: ${status.error}` });
+    if (status.ok && status.body.slotActive !== true) {
+      // Proven absence only: an unanswered status read never starts this clock.
+      const since = fresh.recoveryRescue!.noSenderSince ?? Date.now();
+      if (Date.now() - since >= CATCHUP_NO_SENDER_PARK_MS) {
+        saveRescue(instance.id, { parked: true, noSenderSince: undefined, lagBytes: Number(lag) || 0, lastError: `no walsender has been attached to the recovery slot for ${CATCHUP_NO_SENDER_PARK_MS / 60_000} minutes during catchup; check the standby's connection to the sender, then Continue` });
+        return;
+      }
+      saveRescue(instance.id, { noSenderSince: since, lagBytes: Number(lag) || 0, lastError: 'Standby is up but not receiving from the sender' });
+    } else {
+      saveRescue(instance.id, {
+        ...(status.ok ? { noSenderSince: undefined } : {}),
+        lagBytes: Number(lag) || 0,
+        lastError: status.ok ? undefined : `${status.answered ? 'the source answered the status read with an error' : 'the source did not answer the status read'}: ${status.error}`,
+      });
+    }
     await sleep(CATCHUP_POLL_MS);
   }
 }

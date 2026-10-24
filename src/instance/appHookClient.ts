@@ -17,9 +17,11 @@ export interface AppHookResult<T = any> {
   ok: boolean;
   body?: T;
   error?: string;
+  /** The request went out and no answer came back in time: the app may have acted. */
+  unknown?: boolean;
 }
 
-/** Long enough for a promote's own phases; the app answers or it has failed. */
+/** Long enough for a promote's own phases; past it the outcome is unknown, not failed. */
 const HOOK_TIMEOUT_MS = 180_000;
 
 interface ResolvedEndpoint {
@@ -106,6 +108,10 @@ export async function callAppHook<T = any>(
     }
     return { ok: true, body: parsed as T };
   } catch (err) {
+    if (err instanceof Error && err.name === 'TimeoutError') {
+      if (method !== 'POST') return { ok: false, error: `${action} did not answer within ${Math.round(timeoutMs / 1000)} s` };
+      return { ok: false, unknown: true, error: `${action} sent, no answer within ${Math.round(timeoutMs / 1000)} s; check the app's Fleet view before retrying` };
+    }
     // fetch reports its real reason (an unexpected redirect, a refused socket)
     // in `cause`; without it every transport failure reads the same. A name that
     // resolves to several addresses fails as an AggregateError whose own message

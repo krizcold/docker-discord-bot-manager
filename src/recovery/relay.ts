@@ -73,6 +73,8 @@ const status = {
   bytesIn: 0,
   bytesOut: 0,
   lastError: null as string | null,
+  /** Listener only: the last dial it turned away, with when. A refused dial never touches tunnelUp or lastError. */
+  lastRefusal: null as { reason: string; at: number } | null,
   connectedAt: null as number | null,
   updatedAt: 0,
 };
@@ -87,6 +89,11 @@ function writeStatus(): void {
   } catch { /* status is best effort */ }
 }
 setInterval(writeStatus, STATUS_INTERVAL_MS).unref();
+
+function refused(reason: string): void {
+  status.lastRefusal = { reason, at: Date.now() };
+  writeStatus();
+}
 
 function log(message: string): void {
   console.log(`[Relay] ${message}`);
@@ -307,12 +314,14 @@ function runListener(): void {
           writeHandshake(socket, { ok: false, error: 'bad token' });
           socket.destroy();
           log('rejected a tunnel: bad token');
+          refused('a dial offered the wrong channel token');
           return;
         }
         if (hello.role === selfRole) {
           writeHandshake(socket, { ok: false, error: `both ends are armed as ${selfRole}; one side must re-arm the other way` });
           socket.destroy();
           log(`rejected a tunnel: peer claims the same role (${selfRole})`);
+          refused(`a dial claimed the same role (${selfRole})`);
           return;
         }
         // Single-tunnel policy: a newly authenticated dial replaces a dead
@@ -339,6 +348,7 @@ function runListener(): void {
       } catch (err) {
         socket.destroy();
         log(`handshake failed: ${err instanceof Error ? err.message : String(err)}`);
+        refused(`a dial failed its handshake: ${err instanceof Error ? err.message : String(err)}`);
       }
     })();
   });
@@ -443,8 +453,8 @@ function runDialer(): void {
           socket.on('data', chunk => parser.push(chunk));
           startHeartbeat(tunnel);
         } catch (err) {
-          status.lastError = err instanceof Error ? err.message : String(err);
-          socket.destroy();
+          // Destroy WITH the reason, or the close handler's generic message replaces it.
+          socket.destroy(err instanceof Error ? err : new Error(String(err)));
         }
       })();
     });

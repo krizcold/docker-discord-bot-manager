@@ -3252,12 +3252,19 @@
       }
       const live = ch.live;
       const mb = n => (n / 1048576).toFixed(1);
-      const stateHtml = ch.containerRunning === false
-        ? '<div class="error-message">Relay container is not running; the manager restarts it on its next boot, or disarm and re-arm.</div>'
-        : !live ? '<div class="env-tip" style="color:var(--text-muted);">Relay starting...</div>'
+      const refusalHtml = live && live.lastRefusal
+        ? `<div class="env-tip" style="color:var(--warning);">Last refused dial (${escapeHtml(new Date(live.lastRefusal.at).toLocaleString())}): ${escapeHtml(live.lastRefusal.reason)}</div>`
+        : '';
+      const stateHtml = ch.containerState === 'unknown'
+        ? `<div class="error-message">Relay state could not be read: ${escapeHtml(ch.stateError || 'docker did not answer')}. The manager leaves the relay as it is and reads it again within a minute.</div>`
+        : ch.containerRunning === false
+        ? `<div class="error-message">Relay container is ${ch.containerState === 'absent' ? 'missing' : 'not running'}; the manager tries to ${ch.containerState === 'absent' ? 'recreate' : 'restart'} it every minute, or ${rescue || rescueReadFailed ? 'cancel the rescue, then disarm and re-arm' : 'disarm and re-arm'}.</div>`
+        : !live ? (ch.liveError
+          ? `<div class="error-message">Relay status could not be read: ${escapeHtml(ch.liveError)}</div>`
+          : '<div class="env-tip" style="color:var(--text-muted);">Relay starting: it has not written its status yet.</div>')
         : live.tunnelUp
-          ? `<div class="env-tip" style="color:var(--success);">Tunnel UP${live.streams ? `, ${live.streams} active stream${live.streams === 1 ? '' : 's'}` : ''} - ${mb(live.bytesIn)} MB in / ${mb(live.bytesOut)} MB out${live.peerIdentity && live.peerIdentity.systemId ? ` - peer database ${escapeHtml(String(live.peerIdentity.systemId))} (timeline ${escapeHtml(String(live.peerIdentity.timeline || '?'))})` : ''}</div>`
-          : `<div class="env-tip" style="color:var(--warning);">Tunnel DOWN${live.lastError ? `: ${escapeHtml(live.lastError)}` : ''} - ${ch.mode === 'source' ? 'redialing until the receiver answers' : 'waiting for the sender to dial in'}</div>`;
+          ? `<div class="env-tip" style="color:var(--success);">Tunnel UP${live.streams ? `, ${live.streams} active stream${live.streams === 1 ? '' : 's'}` : ''} - ${mb(live.bytesIn)} MB in / ${mb(live.bytesOut)} MB out${live.peerIdentity && live.peerIdentity.systemId ? ` - peer database ${escapeHtml(String(live.peerIdentity.systemId))} (timeline ${escapeHtml(String(live.peerIdentity.timeline || '?'))}${live.peerIdentity.capturedAt ? `, as of ${escapeHtml(new Date(live.peerIdentity.capturedAt).toLocaleString())}` : ''})` : ''}</div>${refusalHtml}`
+          : `<div class="env-tip" style="color:var(--warning);">Tunnel DOWN${live.lastError ? `: ${escapeHtml(live.lastError)}` : ''} - ${ch.mode === 'source' ? 'redialing until the receiver answers' : 'waiting for the sender to dial in'}</div>${refusalHtml}`;
       body.innerHTML = `
         <div class="env-tip">Armed as <b>${ch.mode === 'receiver' ? 'RECEIVER (this database gets replaced)' : 'SENDER (this database is the good copy)'}</b>${ch.mode === 'receiver' ? ` - listening on <b>${escapeHtml(ch.publicHost || '')}:${ch.tunnelPort}</b>` : ` - dialing <b>${escapeHtml(ch.endpoint || '')}</b>`}</div>
         ${stateHtml}
@@ -3291,7 +3298,10 @@
           bulk: 'Bulk copy: resumable rsync of the live database (the sender keeps serving)',
           consistent: 'Consistent pass: short delta inside backup mode',
           standby: 'Turning the copy into a live standby of the sender',
-          streaming: rescue.caughtUp ? 'Streaming: CAUGHT UP - ready to swap' : `Streaming: catching up${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB behind)` : ''}`,
+          streaming: rescue.caughtUp && rescue.senderAttached === true ? 'Streaming: CAUGHT UP - ready to swap'
+            : rescue.senderAttached === false ? 'Streaming: not receiving'
+            : rescue.senderAttached === null ? "Streaming: can't confirm the copy is receiving (the last status read gave no slot state)"
+            : `Streaming: catching up${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB behind)` : ''}`,
           quiesce: 'Swap: stopping the sender fleet (the downtime window begins)',
           catchup: `Swap: replaying the sender's last WAL${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB left)` : ''}`,
           promote: 'Swap: promoting this copy to primary',
@@ -3299,7 +3309,7 @@
           flip: 'Swap: filing this database as the primary and starting the fleet',
         }[rescue.phase] || rescue.phase;
       const pastPromote = ['promote', 'teardown', 'flip'].includes(rescue.phase);
-      const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && !rescue.parked;
+      const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && rescue.senderAttached === true && !rescue.parked;
       return `
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>

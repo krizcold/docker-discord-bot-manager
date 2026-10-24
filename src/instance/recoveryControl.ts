@@ -38,6 +38,17 @@ function docker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: 
   });
 }
 
+export type ContainerState = 'running' | 'stopped' | 'absent' | 'unknown';
+
+/** A `docker inspect --format {{.State.Running}}` answer read three ways: only docker's own "no such" proves absence; a timeout or a daemon error proves nothing. */
+export function containerStateOf(inspect: { ok: boolean; stdout: string; stderr: string }): ContainerState {
+  if (inspect.ok) {
+    const answer = inspect.stdout.trim();
+    return answer === 'true' ? 'running' : answer === 'false' ? 'stopped' : 'unknown';
+  }
+  return /no such (object|container)/i.test(inspect.stderr) ? 'absent' : 'unknown';
+}
+
 function rsyncdName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-recovery-rsyncd`;
 }
@@ -121,12 +132,17 @@ uid = 0
 gid = 0
 `;
 
-export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string }> {
+/** unknown: the daemon's state could not be read, so it was left alone (it may be serving a transfer). */
+export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string; unknown?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'no managed fleet database' };
   const name = rsyncdName(instance);
-  const state = await docker(['inspect', '--format', '{{.State.Running}}', name]);
-  if (state.ok && state.stdout.trim() === 'true') return { ok: true };
+  const inspect = await docker(['inspect', '--format', '{{.State.Running}}', name]);
+  const state = containerStateOf(inspect);
+  if (state === 'running') return { ok: true };
+  if (state === 'unknown') {
+    return { ok: false, unknown: true, error: `could not read the rsync daemon's state, so it was left as it is: ${inspect.stderr.trim().split('\n').pop() || inspect.stdout.trim() || 'no answer'}` };
+  }
   await docker(['rm', '-f', name]);
   // The config rides an env var: a real multi-line value survives argv+env
   // verbatim, where printf-escape games do not (POSIX %s never expands \n).
@@ -181,8 +197,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (action === 'status') {
       const probe = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
         `SELECT pg_current_wal_lsn(), (SELECT active FROM pg_replication_slots WHERE slot_name = '${RECOVERY_SLOT}'), (SELECT wal_status FROM pg_replication_slots WHERE slot_name = '${RECOVERY_SLOT}')`]);
-      const [lsn, slotActive, walStatus] = probe.ok ? probe.stdout.trim().split('|') : ['', '', ''];
-      send(200, { success: probe.ok, sourceLsn: lsn || null, slotActive: slotActive === 't', slotWalStatus: walStatus || null, backupInProgress: sessions.has(instance.id) });
+      if (!probe.ok) { send(500, { success: false, error: `could not read the source database: ${probe.stderr.trim().split('\n').pop() || 'no answer'}` }); return; }
+      const [lsn, slotActive, walStatus] = probe.stdout.trim().split('|');
+      send(200, { success: true, sourceLsn: lsn || null, slotActive: slotActive === 't', slotWalStatus: walStatus || null, backupInProgress: sessions.has(instance.id) });
       return;
     }
     if (action === 'prepare') {

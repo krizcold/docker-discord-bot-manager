@@ -262,6 +262,10 @@ export interface RecoveryRescueRecord {
   /** Streaming phase telemetry, refreshed by the monitor loop. */
   caughtUp?: boolean;
   lagBytes?: number;
+  /** The source reported its recovery slot active at the last answered status read; null when that read went unanswered. */
+  senderAttached?: boolean | null;
+  /** Catchup: since when answered status reads have shown no walsender on the slot. */
+  noSenderSince?: number;
   /** Swap (RC-4): the source's end-of-WAL captured at quiesce; catchup replays to it. */
   swapTargetLsn?: string;
   /** Swap (RC-4): this machine's public host captured while the channel record still existed; flip enables replication with it when no prior replication record has one. */

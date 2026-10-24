@@ -13,7 +13,10 @@ const tmpData = vi.hoisted(() => {
 });
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
-  const execFile = (_cmd: string, args: string[], _opts: any, cb: any) => { calls.push(args); cb(new Error('fake'), '', 'fake'); };
+  const execFile = (_cmd: string, args: string[], _opts: any, cb: any) => {
+    calls.push(args);
+    cb(new Error('fake'), '', args[0] === 'inspect' ? `Error: No such object: ${args[args.length - 1]}` : 'fake');
+  };
   return { ...real, execFile };
 });
 import { LOG_CAP_RUN_ARGS } from '../../src/templates/logCaps';

@@ -78,6 +78,8 @@ export interface ActionResult {
   needsConfirm?: boolean;
   /** role-reset: whether the app also dropped the store forms it had persisted (false where its environment pins none). */
   formsCleared?: boolean;
+  /** The request went out and no answer came back in time: the app may have acted. */
+  unknown?: boolean;
   /** The app wants the RPO acknowledged before promoting. */
   needsLagConfirm?: boolean;
   /** The app says another designated backup received further than this copy (20.19 F14). */
@@ -104,8 +106,9 @@ export function capabilityRefusal(instance: InstanceConfig): string | null {
 }
 
 /** Translate a hook result into the flat shape the routes and UI expect. */
-function fromHook(result: { ok: boolean; body?: any; error?: string }): ActionResult {
+function fromHook(result: { ok: boolean; body?: any; error?: string; unknown?: boolean }): ActionResult {
   if (result.ok) return { success: true, ...(result.body ?? {}) };
+  if (result.unknown) return { success: false, unknown: true, error: result.error };
   // A refusal carries the app's own named reason plus any confirm flags; a
   // transport failure has no body and only the error survives.
   const body = result.body ?? {};

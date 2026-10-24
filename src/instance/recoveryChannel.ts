@@ -24,7 +24,7 @@ import * as containerManager from '../docker/containerManager';
 import { generateCertPair } from './fleetReplication';
 import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
-import { ensureRsyncDaemon, RECOVERY_CONTROL_PORT } from './recoveryControl';
+import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { childFailureText, redactSecrets } from '../config/secretText';
@@ -94,7 +94,7 @@ async function databaseIdentity(instance: InstanceConfig): Promise<Record<string
     "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), (SELECT checkpoint_lsn FROM pg_control_checkpoint());"]);
   if (!probe.ok) return {};
   const [systemId, timeline, checkpointLsn] = probe.stdout.trim().split('|');
-  return systemId ? { systemId, timeline: Number(timeline), checkpointLsn } : {};
+  return systemId ? { systemId, timeline: Number(timeline), checkpointLsn, capturedAt: Date.now() } : {};
 }
 
 async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string }> {
@@ -148,7 +148,7 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
     const daemon = await ensureRsyncDaemon(instance, image.image!, network.network!);
     if (!daemon.ok) {
       await docker(['rm', '-f', record.containerName]);
-      await docker(['rm', '-f', rsyncContainerName(instance)]);
+      if (!daemon.unknown) await docker(['rm', '-f', rsyncContainerName(instance)]);
       return { ok: false, error: daemon.error };
     }
   }
@@ -310,6 +310,9 @@ export interface RecoveryChannelStatus {
   /** Receiver only: the arm block re-served from the record, so losing the arm-time copy never forces a re-arm. Secrets by design - this endpoint sits behind manager auth like the replica copy block. */
   block?: { host: string; port: number; cert: string; token: string };
   containerRunning?: boolean;
+  /** absent and stopped are proven; unknown means docker did not answer the inspect (stateError says why). */
+  containerState?: ContainerState;
+  stateError?: string;
   live?: {
     tunnelUp: boolean;
     peerIdentity: Record<string, unknown> | null;
@@ -317,8 +320,11 @@ export interface RecoveryChannelStatus {
     bytesIn: number;
     bytesOut: number;
     lastError: string | null;
+    lastRefusal: { reason: string; at: number } | null;
     connectedAt: number | null;
   } | null;
+  /** Why the helper's status file could not be read while it runs. */
+  liveError?: string;
 }
 
 export async function getRecoveryChannelStatus(instance: InstanceConfig): Promise<RecoveryChannelStatus> {
@@ -336,8 +342,10 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
       ? { host: record.publicHost, port: record.tunnelPort, cert: record.tlsCert, token: record.token }
       : undefined,
   };
-  const state = await docker(['inspect', '--format', '{{.State.Running}}', record.containerName]);
-  status.containerRunning = state.ok && state.stdout.trim() === 'true';
+  const inspect = await docker(['inspect', '--format', '{{.State.Running}}', record.containerName]);
+  status.containerState = containerStateOf(inspect);
+  status.containerRunning = status.containerState === 'running';
+  if (status.containerState === 'unknown') status.stateError = inspect.stderr.trim().split('\n').pop() || inspect.stdout.trim() || 'docker did not answer';
   if (status.containerRunning) {
     const raw = await docker(['exec', record.containerName, 'cat', '/tmp/relay-status.json']);
     if (raw.ok) {
@@ -350,11 +358,19 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
           bytesIn: Number(parsed.bytesIn) || 0,
           bytesOut: Number(parsed.bytesOut) || 0,
           lastError: parsed.lastError === null || parsed.lastError === undefined ? null : String(parsed.lastError),
+          lastRefusal: parsed.lastRefusal && typeof parsed.lastRefusal === 'object' && typeof parsed.lastRefusal.reason === 'string'
+            ? { reason: parsed.lastRefusal.reason, at: Number(parsed.lastRefusal.at) || 0 }
+            : null,
           connectedAt: parsed.connectedAt === null || parsed.connectedAt === undefined ? null : Number(parsed.connectedAt),
         };
-      } catch { status.live = null; }
+      } catch {
+        status.live = null;
+        status.liveError = 'the relay status file is not valid JSON';
+      }
     } else {
       status.live = null;
+      // The helper writes its file within a moment of starting; until then cat finds none.
+      if (!/no such file/i.test(raw.stderr)) status.liveError = raw.stderr.trim().split('\n').pop() || 'docker did not answer';
     }
   }
   return status;
@@ -436,9 +452,15 @@ export async function reconcileRecoveryChannels(): Promise<void> {
   for (const snapshot of containerManager.getAllBots()) {
     if (!snapshot.recoveryChannel) continue;
     if (arming.has(snapshot.id)) continue;
-    const state = await docker(['inspect', '--format', '{{.State.Running}}', snapshot.recoveryChannel.containerName]);
-    if (state.ok && state.stdout.trim() === 'true') continue;
-    if (state.ok) {
+    const inspect = await docker(['inspect', '--format', '{{.State.Running}}', snapshot.recoveryChannel.containerName]);
+    const state = containerStateOf(inspect);
+    if (state === 'running') continue;
+    if (state === 'unknown') {
+      // A respawn removes the helper first; over an unread state that could cut a live transfer.
+      console.warn(`[RecoveryChannel] Could not read the state of relay ${snapshot.recoveryChannel.containerName}, so it was left as it is: ${inspect.stderr.trim().split('\n').pop() || 'docker did not answer'}`);
+      continue;
+    }
+    if (state === 'stopped') {
       const started = await docker(['start', snapshot.recoveryChannel.containerName]);
       if (started.ok) { console.log(`[RecoveryChannel] Restarted relay ${snapshot.recoveryChannel.containerName}`); continue; }
     }

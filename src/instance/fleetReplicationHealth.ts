@@ -63,6 +63,39 @@ export function getReplicationHealth(botId: string): ReplicationHealth | null {
   return cache.get(botId) || null;
 }
 
+/** The posture each bot last answered in this run, kept even when storing it failed. */
+const answered: Map<string, { posture: StandInPosture | null; readAt: number }> = new Map();
+
+/** Stores an ANSWERED posture on the instance record, so a restart or an unanswered read keeps the last word; written only when it changes. */
+function recordPosture(instance: InstanceConfig, posture: StandInPosture | null): void {
+  // The gate is live countdown text; stored, it would rewrite the record every tick and later read as current.
+  const kept = posture ? { ...posture, gate: null } : null;
+  const readAt = Date.now();
+  answered.set(instance.id, { posture: kept, readAt });
+  const held = containerManager.getBot(instance.id)?.fleetLastPosture;
+  if (held && JSON.stringify(held.posture) === JSON.stringify(kept)) return;
+  try {
+    containerManager.updateInstanceFleetLastPosture(instance.id, { posture: kept, readAt });
+  } catch (error) {
+    console.warn(`[FleetReplication] Could not store the stand-in posture of ${instance.id}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** The newer of the stored posture (which survives a restart) and the one answered in this run. */
+function newestPosture(instance: InstanceConfig): { posture: StandInPosture | null; readAt: number } | null {
+  const held = containerManager.getBot(instance.id)?.fleetLastPosture ?? instance.fleetLastPosture ?? null;
+  const mem = answered.get(instance.id) ?? null;
+  if (!held) return mem;
+  if (!mem) return held;
+  return mem.readAt >= held.readAt ? mem : held;
+}
+
+/** The covered or stand-in posture last answered. */
+function lastPosture(instance: InstanceConfig): StandInPosture | null {
+  const last = newestPosture(instance)?.posture ?? null;
+  return last && (last.role === 'covered' || last.role === 'stand-in') ? last : null;
+}
+
 function round(seconds: number | null | undefined): number | null {
   return seconds === null || seconds === undefined || !Number.isFinite(seconds) ? null : Math.round(seconds * 10) / 10;
 }
@@ -105,8 +138,16 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   const read = await readFacts(instance);
   const posture = postureFromRead(instance, read);
   const standing = posture.read === 'ok' ? posture.posture : null;
+  if (posture.read === 'ok') recordPosture(instance, standing);
   if (read?.success && read.facts) fleetFailback.settleDecline(instance, read.facts, null);
   fleetFailback.noteHandover(instance, read?.success ? read.facts ?? null : null, null);
+  const remembered = posture.read === 'unanswered' ? lastPosture(instance) : null;
+  if (posture.read === 'unanswered' && remembered?.role === 'covered') {
+    return { ...base, standIn: remembered, severity: 'warn', message: `This node's bot is not answering (${posture.error}), so its stand-in posture is unknown; when last read, it followed ${standInWho(remembered.standInNodeId)} as a co-worker and ${remembered.holdReason === 'copy' ? 'this database was a copy of that node\'s' : 'this database was the copy that is behind'}`, lagSeconds: null };
+  }
+  if (posture.read === 'unanswered' && !remembered && !newestPosture(instance)) {
+    return { ...base, severity: 'warn', message: `This node's bot is not answering (${posture.error}) and its stand-in posture has not been read since the manager started, so whether this database is behind a stand-in is unknown`, lagSeconds: null };
+  }
   if (standing?.role === 'covered') {
     // The failback opens itself here (20.5): the tick is the manager's poll of
     // what its bot concluded, and the run parks before anything destructive.
@@ -131,7 +172,8 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
   // A node that is both sides (a standby beside its own primary, 20.19 F7)
   // is sampled as a primary; its standby's posture still rides the verdict so
   // the automatic re-seed's skip can read it.
-  return standing && instance.fleetDbReplica ? { ...verdict, standIn: standing } : verdict;
+  const carried = standing ?? remembered;
+  return carried && instance.fleetDbReplica ? { ...verdict, standIn: carried } : verdict;
 }
 
 function primaryLinkVerdict(status: Awaited<ReturnType<typeof getFleetReplicationStatus>>, base: { role: 'primary'; checkedAt: number }): ReplicationHealth {
@@ -260,8 +302,12 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // A stand-in whose container is down or whose app has gone silent keeps its
   // last word on the badge, and the automatic re-seed keeps skipping it: the
   // fact is not gone, it is unreadable, and that is not the same claim.
-  const last = cache.get(instance.id)?.standIn;
-  const remembered = last?.role === 'stand-in' ? last : null;
+  const posture = postureFromRead(instance, read);
+  const standing = posture.read === 'ok' ? posture.posture : null;
+  if (posture.read === 'ok') recordPosture(instance, standing);
+  const remembered = posture.read === 'ok'
+    ? (standing?.role === 'stand-in' || standing?.role === 'covered' ? standing : null)
+    : posture.read === 'unanswered' ? lastPosture(instance) : null;
   if (status.provisioning) {
     return { ...base, severity: 'ok', message: `Provisioning (${status.provisioning.phase})`, lagSeconds: null };
   }
@@ -272,7 +318,9 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // live ABSENT means the status could not even be probed (e.g. a record
   // stamped before the identity fields), which is a different claim than a
   // stopped container; say the real reason.
-  const lastSeen = remembered ? `; it was standing in for ${shortId(remembered.coveringNodeId)} when last seen` : '';
+  const lastSeen = !remembered ? ''
+    : remembered.role === 'covered' ? `; it was the returning master's copy of ${standInWho(remembered.standInNodeId)}'s database when last read`
+    : `; it was standing in for ${shortId(remembered.coveringNodeId)} when last read`;
   if (!live) {
     return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `${status.lastError || `Could not read the standby (${status.probeError || 'no output'})`}${lastSeen}`, lagSeconds: null };
   }
@@ -282,8 +330,6 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // The app's explicit posture (B6 map F34): a copy standing in for a dead
   // master is read from that fact alone, never from its recovery state, which
   // cannot tell a stand-in from a promotion.
-  const posture = postureFromRead(instance, read);
-  const standing = posture.read === 'ok' ? posture.posture : null;
   if (read?.success && read.facts && standing?.role === 'stand-in') {
     // A serving stand-in's block reaches the returning master through its bot
     // (F32); an ended lane asked to drop back opens its run here (F5 park).
@@ -337,9 +383,12 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
       ? `This is the returning master's copy of ${holderDb} database, but the primary reports its slot as ${slot?.lost ? 'lost' : 'absent'}, so the failback's catch-up cannot finish; remove the replica and provision it again from the copy block on that node's Database modal (Re-seed now stays unavailable while this node holds)`
       : `This is the returning master's copy of ${holderDb} database${dark}; promote this node from its Fleet tab once it has caught up to take the fleet back`, lagSeconds: round(live.replayLagSeconds) };
   }
+  if (posture.read === 'unanswered' && remembered && live.inRecovery !== false) {
+    return { ...base, standIn: remembered, severity: 'warn', message: `This copy's app is not answering (${posture.error}), so its stand-in posture is unknown${lastSeen}; the automatic re-seed skips it until the app answers again`, lagSeconds: round(live.replayLagSeconds) };
+  }
   if (live.inRecovery === false) {
     if (posture.read === 'unanswered') {
-      return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `This copy has left recovery and its app is not answering (${posture.error}), so the manager cannot tell a stand-in from a promotion${remembered ? ` (it was standing in for ${shortId(remembered.coveringNodeId)} when last seen)` : ''}; ${unansweredRemedy(posture.error)} before adopting or re-seeding it`, lagSeconds: null };
+      return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `This copy has left recovery and its app is not answering (${posture.error}), so the manager cannot tell a stand-in from a promotion${remembered ? ` (${lastSeen.slice(2)})` : ''}; ${unansweredRemedy(posture.error)} before adopting or re-seeding it`, lagSeconds: null };
     }
     return { ...base, severity: 'error', message: 'This copy has been promoted and no longer follows the primary; adopt it as the database of this machine, or re-provision it', lagSeconds: null };
   }
@@ -406,16 +455,16 @@ async function runTick(): Promise<void> {
     // its standby is sampled regardless - a dead standby must never hide
     // behind a stopped instance (drill R-5, finding F2).
     if (isPrimary && unanswered) {
-      cache.set(instance.id, { role: 'primary', severity: 'warn', message: 'could not confirm whether the instance runs: docker did not answer', lagSeconds: null, checkedAt: Date.now() });
+      const held = lastPosture(instance);
+      cache.set(instance.id, { role: 'primary', severity: 'warn', message: 'could not confirm whether the instance runs: docker did not answer', lagSeconds: null, checkedAt: Date.now(), ...(held?.role === 'covered' ? { standIn: held } : {}) });
       continue;
     }
     if (isPrimary && instance.status !== 'running') {
       // A primary stopped while parked behind a stand-in (20.5) keeps that
       // word: stopping is the first step of the re-seed its verdict asks for,
       // and the form for that re-seed only renders on a stopped instance.
-      const covered = cache.get(instance.id)?.standIn;
-      // The failback run stopped it: the run's record is the word that
-      // survives a manager restart, where the cached posture does not.
+      const covered = lastPosture(instance);
+      // The failback run stopped it: the run's record leads the word.
       if (instance.fleetFailback) {
         cache.set(instance.id, { role: 'primary', severity: 'warn', message: fleetFailback.stoppedText(instance.fleetFailback), lagSeconds: null, checkedAt: Date.now(), ...(covered?.role === 'covered' ? { standIn: covered } : {}) });
         continue;
@@ -428,13 +477,17 @@ async function runTick(): Promise<void> {
           : covered.namesThisNode === null
           ? `Instance is stopped; its bot had not registered with the node holding the fleet yet, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`
           : `Instance is stopped; its bot was following ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node holding the fleet'}, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`, lagSeconds: null, checkedAt: Date.now(), standIn: covered }
+        : hasAppHooks(instance) && !newestPosture(instance)
+        ? { role: 'primary', severity: 'warn', message: 'Instance is stopped and its bot\'s stand-in posture has not been read since the manager started, so whether this database is behind a stand-in is unknown; start the instance to read it', lagSeconds: null, checkedAt: Date.now() }
         : { role: 'primary', severity: 'ok', message: 'Instance is stopped', lagSeconds: null, checkedAt: Date.now() });
       continue;
     }
     try {
       cache.set(instance.id, withRun(instance, isPrimary ? await samplePrimary(instance) : await sampleReplica(instance)));
     } catch (error) {
+      const held = lastPosture(instance);
       cache.set(instance.id, {
+        ...(held ? { standIn: held } : {}),
         role: isPrimary ? 'primary' : 'replica',
         severity: 'warn',
         message: `Could not read replication status: ${error instanceof Error ? error.message : String(error)}`,
@@ -448,6 +501,9 @@ async function runTick(): Promise<void> {
   }
   for (const id of [...streamingSeen.keys()]) {
     if (!live.has(id)) streamingSeen.delete(id);
+  }
+  for (const id of [...answered.keys()]) {
+    if (!live.has(id)) answered.delete(id);
   }
 }
 

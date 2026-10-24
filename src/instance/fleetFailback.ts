@@ -28,7 +28,7 @@ import * as containerManager from '../docker/containerManager';
 import * as fleetBackup from './fleetBackup';
 import * as fleetReplica from './fleetReplica';
 import { enableFleetReplication } from './fleetReplication';
-import { ActionResult, AppFacts, deliverCopyBlock, getAppFacts, postureFromRead, StandInPosture, transfer as promoteSide, unansweredRemedy } from './appLifecycle';
+import { ActionResult, AppFacts, deliverCopyBlock, FactsRead, getAppFacts, postureFromRead, StandInPosture, transfer as promoteSide, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { FleetDbReplicaRecord, FleetFailbackDecline, FleetFailbackMode, FleetFailbackPhase, FleetFailbackRun, FleetLineageFact, InstanceConfig } from '../types';
 
@@ -57,6 +57,17 @@ function saveRun(botId: string, patch: Partial<FleetFailbackRun>): void {
   if (!current) return;
   containerManager.updateInstanceFleetFailback(botId, { ...current, ...patch, updatedAt: Date.now() });
   containerManager.broadcastBotUpdated(botId);
+}
+
+/** A finished run closes its episode, so the stored posture is replaced by the one just read, or by none. */
+function recordAnsweredPosture(botId: string, read: FactsRead | null): void {
+  const bot = containerManager.getBot(botId);
+  const posture = bot && read ? postureFromRead(bot, read) : null;
+  try {
+    containerManager.updateInstanceFleetLastPosture(botId, { posture: posture?.read === 'ok' ? posture.posture : null, readAt: Date.now() });
+  } catch (error) {
+    console.warn(`[FleetFailback] Could not store the stand-in posture of ${botId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function clearRun(botId: string): void {
@@ -493,6 +504,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           }
           const applied = await containerManager.applyFleetDbReplicaService(botId);
           if (!applied.success) throw new Error(`the standby's service could not be started from its record: ${applied.error || 'unknown reason'}; Continue retries it`);
+          recordAnsweredPosture(botId, null);
           clearRun(botId);
           console.log(`[FleetFailback] ${bot.displayName}: the drop-back finished; this copy is a standby of ${shortId(run.standInNodeId)}'s database again`);
           return;
@@ -749,16 +761,18 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           const restarted = await containerManager.restartBot(botId);
           if (!restarted.success) throw new Error(`the instance could not be restarted onto its database: ${restarted.error}`);
           const deadline = Date.now() + RESTART_WAIT_MS;
+          let masterRead: FactsRead | null = null;
           for (;;) {
             if (!owns()) return;
             const got = await facts();
             if (!got) return;
             const f = got.read.success ? got.read.facts : undefined;
-            if (f?.running === true && f.initialized && f.role === 'master') break;
+            if (f?.running === true && f.initialized && f.role === 'master') { masterRead = got.read; break; }
             if (Date.now() > deadline) throw new Error('the bot did not come back as master after the restart within 5 minutes; check its Fleet tab');
             await sleep(POLL_MS);
           }
           if (owns()) {
+            recordAnsweredPosture(botId, masterRead);
             clearRun(botId);
             console.log(`[FleetFailback] ${bot.displayName}: the failback finished; this node is the master again on its own database`);
           }

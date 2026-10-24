@@ -1681,12 +1681,14 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           } catch { /* opportunistic; never surfaces */ }
         })();
       }
+      const standRead = await appLifecycle.readStandInPosture(bot, 10_000);
+      const standIn = standRead.read === 'ok' ? standRead.posture : getReplicationHealth(bot.id)?.standIn ?? null;
       if (status.enabled && req.query.include === 'block') {
         const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+        res.json({ success: true, replication: status, standIn, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
         return;
       }
-      res.json({ success: true, replication: status, standIn: getReplicationHealth(bot.id)?.standIn ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+      res.json({ success: true, replication: status, standIn, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

@@ -277,6 +277,7 @@ export async function enableFleetReplication(
   // it at read time (the two-store strip), so no record mirror exists to sync.
   envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
   containerManager.updateInstanceFleetDbReplication(instance.id, replication);
+  forgetProbes(instance.id);
   return { success: true, restartRequired: true, certRotated };
 }
 
@@ -368,6 +369,7 @@ export async function disableFleetReplication(
     unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
   }
   containerManager.updateInstanceFleetDbReplication(instance.id, null);
+  forgetProbes(instance.id);
   if (unedited.length > 0) {
     return { success: true, restartRequired: true, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
   }
@@ -403,6 +405,10 @@ const PROBE_CACHE_MS = 60_000;
 const PROBE_TIMEOUT_MS = 20_000;
 const probeCache: Map<string, { ok: boolean; error?: string; at: number }> = new Map();
 
+function forgetProbes(botId: string): void {
+  for (const key of [...probeCache.keys()]) if (key.startsWith(`${botId}|`)) probeCache.delete(key);
+}
+
 function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?: string }> {
   const repl = instance.fleetDb!.replication!;
   const dbPassword = storedDbPassword(instance);
@@ -419,12 +425,14 @@ function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?:
 }
 
 async function cachedReachability(instance: InstanceConfig): Promise<{ ok: boolean; error?: string; ageSeconds: number }> {
-  const cached = probeCache.get(instance.id);
+  const repl = instance.fleetDb!.replication!;
+  const key = `${instance.id}|${repl.publicHost}:${repl.hostPort}`;
+  const cached = probeCache.get(key);
   if (cached && Date.now() - cached.at < PROBE_CACHE_MS) {
     return { ok: cached.ok, error: cached.error, ageSeconds: Math.round((Date.now() - cached.at) / 1000) };
   }
   const result = await probeEndpoint(instance);
-  probeCache.set(instance.id, { ...result, at: Date.now() });
+  probeCache.set(key, { ...result, at: Date.now() });
   return { ...result, ageSeconds: 0 };
 }
 

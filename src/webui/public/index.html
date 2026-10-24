@@ -2877,9 +2877,10 @@
       const live = r.live;
       const block = res.block;
       const reach = r.reachability;
+      const reachAge = reach && reach.ageSeconds > 0 ? ` (checked ${reach.ageSeconds}s ago)` : '';
       const reachHtml = !live ? ''
-        : reach && reach.ok ? '<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers</div>'
-        : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}</div>`
+        : reach && reach.ok ? `<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers${reachAge}</div>`
+        : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}${reachAge}</div>`
         : '';
       const keepBytes = (() => {
         const m = /^(-?\d+)\s*(kB|MB|GB|TB)?$/.exec((live && live.slotWalKeep) || '');

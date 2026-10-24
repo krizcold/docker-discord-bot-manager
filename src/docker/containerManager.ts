@@ -788,6 +788,16 @@ export function updateInstanceFleetRestoreError(botId: string, notice: { file: s
   saveRegistry(registry);
 }
 
+export function updateInstanceFleetLastPosture(botId: string, record: InstanceConfig['fleetLastPosture'] | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (record) instance.fleetLastPosture = record;
+  else delete instance.fleetLastPosture;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** Record or clear that a failback or drop-back run owns the write fence on this database. Throws when the registry cannot be saved. */
 export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, left: boolean): void {
   const registry = loadRegistry();

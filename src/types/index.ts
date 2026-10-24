@@ -310,6 +310,7 @@ export interface InstanceConfig {
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   fleetTransfer?: FleetTransferRun;    // seed-first transfer in flight or parked (20.19 F21); cleared when the promote is handed to the app
   fleetFailback?: FleetFailbackRun;    // failback or drop-back run in flight or parked (20.5, B6-i); cleared when it finishes, is cancelled or dismissed
+  fleetLastPosture?: { posture: import('../instance/appLifecycle').StandInPosture | null; readAt: number }; // the stand-in posture the bot last answered; absent until one was read
   fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete

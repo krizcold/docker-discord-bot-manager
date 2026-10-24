@@ -498,7 +498,9 @@ export async function buildImage(
   }
   args.push(contextPath);
 
-  console.log(`[Docker] Building image: docker ${args.join(' ')}`);
+  // A build arg's value can be a credential: the log names the arg only.
+  const shown = args.map((a, i) => (args[i - 1] === '--build-arg' ? a.replace(/=[\s\S]*$/, '') : a));
+  console.log(`[Docker] Building image: docker ${shown.join(' ')}`);
 
   return new Promise((resolve, reject) => {
     // BuildKit is required for Dockerfiles using `RUN --mount=...`, and needs the

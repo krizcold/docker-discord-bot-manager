@@ -87,6 +87,7 @@ import * as configFileManager from '../config/configFileManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { writePrivateFile } from '../config/fileModes';
+import { redactSecrets, urlPassword } from '../config/secretText';
 import { getDeploymentMode, isModeExplicit } from '../casaos/detector';
 import * as casaosApi from '../casaos/api';
 import { logCollectors, LogCollector, BuildLogEntry } from '../build/logCollector';
@@ -229,6 +230,43 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
   return lostRecordBlobs.get(`${instId}:${field}`) ?? plain;
 }
 
+/** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
+function recordSecrets(inst: InstanceConfig): string[] {
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.recoveryChannel?.token, inst.recoveryChannel?.tlsKey];
+  try {
+    for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
+      if (!value) continue;
+      if (envManager.isSensitive(key)) secrets.push(value);
+      const pw = urlPassword(value);
+      if (pw) secrets.push(pw);
+    }
+  } catch {
+    // An unreadable env store leaves its values unknown here; the record's own still go.
+  }
+  return secrets.filter((s): s is string => !!s);
+}
+
+/**
+ * A stored error can quote a command or a statement that carried a
+ * credential, so every lastError is written with the record's secrets
+ * replaced by ***.
+ */
+function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
+  const has = [inst.fleetDbReplicaSeed, inst.fleetDbReplica?.autoReseed, inst.fleetTransfer, inst.fleetFailback, inst.recoveryRescue]
+    .some(r => typeof r?.lastError === 'string' && r.lastError !== '');
+  if (!has) return inst;
+  const secrets = recordSecrets(inst);
+  const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
+    r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
+  const out: InstanceConfig = { ...inst };
+  if (out.fleetDbReplicaSeed) out.fleetDbReplicaSeed = scrub(out.fleetDbReplicaSeed);
+  if (out.fleetDbReplica?.autoReseed) out.fleetDbReplica = { ...out.fleetDbReplica, autoReseed: scrub(out.fleetDbReplica.autoReseed) };
+  if (out.fleetTransfer) out.fleetTransfer = scrub(out.fleetTransfer);
+  if (out.fleetFailback) out.fleetFailback = scrub(out.fleetFailback);
+  if (out.recoveryRescue) out.recoveryRescue = scrub(out.recoveryRescue);
+  return out;
+}
+
 function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   const out: InstanceConfig = inst.envVars ? { ...inst, envVars: withoutSensitiveKeys(inst.envVars) } : { ...inst };
   out.updateToken = encryptedOrStashed(inst.id, 'updateToken', out.updateToken);
@@ -285,7 +323,7 @@ function saveRegistrySync(registry: InstanceRegistry): void {
     fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
     const instances: InstanceRegistry['instances'] = {};
     for (const [id, inst] of Object.entries(registry.instances)) {
-      instances[id] = withRecordSecretsEncrypted(inst);
+      instances[id] = withRecordSecretsEncrypted(withStoredErrorsScrubbed(inst));
     }
     // Atomic write: a truncated/interrupted write (e.g. the container killed mid-save
     // during a rebuild) would otherwise corrupt the file, and the next load would
@@ -3660,7 +3698,7 @@ async function buildGitInstance(
     };
     const relayed = { ...dockerfileArgDefaults, ...composeBuildArgs };
     if (Object.keys(relayed).length > 0) {
-      emit(`[Build] Build args: ${Object.entries(relayed).map(([k, v]) => `${k}=${v}`).join(' ')}`, 'info');
+      emit(`[Build] Build args: ${Object.keys(relayed).join(', ')}`, 'info');
     }
 
     // Resolve commit/branch once. Order: the repo's actual HEAD (authoritative

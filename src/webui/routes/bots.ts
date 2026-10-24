@@ -34,6 +34,7 @@ import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
 import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
+import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
 import { hasAppHooks } from '../../instance/appHookClient';
 import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
@@ -1154,9 +1155,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/validate-db - Test a database URL with a one-shot psql.
-   * The URL rides as an argv element (never a shell string, never logged) and
-   * the run is hard-killed after 10 seconds. Errors surface password-redacted.
+   * POST /api/bots/:id/validate-db - Test a database URL with a one-shot psql
+   * (dbProbe: the password goes by environment, never argv). The run is
+   * hard-killed after 10 seconds. Errors surface password-redacted.
    *
    * The probe joins the shared sidecar network, so a managed database's
    * container name resolves here exactly as it does from the bot; on the
@@ -1180,31 +1181,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const target = url.trim();
 
       const network = sharedNetworkName(await getDeploymentMode());
-      const probeUrl = libpqUrl(target);
-      const result = await new Promise<{ ok: boolean; error?: string }>(resolve => {
-        const child = spawn('docker', ['run', '--rm', ...(network ? ['--network', network] : []),
-          'postgres:16-alpine', 'psql', probeUrl, '-c', 'SELECT 1']);
-        let stderr = '';
-        let killed = false;
-        let settled = false;
-        const finish = (r: { ok: boolean; error?: string }) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(r);
-        };
-        const timer = setTimeout(() => {
-          killed = true;
-          child.kill('SIGKILL');
-        }, 10000);
-        child.stderr.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
-        child.on('error', err => finish({ ok: false, error: `Failed to run docker: ${err.message}` }));
-        child.on('close', code => {
-          if (killed) return finish({ ok: false, error: 'Connection test timed out after 10 seconds' });
-          if (code === 0) return finish({ ok: true });
-          finish({ ok: false, error: redactDbError(stderr.trim() || `psql exited with code ${code}`, probeUrl) });
-        });
-      });
+      const result = await probeDatabaseUrl(target, network);
 
       if (result.ok) {
         res.json({ success: true, ok: true });
@@ -2343,53 +2320,6 @@ export function createSystemRoutes(): Router {
   });
 
   return router;
-}
-
-/**
- * Redact the password portion of a database URL.
- */
-function redactDbUrl(url: string): string {
-  return url.replace(/(:\/\/[^:@/]*):[^@]*@/, '$1:***@');
-}
-
-/**
- * Scrub a psql error for the response: any occurrence of the full URL becomes
- * its redacted form, and any occurrence of the password (raw or URI-decoded)
- * becomes ***.
- */
-/**
- * node-postgres accepts sslmode=no-verify for "encrypt, trust is pinned
- * elsewhere"; libpq has no such value and refuses the whole URL. require is
- * its equivalent (encrypt, no certificate verification).
- */
-function libpqUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    if (u.searchParams.get('sslmode') !== 'no-verify') return url;
-    u.searchParams.set('sslmode', 'require');
-    return u.toString();
-  } catch {
-    return url;
-  }
-}
-
-function redactDbError(text: string, url: string): string {
-  let out = text.split(url).join(redactDbUrl(url));
-  const secrets = new Set<string>();
-  try {
-    const pw = new URL(url).password;
-    if (pw) {
-      secrets.add(pw);
-      try { secrets.add(decodeURIComponent(pw)); } catch { /* keep raw */ }
-    }
-  } catch {
-    const m = url.match(/:\/\/[^:@/]*:([^@]+)@/);
-    if (m) secrets.add(m[1]);
-  }
-  for (const pw of secrets) {
-    if (pw) out = out.split(pw).join('***');
-  }
-  return out;
 }
 
 /**

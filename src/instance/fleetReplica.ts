@@ -24,6 +24,7 @@ import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fl
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
 import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyBlock, readStandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
+import { redactSecrets } from '../config/secretText';
 import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
@@ -484,7 +485,7 @@ function startProvisioning(
       // and may yet stream on it; anything else leaves it retaining WAL for a
       // copy that does not exist.
       if (containerManager.getBot(instance.id)?.fleetDbReplica?.slot !== record.slot) {
-        await dropInactiveSlot(instance, seedDsnFor(intake.dsn), hostCertPathFor(instance.id), record.slot);
+        await dropInactiveSlot(instance, intake.dsn, hostCertPathFor(instance.id), record.slot);
       }
       throw err;
     }
@@ -639,7 +640,32 @@ function seedFailureLine(stderr: string, password: string): string {
 }
 
 function seedDsnFor(dsn: ParsedDsn): string {
-  return `postgresql://${encodeURIComponent(dsn.user)}:${encodeURIComponent(dsn.password)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+  return `postgresql://${encodeURIComponent(dsn.user)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+}
+
+/**
+ * A libpq client run against the primary in a throwaway container. The
+ * password reaches it as PGPASSWORD from the docker CLI's own environment
+ * (`-e NAME` with no value), so it is in no command line on either side.
+ * On timeout the container is removed by name: a signal to the CLI is
+ * proxied to the client as PID 1, which drops it, and the container runs
+ * daemon-side.
+ */
+function runPrimaryClient(name: string, dsn: ParsedDsn, mounts: string[], entrypoint: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise(resolve => {
+    const child = spawn('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
+      ...mounts.flatMap(m => ['-v', m]),
+      '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      execFile('docker', ['rm', '-f', name], () => child.kill('SIGKILL'));
+    }, timeoutMs);
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
+    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr: redactSecrets(stderr, [dsn.password]) }); });
+  });
 }
 
 /**
@@ -673,21 +699,8 @@ async function assertSeedableSource(instance: InstanceConfig, dsn: ParsedDsn, ce
 
   const probeName = primaryProbeContainerName(instance);
   await dockerRmForce(probeName);
-  const probe = await new Promise<{ ok: boolean; stdout: string; stderr: string }>(resolve => {
-    const child = spawn('docker', ['run', '--rm', '--name', probeName,
-      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
-      '--entrypoint', 'psql', 'postgres:16-alpine',
-      seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc', 'SELECT pg_is_in_recovery()']);
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      execFile('docker', ['rm', '-f', probeName], () => child.kill('SIGKILL'));
-    }, PROBE_TIMEOUT_MS);
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
-  });
+  const probe = await runPrimaryClient(probeName, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql',
+    [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc', 'SELECT pg_is_in_recovery()'], PROBE_TIMEOUT_MS);
   // committed describes the VOLUME, so a retry over an attempt that already
   // wiped inherits it: the reassurance below would be a lie on exactly the
   // record that most needs the truth.
@@ -717,6 +730,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   await dockerRmForce(seedName);
 
   const seedDsn = seedDsnFor(dsn);
+  const certMount = `${hostCertPath}:/primary-ca.crt:ro`;
 
   // Whatever the volume holds is superseded here: manager debris on a first
   // provision, and on a re-seed the verified-stale copy 20.14 rules wipeable.
@@ -737,11 +751,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // replication was disabled refuses earlier, at the login disable revoked.
   const resetName = slotResetContainerName(instance);
   await dockerRmForce(resetName);
-  const slotReset = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    const child = spawn('docker', ['run', '--rm', '--name', resetName,
-      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
-      '--entrypoint', 'psql', 'postgres:16-alpine',
-      seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
+  const slotReset = await runPrimaryClient(resetName, dsn, [certMount], 'psql', [seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
       DO $$ DECLARE s record; BEGIN
         SELECT active, wal_status INTO s FROM pg_replication_slots WHERE slot_name = '${record.slot}';
         IF NOT FOUND THEN
@@ -750,17 +760,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
           PERFORM pg_drop_replication_slot('${record.slot}');
           PERFORM pg_create_physical_replication_slot('${record.slot}');
         END IF;
-      END $$;`]);
-    let stderr = '';
-    // Same rule as the seed below: a signal to the CLI is proxied to psql as
-    // PID 1, which drops it, so the container is removed by name instead.
-    const timer = setTimeout(() => {
-      execFile('docker', ['rm', '-f', resetName], () => child.kill('SIGKILL'));
-    }, 60_000);
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
-  });
+      END $$;`], 60_000);
   if (!slotReset.ok) {
     // psql prints ERROR, DETAIL and CONTEXT lines; the ERROR line is the one
     // to show, never with the DSN's password should it ever be echoed.
@@ -771,27 +771,14 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
 
   throwIfCancelled(instance.id);
   saveSeed(instance.id, { phase: 'seeding' });
-  const seed = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    const child = spawn('docker', ['run', '--rm', '--name', seedName,
-      '-v', `${record.volume}:${PGDATA}`,
-      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
-      '--entrypoint', 'pg_basebackup', 'postgres:16-alpine',
-      '-d', seedDsn, '-D', PGDATA, '-X', 'stream', '-R', '-S', record.slot, '--checkpoint=fast']);
-    let stderr = '';
-    // Killing the CLI would NOT stop the container (it runs daemon-side and
-    // would keep holding the volume and the primary's walsender): kill the
-    // container by name, which also ends the CLI attachment.
-    const timer = setTimeout(() => {
-      execFile('docker', ['rm', '-f', seedName], () => child.kill('SIGKILL'));
-    }, SEED_TIMEOUT_MS);
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
-  });
+  // A timeout removes the container by name, which also frees the volume and
+  // the primary's walsender it holds.
+  const seed = await runPrimaryClient(seedName, dsn, [`${record.volume}:${PGDATA}`, certMount], 'pg_basebackup',
+    ['-d', seedDsn, '-D', PGDATA, '-X', 'stream', '-R', '-S', record.slot, '--checkpoint=fast'], SEED_TIMEOUT_MS);
   if (!seed.ok) {
     // The slot minted above would retain WAL on the primary for a copy that
     // does not exist; dropped while inactive, and the next attempt mints again.
-    await dropInactiveSlot(instance, seedDsn, hostCertPath, record.slot);
+    await dropInactiveSlot(instance, dsn, hostCertPath, record.slot);
     throw new Error(`pg_basebackup failed: ${seedFailureLine(seed.stderr, dsn.password)}`);
   }
 
@@ -861,23 +848,11 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
 }
 
 /** Best effort: an inactive slot of this name on the primary is dropped; a failure is logged, never thrown. */
-async function dropInactiveSlot(instance: InstanceConfig, seedDsn: string, hostCertPath: string, slot: string): Promise<void> {
+async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCertPath: string, slot: string): Promise<void> {
   const name = `${slotResetContainerName(instance)}-drop`;
   await dockerRmForce(name);
-  const result = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    const child = spawn('docker', ['run', '--rm', '--name', name,
-      '-v', `${hostCertPath}:/primary-ca.crt:ro`,
-      '--entrypoint', 'psql', 'postgres:16-alpine',
-      seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc',
-      `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`]);
-    let stderr = '';
-    const timer = setTimeout(() => {
-      execFile('docker', ['rm', '-f', name], () => child.kill('SIGKILL'));
-    }, 60_000);
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stderr: stderr || 'docker run failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stderr }); });
-  });
+  const result = await runPrimaryClient(name, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql', [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc',
+    `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`], 60_000);
   if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${result.stderr.trim().split('\n').pop()}`);
 }
 

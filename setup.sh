@@ -62,11 +62,16 @@ read_secret() { local __v; read -rsp "$2" __v || die "stdin closed (non-interact
 authelia_cli() { docker run --rm "$AUTHELIA_IMAGE" authelia "$@"; }
 # Extract the value by shape, so a labelled or bare CLI output both parse.
 gen_secret() { authelia_cli crypto rand --length 64 --charset alphanumeric 2>/dev/null | grep -oE '[A-Za-z0-9]{64}' | head -n1; }
-# The password travels via stdin (the image's CLI has no stdin mode itself), so it
-# never appears in the host docker argv or in docker inspect.
+# Authelia's CLI takes the password only as an argument, which any local account
+# reads in ps, so the hash comes from the argon2 CLI, which reads it from stdin.
+# The parameters are Authelia's argon2id defaults. printf is a shell builtin, so
+# the password is in no argv on the host or in the container.
+ARGON2_IMAGE="alpine:3.20"
 gen_hash() {
-  printf '%s\n' "$1" | docker run -i --rm --entrypoint sh "$AUTHELIA_IMAGE" \
-    -c 'IFS= read -r pw; exec authelia crypto hash generate argon2 --password "$pw"' 2>/dev/null \
+  printf '%s\n' "$1" | docker run -i --rm --entrypoint sh "$ARGON2_IMAGE" \
+    -c 'IFS= read -r pw; apk add --no-cache -q argon2 >/dev/null 2>&1 </dev/null || exit 1
+        salt="$(head -c 16 /dev/urandom | base64 | tr -d "\n=+/" | head -c 22)"
+        printf "%s" "$pw" | argon2 "$salt" -id -t 3 -k 65536 -p 4 -l 32 -e' 2>/dev/null \
     | grep -oE '\$argon2id\$[^[:space:]]+' | head -n1
 }
 
@@ -289,6 +294,7 @@ if [ "$need_password" -eq 1 ]; then
     read_secret ADMIN_PW  "Set a NEW admin password (your web login will be admin / this password): "
     read_secret ADMIN_PW2 "Confirm password: "
     [ -n "$ADMIN_PW" ] || { warn "Password cannot be empty."; continue; }
+    [ "$(printf '%s' "$ADMIN_PW" | wc -c)" -lt 128 ] || { warn "Password must be under 128 bytes (the argon2 hasher reads no more)."; continue; }
     [ "$ADMIN_PW" = "$ADMIN_PW2" ] || { warn "Passwords do not match."; continue; }
     break
   done

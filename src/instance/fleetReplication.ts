@@ -28,6 +28,7 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
+import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -73,6 +74,11 @@ function dbExec(containerName: string, args: string[], stdin?: string): Promise<
 
 function psql(containerName: string, user: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-Atc', sql]);
+}
+
+/** SQL on stdin, for a statement that must stay out of every command line. */
+function psqlScript(containerName: string, user: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
 }
 
 function isContainerRunning(containerName: string): Promise<boolean> {
@@ -212,15 +218,16 @@ export async function enableFleetReplication(
   const certRotated = previousCertHost !== undefined && previousCertHost !== host;
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
-  const setup = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
-    DO $$ BEGIN
-      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}') THEN
-        CREATE ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${password}';
-      ELSE
-        ALTER ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${password}';
-      END IF;
-    END $$;`);
-  if (!setup.ok) return { success: false, error: `database setup failed: ${setup.stderr.trim()}` };
+  const exists = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
+  if (!exists.ok) return { success: false, error: `database setup failed: ${exists.stderr.trim()}` };
+  // The verifier, never the password, and outside a DO block: a failing
+  // statement inside one is echoed whole in the CONTEXT line, which the
+  // quiet session settings do not hold back.
+  const verifier = scramSha256Verifier(password);
+  const verb = exists.stdout.trim() === '0' ? 'CREATE' : 'ALTER';
+  const setup = await psqlScript(fleetDb.containerName, fleetDb.user, fleetDb.db,
+    `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`);
+  if (!setup.ok) return { success: false, error: `database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}` };
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
   const ssl = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
@@ -385,12 +392,13 @@ function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?:
   const repl = instance.fleetDb!.replication!;
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return Promise.resolve({ ok: false, error: 'stored URL unreadable' });
-  const url = `postgresql://${instance.fleetDb!.user}:${encodeURIComponent(dbPassword)}@${repl.publicHost}:${repl.hostPort}/${instance.fleetDb!.db}?sslmode=require&connect_timeout=8`;
+  const url = `postgresql://${instance.fleetDb!.user}@${repl.publicHost}:${repl.hostPort}/${instance.fleetDb!.db}?sslmode=require&connect_timeout=8`;
+  // The password rides the docker CLI's environment (`-e NAME` with no value), never its argv.
   return new Promise(resolve => {
-    execFile('docker', ['run', '--rm', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
-      { timeout: PROBE_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFile('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
+      { timeout: PROBE_TIMEOUT_MS, env: { ...process.env, PGPASSWORD: dbPassword } }, (err, stdout, stderr) => {
         if (!err && String(stdout).trim() === '1') resolve({ ok: true });
-        else resolve({ ok: false, error: String(stderr || err || 'no response').trim().split('\n').pop() });
+        else resolve({ ok: false, error: redactSecrets(childFailureText(stderr, err) || 'no response', [dbPassword]).split('\n').pop() });
       });
   });
 }

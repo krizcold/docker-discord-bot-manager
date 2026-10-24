@@ -27,6 +27,7 @@ import { sharedNetworkName } from '../templates/pcsProcessing';
 import { ensureRsyncDaemon, RECOVERY_CONTROL_PORT } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
+import { childFailureText, redactSecrets } from '../config/secretText';
 
 const DEFAULT_TUNNEL_PORT = 15433;
 const TUNNEL_CONTAINER_PORT = 9450;
@@ -42,10 +43,12 @@ function rsyncContainerName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-recovery-rsyncd`;
 }
 
-function docker(args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+/** secretEnv: values a `-e NAME` argument (no value) hands the container from the CLI's own environment, so they are in no argv. */
+function docker(args: string[], stdin?: string, secretEnv?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || err || '') }));
+    const env = secretEnv ? { ...process.env, ...secretEnv } : undefined;
+    const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) },
+      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: err ? childFailureText(stderr, err) : String(stderr || '') }));
     if (stdin !== undefined && child.stdin) { child.stdin.write(stdin); child.stdin.end(); }
   });
 }
@@ -109,7 +112,7 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
 
   const args = ['run', '-d', '--name', record.containerName, '--restart', 'unless-stopped', ...LOG_CAP_RUN_ARGS,
     '--network', network.network!,
-    '-e', `RELAY_TOKEN=${record.token}`,
+    '-e', 'RELAY_TOKEN',
     '-e', `RELAY_SELF_IDENTITY=${identity}`];
   if (record.mode === 'receiver') {
     args.push(
@@ -117,7 +120,7 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
       '-e', 'RELAY_MODE=listen',
       '-e', 'RELAY_SELF_ROLE=receiver',
       '-e', `RELAY_TUNNEL_PORT=${TUNNEL_CONTAINER_PORT}`,
-      '-e', `RELAY_TLS_KEY=${record.tlsKey}`,
+      '-e', 'RELAY_TLS_KEY',
       '-e', `RELAY_TLS_CERT=${record.tlsCert}`,
       '-e', `RELAY_LANES=postgres:${LANE_POSTGRES_PORT},rsync:${LANE_RSYNC_PORT},control:${RECOVERY_CONTROL_PORT}`);
   } else {
@@ -134,8 +137,10 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
   args.push(image.image!, 'node', '/app/dist/recovery/relay.js');
 
   await docker(['rm', '-f', record.containerName]);
-  const run = await docker(args);
-  if (!run.ok) return { ok: false, error: `could not start the relay container: ${run.stderr.trim().split('\n').pop()}` };
+  const secrets: Record<string, string> = { RELAY_TOKEN: record.token };
+  if (record.mode === 'receiver') secrets.RELAY_TLS_KEY = record.tlsKey!;
+  const run = await docker(args, undefined, secrets);
+  if (!run.ok) return { ok: false, error: `could not start the relay container: ${redactSecrets(run.stderr.trim(), Object.values(secrets)).split('\n').pop()}` };
   if (record.mode === 'source') {
     // The seed daemon belongs to the armed state: arm = fully ready to serve
     // the rescue, disarm/delete already remove it by name.

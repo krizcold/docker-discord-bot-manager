@@ -14,6 +14,7 @@ import { SourceMeta, SourceRegistry, CreateSourceRequest, UpdateSourceRequest } 
 import { hasExistingCompose, extractAppName } from '../templates/compose';
 import { isSensitive } from '../env/manager';
 import { storeFileState, preserveCorruptCopy, corruptCopyNote } from '../config/storeFile';
+import { redactSecrets } from '../config/secretText';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 const SOURCES_DIR = path.join(DATA_DIR, 'sources');
@@ -97,6 +98,54 @@ function getDisplayUrl(url: string): string {
   return url.replace(/\/\/([^@]+)@/, '//***@');
 }
 
+/**
+ * A credentialed http(s) URL split for git: the URL without its userinfo,
+ * and the environment that hands git the credential as an Authorization
+ * header scoped to that origin (config read from GIT_CONFIG_COUNT), so it is
+ * in no command line and never written into the clone's .git/config.
+ */
+export function gitCredentialEnv(url: string): { url: string; env: Record<string, string> | null } {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return { url, env: null };
+  }
+  if ((u.protocol !== 'https:' && u.protocol !== 'http:') || (!u.username && !u.password)) return { url, env: null };
+  const user = decodeURIComponent(u.username);
+  const pass = decodeURIComponent(u.password);
+  u.username = '';
+  u.password = '';
+  return {
+    url: u.toString(),
+    env: {
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: `http.${u.origin}/.extraHeader`,
+      GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`,
+    },
+  };
+}
+
+/** A git client for this URL's repo, carrying its credential (if any) by environment. */
+function gitFor(url: string, repoPath?: string): SimpleGit {
+  const { env } = gitCredentialEnv(url);
+  const git = repoPath ? simpleGit(repoPath) : simpleGit();
+  return env ? git.env({ ...process.env, ...env }) : git;
+}
+
+/** An error text with the URL's credential, raw or encoded, replaced by ***. */
+function withoutCredential(text: string, url: string): string {
+  let user = '';
+  let pass = '';
+  try {
+    const u = new URL(url);
+    user = decodeURIComponent(u.username);
+    pass = decodeURIComponent(u.password);
+  } catch { /* not a URL: nothing to redact beyond the userinfo form */ }
+  // A token-only URL carries its secret as the user name.
+  return redactSecrets(getDisplayUrl(text), [pass || user]);
+}
+
 function copyDirSync(src: string, dest: string): void {
   fs.mkdirSync(dest, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
@@ -145,10 +194,11 @@ async function readHeadCommit(repoPath: string): Promise<{ hash: string; message
 async function cloneRepo(url: string, repoPath: string, branch?: string | null): Promise<string> {
   // Clean any leftover dir from a previous failed clone so git won't refuse a non-empty target
   if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
-  const git: SimpleGit = simpleGit();
+  const git: SimpleGit = gitFor(url);
+  const cloneUrl = gitCredentialEnv(url).url;
   if (branch) {
     try {
-      await git.clone(url, repoPath, ['--branch', branch, '--single-branch']);
+      await git.clone(cloneUrl, repoPath, ['--branch', branch, '--single-branch']);
       return branch;
     } catch (err) {
       if (!/Remote branch .* not found/i.test(String(err))) throw err;
@@ -156,7 +206,7 @@ async function cloneRepo(url: string, repoPath: string, branch?: string | null):
       if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
     }
   }
-  await git.clone(url, repoPath, ['--single-branch']);
+  await git.clone(cloneUrl, repoPath, ['--single-branch']);
   try {
     const actual = (await simpleGit(repoPath).revparse(['--abbrev-ref', 'HEAD'])).trim();
     return actual || 'main';
@@ -308,7 +358,7 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     try {
       actualBranch = await cloneRepo(source.url, repoPath, source.branch);
     } catch (err: any) {
-      recordCloneFailure(sourceId, getDisplayUrl(String(err?.message || err)));
+      recordCloneFailure(sourceId, withoutCredential(String(err?.message || err), source.url));
       throw err;
     }
     createSourceRawBackup(sourceId);
@@ -339,7 +389,7 @@ export async function fetchSource(sourceId: string): Promise<{ hasUpdates: boole
     return { hasUpdates: false, behindBy: 0 };
   }
 
-  const git: SimpleGit = simpleGit(repoPath);
+  const git: SimpleGit = gitFor(source.url, repoPath);
 
   // Fetch
   await git.fetch();

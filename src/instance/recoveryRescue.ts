@@ -37,6 +37,7 @@ import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
+import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
 
 const PGDATA = '/var/lib/postgresql/data';
 const APP_HOOK_WAIT_MS = 90_000;
@@ -48,7 +49,7 @@ const DOCKER_TIMEOUT_MS = 60_000;
 function docker(args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
     const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || err || '') }));
+      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: err ? childFailureText(stderr, err) : String(stderr || '') }));
     if (stdin !== undefined && child.stdin) { child.stdin.write(stdin); child.stdin.end(); }
   });
 }
@@ -557,14 +558,18 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   if (!password) throw new Error(envManager.storeBrokenDiagnosis(instance.id) || 'could not recover the database password from the stored database URL');
   // The leading RESET lifts a quiesce write fence the copy may have inherited
   // (a re-rescue rsyncs a fenced source's auto.conf in): ALTER ROLE is a real
-  // catalog write and read-only refuses it, which would wedge the flip.
-  const alter = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
-    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
-    '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
-    '-c', 'ALTER SYSTEM RESET synchronous_standby_names',
-    '-c', 'SELECT pg_reload_conf()',
-    '-c', `ALTER ROLE "${fleetDb.user}" WITH LOGIN PASSWORD '${password.replace(/'/g, "''")}'`]);
-  if (!alter.ok) throw new Error(`could not reconcile the database credentials: ${alter.stderr.trim().split('\n').pop()}`);
+  // catalog write and read-only refuses it, which would wedge the flip. The
+  // script goes on stdin and sets the verifier, so neither the password nor
+  // its verifier is in a command line or the server log.
+  const verifier = scramSha256Verifier(password);
+  const alter = await docker(['exec', '-i', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1'],
+    'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;\n'
+    + 'ALTER SYSTEM RESET default_transaction_read_only;\n'
+    + 'ALTER SYSTEM RESET synchronous_standby_names;\n'
+    + 'SELECT pg_reload_conf();\n'
+    + QUIET_ROLE_SESSION_SQL
+    + `ALTER ROLE "${fleetDb.user}" WITH LOGIN PASSWORD '${verifier}';\n`);
+  if (!alter.ok) throw new Error(`could not reconcile the database credentials: ${redactSecrets(alter.stderr.trim(), [password, verifier]).split('\n').pop()}`);
   const clean = await docker(['exec', fleetDb.containerName, 'sh', '-c',
     `sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf`]);
   if (!clean.ok) throw new Error(`could not clean the standby settings: ${clean.stderr.trim().split('\n').pop()}`);

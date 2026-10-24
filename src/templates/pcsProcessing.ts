@@ -2605,7 +2605,7 @@ export async function redeliverConfigFiles(
   // A file with no bind in the deployed compose was added after the build: only Update mounts it.
   const unbound = configFiles.filter(c => !handled.has(c.path));
   if (unbound.length) {
-    (logFn || console.log)(`[PCS] Warning: ${unbound.map(c => c.path).join(', ')} not mounted yet; press Update to mount`);
+    (logFn || console.log)(`[PCS] Warning: ${unbound.map(c => c.path).join(', ')} not mounted yet; press Build, then Start or Restart, to mount`);
     report.unbound.push(...unbound.map(c => c.path));
   }
   return report;

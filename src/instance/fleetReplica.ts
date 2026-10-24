@@ -1638,7 +1638,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     // it back, and the record that would tell them apart is deleted by a
     // cancel filed in that same window.
     if (!status.live) return refuse(`Could not read the standby container (${status.probeError || 'no output'}), so it cannot be verified as an unpromoted copy; try again`);
-    return refuse('The standby container is not running, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and rebuild it if a stopped re-seed took the standby service out of its compose');
+    return refuse('The standby container is not running, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and press Build on its card, then Apply (or Start if the instance is stopped), if a stopped re-seed took the standby service out of its compose');
   }
   if (!hasAppHooks(instance)) return refuse('This app declares no lifecycle hooks, so the manager cannot obtain the copy block; remove the replica and provision it again by hand');
   const facts = factsRead ?? await getAppFacts(instance, FACTS_TIMEOUT_MS);

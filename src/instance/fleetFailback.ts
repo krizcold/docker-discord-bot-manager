@@ -359,7 +359,7 @@ export async function openFailbackByHand(instance: InstanceConfig): Promise<Acti
     const replicaStatus = await fleetReplica.getFleetReplicaStatus(instance);
     const live = replicaStatus.live;
     if (!live) return { success: false, error: `could not read this copy's container (${replicaStatus.probeError || 'no output'}), so it cannot be verified as the promoted copy; try again` };
-    if (!live.running) return { success: false, error: 'this copy\'s container is not running, so it cannot be verified as the promoted copy; start the instance, and rebuild it if a stopped re-seed took the standby service out of its compose' };
+    if (!live.running) return { success: false, error: 'this copy\'s container is not running, so it cannot be verified as the promoted copy; start the instance, and press Build on its card, then Apply (or Start if the instance is stopped), if a stopped re-seed took the standby service out of its compose' };
     if (live.inRecovery !== false) return { success: false, error: live.inRecovery === true ? 'this copy is in recovery again (a standby), so there is nothing to drop back' : 'this copy did not say whether it is in recovery; retry in a moment' };
     containerManager.updateInstanceFleetFailbackDeclined(instance.id, null);
     maybeOpenDropBack(containerManager.getBot(instance.id) ?? instance, read.facts!, standing, live);

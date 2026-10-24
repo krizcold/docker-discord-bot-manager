@@ -1995,7 +1995,7 @@ function updateLastBuiltCommit(botId: string, commitHash: string | null): void {
 
 function startedResult(emit: EmitFn, unrecorded: string | null, notApplied: string[]): LaneResult {
   const warnings: string[] = [];
-  const retry = notApplied.some(n => !n.includes('press Update')) ? '. Apply or Restart to retry' : '';
+  const retry = notApplied.some(n => !n.includes('press Build')) ? '. Apply or Restart to retry' : '';
   if (notApplied.length > 0) warnings.push(`The bot is running, but these changes were not applied: ${notApplied.join('; ')}${retry}`);
   if (unrecorded) warnings.push(`The bot is running, but its status could not be recorded: ${unrecorded}`);
   for (const w of warnings) emit(`[Warning] ${w}`, 'warning');
@@ -3130,7 +3130,7 @@ function reapplyableConfigFiles(botId: string, emit: EmitFn, notApplied: string[
 }
 
 function noteUndelivered(report: DeliveryReport, emit: EmitFn, notApplied: string[]): void {
-  if (report.unbound.length > 0) notApplied.push(`config files not mounted yet (press Update to mount): ${report.unbound.join(', ')}`);
+  if (report.unbound.length > 0) notApplied.push(`config files not mounted yet (press Build, then Restart, to mount): ${report.unbound.join(', ')}`);
   if (report.failed.length === 0) return;
   emit(`[Config] Warning: ${report.failed.length} config file(s) not re-applied: ${report.failed.join(', ')}`, 'warning');
   notApplied.push(`config files (${report.failed.length} not delivered: ${report.failed.join(', ')})`);
@@ -3142,16 +3142,16 @@ function noteMountsChanged(botId: string, notApplied: string[]): void {
   if (corrupt) return;
   let built: string[] | null;
   try { built = configFileManager.getBuiltMounts(botId); } catch (err) {
-    notApplied.push(`config file mounts (can't confirm they match the last build: ${err instanceof Error ? err.message : String(err)}; press Update)`);
+    notApplied.push(`config file mounts (can't confirm they match the last build: ${err instanceof Error ? err.message : String(err)}; press Build, then Restart)`);
     return;
   }
   if (built === null) {
     if (!configFileManager.hasConfigStore(botId)) return;
-    notApplied.push('config file mounts (no record of the mounts the last build authored; press Update to be sure)');
+    notApplied.push('config file mounts (no record of the mounts the last build authored; press Build, then Restart, to be sure)');
     return;
   }
   const now = files.filter(f => f.enabled !== false).map(configFileManager.mountKey).sort();
-  if (now.join('\n') !== [...built].sort().join('\n')) notApplied.push('config file mounts changed since the last build (press Update)');
+  if (now.join('\n') !== [...built].sort().join('\n')) notApplied.push('config file mounts changed since the last build (press Build, then Restart)');
 }
 
 /** A build in progress or failed leaves no record, so the next start reads "no record" until a build finishes. */

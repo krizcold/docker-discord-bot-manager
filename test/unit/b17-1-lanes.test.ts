@@ -131,7 +131,7 @@ describe('B17-1 lanes: Start and Build apply what they report', () => {
     writeRegistry({ sourceType: 'docker-image', imageRef: 'example/bot:1' });
     configFileManager.setConfigFiles('b1', [{ path: '/app/config.json', body: '{}' }]);
     const r = await containerManager.startBot('b1');
-    expect(r.warning).toContain('config file mounts (no record of the mounts the last build authored; press Update to be sure)');
+    expect(r.warning).toContain('config file mounts (no record of the mounts the last build authored; press Build, then Restart, to be sure)');
     expect(r.warning).not.toContain('changed since the last build');
   }, 20000);
 
@@ -168,17 +168,17 @@ describe('B17-1 lanes: Start and Build apply what they report', () => {
     configFileManager.setConfigFiles('b1', [{ path: '/app/settings.json', body: '{}', readOnly: false }]);
     const r = await containerManager.startBot('b1');
     expect(r.success).toBe(true);
-    expect(r.warning).toContain('config file mounts changed since the last build (press Update)');
+    expect(r.warning).toContain('config file mounts changed since the last build (press Build, then Restart)');
   }, 20000);
 
-  it('a start names Update, not Restart, for a config file added after the build', async () => {
+  it('a start names Build, not a bare Restart retry, for a config file added after the build', async () => {
     writeRegistry({ sourceType: 'docker-image', imageRef: 'example/bot:1' });
     configFileManager.setConfigFiles('b1', [{ path: '/app/new.json', body: '{}' }]);
     configFileManager.setBuiltMounts('b1', ['/app/new.json:ro']);
     const r = await containerManager.startBot('b1');
     expect(r.success).toBe(true);
-    expect(r.warning).toContain('config files not mounted yet (press Update to mount): /app/new.json');
-    expect(r.warning).not.toContain('Restart');
+    expect(r.warning).toContain('config files not mounted yet (press Build, then Restart, to mount): /app/new.json');
+    expect(r.warning).not.toContain('Apply or Restart to retry');
   }, 20000);
 });
 

@@ -2754,7 +2754,7 @@
           </label>
         </div>
         <div id="fleet-backup-list">${listHtml}</div>
-        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. A fresh safety dump is taken first (skipped only when the database itself is missing).</div>
+        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. The database is fenced read-only and a fresh safety dump is taken under that fence before anything changes (skipped only when the database itself is missing).</div>
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Replication</div>
           <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
@@ -2863,17 +2863,21 @@
           : p.cancelable
             ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
             : '';
-        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${cancelHtml}`;
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${seedDumpHtml(p)}${cancelHtml}`;
         setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
         return;
       }
       if (r && r.parkedSeed) {
         const k = r.parkedSeed;
-        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}${seedDumpHtml(k)}
           <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}', '${hint}')">Dismiss</button></div></div>`;
         return;
       }
       still.innerHTML = seedWarningHtml(r && r.pinsWarning);
+    }
+
+    function seedDumpHtml(seed) {
+      return seed && seed.safetyDump ? `<div class="env-tip">A safety dump of this database, taken under a write fence, is kept with the backups as ${escapeHtml(seed.safetyDump)}.</div>` : '';
     }
 
     function seedWarningHtml(warning) {
@@ -3022,7 +3026,7 @@
         </div>`}
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
-          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once (kept with the backups) and then <b>deleted</b>; anything written here after the failover is discarded.</div>
+          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
           ${failback ? '<div class="env-tip">The failback run re-seeds this database itself; answer it above.</div>' : stopped ? `
           <div class="form-group"><label>New primary's replication DSN</label>
             <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
@@ -3043,7 +3047,7 @@
      * fresh safety dump succeeds; that dump is the recovery path.
      */
     async function decommissionFleetDb(botId) {
-      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first and kept with the backups; if the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
+      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first under a write fence (the database is read-only with its sessions closed while it runs) and kept with the backups; if the fence or the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
       if (!confirm(warning)) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
@@ -3570,7 +3574,7 @@
       // the retire warning is the one to keep.
       const parkedHint = parked && parked.committed && parked.copyWhole === true && parked.purpose !== 'provision' ? (res.failback ? 'copy-whole-run' : 'copy-whole') : hint;
       const errHtml = seedWarningHtml(r.pinsWarning) + (parked
-        ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}
+        ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}${seedDumpHtml(parked)}
              <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}', '${parkedHint}')">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>`
         : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '');
@@ -4068,7 +4072,7 @@
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (refuseWhileChecking(botId)) return;
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (read-only, sessions closed), then DELETED and replaced with a fresh copy of the new primary. If the dump fails, nothing is deleted. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
@@ -4238,7 +4242,7 @@
     }
 
     async function restoreFleetBackupFile(botId, file) {
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. A fresh safety dump is taken first (skipped only when the database itself is missing); the database is then fenced read-only with its sessions closed, dropped and rebuilt from the chosen dump, and the instances on this manager that share it are stopped and restarted. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. The instances on this manager that share it are stopped, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, and the stopped instances are restarted. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);

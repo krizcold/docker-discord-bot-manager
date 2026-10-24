@@ -8,12 +8,12 @@
  *
  * Dumps stream to <DATA_DIR>/backups/<botId>/fleet-postgres/<ISO>.dump with a
  * keep-newest retention trim (pre-*.dump safety files are exempt). Restore
- * order: safety dump FIRST (the sidecar is a service of the instance's own
- * compose project, so stopping the host takes the database down with it),
- * courtesy stop of the managed instances this manager can see on the URL,
- * sidecar brought back alone, WRITE FENCE (read-only + terminate sessions -
- * the sweep cannot see a consumer whose DSN lives in the bot's own store, so
- * the fence is the actual protection), database dropped and recreated,
+ * order: courtesy stop of the managed instances this manager can see on the
+ * URL, sidecar brought back alone (it is a service of the instance's own
+ * compose project, so stopping the host takes it down too), WRITE FENCE
+ * (read-only + terminate sessions - the sweep cannot see a consumer whose DSN
+ * lives in the bot's own store, so the fence is the actual protection),
+ * safety dump under the fence, database dropped and recreated,
  * pg_restore --exit-on-error with the restoring session exempted, fence
  * lifted, stopped instances restarted.
  */
@@ -360,6 +360,37 @@ export function liftConsentFence(botId: string, target: ConsentFenceTarget, fail
   return liftAndTrack(botId, target, 'a failback', failedRemedy);
 }
 
+function liftNote(result: 'lifted' | 'stripped' | 'failed', remedy = 'running a restore again retries the lift'): string {
+  return result === 'lifted' ? ''
+    : result === 'stripped' ? '; the write fence could not be lifted live, so the database is READ-ONLY until its container restarts'
+    : `; the write fence could not be lifted, so the database stays READ-ONLY (${remedy})`;
+}
+
+/**
+ * The safety dump a lane that destroys the database takes first (the B7-O19 order): the write fence, then the dump
+ * under it, so the dump holds every write the destroy removes. A failed fence or dump lifts the fence and refuses.
+ * The caller has stopped the writers it can see and brought the database up alone.
+ */
+export async function fencedSafetyDump(instance: InstanceConfig, prefix: string, lane: string, remedy: string): Promise<{ success: true; file: string } | { success: false; error: string }> {
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb) return { success: false, error: 'No fleet database record' };
+  const fence = await applyWriteFence(fleetDb);
+  foreignFenceSet(instance.id, fleetDb.containerName);
+  if (!fence.ok) {
+    const lifted = await liftAndTrack(instance.id, fleetDb, lane, remedy);
+    return { success: false, error: `the write fence could not be applied (${fence.stderr.trim().split('\n').pop() || 'unknown reason'}), so no dump was taken${liftNote(lifted, remedy)}` };
+  }
+  const dump = await runFleetDump(instance, prefix);
+  if (dump.success && dump.file) return { success: true, file: dump.file };
+  const lifted = await liftAndTrack(instance.id, fleetDb, lane, remedy);
+  return { success: false, error: `${dump.error || 'unknown reason'}${liftNote(lifted, remedy)}` };
+}
+
+/** Lift a lane's fence from a database its destroy left standing; the text names a fence left on. */
+export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, lane: string, remedy: string): Promise<string> {
+  return liftNote(await liftAndTrack(botId, fleetDb, lane, remedy), remedy);
+}
+
 /** Whether a failback or drop-back run on this instance left its fence on this database (the persisted record, or this process's when its save was refused). */
 export function failbackFenceLeft(botId: string, containerName: string): boolean {
   const key = fenceKey(botId, containerName);
@@ -526,8 +557,18 @@ function trimFleetBackups(botId: string, tickKeep: number, justWritten: string):
   }
 }
 
+// A file opens 'r+': Windows refuses to flush a handle opened read-only.
+function syncPath(target: string, flags: 'r' | 'r+'): void {
+  const fd = fs.openSync(target, flags);
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /**
- * One pg_dump of the instance's sidecar, streamed to a .tmp then renamed.
+ * One pg_dump of the instance's sidecar, streamed to a .tmp, synced to disk, then renamed.
  * `prefix` names safety dumps (pre-restore-). Skips when the container is not
  * running (scheduler) / fails hard for callers that need the dump.
  */
@@ -589,12 +630,23 @@ export async function runFleetDump(
         settled = true;
         clearTimeout(timer);
         try {
+          syncPath(tmpPath, 'r+');
           fs.renameSync(tmpPath, finalPath);
-          resolve({ success: true, file: fileName });
         } catch (err) {
           try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
           resolve({ success: false, error: `Failed to finalize dump file: ${err}` });
+          return;
         }
+        try {
+          syncPath(dir, 'r');
+        } catch (err) {
+          // Windows cannot open a folder to sync it; NTFS journals the rename itself.
+          if (process.platform !== 'win32') {
+            resolve({ success: false, error: `The dump ${fileName} was written, but its folder could not be synced to disk, so a crash could still lose it: ${err}` });
+            return;
+          }
+        }
+        resolve({ success: true, file: fileName });
       });
     });
   });
@@ -648,10 +700,10 @@ async function runFleetBackupTick(): Promise<void> {
 }
 
 /**
- * Restore a dump into the instance's sidecar. In order: pre-restore safety
- * dump (refusing the restore if it fails), courtesy stop of the managed
- * instances this manager can see on the URL, sidecar brought back alone,
- * write fence, drop and recreate of the database (pg_restore --clean cannot
+ * Restore a dump into the instance's sidecar. In order: courtesy stop of the
+ * managed instances this manager can see on the URL, sidecar brought back
+ * alone, write fence, pre-restore safety dump under the fence (refusing the
+ * restore if it fails), drop and recreate of the database (pg_restore --clean cannot
  * restore this schema: the partition PK drops it emits are refused as
  * inherited constraints and the run exits 1 even when everything applied; a
  * fresh database makes any restore error a real failure), pg_restore
@@ -704,45 +756,7 @@ export async function restoreFleetBackup(
       }
     }
 
-    // 1. Pre-restore safety dump FIRST, while the sidecar is up: the sidecar
-    // is a service of the instance's own compose project, so the stop below
-    // takes it down with the host. The old stop-then-dump order refused
-    // every healthy-fleet restore, and returned before the restart loop.
-    // A MISSING database (a prior recreate failure) has no data to protect
-    // and dumping it would refuse every retry, so existence is probed first;
-    // an unanswerable probe still refuses.
-    const exists = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
-      '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
-    if (!exists.ok) {
-      return { success: false, error: `Could not check the database before the restore: ${exists.stderr.trim().split('\n').pop()}`, steps };
-    }
-    // The app's control term must never move backwards: the witness fence
-    // parks a master whose store term sits below a claim any node ever
-    // posted, and only this lane knows the rewind is a deliberate restore
-    // rather than a stale fork (F-R5-1). Capture the live term, keep the
-    // highest value ever seen in the persisted floor (a retry after a failed
-    // restore probes a partial or missing database), and advance the restored
-    // copy to it after pg_restore. Tolerant on purpose: a database without
-    // the table simply skips the reconcile.
-    let liveTerm: number | null = readTermFloor(botId);
-    if (exists.stdout.trim() !== '0') {
-      const safety = await runFleetDump(instance, 'pre-restore-');
-      if (!safety.success) {
-        lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
-        return { success: false, error: `Pre-restore dump failed, restore refused: ${safety.error}`, steps };
-      }
-      steps.preRestoreDump = safety.file || null;
-
-      const termProbe = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
-        '-c', 'SELECT max(term) FROM smdb_control.term']);
-      const parsed = Number.parseInt(termProbe.stdout.trim(), 10);
-      if (termProbe.ok && Number.isInteger(parsed) && (liveTerm === null || parsed > liveTerm)) {
-        liveTerm = parsed;
-        writeTermFloor(botId, parsed);
-      }
-    }
-
-    // 2. Courtesy stop of every running managed instance this manager can see
+    // 1. Courtesy stop of every running managed instance this manager can see
     // on this exact URL. It cannot see them all (a worker's DSN lives in the
     // bot's own env file, and other machines' instances are out of reach
     // entirely), which is why the fence below is the actual protection. The
@@ -765,7 +779,7 @@ export async function restoreFleetBackup(
       steps.stopped.push(b.id);
     }
 
-    // 3. Stopping the host took its sidecar down with the compose project;
+    // 2. Stopping the host took its sidecar down with the compose project;
     // bring the database back alone.
     if (!await isContainerRunning(fleetDb.containerName)) {
       const started = await asResult(containerManager.startFleetDbSidecar(botId));
@@ -778,7 +792,7 @@ export async function restoreFleetBackup(
       }
     }
 
-    // 4. Write fence, the same one the recovery quiesce uses: writes off
+    // 3. Write fence, the same one the recovery quiesce uses: writes off
     // cluster-wide and every other session terminated, so a consumer the
     // sweep could not see cannot write under the restore.
     // ON_ERROR_STOP so a failed ALTER SYSTEM under a succeeding terminate
@@ -799,6 +813,57 @@ export async function restoreFleetBackup(
       }
       const fenceWarning = cleared === 'lifted' ? '' : '; the database may be READ-ONLY until its container restarts';
       return { success: false, error: `Could not fence the database for the restore: ${fence.stderr.trim().split('\n').pop()}${fenceWarning}`, steps };
+    }
+
+    // A refusal past the fence lifts it and brings back what was stopped; only then has it changed nothing.
+    const refuse = async (refused: string, detail: string) => {
+      const cleared = await liftAndTrack(botId, fleetDb);
+      fenced = cleared !== 'lifted';
+      const unstarted: string[] = [];
+      for (const id of steps.stopped) {
+        const start = await asResult(containerManager.startBot(id));
+        if (start.success) steps.restarted.push(id);
+        else unstarted.push(containerManager.getBot(id)?.displayName || id);
+      }
+      const stoppedNote = unstarted.length > 0
+        ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)`
+        : '';
+      return { success: false, error: `${refused}${unstarted.length > 0 ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared)}${stoppedNote}`, steps };
+    };
+
+    // 4. Pre-restore safety dump UNDER the fence, so it holds every write the
+    // drop below removes. A MISSING database (a prior recreate failure) has
+    // no data to protect and dumping it would refuse every retry, so
+    // existence is probed first; an unanswerable probe still refuses.
+    const exists = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+      '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
+    if (!exists.ok) {
+      return await refuse('Could not check the database before the restore, so the restore was refused', exists.stderr.trim().split('\n').pop() || 'unknown reason');
+    }
+    // The app's control term must never move backwards: the witness fence
+    // parks a master whose store term sits below a claim any node ever
+    // posted, and only this lane knows the rewind is a deliberate restore
+    // rather than a stale fork (F-R5-1). Capture the live term, keep the
+    // highest value ever seen in the persisted floor (a retry after a failed
+    // restore probes a partial or missing database), and advance the restored
+    // copy to it after pg_restore. Tolerant on purpose: a database without
+    // the table simply skips the reconcile.
+    let liveTerm: number | null = readTermFloor(botId);
+    if (exists.stdout.trim() !== '0') {
+      const safety = await runFleetDump(instance, 'pre-restore-');
+      if (!safety.success) {
+        lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
+        return await refuse('Pre-restore dump failed, restore refused', safety.error || 'unknown reason');
+      }
+      steps.preRestoreDump = safety.file || null;
+
+      const termProbe = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
+        '-c', 'SELECT max(term) FROM smdb_control.term']);
+      const parsed = Number.parseInt(termProbe.stdout.trim(), 10);
+      if (termProbe.ok && Number.isInteger(parsed) && (liveTerm === null || parsed > liveTerm)) {
+        liveTerm = parsed;
+        writeTermFloor(botId, parsed);
+      }
     }
 
     // 5. Drop and recreate the database under the fence. pg_restore --clean

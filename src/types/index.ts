@@ -134,6 +134,8 @@ export interface FleetReplicaSeedRecord {
   cancelled?: boolean;
   lastError?: string;
   cancelRequested?: boolean;
+  /** The stale-primary re-seed's safety dump, taken under the write fence and kept with the backups. */
+  safetyDump?: string;
 }
 
 export type FleetTransferPhase = 'seeding' | 'applying' | 'catching-up' | 'promoting';

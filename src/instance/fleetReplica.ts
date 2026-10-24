@@ -296,9 +296,9 @@ function hostCertPathFor(botId: string): string {
 
 export interface FleetReplicaStatus {
   present: boolean;
-  provisioning?: { phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean };
+  provisioning?: { phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean; safetyDump?: string };
   /** A seed no runner owns any more (it failed, or a manager restart interrupted it): Retry or Dismiss. */
-  parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean };
+  parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean; safetyDump?: string };
   /** A retire of the database env pins left them in a compose it could not edit, and a compose still sets one the store does not hold. */
   pinsWarning?: string;
   /** The automatic re-seed's attempt ledger, from the standby record. */
@@ -334,6 +334,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       cancelable: seed.phase === 'preparing' || seed.phase === 'seeding',
       cancelRequested: seed.cancelRequested === true,
       committed: seed.committed === true,
+      ...(seed.safetyDump ? { safetyDump: seed.safetyDump } : {}),
     };
   } else if (seed) {
     status.parkedSeed = {
@@ -345,6 +346,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       cancelled: seed.cancelled === true,
       // A committed seed that stopped after its refile left the copy whole and only its service down.
       copyWhole: !!instance.fleetDbReplica && instance.fleetDbReplica.copyCleared !== true,
+      ...(seed.safetyDump ? { safetyDump: seed.safetyDump } : {}),
     };
   }
   const pinsWarning = livePinsWarning(instance);
@@ -1029,32 +1031,47 @@ export function reseedStalePrimary(
 
   const preflight = async () => {
     throwIfCancelled(instance.id);
-    // Stopping the instance took its whole compose project down, so the
-    // database has to come back up alone to be dumped at all. Best effort, and
-    // deliberately not fatal: a database that will not start cannot be dumped,
-    // and the operator has already accepted losing the diverged tail. The dump
-    // is a safety net, not a precondition. The failback run dumps before it
-    // parks for consent (F5), so it arrives here with the dump done.
-    if (!opts.dumpDone) {
-      const started = await containerManager.startFleetDbSidecar(instance.id);
-      const dump = started.success
-        ? await fleetBackup.runFleetDump(instance, 'pre-reseed-')
-        : { success: false, error: started.error };
-      if (!dump.success) {
-        console.warn(`[FleetReplica] Could not dump the stale primary before re-seeding ${instance.id}: ${dump.error}`);
+    const fleetDb = instance.fleetDb!;
+    // The dump is the permit, as for decommission: the database is destroyed
+    // only after a dump taken under the write fence succeeded. Stopping the
+    // instance took its whole compose project down, so the database comes
+    // back up alone to be dumped. A volume PROVEN absent has nothing to
+    // protect, and starting the sidecar would mint an empty database whose
+    // dump would pose as the safety copy. The failback run dumps under its
+    // own fence before it parks for consent (F5), and that consent names the
+    // dump's outcome, so it arrives here with the dump done.
+    let fenced = false;
+    try {
+      if (!opts.dumpDone) {
+        const volState = await dockerVolumeState(fleetDb.volume);
+        if (volState === 'unknown') throw new Error('could not verify the database volume (docker did not answer), so nothing was destroyed; retry');
+        if (volState === 'exists') {
+          const started = await containerManager.startFleetDbSidecar(instance.id);
+          if (!started.success) throw new Error(`the database did not come up for the safety dump, so nothing was destroyed: ${started.error}`);
+          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY);
+          if (!dump.success) throw new Error(`the safety dump failed, so nothing was destroyed: ${dump.error}`);
+          fenced = true;
+          saveSeed(instance.id, { safetyDump: dump.file });
+        }
       }
+      // Re-check just before the destructive step: the dump above can take
+      // minutes, and a store that corrupted meanwhile would make the pins
+      // retire below throw AFTER the database was destroyed.
+      if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
+        throw new Error('the env store corrupted while the safety dump ran (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); nothing was destroyed - restore it and retry');
+      }
+      // The dump above takes minutes, so a cancel filed during it is honoured
+      // here, with the sidecar running and the record intact.
+      throwIfCancelled(instance.id);
+      const retired = await containerManager.retireFleetDbSidecar(instance.id);
+      if (!retired.success) throw new Error(`could not retire the stale database: ${retired.error}`);
+    } catch (err) {
+      if (fenced) {
+        const note = await liftFenceLeftStanding(instance.id, fleetDb, 'a re-seed', RESEED_LIFT_REMEDY);
+        if (note && err instanceof Error && !(err instanceof SeedCancelled)) err.message += note;
+      }
+      throw err;
     }
-    // Re-check just before the destructive step: the dump above can take
-    // minutes, and a store that corrupted meanwhile would make the pins
-    // retire below throw AFTER the database was destroyed.
-    if (envManager.getEnvVarsWithStatus(instance.id).corrupt) {
-      throw new Error('the env store corrupted while the safety dump ran (a copy is kept beside it as storage.json.corrupt-<time> when it could be read); nothing was destroyed - restore it and retry');
-    }
-    // The dump above takes minutes, so a cancel filed during it is honoured
-    // here, with the sidecar running and the record intact.
-    throwIfCancelled(instance.id);
-    const retired = await containerManager.retireFleetDbSidecar(instance.id);
-    if (!retired.success) throw new Error(`could not retire the stale database: ${retired.error}`);
     // Committed once the retire reports success: a retire that refuses before
     // it touches the volume leaves everything in place, and a cancel filed
     // there must not claim the database is gone.
@@ -1089,14 +1106,29 @@ export function reseedStalePrimary(
   return { success: true, started: true };
 }
 
+const RESEED_LIFT_REMEDY = 'retrying the re-seed retries the lift';
+const DECOMMISSION_LIFT_REMEDY = 'running the decommission again retries the lift';
+
+/**
+ * Lift a lane's write fence after its destroy was refused. The volume is asked
+ * first: the lift's fallback mounts the volume, which would mint one that the
+ * refused destroy had already removed.
+ */
+async function liftFenceLeftStanding(botId: string, fleetDb: NonNullable<InstanceConfig['fleetDb']>, lane: string, remedy: string): Promise<string> {
+  const volState = await dockerVolumeState(fleetDb.volume);
+  if (volState === 'absent') return '';
+  if (volState === 'unknown') return '; whether the database is still fenced read-only could not be confirmed (docker did not answer)';
+  return fleetBackup.liftLaneFence(botId, fleetDb, lane, remedy);
+}
+
 /**
  * Destroy this instance's managed fleet database (PLAN_REPLICATION 20.13
  * [Decommission]; design ruled 2026-09-01: DUMP-GATED DESTROY). "Is it still
  * in use?" proved unanswerable by enumerating consumers five review rounds
  * running (the B4m-2a record), so no app fact gates anything here. The ONLY
- * permit is a fresh pre-decommission dump that SUCCEEDS: a wrong click then
- * costs downtime, not data, because the dump restores through the restore
- * lane into a re-provisioned sidecar. The refusals below are the manager's
+ * permit is a fresh pre-decommission dump, taken under the write fence, that
+ * SUCCEEDS: a wrong click then costs downtime, not data, because the dump
+ * restores through the restore lane into a re-provisioned sidecar. The refusals below are the manager's
  * OWN records exclusively.
  */
 export async function decommissionFleetDb(
@@ -1154,7 +1186,9 @@ export async function decommissionFleetDb(
           if (!started.success) {
             return { success: false, error: `Refused, nothing was destroyed: the database did not come up for the pre-decommission dump: ${started.error}. If its container started, it was left running alone for inspection` };
           }
-          const dump = await fleetBackup.runFleetDump(instance, 'pre-decommission-');
+          // Under the write fence, so a writer this manager cannot see (another
+          // machine's worker) cannot land a row the dump misses.
+          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-decommission-', 'a decommission', DECOMMISSION_LIFT_REMEDY);
           if (!dump.success) {
             return { success: false, error: `Refused, nothing was destroyed: the pre-decommission dump failed: ${dump.error}. The database was left running alone for inspection` };
           }
@@ -1163,7 +1197,8 @@ export async function decommissionFleetDb(
 
         const retired = await containerManager.retireFleetDbSidecar(instance.id);
         if (!retired.success) {
-          return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}`, dumpFile };
+          const note = dumpFile ? await liftFenceLeftStanding(instance.id, instance.fleetDb, 'a decommission', DECOMMISSION_LIFT_REMEDY) : '';
+          return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}${note}`, dumpFile };
         }
         let warning: string | undefined;
         try {

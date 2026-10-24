@@ -1716,7 +1716,7 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean)
     // retry against the listed remnants.
     const remnants = await listDeleteRemnants(instance, appName, botDir, keepData, keepEnv, deploymentMode, ownVolumes, volumesVerified);
     if (remnants.length > 0) {
-      stampErrorBestEffort(botId);
+      await stampFailureFromDocker(botId, instance.status);
       const summary =
         `Bot ${botId} uninstall incomplete - still present: ${remnants.join(', ')}\n` +
         `Step errors:\n  - ${failures.join('\n  - ')}`;
@@ -1800,6 +1800,28 @@ function recordStatusAfterDockerStep(botId: string, status: BotStatus, container
     console.error(`[ContainerManager] ${botId}: status '${status}' could not be recorded: ${msg}`);
     if (broadcastFn) broadcastFn('bot:status', { id: botId, status, activeOp: isBotBusy(botId) });
     return msg;
+  }
+}
+
+/**
+ * The status a failed lane leaves, read from docker: 'running' while the app
+ * container runs, 'error' once it is down, and the status from before the lane
+ * when docker does not answer.
+ */
+async function stampFailureFromDocker(botId: string, statusBefore: BotStatus): Promise<void> {
+  let appId: string | null | undefined;
+  try {
+    appId = await runningAppContainerId(botId, resolveAppName(botId));
+  } catch {
+    appId = undefined;
+  }
+  const kept = statusBefore === 'running' || statusBefore === 'stopped' || statusBefore === 'error' ? statusBefore : 'error';
+  const status: BotStatus = typeof appId === 'string' ? 'running' : appId === null ? 'error' : kept;
+  const ids = typeof appId === 'string' ? (await getContainerIdsForBot(botId).catch(() => null)) ?? undefined : undefined;
+  try {
+    updateBotStatus(botId, status, ids);
+  } catch (err) {
+    console.error(`[ContainerManager] ${botId}: status '${status}' could not be recorded: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -2584,9 +2606,6 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
     if (await projectAfter() === 'same') restoreWebUiReadiness(botId, applyInPlace);
     return result;
   }
-  // The lane's catch stamped 'error', which is what a start that never got its
-  // containers up deserves; here the project may well have kept serving,
-  // which only a concrete answer proves.
   const appId = await runningAppContainerId(botId, instance.sanitizedName);
   if (typeof appId === 'string') {
     recordStatusAfterDockerStep(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
@@ -2724,7 +2743,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start instance ${botId}:`, error);
-    stampErrorBestEffort(botId);
+    await stampFailureFromDocker(botId, instance.status);
     return { success: false, error: msg };
   }
 }
@@ -2871,7 +2890,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start docker-image instance ${botId}:`, error);
-    stampErrorBestEffort(botId);
+    await stampFailureFromDocker(botId, instance.status);
     return { success: false, error: msg };
   }
 }
@@ -2917,6 +2936,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
     const deploymentMode = await getDeploymentMode();
     const appName = resolveAppName(botId);
     emit?.(`[Stop] Stopping containers (${appName})...`, 'info');
+    let downError: string | null = null;
 
     if (deploymentMode === 'casaos') {
       const composePath = resolveComposePath(botId, appName);
@@ -2926,6 +2946,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
         emit ? (msg, key) => emit(`[Compose] ${msg}`, 'info', key) : undefined
       );
       if (!downResult.success) {
+        downError = String(downResult.error);
         console.warn(`[ContainerManager] Compose down failed for ${appName}: ${downResult.error}`);
         emit?.(`[Stop] Warning: compose down failed: ${downResult.error}`, 'warning');
       }
@@ -2935,6 +2956,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
         try {
           await dockerClient.composeDown(composePath, appName);
         } catch (err) {
+          downError = err instanceof Error ? err.message : String(err);
           console.warn(`[ContainerManager] compose down failed for ${appName}:`, err);
           emit?.(`[Stop] Warning: compose down failed: ${err}`, 'warning');
         }
@@ -2945,13 +2967,32 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
             await dockerClient.stopContainer(containerId);
             await dockerClient.removeContainer(containerId);
           } catch (err) {
+            downError = err instanceof Error ? err.message : String(err);
             console.warn(`[ContainerManager] Failed to stop container ${containerId}:`, err);
           }
         }
       }
     }
 
+    const survivors = await runningProjectContainerIds(appName);
+    if (survivors === undefined && downError !== null) {
+      const unrecorded = recordStatusAfterDockerStep(botId, 'running');
+      const error = `The stop failed (${downError}) and docker could not confirm whether the containers still run${unrecorded ? `; the status could not be recorded: ${unrecorded}` : ''}`;
+      emit?.(`[Stop] ${error}`, 'error');
+      return { success: false, error };
+    }
+    if (survivors && survivors.length > 0) {
+      const unrecorded = recordStatusAfterDockerStep(botId, 'running', (await getContainerIdsForBot(botId)) ?? undefined);
+      const error = `The stop failed: ${survivors.length} container${survivors.length === 1 ? '' : 's'} of the project still run${downError ? ` (${downError})` : ''}${unrecorded ? `; the status could not be recorded: ${unrecorded}` : ''}`;
+      emit?.(`[Stop] ${error}`, 'error');
+      return { success: false, error };
+    }
     const unrecorded = recordStatusAfterDockerStep(botId, 'stopped', []);
+    if (survivors === undefined) {
+      const warning = `The stop finished, but docker could not confirm that no container still runs${unrecorded ? `; the status could not be recorded: ${unrecorded}` : ''}`;
+      emit?.(`[Stop] Warning: ${warning}`, 'warning');
+      return { success: true, warning };
+    }
     emit?.('[Stop] Containers stopped', 'info');
     if (unrecorded) {
       const warning = `The containers were stopped, but the status could not be recorded: ${unrecorded}`;
@@ -2961,7 +3002,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
     return { success: true };
   } catch (error) {
     console.error(`[ContainerManager] Failed to stop instance ${botId}:`, error);
-    stampErrorBestEffort(botId);
+    await stampFailureFromDocker(botId, 'running');
     return { success: false, error: String(error) };
   }
 }
@@ -3042,7 +3083,8 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
   try {
     emit(`[Update] Updating ${instance.displayName}...`, 'system');
     if (wasRunning) {
-      await stopBotImpl(botId, emit);
+      const stopResult = await stopBotImpl(botId, emit);
+      if (!stopResult.success) return { success: false, error: `Update stopped before rebuilding: ${stopResult.error}` };
     }
 
     // For source-backed instances, the source repo is already up to date
@@ -3184,10 +3226,14 @@ async function stampBuildOutcome(botId: string, emit: EmitFn, statusBefore: BotS
   const appId = await runningAppContainerId(botId, resolveAppName(botId));
   // Docker not answering is evidence of nothing: what was known before the
   // build stands.
-  if (appId === undefined) emit('[Build] Could not check whether the project is running; keeping what was known before the build', 'warning');
-  const running = appId === undefined ? statusBefore === 'running' : appId !== null;
+  if (appId === undefined) {
+    emit('[Build] Could not check whether the project is running; keeping what was known before the build', 'warning');
+    const kept: BotStatus = statusBefore === 'running' || statusBefore === 'stopped' || statusBefore === 'error' ? statusBefore : 'error';
+    return recordStatusAfterDockerStep(botId, kept);
+  }
+  const running = appId !== null;
   // Ids are refreshed only from an answer; an unanswered listing keeps them.
-  const ids = running && appId !== undefined ? (await getContainerIdsForBot(botId)) ?? undefined : undefined;
+  const ids = running ? (await getContainerIdsForBot(botId)) ?? undefined : undefined;
   if (running) emit('[Build] The running project was not recreated; Start (applies in place) or Restart applies this build', 'warning');
   // Nothing runs that the next Start would not deploy whole.
   try {
@@ -3244,7 +3290,7 @@ async function buildBotImpl(botId: string): Promise<LaneResult> {
     emit(`[Error] Build failed: ${msg}`, 'error');
     emit('[Fatal] Build process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to build instance ${botId}:`, error);
-    stampErrorBestEffort(botId);
+    await stampFailureFromDocker(botId, instance.status);
     return { success: false, error: msg };
   }
 }
@@ -3467,12 +3513,12 @@ async function buildGitInstance(
     }
     if (!fs.existsSync(repoPath)) {
       emit('[Error] Source repository not found', 'error');
-      stampErrorBestEffort(botId);
+      await stampFailureFromDocker(botId, instance.status);
       return { success: false, error: 'Source repository not found' };
     }
   } else {
     emit('[Error] Git instance has no sourceId', 'error');
-    stampErrorBestEffort(botId);
+    await stampFailureFromDocker(botId, instance.status);
     return { success: false, error: 'Git instance has no sourceId' };
   }
 
@@ -3493,7 +3539,7 @@ async function buildGitInstance(
       if (owner.kind === 'unknown') {
         const refusal = `cannot tell who owns ${earlyAppName}: ${owner.reason}`;
         emit(`[Error] ${refusal}`, 'error');
-        stampErrorBestEffort(botId);
+        await stampFailureFromDocker(botId, instance.status);
         return { success: false, error: refusal };
       }
       if (owner.kind === 'other') {

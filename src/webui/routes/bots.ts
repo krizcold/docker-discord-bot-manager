@@ -902,7 +902,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   /**
    * GET /api/bots/:id/containers/:container/logs/stream - Stream container logs via SSE
    */
-  router.get('/:id/containers/:container/logs/stream', (req: Request, res: Response) => {
+  router.get('/:id/containers/:container/logs/stream', async (req: Request, res: Response) => {
     const containerName = req.params.container;
     const lines = parseInt(req.query.lines as string) || 50;
 
@@ -910,6 +910,27 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.status(400).json({ success: false, error: 'Invalid container name' });
       return;
     }
+
+    const bot = containerManager.getBot(req.params.id);
+    if (!bot) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+    let owned: Array<{ name: string }> | null;
+    try {
+      owned = await dockerClient.listProjectContainers(bot.sanitizedName);
+    } catch {
+      owned = null;
+    }
+    if (!owned) {
+      res.status(503).json({ success: false, error: 'Docker did not answer, so the containers of this bot could not be listed' });
+      return;
+    }
+    if (!owned.some((c) => c.name === containerName)) {
+      res.status(403).json({ success: false, error: 'Container does not belong to this bot' });
+      return;
+    }
+    if (req.socket?.destroyed) return;
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');

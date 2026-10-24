@@ -64,12 +64,15 @@ export function spawnCapture(
 
 export interface BotContainer { name: string; state: string }
 
-export async function getBotContainers(appName: string): Promise<BotContainer[]> {
-  const { stdout } = await spawnCapture('docker', [
+export const CONTAINERS_NO_ANSWER = 'Docker did not answer, so the containers of this bot could not be listed';
+
+export async function getBotContainers(appName: string): Promise<BotContainer[] | null> {
+  const { stdout, code, timedOut } = await spawnCapture('docker', [
     'ps', '-a',
     '--filter', `label=com.docker.compose.project=${appName}`,
     '--format', '{{.Names}}\t{{.State}}',
   ]);
+  if (code !== 0 || timedOut) return null;
   return stdout.toString('utf8')
     .split('\n')
     .map((l) => l.trim())
@@ -106,6 +109,7 @@ async function resolveTarget(botId: string, target: string): Promise<FsTarget | 
   }
 
   const containers = await getBotContainers(appName);
+  if (!containers) return { error: CONTAINERS_NO_ANSWER };
   if (!containers.some((c) => c.name === target)) {
     return { error: 'Container does not belong to this bot' };
   }
@@ -1119,6 +1123,7 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
   if (!bot) { send(ws, 'terminal:error', { message: 'Bot not found' }); return; }
 
   const containers = await getBotContainers(bot.sanitizedName);
+  if (!containers) { send(ws, 'terminal:error', { message: CONTAINERS_NO_ANSWER }); return; }
   const target = String(msg.container || '');
   const match = containers.find((c) => c.name === target);
   if (!match) { send(ws, 'terminal:error', { message: 'Container does not belong to this bot' }); return; }

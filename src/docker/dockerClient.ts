@@ -763,10 +763,8 @@ export async function composeDown(
 
 /**
  * List all containers of a compose project without blocking the event loop.
- * The label filter is authoritative; the name substring fallback runs only when
- * the label query itself fails (docker's name= filter matches substrings, so an
- * empty label result must NOT trigger it or stopped bots would list foreign
- * containers).
+ * Only the compose project label selects them: docker's name= filter matches
+ * substrings and would list another bot's containers. Null when docker does not answer.
  */
 export async function listProjectContainers(
   projectName: string
@@ -779,14 +777,7 @@ export async function listProjectContainers(
       { timeout: 10000 }
     );
   } catch {
-    try {
-      output = await execDockerAsync(
-        ['ps', '-a', '--filter', `name=${projectName}`, '--format', format],
-        { timeout: 10000 }
-      );
-    } catch {
-      return null;
-    }
+    return null;
   }
   return output
     .split('\n')

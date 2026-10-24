@@ -4243,17 +4243,29 @@
       autoScroll: true
     };
 
+    let logsOpenSeq = 0;
+
     async function showLogs(botId, botName) {
+      const seq = ++logsOpenSeq;
+      if (logsState.eventSource) {
+        logsState.eventSource.close();
+        logsState.eventSource = null;
+      }
       logsState.botId = botId;
       logsState.botName = botName;
       logsState.logHistory = {};
+      logsState.containers = [];
+      logsState.selectedContainer = null;
 
       document.getElementById('slp-bot-name').textContent = botName;
+      document.getElementById('slp-service-title').textContent = '';
+      document.getElementById('slp-service-list').innerHTML = '<div style="padding:14px;color:var(--text-muted);font-size:0.82rem;">Loading...</div>';
+      document.getElementById('slp-viewer').innerHTML = '';
       document.getElementById('logs-popup').classList.remove('hidden');
 
-      // Fetch containers for this bot
       try {
         const res = await api('GET', `/bots/${botId}/containers`);
+        if (seq !== logsOpenSeq || logsState.botId !== botId) return;
         if (!res.success) {
           document.getElementById('slp-service-list').innerHTML = `<div style="padding:14px;color:var(--text-muted);font-size:0.82rem;">${escapeHtml(res.error || 'Could not list the containers')}</div>`;
           document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Could not list the containers, so their state is unknown.</div>';
@@ -4266,6 +4278,8 @@
           document.getElementById('slp-viewer').innerHTML = '<div class="log-line system">No containers running.</div>';
         }
       } catch (err) {
+        if (seq !== logsOpenSeq || logsState.botId !== botId) return;
+        document.getElementById('slp-service-list').innerHTML = '';
         document.getElementById('slp-viewer').innerHTML = '<div class="log-line error">Could not list the containers: the manager could not be reached.</div>';
       }
 
@@ -4421,6 +4435,7 @@
         logsState.eventSource.close();
         logsState.eventSource = null;
       }
+      logsOpenSeq++;
       logsState.botId = null;
       logsState.selectedContainer = null;
       logsState.containers = [];
@@ -5253,6 +5268,7 @@
     let consoleBotId = null;
     let consoleTerm = null;
     let consoleFit = null;
+    let consoleOpenSeq = 0;
 
     function b64FromBytes(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
     function bytesFromB64(b64) { const s = atob(b64); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
@@ -5264,14 +5280,22 @@
 
     async function showConsole(botId, name) {
       if (!window.Terminal) { showMessage('error', 'Terminal library failed to load (check network)'); return; }
+      const seq = ++consoleOpenSeq;
+      wsSend({ type: 'terminal:stop' });
+      if (consoleTerm) { try { consoleTerm.dispose(); } catch (e) {} consoleTerm = null; }
       consoleBotId = botId;
       document.getElementById('console-bot-name').textContent = name;
+      const sel = document.getElementById('console-container');
+      sel.innerHTML = '';
+      document.getElementById('console-term').innerHTML = '';
       document.getElementById('console-modal').classList.remove('hidden');
 
-      const res = await api('GET', `/bots/${botId}/containers`);
+      let res;
+      try { res = await api('GET', `/bots/${botId}/containers`); }
+      catch (e) { res = { success: false, error: 'Could not list the containers: the manager could not be reached.' }; }
+      if (seq !== consoleOpenSeq || consoleBotId !== botId) return;
       if (!res.success) { showMessage('error', res.error || 'Could not read the containers from docker'); return; }
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
-      const sel = document.getElementById('console-container');
       sel.innerHTML = running.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
       if (running.length === 0) { showMessage('error', 'No running containers for this bot'); return; }
 
@@ -5305,6 +5329,7 @@
       wsSend({ type: 'terminal:stop' });
       document.getElementById('console-modal').classList.add('hidden');
       if (consoleTerm) { try { consoleTerm.dispose(); } catch (e) {} consoleTerm = null; }
+      consoleOpenSeq++;
       consoleBotId = null;
     }
 
@@ -5329,6 +5354,7 @@
     let filesEntries = [];
     let filesListSeq = 0;
     let filesOpenSeq = 0;
+    let filesShowSeq = 0;
 
     function joinPath(base, name) {
       const parts = (base + '/' + name).split('/');
@@ -5349,12 +5375,23 @@
     }
 
     async function showFiles(botId, name) {
+      const seq = ++filesShowSeq;
       filesBotId = botId;
       document.getElementById('files-bot-name').textContent = name;
+      const scopeSel = document.getElementById('files-scope');
+      scopeSel.innerHTML = `<option value="host">Persistent data (host)</option>`;
+      scopeSel.value = 'host';
+      filesScope = 'host';
+      filesCwd = '';
+      filesListing = null;
+      filesEntries = [];
+      document.getElementById('files-path').value = '';
+      document.getElementById('files-list').innerHTML = '';
       document.getElementById('files-modal').classList.remove('hidden');
       filesEditorIdle();
 
-      const res = await api('GET', `/bots/${botId}/containers`);
+      const res = await filesCall('GET', `/bots/${botId}/containers`);
+      if (seq !== filesShowSeq || filesBotId !== botId) return;
       if (!res.success) showMessage('error', res.error || 'Could not read the containers from docker');
       const running = (res.containers || []).filter(c => /run/i.test(c.state));
       // Persistent data first (the point of the Files view); containers at the end.

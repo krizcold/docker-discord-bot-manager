@@ -116,7 +116,7 @@ describe('fleet backup Keep', () => {
     const p = page(numInput('40'), 30);
     await p.ctx.saveFleetBackupConfig();
     expect(p.asked).toHaveLength(0);
-    expect(p.sent[0].body).toEqual({ enabled: true, hour: 4, keep: 40 });
+    expect(p.sent[0].body).toEqual({ keep: 40, expected: { keep: 30 } });
   });
 });
 

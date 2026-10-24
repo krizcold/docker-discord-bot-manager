@@ -37,6 +37,8 @@ export interface AppFacts {
   term: number | null;
   standalone: boolean;
   backupMaster: boolean;
+  /** The running bot's consent to active backup mode, as it booted; the saved env may differ until the container is recreated. */
+  activeCapable?: boolean;
   /** The app's own verdict that this node is where the copy block belongs. */
   copyBlockTarget: boolean;
   superseded: { byNodeId: string; byNodeName: string; term: number; retireRequested: boolean; at: number; source: string; steppedDown: boolean } | null;

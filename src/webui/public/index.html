@@ -3348,6 +3348,45 @@
             </div>`).join('')}
         </div>`;
     }
+    // Promoting this node takes the fleet only for a designated backup, or for
+    // a returning master whose follower hold names this node (20.5, 20.13).
+    function replicaPromotable(facts) {
+      return !!(facts && (facts.backupMaster === true || (facts.followerHold && facts.followerHold.namesThisNode === true)));
+    }
+
+    function replicaPromiseText(facts, factsError) {
+      if (replicaPromotable(facts)) return 'If that machine dies, promoting this node\'s instance also promotes this copy.';
+      if (facts) return 'This node is not a designated backup, so promoting it cannot take the fleet: to make it one, set Fleet Role to Backup Master in this instance\'s env and restart it.';
+      return `Can't confirm whether promoting this node would take the fleet: its role could not be read (${escapeHtml(factsError || 'no answer')}).`;
+    }
+
+    function replicaTransferHtml(botId, facts, factsError) {
+      const head = '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);"><div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the primary side</div>';
+      if (!facts) return `${head}<div class="env-tip">Transfer is not offered: can't confirm this node's fleet role, because its app did not answer (${escapeHtml(factsError || 'no answer')}).</div></div>`;
+      if (!replicaPromotable(facts)) return `${head}<div class="env-tip">Transfer is not offered: this node is not a designated backup. Set Fleet Role to Backup Master in this instance's env and restart it; Transfer appears here once its bot reports that role.</div></div>`;
+      return `${head}
+          <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old primary's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', false)">Transfer</button>
+            <button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', true)">Transfer and retire</button>
+          </div>
+        </div>`;
+    }
+
+    // The node's own half of active mode (20.5): the saved env and the running
+    // bot are read separately, and a difference between them is shown.
+    function replicaConsentHtml(saved, facts, factsError) {
+      if (saved !== true && saved !== false) return '';
+      const mode = (v) => v ? 'active' : 'passive';
+      const running = facts ? facts.activeCapable === true : null;
+      const howTo = saved
+        ? ' The master enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.'
+        : ' Taking over is a manual Promote. To let this node stand in temporarily, set Backup Mode to active in this instance\'s env, restart it, then enable it on the master\'s Fleet tab.';
+      if (running === null) return `<div class="env-tip">Backup mode is ${mode(saved)} in this instance's saved env; can't confirm what the running bot uses (${escapeHtml(factsError || 'no answer')}).${howTo}</div>`;
+      if (running === saved) return `<div class="env-tip">Backup mode is ${mode(saved)} in this instance's saved env and in the running bot.${howTo}</div>`;
+      return `<div class="env-tip" style="color:var(--warning);">Backup mode is ${mode(saved)} in this instance's saved env, but the running bot still uses ${mode(running)}; it picks up the saved value when its container is next recreated (Apply or Restart).${howTo}</div>`;
+    }
+
     async function renderFleetReplica(botId) {
       const body = document.getElementById('fleet-replica-body');
       if (!body || fleetBackupBotId !== botId) return;
@@ -3416,25 +3455,36 @@
         return;
       }
 
+      // The app's own role facts decide what this panel may promise or offer;
+      // facts stays null, with the reason in factsError, when they are unread.
+      let facts = null;
+      let factsError = 'the app declares no lifecycle hooks';
+      let answered = null;
+      if ((bots.find(b => b.id === botId) || {}).appHooks === true) {
+        try {
+          const f = await api('GET', `/bots/${botId}/app-facts`);
+          if (f && f.success && f.facts) answered = f.facts;
+          if (f && f.success && f.facts && f.facts.running === true && f.facts.nodeId) facts = f.facts;
+          else if (f && f.success && f.facts && f.facts.running === true) factsError = 'the bot has not reported its fleet state yet';
+          else factsError = (f && f.success) ? 'the bot process is not running' : ((f && f.error) || 'no answer');
+        } catch (err) { factsError = String((err && err.message) || err); }
+        if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
+      }
+
       if (!r.record) {
         // The block a designated backup already holds makes both the paste and
         // the standby-first step of a transfer unnecessary (20.14, 20.19 F15/F21).
-        let facts = null;
-        if ((bots.find(b => b.id === botId) || {}).appHooks === true) {
-          try { const f = await api('GET', `/bots/${botId}/app-facts`); if (f && f.success) facts = f.facts; } catch (err) { facts = null; }
-          if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
-        }
-        const fromFactsHtml = (facts && facts.copyBlockPresent && !runLive) ? `
+        const fromFactsHtml = (answered && answered.copyBlockPresent && !runLive) ? `
           <div class="env-tip">This node already holds the primary's copy block (delivered over the fleet channel), so nothing needs pasting. Give this machine's public host and port below, then either provision the standby, or transfer in one action: the standby is seeded and caught up first, then this side is promoted.</div>
           <div style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-primary btn-small" onclick="provisionFleetReplicaFromFacts('${botId}')">Provision from the block</button>
-            ${facts.backupMaster ? `<button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', false, true)">Transfer (seed first)</button>` : ''}
+            ${facts && facts.backupMaster === true ? `<button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', false, true)">Transfer (seed first)</button>` : ''}
           </div>` : '';
         body.innerHTML = `
           ${errHtml}
           ${transferRunHtml}${failbackHtml}${declinedHtml}
           ${fromFactsHtml}
-          <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. If that machine dies, promoting this node's instance also promotes this copy. Paste the block from the primary's Database modal (Replication section).</div>
+          <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. ${replicaPromiseText(facts, factsError)} Paste the block from the primary's Database modal (Replication section).</div>
           <div class="form-group"><label>Replication DSN</label>
             <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
           <div class="form-group"><label>Primary certificate (PEM)</label>
@@ -3560,15 +3610,7 @@
       // side already.
       const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
       const isCopy = !!(r.live && r.live.inRecovery === true);
-      const transferHtml = (appHooks && isCopy && !runLive && !runHeld) ? `
-        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
-          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Make this machine the primary side</div>
-          <div class="env-tip">Promotes this whole instance in one action: the bot claims the fleet, this copy becomes the true database, and every other node repoints to it. While the old primary's database is still reachable this is a zero-loss handover; if it is gone the bot asks you to accept the replication lag first. <b>Transfer and retire</b> additionally tells the old machine to stand down, which its own manager carries out when it is running.</div>
-          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
-            <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', false)">Transfer</button>
-            <button class="btn btn-secondary btn-small" onclick="appTransfer('${botId}', true)">Transfer and retire</button>
-          </div>
-        </div>` : '';
+      const transferHtml = (appHooks && isCopy && !runLive && !runHeld) ? replicaTransferHtml(botId, facts, factsError) : '';
       // The re-seed ledger (20.14): who asked last, why it stopped, or when it last ran.
       const ledWho = led && led.trigger === 'operator' ? 'Re-seed now' : 'Automatic re-seed';
       const ledgerHtml = !led
@@ -3587,15 +3629,7 @@
           : `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
         : '';
 
-      // The node's own half of active mode (20.5) as its SAVED env holds it
-      // (the container learns it when next recreated, like the standby); the
-      // master's half is enabled on that bot's Fleet tab.
-      const consent = (bots.find(b => b.id === botId) || {}).fleetBackupConsent;
-      const consentHtml = consent === true
-        ? '<div class="env-tip">Backup mode is set to active in this instance\'s env (the bot picks a change up when its container is next recreated, Apply or Restart); the master enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.</div>'
-        : consent === false
-          ? '<div class="env-tip">Backup mode: passive (this node only keeps the copy; taking over is a manual Promote). To let it stand in temporarily, set Backup Mode to active in this instance\'s env, restart it, then enable it on the master\'s Fleet tab.</div>'
-          : '';
+      const consentHtml = replicaConsentHtml((bots.find(b => b.id === botId) || {}).fleetBackupConsent, facts, factsError);
       body.innerHTML = `
         ${errHtml}
         ${transferRunHtml}${failbackHtml}${declinedHtml}

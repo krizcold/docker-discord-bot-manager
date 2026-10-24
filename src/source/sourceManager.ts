@@ -126,10 +126,13 @@ export function gitCredentialEnv(url: string): { url: string; env: Record<string
   };
 }
 
+// A clone with no output for this long is killed, so a stalled first clone fails and frees its URL.
+const CLONE_SILENCE_LIMIT_MS = 5 * 60 * 1000;
+
 /** A git client for this URL's repo, carrying its credential (if any) by environment. */
 function gitFor(url: string, repoPath?: string): SimpleGit {
   const { env } = gitCredentialEnv(url);
-  const git = repoPath ? simpleGit(repoPath) : simpleGit();
+  const git = repoPath ? simpleGit(repoPath) : simpleGit({ timeout: { block: CLONE_SILENCE_LIMIT_MS } });
   return env ? git.env({ ...process.env, ...env }) : git;
 }
 
@@ -193,6 +196,14 @@ async function readHeadCommit(repoPath: string): Promise<{ hash: string; message
  * (or the requested branch does not exist), clone the remote's default branch
  * and report its real name so the registry stores the correct branch.
  */
+function withoutProgress(err: unknown): Error {
+  const message = err instanceof Error ? err.message : String(err);
+  const kept = message.split(/[\r\n]+/)
+    .filter((line) => line.trim() && !line.startsWith('remote: ') && !/\d+% \(\d+\/\d+\)/.test(line));
+  const cleaned = new Error(kept.join('\n') || 'git clone failed');
+  return cleaned;
+}
+
 async function cloneRepo(url: string, repoPath: string, branch?: string | null): Promise<string> {
   // Clean any leftover dir from a previous failed clone so git won't refuse a non-empty target
   if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
@@ -200,15 +211,19 @@ async function cloneRepo(url: string, repoPath: string, branch?: string | null):
   const cloneUrl = gitCredentialEnv(url).url;
   if (branch) {
     try {
-      await git.clone(cloneUrl, repoPath, ['--branch', branch, '--single-branch']);
+      await git.clone(cloneUrl, repoPath, ['--progress', '--branch', branch, '--single-branch']);
       return branch;
     } catch (err) {
-      if (!/Remote branch .* not found/i.test(String(err))) throw err;
+      if (!/Remote branch .* not found/i.test(String(err))) throw withoutProgress(err);
       console.warn(`[SourceManager] Branch '${branch}' not found for ${getDisplayUrl(url)}; falling back to the default branch`);
       if (fs.existsSync(repoPath)) fs.rmSync(repoPath, { recursive: true, force: true });
     }
   }
-  await git.clone(cloneUrl, repoPath, ['--single-branch']);
+  try {
+    await git.clone(cloneUrl, repoPath, ['--progress', '--single-branch']);
+  } catch (err) {
+    throw withoutProgress(err);
+  }
   try {
     const actual = (await simpleGit(repoPath).revparse(['--abbrev-ref', 'HEAD'])).trim();
     return actual || 'main';
@@ -236,7 +251,30 @@ export function getSource(sourceId: string): SourceMeta | null {
   return registry.sources[sourceId] || null;
 }
 
+// URLs whose first clone is running: the source is registered only after it,
+// so a second add of the same URL during the clone must be refused here.
+const cloningUrls = new Set<string>();
+
+function normalizeSourceUrl(u: string): string {
+  return u.replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/\/([^@]+)@/, '//');
+}
+
+export function isSourceCloning(url: string): boolean {
+  return cloningUrls.has(normalizeSourceUrl(url));
+}
+
 export async function createSource(request: CreateSourceRequest): Promise<SourceMeta> {
+  const key = normalizeSourceUrl(request.url);
+  if (cloningUrls.has(key)) throw new Error('A source with this URL is being cloned');
+  cloningUrls.add(key);
+  try {
+    return await createSourceCloned(request);
+  } finally {
+    cloningUrls.delete(key);
+  }
+}
+
+async function createSourceCloned(request: CreateSourceRequest): Promise<SourceMeta> {
   const registry = loadSourceRegistry();
   const sourceId = uuidv4();
   const now = new Date().toISOString();
@@ -598,10 +636,9 @@ function reAssociateInstances(sourceId: string, sourceUrl: string): void {
  * Find a source by URL (normalized comparison).
  */
 export function findSourceByUrl(url: string): SourceMeta | null {
-  const normalize = (u: string) => u.replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/\/([^@]+)@/, '//');
-  const normalizedUrl = normalize(url);
+  const normalizedUrl = normalizeSourceUrl(url);
   const sources = getAllSources();
-  return sources.find(s => normalize(s.url) === normalizedUrl) || null;
+  return sources.find(s => normalizeSourceUrl(s.url) === normalizedUrl) || null;
 }
 
 // ─── Default Sources (seeded on first run) ───

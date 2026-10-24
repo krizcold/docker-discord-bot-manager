@@ -115,7 +115,7 @@ import * as envManager from '../../src/env/manager';
 import { enableFleetReplication, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 import { getFleetReplicaStatus, reseedStalePrimary } from '../../src/instance/fleetReplica';
 import { armReceiver } from '../../src/instance/recoveryChannel';
-import { startRescue } from '../../src/instance/recoveryRescue';
+import { cancelRescue, startRescue } from '../../src/instance/recoveryRescue';
 import { scramSha256Verifier } from '../../src/config/secretText';
 
 const botDir = path.join(h.dir, 'bots', 'b1');
@@ -295,6 +295,32 @@ describe('the rescue flip', () => {
     expect(alter[0].stdin).toMatch(/SET log_min_error_statement = panic;/);
     expect(alter[0].stdin).toMatch(/PASSWORD 'SCRAM-SHA-256\$4096:/);
     expect(alter[0].stdin).not.toContain(DB_SECRET);
+  });
+});
+
+describe('the swap outcome record', () => {
+  it('stores the rescue start as the last swap when the flip clears the record', async () => {
+    const startedAt = Date.now() - 5000;
+    writeRegistry({
+      fleetDb: { ...fleetDb, replication },
+      recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 'Chan-Token-0123456789', createdAt: startedAt, tunnelPort: 15433, publicHost: 'primary.invalid', tlsKey: 'k', tlsCert: 'c' },
+      recoveryRescue: { phase: 'flip', startedAt, updatedAt: startedAt, swapPublicHost: 'primary.invalid' },
+    });
+    const res = await startRescue(containerManager.getBot('b1')!, true);
+    expect(res.success).toBe(true);
+    await waitFor(() => !containerManager.getBot('b1')?.recoveryRescue || !!containerManager.getBot('b1')?.recoveryRescue?.lastError);
+    const bot = containerManager.getBot('b1')!;
+    expect(bot.recoveryRescue).toBeUndefined();
+    expect(bot.recoveryLastSwap?.startedAt).toBe(startedAt);
+  });
+  it('leaves the last swap unset when a cancel clears the record', async () => {
+    const startedAt = Date.now() - 5000;
+    writeRegistry({ recoveryRescue: { phase: 'catchup', startedAt, updatedAt: startedAt } });
+    const res = await cancelRescue(containerManager.getBot('b1')!);
+    expect(res.success).toBe(true);
+    const bot = containerManager.getBot('b1')!;
+    expect(bot.recoveryRescue).toBeUndefined();
+    expect(bot.recoveryLastSwap).toBeUndefined();
   });
 });
 

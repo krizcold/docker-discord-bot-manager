@@ -421,7 +421,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
       }
 
-      res.json({ success: true, bot: publicBot(bot), source, repoInfo, updateAvailable });
+      res.json({ success: true, bot: withActiveOp(publicBot(bot)), source, repoInfo, updateAvailable });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

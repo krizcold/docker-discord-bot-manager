@@ -669,12 +669,13 @@ export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryCh
   return instance;
 }
 
-export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null): InstanceConfig | null {
+export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null, lastSwap?: { startedAt: number; completedAt: number }): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
   if (rescue) instance.recoveryRescue = rescue;
   else delete instance.recoveryRescue;
+  if (lastSwap) instance.recoveryLastSwap = lastSwap;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;

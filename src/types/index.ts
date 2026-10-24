@@ -316,6 +316,7 @@ export interface InstanceConfig {
   fleetConsentFenceLeft?: string[];    // containers whose write fence a failback or drop-back run set and has not seen lifted; the next run there owns it
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
+  recoveryLastSwap?: { startedAt: number; completedAt: number }; // set by the swap's flip alone, startedAt from its rescue record
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

@@ -56,6 +56,10 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
         res.status(409).json({ success: false, error: 'A source with this URL already exists', source: existing });
         return;
       }
+      if (sourceManager.isSourceCloning(request.url)) {
+        res.status(409).json({ success: false, error: 'A source with this URL is being cloned' });
+        return;
+      }
 
       const source = await sourceManager.createSource(request);
       broadcastToClients(wss, 'source:created', source);

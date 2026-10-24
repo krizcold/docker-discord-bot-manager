@@ -389,8 +389,8 @@ describe('review fixes', () => {
   it('a late re-seed answer leaves another bot\'s fleet modal open and names its instance', async () => {
     const d = deferred();
     let hidden = 0; const messages: string[][] = [];
-    const ctx = runPage(['botLabel', 'reseedStalePrimary'], {
-      bots, fleetBackupBotId: 'b1', confirm: () => true, window: { confirm: () => true },
+    const ctx = runPage(['botLabel', 'reseedStalePrimary', 'refuseWhileChecking'], {
+      bots, fleetBackupBotId: 'b1', provisionChecking: new Set(), confirm: () => true, window: { confirm: () => true },
       document: { getElementById: () => ({ value: 'x' }) },
       refuseBadNumbers: () => false,
       api: async () => d.promise,

@@ -596,7 +596,7 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
 
   // The record clears BEFORE the start (the start-guard keys on it); from
   // here the swap is complete and a failed start is an ordinary start problem.
-  containerManager.updateInstanceRecoveryRescue(instance.id, null);
+  containerManager.updateInstanceRecoveryRescue(instance.id, null, { startedAt: rescue.startedAt, completedAt: Date.now() });
   const started = await containerManager.startBot(instance.id);
   if (!started.success) {
     console.warn(`[RecoveryRescue] Swap complete but the fleet did not start on ${instance.displayName}: ${started.error}; start it manually`);

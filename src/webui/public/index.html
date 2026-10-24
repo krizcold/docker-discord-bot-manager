@@ -1315,8 +1315,20 @@
     async function api(method, endpoint, data = null) {
       const options = { method, headers: { 'Content-Type': 'application/json' } };
       if (data) options.body = JSON.stringify(data);
-      const res = await fetch(`/api${endpoint}`, options);
-      return res.json();
+      let res;
+      try { res = await fetch(`/api${endpoint}`, options); } catch (err) { throw noAnswerError(); }
+      try { return await res.json(); } catch (err) { throw noAnswerError(); }
+    }
+
+    function noAnswerError() {
+      const err = new Error('No answer from the manager');
+      err.noAnswer = true;
+      return err;
+    }
+
+    // A write whose answer was lost may still have run; the caller re-reads its view after this.
+    function showNoAnswer(op) {
+      showMessage('error', `No answer from the manager; the ${op} may still be running. Check its state before trying again.`);
     }
 
     function wsSend(obj) {
@@ -1681,10 +1693,10 @@
         if (terminalBotId === id) streamBuildLogs(id);
       } catch (err) {
         if (terminalBotId === id) {
-          addTerminalLog('Error: Failed to update bot', 'error');
-          markTerminalComplete(false);
+          addTerminalLog('No answer from the manager; the update may still be running. Following its log:', 'error');
+          streamBuildLogs(id);
         } else {
-          showMessage('error', 'Failed to update bot');
+          showNoAnswer('update');
         }
         busyBots.delete(id); loadBots();
       }
@@ -1702,7 +1714,7 @@
           loadBots();
         }
       } catch (err) {
-        showMessage('error', 'Failed to change source');
+        showNoAnswer('source change');
         loadBots();
       }
     }
@@ -1732,10 +1744,10 @@
         if (terminalBotId === id) streamBuildLogs(id);
       } catch (err) {
         if (terminalBotId === id) {
-          addTerminalLog('Error: Failed to start bot', 'error');
-          markTerminalComplete(false);
+          addTerminalLog('No answer from the manager; the start may still be running. Following its log:', 'error');
+          streamBuildLogs(id);
         } else {
-          showMessage('error', 'Failed to start bot');
+          showNoAnswer('start');
         }
         busyBots.delete(id); loadBots();
       }
@@ -1765,7 +1777,7 @@
           // busyBots cleared by WebSocket 'bot:restarted' or 'bot:restart-failed'
         }
       } catch (err) {
-        showMessage('error', 'Failed to restart bot');
+        showNoAnswer('restart');
         busyBots.delete(id); loadBots();
       }
     }
@@ -1776,7 +1788,7 @@
         if (!res.success) showMessage('error', res.error || 'Failed to toggle auto-update');
         else if (res.message) showMessage('warning', res.message);
       } catch (err) {
-        showMessage('error', 'Failed to toggle auto-update');
+        showNoAnswer('auto-update change');
       }
       loadBots();
     }
@@ -1788,7 +1800,7 @@
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, interval });
         if (!res.success) showMessage('error', res.error || 'Failed to set interval');
       } catch (err) {
-        showMessage('error', 'Failed to set auto-update interval');
+        showNoAnswer('auto-update change');
       }
       loadBots();
     }
@@ -1800,7 +1812,7 @@
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, hour });
         if (!res.success) { showMessage('error', res.error || 'Failed to set hour'); loadBots(); }
       } catch (err) {
-        showMessage('error', 'Failed to set auto-update hour');
+        showNoAnswer('auto-update change');
         loadBots();
       }
     }
@@ -1811,7 +1823,7 @@
         if (!res.success) showMessage('error', res.error || 'Failed to set web auth mode');
         else showMessage('success', 'Web auth mode saved: applies on the next Update or Build');
       } catch (err) {
-        showMessage('error', 'Failed to set web auth mode');
+        showNoAnswer('web auth change');
       }
       loadBots();
     }
@@ -1851,7 +1863,7 @@
           showMessage('error', res.error || 'Failed to toggle auto-update');
         }
       } catch (err) {
-        showMessage('error', 'Failed to toggle auto-update');
+        showNoAnswer('auto-update change');
       }
       loadBots();
     }
@@ -2587,12 +2599,16 @@
         if (dbUrl && dbUrl !== ((dbKey && envEditorInitial[dbKey]) || '').trim()) {
           saveBtn.textContent = 'Testing database...';
           let check = null;
-          try { check = await api('POST', `/bots/${botId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; }
+          let unanswered = false;
+          try { check = await api('POST', `/bots/${botId}/validate-db`, { url: dbUrl }); } catch (err) { check = null; unanswered = true; }
           if (!stillOpen()) { showMessage('error', `The environment editor for ${name} was closed before saving. Nothing was saved.`); return; }
           if (!(check && check.success && check.ok)) {
             const msg = (check && check.error) || 'connection test failed';
             const hint = (check && check.hint) ? `\n\nHint: ${check.hint}` : '';
-            if (!confirm(`Database connection test failed:\n${msg}${hint}\n\nSave anyway?`)) return;
+            const question = unanswered
+              ? 'The database connection test got no answer from the manager, so whether this URL works is unknown.\n\nSave anyway?'
+              : `Database connection test failed:\n${msg}${hint}\n\nSave anyway?`;
+            if (!confirm(question)) return;
             if (!stillOpen()) { showMessage('error', `The environment editor for ${name} was closed before saving. Nothing was saved.`); return; }
           }
           saveBtn.textContent = 'Saving...';
@@ -2973,7 +2989,7 @@
           ? `Database decommissioned; safety dump kept: ${res.dumpFile}`
           : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list)');
       } catch (err) {
-        showMessage('error', 'Decommission failed');
+        showNoAnswer('decommission');
       } finally {
         await loadBots();
         if (fleetBackupBotId === botId) showFleetBackups(botId);
@@ -2996,7 +3012,8 @@
         showMessage('success', 'Demoted; the bot restarts as a worker');
         loadBots();
       } catch (err) {
-        showMessage('error', 'Demote failed');
+        showNoAnswer('demote');
+        loadBots();
       }
     }
 
@@ -3026,7 +3043,7 @@
           showMessage('error', res.error || 'Failed to enable replication');
         }
       } catch (err) {
-        showMessage('error', 'Failed to enable replication');
+        showNoAnswer('replication change');
       }
       renderFleetReplication(botId);
       loadBots();
@@ -3042,7 +3059,7 @@
           ? 'WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.'
           : (apply.error || 'Failed to apply the bound'));
       } catch (err) {
-        showMessage('error', 'Failed to apply the bound');
+        showNoAnswer('WAL bound change');
       }
       renderFleetReplication(botId);
     }
@@ -3053,7 +3070,7 @@
         const res = await api('DELETE', `/bots/${botId}/fleet-replication/slots/${encodeURIComponent(slot)}`);
         showMessage(res.success ? 'success' : 'error', res.success ? `Slot ${slot} dropped` : (res.error || 'Failed to drop the slot'));
       } catch (err) {
-        showMessage('error', 'Failed to drop the slot');
+        showNoAnswer('slot drop');
       }
       renderFleetReplication(botId);
     }
@@ -3070,32 +3087,84 @@
           showMessage('error', res.error || 'Failed to disable replication');
         }
       } catch (err) {
-        showMessage('error', 'Failed to disable replication');
+        showNoAnswer('replication change');
       }
       renderFleetReplication(botId);
       loadBots();
     }
 
     // ─── Recovery channel (PLAN_REPLICATION.md Section 18, RC-2) ───
+    let recoveryChannelSeq = 0;
+    const recoveryLastPhase = {};
+    const SWAP_PHASES = ['quiesce', 'catchup', 'promote', 'teardown', 'flip'];
+    async function readRecoveryRescue(botId) {
+      try {
+        const rr = await api('GET', `/bots/${botId}/recovery-rescue`);
+        return rr && rr.success ? { rescue: rr.rescue || null } : { failed: true };
+      } catch (err) { return { failed: true }; }
+    }
+    function pollRecoveryChannel(botId, seq) {
+      setTimeout(() => {
+        const body = document.getElementById('recovery-channel-body');
+        if (seq !== recoveryChannelSeq || !body || !body.isConnected || fleetBackupBotId !== botId) return;
+        renderRecoveryChannel(botId);
+      }, 5000);
+    }
     async function renderRecoveryChannel(botId) {
       const body = document.getElementById('recovery-channel-body');
       if (!body || fleetBackupBotId !== botId) return;
+      const seq = ++recoveryChannelSeq;
       let res = null;
       try { res = await api('GET', `/bots/${botId}/recovery-channel`); } catch (err) { res = null; }
-      if (!body.isConnected || fleetBackupBotId !== botId) return;
+      if (seq !== recoveryChannelSeq || !body.isConnected || fleetBackupBotId !== botId) return;
       if (!res || !res.success) {
-        body.innerHTML = '<div class="error-message">Failed to load recovery channel status</div>';
+        body.innerHTML = '<div class="error-message">Failed to load recovery channel status; retrying</div>';
+        pollRecoveryChannel(botId, seq);
         return;
       }
       const ch = res.channel || { armed: false };
       if (!ch.armed) {
         // The swap's last phases outlive the channel (teardown removes it);
         // a surviving rescue record still needs its progress shown.
-        let tailRescue = null;
-        try { const rr = await api('GET', `/bots/${botId}/recovery-rescue`); tailRescue = rr && rr.rescue; } catch (err) { /* section renders without it */ }
-        if (!body.isConnected || fleetBackupBotId !== botId) return;
-        if (tailRescue) {
-          body.innerHTML = renderRescueBlock(botId, tailRescue);
+        const tail = await readRecoveryRescue(botId);
+        if (seq !== recoveryChannelSeq || !body.isConnected || fleetBackupBotId !== botId) return;
+        if (tail.failed) {
+          body.innerHTML = '<div class="error-message">Could not read the rescue state; retrying</div>';
+          pollRecoveryChannel(botId, seq);
+          return;
+        }
+        if (tail.rescue) {
+          recoveryLastPhase[botId] = { phase: tail.rescue.phase, startedAt: tail.rescue.startedAt, waits: 0 };
+          body.innerHTML = renderRescueBlock(botId, tail.rescue);
+          pollRecoveryChannel(botId, seq);
+          return;
+        }
+        const ended = recoveryLastPhase[botId];
+        delete recoveryLastPhase[botId];
+        if (ended && SWAP_PHASES.includes(ended.phase)) {
+          loadBots();
+          let got = null;
+          try { got = await api('GET', `/bots/${botId}`); } catch (err) { got = null; }
+          if (seq !== recoveryChannelSeq || !body.isConnected || fleetBackupBotId !== botId) return;
+          const b = got && got.success ? got.bot : null;
+          const phase = escapeHtml(ended.phase);
+          const flipped = !!(b && b.recoveryLastSwap && ended.startedAt && b.recoveryLastSwap.startedAt === ended.startedAt);
+          const starting = flipped && (b.status === 'building' || b.status === 'starting' || b.activeOp === 'start');
+          const notShown = flipped && !starting && b.status === 'stopped' && !b.activeOp && ended.waits < 3;
+          let text;
+          if (!b) text = `The swap's record closed after its ${phase} phase, and the instance could not be read: can't confirm the outcome. Check in the bot list that the instance runs on this machine as the primary before arming again.`;
+          else if (starting) text = 'The swap finished: this machine now holds the primary database, and the fleet is starting.';
+          else if (notShown) text = 'The swap finished: this machine now holds the primary database. The fleet is stopped and its start has not shown yet; checking again.';
+          else if (flipped) text = b.status === 'running'
+            ? 'The swap finished: this machine now holds the primary database, and the fleet is running.'
+            : `The swap finished: this machine now holds the primary database, but the fleet did not start (${escapeHtml(b.status || 'unknown')}). Start it from the bot list.`;
+          else if (b.fleetDbReplica) text = `The swap's record closed after its ${phase} phase, and the swap did not make this machine the primary. Read the bot list and the other machine before arming again.`;
+          else text = `The swap's record closed after its ${phase} phase: can't confirm whether this machine became the primary. Check the bot list and the other machine before arming again.`;
+          body.innerHTML = `<div class="env-tip">${text}</div>`;
+          if (starting || notShown) {
+            recoveryLastPhase[botId] = { ...ended, waits: ended.waits + 1 };
+            pollRecoveryChannel(botId, seq);
+          }
           return;
         }
         body.innerHTML = `
@@ -3120,9 +3189,14 @@
         return;
       }
       let rescue = null;
+      let rescueReadFailed = false;
       if (ch.mode === 'receiver') {
-        try { const rr = await api('GET', `/bots/${botId}/recovery-rescue`); rescue = rr && rr.rescue; } catch (err) { /* section renders without it */ }
-        if (!body.isConnected || fleetBackupBotId !== botId) return;
+        const rr = await readRecoveryRescue(botId);
+        if (seq !== recoveryChannelSeq || !body.isConnected || fleetBackupBotId !== botId) return;
+        rescueReadFailed = !!rr.failed;
+        rescue = rr.rescue || null;
+        if (rescue) recoveryLastPhase[botId] = { phase: rescue.phase, startedAt: rescue.startedAt, waits: 0 };
+        else if (!rescueReadFailed) delete recoveryLastPhase[botId];
       }
       const live = ch.live;
       const mb = n => (n / 1048576).toFixed(1);
@@ -3142,10 +3216,11 @@
         </div>
         <input type="hidden" id="rc-arm-block" value="${escapeHtml(JSON.stringify(ch.block))}">
         <div class="env-tip">Paste it into "Arm sender" on the machine that holds the good database.</div>` : ''}
-        ${ch.mode === 'receiver' ? renderRescueBlock(botId, rescue) : ''}
+        ${ch.mode !== 'receiver' ? '' : rescueReadFailed ? '<div class="error-message">Could not read the rescue state; retrying</div>' : renderRescueBlock(botId, rescue)}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disarmRecoveryChannel('${botId}')">Disarm this side</button>
         </div>`;
+      pollRecoveryChannel(botId, seq);
     }
 
     function renderRescueBlock(botId, rescue) {
@@ -3195,7 +3270,7 @@
         }
         showMessage(res.success ? 'success' : 'error', res.success ? 'Swap running; it finishes on its own and starts the fleet on this machine.' : (res.error || 'Failed to start the swap'));
       } catch (err) {
-        showMessage('error', 'Failed to start the swap');
+        showNoAnswer('swap');
       }
       renderRecoveryChannel(botId);
     }
@@ -3213,7 +3288,7 @@
         }
         showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue running; it survives restarts on both ends and resumes after interruptions.' : (res.error || 'Failed to start the rescue'));
       } catch (err) {
-        showMessage('error', 'Failed to start the rescue');
+        showNoAnswer('rescue');
       }
       renderRecoveryChannel(botId);
     }
@@ -3224,7 +3299,7 @@
         const res = await api('DELETE', `/bots/${botId}/recovery-rescue`);
         showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue cancelled.' : (res.error || 'Failed to cancel'));
       } catch (err) {
-        showMessage('error', 'Failed to cancel');
+        showNoAnswer('rescue cancel');
       }
       renderRecoveryChannel(botId);
     }
@@ -3253,7 +3328,7 @@
           ? 'Receiver armed. Copy the arm block below and paste it into "Arm sender" on the other machine.'
           : (res.error || 'Failed to arm the receiver'));
       } catch (err) {
-        showMessage('error', 'Failed to arm the receiver');
+        showNoAnswer('receiver arming');
       }
       renderRecoveryChannel(botId);
     }
@@ -3283,7 +3358,7 @@
         const res = await api('POST', `/bots/${botId}/recovery-channel`, { mode: 'source', host: hostVal, port: portVal, cert, token });
         showMessage(res.success ? 'success' : 'error', res.success ? 'Sender armed; dialing the receiver.' : (res.error || 'Failed to arm the sender'));
       } catch (err) {
-        showMessage('error', 'Failed to arm the sender');
+        showNoAnswer('sender arming');
       }
       renderRecoveryChannel(botId);
     }
@@ -3294,7 +3369,7 @@
         const res = await api('DELETE', `/bots/${botId}/recovery-channel`);
         showMessage(res.success ? 'success' : 'error', res.success ? 'Recovery channel disarmed on this side.' : (res.error || 'Failed to disarm'));
       } catch (err) {
-        showMessage('error', 'Failed to disarm');
+        showNoAnswer('disarm');
       }
       renderRecoveryChannel(botId);
     }
@@ -3714,7 +3789,9 @@
         renderFleetReplica(botId);
         loadBots();
       } catch (err) {
-        showMessage('error', `${label} failed`);
+        showNoAnswer(label.toLowerCase());
+        renderFleetReplica(botId);
+        loadBots();
       }
     }
 
@@ -3731,10 +3808,35 @@
         const res = await api('DELETE', `/bots/${botId}/app-transfer`);
         if (!res.success) showMessage('error', res.error || 'Failed to dismiss the transfer');
       } catch (err) {
-        showMessage('error', 'Failed to dismiss the transfer');
+        showNoAnswer('transfer dismissal');
       }
       renderFleetReplica(botId);
       loadBots();
+    }
+
+    // A provisioning or re-seed POST whose answer was lost may still be running:
+    // a second press is refused until the instance has been re-read.
+    const provisionChecking = new Set();
+    function refuseWhileChecking(botId) {
+      if (!provisionChecking.has(botId)) return false;
+      showMessage('error', 'The last request on this instance got no answer; its state is still being checked.');
+      return true;
+    }
+    async function followLostProvisioning(botId, onStarted) {
+      provisionChecking.add(botId);
+      loadBots();
+      try {
+        for (let i = 0; i < 20; i++) {
+          let res = null;
+          try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
+          const r = res && res.success ? res.replica : null;
+          if (r && (r.provisioning || r.parkedSeed)) { loadBots(); onStarted(); return; }
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+        showMessage('error', 'No seed run shows on this instance after 60 s, so the request most likely did not start one. Check the panel before trying again.');
+      } finally {
+        provisionChecking.delete(botId);
+      }
     }
 
     async function provisionFleetReplicaFromFacts(botId) {
@@ -3742,6 +3844,7 @@
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
       if (refuseBadNumbers([['replica-port', 'port']])) return;
       if (!host) { showMessage('error', 'This machine\'s public host is required'); return; }
+      if (refuseWhileChecking(botId)) return;
       const payload = { publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
@@ -3753,7 +3856,8 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started from the block this node holds');
       } catch (err) {
-        showMessage('error', 'Failed to start provisioning');
+        showNoAnswer('provisioning');
+        await followLostProvisioning(botId, () => renderFleetReplica(botId));
         return;
       }
       renderFleetReplica(botId);
@@ -3766,6 +3870,7 @@
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
       if (refuseBadNumbers([['replica-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
+      if (refuseWhileChecking(botId)) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
@@ -3778,7 +3883,8 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started');
       } catch (err) {
-        showMessage('error', 'Failed to start provisioning');
+        showNoAnswer('provisioning');
+        await followLostProvisioning(botId, () => renderFleetReplica(botId));
         return;
       }
       renderFleetReplica(botId);
@@ -3837,8 +3943,7 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to continue the run'); return; }
         showMessage('success', 'Run continued');
       } catch (err) {
-        showMessage('error', 'Failed to continue the run');
-        return;
+        showNoAnswer('run');
       }
       renderFleetReplica(botId);
       renderFleetReplication(botId);
@@ -3850,8 +3955,7 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to cancel the run'); return; }
         showMessage(res.error ? 'error' : 'success', res.error || 'Run cancelled');
       } catch (err) {
-        showMessage('error', 'Failed to cancel the run');
-        return;
+        showNoAnswer('run cancel');
       }
       renderFleetReplica(botId);
       renderFleetReplication(botId);
@@ -3863,8 +3967,7 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to dismiss the run'); return; }
         showMessage(res.error ? 'error' : 'success', res.error || 'Run dismissed');
       } catch (err) {
-        showMessage('error', 'Failed to dismiss the run');
-        return;
+        showNoAnswer('run dismissal');
       }
       renderFleetReplica(botId);
       renderFleetReplication(botId);
@@ -3875,8 +3978,7 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to open the failback run'); return; }
         showMessage('success', 'Run opened');
       } catch (err) {
-        showMessage('error', 'Failed to open the run');
-        return;
+        showNoAnswer('failback run');
       }
       renderFleetReplication(botId);
       renderFleetReplica(botId);
@@ -3889,6 +3991,7 @@
       const portRaw = (document.getElementById('reseed-port')?.value || '').trim();
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
+      if (refuseWhileChecking(botId)) return;
       if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once, then DELETED and replaced with a fresh copy of the new primary. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
@@ -3902,7 +4005,8 @@
         if (!res.success) { showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to start re-seeding'}`); return; }
         showMessage('success', `${botLabel(botId)}: re-seeding started`);
       } catch (err) {
-        showMessage('error', `${botLabel(botId)}: could not confirm re-seeding started`);
+        showNoAnswer('re-seed');
+        await followLostProvisioning(botId, () => { if (fleetBackupBotId === botId) hideFleetBackups(); });
         return;
       }
       if (fleetBackupBotId === botId) hideFleetBackups();
@@ -3919,7 +4023,7 @@
           showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to adopt the database'}`);
         }
       } catch (err) {
-        showMessage('error', `${botLabel(botId)}: could not confirm the database was adopted`);
+        showNoAnswer('adoption');
       }
       if (fleetBackupBotId === botId) hideFleetBackups();
       loadBots();
@@ -3940,7 +4044,7 @@
           showMessage('error', res.error || 'Failed to remove replica');
         }
       } catch (err) {
-        showMessage('error', 'Failed to remove replica');
+        showNoAnswer('replica removal');
       }
       renderFleetReplica(botId);
       loadBots();
@@ -3983,7 +4087,7 @@
         if (res.success) showMessage('success', res.dismissed ? 'Dismissed' : 'Cancel requested');
         else showMessage('error', res.error || 'Failed to cancel the seed');
       } catch (err) {
-        showMessage('error', 'Failed to cancel the seed');
+        showNoAnswer('seed cancel');
       }
       if (document.getElementById('fleet-replica-body')) renderFleetReplica(botId);
       else if (document.getElementById('fleet-seed-banner')) renderSeedBanner(botId);
@@ -3997,7 +4101,7 @@
         if (res.success) showMessage('success', 'Re-seed started');
         else showMessage('error', res.error || 'Failed to start the re-seed');
       } catch (err) {
-        showMessage('error', 'Failed to start the re-seed');
+        showNoAnswer('re-seed');
       }
       renderFleetReplica(botId);
       loadBots();
@@ -4033,7 +4137,7 @@
           showMessage('error', res.error || 'Failed to save backup settings');
         }
       } catch (err) {
-        showMessage('error', 'Failed to save backup settings');
+        showNoAnswer('backup settings change');
       }
       showFleetBackupControls(fleetBackupStored);
       loadBots();
@@ -4065,7 +4169,7 @@
           if (res.steps && res.steps.restored) alert(`The data was restored, but the lane finished WITH PROBLEMS:\n\n${res.error || ''}`);
         }
       } catch (err) {
-        showMessage('error', 'Restore failed');
+        showNoAnswer('restore');
       } finally {
         await loadBots();
         if (fleetBackupBotId === botId) showFleetBackups(botId);
@@ -4676,8 +4780,9 @@
           renderSourceSidebar();
         }
       } catch (err) {
-        showMessage('error', 'Failed to clone source');
+        showNoAnswer('clone');
         cloningSources.delete(id);
+        await loadSources();
         renderSourceSidebar();
       }
     }
@@ -4689,6 +4794,17 @@
     }
     function hideAddSourceModal() {
       document.getElementById('source-modal').classList.add('hidden');
+    }
+
+    // After a lost add answer the clone may still run; the form stays locked
+    // until the source lists or two minutes pass.
+    async function waitForSourceUrl(url) {
+      const norm = (u) => String(u || '').replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/\/([^@]+)@/, '//');
+      for (let i = 0; i < 48; i++) {
+        await loadSources();
+        if (sources.some(s => norm(s.url) === norm(url))) { hideAddSourceModal(); showMessage('success', 'Source added'); return; }
+        await new Promise(resolve => setTimeout(resolve, 2500));
+      }
     }
 
     async function addSource() {
@@ -4709,7 +4825,9 @@
           showMessage('error', res.error || 'Failed to add source');
         }
       } catch (err) {
-        showMessage('error', 'Failed to add source');
+        showNoAnswer('source add');
+        btn.textContent = 'Checking...';
+        await waitForSourceUrl(url);
       } finally {
         btn.disabled = false; btn.textContent = 'Add Source';
       }
@@ -4721,7 +4839,7 @@
         const res = await api('DELETE', `/sources/${id}`);
         if (res.success) { showMessage('success', 'Source removed'); loadSources(); loadBots(); }
         else showMessage('error', res.error || 'Failed to remove source');
-      } catch (err) { showMessage('error', 'Failed to remove source'); }
+      } catch (err) { showNoAnswer('source removal'); loadSources(); loadBots(); }
     }
 
     async function fetchSource(id) {
@@ -4739,13 +4857,13 @@
           showMessage('error', res.error || 'Fetch failed');
           loadSources();
         }
-      } catch (err) { showMessage('error', 'Fetch failed'); }
+      } catch (err) { showNoAnswer('fetch'); loadSources(); loadBots(); }
     }
 
     async function toggleSourceAutoUpdate(id, enabled) {
       try {
         await api('PUT', `/sources/${id}`, { autoUpdate: enabled });
-      } catch (err) { showMessage('error', 'Failed to update setting'); }
+      } catch (err) { showNoAnswer('auto-update change'); loadSources(); }
     }
 
     // ─── Edit Source Modal ───
@@ -4784,7 +4902,8 @@
           showMessage('error', res.error || 'Failed to update source');
         }
       } catch (err) {
-        showMessage('error', 'Failed to update source');
+        showNoAnswer('source update');
+        loadSources();
       } finally {
         btn.disabled = false; btn.textContent = 'Save';
       }
@@ -6102,7 +6221,9 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showMessage('error', 'Failed to save');
+        showNoAnswer('save');
+        vaultValuesCache = null;
+        loadVault();
       } finally {
         unlock();
       }
@@ -6118,7 +6239,9 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showMessage('error', 'Failed to delete entry');
+        showNoAnswer('delete');
+        vaultValuesCache = null;
+        loadVault();
       } finally {
         unlock();
       }
@@ -6132,7 +6255,9 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showMessage('error', 'Failed to delete entry');
+        showNoAnswer('delete');
+        vaultValuesCache = null;
+        loadVault();
       } finally {
         unlock();
       }
@@ -6147,7 +6272,9 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showMessage('error', 'Failed to remove category');
+        showNoAnswer('category removal');
+        vaultValuesCache = null;
+        loadVault();
       } finally {
         unlock();
       }
@@ -6175,7 +6302,8 @@
         document.getElementById('vault-new-value').value = '';
         loadVault();
       } catch (err) {
-        showMessage('error', 'Failed to add vault entry');
+        showNoAnswer('vault entry add');
+        loadVault();
       }
     }
 

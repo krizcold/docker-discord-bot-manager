@@ -101,7 +101,7 @@ describe('copy buttons', () => {
 describe('instance auto-update controls', () => {
   const run = async (fn: string, args: unknown[], answer: any) => {
     let reloads = 0;
-    const ctx = runPage([fn], {
+    const ctx = runPage([fn, ...fns('showNoAnswer')], {
       api: async () => { if (answer instanceof Error) throw answer; return answer; },
       showMessage: () => {}, loadBots: () => { reloads++; }, bots: [{ id: 'b1', autoUpdate: true }],
     });
@@ -129,7 +129,7 @@ describe('fleet backup settings', () => {
       'fleet-backup-keep': { value: '30' },
     };
     const messages: string[][] = [];
-    const ctx = runPage(fns('saveFleetBackupConfig', 'showFleetBackupControls'), {
+    const ctx = runPage(fns('saveFleetBackupConfig', 'showFleetBackupControls', 'showNoAnswer'), {
       document: { getElementById: (id: string) => els[id] },
       isBadNumber: () => false, confirm: () => true,
       api: async () => { if (answer instanceof Error) throw answer; return answer; },

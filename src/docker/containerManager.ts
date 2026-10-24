@@ -3142,7 +3142,9 @@ export async function startBot(botId: string): Promise<LaneResult> {
 
 /** The synchronous refusal a start or restart answers before touching anything; null when it may proceed. */
 export function startPreflightRefusal(botId: string): { success: false; error: string } | null {
-  if (getBot(botId)?.recoveryRescue) {
+  const rescue = getBot(botId)?.recoveryRescue;
+  // The flip's sub-steps run after the copy is filed as the primary: the volume is no longer being rewritten.
+  if (rescue && !(rescue.phase === 'flip' && rescue.flipStep)) {
     return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
   }
   return deleteLaneRefusal(botId, 'Start');

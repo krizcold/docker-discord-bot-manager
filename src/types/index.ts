@@ -272,6 +272,8 @@ export interface RecoveryRescueRecord {
   swapTargetLsn?: string;
   /** Swap (RC-4): this machine's public host captured while the channel record still existed; flip enables replication with it when no prior replication record has one. */
   swapPublicHost?: string;
+  /** Flip: 'start' once the copy is filed as the primary (the fleet may start), 'role' once the fleet started and the app is being returned to its configured role. */
+  flipStep?: 'start' | 'role';
 }
 
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults

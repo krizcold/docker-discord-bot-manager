@@ -100,7 +100,9 @@ vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
 vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
   capabilityRefusal: () => null,
-  waitForAppHook: async () => ({ success: false, error: 'fake app silent' }),
+  waitForAppHook: async () => ({ success: true }),
+  deliverCopyBlock: async () => ({ success: true }),
+  resetRole: async () => ({ success: true }),
 }));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),

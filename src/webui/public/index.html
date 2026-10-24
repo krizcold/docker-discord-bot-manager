@@ -3307,8 +3307,11 @@
           <button class="btn btn-danger btn-small" onclick="startRecoveryRescue('${botId}')">Start rescue</button>
         </div>`;
       }
+      const flipText = rescue.flipStep === 'role' ? 'the fleet started; returning the app to its configured role'
+        : rescue.flipStep === 'start' ? 'this database is the primary; starting the fleet'
+        : 'filing this database as the primary';
       const phaseText = rescue.parked
-        ? `PARKED at ${rescue.phase} - fix the cause, then Continue to re-enter that phase`
+        ? `PARKED at ${rescue.phase === 'flip' ? `flip (${flipText})` : rescue.phase} - fix the cause, then Continue to re-enter that phase`
         : {
           preflight: 'Preflight: dumping the stale copy before the overwrite',
           bulk: 'Bulk copy: resumable rsync of the live database (the sender keeps serving)',
@@ -3322,7 +3325,7 @@
           catchup: `Swap: replaying the sender's last WAL${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB left)` : ''}`,
           promote: 'Swap: promoting this copy to primary',
           teardown: 'Swap: tearing the channel down on both ends',
-          flip: 'Swap: filing this database as the primary and starting the fleet',
+          flip: `Swap: ${flipText}`,
         }[rescue.phase] || rescue.phase;
       const pastPromote = ['promote', 'teardown', 'flip'].includes(rescue.phase);
       const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && rescue.senderAttached === true && !rescue.parked;
@@ -3346,7 +3349,7 @@
           if (!confirm('Swap now?\n\nThe SENDER fleet stops (downtime begins), this copy replays the last WAL and is promoted to primary, the channel is torn down, and the fleet starts HERE against the rescued database.\n\nAfterwards, re-seed the old machine as a standby of this one (its Database modal, with this machine\'s copy block) to restore the pair.')) return;
           res = await api('POST', `/bots/${botId}/recovery-rescue/swap`, { confirm: true });
         }
-        showMessage(res.success ? 'success' : 'error', res.success ? 'Swap running; it finishes on its own and starts the fleet on this machine.' : (res.error || 'Failed to start the swap'));
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Swap running; this card shows each step, including whether the fleet started on this machine.' : (res.error || 'Failed to start the swap'));
       } catch (err) {
         showNoAnswer('swap');
       }

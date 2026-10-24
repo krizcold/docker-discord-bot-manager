@@ -35,6 +35,7 @@ import * as appLifecycle from './appLifecycle';
 import { runFleetDump } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
+import { hasAppHooks } from './appHookClient';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
@@ -158,8 +159,10 @@ export async function startRescue(
   confirm: boolean,
 ): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; state?: 'fresh' | 'outdated'; sourceIdentity?: Record<string, unknown> }> {
   if (!instance.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
-  if (instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
-  if (instance.status === 'running') return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
+  // Teardown removes the channel, and the flip starts the fleet: Continue past them needs neither check.
+  const pastChannel = instance.recoveryRescue?.phase === 'teardown' || instance.recoveryRescue?.phase === 'flip';
+  if (!pastChannel && instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
+  if (!pastChannel && instance.status === 'running') return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
   if (instance.recoveryRescue) {
     // Re-entry ALWAYS continues the recorded phase (Continue after a manager
     // outage or a parked halt); restarting from preflight would boot postgres
@@ -294,8 +297,11 @@ async function runRescue(botId: string): Promise<void> {
         else return;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (!saveRescue(botId, { lastError: message })) {
+          console.warn(`[RecoveryRescue] ${instance.displayName} phase ${phase} failed: ${message}; the rescue record is gone, so nothing retries`);
+          return;
+        }
         console.warn(`[RecoveryRescue] ${instance.displayName} phase ${phase} failed: ${message}; retrying in ${RETRY_DELAY_MS / 1000}s`);
-        saveRescue(botId, { lastError: message });
         await sleep(RETRY_DELAY_MS);
         // The rescue record may have been cancelled during the sleep.
         if (!containerManager.getBot(botId)?.recoveryRescue) return;
@@ -586,9 +592,38 @@ async function phaseTeardown(instance: InstanceConfig): Promise<void> {
  * this machine's stored env first (over the trust socket), so the fleet and
  * the manager keep reading the URL they always had. Then the standby remnants
  * go, replication is enabled (slot + copy block ready for the handback
- * re-seed), and the fleet starts.
+ * re-seed), the fleet starts, and the app returns to its configured role.
+ * The record keeps a flipStep through the start and the role reset, so a
+ * failed start retries and a manager restart resumes the remaining sub-steps;
+ * it clears only once the role reset answered.
  */
 async function phaseFlip(instance: InstanceConfig): Promise<void> {
+  const step = instance.recoveryRescue!.flipStep;
+  if (!step) {
+    await fileCopyAsPrimary(instance);
+    saveRescue(instance.id, { flipStep: 'start', lastError: undefined });
+  }
+  if (step !== 'role') {
+    await startFlippedFleet(instance);
+    if (!hasAppHooks(containerManager.getBot(instance.id) || instance)) {
+      finishFlip(instance);
+      return;
+    }
+    saveRescue(instance.id, { flipStep: 'role', lastError: undefined });
+  }
+  await returnAppToRole(instance);
+}
+
+function finishFlip(instance: InstanceConfig): void {
+  containerManager.updateInstanceRecoveryRescue(instance.id, null, { startedAt: instance.recoveryRescue!.startedAt, completedAt: Date.now() });
+}
+
+function parkFlip(instance: InstanceConfig, reason: string): void {
+  console.warn(`[RecoveryRescue] ${instance.displayName}: ${reason}`);
+  saveRescue(instance.id, { parked: true, lastError: reason });
+}
+
+async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {
   const fleetDb = instance.fleetDb!;
   const rescue = instance.recoveryRescue!;
   const dbSpec = findAppCapabilities(instance.sourceUrl)?.companionDb;
@@ -633,37 +668,47 @@ async function phaseFlip(instance: InstanceConfig): Promise<void> {
   // The env store alone: container env assembly derives sensitive values from
   // it at read time (the two-store strip).
   if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
+}
 
-  // The record clears BEFORE the start (the start-guard keys on it); from
-  // here the swap is complete and a failed start is an ordinary start problem.
-  containerManager.updateInstanceRecoveryRescue(instance.id, null, { startedAt: rescue.startedAt, completedAt: Date.now() });
-  const started = await containerManager.startBot(instance.id);
+/** Throws on a failed start so the driver retries with the record kept; a fleet the operator already started counts as started. */
+async function startFlippedFleet(instance: InstanceConfig): Promise<void> {
+  if (containerManager.getBot(instance.id)?.status === 'running') return;
+  let started: { success: boolean; error?: string };
+  try {
+    started = await containerManager.startBot(instance.id);
+  } catch (err) {
+    started = { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
   if (!started.success) {
-    console.warn(`[RecoveryRescue] Swap complete but the fleet did not start on ${instance.displayName}: ${started.error}; start it manually`);
+    throw new Error(`The swap finished but the fleet did not start: ${started.error}; the manager retries every ${RETRY_DELAY_MS / 1000} s, or start it from the bot list`);
   }
-  // AFTER the start: the certificate rotated behind an unchanged host and port,
-  // which the endpoint-keyed freshness check cannot see, so it must be pushed
-  // explicitly - and the app only serves its hook once it is running. Failure is
-  // survivable: opening the Database modal republishes.
-  if (started.success) {
-    // The container was just started; its hooks answer once its web server
-    // listens, not when the start returns.
-    const answering = await appLifecycle.waitForAppHook(containerManager.getBot(instance.id) || fresh, APP_HOOK_WAIT_MS);
-    if (!answering.success) {
-      console.warn(`[RecoveryRescue] ${answering.error} on ${instance.displayName}; open the Database panel on this instance to publish the copy block, then clear its role override and restart it`);
-      return;
-    }
-    const republished = await appLifecycle.deliverCopyBlock(containerManager.getBot(instance.id) || fresh);
-    if (!republished.success) {
-      console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);
-    }
-    // The app booted in whatever role and store its own files last recorded
-    // (a demote's co-worker override, the forms it followed as a co-worker);
-    // the swap made this machine the primary by infrastructure means, so the
-    // app is told to return to its configured role and store, and restarts.
-    const reset = await appLifecycle.resetRole(containerManager.getBot(instance.id) || fresh, true);
-    if (!reset.success) {
-      console.warn(`[RecoveryRescue] The app did not return to its configured role after the swap on ${instance.displayName}: ${reset.error}; clear its role override and restart it`);
-    }
+}
+
+async function returnAppToRole(instance: InstanceConfig): Promise<void> {
+  const current = () => containerManager.getBot(instance.id) || instance;
+  // The certificate rotated behind an unchanged host and port, which the
+  // endpoint-keyed freshness check cannot see, so the copy block is pushed
+  // explicitly once the app answers. Its hooks answer when its web server
+  // listens, not when the start returns.
+  const answering = await appLifecycle.waitForAppHook(current(), APP_HOOK_WAIT_MS);
+  if (!answering.success) {
+    parkFlip(instance, `The fleet started, but ${answering.error}; check the app, then Continue to publish the copy block and return it to its configured role`);
+    return;
   }
+  const republished = await appLifecycle.deliverCopyBlock(current());
+  if (!republished.success) {
+    console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);
+  }
+  // The app booted in whatever role and store its own files last recorded
+  // (a demote's co-worker override, the forms it followed as a co-worker);
+  // the swap made this machine the primary by infrastructure means, so the
+  // app is told to return to its configured role and store, and restarts.
+  const reset = await appLifecycle.resetRole(current(), true);
+  if (!reset.success) {
+    parkFlip(instance, reset.unknown
+      ? `The fleet started, but can't confirm the app returned to its configured role: ${reset.error}; Continue sends the role reset again`
+      : `The fleet started, but the app did not return to its configured role: ${reset.error}; fix the cause, then Continue`);
+    return;
+  }
+  finishFlip(instance);
 }

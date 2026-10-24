@@ -345,8 +345,10 @@ export async function openFailbackByHand(instance: InstanceConfig): Promise<Acti
   const standing = posture.read === 'ok' ? posture.posture : null;
   if (standing?.role === 'stand-in' && !standing.live) {
     if (read.facts!.superseded?.retireRequested !== true) return { success: false, error: 'this copy\'s stand-in lane ended, but no failback asked this side to drop back, so there is no drop-back to run; the by-hand routes on this modal apply' };
-    const live = (await fleetReplica.getFleetReplicaStatus(instance)).live;
-    if (!live?.running) return { success: false, error: 'this copy\'s container is not running, or could not be probed, so it cannot be verified as the promoted copy; start the instance, and rebuild it if a stopped re-seed took the standby service out of its compose' };
+    const replicaStatus = await fleetReplica.getFleetReplicaStatus(instance);
+    const live = replicaStatus.live;
+    if (!live) return { success: false, error: `could not read this copy's container (${replicaStatus.probeError || 'no output'}), so it cannot be verified as the promoted copy; try again` };
+    if (!live.running) return { success: false, error: 'this copy\'s container is not running, so it cannot be verified as the promoted copy; start the instance, and rebuild it if a stopped re-seed took the standby service out of its compose' };
     if (live.inRecovery !== false) return { success: false, error: live.inRecovery === true ? 'this copy is in recovery again (a standby), so there is nothing to drop back' : 'this copy did not say whether it is in recovery; retry in a moment' };
     containerManager.updateInstanceFleetFailbackDeclined(instance.id, null);
     maybeOpenDropBack(containerManager.getBot(instance.id) ?? instance, read.facts!, standing, live);
@@ -629,7 +631,8 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
             const fresh = containerManager.getBot(botId);
             if (!fresh) return;
             if (!fresh.fleetDbReplica) throw new Error('the standby was removed while the failback waited for it');
-            const live = (await fleetReplica.getFleetReplicaStatus(fresh)).live;
+            const replicaStatus = await fleetReplica.getFleetReplicaStatus(fresh);
+            const live = replicaStatus.live;
             // The handover's evidence is read every poll, beside the probe: a
             // claim that landed with the copy still in recovery, or the copy out
             // of recovery, must not leave a park or a restart here cancelable.
@@ -647,7 +650,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
               if (notStreamingSince === null) notStreamingSince = Date.now();
               else if (Date.now() - notStreamingSince >= NOT_STREAMING_GRACE_MS) throw new Error(`the copy is not receiving from the stand-in's database (receiver ${live.receiverStatus || 'not connected'}); the failback needs it streaming`);
             } else notStreamingSince = null;
-            if (Date.now() > deadline) throw new Error(`the copy did not catch up within 10 minutes (${!live?.running ? 'the standby container is not running' : `receiver ${live.receiverStatus || 'not connected'}`})`);
+            if (Date.now() > deadline) throw new Error(`the copy did not catch up within 10 minutes (${!live?.running ? fleetReplica.standbyDownText(replicaStatus) : `receiver ${live.receiverStatus || 'not connected'}`})`);
             await sleep(POLL_MS);
           }
           continue;

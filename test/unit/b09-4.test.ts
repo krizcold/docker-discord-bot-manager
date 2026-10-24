@@ -6,6 +6,7 @@ import * as vm from 'vm';
 const st = vi.hoisted(() => ({
   broadcasts: [] as Array<{ type: string; data: any }>,
   lastError: null as string | null,
+  fence: null as string | null,
   health: null as any,
   bots: [] as any[],
 }));
@@ -24,6 +25,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
 vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
   getFleetBackupError: () => st.lastError,
+  getFleetFenceStuck: () => st.fence,
   isFleetBackupStale: () => false,
   fleetBackupScopeState: () => true,
   listFleetBackups: () => [],
@@ -47,6 +49,7 @@ const call = async (routePath: string): Promise<any> => {
 beforeEach(() => {
   st.broadcasts = [];
   st.lastError = 'disk full';
+  st.fence = null;
   st.health = { role: 'primary', severity: 'error', message: 'standby gone', lagSeconds: null, checkedAt: 1 };
   st.bots = [{ id: 'b1', status: 'running', sourceType: 'git', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4, keep: 7 } }];
 });
@@ -63,6 +66,14 @@ describe('B09-4 lifecycle pushes carry the enriched health keys', () => {
 });
 
 describe('B09-4 health changes are pushed', () => {
+  it('carries a stuck fence for an instance with only a standby', () => {
+    st.bots = [{ id: 'r1', status: 'running', sourceType: 'git', fleetDbReplica: { containerName: 'copy' } }];
+    st.fence = 'The copy is READ-ONLY';
+    const pushed = (routes as any).collectHealthChanges(new Map());
+    expect(pushed[0].fenceStuck).toBe('The copy is READ-ONLY');
+    expect(pushed[0].fleetBackup).toBeNull();
+  });
+
   it('reports a bot once, then only when its verdict or backup status changes', () => {
     const fn = (routes as any).collectHealthChanges;
     expect(typeof fn).toBe('function');

@@ -135,6 +135,9 @@ async function samplePrimary(instance: InstanceConfig): Promise<ReplicationHealt
 }
 
 function primaryLinkVerdict(status: Awaited<ReturnType<typeof getFleetReplicationStatus>>, base: { role: 'primary'; checkedAt: number }): ReplicationHealth {
+  if (!status.live && status.probeError) {
+    return { ...base, severity: 'warn', message: `Could not read the database (${status.probeError}), so the replication state is unknown`, lagSeconds: null };
+  }
   if (!status.live) {
     return { ...base, severity: 'warn', message: 'Database container is not running, so nothing is being replicated', lagSeconds: null };
   }
@@ -271,7 +274,7 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // stopped container; say the real reason.
   const lastSeen = remembered ? `; it was standing in for ${shortId(remembered.coveringNodeId)} when last seen` : '';
   if (!live) {
-    return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `${status.lastError || 'Standby state could not be read'}${lastSeen}`, lagSeconds: null };
+    return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `${status.lastError || `Could not read the standby (${status.probeError || 'no output'})`}${lastSeen}`, lagSeconds: null };
   }
   if (!live.running) {
     return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `Standby container is not running, so it is no longer receiving changes${lastSeen}`, lagSeconds: null };

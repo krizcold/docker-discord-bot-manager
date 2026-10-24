@@ -26,6 +26,7 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
+import { probeErrorTail } from '../config/secretText';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
 const REFIRE_GUARD_MS = 23 * 60 * 60 * 1000; // prevents double-fire within the hour window
@@ -83,8 +84,12 @@ function recordFailbackFence(botId: string, containerName: string, left: boolean
 const busy: Set<string> = new Set();
 
 export function getFleetBackupError(botId: string): string | null {
-  const stuck = Array.from(fenceStuck.get(botId)?.values() ?? [], e => e.text).join('; ');
-  return stuck || lastErrors.get(botId) || null;
+  return lastErrors.get(botId) || null;
+}
+
+/** The write fences a restore, drop-back or failback left on, one text per database; null when none. */
+export function getFleetFenceStuck(botId: string): string | null {
+  return Array.from(fenceStuck.get(botId)?.values() ?? [], e => e.text).join('; ') || null;
 }
 
 /**
@@ -215,12 +220,25 @@ export function clearTermFloor(botId: string): void {
   }
 }
 
-function isContainerRunning(containerName: string): Promise<boolean> {
+/** running true or false as docker says it; null with docker's error when docker could not be asked. */
+type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
+function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout) => {
-      resolve(!err && String(stdout).trim() === 'true');
+    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout, stderr) => {
+      if (!err) return resolve({ running: String(stdout).trim() === 'true' });
+      const text = String(stderr || err || '');
+      resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });
     });
   });
+}
+
+async function isContainerRunning(containerName: string): Promise<boolean> {
+  return (await containerState(containerName)).running === true;
+}
+
+/** The refusal for a database that is not up: docker's own "not running", or why it could not be asked. */
+function dbDownText(state: ContainerState, stopped: string): string {
+  return state.running === null ? `Could not probe the database container (${state.error})` : stopped;
 }
 
 function execDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -466,8 +484,9 @@ export async function runFleetDump(
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'No fleet database record' };
 
-  if (!await isContainerRunning(fleetDb.containerName)) {
-    return { success: false, error: 'Database container is not running' };
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) {
+    return { success: false, error: dbDownText(dbState, 'Database container is not running') };
   }
 
   const dir = backupDir(instance.id);

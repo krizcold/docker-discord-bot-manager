@@ -58,7 +58,7 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 
 // The computed health keys every bot record carries to the page, so a push
 // never replaces them with the raw record's fleetBackup config.
-function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; replicationHealth: ReturnType<typeof getReplicationHealth> } {
+function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null; replicationHealth: ReturnType<typeof getReplicationHealth> } {
   return {
     fleetBackup: bot.fleetDb ? {
       lastAt: bot.lastFleetBackupAt || null,
@@ -67,6 +67,7 @@ function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> 
       scoped: fleetBackup.fleetBackupScopeState(bot),
       ...fleetBackup.effectiveFleetBackup(bot),
     } : null,
+    fenceStuck: fleetBackup.getFleetFenceStuck(bot.id),
     replicationHealth: getReplicationHealth(bot.id),
   };
 }
@@ -87,7 +88,7 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
     let health: ReturnType<typeof botHealth>;
     try { health = botHealth(bot); } catch { continue; }
     const rh = health.replicationHealth;
-    const key = JSON.stringify([health.fleetBackup, rh ? { ...rh, checkedAt: undefined } : null]);
+    const key = JSON.stringify([health.fleetBackup, health.fenceStuck, rh ? { ...rh, checkedAt: undefined } : null]);
     if (seen.get(bot.id) === key) continue;
     seen.set(bot.id, key);
     changed.push({ id: bot.id, ...health });

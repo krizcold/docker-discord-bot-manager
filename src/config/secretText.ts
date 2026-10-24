@@ -52,6 +52,12 @@ export function childFailureText(stderr: unknown, err: unknown): string {
   return 'the command failed';
 }
 
+/** The last non-empty line of a failed probe's stderr, short enough for a badge. */
+export function probeErrorTail(stderr: string): string {
+  const line = String(stderr || '').trim().split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no output';
+  return line.length > 200 ? `${line.slice(0, 200)}...` : line;
+}
+
 /**
  * The SCRAM-SHA-256 verifier Postgres stores for a password (RFC 5802/7677),
  * so a role statement carries this instead of the password itself. Postgres

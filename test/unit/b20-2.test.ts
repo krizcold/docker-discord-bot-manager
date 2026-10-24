@@ -102,6 +102,13 @@ beforeEach(() => {
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 
 describe('X26: one stuck-fence warning per database, and a foreign fence is not the failback\'s', () => {
+  it('a stuck fence shows on its own reader, never as a backup failure', async () => {
+    const fb = await restartedManager();
+    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
+    expect(fb.getFleetBackupError('a')).toBeNull();
+  });
+
   it('a lift on the copy leaves the primary\'s stuck-fence warning in place', async () => {
     const fb = await restartedManager();
     expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
@@ -109,7 +116,7 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     pg.liftWorks = true;
     pg.onLift = (c) => { if (c === primary.containerName) throw new Error('the primary must not be lifted here'); };
     expect(await fb.liftConsentFence('a', copy, 'reseed')).toBe('lifted');
-    expect(fb.getFleetBackupError('a')).toContain('READ-ONLY');
+    expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
   });
 
   it('a lift on the primary leaves the copy\'s warning, whichever stuck first', async () => {
@@ -119,22 +126,22 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     pg.liftWorks = true;
     pg.onLift = (c) => { if (c === copy.containerName) throw new Error('the copy must not be lifted here'); };
     expect(await fb.liftConsentFence('a', primary, 'x')).toBe('lifted');
-    expect(fb.getFleetBackupError('a')).toContain('reseed');
+    expect(fb.getFleetFenceStuck('a')).toContain('reseed');
   });
 
   it('at start a fenced copy does not hide a primary also fenced', async () => {
     const fb = await restartedManager();
     fb.startFleetBackupScheduler();
     fb.stopFleetBackupScheduler();
-    await vi.waitFor(() => expect(fb.getFleetBackupError('a')).toContain('The copy is READ-ONLY'));
-    await vi.waitFor(() => expect(fb.getFleetBackupError('a')).toContain('The database is READ-ONLY'));
+    await vi.waitFor(() => expect(fb.getFleetFenceStuck('a')).toContain('The copy is READ-ONLY'));
+    await vi.waitFor(() => expect(fb.getFleetFenceStuck('a')).toContain('The database is READ-ONLY'));
     // The copy comes back writable; the primary's warning stays.
     pg.fenced.set(copy.containerName, false);
     const tick = await startedWithTick(fb);
     fb.stopFleetBackupScheduler();
     tick();
-    await vi.waitFor(() => expect(fb.getFleetBackupError('a')).not.toContain('The copy is READ-ONLY'));
-    expect(fb.getFleetBackupError('a')).toContain('The database is READ-ONLY');
+    await vi.waitFor(() => expect(fb.getFleetFenceStuck('a')).not.toContain('The copy is READ-ONLY'));
+    expect(fb.getFleetFenceStuck('a')).toContain('The database is READ-ONLY');
   });
 
   it('a foreign fence over a failback\'s stuck one passes it to that lane, so the re-armed run does not lift it', async () => {

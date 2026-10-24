@@ -28,7 +28,7 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
-import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
+import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
 
 export const REPLICATION_ROLE = 'replicator';
@@ -79,12 +79,25 @@ function psqlScript(containerName: string, user: string, db: string, sql: string
   return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
 }
 
-function isContainerRunning(containerName: string): Promise<boolean> {
+/** running true or false as docker says it; null with docker's error when docker could not be asked. */
+type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
+function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout) => {
-      resolve(!err && String(stdout).trim() === 'true');
+    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout, stderr) => {
+      if (!err) return resolve({ running: String(stdout).trim() === 'true' });
+      const text = String(stderr || err || '');
+      resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });
     });
   });
+}
+
+async function isContainerRunning(containerName: string): Promise<boolean> {
+  return (await containerState(containerName)).running === true;
+}
+
+/** The refusal for a database that is not up: docker's own "not running", or why it could not be asked. */
+function dbDownText(state: ContainerState, stopped: string): string {
+  return state.running === null ? `Could not probe the database container (${state.error})` : stopped;
 }
 
 function isIpAddress(host: string): boolean {
@@ -194,8 +207,9 @@ export async function enableFleetReplication(
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
-  if (!await isContainerRunning(fleetDb.containerName)) {
-    return { success: false, error: 'Database container is not running (start the instance first)' };
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) {
+    return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
   }
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
@@ -282,8 +296,9 @@ export async function disableFleetReplication(
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
-  if (!await isContainerRunning(fleetDb.containerName)) {
-    return { success: false, error: 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)' };
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) {
+    return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
   }
 
   const streaming = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
@@ -380,6 +395,8 @@ export interface FleetReplicationStatus {
    * path a REMOTE worker's delivery hands out)? Catches firewall traps before
    * a cross-host standby is pointed at a dead port. */
   reachability?: { ok: boolean; error?: string; ageSeconds: number };
+  /** The database could not be read (live stays absent): docker's or psql's last line. Absent with no live means docker said it is stopped. */
+  probeError?: string;
 }
 
 const PROBE_CACHE_MS = 60_000;
@@ -427,7 +444,9 @@ export async function getFleetReplicationStatus(
     hostPort: repl.hostPort,
   };
   const fleetDb = instance.fleetDb!;
-  if (!await isContainerRunning(fleetDb.containerName)) return status;
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running === null) status.probeError = dbState.error;
+  if (dbState.running !== true) return status;
 
   const probe = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
     `SELECT current_setting('ssl'),
@@ -477,6 +496,8 @@ export async function getFleetReplicationStatus(
       }
     } catch { /* no slots */ }
     status.live = { sslOn: sslOn === 'on', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
+  } else {
+    status.probeError = probeErrorTail(probe.stderr);
   }
   if (opts.probeEndpoint !== false) status.reachability = await cachedReachability(instance);
   return status;
@@ -493,7 +514,8 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
   if (!/^[a-z0-9_]{1,63}$/.test(slot) || !slot.startsWith(FLEET_SLOT_PREFIX)) {
     return { success: false, error: 'Only a fleet standby slot can be dropped here' };
   }
-  if (!await isContainerRunning(fleetDb.containerName)) return { success: false, error: 'Database container is not running' };
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) return { success: false, error: dbDownText(dbState, 'Database container is not running') };
   const result = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
     DO $$ DECLARE s record; BEGIN
       SELECT active INTO s FROM pg_replication_slots WHERE slot_name = '${slot}';
@@ -525,8 +547,9 @@ export async function getReplicaCopyBlock(
   if (!repl.password) {
     return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to mint a fresh credential.' };
   }
-  if (!await isContainerRunning(fleetDb.containerName)) {
-    return { success: false, error: 'Database container is not running' };
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) {
+    return { success: false, error: dbDownText(dbState, 'Database container is not running') };
   }
   const cert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
   if (!cert.ok) return { success: false, error: 'Could not read the server certificate' };

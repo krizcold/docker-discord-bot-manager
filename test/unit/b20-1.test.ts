@@ -134,12 +134,12 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
   it('a lift that lands on the primary leaves the copy stuck-fence warning in place', async () => {
     const fb = await restartedManager();
     await fb.liftConsentFence('a', copy, 'reseed');
-    expect(fb.getFleetBackupError('a')).toContain('READ-ONLY');
+    expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
     pg.liftWorks = true;
     pg.fenced.set(copy.containerName, true);
     pg.onLift = (c) => { if (c === copy.containerName) throw new Error('the copy must not be lifted here'); };
     expect(await fb.liftConsentFence('a', primary, 'x')).toBe('lifted');
-    expect(fb.getFleetBackupError('a')).toContain('READ-ONLY');
+    expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
     expect(onDisk().fleetConsentFenceLeft).toEqual([copy.containerName]);
   });
 
@@ -186,7 +186,7 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
     blockSaves();
     try {
       expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
-      expect(fb.getFleetBackupError('a')).toContain('could not save that the failback owns this fence');
+      expect(fb.getFleetFenceStuck('a')).toContain('could not save that the failback owns this fence');
       expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(true);
     } finally {
       unblockSaves();

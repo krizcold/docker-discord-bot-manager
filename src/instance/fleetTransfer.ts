@@ -172,7 +172,8 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
       const bot = containerManager.getBot(botId);
       if (!bot) return;
       if (!bot.fleetDbReplica) throw new Error('the standby was removed while the transfer waited for it');
-      const live = (await fleetReplica.getFleetReplicaStatus(bot)).live;
+      const replicaStatus = await fleetReplica.getFleetReplicaStatus(bot);
+      const live = replicaStatus.live;
       if (live?.running && live.inRecovery === false) {
         throw new Error('the copy left recovery before the promote ran; adopt it if this machine now serves the fleet, or remove it');
       }
@@ -191,7 +192,7 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
         notStreamingSince = null;
       }
       if (Date.now() > catchDeadline) {
-        const why = !live?.running ? 'the standby container is not running' : `receiver ${live.receiverStatus || 'not connected'}`;
+        const why = !live?.running ? fleetReplica.standbyDownText(replicaStatus) : `receiver ${live.receiverStatus || 'not connected'}`;
         throw new Error(`the standby did not catch up within 10 minutes (${why})`);
       }
       await sleep(POLL_MS);

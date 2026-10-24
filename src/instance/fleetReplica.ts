@@ -24,7 +24,7 @@ import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fl
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
 import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyBlock, readStandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
-import { redactSecrets } from '../config/secretText';
+import { probeErrorTail, redactSecrets } from '../config/secretText';
 import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
 
@@ -120,6 +120,11 @@ function containerRunning(name: string): Promise<boolean | null> {
       resolve(/no such object|no such container/i.test(String(stderr || err)) ? false : null);
     });
   });
+}
+
+/** Why the standby is not up, for a park reason: docker's own "not running", or what stopped the read. */
+export function standbyDownText(status: Pick<FleetReplicaStatus, 'live' | 'probeError'>): string {
+  return status.live ? 'the standby container is not running' : `the standby could not be probed (${status.probeError || 'no output'})`;
 }
 
 function seedContainerName(instance: InstanceConfig): string {
@@ -301,6 +306,8 @@ export interface FleetReplicaStatus {
   /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
   autoReseedStopped?: boolean;
   lastError?: string;
+  /** The standby could not be read (live stays absent): the last line docker or psql gave. */
+  probeError?: string;
   record?: Pick<FleetDbReplicaRecord, 'containerName' | 'publicHost' | 'hostPort' | 'primaryHost' | 'primaryPort'>;
   live?: {
     running: boolean;
@@ -378,7 +385,12 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       replayLagSeconds: lag ? Number(lag) : null,
     };
   } else {
-    status.live = { running: false, inRecovery: null, receiverStatus: null, caughtUp: null, replayLagSeconds: null };
+    const running = await containerRunning(rec.containerName);
+    if (running === false) {
+      status.live = { running: false, inRecovery: null, receiverStatus: null, caughtUp: null, replayLagSeconds: null };
+    } else {
+      status.probeError = probeErrorTail(probe.stderr);
+    }
   }
   return status;
 }
@@ -1294,7 +1306,10 @@ export async function adoptPromotedReplica(
     return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby before adopting' };
   }
   const status = await getFleetReplicaStatus(instance);
-  if (!status.live?.running) {
+  if (!status.live) {
+    return { success: false, error: `Could not read the standby container (${status.probeError || 'no output'}), so it cannot be verified for adoption; try again` };
+  }
+  if (!status.live.running) {
     return { success: false, error: 'The standby container is not running, so it cannot be adopted; start the instance first' };
   }
   // Adopting a copy that still follows somebody would file a standby as a
@@ -1614,7 +1629,8 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     // took the standby service out of the compose, where a start cannot bring
     // it back, and the record that would tell them apart is deleted by a
     // cancel filed in that same window.
-    return refuse('The standby container is not running, or could not be probed, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and rebuild it if a stopped re-seed took the standby service out of its compose');
+    if (!status.live) return refuse(`Could not read the standby container (${status.probeError || 'no output'}), so it cannot be verified as an unpromoted copy; try again`);
+    return refuse('The standby container is not running, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and rebuild it if a stopped re-seed took the standby service out of its compose');
   }
   if (!hasAppHooks(instance)) return refuse('This app declares no lifecycle hooks, so the manager cannot obtain the copy block; remove the replica and provision it again by hand');
   const facts = factsRead ?? await getAppFacts(instance, FACTS_TIMEOUT_MS);

@@ -68,6 +68,7 @@ export interface FleetDbReplication {
   publicHost: string;                  // operator-provided host workers/replicas dial
   certHost: string;                    // host the pinned cert names; differing publicHost forces regeneration
   slotWalKeepMb?: number;              // max_slot_wal_keep_size bound; absent on old records = default applied on next enable
+  disablingSince?: string;             // ISO time a Disable began changing the database; leaves with the record once Disable finishes
 }
 
 // Manager-provisioned streaming REPLICA of another machine's fleet database

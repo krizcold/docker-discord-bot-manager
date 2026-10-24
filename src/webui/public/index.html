@@ -2976,6 +2976,7 @@
         : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : r.probeError ? ` - <span style="color:var(--warning)">could not read the database (${escapeHtml(r.probeError)})</span>` : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
+        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the standby slots dropped). Press Disable replication to finish it.</div>` : ''}
         ${reachHtml}
         ${coveredHtml}${failbackHtml}${failbackOpenHtml}
         ${slotsHtml}

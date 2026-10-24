@@ -297,6 +297,8 @@ export async function disableFleetReplication(
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
+  const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
+  if (!dbEnv) return { success: false, error: 'This app declares no managed database companion (nothing was disabled)' };
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
@@ -321,6 +323,15 @@ export async function disableFleetReplication(
   if (posture.stdout.trim() !== '') {
     return { success: false, error: `This database still holds its writes for a synchronous standby (${posture.stdout.trim()}), and only the instance's bot may release them, once it has recorded that on the witness: it does so within seconds of the standby leaving, so wait for that, or start the bot if it is stopped, then disable again; if the fleet no longer runs on this database, re-seed it as a standby of the current master or remove it instead (nothing was disabled)` };
   }
+  // Every refusal above changed nothing. From here on each step changes the
+  // database, so the record says a Disable is under way until it finishes:
+  // an interrupted one is then shown, and pressing Disable again finishes it.
+  try {
+    const marked = containerManager.updateInstanceFleetDbReplication(instance.id, { ...fleetDb.replication, disablingSince: fleetDb.replication.disablingSince ?? new Date().toISOString() });
+    if (!marked?.fleetDb?.replication) return { success: false, error: 'The instance record is gone (nothing was disabled)' };
+  } catch (err) {
+    return { success: false, error: `could not record that a Disable is under way (nothing was disabled): ${String(err)}` };
+  }
   // With the live setting empty, this clears what an arm that never reached
   // its reload may have left in auto.conf, which would wedge this database's
   // next write (B6 map F18). Separate
@@ -328,11 +339,11 @@ export async function disableFleetReplication(
   // inside the implicit transaction a multi-statement psql -c wraps its input in.
   const relax = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
   if (!relax.ok) {
-    return { success: false, error: `could not relax the synchronous posture (nothing was disabled): ${relax.stderr.trim()}` };
+    return { success: false, error: `could not relax the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relax.stderr.trim()}` };
   }
   const relaxed = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!relaxed.ok) {
-    return { success: false, error: `could not reload after relaxing the synchronous posture (nothing was disabled): ${relaxed.stderr.trim()}` };
+    return { success: false, error: `could not reload after relaxing the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relaxed.stderr.trim()}` };
   }
   const drop = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
     DO $$ DECLARE s record; BEGIN
@@ -341,15 +352,15 @@ export async function disableFleetReplication(
       END LOOP;
     END $$;`);
   if (!drop.ok) {
-    return { success: false, error: `slot drop failed (nothing was disabled): ${drop.stderr.trim()}` };
+    return { success: false, error: `slot drop failed, so the Disable did not finish; press Disable replication again to finish it: ${drop.stderr.trim()}` };
   }
   const left = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
     `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}');`);
   if (!left.ok) {
-    return { success: false, error: `could not confirm the replication slots are gone (nothing else was changed): ${left.stderr.trim()}` };
+    return { success: false, error: `could not confirm the replication slots are gone, so the Disable did not finish; press Disable replication again to finish it: ${left.stderr.trim()}` };
   }
   if (left.stdout.trim() !== '') {
-    return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then disable again (nothing else was changed)` };
+    return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then press Disable replication again to finish it` };
   }
   const revoke = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
   if (!revoke.ok) {
@@ -358,8 +369,6 @@ export async function disableFleetReplication(
 
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
-  const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
-  if (!dbEnv) return { success: false, error: 'This app declares no managed database companion' };
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
   let unedited: string[] = [];
@@ -378,6 +387,8 @@ export async function disableFleetReplication(
 
 export interface FleetReplicationStatus {
   enabled: boolean;
+  /** Set while a Disable that began changing the database has not finished; pressing Disable again finishes it. */
+  disablingSince?: string;
   publicHost?: string;
   hostPort?: number;
   live?: {
@@ -451,6 +462,7 @@ export async function getFleetReplicationStatus(
     publicHost: repl.publicHost,
     hostPort: repl.hostPort,
   };
+  if (repl.disablingSince) status.disablingSince = repl.disablingSince;
   const fleetDb = instance.fleetDb!;
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running === null) status.probeError = dbState.error;
@@ -549,6 +561,7 @@ export async function getReplicaCopyBlock(
   const fleetDb = instance.fleetDb;
   const repl = fleetDb?.replication;
   if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled' };
+  if (repl.disablingSince) return { success: false, error: 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it' };
   // A key-loss-scrubbed password would mint a passwordless DSN that fails as
   // an auth error on the OTHER machine, misdirecting the operator away from
   // the key loss here.

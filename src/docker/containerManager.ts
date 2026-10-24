@@ -1273,13 +1273,14 @@ async function withLoggedBotOp(
   activeOps.set(botId, op);
   const log = logCollectors.get(botId);
   log.beginOp(op);
+  const endStatus = () => { try { return getBot(botId)?.status; } catch { return undefined; } };
   try {
     const result = await fn();
-    if (result.success) log.endOp('done');
-    else log.endOp('failed', result.error || 'unknown error');
+    if (result.success) log.endOp('done', undefined, endStatus());
+    else log.endOp('failed', result.error || 'unknown error', endStatus());
     return result;
   } catch (err) {
-    log.endOp('failed', String(err));
+    log.endOp('failed', String(err), endStatus());
     throw err;
   } finally {
     activeOps.delete(botId);

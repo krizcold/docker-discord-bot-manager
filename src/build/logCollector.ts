@@ -10,6 +10,9 @@
  */
 
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
+
+export const LOG_BOOT_ID = randomUUID();
 
 export interface BuildLogEntry {
   message: string;
@@ -31,6 +34,7 @@ export class LogCollector extends EventEmitter {
   public opStartedAt = 0;
   public opEndedAt = 0;
   public opError: string | null = null;
+  public opEndStatus: string | null = null;
   public lastActivityAt = 0;
 
   constructor(botId: string) {
@@ -47,12 +51,14 @@ export class LogCollector extends EventEmitter {
     this.opStartedAt = Date.now();
     this.opEndedAt = 0;
     this.opError = null;
+    this.opEndStatus = null;
     this.lastActivityAt = this.opStartedAt;
     this.emit('op');
   }
 
-  endOp(outcome: 'done' | 'failed', error?: string): void {
+  endOp(outcome: 'done' | 'failed', error?: string, endStatus?: string): void {
     this.opState = outcome;
+    this.opEndStatus = endStatus || null;
     this.opEndedAt = Date.now();
     this.opError = error || null;
     this.emit('op');

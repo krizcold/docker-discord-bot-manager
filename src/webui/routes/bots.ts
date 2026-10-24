@@ -27,7 +27,7 @@ import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
 import { DeploymentMode, InstanceConfig } from '../../types';
-import { logCollectors } from '../../build/logCollector';
+import { logCollectors, LOG_BOOT_ID } from '../../build/logCollector';
 import { makeUniqueName, resolveNames, checkFolderReuse, sanitizeName } from '../../naming';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -790,7 +790,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
     const writeFrame = (frame: object) => {
       if (res.writable) {
-        res.write(`data: ${JSON.stringify(frame)}\n\n`);
+        res.write(`data: ${JSON.stringify({ ...frame, bootId: LOG_BOOT_ID })}\n\n`);
       }
     };
     const currentStatus = () => containerManager.getBot(botId)?.status || 'unknown';
@@ -809,14 +809,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     for (const log of collector.getLogs()) writeFrame(log);
 
     const writeTerminalFrame = () => {
-      const durationMs = (collector.opEndedAt || Date.now()) - collector.opStartedAt;
+      const endedAt = collector.opEndedAt || Date.now();
+      const ending = {
+        op: collector.opName, durationMs: endedAt - collector.opStartedAt,
+        finalStatus: collector.opEndStatus || 'unknown', currentStatus: currentStatus(), timestamp: endedAt
+      };
       if (collector.opState === 'done') {
-        writeFrame({ type: 'done', op: collector.opName, durationMs, finalStatus: currentStatus(), timestamp: Date.now() });
+        writeFrame({ type: 'done', ...ending });
       } else {
-        writeFrame({
-          type: 'failed', op: collector.opName, durationMs,
-          error: collector.opError || 'unknown error', finalStatus: currentStatus(), timestamp: Date.now()
-        });
+        writeFrame({ type: 'failed', ...ending, error: collector.opError || 'unknown error' });
       }
       res.end();
     };

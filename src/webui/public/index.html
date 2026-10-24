@@ -4034,6 +4034,8 @@
     let terminalSilenceAt = 0;
     let terminalOp = null;
     let terminalFinished = false;
+    let terminalBootId = null;
+    let terminalPendingClear = false;
     const TERMINAL_SILENCE_WARN_MS = 30000;
 
     // ─── Terminal Popup ───
@@ -4046,6 +4048,8 @@
       terminalBotId = botId;
       terminalFinished = false;
       terminalOp = null;
+      terminalBootId = null;
+      terminalPendingClear = false;
       resetTerminalSilence();
 
       const overlay = document.createElement('div');
@@ -4118,11 +4122,10 @@
       if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
       terminalEventSource = new EventSource(`/api/bots/${botId}/build-logs`);
       terminalEventSource.onopen = () => {
-        // Every connection replays full history, so clearing on open is the
+        // Every connection replays full history, so clearing on the first frame is the
         // dedup mechanism for browser auto-reconnect (also resets progress
         // keys, which live only as data-key attributes).
-        const body = document.getElementById('terminal-body');
-        if (body) body.innerHTML = '';
+        terminalPendingClear = true;
         terminalFinished = false;
         resetTerminalSilence();
         setTerminalStatus('Streaming', 'dot-live', '');
@@ -4130,6 +4133,18 @@
       terminalEventSource.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          if (terminalPendingClear) {
+            terminalPendingClear = false;
+            const cutOp = terminalBootId && data.bootId && data.bootId !== terminalBootId && terminalOp;
+            terminalBootId = data.bootId || null;
+            if (cutOp) {
+              addTerminalLog(`[the manager restarted while ${cutOp} was running; it did not finish]`, 'error');
+              markTerminalComplete(false);
+              return;
+            }
+            const body = document.getElementById('terminal-body');
+            if (body) body.innerHTML = '';
+          }
           switch (data.type) {
             case 'status':
               terminalOp = data.op || null;
@@ -4142,13 +4157,19 @@
               resetTerminalSilence();
               break;
             case 'done':
-              if (data.finalStatus && data.finalStatus !== 'running') {
-                addTerminalLog(`Bot remains ${data.finalStatus}`, 'info');
+              if (data.finalStatus && data.finalStatus !== 'unknown') {
+                addTerminalLog(`Bot was ${data.finalStatus} when the ${data.op || 'operation'} ended`, 'info');
+              }
+              if (data.currentStatus && data.currentStatus !== 'unknown' && data.currentStatus !== data.finalStatus) {
+                addTerminalLog(`Bot is ${data.currentStatus} now`, 'info');
               }
               markTerminalComplete(true);
               break;
             case 'failed':
               if (data.error) addTerminalLog(`Error: ${data.error}`, 'error');
+              if (data.finalStatus && data.finalStatus !== 'unknown') {
+                addTerminalLog(`Bot was ${data.finalStatus} when the ${data.op || 'operation'} ended`, 'info');
+              }
               markTerminalComplete(false);
               break;
             case 'idle':

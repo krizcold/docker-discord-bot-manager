@@ -275,7 +275,6 @@ export async function createSource(request: CreateSourceRequest): Promise<Source
 }
 
 async function createSourceCloned(request: CreateSourceRequest): Promise<SourceMeta> {
-  const registry = loadSourceRegistry();
   const sourceId = uuidv4();
   const now = new Date().toISOString();
 
@@ -319,6 +318,13 @@ async function createSourceCloned(request: CreateSourceRequest): Promise<SourceM
     updatedAt: now,
   };
 
+  // Loaded after the last await, so a registry write made during the clone is kept.
+  const registry = loadSourceRegistry();
+  const key = normalizeSourceUrl(request.url);
+  if (Object.values(registry.sources).some(s => !!s.url && normalizeSourceUrl(s.url) === key)) {
+    fs.rmSync(sourceDir, { recursive: true, force: true });
+    throw new Error('A source with this URL already exists');
+  }
   registry.sources[sourceId] = source;
   saveSourceRegistry(registry);
 

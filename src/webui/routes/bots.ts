@@ -26,7 +26,7 @@ import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
-import { DeploymentMode, InstanceConfig } from '../../types';
+import { DeploymentMode, FleetBackupConfig, InstanceConfig } from '../../types';
 import { logCollectors, LOG_BOOT_ID } from '../../build/logCollector';
 import { makeUniqueName, validateName, resolveNames, checkFolderReuse, sanitizeName, InstallSource } from '../../naming';
 import * as fs from 'fs';
@@ -1543,7 +1543,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * PUT /api/bots/:id/fleet-backup-config - Update the sidecar backup schedule
-   * on the INSTANCE (enabled / hour / keep). Mirrors /auto-update.
+   * on the INSTANCE. The body carries only the changed fields (enabled / hour /
+   * keep) and, under `expected`, the stored value each one replaces; a field
+   * changed since answers 409 with what is stored, and nothing is saved.
    */
   router.put('/:id/fleet-backup-config', async (req: Request, res: Response) => {
     try {
@@ -1553,15 +1555,48 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const { enabled, hour, keep } = req.body as { enabled: boolean; hour?: number; keep?: number };
-      if (typeof enabled !== 'boolean') {
-        res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
+      const body = (req.body || {}) as { enabled?: unknown; hour?: unknown; keep?: unknown; expected?: Record<string, unknown> };
+      const changes: Partial<FleetBackupConfig> = {};
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== 'boolean') { res.status(400).json({ success: false, error: 'enabled must be true or false. Nothing was saved.' }); return; }
+        changes.enabled = body.enabled;
+      }
+      if (body.hour !== undefined) {
+        if (typeof body.hour !== 'number' || !Number.isInteger(body.hour) || body.hour < 0 || body.hour > 23) {
+          res.status(400).json({ success: false, error: 'hour must be a whole number from 0 to 23. Nothing was saved.' }); return;
+        }
+        changes.hour = body.hour;
+      }
+      if (body.keep !== undefined) {
+        if (!fleetBackup.isValidFleetBackupKeep(body.keep)) {
+          res.status(400).json({ success: false, error: 'keep must be a whole number from 1 to 365. Nothing was saved.' }); return;
+        }
+        changes.keep = body.keep;
+      }
+      const fields = Object.keys(changes) as Array<keyof FleetBackupConfig>;
+      if (fields.length === 0) {
+        res.status(400).json({ success: false, error: 'No backup setting was given. Nothing was saved.' });
         return;
       }
+      const expected = body.expected && typeof body.expected === 'object' ? body.expected : null;
+      if (!expected || fields.some(f => expected[f] === undefined)) {
+        res.status(400).json({ success: false, error: 'expected must carry the stored value of each changed setting. Nothing was saved.' });
+        return;
+      }
+      const prior: Partial<FleetBackupConfig> = {};
+      for (const f of fields) (prior as Record<string, unknown>)[f] = expected[f];
 
-      const updated = containerManager.updateInstanceFleetBackup(req.params.id, enabled, hour, keep);
-      broadcastToClients(wss, 'bot:updated', publicBot(updated));
-      res.json({ success: true, fleetBackup: updated?.fleetBackup });
+      const result = containerManager.updateInstanceFleetBackup(req.params.id, changes, prior);
+      if (!result.instance) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      if (result.conflict) {
+        res.status(409).json({ success: false, error: 'The backup settings were changed elsewhere. Nothing was saved; the stored settings are shown.', fleetBackup: result.conflict });
+        return;
+      }
+      broadcastToClients(wss, 'bot:updated', publicBot(result.instance));
+      res.json({ success: true, fleetBackup: result.instance.fleetBackup });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

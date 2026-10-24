@@ -479,23 +479,45 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
   return out.sort((a, b) => b.mtime - a.mtime);
 }
 
+export function isValidFleetBackupKeep(keep: unknown): keep is number {
+  return typeof keep === 'number' && Number.isInteger(keep) && keep >= 1 && keep <= 365;
+}
+
 /**
  * Keep the newest `keep` dumps; every pre-*.dump safety file is exempt
  * (pre-restore-, pre-reseed-, pre-rescue-, pre-decommission-): each one is
  * some destructive lane's recovery copy and must never age out under it.
- * So is the dump a failed restore targeted, while its notice stands.
+ * So is the dump a failed restore targeted, while its notice stands, and the
+ * dump just written. When any dump is dated in the future (a clock step
+ * back), every dump is kept. The keep
+ * is the larger of the tick's and the one stored now, so a Keep raised during
+ * the dump holds.
  */
-function trimFleetBackups(botId: string, keep: number): void {
+function trimFleetBackups(botId: string, tickKeep: number, justWritten: string): void {
   const dir = backupDir(botId);
   let trimmable: Array<{ file: string }>;
+  let keep: number;
   try {
+    const stored = containerManager.getBot(botId);
+    const storedKeep = stored ? effectiveFleetBackup(stored).keep : undefined;
+    if (!isValidFleetBackupKeep(tickKeep) || !isValidFleetBackupKeep(storedKeep)) {
+      console.warn(`[FleetBackup] Kept every dump for ${botId}: Keep (${tickKeep} at the tick, ${storedKeep} stored now) is not a whole number from 1 to 365`);
+      return;
+    }
+    keep = Math.max(tickKeep, storedKeep);
+    if (storedKeep !== tickKeep) console.log(`[FleetBackup] Keep for ${botId} changed during the dump (${tickKeep} to ${storedKeep}); kept the newest ${keep}`);
     const target = restoreNotice(botId)?.file;
-    trimmable = listFleetBackups(botId).filter(f => !f.file.startsWith('pre-') && f.file !== target);
+    const all = listFleetBackups(botId);
+    if (all.some(f => f.mtime > Date.now() + 5 * 60000)) {
+      console.warn(`[FleetBackup] Kept every dump for ${botId}: a dump is dated in the future, so the clock may have stepped back`);
+      return;
+    }
+    trimmable = all.filter(f => !f.file.startsWith('pre-') && f.file !== target && f.file !== justWritten);
   } catch (err) {
     console.warn(`[FleetBackup] Kept every dump for ${botId}: ${err}`);
     return;
   }
-  for (const f of trimmable.slice(keep)) {
+  for (const f of trimmable.slice(keep - 1)) {
     try {
       fs.unlinkSync(path.join(dir, f.file));
     } catch (err) {
@@ -585,7 +607,7 @@ async function runScheduledDump(instance: InstanceConfig): Promise<void> {
     if (result.success) {
       lastErrors.delete(instance.id);
       containerManager.setLastFleetBackupAt(instance.id, Date.now());
-      trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep);
+      trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!);
       console.log(`[FleetBackup] Dumped ${instance.displayName} (${instance.id}) -> ${result.file}`);
     } else {
       lastErrors.set(instance.id, result.error || 'unknown error');

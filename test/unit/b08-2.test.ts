@@ -65,9 +65,10 @@ beforeEach(() => {
 afterAll(() => {
   fs.rmSync(h.dir, { recursive: true, force: true });
 });
+let sourceCount = 0;
 
 async function newSource(): Promise<string> {
-  const s = await sourceManager.createSource({ url: 'https://example.invalid/o/r.git', branch: 'main' });
+  const s = await sourceManager.createSource({ url: `https://example.invalid/o/r${++sourceCount}.git`, branch: 'main' });
   return s.id;
 }
 

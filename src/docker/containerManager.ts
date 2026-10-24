@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
-  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun,
+  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -612,21 +612,30 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
 /**
  * Update the sidecar backup schedule (enabled / hour / keep).
  */
-export function updateInstanceFleetBackup(botId: string, enabled: boolean, hour?: number, keep?: number): InstanceConfig | null {
+export function updateInstanceFleetBackup(
+  botId: string,
+  changes: Partial<FleetBackupConfig>,
+  expected?: Partial<FleetBackupConfig>
+): { instance: InstanceConfig | null; conflict?: FleetBackupConfig } {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
-  if (!instance) return null;
+  if (!instance) return { instance: null };
 
   const current = instance.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+  if (expected) {
+    for (const k of Object.keys(expected) as Array<keyof FleetBackupConfig>) {
+      if (expected[k] !== undefined && expected[k] !== current[k]) return { instance, conflict: { ...current } };
+    }
+  }
   instance.fleetBackup = {
-    enabled,
-    hour: hour !== undefined ? Math.max(0, Math.min(23, hour)) : current.hour,
-    keep: keep !== undefined ? Math.max(1, Math.min(365, keep)) : current.keep,
+    enabled: changes.enabled !== undefined ? changes.enabled : current.enabled,
+    hour: changes.hour !== undefined ? changes.hour : current.hour,
+    keep: changes.keep !== undefined ? changes.keep : current.keep,
   };
   instance.updatedAt = new Date().toISOString();
   registry.instances[botId] = instance;
   saveRegistry(registry);
-  return instance;
+  return { instance };
 }
 
 /**

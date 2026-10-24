@@ -4179,11 +4179,20 @@
         showFleetBackupControls(fleetBackupStored);
         return;
       }
+      const body = { expected: {} };
+      for (const [k, v] of Object.entries({ enabled, hour, keep })) {
+        if (v !== fleetBackupStored[k]) { body[k] = v; body.expected[k] = fleetBackupStored[k]; }
+      }
+      if (Object.keys(body.expected).length === 0) return;
       try {
-        const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, { enabled, hour, keep });
-        const fb = res.success && res.fleetBackup;
-        if (fb && typeof fb.enabled === 'boolean' && typeof fb.hour === 'number' && typeof fb.keep === 'number') {
+        const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, body);
+        const fb = res.fleetBackup;
+        const fbValid = fb && typeof fb.enabled === 'boolean' && typeof fb.hour === 'number' && typeof fb.keep === 'number';
+        if (res.success && fbValid) {
           fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+        } else if (!res.success && fbValid) {
+          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+          showMessage('error', res.error || 'The backup settings were changed elsewhere. Nothing was saved.');
         } else if (res.success) {
           showMessage('error', 'Can\'t confirm the backup settings: the manager did not return them. Reopen this window to see what is stored.');
         } else {

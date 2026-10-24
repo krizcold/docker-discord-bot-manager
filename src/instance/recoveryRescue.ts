@@ -38,6 +38,7 @@ import { disarmRecoveryChannel } from './recoveryChannel';
 import { InstanceConfig, RecoveryRescueRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
+import { feedStdin } from '../docker/childStdin';
 
 const PGDATA = '/var/lib/postgresql/data';
 const APP_HOOK_WAIT_MS = 90_000;
@@ -50,7 +51,7 @@ function docker(args: string[], stdin?: string): Promise<{ ok: boolean; stdout: 
   return new Promise(resolve => {
     const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: err ? childFailureText(stderr, err) : String(stderr || '') }));
-    if (stdin !== undefined && child.stdin) { child.stdin.write(stdin); child.stdin.end(); }
+    if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
 

@@ -26,6 +26,7 @@ import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyB
 import { hasAppHooks } from './appHookClient';
 import { redactSecrets } from '../config/secretText';
 import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
+import { feedStdin } from '../docker/childStdin';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
 const FLEET_SLOT_PREFIX = 'fleet_standby';
@@ -233,10 +234,7 @@ async function volExec(volume: string, script: string, stdin?: string, extraMoun
     child.stderr.on('data', d => { stderr += d; });
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
     child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
-    if (stdin !== undefined) {
-      child.stdin.write(stdin);
-      child.stdin.end();
-    }
+    if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
 

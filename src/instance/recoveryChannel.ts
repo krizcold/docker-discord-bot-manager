@@ -28,6 +28,7 @@ import { ensureRsyncDaemon, RECOVERY_CONTROL_PORT } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { childFailureText, redactSecrets } from '../config/secretText';
+import { feedStdin } from '../docker/childStdin';
 
 const DEFAULT_TUNNEL_PORT = 15433;
 const TUNNEL_CONTAINER_PORT = 9450;
@@ -49,7 +50,7 @@ function docker(args: string[], stdin?: string, secretEnv?: Record<string, strin
     const env = secretEnv ? { ...process.env, ...secretEnv } : undefined;
     const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) },
       (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: err ? childFailureText(stderr, err) : String(stderr || '') }));
-    if (stdin !== undefined && child.stdin) { child.stdin.write(stdin); child.stdin.end(); }
+    if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
 

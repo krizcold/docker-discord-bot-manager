@@ -29,6 +29,7 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
+import { feedStdin } from '../docker/childStdin';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -65,10 +66,7 @@ function dbExec(containerName: string, args: string[], stdin?: string): Promise<
     child.stderr.on('data', d => { stderr += d; });
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker exec failed' }); });
     child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
-    if (stdin !== undefined) {
-      child.stdin.write(stdin);
-      child.stdin.end();
-    }
+    if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
 

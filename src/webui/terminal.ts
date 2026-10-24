@@ -25,6 +25,7 @@ import { getBot } from '../docker/containerManager';
 import { getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { grantToApp, grantFd } from '../templates/pcsProcessing';
+import { feedStdin } from '../docker/childStdin';
 
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 
@@ -36,7 +37,7 @@ const CONTAINER_OP_BOUND_S = 12;
 
 // ─── Container resolution / validation ──────────────────────────────────────
 
-function spawnCapture(
+export function spawnCapture(
   cmd: string,
   args: string[],
   opts: { input?: Buffer; timeoutMs?: number } = {}
@@ -57,8 +58,7 @@ function spawnCapture(
     child.stderr.on('data', (d) => { err += d.toString(); });
     child.on('error', () => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err || 'spawn failed', code: 1, timedOut }); });
     child.on('close', (code) => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err, code: code == null ? 1 : code, timedOut }); });
-    if (opts.input) { child.stdin.write(opts.input); }
-    child.stdin.end();
+    feedStdin(child.stdin, opts.input);
   });
 }
 
@@ -1135,6 +1135,7 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
   const launch = (useTty: boolean): void => {
     const child = spawn('docker', buildExecArgs(target, useTty, cols, rows), { windowsHide: true });
     (ws as any).__term = { child } as TermSession;
+    child.stdin?.on('error', () => { /* the exit event tells the browser the session ended */ });
 
     const forward = (d: Buffer) => send(ws, 'terminal:data', { data: d.toString('base64') });
     child.stdout?.on('data', forward);

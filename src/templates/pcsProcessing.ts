@@ -237,7 +237,7 @@ export function processComposeForCasaOS(
   appName: string,
   bot: BotConfig,
   opts: { mode?: DeploymentMode; hostBotDir?: string } = {}
-): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[] } {
+): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[]; networkNotes?: string[] } {
   if ((opts.mode ?? 'casaos') === 'docker') {
     return processComposeForDocker(composeContent, appName, bot, opts.hostBotDir);
   }
@@ -421,7 +421,9 @@ export function processComposeForCasaOS(
     if (serviceName === mainServiceName && pcs.REF_NET) {
       if (!service.network_mode || service.network_mode === 'bridge') {
         if (!service.networks) {
-          service.networks = [];
+          // Keep the project network: without it the service reaches its own
+          // db and redis only over the shared network.
+          service.networks = service.network_mode ? [] : ['default'];
         }
         if (Array.isArray(service.networks)) {
           if (!service.networks.includes(pcs.REF_NET)) {
@@ -649,9 +651,39 @@ export function processComposeForCasaOS(
   }
 
   capServiceLogs(services);
+  const networkNotes = namespaceNamedNetworks(compose, appName);
 
   // ── Single stringify ──
-  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected };
+  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected, networkNotes };
+}
+
+/** The shared networks the manager itself puts bots on. */
+export function platformNetworkNames(): string[] {
+  return [getPCSEnvironment().REF_NET, 'dbm_internal', 'dbm_remote'];
+}
+
+/**
+ * Give every explicitly named, non-external network the name compose would
+ * give it inside this project, so two instances of one compose never join one
+ * network where the service names (db, redis) answer for both. Returns one log
+ * line per renamed network.
+ */
+function namespaceNamedNetworks(compose: Record<string, unknown>, appName: string): string[] {
+  const notes: string[] = [];
+  const nets = compose.networks;
+  if (!nets || typeof nets !== 'object' || Array.isArray(nets)) return notes;
+  const platform = platformNetworkNames();
+  for (const [key, value] of Object.entries(nets as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object') continue;
+    const net = value as Record<string, unknown>;
+    if (net.external || typeof net.name !== 'string') continue;
+    if (platform.includes(net.name) || platform.includes(key)) continue;
+    const name = `${appName}_${key}`;
+    if (net.name === name) continue;
+    net.name = name;
+    notes.push(`[Compose] Network ${key} -> ${name}`);
+  }
+  return notes;
 }
 
 // ─── Standalone (plain Docker) Compose Processing ──────────────────────────
@@ -853,7 +885,7 @@ export function processComposeForDocker(
   appName: string,
   bot: BotConfig,
   hostBotDir?: string
-): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[] } {
+): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[]; networkNotes?: string[] } {
   const pcs = getPCSEnvironment();
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
 
@@ -1027,7 +1059,8 @@ export function processComposeForDocker(
   }
 
   capServiceLogs(services);
-  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false, droppedGatewayBinds };
+  const networkNotes = namespaceNamedNetworks(compose, appName);
+  return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false, droppedGatewayBinds, networkNotes };
 }
 
 /** The in-container targets of the fronting gateway's volumes; empty when there is no gateway. */

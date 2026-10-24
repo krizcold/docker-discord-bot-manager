@@ -46,6 +46,7 @@ interface ComposeService {
   build?: { context: string; dockerfile: string };
   container_name: string;
   restart: string;
+  command?: string[];
   cpu_shares?: number;
   environment?: Record<string, string>;
   volumes?: VolumeMount[];
@@ -80,13 +81,49 @@ interface ComposeFile {
 }
 
 /**
- * Generate docker-compose.yml for a bot
+ * A password one generated backing service needs. initEnv names the service
+ * env key that set it when the volume was first initialized (the server keeps
+ * that value afterwards), or null when nothing about it is stored in a volume.
+ */
+export interface BackingSecret {
+  key: string;
+  service: string;
+  volume: string;
+  initEnv: string | null;
+}
+
+/** The passwords the generated backing services of this detection need. */
+export function generatedBackingSecrets(botId: string, detection: DetectionResult): BackingSecret[] {
+  const appName = `bot-${botId}`;
+  const out: BackingSecret[] = [];
+  const add = (key: string, service: string, initEnv: string | null) => {
+    if (!out.some(s => s.key === key)) out.push({ key, service, volume: `${appName}-${service}-data`, initEnv });
+  };
+  for (const db of detection.databases) {
+    switch (db) {
+      case 'postgres': add('postgres', 'postgres', 'POSTGRES_PASSWORD'); break;
+      case 'mongo': add('mongo', 'mongo', 'MONGO_INITDB_ROOT_PASSWORD'); break;
+      case 'mariadb':
+      case 'mysql':
+        add('mariadb', 'mariadb', 'MARIADB_PASSWORD');
+        add('mariadb-root', 'mariadb', 'MARIADB_ROOT_PASSWORD');
+        break;
+      case 'redis': add('redis', 'redis', null); break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Generate docker-compose.yml for a bot. secrets holds a password for every
+ * key generatedBackingSecrets names for this detection.
  */
 export function generateCompose(
   bot: BotConfig,
   detection: DetectionResult,
   botDir: string,
-  imageName: string
+  imageName: string,
+  secrets: Record<string, string> = {}
 ): string {
   const appName = `bot-${bot.id}`;
 
@@ -147,7 +184,7 @@ export function generateCompose(
   compose.services['bot'] = botService;
 
   // Add backing services (databases + Lavalink) detected from dependencies
-  addBackingServices(compose, bot, appName, detection);
+  addBackingServices(compose, bot, appName, detection, secrets);
 
   // CasaOS metadata
   compose['x-casaos'] = {
@@ -177,18 +214,23 @@ function addBackingServices(
   compose: ComposeFile,
   bot: BotConfig,
   appName: string,
-  detection: DetectionResult
+  detection: DetectionResult,
+  secrets: Record<string, string>
 ): void {
   const botService = compose.services['bot'];
-  const pw = defaultDbPassword();
+  const pw = (key: string): string => {
+    const value = secrets[key];
+    if (!value) throw new Error(`No password is on record for the generated ${key} service`);
+    return value;
+  };
 
   for (const db of detection.databases) {
     switch (db) {
-      case 'postgres': addPostgres(compose, botService, bot.id, appName, pw); break;
-      case 'mongo': addMongo(compose, botService, bot.id, appName, pw); break;
+      case 'postgres': addPostgres(compose, botService, bot.id, appName, pw('postgres')); break;
+      case 'mongo': addMongo(compose, botService, bot.id, appName, pw('mongo')); break;
       case 'mariadb':
-      case 'mysql': addMariadb(compose, botService, bot.id, appName, pw); break;
-      case 'redis': addRedis(compose, botService, bot.id, appName); break;
+      case 'mysql': addMariadb(compose, botService, bot.id, appName, pw('mariadb'), pw('mariadb-root')); break;
+      case 'redis': addRedis(compose, botService, bot.id, appName, pw('redis')); break;
       case 'sqlite': break;
     }
   }
@@ -198,8 +240,9 @@ function addBackingServices(
   }
 }
 
-function defaultDbPassword(): string {
-  return process.env.APP_DEFAULT_PASSWORD || 'casaos';
+/** A URL userinfo password as compose delivers it literally. */
+function urlSecret(pw: string): string {
+  return encodeURIComponent(pw);
 }
 
 function dbLabels(botId: string, serviceType: string): Record<string, string> {
@@ -234,7 +277,7 @@ function addPostgres(compose: ComposeFile, botService: ComposeService, botId: st
     networks: ['internal'],
     environment: {
       POSTGRES_USER: 'bot',
-      POSTGRES_PASSWORD: pw,
+      POSTGRES_PASSWORD: composeEnvValue(pw),
       POSTGRES_DB: 'bot_data'
     },
     volumes: [{ type: 'volume', source: volName, target: '/var/lib/postgresql/data' }],
@@ -242,7 +285,7 @@ function addPostgres(compose: ComposeFile, botService: ComposeService, botId: st
     'x-casaos': { volumes: [{ container: '/var/lib/postgresql/data', description: { en_us: 'PostgreSQL database storage.' } }] }
   };
   addDependency(botService, 'postgres');
-  setBotEnv(botService, { DATABASE_URL: `postgresql://bot:${pw}@postgres:5432/bot_data` });
+  setBotEnv(botService, { DATABASE_URL: `postgresql://bot:${urlSecret(pw)}@${appName}-postgres:5432/bot_data` });
   registerVolume(compose, volName);
 }
 
@@ -257,19 +300,19 @@ function addMongo(compose: ComposeFile, botService: ComposeService, botId: strin
     networks: ['internal'],
     environment: {
       MONGO_INITDB_ROOT_USERNAME: 'bot',
-      MONGO_INITDB_ROOT_PASSWORD: pw
+      MONGO_INITDB_ROOT_PASSWORD: composeEnvValue(pw)
     },
     volumes: [{ type: 'volume', source: volName, target: '/data/db' }],
     labels: dbLabels(botId, 'database'),
     'x-casaos': { volumes: [{ container: '/data/db', description: { en_us: 'MongoDB database storage.' } }] }
   };
   addDependency(botService, 'mongo');
-  const uri = `mongodb://bot:${pw}@mongo:27017/bot_data?authSource=admin`;
+  const uri = `mongodb://bot:${urlSecret(pw)}@${appName}-mongo:27017/bot_data?authSource=admin`;
   setBotEnv(botService, { MONGO_URI: uri, MONGODB_URI: uri });
   registerVolume(compose, volName);
 }
 
-function addMariadb(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string): void {
+function addMariadb(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string, rootPw: string): void {
   if (compose.services['mariadb']) return;
   const volName = `${appName}-mariadb-data`;
   compose.services['mariadb'] = {
@@ -280,26 +323,27 @@ function addMariadb(compose: ComposeFile, botService: ComposeService, botId: str
     networks: ['internal'],
     environment: {
       MARIADB_USER: 'bot',
-      MARIADB_PASSWORD: pw,
+      MARIADB_PASSWORD: composeEnvValue(pw),
       MARIADB_DATABASE: 'bot_data',
-      MARIADB_ROOT_PASSWORD: pw
+      MARIADB_ROOT_PASSWORD: composeEnvValue(rootPw)
     },
     volumes: [{ type: 'volume', source: volName, target: '/var/lib/mysql' }],
     labels: dbLabels(botId, 'database'),
     'x-casaos': { volumes: [{ container: '/var/lib/mysql', description: { en_us: 'MariaDB database storage.' } }] }
   };
   addDependency(botService, 'mariadb');
-  setBotEnv(botService, { DATABASE_URL: `mysql://bot:${pw}@mariadb:3306/bot_data` });
+  setBotEnv(botService, { DATABASE_URL: `mysql://bot:${urlSecret(pw)}@${appName}-mariadb:3306/bot_data` });
   registerVolume(compose, volName);
 }
 
-function addRedis(compose: ComposeFile, botService: ComposeService, botId: string, appName: string): void {
+function addRedis(compose: ComposeFile, botService: ComposeService, botId: string, appName: string, pw: string): void {
   if (compose.services['redis']) return;
   const volName = `${appName}-redis-data`;
   compose.services['redis'] = {
     image: 'redis:7-alpine',
     container_name: `${appName}-redis`,
     restart: 'unless-stopped',
+    command: ['redis-server', '--requirepass', composeEnvValue(pw)],
     cpu_shares: 10,
     networks: ['internal'],
     volumes: [{ type: 'volume', source: volName, target: '/data' }],
@@ -307,7 +351,7 @@ function addRedis(compose: ComposeFile, botService: ComposeService, botId: strin
     'x-casaos': { volumes: [{ container: '/data', description: { en_us: 'Redis data storage.' } }] }
   };
   addDependency(botService, 'redis');
-  setBotEnv(botService, { REDIS_URL: 'redis://redis:6379' });
+  setBotEnv(botService, { REDIS_URL: `redis://:${urlSecret(pw)}@${appName}-redis:6379` });
   registerVolume(compose, volName);
 }
 
@@ -336,7 +380,7 @@ function addLavalink(compose: ComposeFile, botService: ComposeService, botId: st
   };
   addDependency(botService, 'lavalink');
   setBotEnv(botService, {
-    LAVALINK_HOST: 'lavalink',
+    LAVALINK_HOST: `${appName}-lavalink`,
     LAVALINK_PORT: '2333',
     LAVALINK_PASSWORD: 'youshallnotpass'
   });
@@ -367,6 +411,9 @@ function formatComposeYaml(compose: ComposeFile): string {
 
     lines.push(`    container_name: ${service.container_name}`);
     lines.push(`    restart: ${service.restart}`);
+    if (service.command?.length) {
+      lines.push(`    command: [${service.command.map(c => JSON.stringify(c)).join(', ')}]`);
+    }
     lines.push('    logging:');
     lines.push('      driver: json-file');
     lines.push('      options:');

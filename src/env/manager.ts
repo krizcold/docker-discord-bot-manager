@@ -312,6 +312,55 @@ export function storeBrokenDiagnosis(botId: string): string | null {
   return null;
 }
 
+function backingPasswordsPath(botId: string): string {
+  return path.join(getEnvPath(botId), 'backingServices.json');
+}
+
+/** The stored ciphertexts by key; throws when the file exists but cannot be read whole. */
+function readBackingCiphertexts(botId: string): Record<string, string> {
+  const file = backingPasswordsPath(botId);
+  const state = storeFileState(file);
+  if (state.kind === 'absent') return {};
+  const broken = (why: string) => new Error(`The generated database passwords of bot ${botId} (${file}) cannot be read (${why}); restore the file, since the databases it belongs to only accept those passwords`);
+  if (state.kind === 'broken') throw broken(state.error);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch (error: any) {
+    throw broken(error?.message || String(error));
+  }
+  const map = parsed?.encrypted;
+  if (!map || typeof map !== 'object' || Array.isArray(map) || !Object.values(map).every(v => typeof v === 'string')) {
+    throw broken('it is not a password file');
+  }
+  return map as Record<string, string>;
+}
+
+/**
+ * The passwords of a bot's generated backing services, by service key.
+ * Throws when the file cannot be read or a value no longer decrypts.
+ */
+export function getBackingPasswords(botId: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, encrypted] of Object.entries(readBackingCiphertexts(botId))) {
+    const value = decryptOrNull(encrypted);
+    if (value === null) throw new Error(`The generated ${key} password of bot ${botId} no longer decrypts (the encryption key or salt changed); restore the key, since the database only accepts that password`);
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Record new backing-service passwords. A key already on record is never replaced. */
+export function addBackingPasswords(botId: string, add: Record<string, string>): void {
+  const encrypted = readBackingCiphertexts(botId);
+  for (const [key, value] of Object.entries(add)) {
+    if (key in encrypted) throw new Error(`The generated ${key} password of bot ${botId} is already on record; refusing to replace it`);
+    encrypted[key] = encrypt(value);
+  }
+  fs.mkdirSync(getEnvPath(botId), { recursive: true });
+  writePrivateFile(backingPasswordsPath(botId), JSON.stringify({ encrypted }, null, 2));
+}
+
 /**
  * Delete an environment variable
  */

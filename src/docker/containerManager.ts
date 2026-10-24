@@ -39,6 +39,8 @@ import {
   extractComposeBuildArgs,
   findBuildServices,
   replaceBuildsWithImages,
+  generatedBackingSecrets,
+  BackingSecret,
   ComposeResult
 } from '../templates/compose';
 import { applyVariableSubstitution } from '../templates/variableSubstitution';
@@ -86,6 +88,7 @@ import {
   fixPostDeployOwnership,
   executeInstallCommand,
   removeFleetPostgresService,
+  platformNetworkNames,
   splitDockerVolume
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
@@ -2435,7 +2438,8 @@ export function appIdFolderRefusal(instance: InstanceConfig, rawCompose: string)
 /**
  * Refuses a build that would mount storage this instance does not own: a CasaOS
  * data folder kept from another source, or a volume or data folder that another
- * instance's deployed compose declares.
+ * instance's deployed compose declares. Also refuses an external network that
+ * another instance's deployed compose declares.
  */
 export function refuseUnownedStorage(instance: InstanceConfig, appName: string, composeContent: string, isCasaOS: boolean): void {
   if (isCasaOS) {
@@ -2444,6 +2448,152 @@ export function refuseUnownedStorage(instance: InstanceConfig, appName: string, 
   }
   const conflicts = sharedStorageConflicts(instance.id, composeContent);
   if (conflicts.length > 0) throw new Error(`Storage shared with another bot: ${conflicts.join('; ')}`);
+  const shared = sharedNetworkConflicts(instance.id, composeContent);
+  if (shared.length > 0) throw new Error(`Network shared with another bot: ${shared.join('; ')}`);
+}
+
+/**
+ * The docker names of the networks a compose joins outside its own project:
+ * external ones, and ones with an explicit name. The manager's own shared
+ * networks are left out. Null when the compose cannot be parsed.
+ */
+function namedNetworks(composeContent: string): { external: string[]; named: string[] } | null {
+  const parsed = YAML.parseDocument(composeContent);
+  if (parsed.errors.length > 0) return null;
+  const doc: any = parsed.toJSON();
+  const out = { external: [] as string[], named: [] as string[] };
+  const nets = doc && typeof doc === 'object' ? doc.networks : null;
+  if (!nets || typeof nets !== 'object') return out;
+  const platform = platformNetworkNames();
+  for (const [key, v] of Object.entries(nets) as Array<[string, any]>) {
+    const external = !!(v && typeof v === 'object' && v.external);
+    const name = v && typeof v === 'object' && typeof v.name === 'string' ? v.name
+      : (external && typeof v.external === 'object' && typeof v.external.name === 'string') ? v.external.name
+      : external ? key : null;
+    if (name === null || platform.includes(name)) continue;
+    (external ? out.external : out.named).push(name);
+  }
+  return out;
+}
+
+/**
+ * The external networks this compose would share with another instance's
+ * deployed compose: on a shared network a service name such as db or redis
+ * answers with both instances' containers. An unreadable compose of another
+ * instance is a conflict too, since its networks cannot be checked.
+ */
+export function sharedNetworkConflicts(botId: string, composeContent: string): string[] {
+  const own = namedNetworks(composeContent);
+  if (own === null) return ['the compose about to be written cannot be parsed, so its networks could not be checked against other bots'];
+  if (own.external.length === 0) return [];
+  const conflicts: string[] = [];
+  for (const other of Object.values(loadRegistry().instances)) {
+    if (other.id === botId) continue;
+    const composePath = resolveComposePath(other.id, other.sanitizedName);
+    let body: string;
+    try {
+      body = fs.readFileSync(composePath, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') continue;
+      conflicts.push(`${other.displayName}'s compose (${composePath}) cannot be read (${err?.code || err?.message || err}), so its networks could not be checked`);
+      continue;
+    }
+    const theirs = namedNetworks(body);
+    if (theirs === null) {
+      conflicts.push(`${other.displayName}'s compose (${composePath}) cannot be parsed, so its networks could not be checked`);
+      continue;
+    }
+    for (const n of own.external) {
+      if (theirs.external.includes(n) || theirs.named.includes(n)) {
+        conflicts.push(`network ${n} is also used by ${other.displayName}; services named db or redis would answer for both bots`);
+      }
+    }
+  }
+  return conflicts;
+}
+
+/**
+ * Where a generated database's password was set when its volume was first
+ * initialized: the deployed compose service that mounts that volume. Null when
+ * no deployed compose mounts it. Throws when the value cannot be confirmed.
+ */
+function deployedInitPassword(instance: InstanceConfig, secret: BackingSecret): string | null {
+  const dataRoot = process.env.DATA_ROOT || '/DATA';
+  const candidates = [
+    path.join(getBotDir(instance.id), 'docker-compose.yml'),
+    path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName, 'docker-compose.yml'),
+  ];
+  const cannot = (why: string) => new Error(`Could not confirm the password the ${secret.service} database was created with (${why}); a different password would lock the bot out of it, so the build stopped`);
+  for (const file of candidates) {
+    let body: string;
+    try {
+      body = fs.readFileSync(file, 'utf-8');
+    } catch (err: any) {
+      if (err?.code === 'ENOENT') continue;
+      throw cannot(`${file} cannot be read: ${err?.code || err?.message || err}`);
+    }
+    // failsafe: every scalar stays the text compose read.
+    const parsed = YAML.parseDocument(body, { schema: 'failsafe' });
+    if (parsed.errors.length > 0) throw cannot(`${file} cannot be parsed`);
+    const doc: any = parsed.toJSON();
+    const services = doc && typeof doc === 'object' && doc.services && typeof doc.services === 'object' ? doc.services : {};
+    for (const svc of Object.values(services) as any[]) {
+      const mounts = Array.isArray(svc?.volumes) ? svc.volumes : [];
+      const mountsVolume = mounts.some((v: any) => typeof v === 'string'
+        ? v.split(':')[0] === secret.volume
+        : v && typeof v === 'object' && v.source === secret.volume);
+      if (!mountsVolume) continue;
+      const env = svc.environment;
+      let value: unknown;
+      if (Array.isArray(env)) {
+        const entry = env.find((e: unknown) => typeof e === 'string' && e.startsWith(`${secret.initEnv}=`));
+        value = entry === undefined ? undefined : entry.slice(secret.initEnv!.length + 1);
+      } else if (env && typeof env === 'object') {
+        value = env[secret.initEnv!];
+      }
+      if (typeof value !== 'string' || value === '') throw cannot(`${file} sets no ${secret.initEnv}`);
+      if (value.replace(/\$\$/g, '').includes('$')) throw cannot(`${file} sets ${secret.initEnv} through a variable`);
+      return composeEnvLiteral(value);
+    }
+  }
+  return null;
+}
+
+/**
+ * The passwords of the generated backing services, on record before the
+ * compose is written. A database volume initialized earlier keeps the password
+ * its deployed compose set; anything new gets a random password. Throws when
+ * an existing volume's password cannot be confirmed.
+ */
+export function generatedBackingPasswords(instance: InstanceConfig, detection: DetectionResult): { passwords: Record<string, string>; notes: string[] } {
+  const needed = generatedBackingSecrets(instance.id, detection);
+  if (needed.length === 0) return { passwords: {}, notes: [] };
+  const stored = envManager.getBackingPasswords(instance.id);
+  const add: Record<string, string> = {};
+  const notes: string[] = [];
+  for (const secret of needed) {
+    if (stored[secret.key]) continue;
+    if (secret.initEnv) {
+      const existing = deployedInitPassword(instance, secret);
+      if (existing !== null) {
+        add[secret.key] = existing;
+        notes.push(`[Compose] Recorded the password the ${secret.service} database was created with (${secret.initEnv})`);
+        continue;
+      }
+      const volume = `${instance.sanitizedName}_${secret.volume}`;
+      const state = dockerClient.volumeState(volume);
+      if (state === 'exists') {
+        throw new Error(`Volume ${volume} already holds the ${secret.service} database, but the password it was created with is not on record, and a new password would lock the bot out of it. Restore the deployed compose that created it, then build again`);
+      }
+      if (state === 'unknown') {
+        throw new Error(`Could not confirm whether volume ${volume} already holds the ${secret.service} database (docker did not answer), so no new password was set; build again once docker answers`);
+      }
+    }
+    add[secret.key] = crypto.randomBytes(24).toString('base64url');
+    notes.push(`[Compose] Generated a password for the ${secret.service} service (${secret.key})`);
+  }
+  if (Object.keys(add).length > 0) envManager.addBackingPasswords(instance.id, add);
+  return { passwords: { ...stored, ...add }, notes };
 }
 
 export function keptFolderRefusal(instance: InstanceConfig, appName: string): string | null {
@@ -4089,6 +4239,7 @@ async function buildGitInstanceHeld(
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
       droppedGatewayBinds = processed.droppedGatewayBinds || [];
+      for (const note of processed.networkNotes || []) emit(note, 'info');
     }
 
     if (fleetDb) {
@@ -4140,12 +4291,15 @@ async function buildGitInstanceHeld(
       usedGeneratedDockerfile = true;
     }
 
-    composeContent = generateCompose(botWithEnv, detection, botDir, imageName);
+    const backing = generatedBackingPasswords(instance, detection);
+    for (const note of backing.notes) emit(note, 'info');
+    composeContent = generateCompose(botWithEnv, detection, botDir, imageName, backing.passwords);
     appName = instance.sanitizedName;
     {
       const processed = processComposeForCasaOS(composeContent, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
+      for (const note of processed.networkNotes || []) emit(note, 'info');
     }
     buildTarget = 'bot';
   }

@@ -1465,7 +1465,7 @@
               ? '<span class="update-badge">Update available</span>'
               : '';
             const pendingBadge = bot.pendingApply
-              ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached), or a start could not apply env or config changes, and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
+              ? '<span class="update-badge" title="The deployed project changed while this bot was running (a build finished, or a database standby was attached, or env was saved while it ran), or a start could not apply env or config changes, and is not applied yet. Apply recreates only the containers whose definition changed; Restart recreates everything.">Not applied</span>'
               : '';
 
             // Fleet DB backup warning (failed or stale sidecar dump)
@@ -2351,6 +2351,10 @@
           const wrapper = semanticWrapper(container, sem);
           const el = wrapper && wrapper.querySelector('.env-row .env-value');
           if (!el) continue;
+          if (sem === 'peer-secret' && m.secretUnfilled) {
+            if (el.dataset.autofilled === '1') { setEnvInputValue(el, ''); delete el.dataset.autofilled; }
+            continue;
+          }
           if (el.value.trim() !== '' && el.dataset.autofilled !== '1') continue;
           setEnvInputValue(el, value);
           el.dataset.autofilled = '1';
@@ -2366,6 +2370,7 @@
       const machineOwned = sem => {
         const el = rowEl(sem);
         const m = chosen();
+        if (sem === 'peer-secret' && m && m.secretUnfilled) return false;
         const want = !m ? null : sem === 'peer-list' ? candidatesOf(m).join(',') : m.controlSecret;
         return !el || el.dataset.autofilled === '1' || (want !== null && el.value.trim() === String(want ?? ''));
       };
@@ -2390,6 +2395,8 @@
         if (secretWrapper) secretWrapper.dataset.forceHide = local && machineOwned('peer-secret') ? '1' : '';
         tip.textContent = locSel.value !== 'local'
           ? "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker)."
+          : chosen() && chosen().secretUnfilled
+            ? chosen().secretUnfilled
           : kept
             ? "A value you entered is kept and shown below; clear it to use the selected node's value."
             : 'Connection and secret are filled automatically from the selected node.';
@@ -2585,7 +2592,10 @@
         const open = stillOpen();
         if (res.success) {
           const gone = res.removed || [];
-          showMessage('success', gone.length ? `Environment variables of ${name} saved; removed ${gone.join(', ')}` : `Environment variables of ${name} saved`);
+          const saved = gone.length ? `Environment variables of ${name} saved; removed ${gone.join(', ')}` : `Environment variables of ${name} saved`;
+          if (res.warning) showMessage('error', `${saved}. ${res.warning}`);
+          else if (res.notApplied) showMessage('success', `${saved}. The running bot still uses the old values until you Apply or Restart it.`);
+          else showMessage('success', saved);
           if (open) hideEnvEditor();
           loadBots();
         } else {
@@ -5956,6 +5966,8 @@
               showMessage('error', res.error || 'Failed to save');
               return;
             }
+            if (res.warning) showMessage('error', `${originalKey} saved. ${res.warning}`);
+            else if (res.notApplied) showMessage('success', `${originalKey} saved. The running bot still uses the old value until you Apply or Restart it.`);
           }
         }
         row.classList.remove('dirty');

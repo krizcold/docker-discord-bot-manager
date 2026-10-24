@@ -327,7 +327,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const masters: Array<{
         id: string; name: string; masterUrl: string | null; localUrl: string | null;
-        secretSet: boolean; controlSecret: string; localCandidates: string[]; publicCandidates: string[];
+        secretSet: boolean; controlSecret: string; secretUnfilled: string | null; localCandidates: string[]; publicCandidates: string[];
       }> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
@@ -347,12 +347,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // Positions in dialTargetOrder are disjoint, so a node cannot match
           // both lists; the id filter stays as a cheap invariant guard.
           const peers = controlSecret === '' ? [] : secondaries.filter(b => b.secret === controlSecret && b.id !== bot.id);
+          // The wizard fills only the secret the node was deployed with.
+          let secretUnfilled: string | null = null;
+          if (cp.groupSecretEnv && controlSecret !== '') {
+            const deployed = containerManager.deployedComposeEnvValues(bot.id, [cp.groupSecretEnv], true);
+            if (deployed === null) secretUnfilled = `The deployed setup of ${bot.displayName} could not be read, so its fleet secret is not filled in. Paste it from that node (its Usage tab > Connect a worker).`;
+            else if (deployed.length === 0 || deployed.some(d => d.value.trim() !== controlSecret)) secretUnfilled = `The saved fleet secret of ${bot.displayName} is not the one it was deployed with, so it is not filled in. Restart ${bot.displayName} to apply its saved settings, then reopen this form.`;
+          }
           const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
           const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
           const publicCandidates = dedupe([addrs.publicUrl, ...peers.map(p => p.publicUrl)]);
           masters.push({
             id: bot.id, name: bot.displayName, masterUrl: addrs.publicUrl, localUrl: addrs.localUrl,
-            secretSet: controlSecret !== '', controlSecret, localCandidates, publicCandidates,
+            secretSet: controlSecret !== '', controlSecret: secretUnfilled ? '' : controlSecret, secretUnfilled, localCandidates, publicCandidates,
           });
         } catch {
           // an unreadable instance must not break the list
@@ -1118,6 +1125,14 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // (sensitive values encrypted), the record keeps the non-sensitive keys.
       await containerManager.updateBot(req.params.id, { envVars: { ...vars } });
       const removal = containerManager.removeStoredEnvKeys(req.params.id, toRemove);
+      // A running bot keeps the env it was deployed with until Apply or Restart applies the save.
+      let pendingUnrecorded = '';
+      try {
+        await containerManager.markPendingApplyIfRunning(req.params.id);
+      } catch (err) {
+        pendingUnrecorded = err instanceof Error ? err.message : String(err);
+      }
+      const notApplied = containerManager.getBot(req.params.id)?.pendingApply === true;
 
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
@@ -1132,7 +1147,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         });
         return;
       }
-      res.json({ success: true, removed: removal.removed, valid: validation.valid, missing: validation.missing });
+      res.json({
+        success: true, removed: removal.removed, valid: validation.valid, missing: validation.missing,
+        ...(notApplied ? { notApplied: true } : {}),
+        ...(pendingUnrecorded ? { warning: `Saved, but could not record that the running bot needs Apply or Restart to apply it: ${pendingUnrecorded}` } : {}),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

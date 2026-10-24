@@ -693,16 +693,18 @@ export function updateInstanceFleetDbPinsWarning(botId: string, warning: string 
 /**
  * Every value a deployed compose copy's app service sets for the given keys
  * (one entry per copy that sets it), or null when a copy could not be read.
+ * With activeOnly, only the copy a start deploys from is read.
  */
-export function deployedComposeEnvValues(botId: string, keys: string[]): Array<{ key: string; value: string }> | null {
+export function deployedComposeEnvValues(botId: string, keys: string[], activeOnly = false): Array<{ key: string; value: string }> | null {
   const instance = getBot(botId);
   if (!instance) return [];
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const found: Array<{ key: string; value: string }> = [];
-  for (const composePath of [
+  const paths = activeOnly ? [resolveComposePath(botId, instance.sanitizedName)] : [
     path.join(getBotDir(botId), 'docker-compose.yml'),
     path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName, 'docker-compose.yml'),
-  ]) {
+  ];
+  for (const composePath of paths) {
     if (!fs.existsSync(composePath)) continue;
     try {
       const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();

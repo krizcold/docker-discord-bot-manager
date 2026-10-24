@@ -1554,6 +1554,14 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
   }
 }
 
+/** The remedy for a copy held by a failback that is over, worded from whether the demoted node can receive the current primary's copy block. */
+export function coveredOverRefusal(facts: Pick<AppFacts, 'backupMaster' | 'copyBlockCurrent'> | null): string {
+  const head = "This copy is the returning master's, and its bot is still in the follower hold of a failback that is over (the node it follows no longer stands in for it)";
+  if (facts?.copyBlockCurrent === true) return `${head}; demote the node from its Fleet tab to release the copy, then Re-seed now`;
+  if (facts?.backupMaster === true) return `${head}; demote the node from its Fleet tab to release the copy, then Re-seed now once the current primary's copy block reaches this node`;
+  return `${head}. Demoted, this node is a co-worker, and a co-worker is not sent the current primary's copy block, so Re-seed now would have nothing to follow. Remove the replica and provision it again from the copy block on the current primary's Database modal, or set BOT_NODE_ROLE=backup-master on this node and restart it first, then demote it from its Fleet tab and Re-seed now once the block reaches it`;
+}
+
 /**
  * Re-seed an existing standby whose slot the primary reports lost (20.14). The
  * orchestrator's entry: it keys on the manager's OWN standby record and never
@@ -1601,7 +1609,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   }
   if (standing?.role === 'covered') {
     return { success: false, error: standing.namesThisNode === false
-      ? `This copy is the returning master's, and its bot is still in the follower hold of a failback that is over (the node it follows no longer stands in for it); demote the node from its Fleet tab to release the copy, then re-seed it`
+      ? coveredOverRefusal(factsRead?.facts ?? null)
       : `This copy is the returning master's, held for the failback from ${standing.standInNodeId ? `its stand-in ${shortId(standing.standInNodeId)}` : 'the node holding the fleet'}; it is the copy the failback promotes, so it is not re-seeded from here` };
   }
   if (trigger === 'operator') patchLedger(instance.id, () => undefined);

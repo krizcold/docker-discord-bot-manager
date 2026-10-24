@@ -99,6 +99,8 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
 
 const HEALTH_PUSH_MS = 15000;
 
+const FLEET_MASTER_FACTS_TIMEOUT_MS = 3000;
+
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
 
@@ -273,6 +275,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.get('/fleet/masters', async (req: Request, res: Response) => {
     try {
       const dataRoot = process.env.DATA_ROOT || '/DATA';
+      // Only the lane this mode's deploy attaches: casaos routes APP_DOMAIN, docker BOT_DOMAIN_BASE.
+      const mode = await getDeploymentMode();
       // Deployed compose, resolved like containerManager's resolveComposePath:
       // CasaOS metadata path when present, else the bot-dir copy. Schemes come
       // from the bot's own record: the public route is TLS-terminated at the
@@ -288,7 +292,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         // Public URL a genuinely cross-host worker uses. Same URL the
         // injection path authors under the record's publicUrl key; null when no
         // publicly-trusted base exists for the mode (e.g. standalone/Windows).
-        const host = fleetPublicHost(bot.sanitizedName);
+        const host = fleetPublicHost(bot.sanitizedName, mode);
         const publicUrl = host ? `${urlScheme.secure}://${host}` : null;
 
         // Local URL a same-host/same-manager worker should dial instead, so the
@@ -326,10 +330,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         }
       }
 
-      const masters: Array<{
+      type MasterEntry = {
         id: string; name: string; masterUrl: string | null; localUrl: string | null;
         secretSet: boolean; controlSecret: string; secretUnfilled: string | null; localCandidates: string[]; publicCandidates: string[];
-      }> = [];
+        unanswered: string | null;
+      };
+      // One slot per candidate in record order; a slot settles to null when the app says it is not a live master.
+      const slots: Array<Promise<MasterEntry | null>> = [];
       for (const bot of containerManager.getAllBots()) {
         try {
           const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
@@ -358,17 +365,30 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
           const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
           const publicCandidates = dedupe([addrs.publicUrl, ...peers.map(p => p.publicUrl)]);
-          masters.push({
+          const entry: MasterEntry = {
             id: bot.id, name: bot.displayName, masterUrl: addrs.publicUrl, localUrl: addrs.localUrl,
             secretSet: controlSecret !== '', controlSecret: secretUnfilled ? '' : controlSecret, secretUnfilled, localCandidates, publicCandidates,
-          });
+            unanswered: null,
+          };
+          const cantConfirm = `${bot.displayName} did not answer, so the manager can't confirm it is running as the fleet's master.`;
+          const unanswered = (): MasterEntry => ({ ...entry, unanswered: cantConfirm });
+          if (!hasAppHooks(bot)) {
+            slots.push(Promise.resolve(unanswered()));
+            continue;
+          }
+          slots.push(appLifecycle.getAppFacts(bot, FLEET_MASTER_FACTS_TIMEOUT_MS).then(read => {
+            const f = read.success ? read.facts : undefined;
+            if (!f) return unanswered();
+            return f.running && f.initialized && f.role === 'master' && !f.superseded && !f.followerHold ? entry : null;
+          }, unanswered));
         } catch {
           // an unreadable instance must not break the list
         }
       }
+      const masters = (await Promise.all(slots)).filter((m): m is MasterEntry => m !== null);
       // A full template rather than a bare host suffix, so the browser never
       // composes a URL (or assumes a scheme) itself.
-      const suffix = fleetHostSuffix();
+      const suffix = fleetHostSuffix(mode);
       res.json({ success: true, fleetUrlTemplate: suffix === null ? null : `wss://{name}${suffix}`, masters });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

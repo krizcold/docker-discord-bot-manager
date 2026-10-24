@@ -1366,8 +1366,8 @@ export function getFleetTransferService(composeContent: string): { service: stri
  * host construction: `<name>-fleet-<APP_DOMAIN>` on Yundera,
  * `<name>-fleet.<BOT_DOMAIN_BASE>` on the remote docker stack.
  */
-export function fleetPublicHost(sanitizedName: string): string | null {
-  const suffix = fleetHostSuffix();
+export function fleetPublicHost(sanitizedName: string, mode?: DeploymentMode): string | null {
+  const suffix = fleetHostSuffix(mode);
   return suffix === null ? null : `${sanitizedName}${suffix}`;
 }
 
@@ -1379,11 +1379,11 @@ export function fleetPublicHost(sanitizedName: string): string | null {
  * custom-CA gateway cert), the ACME-issued `<base>` on the remote stack. Lets
  * clients preview a fleet URL before install.
  */
-export function fleetHostSuffix(): string | null {
+export function fleetHostSuffix(mode?: DeploymentMode): string | null {
   const appDomain = process.env.APP_DOMAIN || '';
-  if (appDomain) return `-fleet-${appDomain}`;
+  if (appDomain && mode !== 'docker') return `-fleet-${appDomain}`;
   const domainBase = process.env.BOT_DOMAIN_BASE || '';
-  if (domainBase) return `-fleet.${domainBase}`;
+  if (domainBase && mode !== 'casaos') return `-fleet.${domainBase}`;
   return null;
 }
 

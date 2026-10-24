@@ -2320,7 +2320,7 @@
 
       const candidatesOf = m => (Array.isArray(m.localCandidates) && m.localCandidates.length)
         ? m.localCandidates : [m.localUrl].filter(Boolean);
-      const options = joinable.map((m, i) => `<option value="${i}">${escapeHtml(m.name)}</option>`).join('');
+      const options = joinable.map((m, i) => `<option value="${i}">${escapeHtml(m.name)}${m.unanswered ? ' (not answering)' : ''}</option>`).join('');
       const block = document.createElement('div');
       block.className = 'fleet-master-prefill';
       block.dataset.showKey = roleKey;
@@ -2398,6 +2398,8 @@
         if (secretWrapper) secretWrapper.dataset.forceHide = local && machineOwned('peer-secret') ? '1' : '';
         tip.textContent = locSel.value !== 'local'
           ? "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker)."
+          : chosen() && chosen().unanswered
+            ? chosen().unanswered + (chosen().secretUnfilled ? ' ' + chosen().secretUnfilled : '')
           : chosen() && chosen().secretUnfilled
             ? chosen().secretUnfilled
           : kept
@@ -2472,9 +2474,10 @@
         </div>`;
       const urlSpan = el.querySelector('.fleet-url-value');
       const labelEl = el.querySelector('.fleet-url-label');
-      const urlOf = () => fleetUrlTemplate.replace('{name}', sanitizeNamePreview(nameInput.value.trim()));
+      const urlOf = () => installValidatedName ? fleetUrlTemplate.replace('{name}', installValidatedName) : '';
       const update = () => {
-        urlSpan.textContent = urlOf();
+        urlSpan.textContent = urlOf() || 'Shown once the name is checked.';
+        btn.disabled = !urlOf();
         const position = targetOrder.indexOf(semanticEnvValue(container, 'peer-role'));
         const text = position < 0 ? null : FLEET_URL_PREVIEW_TEXT[Math.min(position, FLEET_URL_PREVIEW_TEXT.length - 1)];
         if (text) {
@@ -2482,11 +2485,12 @@
           labelEl.title = text.title;
         }
       };
+      const btn = el.querySelector('button');
       update();
       nameInput.addEventListener('input', update);
+      document.addEventListener('install-name-validated', update);
       container.addEventListener('change', update);
-      const btn = el.querySelector('button');
-      btn.addEventListener('click', () => copyToClipboard(btn, urlOf(), 'Copy'));
+      btn.addEventListener('click', () => { if (urlOf()) copyToClipboard(btn, urlOf(), 'Copy'); });
       roleWrapper.insertAdjacentElement('afterend', el);
       updateEnvConditionals(container);
     }
@@ -5615,8 +5619,16 @@
       return name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
     }
 
+    // sanitizedName from the latest validate-name answer for the current input; null until it answers.
+    let installValidatedName = null;
+    const setInstallValidatedName = (value) => {
+      installValidatedName = value;
+      document.dispatchEvent(new Event('install-name-validated'));
+    };
+
     async function onNameInput() {
       const name = document.getElementById('install-name').value.trim();
+      setInstallValidatedName(null);
       const preview = document.getElementById('install-name-preview');
       const error = document.getElementById('install-name-error');
       if (!name) {
@@ -5632,6 +5644,7 @@
       nameValidationTimeout = setTimeout(async () => {
         try {
           const res = await api('GET', `/validate-name?name=${encodeURIComponent(name)}`);
+          if (document.getElementById('install-name').value.trim() !== name) return;
           const reuseRow = document.getElementById('install-reuse-row');
           if (reuseRow) {
             // Clear any "loaded" state when name changes
@@ -5647,6 +5660,7 @@
               ? ` <span style="opacity:0.7">(saved as "${escapeHtml(res.displayName)}" to keep it unique)</span>`
               : '';
             preview.innerHTML = `Compose name: <span class="sanitized">${escapeHtml(res.sanitizedName)}</span>${note}`;
+            setInstallValidatedName(res.sanitizedName);
             if (reuseRow) reuseRow.style.display = res.reuseAvailable ? 'flex' : 'none';
           } else {
             error.textContent = res.errors.join(', ');

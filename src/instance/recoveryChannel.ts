@@ -46,16 +46,16 @@ function rsyncContainerName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-recovery-rsyncd`;
 }
 
-/** secretEnv: values a `-e NAME` argument (no value) hands the container from the CLI's own environment, so they are in no argv. timedOut: the CLI was killed at DOCKER_TIMEOUT_MS, and the daemon may still carry the call out. */
-function docker(args: string[], stdin?: string, secretEnv?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string; timedOut: boolean }> {
+/** secretEnv: values a `-e NAME` argument (no value) hands the container from the CLI's own environment, so they are in no argv. A read is killed at DOCKER_TIMEOUT_MS; a call that writes (writes: true) is not, since the daemon carries out a killed call anyway. */
+function docker(args: string[], opts: { writes?: boolean; stdin?: string; secretEnv?: Record<string, string> } = {}): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  const { stdin, secretEnv } = opts;
   return new Promise(resolve => {
     const env = secretEnv ? { ...process.env, ...secretEnv } : undefined;
-    const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) },
+    const child = execFile('docker', args, { ...(opts.writes ? {} : { timeout: DOCKER_TIMEOUT_MS }), maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) },
       (err, stdout, stderr) => resolve({
         ok: !err,
         stdout: String(stdout || ''),
         stderr: err ? childFailureText(stderr, err) : String(stderr || ''),
-        timedOut: !!err && (err as { killed?: boolean }).killed === true,
       }));
     if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
@@ -112,8 +112,8 @@ async function databaseIdentity(instance: InstanceConfig): Promise<Record<string
   return systemId ? { systemId, timeline: Number(timeline), checkpointLsn, capturedAt: Date.now() } : {};
 }
 
-/** left: what a failed spawn could not remove or could not read, still running with only this record naming it; runTimedOut: the relay's docker run did not answer. */
-async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string; left?: string; runTimedOut?: boolean }> {
+/** left: what a failed spawn could not remove or could not read, still running with only this record naming it. */
+async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string; left?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'instance no longer has a managed fleet database; disarm the recovery channel' };
   // A key-loss-scrubbed credential would spawn a relay that exits fatally and
@@ -153,11 +153,11 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
   }
   args.push(image.image!, 'node', '/app/dist/recovery/relay.js');
 
-  await docker(['rm', '-f', record.containerName]);
+  await docker(['rm', '-f', record.containerName], { writes: true });
   const secrets: Record<string, string> = { RELAY_TOKEN: record.token };
   if (record.mode === 'receiver') secrets.RELAY_TLS_KEY = record.tlsKey!;
-  const run = await docker(args, undefined, secrets);
-  if (!run.ok) return { ok: false, error: `could not start the relay container: ${redactSecrets(run.stderr.trim(), Object.values(secrets)).split('\n').pop()}`, runTimedOut: run.timedOut };
+  const run = await docker(args, { writes: true, secretEnv: secrets });
+  if (!run.ok) return { ok: false, error: `could not start the relay container: ${redactSecrets(run.stderr.trim(), Object.values(secrets)).split('\n').pop()}` };
   if (record.mode === 'source') {
     // The seed daemon belongs to the armed state: arm = fully ready to serve
     // the rescue, disarm/delete already remove it by name.
@@ -165,9 +165,8 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
     if (!daemon.ok) {
       const left: string[] = [];
       for (const name of daemon.unknown ? [record.containerName] : [record.containerName, rsyncContainerName(instance)]) {
-        const rm = await docker(['rm', '-f', name]);
-        if (daemon.runTimedOut && name === rsyncContainerName(instance)) left.push(`docker did not answer the start of ${name} within ${DOCKER_TIMEOUT_MS / 1000} s, so it may still be created after the removal`);
-        else if (!rm.ok && !/no such container/i.test(rm.stderr)) left.push(`${name} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`);
+        const rm = await docker(['rm', '-f', name], { writes: true });
+        if (!rm.ok && !/no such container/i.test(rm.stderr)) left.push(`${name} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`);
       }
       if (daemon.unknown) left.push(`docker did not say whether the rsync daemon ${rsyncContainerName(instance)} runs`);
       return { ok: false, error: daemon.error, left: left.length > 0 ? left.join('; and ') : undefined };
@@ -322,14 +321,12 @@ async function armSourceImpl(
 async function rollBackArm(
   instance: InstanceConfig,
   record: RecoveryChannelRecord,
-  spawned: { error?: string; left?: string; runTimedOut?: boolean },
+  spawned: { error?: string; left?: string },
 ): Promise<{ success: false; error: string }> {
   let left = spawned.left;
   if (!left) {
-    const rm = await docker(['rm', '-f', record.containerName]);
+    const rm = await docker(['rm', '-f', record.containerName], { writes: true });
     if (!rm.ok && !/no such container/i.test(rm.stderr)) left = `${record.containerName} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`;
-    // The daemon can still create the container after its killed run, so an rm that found nothing proves nothing.
-    else if (spawned.runTimedOut) left = `docker did not answer the start of ${record.containerName} within ${DOCKER_TIMEOUT_MS / 1000} s, so it may still be created after the removal`;
   }
   if (!left) {
     containerManager.updateInstanceRecoveryChannel(instance.id, null);
@@ -455,7 +452,7 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
     // consent revocation, and clearing over a failed rm would leave a live
     // tunnel no record points at.
     for (const name of [record.containerName, rsyncContainerName(instance)]) {
-      const rm = await docker(['rm', '-f', name]);
+      const rm = await docker(['rm', '-f', name], { writes: true });
       if (!rm.ok && !/no such container/i.test(rm.stderr)) {
         return keep(`could not remove ${name}: ${rm.stderr.trim().split('\n').pop()}`);
       }
@@ -476,19 +473,19 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       // The fence and the slot are cluster-level, so these sessions use the
       // maintenance db: they must keep working when the fleet database itself
       // is missing (a restore whose recreate failed).
-      const hba = await docker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', stripFenceHbaScript(FENCE_PGDATA)]);
+      const hba = await docker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', stripFenceHbaScript(FENCE_PGDATA)], { writes: true });
       const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
         '-c', 'SELECT pg_reload_conf()',
         '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
         '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
-        '-c', 'SELECT pg_reload_conf()']);
+        '-c', 'SELECT pg_reload_conf()'], { writes: true });
       const volume = hba.ok && unfence.ok ? null : await volumeState(fleetDb.volume);
       const fencedText = 'READ-ONLY or refusing every connection but the manager\'s';
       if (volume && volume.state === 'unknown') {
         left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists (${volume.error}), so the disarm can't confirm whether the database is still ${fencedText}`);
       } else if (volume && volume.state === 'exists') {
         const strip = await docker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
-          `f=/pgdata/postgresql.auto.conf; s=; if grep -q '^default_transaction_read_only' "$f" 2>/dev/null; then sed -i '/^default_transaction_read_only/d' "$f" || exit 1; s=1; fi; if grep -q '${WRITE_FENCE_MARK}$' /pgdata/pg_hba.conf 2>/dev/null; then ${stripFenceHbaScript('/pgdata')} || exit 1; s=1; fi; [ -z "$s" ] || echo stripped`]);
+          `f=/pgdata/postgresql.auto.conf; s=; if grep -q '^default_transaction_read_only' "$f" 2>/dev/null; then sed -i '/^default_transaction_read_only/d' "$f" || exit 1; s=1; fi; if grep -q '${WRITE_FENCE_MARK}$' /pgdata/pg_hba.conf 2>/dev/null; then ${stripFenceHbaScript('/pgdata')} || exit 1; s=1; fi; [ -z "$s" ] || echo stripped`], { writes: true });
         if (!strip.ok) {
           left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${strip.stderr.trim().split('\n').pop() || 'docker did not answer'}), so the database may stay ${fencedText}`);
         } else if (strip.stdout.includes('stripped')) {
@@ -504,9 +501,9 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       for (let attempt = 0; !dbDown && attempt < 2; attempt++) {
         if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 2_000));
         await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
-          "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"]);
+          "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"], { writes: true });
         const drop = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
-          "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'recovery_channel'"]);
+          "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'recovery_channel'"], { writes: true });
         if (drop.ok) { dropError = ''; break; }
         dropError = drop.stderr.trim().split('\n').pop() || 'docker did not answer';
       }
@@ -550,7 +547,7 @@ export async function reconcileRecoveryChannels(): Promise<void> {
       continue;
     }
     if (state === 'stopped') {
-      const started = await docker(['start', snapshot.recoveryChannel.containerName]);
+      const started = await docker(['start', snapshot.recoveryChannel.containerName], { writes: true });
       if (started.ok) { console.log(`[RecoveryChannel] Restarted relay ${snapshot.recoveryChannel.containerName}`); continue; }
     }
     // Respawn under the same gate the arm/disarm paths hold, against a FRESH

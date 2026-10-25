@@ -33,15 +33,14 @@ const RECOVERY_SLOT = 'recovery_channel';
 const DOCKER_TIMEOUT_MS = 30_000;
 const SESSION_QUERY_TIMEOUT_MS = 120_000;
 
-/** timedOut: the CLI was killed at DOCKER_TIMEOUT_MS, and the daemon may still carry the call out. */
-function docker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string; timedOut: boolean }> {
+/** A read is killed at DOCKER_TIMEOUT_MS; a call that writes (writes: true) is not, since the daemon carries out a killed call anyway. */
+function docker(args: string[], opts: { writes?: boolean } = {}): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
+    execFile('docker', args, { ...(opts.writes ? {} : { timeout: DOCKER_TIMEOUT_MS }), maxBuffer: 8 * 1024 * 1024 },
       (err, stdout, stderr) => resolve({
         ok: !err,
         stdout: String(stdout || ''),
         stderr: String(stderr || err || ''),
-        timedOut: !!err && (err as { killed?: boolean }).killed === true,
       }));
   });
 }
@@ -164,8 +163,8 @@ uid = 0
 gid = 0
 `;
 
-/** unknown: the daemon's state could not be read, so it was left alone (it may be serving a transfer). runTimedOut: its docker run did not answer, so docker may still create it. */
-export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string; unknown?: boolean; runTimedOut?: boolean }> {
+/** unknown: the daemon's state could not be read, so it was left alone (it may be serving a transfer). */
+export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string; unknown?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'no managed fleet database' };
   const name = rsyncdName(instance);
@@ -179,7 +178,7 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
   const volState = await (await import('./fleetReplica')).dockerVolumeState(fleetDb.volume);
   if (volState === 'absent') return { ok: false, error: `the source database volume ${fleetDb.volume} is gone, so the rsync daemon was not started: there is no database here to send` };
   if (volState === 'unknown') return { ok: false, error: `can't confirm whether the source database volume ${fleetDb.volume} exists (docker did not answer), so the rsync daemon was not started` };
-  await docker(['rm', '-f', name]);
+  await docker(['rm', '-f', name], { writes: true });
   // The config rides an env var: a real multi-line value survives argv+env
   // verbatim, where printf-escape games do not (POSIX %s never expands \n).
   const run = await docker(['run', '-d', '--name', name, '--restart', 'unless-stopped', ...LOG_CAP_RUN_ARGS,
@@ -187,8 +186,8 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
     '-v', `${fleetDb.volume}:/pgdata:ro`,
     '-e', `RSYNCD_CONF=${RSYNCD_CONF}`,
     '--entrypoint', 'sh', image, '-c',
-    'printf %s "$RSYNCD_CONF" > /etc/rsyncd.conf && exec rsync --daemon --no-detach']);
-  if (!run.ok) return { ok: false, error: `could not start the rsync daemon: ${run.stderr.trim().split('\n').pop()}`, runTimedOut: run.timedOut };
+    'printf %s "$RSYNCD_CONF" > /etc/rsyncd.conf && exec rsync --daemon --no-detach'], { writes: true });
+  if (!run.ok) return { ok: false, error: `could not start the rsync daemon: ${run.stderr.trim().split('\n').pop()}` };
   return { ok: true };
 }
 
@@ -259,7 +258,7 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
   let leftovers = await containerManager.runningNonSidecarContainers(instance.id);
   if (leftovers === null) return { code: 500, body: { success: false, error: 'could not verify the source containers stopped' }, changed: true };
   if (leftovers.length > 0) {
-    for (const name of leftovers) await docker(['stop', name]);
+    for (const name of leftovers) await docker(['stop', name], { writes: true });
     leftovers = await containerManager.runningNonSidecarContainers(instance.id);
     if (leftovers === null || leftovers.length > 0) {
       return { code: 500, body: { success: false, error: `source containers still running after the stop: ${(leftovers || ['unverifiable']).join(', ')}` }, changed: true };
@@ -365,11 +364,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // (unreserved: the backup checkpoint itself would flip it to lost) is
       // dropped first.
       const dropStale = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
-        `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${RECOVERY_SLOT}' AND NOT active AND (restart_lsn IS NULL OR wal_status IN ('lost', 'unreserved'))`]);
+        `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${RECOVERY_SLOT}' AND NOT active AND (restart_lsn IS NULL OR wal_status IN ('lost', 'unreserved'))`], { writes: true });
       if (!dropStale.ok) { send(500, { success: false, error: `recovery slot cleanup: ${dropStale.stderr.trim().split('\n').pop()}` }); return; }
       const slot = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
         `SELECT CASE WHEN EXISTS (SELECT FROM pg_replication_slots WHERE slot_name = '${RECOVERY_SLOT}') THEN 'kept'
-                ELSE (SELECT 'reserved' FROM pg_create_physical_replication_slot('${RECOVERY_SLOT}', true)) END`]);
+                ELSE (SELECT 'reserved' FROM pg_create_physical_replication_slot('${RECOVERY_SLOT}', true)) END`], { writes: true });
       if (!slot.ok || !slot.stdout.trim()) { send(500, { success: false, error: `recovery slot: ${slot.stderr.trim().split('\n').pop() || 'could not reserve'}` }); return; }
       const session = openBackupSession(instance);
       if (!session) { send(500, { success: false, error: 'could not open the backup session' }); return; }

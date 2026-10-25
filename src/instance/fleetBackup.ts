@@ -1207,7 +1207,7 @@ export async function raiseGuildTerms(fleetDb: RestoreFleetDb, floor: number): P
 async function stopListedContainers(botId: string, names: string[]): Promise<string | null> {
   for (const name of names) {
     const stop = await execDocker(['stop', name]);
-    if (!stop.ok) console.warn(`[FleetBackup] Could not stop ${name}: ${lastLine(stop.stderr)}`);
+    if (!stop.ok) console.warn(`[FleetBackup] Could not stop ${name}: ${scrubbed(botId, lastLine(stop.stderr))}`);
   }
   const after = await containerManager.runningInstanceContainers(botId);
   if (after === null) return "docker did not answer after the stop, so the manager can't confirm they stopped";
@@ -1237,9 +1237,22 @@ async function sharersRunning(sharing: InstanceConfig[]): Promise<{ ids: string[
  * drops it emits are refused as inherited constraints and the run exits 1 even when everything applied; a fresh
  * database makes any restore error a real failure), pg_restore --exit-on-error of the chosen file with the
  * restoring session exempted, the control term and every guild lease raised to the kept term, fence lifted,
- * stopped instances restarted. A failure past the drop keeps the fence on and the instances stopped.
+ * stopped instances restarted. A failure past the drop keeps the fence on and the instances stopped. docker's stderr
+ * can quote the database URL, so the answer passes the secret filter, as do the notices and logs built from stderr.
  */
 export async function restoreFleetBackup(
+  botId: string,
+  file: string
+): Promise<{ success: boolean; error?: string; warning?: string; steps: RestoreSteps }> {
+  const result = await runFleetRestore(botId, file);
+  return {
+    ...result,
+    ...(result.error !== undefined ? { error: scrubbed(botId, result.error) } : {}),
+    ...(result.warning !== undefined ? { warning: scrubbed(botId, result.warning) } : {}),
+  };
+}
+
+async function runFleetRestore(
   botId: string,
   file: string
 ): Promise<{ success: boolean; error?: string; warning?: string; steps: RestoreSteps }> {
@@ -1324,7 +1337,7 @@ export async function restoreFleetBackup(
     }
     if (sidecarStartedAlone && !steps.stopped.includes(botId)) {
       const stop = await execDocker(['stop', fleetDb.containerName]);
-      if (!stop.ok) console.error(`[FleetBackup] Could not stop the database the refused restore started for ${botId}: ${lastLine(stop.stderr)}`);
+      if (!stop.ok) console.error(`[FleetBackup] Could not stop the database the refused restore started for ${botId}: ${scrubbed(botId, lastLine(stop.stderr))}`);
     }
     return unstarted.length > 0
       ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)`
@@ -1514,7 +1527,7 @@ export async function restoreFleetBackup(
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
     if (!recreate.ok) {
-      const reason = `could not recreate the database: ${lastLine(recreate.stderr)}`;
+      const reason = scrubbed(botId, `could not recreate the database: ${lastLine(recreate.stderr)}`);
       setRestoreError(botId, file, reason, `The database may be missing, or unchanged if the drop itself failed; its write fence stays on (${back})`);
       return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
@@ -1574,7 +1587,7 @@ export async function restoreFleetBackup(
       // would keep writing into the database.
       await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA',
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
-      const reason = restore.error || 'unknown error';
+      const reason = scrubbed(botId, restore.error || 'unknown error');
       setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`);
       return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
@@ -1591,11 +1604,11 @@ export async function restoreFleetBackup(
         steps.termReconciledTo = floor;
       } else {
         termWarning = `; the restored control term could not be advanced to the pre-restore value (${floor})${bump.ok ? ' - the restored dump has no control term row' : ''} - if the master parks on the witness fence, advance smdb_control.term by hand and restart it`;
-        console.error(`[FleetBackup] Term reconcile failed on ${fleetDb.containerName}: ${bump.ok ? 'no term row to advance' : lastLine(bump.stderr)}`);
+        console.error(`[FleetBackup] Term reconcile failed on ${fleetDb.containerName}: ${bump.ok ? 'no term row to advance' : scrubbed(botId, lastLine(bump.stderr))}`);
       }
       const raised = await raiseGuildTerms(fleetDb, floor);
       if (!raised.ok) {
-        const reason = `the restored guild leases could not be raised above the pre-restore term ${floor} (${raised.error})`;
+        const reason = scrubbed(botId, `the restored guild leases could not be raised above the pre-restore term ${floor} (${raised.error})`);
         setRestoreError(botId, file, reason, `A node still holding a pre-restore lease could write over the restored rows, so the write fence stays on (${back})`);
         return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
       }
@@ -1645,7 +1658,7 @@ export async function restoreFleetBackup(
       if (start.success) steps.restarted.push(id);
       else {
         unstarted.push(nameOf(id));
-        console.error(`[FleetBackup] Failed to restart ${id} after restore: ${start.error}`);
+        console.error(`[FleetBackup] Failed to restart ${id} after restore: ${scrubbed(botId, start.error || 'unknown error')}`);
       }
     }
     const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';

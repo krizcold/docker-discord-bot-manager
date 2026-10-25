@@ -214,8 +214,9 @@ async function isAncestor(commit: string, head: string): Promise<boolean> {
 }
 
 /** A git read is killed after 30 s; a call that writes (writes: true) is not, so no killed child leaves the index half written. */
-async function gitAsync(args: string[], opts: { writes?: boolean } = {}): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', ...(opts.writes ? {} : { timeout: 30000 }) });
+async function gitAsync(args: string[], opts: { writes?: boolean; termAfterMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+  const bound = opts.termAfterMs ? { timeout: opts.termAfterMs, killSignal: 'SIGTERM' as const } : opts.writes ? {} : { timeout: 30000 };
+  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', ...bound, ...(opts.env ? { env: opts.env } : {}) });
   return stdout.trim();
 }
 
@@ -387,6 +388,29 @@ export async function stackNeedsApply(self: SelfInfo): Promise<string | null> {
   return null;
 }
 
+const FETCH_WAIT_MS = 30000;
+const FETCH_TERM_MS = 10 * 60 * 1000;
+let fetchInFlight: Promise<void> | null = null;
+
+/** git ends a stalled transfer itself (low-speed limit, ssh keepalive); a fetch past FETCH_TERM_MS gets SIGTERM, on which git removes its lock files. A read waits at most FETCH_WAIT_MS ('running') and joins a fetch still running. */
+async function fetchUpstream(): Promise<'done' | 'running'> {
+  if (!fetchInFlight) {
+    fetchInFlight = gitAsync(['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=60', 'fetch', '--quiet'], {
+      writes: true,
+      termAfterMs: FETCH_TERM_MS,
+      env: { ...process.env, GIT_SSH_COMMAND: 'ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4' },
+    }).then(() => {}).finally(() => { fetchInFlight = null; });
+  }
+  const run = fetchInFlight;
+  let timer: NodeJS.Timeout | undefined;
+  const waited = new Promise<'running'>((resolve) => { timer = setTimeout(() => resolve('running'), FETCH_WAIT_MS); });
+  try {
+    return await Promise.race([run.then(() => 'done' as const), waited]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function readManagerVersion(): Promise<ManagerVersion> {
   if (await getDeploymentMode() !== 'docker') {
     return { supported: false, bootId: BOOT_ID, reason: 'Updates are managed by the platform (Yundera/CasaOS).' };
@@ -413,8 +437,12 @@ async function readManagerVersion(): Promise<ManagerVersion> {
     let checked = true;
     let fetchError: string | undefined;
     try {
-      await gitAsync(['fetch', '--quiet']);
-      behindBy = parseInt(await gitAsync(['rev-list', '--count', 'HEAD..@{u}']) || '0', 10) || 0;
+      if (await fetchUpstream() === 'running') {
+        checked = false;
+        fetchError = `git fetch has run for over ${FETCH_WAIT_MS / 1000} s without finishing`;
+      } else {
+        behindBy = parseInt(await gitAsync(['rev-list', '--count', 'HEAD..@{u}']) || '0', 10) || 0;
+      }
     } catch (err) {
       checked = false;
       const e = err as { stderr?: string; message?: string };

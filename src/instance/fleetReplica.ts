@@ -19,6 +19,7 @@ import * as containerManager from '../docker/containerManager';
 import * as dockerClient from '../docker/dockerClient';
 import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
+import * as fleetFailback from './fleetFailback';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
@@ -84,7 +85,13 @@ function saveSeed(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
 function runHold(instance: InstanceConfig, run?: number): string | null {
   const active = instance.fleetFailback;
   if (!active || active.startedAt === run) return null;
-  return `A ${active.mode} run is on this instance (${active.phase}); Continue, Cancel or Dismiss it on the Database modal first`;
+  const phase = fleetFailback.failbackPhaseText(active);
+  if (!active.parked) return `A ${active.mode} run is on this instance (${phase}); wait for it to park or finish (its card on the Database modal then shows its exits)`;
+  if (active.phase === 'wipe-consent' && !active.consentAt) {
+    return `A ${active.mode} run is on this instance (${phase}); answer it on the Database modal first (${active.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}, or Cancel)`;
+  }
+  const exits = fleetFailback.cancelableFailback(instance) ? 'Continue, Cancel or Dismiss it' : 'Continue or Dismiss it';
+  return `A ${active.mode} run is on this instance, stopped (${phase}); ${exits} on the Database modal first`;
 }
 
 function seedRunning(botId: string): boolean {

@@ -3014,9 +3014,9 @@
             <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached standby may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
             <button class="btn btn-primary btn-small" id="fleet-repl-enable" onclick="enableFleetReplication('${botId}')">Enable</button>
           </div>
-          <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+          ${failback ? '' : `<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
             <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
-          </div>`;
+          </div>`}`;
         return;
       }
       const stopped = (bots.find(b => b.id === botId) || {}).status !== 'running';
@@ -3057,10 +3057,10 @@
         : res.standIn.namesThisNode !== true
         ? `<div class="error-message">RETURNING MASTER, NOT REGISTERED YET: this node's bot has not registered with the node holding the fleet, so the failback cannot start; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. The failback needs that node reachable${res.standIn.holdReason === 'behind' ? '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.' : '.'}</div>`
         : res.standIn.followsDelivered === false
-        ? `<div class="error-message">RETURNING MASTER, DATABASE NOT INSTALLED: this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. ${res.standIn.holdReason === 'behind' ? (stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand') + '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.' : 'Or promote that node by hand.'}</div>`
+        ? `<div class="error-message">RETURNING MASTER, DATABASE NOT INSTALLED: this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so; ${res.standIn.holdReason === 'copy' ? 'this database is a copy of that node\'s' : 'this database is the copy that is behind'}. ${res.standIn.holdReason === 'behind' ? (failback ? 'The failback run on record owns the re-seed; its card shows its exits' : stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby; or promote that node by hand') + '. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance\'s env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.' : 'Or promote that node by hand.'}</div>`
         : res.standIn.holdReason === 'copy'
         ? `<div class="error-message">RETURNING MASTER: this database is a copy in recovery of node <b>${coveredWho}</b>'s, and this node's bot follows that node as a co-worker. Promote this node from its Fleet tab once the copy has caught up to take the fleet back; or promote that node by hand.</div>`
-        : `<div class="error-message">BEHIND A STAND-IN: node <b>${coveredWho}</b> took the fleet's writes while this node was down, so this database is the copy that is behind; this node's bot follows that node as a co-worker meanwhile. ${stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby'}, then start it and promote it from its Fleet tab once the copy has caught up; or promote that node by hand. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance's env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.</div>`;
+        : `<div class="error-message">BEHIND A STAND-IN: node <b>${coveredWho}</b> took the fleet's writes while this node was down, so this database is the copy that is behind; this node's bot follows that node as a co-worker meanwhile. ${failback ? 'The failback run on record owns the re-seed (its card shows its exits); once it is gone, paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : stopped ? 'Paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby' : 'Stop this instance, then paste that node\'s copy block below under "Failed over to another machine?" to re-seed this machine as its standby'}, then start it and promote it from its Fleet tab once the copy has caught up; or promote that node by hand. If that node is gone for good, FLEET_CONFIRM_TAKEOVER=1 in this instance's env plus a restart seizes the fleet back onto this database, losing what that node accepted during the outage.</div>`;
       const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
       const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
       const fleetSlotsHtml = fleetSlots.length === 0
@@ -3117,17 +3117,17 @@
         ${((bots.find(b => b.id === botId) || {}).appHooks === true) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Stand this machine down</div>
-          <div class="env-tip"><b>Demote</b> stops this instance being the primary side and rejoins it as a worker; the database here stays untouched. <b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.</div>
+          <div class="env-tip"><b>Demote</b> stops this instance being the primary side and rejoins it as a worker; the database here stays untouched. ${failback ? '' : '<b>Decommission</b> then destroys that database and stops the manager pinning it anywhere, once another side is serving.'}</div>
           <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-small" onclick="appDemote('${botId}')">Demote</button>
-            <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission</button>
+            ${failback ? '' : `<button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission</button>`}
           </div>
         </div>` : `
-        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
+        ${failback ? '' : `<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="margin-top:6px;">
             <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
           </div>
-        </div>`}
+        </div>`}`}
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
@@ -3763,7 +3763,7 @@
       const run = res.transfer || null;
       const runLive = !!(run && !run.parked);
       const transferRunHtml = !run ? '' : run.parked
-        ? `<div class="error-message">Transfer stopped while <b>${escapeHtml(transferPhaseText(run.phase))}</b>: ${escapeHtml(run.lastError || 'unknown reason')} Continuing picks up from where it stopped.
+        ? `<div class="error-message">Transfer stopped while <b>${escapeHtml(transferPhaseText(run.phase))}</b>: ${escapeHtml(run.lastError || 'unknown reason')}${namesAnExit(run.lastError) ? '' : ' Continuing picks up from where it stopped.'}
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', ${run.retireOldMaster === true}, ${!r.record}, true)">Continue transfer</button>
                <button class="btn btn-secondary btn-small" onclick="dismissTransfer('${botId}')">Dismiss</button></div></div>`
@@ -3777,7 +3777,7 @@
       const standingNow = res.standIn && res.standIn.read === 'ok' ? res.standIn.posture : null;
       const declinedHtml = !declined ? '' : declined.mode === 'drop-back'
         ? (standingNow && standingNow.role === 'stand-in' && !standingNow.live ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '')
-        : (standingNow && standingNow.role === 'covered' ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. <button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span></div>` : '');
+        : (standingNow && standingNow.role === 'covered' ? `<div class="env-tip" style="color:var(--warning);">The automatic ${declined.mode === 'drop-back' ? 'drop-back' : 'failback'} was declined on ${escapeHtml(new Date(declined.at).toLocaleString())} at its <b>${escapeHtml(failbackPhaseText({ mode: declined.mode, phase: declined.phase, standInNodeId: declined.standInNodeId }))}</b> step; it does not reopen for this stand-in episode, and the by-hand routes below are open. ${standingNow.namesThisNode === true ? `<button class="btn btn-primary btn-small" onclick="openFailback('${botId}')">${declined.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'}</button> <span class="env-tip">re-arms it and opens it now.</span>` : standingNow.namesThisNode === false ? 'The node this bot followed no longer stands in for it, so there is no failback to run.' : 'Fail back now shows here once the node holding the fleet names this node as the one it stands in for.'}</div>` : '');
       if (r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
@@ -4052,7 +4052,9 @@
           res = await api('POST', `/bots/${botId}/app-transfer`, body);
         }
         if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
-        showMessage('success', res.seedFirst
+        showMessage('success', res.resumed
+          ? `${label} continued; progress shows in this panel`
+          : res.seedFirst
           ? `${label} started: the standby is seeded from the primary first; progress shows in this panel`
           : `${label} started; the bot reports progress in its own Fleet view`);
         renderFleetReplica(botId);
@@ -4193,12 +4195,16 @@
     }
     // The failback or drop-back run (20.5, B6-i): its phase, the F5 park (the
     // consent question is the server's own text, read on the click), its exits.
+    // A stop reason that names its own exits is not followed by a generic Continue promise.
+    function namesAnExit(text) {
+      return /\b(Continue|Cancel|Dismiss)\b/.test(text || '');
+    }
     function failbackRunHtml(botId, run, cancelable) {
       if (!run) return '';
       const label = run.mode === 'drop-back' ? 'Drop-back' : 'Failback';
       const secs = Math.round((Date.now() - run.startedAt) / 1000);
       if (run.parked && run.phase === 'wipe-consent' && !run.consentAt) {
-        return `<div class="error-message">${label} run is waiting for your answer: it is ${escapeHtml(failbackPhaseText(run))}. ${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'} shows exactly what the wipe destroys (the divergence verdict${run.mode === 'drop-back' ? '' : ' and the outcome of the dump taken first'}) and asks you to confirm.${run.fence ? (run.fence.ok ? ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} is fenced read-only while this waits, so nothing lands on it unseen.` : ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} could NOT be fenced read-only (${escapeHtml(run.fence.error || 'unknown reason')}), so a write landing on it before you answer is destroyed by the wipe unseen.`) : ''} Cancel ${run.fence && run.fence.ok && run.fence.owned ? 'lifts the fence and ' : ''}${run.mode === 'drop-back' ? 'leaves the copy as it is' : 'starts the instance again with the database untouched'} and closes the automatic run for this stand-in episode (${run.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'} on this modal re-arms it).
+        return `<div class="error-message">${label} run is waiting for your answer: it is ${escapeHtml(failbackPhaseText(run))}. ${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'} shows exactly what the wipe destroys (the divergence verdict${run.mode === 'drop-back' ? '' : ' and the outcome of the dump taken first'}) and asks you to confirm.${run.fence ? (run.fence.ok ? ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} is fenced read-only while this waits, so nothing lands on it unseen.` : ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} could NOT be fenced read-only (${escapeHtml(run.fence.error || 'unknown reason')}), so a write landing on it before you answer is destroyed by the wipe unseen.`) : ''} Cancel ${run.fence && run.fence.ok && run.fence.owned ? 'lifts the fence and ' : ''}${run.mode === 'drop-back' ? 'leaves the copy as it is' : run.stoppedByRun ? 'starts the instance again with the database untouched' : 'leaves the instance stopped, as it was, with the database untouched'} and closes the automatic run for this stand-in episode (${run.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'} on this modal re-arms it).
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-danger btn-small" onclick="continueFailback('${botId}')">${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}</button>
                <button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button></div></div>`;
@@ -4206,7 +4212,7 @@
       if (run.parked) {
         // Cancelable is the server's word, from the records that prove whether the wipe began.
         const beforeWipe = cancelable === true;
-        return `<div class="error-message">${label} run stopped while <b>${escapeHtml(failbackPhaseText(run))}</b>: ${escapeHtml(run.lastError || 'unknown reason')} Continuing picks up from where it stopped.
+        return `<div class="error-message">${label} run stopped while <b>${escapeHtml(failbackPhaseText(run))}</b>: ${escapeHtml(run.lastError || 'unknown reason')}${namesAnExit(run.lastError) ? '' : ' Continuing picks up from where it stopped.'}
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-primary btn-small" onclick="continueFailback('${botId}')">Continue</button>
                ${beforeWipe ? `<button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button>` : ''}

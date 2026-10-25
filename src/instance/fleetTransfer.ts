@@ -158,7 +158,7 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
       const facts = await getAppFacts(bot, FACTS_TIMEOUT_MS);
       if (facts.success && facts.facts?.running && facts.facts.initialized && facts.facts.dbReplica === true) break;
       if (Date.now() > bootDeadline) {
-        const why = !facts.success ? facts.error : facts.facts?.dbReplica === false ? 'it runs without its standby endpoint' : 'it is still initializing';
+        const why = !facts.success ? facts.error : facts.facts?.running !== true ? 'the bot process is not running (read its logs)' : facts.facts?.dbReplica === false ? 'it runs without its standby endpoint' : 'it is still initializing';
         throw new Error(`the app did not come up with its standby within 3 minutes (${why})`);
       }
       await sleep(POLL_MS);

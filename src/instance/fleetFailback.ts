@@ -264,13 +264,14 @@ export function consentText(run: FleetFailbackRun): string {
   if (run.mode === 'drop-back') {
     return `Re-seed this copy as a standby of ${who}'s database? ${lineageText(run.lineage, who, 'This copy')}${fenceText(run.fence, 'that verdict')} Continue wipes this copy and rebuilds it from that database. Cancel ${run.fence?.ok && run.fence.owned ? 'lifts the fence and ' : ''}leaves it as it is, out of recovery and holding whatever it holds, and closes the automatic drop-back for this episode (Drop back now on this modal re-arms it).`;
   }
-  return `Wipe this machine's database and re-seed it from ${who}'s copy? ${lineageText(run.lineage, who, 'This database')} ${dumpText(run.dump)}${fenceText(run.fence, 'the dump')} Continue deletes the database and rebuilds it as a standby of that copy; the failback then promotes it back once it has caught up. Cancel ${run.fence?.ok && run.fence.owned ? 'lifts the fence and ' : ''}starts the instance again with the database untouched and closes the automatic failback for this stand-in episode (Fail back now on this modal re-arms it).`;
+  return `Wipe this machine's database and re-seed it from ${who}'s copy? ${lineageText(run.lineage, who, 'This database')} ${dumpText(run.dump)}${fenceText(run.fence, 'the dump')} Continue deletes the database and rebuilds it as a standby of that copy; the failback then promotes it back once it has caught up. Cancel ${run.fence?.ok && run.fence.owned ? 'lifts the fence and ' : ''}${run.stoppedByRun ? 'starts the instance again' : 'leaves the instance stopped, as it was,'} with the database untouched and closes the automatic failback for this stand-in episode (Fail back now on this modal re-arms it).`;
 }
 
 /** What a stopped instance's badge says while a failback run owns it. */
 export function stoppedText(run: FleetFailbackRun): string {
-  if (run.phase === 'wipe-consent' && !run.consentAt) return `Instance is stopped by the failback run, which is ${failbackPhaseText(run)}: answer it on the Database modal`;
-  return `Instance is stopped by the failback run (${failbackPhaseText(run)})${run.parked ? `; the run stopped: ${run.lastError || 'unknown reason'}` : ''}`;
+  const head = run.stoppedByRun ? 'Instance is stopped by the failback run' : 'Instance is stopped; a failback run is on record';
+  if (run.phase === 'wipe-consent' && !run.consentAt) return `${head}, which is ${failbackPhaseText(run)}: answer it on the Database modal`;
+  return `${head} (${failbackPhaseText(run)})${run.parked ? `; the run stopped: ${run.lastError || 'unknown reason'}` : ''}`;
 }
 
 function laneOverError(standInNodeId: string | null, past: 'none' | 'wipe' | 'handover' = 'none'): Error {
@@ -368,9 +369,13 @@ export async function openFailbackByHand(instance: InstanceConfig): Promise<Acti
       : { success: false, error: 'the drop-back did not open: this manager manages no standby record on this instance' };
   }
   if (!standing || standing.role !== 'covered') return { success: false, error: 'this node is not a returning master behind a stand-in, so there is no failback to run' };
+  if (standing.namesThisNode === false) return { success: false, error: 'the node this bot followed no longer stands in for it, so there is no failback to run' };
+  const managed = standing.holdReason === 'copy' ? !!instance.fleetDbReplica : !!instance.fleetDb;
+  if (!managed) return { success: false, error: 'the failback does not open: this manager manages no database on this instance to fail back (a hand-deployed database keeps the by-hand route)' };
   if (standing.namesThisNode !== true) {
-    return { success: false, error: standing.namesThisNode === false
-      ? 'the node this bot followed no longer stands in for it, so there is no failback to run'
+    const episode = typeof read.facts!.followerHold?.observedTerm === 'number' ? read.facts!.followerHold.observedTerm : null;
+    return { success: false, error: declinedFor(instance, 'failback', standing.standInNodeId, episode)
+      ? 'the bot has not registered with the node holding the fleet yet, and the automatic failback stays declined for this stand-in episode; press Fail back now again once the bot has registered'
       : 'the bot has not registered with the node holding the fleet yet; the failback opens once it has' };
   }
   containerManager.updateInstanceFleetFailbackDeclined(instance.id, null);
@@ -381,7 +386,7 @@ export async function openFailbackByHand(instance: InstanceConfig): Promise<Acti
 }
 
 /** The copy block the bot holds, read from its own file: the instance is stopped when the seed needs it, so no hook can answer. */
-async function readBlockFile(instance: InstanceConfig, expected: { host: string; port: number } | null): Promise<{ dsn: string; cert: string }> {
+async function readBlockFile(instance: InstanceConfig, expected: { host: string; port: number } | null, stoppedByRun: boolean): Promise<{ dsn: string; cert: string }> {
   const dir = await fleetReplica.instanceDataDir(instance);
   const file = path.join(dir, 'global', 'fleet', 'copy-block.json');
   let parsed: any;
@@ -395,7 +400,7 @@ async function readBlockFile(instance: InstanceConfig, expected: { host: string;
   }
   const found = endpointOf(parsed.dsn);
   if (expected && (!found || found.host !== expected.host || found.port !== expected.port)) {
-    throw new Error(`the block the bot holds names ${found ? `${found.host}:${found.port}` : 'an unparseable endpoint'}, not the stand-in's copy at ${expected.host}:${expected.port} this run was decided on; Cancel this run (nothing here was destroyed: the instance starts again, and Fail back now re-arms the run), or Dismiss it and re-seed by hand from that node's block`);
+    throw new Error(`the block the bot holds names ${found ? `${found.host}:${found.port}` : 'an unparseable endpoint'}, not the stand-in's copy at ${expected.host}:${expected.port} this run was decided on; Cancel this run (nothing here was destroyed: ${stoppedByRun ? 'the instance starts again' : 'the instance stays stopped, as it was'}, and Fail back now re-arms the run), or Dismiss it and re-seed by hand from that node's block`);
   }
   return { dsn: parsed.dsn, cert: parsed.cert };
 }
@@ -435,11 +440,12 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
               const standing = posture.read === 'ok' ? posture.posture : null;
               if (!standing || standing.role !== 'stand-in' || standing.live) {
                 const held = currentRun(botId);
+                let fenceNote = '';
                 if (held?.fence?.owned === true) {
-                  await liftRunFence(got.bot, held);
-                  saveRun(botId, { fence: null });
+                  fenceNote = await liftRunFence(got.bot, held);
+                  if (!fenceNote) saveRun(botId, { fence: null });
                 }
-                throw new Error('the bot no longer reports this copy as an ended stand-in lane; nothing has been changed');
+                throw new Error(`the bot no longer reports this copy as an ended stand-in lane; nothing has been changed${fenceNote}${fenceNote ? ' (Continue or Dismiss retries the lift)' : ''}`);
               }
               if (!fenceTried) {
                 fenceTried = true;
@@ -585,7 +591,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
               throw new Error(`the seed stopped (${bot.fleetDbReplicaSeed.lastError || 'unknown reason'}); dismiss it on this modal, then Continue to seed again from the block`);
             }
             if (!run.serve) throw new Error('this machine\'s endpoint for the copy is not known (no replication record); Dismiss this run (the instance stays stopped) and re-seed by hand from the block on the stand-in\'s Database modal');
-            const block = await readBlockFile(bot, run.block);
+            const block = await readBlockFile(bot, run.block, currentRun(botId)?.stoppedByRun === true);
             const started = bot.fleetDb
               ? fleetReplica.reseedStalePrimary(bot, block.dsn, block.cert, run.serve.publicHost, run.serve.hostPort, false, { dumpDone: true, run: startedAt })
               : fleetReplica.provisionFleetReplica(bot, block.dsn, block.cert, run.serve.publicHost, run.serve.hostPort, false, { run: startedAt });
@@ -917,6 +923,14 @@ export async function dismissFailback(instance: InstanceConfig): Promise<ActionR
   return fenceNote ? { success: true, error: `The run is dismissed${fenceNote}` } : { success: true };
 }
 
+/** The exit a restart-parked run offers: a seed the restart also parked must be dismissed before Continue can seed again. */
+function restartExit(instance: InstanceConfig, run: FleetFailbackRun): string {
+  if (run.phase === 'seeding' && instance.fleetDbReplicaSeed?.parked === true) {
+    return `its seed stopped too; dismiss the seed on this modal, then Continue seeds again${cancelableFailback(instance) ? ', or Cancel this run' : ''}`;
+  }
+  return 'Continue picks up from where it stopped';
+}
+
 /** Boot: a run the previous manager process owned has no runner any more; a consent park is not an interruption. */
 export function parkInterruptedFailbacks(): void {
   for (const instance of containerManager.getAllBots()) {
@@ -926,7 +940,7 @@ export function parkInterruptedFailbacks(): void {
     containerManager.updateInstanceFleetFailback(instance.id, {
       ...run,
       parked: true,
-      lastError: `the manager restarted during the run (${failbackPhaseText(run)}); Continue picks up from where it stopped`,
+      lastError: `the manager restarted during the run (${failbackPhaseText(run)}); ${restartExit(instance, run)}`,
       updatedAt: Date.now(),
     });
   }

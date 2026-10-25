@@ -56,6 +56,7 @@ export interface FleetDbRecord {
   volume: string;
   replication?: FleetDbReplication;
   retiringAt?: string;                 // ISO time a retire first began removing this database; leaves with the record once a retire finishes
+  keptPlain?: string[];                // FleetDbReplication.keptPlain a Disable carried over; the next start narrows them
 }
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).

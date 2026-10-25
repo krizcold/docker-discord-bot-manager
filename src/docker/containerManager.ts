@@ -242,7 +242,7 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 }
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
-function recordSecrets(inst: InstanceConfig): string[] {
+export function recordSecrets(inst: InstanceConfig): string[] {
   const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.recoveryChannel?.token, inst.recoveryChannel?.tlsKey];
   try {
     for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
@@ -662,20 +662,22 @@ export function updateInstanceFleetBackup(
 /**
  * Persist (or clear) the sidecar's replication posture (the rewritten database
  * URL lives only in the encrypted env store). Applies to the compose on the
- * next start.
+ * next start. With replication null, keptPlain names the non-TLS lines still
+ * in pg_hba.conf for the next start to narrow; a posture carries its own.
  */
 export function updateInstanceFleetDbReplication(
   botId: string,
   replication: FleetDbReplication | null,
+  keptPlain: string[] = [],
 ): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance || !instance.fleetDb) return null;
+  const { replication: _drop, keptPlain: _kept, ...rest } = instance.fleetDb;
   if (replication) {
-    instance.fleetDb = { ...instance.fleetDb, replication };
+    instance.fleetDb = { ...rest, replication };
   } else {
-    const { replication: _drop, ...rest } = instance.fleetDb;
-    instance.fleetDb = rest;
+    instance.fleetDb = keptPlain.length > 0 ? { ...rest, keptPlain } : rest;
   }
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
@@ -3593,7 +3595,8 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
     }
     const laneUncleared = clearFinishedLane(botId);
     if (laneUncleared) result.warning = result.warning ? `${result.warning}; ${laneUncleared}` : laneUncleared;
-    if (getBot(botId)?.fleetDb?.replication?.keptPlain?.length) {
+    const keptFleetDb = getBot(botId)?.fleetDb;
+    if (keptFleetDb?.replication?.keptPlain?.length || keptFleetDb?.keptPlain?.length) {
       // Imported here: fleetReplication imports this module.
       const narrowed = await (await import('../instance/fleetReplication')).narrowKeptPlainHba(botId).catch(err => `pg_hba could not be narrowed: ${err instanceof Error ? err.message : String(err)}`);
       if (narrowed) {

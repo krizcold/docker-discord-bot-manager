@@ -1297,7 +1297,8 @@ export function publishHostPort(
     // Set BOT_PORT_BIND=0.0.0.0 to opt into all-interfaces (trusted LAN only).
     const bind = botPortBind();
     if (!isLoopbackBind(bind)) {
-      console.warn(`[Docker] Publishing host port ${hostPort} on ${bind} (BOT_PORT_BIND): reachable from other hosts, not only this machine`);
+      const authelia = process.env.BOT_DOMAIN_BASE ? ", and the Authelia login on the bot's BOT_DOMAIN_BASE address does not cover this port" : '';
+      console.warn(`[Docker] Publishing host port ${hostPort} on ${bind} (BOT_PORT_BIND): reachable from other hosts, not only this machine${authelia}`);
     }
     const mapping = (bind && bind !== '0.0.0.0') ? `${bind}:${hostPort}:${containerPort}` : `${hostPort}:${containerPort}`;
     ports.push(mapping);

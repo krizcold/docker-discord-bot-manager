@@ -27,7 +27,7 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
-import { probeErrorTail } from '../config/secretText';
+import { probeErrorTail, redactSecrets } from '../config/secretText';
 import { readStandInPosture, StandInRead } from './appLifecycle';
 import * as fleetFailback from './fleetFailback';
 import * as fleetReplica from './fleetReplica';
@@ -56,6 +56,11 @@ const lastErrors: Map<string, string> = new Map();
 const COPY_PREFIX = 'standin-';
 const lastCopyAttempts: Map<string, number> = new Map();
 const copyErrors: Map<string, string> = new Map();
+/** docker's stderr can quote a DSN or a password, so a stored error text carries the instance's secrets as ***. */
+function scrubbed(botId: string, text: string): string {
+  const instance = containerManager.getBot(botId);
+  return instance ? redactSecrets(text, containerManager.recordSecrets(instance)) : text;
+}
 // A stuck restore write fence, tracked apart from lastErrors: a read-only
 // database still DUMPS successfully, so the nightly dump's success would wipe
 // a warning parked in the shared slot while the fence still stands.
@@ -977,8 +982,9 @@ async function runScheduledDump(instance: InstanceConfig): Promise<void> {
       trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!);
       console.log(`[FleetBackup] Dumped ${instance.displayName} (${instance.id}) -> ${result.file}`);
     } else {
-      lastErrors.set(instance.id, result.error || 'unknown error');
-      console.error(`[FleetBackup] Dump failed for ${instance.displayName} (${instance.id}): ${result.error}`);
+      const error = scrubbed(instance.id, result.error || 'unknown error');
+      lastErrors.set(instance.id, error);
+      console.error(`[FleetBackup] Dump failed for ${instance.displayName} (${instance.id}): ${error}`);
     }
   } finally {
     busy.delete(instance.id);
@@ -1049,8 +1055,9 @@ async function runScheduledCopyDump(instance: InstanceConfig): Promise<void> {
   try {
     const role = await copyTakesWrites(target);
     if ('error' in role) {
-      copyErrors.set(instance.id, `could not read whether this copy takes writes (${role.error}), so no scheduled dump of it ran`);
-      console.error(`[FleetBackup] Could not read the role of the copy for ${instance.displayName} (${instance.id}): ${role.error}`);
+      const why = scrubbed(instance.id, role.error);
+      copyErrors.set(instance.id, `could not read whether this copy takes writes (${why}), so no scheduled dump of it ran`);
+      console.error(`[FleetBackup] Could not read the role of the copy for ${instance.displayName} (${instance.id}): ${why}`);
       return;
     }
     if (!role.writes && !copyMayBeAlone(await readStandInPosture(instance, FACTS_TIMEOUT_MS))) {
@@ -1064,8 +1071,9 @@ async function runScheduledCopyDump(instance: InstanceConfig): Promise<void> {
       trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!, COPY_PREFIX);
       console.log(`[FleetBackup] Dumped the copy of ${instance.displayName} (${instance.id}) -> ${result.file}`);
     } else {
-      copyErrors.set(instance.id, result.error || 'unknown error');
-      console.error(`[FleetBackup] Dump of the copy failed for ${instance.displayName} (${instance.id}): ${result.error}`);
+      const error = scrubbed(instance.id, result.error || 'unknown error');
+      copyErrors.set(instance.id, error);
+      console.error(`[FleetBackup] Dump of the copy failed for ${instance.displayName} (${instance.id}): ${error}`);
     }
   } finally {
     busy.delete(instance.id);
@@ -1483,8 +1491,9 @@ export async function restoreFleetBackup(
     if (exists.stdout.trim() !== '0') {
       const safety = await runFleetDump(instance, 'pre-restore-');
       if (!safety.success) {
-        lastErrors.set(botId, `Pre-restore dump failed: ${safety.error}`);
-        return await refuse('Pre-restore dump failed, restore refused', safety.error || 'unknown reason');
+        const why = scrubbed(botId, safety.error || 'unknown reason');
+        lastErrors.set(botId, `Pre-restore dump failed: ${why}`);
+        return await refuse('Pre-restore dump failed, restore refused', why);
       }
       steps.preRestoreDump = safety.file || null;
 

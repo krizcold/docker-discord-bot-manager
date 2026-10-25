@@ -369,7 +369,7 @@ async function enableInLane(
     if (!containers.ok) return { success: false, error: `could not read the addresses of this instance's containers (nothing was changed): ${containers.error}` };
     own = containers.addrs;
   }
-  const plain = { addrs: [...new Set([...live.addrs, ...(fleetDb.replication?.keptPlain ?? []), ...own])].sort() };
+  const plain = { addrs: [...new Set([...live.addrs, ...(fleetDb.replication?.keptPlain ?? fleetDb.keptPlain ?? []), ...own])].sort() };
 
   const previousCertHost = fleetDb.replication?.certHost;
   // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
@@ -453,8 +453,10 @@ async function enableInLane(
  * disk fills, so a disable that cannot drop them refuses and keeps the record),
  * revoke the replication login (the port may stay published until the next
  * restart, and a seed against a disabled primary must fail at the login), then
- * drop the record and revert the URL to the private sidecar form. Cert and
- * ssl=on stay in PGDATA. Port unpublish applies on the next restart.
+ * drop the record and revert the URL to the private sidecar form. Cert, ssl=on
+ * and pg_hba stay in PGDATA; the non-TLS lines an Enable kept move to the
+ * database record, and the next start narrows them. Port unpublish applies on
+ * the next restart.
  */
 export function disableFleetReplication(
   instance: InstanceConfig,
@@ -469,7 +471,7 @@ export function disableFleetReplication(
   });
 }
 
-type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string };
+type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string; plainClientsKept?: number };
 
 async function disableInLane(
   instance: InstanceConfig,
@@ -575,6 +577,9 @@ async function disableInLane(
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
+  // The bot may still dial its old non-TLS URL until it restarts, so the lines stay until a start narrows them.
+  const keptPlain = fleetDb.replication.keptPlain ?? [];
+  const kept = keptPlain.length > 0 ? { plainClientsKept: keptPlain.length } : {};
   let unedited: string[] = [];
   try {
     envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
@@ -583,7 +588,7 @@ async function disableInLane(
       containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
       unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
     }
-    containerManager.updateInstanceFleetDbReplication(instance.id, null);
+    containerManager.updateInstanceFleetDbReplication(instance.id, null, keptPlain);
   } catch (err) {
     // The disabling mark stays on the record, so the card shows the Disable as unfinished.
     forgetProbes(instance.id);
@@ -591,9 +596,9 @@ async function disableInLane(
   }
   forgetProbes(instance.id);
   if (unedited.length > 0) {
-    return { success: true, restartRequired: true, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
+    return { success: true, restartRequired: true, ...kept, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
   }
-  return { success: true, restartRequired: true };
+  return { success: true, restartRequired: true, ...kept };
 }
 
 /**
@@ -605,22 +610,27 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const instance = containerManager.getBot(botId);
   const fleetDb = instance?.fleetDb;
   const repl = fleetDb?.replication;
-  if (!fleetDb || !repl?.keptPlain?.length) return null;
+  const keptPlain = repl ? repl.keptPlain : fleetDb?.keptPlain;
+  if (!fleetDb || !keptPlain?.length) return null;
   const notNarrowed = 'the database still admits non-TLS connections from the addresses Enable kept, and the next start tries again';
   const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.user, fleetDb.db);
   if (fenced) return `pg_hba was not narrowed: ${fenced}; ${notNarrowed}`;
   const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
   if (!live.ok) return `Could not read which clients connect to the database without TLS (${live.error}), so ${notNarrowed}`;
-  const plain = { addrs: live.addrs.filter(a => repl.keptPlain!.includes(a)) };
+  const plain = { addrs: live.addrs.filter(a => keptPlain.includes(a)) };
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
     `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
   const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;
-  const { keptPlain: _kept, ...rest } = repl;
   try {
-    containerManager.updateInstanceFleetDbReplication(botId, plain.addrs.length > 0 ? { ...rest, keptPlain: plain.addrs } : rest);
+    if (repl) {
+      const { keptPlain: _kept, ...rest } = repl;
+      containerManager.updateInstanceFleetDbReplication(botId, plain.addrs.length > 0 ? { ...rest, keptPlain: plain.addrs } : rest);
+    } else {
+      containerManager.updateInstanceFleetDbReplication(botId, null, plain.addrs);
+    }
   } catch (err) {
     console.warn(`[FleetReplication] ${botId}: pg_hba is narrowed, but the record could not be updated: ${err instanceof Error ? err.message : String(err)}`);
   }

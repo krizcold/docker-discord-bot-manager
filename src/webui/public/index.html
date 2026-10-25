@@ -889,6 +889,7 @@
     let envEditorStored = [];
     let envEditorSeq = 0;
     let deploymentMode = null;
+    let portBind = null;
     let configEditorBotId = null;
     let configEditorSeq = 0;
     function botLabel(id) {
@@ -1405,6 +1406,7 @@
         botsLoadError = res.success ? null : (res.error || 'Failed to load bots');
         if (res.success) bots = (res.bots || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
         if (res.success && res.deploymentMode) deploymentMode = res.deploymentMode;
+        if (res.success) portBind = res.portBind || null;
         if (!res.success) showMessage('error', res.error || 'Failed to load bots');
       } catch (err) {
         botsLoadError = 'Failed to load bots: the manager could not be reached';
@@ -1438,6 +1440,20 @@
       } catch {
         box.innerHTML = '';
       }
+    }
+
+    // The Open button's title. portBind is the manager's BOT_PORT_BIND now; a bot keeps the bind it was deployed under.
+    function openButtonTitle(bot, viaPublicUrl) {
+      const kept = 'a bot deployed under another bind keeps it until it is rebuilt';
+      const exposed = portBind && !portBind.loopback && bot.hostPort
+        ? `Bots deployed while BOT_PORT_BIND is ${portBind.bind} publish their web UI port (this bot's port is ${bot.hostPort}) on ${portBind.bind}`
+        : '';
+      if (viaPublicUrl) {
+        return exposed ? `Open the bot's web UI at its HTTPS address. ${exposed}, where the Authelia login does not cover it; ${kept}.` : "Open the bot's web UI";
+      }
+      if (exposed) return `${exposed}, where other machines that reach that address can open it; ${kept}. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.`;
+      if (portBind) return `Bots deployed while BOT_PORT_BIND is ${portBind.bind} publish their web UI port only on the server itself; ${kept}. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.`;
+      return "The manager did not say which address BOT_PORT_BIND publishes bot web UI ports on. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.";
     }
 
     function renderBots() {
@@ -1624,12 +1640,12 @@
                   ${(bot.publicUrl || bot.webOpenUrl || bot.hostPort) && !bot.webUiReady
                     ? `<button class="btn btn-primary btn-small" disabled title="The bot's web UI is still starting up; this enables once it reports reachable">Starting...</button>`
                     : bot.publicUrl
-                    ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.publicUrl) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
+                    ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.publicUrl) + escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="${escapeHtml(openButtonTitle(bot, true))}">Open</a>`
                     : bot.webOpenUrl
                     ? `<a class="btn btn-primary btn-small" href="${escapeHtml(bot.webOpenUrl)}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
                     : bot.hostPort ? (isLocalBrowser
                       ? `<a class="btn btn-primary btn-small" href="http://${location.hostname}:${bot.hostPort}${escapeHtml(bot.webUiPath || '/')}" target="_blank" rel="noopener" title="Open the bot's web UI">Open</a>`
-                      : `<button class="btn btn-primary btn-small" disabled title="The bot's web UI port is bound to 127.0.0.1 on the server, so it is only reachable from the server itself. Set BOT_DOMAIN_BASE to give bots public HTTPS URLs.">Open</button>`) : ''}
+                      : `<button class="btn btn-primary btn-small" disabled title="${escapeHtml(openButtonTitle(bot, false))}">Open</button>`) : ''}
                   ${bot.pendingApply ? `<button class="btn btn-primary btn-small"${d} onclick="startBot('${bot.id}', 'Applying')" title="Apply the pending change to the running project in place">Apply</button>` : ''}
                   <button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')">Stop</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="restartBot('${bot.id}')">Restart</button>
@@ -3278,10 +3294,11 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
         const copyNote = res.copyBlockNote ? ` ${res.copyBlockNote}` : '';
+        const keptNote = res.plainClientsKept ? ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.` : '';
         if (res.success && res.warning) {
-          showMessage('error', `${res.warning}. Restart the instance to apply.${copyNote}`);
+          showMessage('error', `${res.warning}. Restart the instance to apply.${keptNote}${copyNote}`);
         } else if (res.success) {
-          showMessage('success', `Replication disabled. Restart the instance to apply.${copyNote}`);
+          showMessage('success', `Replication disabled. Restart the instance to apply.${keptNote}${copyNote}`);
         } else {
           showMessage('error', res.error || 'Failed to disable replication');
         }

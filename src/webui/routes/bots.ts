@@ -32,7 +32,7 @@ import { makeUniqueName, validateName, resolveNames, checkFolderReuse, sanitizeN
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName, frontingGatewayDropped } from '../../templates/pcsProcessing';
+import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName, frontingGatewayDropped, botPortBind, isLoopbackBind } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
@@ -246,7 +246,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         };
       }));
 
-      res.json({ success: true, bots: botsWithSource, deploymentMode: mode, ...(deploymentModeError ? { deploymentModeError } : {}) });
+      const bind = botPortBind();
+      res.json({ success: true, bots: botsWithSource, deploymentMode: mode, portBind: { bind, loopback: isLoopbackBind(bind) }, ...(deploymentModeError ? { deploymentModeError } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

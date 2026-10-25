@@ -292,6 +292,8 @@ export interface RecoveryRescueRecord {
   lagBytes?: number;
   /** The source reported its recovery slot active at the last answered status read; null when that read went unanswered. */
   senderAttached?: boolean | null;
+  /** When the monitor last wrote the telemetry above; the swap accepts only a probe from the current driver run. */
+  probedAt?: number;
   /** Catchup: since when answered status reads have shown no walsender on the slot. */
   noSenderSince?: number;
   /** Swap (RC-4): the source's end-of-WAL captured at quiesce; catchup replays to it. */

@@ -208,11 +208,18 @@ async function refuseForeignMounts(instance: InstanceConfig): Promise<void> {
 
 // ─── Phase record plumbing ───
 
+// Probe telemetry belongs to the phase and the driver run that measured it: a phase change, a park or a Continue drops it.
+const PROBE_TELEMETRY = ['caughtUp', 'lagBytes', 'senderAttached', 'probedAt'] as const;
+
 function saveRescue(botId: string, patch: Partial<RecoveryRescueRecord>): RecoveryRescueRecord | null {
   const instance = containerManager.getBot(botId);
   const current = instance?.recoveryRescue;
   if (!instance || !current) return null;
-  const next = { ...current, ...patch, updatedAt: Date.now() };
+  const next: RecoveryRescueRecord = { ...current, ...patch, updatedAt: Date.now() };
+  const phaseChanged = patch.phase !== undefined && patch.phase !== current.phase;
+  if (phaseChanged || patch.parked !== undefined) {
+    for (const key of PROBE_TELEMETRY) if (!(key in patch)) delete next[key];
+  }
   containerManager.updateInstanceRecoveryRescue(botId, next);
   return next;
 }
@@ -228,6 +235,7 @@ function structurallySound(instance: InstanceConfig | null): instance is Instanc
 // ─── The driver ───
 
 const running = new Set<string>();
+const runStartedAt = new Map<string, number>();
 const SLOT_PHASES: string[] = ['preflight', 'bulk', 'consistent', 'standby'];
 // From phaseStandby on, the copy may run as a standby of the sender.
 const STANDBY_PHASES: string[] = ['standby', 'streaming', 'quiesce', 'catchup'];
@@ -357,6 +365,10 @@ export function startSwap(
   if (!rescue) return { success: false, error: 'No rescue is running on this instance' };
   if (rescue.parked) return { success: false, error: 'The rescue is parked; fix the cause and Continue it first' };
   if (rescue.phase !== 'streaming') return { success: false, error: `The rescue is at phase ${rescue.phase}; the swap starts from a caught-up streaming standby` };
+  const runStart = runStartedAt.get(instance.id);
+  if (runStart === undefined || rescue.probedAt === undefined || rescue.probedAt < runStart) {
+    return { success: false, error: 'The copy has not been probed since the rescue last started or continued; wait for the next status read' };
+  }
   if (!rescue.caughtUp) return { success: false, error: 'The copy has not caught up yet; the swap starts from a caught-up standby to keep the downtime window short' };
   if (rescue.senderAttached !== true) return { success: false, error: 'The source does not report this standby attached to its recovery slot; the swap starts only while the copy is receiving' };
   if (!structurallySound(instance)) return { success: false, error: 'The channel or the database record is gone; the rescue will park' };
@@ -441,6 +453,7 @@ export function resumeRecoveryRescues(): void {
     const rescue = instance.recoveryRescue;
     if (!rescue || rescue.parked) continue;
     console.log(`[RecoveryRescue] Resuming rescue for ${instance.displayName} at phase ${rescue.phase}`);
+    saveRescue(instance.id, Object.fromEntries(PROBE_TELEMETRY.map(key => [key, undefined])));
     void runRescue(instance.id);
   }
 }
@@ -448,6 +461,7 @@ export function resumeRecoveryRescues(): void {
 async function runRescue(botId: string): Promise<void> {
   if (running.has(botId)) return;
   running.add(botId);
+  runStartedAt.set(botId, Date.now());
   // The phases that rewrite the volume hold the backup slot, so no dump, restore or replication change runs under them.
   let slotHeld = false;
   try {
@@ -497,7 +511,7 @@ async function runRescue(botId: string): Promise<void> {
           saveRescue(botId, { phase: 'bulk', parked: true, lastError: message });
           return;
         }
-        if (!saveRescue(botId, { lastError: message })) {
+        if (!saveRescue(botId, { caughtUp: undefined, lagBytes: undefined, lastError: message })) {
           console.warn(`[RecoveryRescue] ${instance.displayName} phase ${phase} failed: ${message}; the rescue record is gone, so nothing retries`);
           return;
         }
@@ -510,6 +524,7 @@ async function runRescue(botId: string): Promise<void> {
   } finally {
     if (slotHeld) releaseFleetBackupBusy(botId);
     running.delete(botId);
+    runStartedAt.delete(botId);
   }
 }
 
@@ -774,7 +789,8 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
     saveRescue(instance.id, {
       caughtUp: verdict.caughtUp,
       senderAttached: verdict.senderAttached,
-      ...(verdict.lagBytes !== undefined ? { lagBytes: verdict.lagBytes } : {}),
+      lagBytes: verdict.lagBytes,
+      probedAt: Date.now(),
       lastError: verdict.lastError,
     });
     await sleep(MONITOR_INTERVAL_MS);

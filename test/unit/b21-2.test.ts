@@ -195,13 +195,21 @@ describe('caught up needs an attached walsender', () => {
     expect(v.lastError).toMatch(/did not answer the status read/);
   });
 
-  it('refuses the swap until a walsender was seen attached', () => {
-    const bot = receiver({ recoveryRescue: { phase: 'streaming', startedAt: 1, updatedAt: 1, caughtUp: true } });
+  it('refuses the swap until a walsender was seen attached', async () => {
+    const bot = receiver({ id: 'b-sender', recoveryRescue: { phase: 'streaming', startedAt: 1, updatedAt: 1 } });
     st.bots = [bot];
+    st.rules.push([a => a[0] === 'exec' && a.includes('psql'), true, 't|0\n', '']);
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ success: true, sourceLsn: '0/10', slotActive: false }), { status: 200 }));
+    rescue.resumeRecoveryRescues();
+    await vi.waitFor(() => expect(bot.recoveryRescue.probedAt).toBeDefined());
+    expect(bot.recoveryRescue.senderAttached).toBe(false);
+    bot.recoveryRescue.caughtUp = true;
     const r = rescue.startSwap(bot, false);
     expect(r.success).toBe(false);
     expect(r.needsConfirm).toBeUndefined();
     expect(r.error).toMatch(/recovery slot/);
+    bot.recoveryRescue = undefined;
+    vi.unstubAllGlobals();
   });
 });
 

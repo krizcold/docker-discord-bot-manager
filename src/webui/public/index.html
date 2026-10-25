@@ -3446,7 +3446,8 @@
           bulk: 'Bulk copy: resumable rsync of the live database (the sender keeps serving)',
           consistent: 'Consistent pass: short delta inside backup mode',
           standby: 'Turning the copy into a live standby of the sender',
-          streaming: rescue.caughtUp && rescue.senderAttached === true ? 'Streaming: CAUGHT UP - ready to swap'
+          streaming: rescue.probedAt == null ? 'Streaming: not measured yet since the rescue started or continued'
+            : rescue.caughtUp && rescue.senderAttached === true ? 'Streaming: CAUGHT UP - ready to swap'
             : rescue.senderAttached === false ? 'Streaming: not receiving'
             : rescue.senderAttached === null ? "Streaming: can't confirm the copy is receiving (the last status read gave no slot state)"
             : `Streaming: catching up${rescue.lagBytes != null ? ` (${(rescue.lagBytes / 1048576).toFixed(1)} MB behind)` : ''}`,
@@ -3457,7 +3458,7 @@
           flip: `Swap: ${flipText}`,
         }[rescue.phase] || rescue.phase;
       const pastPromote = ['promote', 'teardown', 'flip'].includes(rescue.phase);
-      const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && rescue.senderAttached === true && !rescue.parked;
+      const swapReady = rescue.phase === 'streaming' && rescue.probedAt != null && rescue.caughtUp && rescue.senderAttached === true && !rescue.parked;
       const dumpFailedPark = rescue.parked && rescue.phase === 'preflight' && rescue.dumpOk === false;
       const dumpText = rescue.dumpOk === true ? `Safety dump of this machine's database: ${rescue.dumpFile || 'taken'} (kept with the backups)`
         : rescue.dumpSkipped === 'waived' ? `No safety dump: it failed (${rescue.dumpError || 'no reason recorded'}) and the overwrite went ahead without one, as chosen`
@@ -3468,7 +3469,7 @@
       return `
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
-          <div class="env-tip" style="color:var(--${rescue.parked ? 'danger' : rescue.caughtUp ? 'success' : 'text-secondary'});">${escapeHtml(phaseText)}</div>
+          <div class="env-tip" style="color:var(--${rescue.parked ? 'danger' : swapReady ? 'success' : 'text-secondary'});">${escapeHtml(phaseText)}</div>
           ${rescue.lastError ? `<div class="env-tip" style="color:var(--warning);">${escapeHtml(rescue.lastError)}</div>` : ''}
           <div class="env-tip" style="color:var(--${rescue.dumpOk === false || rescue.dumpSkipped === 'waived' ? 'warning' : 'text-secondary'});">${escapeHtml(dumpText)}</div>
           <div class="env-tip">From the preflight dump until the copy turns into a standby, this app's compose file (on CasaOS, its app file) does not list the database and its container is removed. Do not start the app from CasaOS until the rescue ends: a database container started during the copy parks the rescue and the copy starts again.</div>

@@ -905,6 +905,7 @@ export function broadcastBotUpdated(botId: string): void {
 export async function applyFleetDbReplicaService(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance?.fleetDbReplica) return { success: false, error: 'No standby record' };
+  if (instance.fleetDb?.retiringAt) return { success: false, error: unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found (install the instance first)' };
@@ -3468,6 +3469,8 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   if (rescue && !(rescue.phase === 'flip' && rescue.flipStep)) {
     return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
   }
+  const retiringAt = getBot(botId)?.fleetDb?.retiringAt;
+  if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
   return swappedAwayRefusal(botId, 'a start') ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
@@ -3519,6 +3522,8 @@ export async function rescueLeftoverRefusal(botId: string): Promise<{ success: f
   return { success: false, error: `A rescue cancelled on ${day} may have left a partial copy on this instance's volume, and docker could not check it (${probe.ok ? `it answered '${probe.out}'` : probe.out}), so the instance was not started; retry in a moment` };
 }
 
+const COPY_BLOCK_RETRACT_LOCK_WAIT_MS = 30 * 60_000;
+
 /** A recorded copy-block retraction reaches the app once its hooks answer after a start; a miss stays recorded. */
 async function sendCopyBlockRetract(botId: string): Promise<void> {
   try {
@@ -3528,8 +3533,11 @@ async function sendCopyBlockRetract(botId: string): Promise<void> {
     if (!instance) return;
     const up = await lifecycle.waitForAppHook(instance, 90_000);
     if (!up.success) return;
+    // The lane that started the bot, or one that took the lock after it, may still hold it.
+    const until = Date.now() + COPY_BLOCK_RETRACT_LOCK_WAIT_MS;
+    while (isBotBusy(botId) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 1000).unref());
     const settled = await lifecycle.settleCopyBlockRetract(botId);
-    if (settled.pending) console.warn(`[Start] ${instance.displayName}: the copy-block retraction is still pending (${settled.reason}); opening its Database modal sends it again`);
+    if (settled.pending) console.warn(`[Start] ${instance.displayName}: the copy-block retraction is still pending (${settled.reason}); the next start or opening its Database modal sends it again`);
   } catch (err) {
     console.warn(`[Start] the copy-block retraction for ${botId} could not be sent: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -3540,7 +3548,7 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
   if (!instance) return { success: false, error: 'Bot not found' };
   const rescueRefusal = startPreflightRefusal(botId) ?? await rescueLeftoverRefusal(botId);
   if (rescueRefusal) return rescueRefusal;
-  if (instance.fleetDb?.retiringAt) return { success: false, error: unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
+  let statusBefore = instance.status;
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
   if (instance.status === 'running') {
     // Reconcile against live container state: an externally-stopped bot
@@ -3564,18 +3572,22 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
     } else {
       console.warn(`[ContainerManager] ${botId} marked running but no container is up; correcting to stopped`);
       recordStatusAfterDockerStep(botId, 'stopped');
+      statusBefore = 'stopped';
     }
   }
 
   const sourceType = instance.sourceType || 'git';
-  const result = sourceType === 'docker-image' ? await startDockerImageBot(instance) : await startGitBot(instance);
+  const result = sourceType === 'docker-image' ? await startDockerImageBot(instance, statusBefore) : await startGitBot(instance, statusBefore);
   // Any successful start deploys the current compose and image, whichever way
   // the project was reached (Restart, Stop then Start, Update).
   if (result.success) {
     try {
       setPendingApply(botId, !!result.notApplied);
     } catch (err) {
-      const msg = `The deployed build is applied, but that could not be recorded: ${err instanceof Error ? err.message : String(err)}`;
+      const why = err instanceof Error ? err.message : String(err);
+      const msg = result.notApplied
+        ? `The changes listed as not applied could not be recorded as pending, so this instance may not offer to apply them: ${why}`
+        : `The deployed build is applied, but that could not be recorded: ${why}`;
       logCollectors.get(botId).addLog(`[Start] ${msg}`, 'warning');
       result.warning = result.warning ? `${result.warning}; ${msg}` : msg;
     }
@@ -3622,7 +3634,7 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
   return result;
 }
 
-async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
+async function startGitBot(instance: InstanceConfig, statusBefore: BotStatus): Promise<LaneResult> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
 
@@ -3685,9 +3697,18 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       await fixPostDeployOwnership(appName, (msg) => emit(msg, 'info'));
 
       let postInstallFailed = false;
-      if (!latestInstance.hasBeenStarted) {
+      // The registry's hasBeenStarted rides the running stamp; this file keeps the fact when that stamp is refused.
+      const postInstallMark = path.join(botDir, 'post-install.done');
+      if (!latestInstance.hasBeenStarted && !fs.existsSync(postInstallMark)) {
         const composeContent = fs.readFileSync(composePath, 'utf-8');
         postInstallFailed = !(await executeInstallCommand('post', composeContent, (msg) => emit(msg, 'info')));
+        if (!postInstallFailed) {
+          try {
+            fs.writeFileSync(postInstallMark, new Date().toISOString());
+          } catch (err) {
+            emit(`[Start] Could not write ${postInstallMark} (${err instanceof Error ? err.message : String(err)}); if the status below is not recorded either, the post-install command runs again at the next start`, 'warning');
+          }
+        }
       }
 
       const containerIds = await getContainerIdsForBot(botId);
@@ -3732,7 +3753,7 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start instance ${botId}:`, error);
-    await stampFailureFromDocker(botId, instance.status);
+    await stampFailureFromDocker(botId, statusBefore);
     return { success: false, error: msg };
   }
 }
@@ -3845,7 +3866,7 @@ function capComposeFileLogs(composePath: string): void {
   }
 }
 
-async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult> {
+async function startDockerImageBot(instance: InstanceConfig, statusBefore: BotStatus): Promise<LaneResult> {
   const botId = instance.id;
   const log = logCollectors.get(botId);
 
@@ -3940,7 +3961,7 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
     emit(`[Error] Start failed: ${msg}`, 'error');
     emit('[Fatal] Start process terminated with error', 'error');
     console.error(`[ContainerManager] Failed to start docker-image instance ${botId}:`, error);
-    await stampFailureFromDocker(botId, instance.status);
+    await stampFailureFromDocker(botId, statusBefore);
     return { success: false, error: msg };
   }
 }
@@ -4160,6 +4181,8 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
   const prior = instance.lane;
   const owedStart = (prior?.op === 'update' || prior?.op === 'restart') && prior.wasRunning;
   const wasRunning = instance.status === 'running' || owedStart;
+  const retiringAt = (getBot(botId) ?? instance).fleetDb?.retiringAt;
+  if (wasRunning && retiringAt) return { success: false, error: `${unfinishedRetireRefusal(retiringAt)}. The update was refused before the bot was stopped` };
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {
     console.log(`[Update ${botId}] ${msg}`);

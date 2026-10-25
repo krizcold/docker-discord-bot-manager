@@ -587,6 +587,30 @@ export function listFleetBackups(botId: string): Array<{ file: string; size: num
   return out.sort((a, b) => b.mtime - a.mtime);
 }
 
+/**
+ * Backup folders holding dumps for ids the registry no longer has: a
+ * decommission's safety dump outlives a Remove of its instance. A folder that
+ * cannot be read is listed with dumps null.
+ */
+export function orphanedFleetBackups(knownIds: ReadonlySet<string>): Array<{ id: string; dumps: number | null; folder: string }> {
+  let ids: string[];
+  try {
+    ids = fs.readdirSync(path.join(DATA_DIR, 'backups'));
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return [];
+    throw new Error(`The backups folder could not be read: ${err?.message || err}`);
+  }
+  const out: Array<{ id: string; dumps: number | null; folder: string }> = [];
+  for (const id of ids.sort()) {
+    if (knownIds.has(id)) continue;
+    try { if (!fs.statSync(path.join(DATA_DIR, 'backups', id)).isDirectory()) continue; } catch { /* listed below as unreadable */ }
+    let dumps: number | null;
+    try { dumps = listFleetBackups(id).length; } catch { dumps = null; }
+    if (dumps !== 0) out.push({ id, dumps, folder: `backups/${id}/fleet-postgres` });
+  }
+  return out;
+}
+
 export function isValidFleetBackupKeep(keep: unknown): keep is number {
   return typeof keep === 'number' && Number.isInteger(keep) && keep >= 1 && keep <= 365;
 }

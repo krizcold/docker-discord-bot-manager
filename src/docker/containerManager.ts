@@ -679,6 +679,16 @@ export function updateInstanceFleetDbReplica(botId: string, replica: FleetDbRepl
   return instance;
 }
 
+export function updateInstanceFleetDbReplicaKept(botId: string, kept: InstanceConfig['fleetDbReplicaKept'] | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (kept) instance.fleetDbReplicaKept = kept;
+  else delete instance.fleetDbReplicaKept;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryChannelRecord | null): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -1837,8 +1847,8 @@ async function performDockerCleanup(appName: string, composePath: string): Promi
   return { failures };
 }
 
-export async function deleteBot(botId: string, keepData: boolean = false, keepEnv: boolean = true): Promise<boolean> {
-  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData, keepEnv));
+export async function deleteBot(botId: string, keepData: boolean = false, keepEnv: boolean = true, confirmFleetData = false, confirmPromoted = false): Promise<boolean> {
+  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData, keepEnv, confirmFleetData, confirmPromoted));
 }
 
 /**
@@ -2023,9 +2033,11 @@ function recordProjectVolumes(instance: InstanceConfig, declared: string[] | nul
   else instance.projectVolumes = [...new Set([...(instance.projectVolumes ?? []), ...declared])];
 }
 
-async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean): Promise<boolean> {
+async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean, confirmFleetData: boolean, confirmPromoted: boolean): Promise<boolean> {
   const instance = getBot(botId);
   if (!instance) return false;
+  const refusal = await (await import('../instance/fleetReplica')).instanceRemovalRefusal(instance, keepData, confirmFleetData, confirmPromoted);
+  if (refusal) throw new Error(refusal.error);
 
   const deploymentMode = await getDeploymentMode();
   const appName = resolveAppName(botId);
@@ -4477,7 +4489,7 @@ function fillKnownDockerfileArgs(dockerfilePath: string, provided: Record<string
  * injection but KEEPS the volume and the record (data retention). Returns what
  * the compose injection needs, or null when no sidecar applies.
  */
-function ensureFleetDataBackend(instance: InstanceConfig): { containerName: string; volume: string; password: string; user: string; db: string } | null {
+export function ensureFleetDataBackend(instance: InstanceConfig): { containerName: string; volume: string; password: string; user: string; db: string } | null {
   const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!spec) return null;
 
@@ -4494,6 +4506,16 @@ function ensureFleetDataBackend(instance: InstanceConfig): { containerName: stri
   const url = (stored[spec.env.url] || '').trim();
 
   if (url === '') {
+    // Postgres keeps the password a volume was initialized with, so a new one
+    // minted over a kept volume (a Remove that kept data, then a same-name
+    // install) locks the app out of that database.
+    const state = dockerClient.volumeState(volume);
+    if (state === 'exists') {
+      throw new Error(`The database volume ${volume} already exists (an earlier install under this name kept it), and a new password would not open it. Put that install's database URL back into ${spec.env.url}, or remove the volume by hand if it holds nothing to keep`);
+    }
+    if (state === 'unknown') {
+      throw new Error(`Docker did not say whether the database volume ${volume} exists, so the manager can't confirm a new database password is safe to mint; try again`);
+    }
     const password = crypto.randomBytes(24).toString('base64url');
     const newUrl = `postgresql://${spec.user}:${password}@${containerName}:5432/${spec.database}`;
     envManager.setEnvVars(instance.id, { [spec.env.url]: newUrl });

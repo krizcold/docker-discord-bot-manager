@@ -482,8 +482,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    */
   router.delete('/:id', async (req: Request, res: Response) => {
     try {
-      const keepData = req.query.keepData === 'true';
+      const keepData = req.query.keepData !== 'false';
       const keepEnv = req.query.keepEnv !== 'false'; // default true (preserve env)
+      const confirmFleetData = req.query.confirmFleetData === 'true';
+      const confirmPromoted = req.query.confirmPromoted === 'true';
       const bot = containerManager.getBot(req.params.id);
 
       if (!bot) {
@@ -496,6 +498,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
         return;
       }
+
+      const refusal = await fleetReplica.instanceRemovalRefusal(bot, keepData, confirmFleetData, confirmPromoted);
+      if (refusal) {
+        res.status(409).json({ success: false, ...refusal });
+        return;
+      }
+      let dbDumps = 0;
+      try { dbDumps = fleetBackup.listFleetBackups(req.params.id).length; } catch { /* the answer then names none */ }
+      const keptReplicaVolume = !keepData ? bot.fleetDbReplicaKept?.volume : undefined;
 
       // Docker mode keys a bot's data folder by its id, so a later install
       // under the same name starts on a new, empty folder.
@@ -582,7 +593,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const envCopies = containerManager.botEnvCopies(req.params.id);
       let success: boolean;
       try {
-        success = await containerManager.deleteBot(req.params.id, keepData, keepEnv);
+        success = await containerManager.deleteBot(req.params.id, keepData, keepEnv, confirmFleetData, confirmPromoted);
       } catch (err) {
         rollbackVaultGroup();
         throw err;
@@ -595,7 +606,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const envDeleted = !keepEnv && envCopies.every(p => !fs.existsSync(p));
       broadcastToClients(wss, 'bot:deleted', { id: req.params.id });
-      res.json({ success: true, vaulted: savedGroupId !== null, envDeleted, ...(keptDataDir ? { keptDataDir } : {}) });
+      res.json({
+        success: true, vaulted: savedGroupId !== null, envDeleted,
+        ...(keptDataDir ? { keptDataDir } : {}),
+        ...(dbDumps > 0 ? { dbDumpsKept: { count: dbDumps, folder: `backups/${req.params.id}/fleet-postgres` } } : {}),
+        ...(keptReplicaVolume ? { keptReplicaVolume } : {}),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1614,13 +1630,39 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /** GET /api/bots/fleet/orphan-backups - Dump folders whose instance was removed. */
+  router.get('/fleet/orphan-backups', (_req: Request, res: Response) => {
+    try {
+      const fault = containerManager.registryFault();
+      if (fault) {
+        res.status(503).json({ success: false, broken: true, error: fault });
+        return;
+      }
+      const known = new Set(containerManager.getAllBots().map(b => b.id));
+      res.json({ success: true, folders: fleetBackup.orphanedFleetBackups(known) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   /**
    * GET /api/bots/:id/fleet-backups - List sidecar dump files, newest first.
+   * Answers for a removed instance too while its folder holds dumps.
    */
   router.get('/:id/fleet-backups', async (req: Request, res: Response) => {
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
+        const fault = containerManager.registryFault();
+        if (fault) {
+          res.status(503).json({ success: false, broken: true, error: fault });
+          return;
+        }
+        const kept = /^[A-Za-z0-9_-]+$/.test(req.params.id) ? fleetBackup.listFleetBackups(req.params.id) : [];
+        if (kept.length > 0) {
+          res.json({ success: true, removed: true, backups: kept });
+          return;
+        }
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
@@ -1864,12 +1906,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort, confirm } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean };
+      const { primaryDsn, cert, publicHost, hostPort, confirm, confirmVolume } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
       if (!primaryDsn || !cert || !publicHost) {
         res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
         return;
       }
-      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort, confirm === true));
+      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1887,12 +1929,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { publicHost, hostPort, confirm } = req.body as { publicHost?: string; hostPort?: number; confirm?: boolean };
+      const { publicHost, hostPort, confirm, confirmVolume } = req.body as { publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
       if (!publicHost) {
         res.status(400).json({ success: false, error: 'publicHost is required' });
         return;
       }
-      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort, confirm === true));
+      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort, confirm === true, typeof confirmVolume === 'string' ? confirmVolume : undefined));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2119,7 +2161,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const slot = bot.fleetDbReplica?.slot;
-      const result = await fleetReplica.removeFleetReplica(bot);
+      const result = await fleetReplica.removeFleetReplica(bot, { confirmPromoted: (req.body as { confirmPromoted?: boolean } | undefined)?.confirmPromoted === true });
       if (result.success) {
         broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
         res.json({ success: true, warning: `The primary keeps replication slot ${slot}, which retains WAL until it is dropped there: its Database modal lists the slot with a Drop action once nothing streams on it` });

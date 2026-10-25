@@ -265,7 +265,9 @@ const HANDLERS: Record<string, Handler> = {
   'bots delete': (c) => {
     const id = need(c, 0, 'id');
     const q: string[] = [];
-    if (c.flags['keep-data']) q.push('keepData=true');
+    q.push(c.flags['delete-data'] ? 'keepData=false' : 'keepData=true');
+    if (c.flags['confirm-fleet-data']) q.push('confirmFleetData=true');
+    if (c.flags['confirm-promoted']) q.push('confirmPromoted=true');
     if (c.flags['no-keep-env']) q.push('keepEnv=false');
     return simple(c, 'DELETE', `/api/bots/${id}${q.length ? '?' + q.join('&') : ''}`);
   },

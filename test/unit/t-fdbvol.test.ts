@@ -89,10 +89,10 @@ afterAll(() => {
   fs.rmSync(h.dir, { recursive: true, force: true });
 });
 
-describe('deleting a bot whose fleet database volume another instance declares', () => {
-  it('keeps the volume, names the other instance and keeps the record', async () => {
+describe('a data-deleting Remove of a bot whose fleet database volume another instance declares', () => {
+  it('refuses, keeping the volume and both records', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { fleetDb }));
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/database volume bot1-fleet-postgres-data kept: instance Bot b2 \(b2\) uses it/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database in volume bot1-fleet-postgres-data/);
     expect(h.removed).not.toContain(DB);
     expect(h.volumes.has(DB)).toBe(true);
     expect(registered('b1')).toBe(true);
@@ -101,61 +101,61 @@ describe('deleting a bot whose fleet database volume another instance declares',
 
   it('keeps it when the other instance holds it as its standby volume', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { fleetDbReplica: { ...fleetDbReplica, volume: DB } }));
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/kept: instance Bot b2 \(b2\) uses it/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database/);
     expect(h.removed).not.toContain(DB);
   });
 
   it('keeps it when the other instance names it in its deployed compose', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { sanitizedName: 'bot2' }));
     deploy('b2', `services: {}\nvolumes:\n  fleet-postgres-data:\n    name: ${DB}\n`);
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/kept: instance Bot b2 \(b2\) declares it in its compose/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database/);
     expect(h.removed).not.toContain(DB);
   });
 
   it('keeps it when another deployed compose cannot be read', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { sanitizedName: 'bot2' }));
     deploy('b2', 'services: [unclosed\n');
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/can't confirm no other bot uses it/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database/);
     expect(h.removed).not.toContain(DB);
   });
 
   it('keeps it when the registry cannot be read at removal time', async () => {
     writeRegistry(record('b1', { fleetDb }));
     h.onComposeCleanup = () => fs.writeFileSync(registryPath, 'not json');
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/can't confirm no other bot uses it/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database/);
     expect(h.removed).not.toContain(DB);
     expect(h.volumes.has(DB)).toBe(true);
   });
 
   it('a delete with keep data then completes and leaves the volume', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { fleetDb }));
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/kept/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/hosts the fleet database/);
     await expect(containerManager.deleteBot('b1', true, false)).resolves.toBe(true);
     expect(registered('b1')).toBe(false);
     expect(h.volumes.has(DB)).toBe(true);
   });
 
-  it('still removes a volume no other instance declares', async () => {
+  it('refuses a volume no other instance declares too', async () => {
     writeRegistry(record('b1', { fleetDb }), record('b2', { sanitizedName: 'bot2', fleetDb: { ...fleetDb, volume: 'bot2-fleet-postgres-data' } }));
     deploy('b2', 'services: {}\nvolumes:\n  data: {}\n');
-    await expect(containerManager.deleteBot('b1', false, false)).resolves.toBe(true);
-    expect(h.removed).toContain(DB);
-    expect(registered('b1')).toBe(false);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/Decommission it/);
+    expect(h.removed).not.toContain(DB);
+    expect(registered('b1')).toBe(true);
   });
 });
 
-describe('deleting a bot whose standby replica volume another instance declares', () => {
-  it('keeps the replica volume and names the other instance', async () => {
+describe('a data-deleting Remove of a bot whose standby replica volume another instance declares', () => {
+  it('refuses, keeping the replica volume and the record', async () => {
     writeRegistry(record('b1', { fleetDbReplica }), record('b2', { fleetDbReplica }));
-    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/replica volume bot1-fleet-postgres-replica-data kept: instance Bot b2 \(b2\) uses it/);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/copy of the fleet database in volume bot1-fleet-postgres-replica-data/);
     expect(h.removed).not.toContain(REPLICA);
     expect(registered('b1')).toBe(true);
   });
 
-  it('still removes a replica volume no other instance declares', async () => {
+  it('refuses a replica volume no other instance declares too', async () => {
     writeRegistry(record('b1', { fleetDbReplica }));
-    await expect(containerManager.deleteBot('b1', false, false)).resolves.toBe(true);
-    expect(h.removed).toContain(REPLICA);
+    await expect(containerManager.deleteBot('b1', false, false)).rejects.toThrow(/Remove the replica on the Database modal first/);
+    expect(h.removed).not.toContain(REPLICA);
   });
 });
 

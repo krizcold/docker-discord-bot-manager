@@ -154,7 +154,7 @@ describe('a provisioning request whose answer was lost', () => {
         },
       };
       for (const r of ['loadBots', 'renderFleetReplica']) g[r] = async () => { calls.push(r); };
-      const ctx = runPage([fn, ...fns('showNoAnswer', 'followLostProvisioning', 'refuseWhileChecking')], g);
+      const ctx = runPage([fn, ...fns('showNoAnswer', 'followLostProvisioning', 'refuseWhileChecking', 'postProvision')], g);
       vm.runInContext('var provisionChecking = new Set();', ctx);
       const first = ctx[fn]('b1');
       await new Promise((r) => setTimeout(r, 10));

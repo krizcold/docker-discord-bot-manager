@@ -680,6 +680,7 @@
         <div id="bots-container">
           <div class="loading">Loading bots...</div>
         </div>
+        <div id="orphan-backups"></div>
       </div>
     </div>
 
@@ -1412,8 +1413,25 @@
         }
       }
       renderBots();
+      if (!botsLoadError) loadOrphanBackups();
       // Source sidebar's "[N updates]" badge depends on bots[].updateAvailable; re-render it too
       if (sources.length > 0) renderSourceSidebar();
+    }
+
+    // Database dumps whose instance was removed stay on disk; this names where.
+    async function loadOrphanBackups() {
+      const box = document.getElementById('orphan-backups');
+      if (!box) return;
+      try {
+        const res = await api('GET', '/bots/fleet/orphan-backups');
+        const folders = res.success ? (res.folders || []) : [];
+        box.innerHTML = !res.success
+          ? `<div class="env-tip" style="margin-top:12px;">The manager could not list database dumps of removed instances: ${escapeHtml(res.error || 'no answer')}</div>`
+          : folders.length === 0 ? ''
+          : `<div class="env-tip" style="margin-top:12px;">Database dumps of removed instances are kept in the manager's data folder:${folders.map(f => `<br>${escapeHtml(f.folder)}: ${f.dumps === null ? 'the folder could not be read' : `${f.dumps} ${f.dumps === 1 ? 'dump' : 'dumps'}`}`).join('')}</div>`;
+      } catch {
+        box.innerHTML = '';
+      }
     }
 
     function renderBots() {
@@ -1942,7 +1960,12 @@
     function updateDataWarning() {
       const warn = document.getElementById('data-warning');
       if (document.getElementById('delete-also-data').checked) {
-        warn.textContent = 'All settings and user data will be permanently deleted';
+        const delBot = bots.find(b => b.id === deleteBotId);
+        warn.textContent = delBot && delBot.fleetDb
+          ? 'This instance hosts the fleet database. While its volume exists the manager refuses to delete the data: decommission it on the Database modal first, which takes a safety dump'
+          : delBot && delBot.fleetDbReplica
+            ? 'This instance holds a copy of the fleet database. While its volume exists the manager refuses to delete the data: remove the replica on the Database modal first, which keeps that volume'
+            : 'All settings and user data will be permanently deleted';
         warn.style.color = 'var(--danger)';
       } else {
         warn.textContent = deploymentMode === 'docker'
@@ -1966,11 +1989,21 @@
       hideDeleteModal();
       busyBots.add(id); renderBots();
       try {
-        const res = await api('DELETE', `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`);
+        const query = `/bots/${id}?keepData=${preserveData}&keepEnv=${keepEnv}`;
+        let res = await api('DELETE', query);
+        // Each question the server asks is answered by its own flag.
+        let confirmed = '';
+        for (let round = 0; round < 2 && !res.success && res.needsConfirm && res.confirmFlag; round++) {
+          if (!window.confirm(`${res.error}\n\n${res.confirmFlag === 'confirmPromoted' ? 'Remove it anyway?' : 'Delete this data anyway?'}`)) { showMessage('info', 'Nothing was removed'); return; }
+          confirmed += `&${res.confirmFlag}=true`;
+          res = await api('DELETE', `${query}${confirmed}`);
+        }
         if (!res.success) { showMessage('error', res.error || 'Failed to remove bot'); return; }
         let msg = !preserveData ? 'Bot removed'
           : res.keptDataDir ? `Bot removed; its data stays in ${res.keptDataDir}, and a new install does not reuse that folder`
           : 'Bot removed (data preserved)';
+        if (res.keptReplicaVolume) msg += `; the replica volume ${res.keptReplicaVolume} that Remove replica kept was not deleted`;
+        if (res.dbDumpsKept) msg += `; its ${res.dbDumpsKept.count} database ${res.dbDumpsKept.count === 1 ? 'dump stays' : 'dumps stay'} in the manager's ${res.dbDumpsKept.folder} folder`;
         if (!keepEnv) msg += res.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
         else if (res.vaulted) msg += '; environment values copied to the vault';
         showMessage('success', msg);
@@ -3851,7 +3884,7 @@
         : live.inRecovery === false && unanswered
           ? `<div class="error-message">This copy has left recovery and its app is not answering (${escapeHtml(posture.error || 'no answer')}), so the manager cannot tell a stand-in from a promotion. Nothing is adopted or re-seeded until it answers; removing the replica keeps its volume.</div>`
         : live.inRecovery === false
-          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again.</div>
+          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again; that destroys every write made to this copy since the promote.</div>
              ${runHeld ? '' : `<div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`}`
           : coveredCopy
             ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})`}. ${standing.namesThisNode === false ? (slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it and this copy follows a database that is no longer the fleet's. ${(facts && facts.copyBlockCurrent === true) || (facts && facts.backupMaster === true) ? `Demote the node from its Fleet tab to release the copy, then Re-seed now repoints it at the current primary${facts.copyBlockCurrent === true ? '' : ' once that primary\'s copy block reaches this node'}.` : `Demoted, this node is a co-worker, and a co-worker is not sent the current primary's copy block, so Re-seed now would have nothing to follow. Remove the replica and provision it again from the copy block on the current primary's Database modal, or set BOT_NODE_ROLE=backup-master on this node and restart it first, then demote it from its Fleet tab and Re-seed now once the block reaches it.`}` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, but that node no longer stands in for it (promoted by hand, or its lane ended), so there is no failback to run; demote the node from its Fleet tab to stay a co-worker, or set BOT_NODE_ROLE=backup-master on this node and restart it to make it a designated backup.`) : standing.namesThisNode !== true ? `This is the RETURNING MASTER's copy, re-seeded for the failback, but its bot is not registered with the node holding the fleet yet; the failback needs that node reachable, and nothing is adopted or re-seeded meanwhile.` : standing.followsDelivered === false ? `This is the RETURNING MASTER's copy, re-seeded for the failback; this node's bot is registered with the node holding the fleet, but the database it delivered is not installed here yet (not dialable from this machine, or its identity did not verify), so the failback cannot start; the node's own Fleet tab hold notice says so.` : slot && slot.sourceIsCurrentMaster === false ? `This is the RETURNING MASTER's copy, but it follows a database other than the one the node holding the fleet serves (that node reports no slot of its own for it), so the failback cannot promote it; remove the replica and provision it again from the copy block on that node's Database modal.` : `This is the RETURNING MASTER's copy of <b>${standInWho}</b>'s database, and this node's bot follows that node as a co-worker; promote this node from its Fleet tab once the copy has caught up to take the fleet back.`}</div>`
@@ -4074,6 +4107,24 @@
       }
     }
 
+    // Each confirm the server asks for is answered on its own: a volume to clear
+    // is named in confirmVolume, any other question takes confirm.
+    async function postProvision(url, payload) {
+      let body = payload;
+      let res = await api('POST', url, body);
+      for (let round = 0; round < 3 && !res.success && res.needsConfirm; round++) {
+        if (res.confirmVolume) {
+          if (!window.confirm(`${res.error}\n\nClear ${res.confirmVolume} and provision?`)) return null;
+          body = { ...body, confirmVolume: res.confirmVolume };
+        } else {
+          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return null;
+          body = { ...body, confirm: true };
+        }
+        res = await api('POST', url, body);
+      }
+      return res;
+    }
+
     async function provisionFleetReplicaFromFacts(botId) {
       const host = (document.getElementById('replica-host')?.value || '').trim();
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
@@ -4083,11 +4134,8 @@
       const payload = { publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        let res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, payload);
-        if (!res.success && res.needsConfirm) {
-          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return;
-          res = await api('POST', `/bots/${botId}/fleet-replica/from-facts`, { ...payload, confirm: true });
-        }
+        const res = await postProvision(`/bots/${botId}/fleet-replica/from-facts`, payload);
+        if (!res) return;
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started from the block this node holds');
       } catch (err) {
@@ -4109,11 +4157,8 @@
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        let res = await api('POST', `/bots/${botId}/fleet-replica`, payload);
-        if (!res.success && res.needsConfirm) {
-          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return;
-          res = await api('POST', `/bots/${botId}/fleet-replica`, { ...payload, confirm: true });
-        }
+        const res = await postProvision(`/bots/${botId}/fleet-replica`, payload);
+        if (!res) return;
         // Failure keeps the form (and everything pasted into it) intact.
         if (!res.success) { showMessage('error', res.error || 'Failed to start provisioning'); return; }
         showMessage('success', 'Provisioning started');
@@ -4269,13 +4314,17 @@
     async function removeFleetReplica(botId, holdsOutageWrites, appSilent) {
       const rec = (bots.find(b => b.id === botId) || {}).fleetDbReplica;
       const outage = holdsOutageWrites
-        ? '\n\nThis copy took the fleet\'s writes while it stood in for the dead master, and may hold writes no other database has. The data volume survives this removal, but provisioning a replica again afterwards wipes it. Promote this node by hand instead if those writes must be kept.'
+        ? '\n\nThis copy took the fleet\'s writes while it stood in for the dead master, and may hold writes no other database has. The data volume survives this removal; provisioning a replica again afterwards asks before it wipes the volume. Promote this node by hand instead if those writes must be kept.'
         : appSilent
-          ? '\n\nThe app on this instance is not answering, so the manager cannot tell whether this copy is standing in for a dead master and holds writes nothing else has. The data volume survives this removal, but provisioning a replica again afterwards wipes it.'
+          ? '\n\nThe app on this instance is not answering, so the manager cannot tell whether this copy is standing in for a dead master and holds writes nothing else has. The data volume survives this removal; provisioning a replica again afterwards asks before it wipes the volume.'
           : '';
       if (!confirm(`Remove this replica?${outage}\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
       try {
-        const res = await api('DELETE', `/bots/${botId}/fleet-replica`);
+        let res = await api('DELETE', `/bots/${botId}/fleet-replica`);
+        if (!res.success && res.needsConfirm) {
+          if (!window.confirm(`${res.error}\n\nRemove it anyway?`)) { renderFleetReplica(botId); return; }
+          res = await api('DELETE', `/bots/${botId}/fleet-replica`, { confirmPromoted: true });
+        }
         if (res.success) {
           showMessage('success', res.warning || 'Replica removed');
         } else {

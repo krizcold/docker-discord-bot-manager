@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as containerManager from '../docker/containerManager';
+import * as dockerClient from '../docker/dockerClient';
 import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import { getBotDir, getDataPath } from '../git/repoManager';
@@ -125,12 +126,17 @@ function removalHold(botId: string, containerName: string): string | null {
   if (seedRunning(botId)) return 'A seed is running on this standby; wait for it to finish';
   const busyOp = containerManager.isBotBusy(botId);
   if (busyOp) return `Operation '${busyOp}' is running on this instance; wait for it to finish`;
-  const run = now.fleetTransfer;
+  return promoteHold(now);
+}
+
+/** A transfer that is promoting, or may be promoting, this instance's copy. */
+function promoteHold(instance: InstanceConfig): string | null {
+  const run = instance.fleetTransfer;
   if (run && !run.parked) return `A transfer is running on this instance (${run.phase}); wait for it to finish`;
   if (run?.phase === 'promoting') {
     return 'A transfer stopped while the app was promoting this copy, and the app may still be promoting it; check its Fleet view, then Continue or Dismiss the transfer first';
   }
-  if (promotesInFlight.has(botId)) return 'A Transfer is asking the app to promote this copy right now; wait for its answer';
+  if (promotesInFlight.has(instance.id)) return 'A Transfer is asking the app to promote this copy right now; wait for its answer';
   return null;
 }
 
@@ -523,6 +529,7 @@ function startProvisioning(
   purpose: FleetReplicaSeedPurpose,
   preflight?: () => Promise<void>,
   onSettled?: () => void,
+  confirmVolume?: string,
 ): { success: boolean; error?: string } {
   // The busy check, the record write and the lock claim share one synchronous
   // segment: a second entrant that wrote the record and only then lost the
@@ -562,7 +569,7 @@ function startProvisioning(
     assertVolumeOwnedHere(instance.id, record.volume);
     if (preflight) await preflight();
     try {
-      await runProvisioning(instance, record, intake.dsn, intake.cert, purpose);
+      await runProvisioning(instance, record, intake.dsn, intake.cert, purpose, confirmVolume);
     } catch (err) {
       // A record still naming this slot means the standby's own copy survived
       // and may yet stream on it; anything else leaves it retaining WAL for a
@@ -599,8 +606,9 @@ function startProvisioning(
 
 /**
  * Kick off provisioning (async; poll status). Refuses when a record already
- * exists (remove first), when the target volume holds data, or when the host
- * port collides with any other managed database on this manager.
+ * exists (remove first) or when the host port collides with any other managed
+ * database on this manager, and asks before clearing a replica volume that
+ * already exists.
  */
 const FAILBACK_PAST_WIPE: ReadonlySet<FleetFailbackPhase> = new Set(['seeding', 'applying', 'catching-up', 'promoting', 'adopting', 'restarting']);
 
@@ -611,8 +619,8 @@ export function provisionFleetReplica(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
-  opts: { run?: number } = {},
-): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
+  opts: { run?: number; confirmVolume?: string } = {},
+): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
   const held = runHold(instance, opts.run);
   if (held) return { success: false, error: held };
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
@@ -672,9 +680,17 @@ export function provisionFleetReplica(
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
+  const record = replicaRecordFor(instance, validated.intake);
+  // The failback's wipe consent covers this volume: its stale-primary seed
+  // clears the same volume unasked, and a retry after that seed parked
+  // finds the volume it made.
+  const confirmVolume = inRun && typeof instance.fleetFailback?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
+  if (volumeRefusal) return { success: false, ...volumeRefusal };
+
   // The op lock keeps start/rebuild/delete away from the minutes-long seed
   // (and vice versa: the busy check above refuses while one of those runs).
-  const started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'provision');
+  const started = startProvisioning(instance, record, validated.intake, 'provision', undefined, undefined, confirmVolume);
   if (!started.success) return started;
   return { success: true, started: true };
 }
@@ -690,7 +706,8 @@ export async function provisionFleetReplicaFromFacts(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
-): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean }> {
+  confirmVolume?: string,
+): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string }> {
   const held = runHold(instance);
   if (held) return { success: false, error: held };
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
@@ -709,7 +726,7 @@ export async function provisionFleetReplicaFromFacts(
   if (facts.facts?.copyBlockCurrent !== true) {
     return { success: false, error: 'The app did not say whether its block is current; paste the block from the primary machine instead' };
   }
-  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort, confirm);
+  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort, confirm, { confirmVolume });
 }
 
 /**
@@ -804,13 +821,32 @@ async function assertSeedableSource(instance: InstanceConfig, dsn: ParsedDsn, ce
   }
 }
 
+/** What the first provision would clear, worded for its confirm; names what Remove replica recorded about the volume. */
+function keptVolumeQuestion(instance: InstanceConfig, volume: string): string {
+  const kept = instance.fleetDbReplicaKept?.volume === volume ? instance.fleetDbReplicaKept : null;
+  const held = !kept ? 'Nothing on record says what it holds; a volume left by Remove replica can be a promoted copy with writes no other database has'
+    : kept.held === 'promoted' ? `Remove replica left it on ${kept.removedAt.slice(0, 10)}, and the copy in it had been promoted, so it may hold writes no other database has`
+      : kept.held === 'standby' ? `Remove replica left it on ${kept.removedAt.slice(0, 10)}, when it held a standby copy that was still following its primary`
+        : `Remove replica left it on ${kept.removedAt.slice(0, 10)}, while its container was not running, so what it held then is unknown`;
+  return `The replica volume ${volume} already exists, and provisioning clears everything in it for good. ${held}`;
+}
+
+/** The volume a first provision may clear: proven absent, or the one the operator's confirm named. */
+function provisionVolumeRefusal(instance: InstanceConfig, volume: string, confirmVolume: string | undefined): { error: string; needsConfirm?: true; confirmVolume?: string } | null {
+  const state = dockerClient.volumeState(volume);
+  if (state === 'absent') return null;
+  if (state === 'unknown') return { error: `Docker did not say whether the replica volume ${volume} exists, so the manager can't confirm provisioning would clear nothing; nothing was started, try again` };
+  if (confirmVolume === volume) return null;
+  return { error: keptVolumeQuestion(instance, volume), needsConfirm: true, confirmVolume: volume };
+}
+
 /** The seed clears the volume whole, so a volume another instance uses or declares is refused, and so is one that cannot be checked. */
 function assertVolumeOwnedHere(botId: string, volume: string): void {
   const shared = containerManager.sharedVolumeReason(volume, botId);
   if (shared) throw new Error(`the seed stopped before clearing the replica volume ${volume}: ${shared}`);
 }
 
-async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaRecord, dsn: ParsedDsn, certPem: string, purpose: FleetReplicaSeedPurpose): Promise<void> {
+async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaRecord, dsn: ParsedDsn, certPem: string, purpose: FleetReplicaSeedPurpose, confirmVolume?: string): Promise<void> {
   const hostCertPath = hostCertPathFor(instance.id);
   const seedName = seedContainerName(instance);
 
@@ -826,6 +862,15 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // Past this point cancelling cannot put it back.
   throwIfCancelled(instance.id);
   assertVolumeOwnedHere(instance.id, record.volume);
+  if (purpose === 'provision') {
+    // Asked again here: the request's check was minutes ago, and a volume made
+    // since then was never part of what the operator confirmed.
+    const state = await dockerVolumeState(record.volume);
+    if (state === 'unknown') throw new Error(`the seed stopped before clearing anything: docker did not say whether the replica volume ${record.volume} exists`);
+    if (state === 'exists' && confirmVolume !== record.volume) {
+      throw new Error(`the seed stopped before clearing anything: ${keptVolumeQuestion(containerManager.getBot(instance.id) ?? instance, record.volume)}. Provision again and confirm to clear it`);
+    }
+  }
   saveSeed(instance.id, { committed: true });
   setCopyCleared(instance.id, true);
   const wipe = await volExec(record.volume, `find ${PGDATA} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`);
@@ -924,6 +969,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   const builtBy = seedRecord(instance.id)?.startedAt;
   const rebuilt = { ...restored, seededAt: Date.now(), ...(typeof builtBy === 'number' ? { seededBy: builtBy } : {}) };
   containerManager.updateInstanceFleetDbReplica(instance.id, ledger ? { ...rebuilt, autoReseed: ledger } : rebuilt);
+  if (containerManager.getBot(instance.id)?.fleetDbReplicaKept?.volume === record.volume) containerManager.updateInstanceFleetDbReplicaKept(instance.id, null);
   const apply = await containerManager.applyFleetDbReplicaService(instance.id);
   if (!apply.success) {
     // A first provision leaves no half record behind; either re-seed keeps the
@@ -947,11 +993,41 @@ async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCe
 }
 
 /**
+ * What the copy holds now, read from its running database: a standby still in
+ * recovery, a promoted copy, or unknown when its container is not running.
+ * A running copy that cannot be read is 'unanswered' after a failed probe and
+ * 'no-identity' when its record names no user and database to probe with.
+ */
+async function copyHeld(rec: FleetDbReplicaRecord): Promise<'standby' | 'promoted' | 'unknown' | 'unanswered' | 'no-identity'> {
+  if (rec.user && rec.db) {
+    const probe = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery();']);
+    const answer = probe.ok ? probe.stdout.trim().split('|')[0] : '';
+    if (answer === 't') return 'standby';
+    if (answer === 'f') return 'promoted';
+  }
+  if ((await containerRunning(rec.containerName)) === false) return 'unknown';
+  return rec.user && rec.db ? 'unanswered' : 'no-identity';
+}
+
+/** Why a running copy that cannot be read refuses, and the stop that works for the instance's status. */
+function unreadCopyRefusal(instance: InstanceConfig, rec: FleetDbReplicaRecord, state: 'unanswered' | 'no-identity', subject: string, after: string): string {
+  const why = state === 'no-identity'
+    ? `${subject} is running, but its record has no database identity to read it with`
+    : `${subject} is running but its database did not answer`;
+  const stop = instance.status === 'running'
+    ? "stop the instance (its copy's container stops with it)"
+    : `stop the copy's container with docker stop ${rec.containerName} (Stop refuses an instance that is not running), or Start the instance and then Stop it`;
+  const lead = state === 'no-identity' ? `To remove it, ${stop}` : `If it keeps not answering, ${stop}`;
+  return `${why}, so the manager can't confirm whether it was promoted and now holds the fleet's writes; nothing was removed. ${lead}, then ${after}`;
+}
+
+/**
  * Remove the standby service + record. The volume and the stored primary cert
- * stay (data retention / re-provision). The PRIMARY's replication slot is now
+ * stay (data retention / re-provision), and what the volume held is recorded
+ * for the next Provision to name. The PRIMARY's replication slot is now
  * orphaned and retains WAL: the caller must surface that loudly.
  */
-export async function removeFleetReplica(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+export async function removeFleetReplica(instance: InstanceConfig, opts: { confirmPromoted?: boolean } = {}): Promise<{ success: boolean; error?: string; needsConfirm?: boolean }> {
   const held = runHold(instance);
   if (held) return { success: false, error: held };
   const rec = instance.fleetDbReplica;
@@ -960,15 +1036,25 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   const hold = removalHold(instance.id, rec.containerName);
   if (hold) return { success: false, error: hold };
   // A stand-in's copy IS the fleet's database (20.5): removing it takes the
-  // fleet down. Judged from the app's fact alone (B6 map F34). Not refused
-  // when the app is silent, and not on an ended lane: this removal keeps the
-  // data volume, it is the one exit left when nothing else answers, and the
-  // modal's confirm names what may be inside; the destructive act is the
-  // later Provision, which the operator takes separately.
+  // fleet down. Judged from the app's fact alone (B6 map F34); a silent app
+  // or an ended lane is not refused here. The copy's own database is read
+  // next, and a running copy that does not answer refuses: the exit then is
+  // stopping its container, after which this removal keeps the volume and
+  // records what it held as unknown.
   const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
   const standing = posture.read === 'ok' ? posture.posture : null;
   if (standing?.role === 'stand-in' && standing.live) {
     return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing it would take the fleet's database down. It returns to standby duty through the failback, or by hand after a manual promote or demote` };
+  }
+  // A copy promoted by hand reads no posture at all, and the app may be
+  // serving the fleet from it until it is adopted.
+  const copyState = await copyHeld(rec);
+  if (copyState === 'unanswered' || copyState === 'no-identity') {
+    const after = `Remove replica keeps the volume and records what it held as unknown${copyState === 'no-identity' ? '; a Provision after that stamps the identity' : ''}`;
+    return { success: false, error: unreadCopyRefusal(instance, rec, copyState, "The copy's container", after) };
+  }
+  if (copyState === 'promoted' && !opts.confirmPromoted) {
+    return { success: false, needsConfirm: true, error: "This copy no longer follows a primary: it was promoted, so the fleet may be serving from it now, and it may hold writes no other database has. Adopt it below to keep it as this machine's database. Removing it takes its container down at once; the volume is kept, and a later Provision here asks before clearing it" };
   }
   // The posture read can take seconds; a seed, a build or a transfer that
   // started meanwhile would write back or wipe what this removal leaves.
@@ -980,6 +1066,7 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
     const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
     if (!removed.success) return { success: false, error: `${removed.error}; the standby record was kept, so Remove can be retried` };
     try {
+      containerManager.updateInstanceFleetDbReplicaKept(instance.id, { volume: rec.volume, removedAt: new Date().toISOString(), held: copyState });
       containerManager.updateInstanceFleetDbReplica(instance.id, null);
       containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
     } catch (err) {
@@ -988,6 +1075,66 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
     return { success: true };
   });
 }
+
+/**
+ * Why Remove must not run on this instance now; null when it may. A delete
+ * that also deletes data reaches the fleet database only through decommission
+ * (its safety dump is the ruled permit), a standby copy only through Remove
+ * replica, and a fleet node's data folder only on the operator's confirm.
+ */
+export async function instanceRemovalRefusal(
+  instance: InstanceConfig,
+  keepData: boolean,
+  confirmFleetData: boolean,
+  confirmPromoted = false,
+): Promise<{ error: string; needsConfirm?: true; confirmFlag?: 'confirmFleetData' | 'confirmPromoted' } | null> {
+  const held = runHold(instance);
+  if (held) return { error: held };
+  if (instance.fleetDbReplica) {
+    const promoting = promoteHold(instance);
+    if (promoting) return { error: `${promoting}. Nothing was removed` };
+    const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
+    const standing = posture.read === 'ok' ? posture.posture : null;
+    if (standing?.role === 'stand-in' && standing.live) {
+      return { error: `This instance's database copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing the instance would take the fleet's database down. Nothing was removed` };
+    }
+    // Remove takes the copy's container down whether or not it keeps the data.
+    const copyState = await copyHeld(instance.fleetDbReplica);
+    if (copyState === 'unanswered' || copyState === 'no-identity') {
+      return { error: unreadCopyRefusal(instance, instance.fleetDbReplica, copyState, "The container of this instance's database copy", 'Remove') };
+    }
+    if (copyState === 'promoted' && !confirmPromoted) {
+      return { needsConfirm: true, confirmFlag: 'confirmPromoted', error: "This instance's database copy no longer follows a primary: it was promoted, so the fleet may be serving from it now, and it may hold writes no other database has. Removing the instance takes that copy's container down at once" };
+    }
+  }
+  if (keepData) return null;
+  if (instance.fleetDb) {
+    const state = await dockerVolumeState(instance.fleetDb.volume);
+    if (state === 'unknown') return { error: `Docker did not say whether the fleet database volume ${instance.fleetDb.volume} exists, so the manager can't confirm deleting the data would not destroy it; nothing was removed, try again` };
+    if (state === 'exists') return { error: `This instance hosts the fleet database in volume ${instance.fleetDb.volume}. Decommission it on the Database modal first, which takes a safety dump before destroying it, or remove the instance and keep its data. Nothing was removed` };
+  }
+  if (instance.fleetDbReplica) {
+    const state = await dockerVolumeState(instance.fleetDbReplica.volume);
+    if (state === 'unknown') return { error: `Docker did not say whether the replica volume ${instance.fleetDbReplica.volume} exists, so the manager can't confirm deleting the data would not destroy it; nothing was removed, try again` };
+    if (state === 'exists') return { error: `This instance holds a copy of the fleet database in volume ${instance.fleetDbReplica.volume}, and a copy can be promoted and hold writes no other database has. Remove the replica on the Database modal first (that keeps the volume), or remove the instance and keep its data. Nothing was removed` };
+  }
+  if (findAppCapabilities(instance.sourceUrl)?.controlPlane && !confirmFleetData) {
+    const dir = await instanceDataDir(instance);
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        return { error: `The data folder ${dir} could not be read (${err instanceof Error ? err.message : String(err)}), so the manager can't confirm what deleting it would lose; nothing was removed` };
+      }
+    }
+    if (entries.length > 0) {
+      return { needsConfirm: true, confirmFlag: 'confirmFleetData', error: `This instance runs an app that can be a fleet node, and its data folder ${dir} holds ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'}. On a fleet node they can include guilds no other node holds, the fleet's control records, or the backup copy of a master's data, and deleting them cannot be undone` };
+    }
+  }
+  return null;
+}
+
 /**
  * Stop pinning the fleet database on a node that no longer hosts it. A worker
  * is not told its database by the manager at all: the master delivers it on

@@ -15,7 +15,7 @@ Usage: dbm [--port N | --url URL] [--json] <command> [args]
 
 Sources:  sources list | add <url> [--name N] [--branch B] | info <id> | rm <id> | fetch <id> | envs <id> [--scan]
 Bots:     bots list | info <id> | create (--source <id>|--image <ref> --name N) | start|restart|build|update <id> [--wait]
-          bots stop <id> | delete <id> [--keep-data] [--no-keep-env] | check-updates <id> | containers <id> | stats <id>
+          bots stop <id> | delete <id> [--delete-data [--confirm-fleet-data]] [--confirm-promoted] [--no-keep-env] | check-updates <id> | containers <id> | stats <id>
           bots logs <id> [--tail N] | build-logs <id> [--follow] | container-logs <id> <name> [--lines N] [--follow]
           bots web-auth <id> <auto|managed|public> | port <id|name>
 Env:      env get <id> | set <id> KEY=VAL [KEY=VAL ...] | unset <id> KEY

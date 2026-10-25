@@ -390,7 +390,7 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     if (posture.read === 'unanswered') {
       return { ...base, ...(remembered ? { standIn: remembered } : {}), severity: 'error', message: `This copy has left recovery and its app is not answering (${posture.error}), so the manager cannot tell a stand-in from a promotion${remembered ? ` (${lastSeen.slice(2)})` : ''}; ${unansweredRemedy(posture.error)} before adopting or re-seeding it`, lagSeconds: null };
     }
-    return { ...base, severity: 'error', message: 'This copy has been promoted and no longer follows the primary; adopt it as the database of this machine, or re-provision it', lagSeconds: null };
+    return { ...base, severity: 'error', message: 'This copy has been promoted and no longer follows the primary; adopt it as the database of this machine. Removing it and provisioning again destroys every write made to it since the promote', lagSeconds: null };
   }
   // F35: a peer's wording is driven by the stand-in fact, not by the survivor
   // verdict below, which would invite a re-seed off a temporary primary.

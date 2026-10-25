@@ -4,7 +4,7 @@
  * unless written as `--flag=value`.
  */
 
-const BOOLEAN_FLAGS = new Set(['json', 'wait', 'follow', 'scan', 'help', 'keep-data', 'no-keep-env']);
+const BOOLEAN_FLAGS = new Set(['json', 'wait', 'follow', 'scan', 'help', 'keep-data', 'delete-data', 'confirm-fleet-data', 'confirm-promoted', 'no-keep-env']);
 
 export interface ParsedArgs {
   positionals: string[];

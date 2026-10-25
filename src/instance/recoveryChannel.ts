@@ -54,6 +54,14 @@ function docker(args: string[], stdin?: string, secretEnv?: Record<string, strin
   });
 }
 
+/** 'absent' only when docker says "no such volume": a docker run -v over an absent volume would mint an empty one under its name. */
+async function volumeState(name: string): Promise<{ state: 'exists' | 'absent' | 'unknown'; error: string }> {
+  const inspect = await docker(['volume', 'inspect', name]);
+  if (inspect.ok) return { state: 'exists', error: '' };
+  const error = inspect.stderr.trim().split('\n').pop() || 'docker did not answer';
+  return { state: /no such volume/i.test(inspect.stderr) ? 'absent' : 'unknown', error };
+}
+
 /** The image this manager runs, resolved from its own container: the helper reuses it so the relay code always matches the deployed manager. */
 async function selfImage(): Promise<{ ok: boolean; image?: string; error?: string }> {
   const override = (process.env.RECOVERY_RELAY_IMAGE || '').trim();
@@ -438,7 +446,10 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
         '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
         '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
         '-c', 'SELECT pg_reload_conf()']);
-      if (!unfence.ok) {
+      const volume = unfence.ok ? null : await volumeState(fleetDb.volume);
+      if (volume && volume.state === 'unknown') {
+        left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists (${volume.error}), so the disarm can't confirm whether the database is still fenced READ-ONLY`);
+      } else if (volume && volume.state === 'exists') {
         const strip = await docker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
           "f=/pgdata/postgresql.auto.conf; grep -q '^default_transaction_read_only' \"$f\" 2>/dev/null || exit 0; sed -i '/^default_transaction_read_only/d' \"$f\" && echo stripped"]);
         if (!strip.ok) {

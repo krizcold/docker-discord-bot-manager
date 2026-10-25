@@ -2565,16 +2565,18 @@ export function applyDockerHostPort(composeContent: string, instance: InstanceCo
 /**
  * Write a .env next to the bot's compose so `${VAR}` interpolation and `env_file:`
  * services resolve in docker mode. Mirrors writeComposeEnvFile, but under the
- * manager data dir rather than /DATA.
+ * manager data dir rather than /DATA. Returns why the write failed, or null.
  */
-export function writeDockerEnvFile(botDir: string, env: Record<string, string>): void {
+export function writeDockerEnvFile(botDir: string, env: Record<string, string>): string | null {
   try {
     const lines = Object.entries(env)
       .filter(([k]) => k)
       .map(([k, v]) => `${k}=${formatDotenvValue(v)}`);
     writePrivateFile(path.join(botDir, '.env'), lines.join('\n') + '\n');
+    return null;
   } catch (err) {
     console.warn(`[ContainerManager] Failed to write .env file: ${err}`);
+    return err instanceof Error ? err.message : String(err);
   }
 }
 
@@ -3637,7 +3639,8 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       // ${VAR} / env_file services, then deploy the full compose (multi-service).
       const envErr = syncComposeEnvVars(latestInstance, composePath, true);
       if (envErr) notApplied.push(`environment variables (${envErr})`);
-      writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
+      const dotenvErr = writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
+      if (dotenvErr) notApplied.push(`the .env file (could not be written: ${dotenvErr}; compose read the .env already there, if any)`);
 
       // Re-apply edited config files so changes made while stopped take effect.
       reapplyConfigFilesDocker(botId, botDir, composePath, emit, notApplied);
@@ -3848,7 +3851,8 @@ async function startDockerImageBot(instance: InstanceConfig): Promise<LaneResult
       const composePath = path.join(botDir, 'docker-compose.yml');
       const envErr = syncComposeEnvVars(instance, composePath, true);
       if (envErr) notApplied.push(`environment variables (${envErr})`);
-      writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
+      const dotenvErr = writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
+      if (dotenvErr) notApplied.push(`the .env file (could not be written: ${dotenvErr}; compose read the .env already there, if any)`);
 
       reapplyConfigFilesDocker(botId, botDir, composePath, emit, notApplied);
 

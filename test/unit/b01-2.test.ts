@@ -258,7 +258,7 @@ const editorPage = (rows: FakeRow[], stored: string[], answer: any) => {
   const els = rows.map((r) => {
     const key = { value: r.key, dataset: r.originalKey ? { originalKey: r.originalKey } : {} };
     const val = { value: r.value, dataset: r.sensitive ? { sensitive: 'true' } : {} };
-    return { querySelector: (s: string) => (s === '.env-key' ? key : s === '.env-value' ? val : null) };
+    return { classList: { contains: () => false }, querySelector: (s: string) => (s === '.env-key' ? key : s === '.env-value' ? val : null) };
   });
   const btn = { disabled: false, textContent: 'Save', isConnected: true };
   const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'saveEnvEditor'], {

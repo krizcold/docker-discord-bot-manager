@@ -1179,7 +1179,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
 
-      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl, domainBase: !!process.env.BOT_DOMAIN_BASE };
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl };
       const vars = buildBotEnvList(repoPath, req.params.id, bot.tokenVarName, bot.sourceUrl || undefined, gateway);
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       const storePath = path.join(getEnvPath(req.params.id), 'storage.json');
@@ -1418,7 +1418,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ? sourceManager.getSourceRepoPath(bot.sourceId)
         : null;
       const source = bot.sourceId ? sourceManager.getSource(bot.sourceId) : null;
-      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl, domainBase: !!process.env.BOT_DOMAIN_BASE };
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), bot.webAuth), webAuth: bot.webAuth, publicUrl: !!bot.publicUrl };
       // Attach a guided install manifest + parsed body per file when one exists,
       // so the post-install editor renders the same guided form as the wizard.
       const files = buildBotConfigList(repoPath, req.params.id, source?.url, gateway).map(f => {

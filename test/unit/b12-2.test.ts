@@ -201,11 +201,11 @@ describe('B12-2 review 2: the note and rows match the deployment', () => {
     for (const r of rows) expect(r.inactive).toBeUndefined();
   });
 
-  it('with BOT_DOMAIN_BASE set and no public URL yet, the note does not name BOT_PORT_BIND', async () => {
+  it('with no public URL yet, the note names BOT_PORT_BIND', async () => {
     const { buildWizardEnvList } = await import('../../src/env/envList');
-    const row = buildWizardEnvList(repo, { gateway: { dropped: true, webAuth: 'auto', publicUrl: false, domainBase: true } }).vars.find(v => v.key === 'WEBUI_USER')!;
+    const row = buildWizardEnvList(repo, { gateway: { dropped: true, webAuth: 'auto', publicUrl: false } }).vars.find(v => v.key === 'WEBUI_USER')!;
     expect(row.inactive).toMatch(/bots web-auth <id> public/);
-    expect(row.inactive).not.toMatch(/BOT_PORT_BIND/);
+    expect(row.inactive).toMatch(/BOT_PORT_BIND is off loopback/);
   });
 
   it('the config editor shows a file note and still saves the file', () => {

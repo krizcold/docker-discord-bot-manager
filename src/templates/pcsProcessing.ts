@@ -969,15 +969,25 @@ export function frontingGateway(compose: Record<string, unknown>): { gateway: st
   return { gateway: mainName, backend: backendName, backendPort };
 }
 
+// A fronting gateway kept for an off-loopback bind still goes behind Authelia on the domain route in auto mode.
+export function domainRouteForwardAuth(content: string, webAuth: string | undefined): boolean {
+  if (webAuth === 'public') return false;
+  if (webAuth === 'managed') return true;
+  let parsed: Record<string, unknown> = {};
+  try { parsed = (parseDocument(content).toJS() as Record<string, unknown>) || {}; } catch { return true; }
+  if (frontingGateway(parsed) !== null) return true;
+  return !mainServiceSelfAuths(content);
+}
+
 /**
  * Whether a deploy in this mode with this webAuth drops a fronting gateway. On
- * the docker stack the boundary is the localhost bind or the bundled Authelia;
- * webAuth=public keeps the bot's own gate, and a non-loopback BOT_PORT_BIND with
- * no domain route keeps it as the only boundary. CasaOS always keeps it.
+ * the docker stack the localhost bind is the boundary; a non-loopback
+ * BOT_PORT_BIND keeps the gateway, since Authelia covers only the domain route.
+ * webAuth=public keeps the bot's own gate. CasaOS always keeps it.
  */
 export function frontingGatewayDropped(mode: DeploymentMode, webAuth: BotConfig['webAuth']): boolean {
   if (mode !== 'docker' || webAuth === 'public') return false;
-  return isLoopbackBind(botPortBind()) || !!process.env.BOT_DOMAIN_BASE;
+  return isLoopbackBind(botPortBind());
 }
 
 /**
@@ -1340,8 +1350,10 @@ export function publishHostPort(
     // Set BOT_PORT_BIND=0.0.0.0 to opt into all-interfaces (trusted LAN only).
     const bind = botPortBind();
     if (!isLoopbackBind(bind)) {
-      const authelia = process.env.BOT_DOMAIN_BASE ? ", and the Authelia login on the bot's BOT_DOMAIN_BASE address does not cover this port" : '';
-      console.warn(`[Docker] Publishing host port ${hostPort} on ${bind} (BOT_PORT_BIND): reachable from other hosts, not only this machine${authelia}`);
+      const guard = frontingGateway(compose)
+        ? "; the bot's own login gateway guards this port"
+        : `; no login gateway guards this port${process.env.BOT_DOMAIN_BASE ? ", and the Authelia login on the bot's BOT_DOMAIN_BASE address does not cover this port" : ''}`;
+      console.warn(`[Docker] Publishing host port ${hostPort} on ${bind} (BOT_PORT_BIND): reachable from other hosts, not only this machine${guard}`);
     }
     const mapping = (bind && bind !== '0.0.0.0') ? `${bind}:${hostPort}:${containerPort}` : `${hostPort}:${containerPort}`;
     ports.push(mapping);

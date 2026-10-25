@@ -220,7 +220,7 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       const scanSource = req.query.scan === 'true';
       const hasEnvExample = fs.existsSync(path.join(repoPath, '.env.example'));
       // A new bot starts with the default Auth mode.
-      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), undefined), publicUrl: !!process.env.BOT_DOMAIN_BASE, domainBase: !!process.env.BOT_DOMAIN_BASE };
+      const gateway = { dropped: frontingGatewayDropped(await getDeploymentMode(), undefined), publicUrl: !!process.env.BOT_DOMAIN_BASE };
       const { vars, detection, sourceScan } = buildWizardEnvList(repoPath, { scanSource, sourceUrl: source.url, gateway });
 
       // Apply any per-source template modifier to the prefilled config defaults

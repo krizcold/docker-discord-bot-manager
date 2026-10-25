@@ -52,7 +52,7 @@ import {
   gatewayOnDefaultPassword,
   botPortBind,
   attachBotToProxy,
-  mainServiceSelfAuths,
+  domainRouteForwardAuth,
   getFleetControlPort,
   getFleetTransferPort,
   getFleetControlService,
@@ -2666,10 +2666,7 @@ export function applyDockerHostPort(composeContent: string, instance: InstanceCo
       // Auth in front of the public vhost: explicit instance setting wins; in auto
       // mode a self-authenticating main service is left to protect itself, everything
       // else goes behind our managed gate (Authelia MFA on this stack).
-      const forwardAuth =
-        instance.webAuth === 'public' ? false :
-        instance.webAuth === 'managed' ? true :
-        !mainServiceSelfAuths(content);
+      const forwardAuth = domainRouteForwardAuth(content, instance.webAuth);
       content = attachBotToProxy(content, host, info.containerPort, { forwardAuth });
       publicUrl = `https://${host}`;
     }

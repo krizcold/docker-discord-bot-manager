@@ -60,17 +60,13 @@ export interface GatewayDeploy {
   webAuth?: string;
   /** The bot has a public URL (BOT_DOMAIN_BASE set), so the bot card shows its Auth select. */
   publicUrl?: boolean;
-  /** BOT_DOMAIN_BASE is set, so the bind does not keep the gateway. */
-  domainBase?: boolean;
 }
 
 function gatewayDroppedNote(gateway: GatewayDeploy): string {
   const mode = gateway.webAuth || 'auto';
   const keep = gateway.publicUrl
-    ? 'With Auth set to Public on the bot card, the gateway and this login stay.'
-    : gateway.domainBase
-      ? 'The gateway and this login stay when Auth is Public (`bots web-auth <id> public`).'
-      : 'The gateway and this login stay when Auth is Public (`bots web-auth <id> public`) or when BOT_PORT_BIND is off loopback.';
+    ? 'The gateway and this login stay with Auth set to Public on the bot card, or when BOT_PORT_BIND is off loopback.'
+    : 'The gateway and this login stay when Auth is Public (`bots web-auth <id> public`) or when BOT_PORT_BIND is off loopback.';
   return `Not used: this deployment removes the bot's own login gateway (Auth: ${mode.charAt(0).toUpperCase()}${mode.slice(1)}). ${keep}`;
 }
 

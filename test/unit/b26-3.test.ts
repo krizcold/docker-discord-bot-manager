@@ -51,10 +51,10 @@ describe('B26-3 gateway strip reads BOT_PORT_BIND', () => {
     expect(services(processComposeForDocker(compose, 'b1', bot).content)).not.toContain('gateway');
   });
 
-  it('still strips it when a domain route fronts the bot', () => {
+  it('keeps it when a domain route also fronts the bot', () => {
     process.env.BOT_PORT_BIND = '0.0.0.0';
     process.env.BOT_DOMAIN_BASE = 'dbot.example.com';
-    expect(services(processComposeForDocker(compose, 'b1', bot).content)).not.toContain('gateway');
+    expect(services(processComposeForDocker(compose, 'b1', bot).content)).toContain('gateway');
   });
 
   it('logs the exposure when a host port is published off loopback', () => {

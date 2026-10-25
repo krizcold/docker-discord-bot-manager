@@ -24,7 +24,8 @@ import * as containerManager from '../docker/containerManager';
 import { generateCertPair } from './fleetReplication';
 import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
-import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT, releaseQuiesceSlot } from './recoveryControl';
+import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT, holdsQuiesceSlot, releaseQuiesceSlot } from './recoveryControl';
+import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { FenceHeld, heldText, liftOwnedFence } from './fleetBackup';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
@@ -471,20 +472,32 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       // stays on and the answer names it. The shared lift takes the pg_hba
       // lines first and strips the volume files when the database is down.
       const held: FenceHeld = { readOnly: false, hba: false, holder: null };
-      const lifted = await liftOwnedFence(fleetDb, 'swap:*', { readOnly: true, hba: true }, held);
       const fencedText = 'READ-ONLY or refusing every connection but the manager\'s';
-      if (lifted === 'unknown') {
-        const volume = await volumeState(fleetDb.volume);
-        left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists${volume.error ? ` (${volume.error})` : ''}, so the disarm can't confirm whether the database is still ${fencedText}`);
-      } else if (lifted === 'failed' || lifted === 'locked' || lifted === 'unreloaded') {
-        left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${held.detail || 'docker did not answer'}), so the database may stay ${fencedText}`);
-      } else if (lifted === 'stripped' && held.fromFiles) {
-        // A database that runs on keeps the fence it loaded until it restarts.
-        const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
-        if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database may stay ${fencedText} until its container restarts`);
-        else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay ${fencedText} until its container restarts`);
+      // The backup slot is held from the lift's owner read to its reset, so no restore, re-seed or decommission
+      // fences this database in between; a swap's quiesce already holds it.
+      const slot = !holdsQuiesceSlot(instance.id);
+      if (slot && !claimFleetBackupBusy(instance.id)) {
+        left.push(`the write fence on ${fleetDb.containerName} was not lifted, because ${containerManager.isShuttingDown() ? 'the manager is shutting down' : 'another database operation holds the backup slot of this instance'}, so a swap's fence on it, if one is there, stays on`);
+      } else {
+        let lifted: Awaited<ReturnType<typeof liftOwnedFence>>;
+        try {
+          lifted = await liftOwnedFence(fleetDb, 'swap:*', { readOnly: true, hba: true }, held);
+        } finally {
+          if (slot) releaseFleetBackupBusy(instance.id);
+        }
+        if (lifted === 'unknown') {
+          const volume = await volumeState(fleetDb.volume);
+          left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists${volume.error ? ` (${volume.error})` : ''}, so the disarm can't confirm whether the database is still ${fencedText}`);
+        } else if (lifted === 'failed' || lifted === 'locked' || lifted === 'unreloaded') {
+          left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${held.detail || 'docker did not answer'}), so the database may stay ${fencedText}`);
+        } else if (lifted === 'stripped' && held.fromFiles) {
+          // A database that runs on keeps the fence it loaded until it restarts.
+          const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
+          if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database may stay ${fencedText} until its container restarts`);
+          else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay ${fencedText} until its container restarts`);
+        }
+        if (held.readOnly || held.hba) heldNote = heldText(held, 'the disarm');
       }
-      if (held.readOnly || held.hba) heldNote = heldText(held, 'the disarm');
       const dbState = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
       const dbDown = dbState === 'stopped' || dbState === 'absent';
       let dropError = '';

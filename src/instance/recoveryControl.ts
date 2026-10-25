@@ -200,6 +200,10 @@ export function releaseQuiesceSlot(botId: string): void {
   if (quiesceSlots.delete(botId)) releaseFleetBackupBusy(botId);
 }
 
+export function holdsQuiesceSlot(botId: string): boolean {
+  return quiesceSlots.has(botId);
+}
+
 let server: http.Server | null = null;
 
 function tokenOk(instance: InstanceConfig, offered: string): boolean {
@@ -479,18 +483,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // disarm below tears down - then disarm this side exactly like the
       // operator's button would (helpers removed, slot dropped, record
       // cleared). Best effort by design: if it fails, the source operator
-      // disarms manually during the handback visit.
-      releaseQuiesceSlot(instance.id);
+      // disarms manually during the handback visit. The quiesce slot stays
+      // held until that disarm ends, so no lane fences the database between
+      // the disarm's owner read and its reset.
       send(200, { success: true });
       setTimeout(() => {
         void (async () => {
-          const { disarmRecoveryChannel } = await import('./recoveryChannel');
-          const fresh = containerManager.getBot(instance.id);
-          if (!fresh?.recoveryChannel) return;
-          const disarmed = await disarmRecoveryChannel(fresh);
-          console.log(disarmed.success
-            ? `[RecoveryControl] Source side disarmed after the swap (${fresh.displayName})${disarmed.warning ? `: ${disarmed.warning}` : ''}`
-            : `[RecoveryControl] Source-side disarm after the swap failed (${fresh.displayName}): ${disarmed.error}`);
+          try {
+            const { disarmRecoveryChannel } = await import('./recoveryChannel');
+            const fresh = containerManager.getBot(instance.id);
+            if (!fresh?.recoveryChannel) return;
+            const disarmed = await disarmRecoveryChannel(fresh);
+            console.log(disarmed.success
+              ? `[RecoveryControl] Source side disarmed after the swap (${fresh.displayName})${disarmed.warning ? `: ${disarmed.warning}` : ''}`
+              : `[RecoveryControl] Source-side disarm after the swap failed (${fresh.displayName}): ${disarmed.error}`);
+          } finally {
+            releaseQuiesceSlot(instance.id);
+          }
         })();
       }, 2_000).unref();
       return;

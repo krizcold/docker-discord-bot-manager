@@ -172,7 +172,7 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     expect(st.events).toEqual(['reset']);
   });
 
-  it('claims the backup slot from the quiesce until the teardown', async () => {
+  it('claims the backup slot from the quiesce until the teardown\'s disarm ends', async () => {
     const r = await call('quiesce');
     expect(r.code).toBe(200);
     expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(false);
@@ -180,6 +180,8 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     expect(again.code).toBe(200);
     const bye = await call('teardown');
     expect(bye.code).toBe(200);
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(false);
+    await vi.waitFor(() => expect(fleetBackupGuards.isFleetBackupBusy('s1')).toBe(false), { timeout: 6000 });
     expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(true);
     fleetBackupGuards.releaseFleetBackupBusy('s1');
   });

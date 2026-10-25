@@ -28,7 +28,7 @@ import * as containerManager from '../docker/containerManager';
 import * as fleetBackup from './fleetBackup';
 import * as fleetReplica from './fleetReplica';
 import { enableFleetReplication } from './fleetReplication';
-import { fenceOwnerLane } from './fleetBackupGuards';
+import { claimFleetBackupBusy, fenceOwnerLane, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { ActionResult, AppFacts, deliverCopyBlock, FactsRead, getAppFacts, postureFromRead, StandInPosture, transfer as promoteSide, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { FleetDbReplicaRecord, FleetFailbackDecline, FleetFailbackMode, FleetFailbackPhase, FleetFailbackRun, FleetLineageFact, InstanceConfig } from '../types';
@@ -347,23 +347,60 @@ async function fenceConsentPark(botId: string, instance: InstanceConfig, run: Fl
   return { ok: fenced.ok, error: fenced.ok ? null : fenced.error, at: Date.now(), owned: true, ownedLayers };
 }
 
-/** Lift the run's own fence while its database still stands; the note names a fence left behind. */
-async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Promise<string> {
-  if (run.fence?.owned !== true || destroyedBy(instance, run)) return '';
+/** Why a fence lift did not start: another lane holds this instance's backup slot, or the manager is stopping. */
+function slotRefusal(): string {
+  return containerManager.isShuttingDown()
+    ? 'the manager is shutting down'
+    : 'another database operation holds the backup slot of this instance';
+}
+
+/** Instances whose runner holds the backup slot for its own fence lift. */
+const runLifting = new Set<string>();
+
+/** A Cancel or Dismiss refused because the backup slot is taken, naming the run's own lift when that is the holder. */
+function closeRefusal(botId: string, word: string): ActionResult {
+  return { success: false, error: runLifting.has(botId)
+    ? `${word} was refused because the run is lifting its own write fence; nothing was changed. ${word} again in a moment`
+    : `${word} was refused because ${slotRefusal()}; nothing was changed. ${word} again once it ends` };
+}
+
+/** A run's fence lift: the note names a fence left behind, and retry says whether another lift of the run can change it. */
+type RunLift = { note: string; retry: boolean };
+
+/**
+ * Lift the run's own fence while its database still stands. The backup slot is held from the owner read to the
+ * reset (the caller's when slotHeld), so a restore, re-seed or decommission cannot fence the database in between;
+ * null when another lane holds it, and then nothing was sent.
+ */
+async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun, slotHeld = false): Promise<RunLift | null> {
+  if (run.fence?.owned !== true || destroyedBy(instance, run)) return { note: '', retry: false };
   const target = consentTarget(instance, run);
-  if (!target) return '';
-  const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
-  const held: fleetBackup.FenceHeld = { readOnly: false, hba: false, holder: null };
-  const lifted = await fleetBackup.liftConsentFence(instance.id, target, runFenceOwner(run), remedy, run.fence.ownedLayers, held);
-  const heldNote = held.readOnly || held.hba ? `; ${fleetBackup.heldText(held, 'the run')}` : '';
-  if (lifted === 'held') return heldNote;
-  return `${lifted === 'lifted' ? ''
-    : lifted === 'gone' ? `; its database volume ${target.volume} is gone, so no write fence remains on it`
-    : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
-    : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
-    : lifted === 'locked' ? `; the pg_hba lines of its write fence could not be removed, so the database refuses every connection but the manager's and the bot cannot reach it, through a restart too (${remedy})`
-    : lifted === 'unreloaded' ? `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart, and it may still refuse the bot's connections until it reloads or restarts (${remedy})`
-    : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`}${heldNote}`;
+  if (!target) return { note: '', retry: false };
+  if (!slotHeld) {
+    if (!claimFleetBackupBusy(instance.id)) return null;
+    runLifting.add(instance.id);
+  }
+  try {
+    const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
+    const held: fleetBackup.FenceHeld = { readOnly: false, hba: false, holder: null };
+    const lifted = await fleetBackup.liftConsentFence(instance.id, target, runFenceOwner(run), remedy, run.fence.ownedLayers, held);
+    const heldNote = held.readOnly || held.hba ? `; ${fleetBackup.heldText(held, 'the run')}` : '';
+    // A layer another lane holds stays on until that lane lifts it, so a lift of this run cannot change it.
+    if (lifted === 'held') return { note: heldNote, retry: false };
+    const note = `${lifted === 'lifted' ? ''
+      : lifted === 'gone' ? `; its database volume ${target.volume} is gone, so no write fence remains on it`
+      : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
+      : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
+      : lifted === 'locked' ? `; the pg_hba lines of its write fence could not be removed, so the database refuses every connection but the manager's and the bot cannot reach it, through a restart too (${remedy})`
+      : lifted === 'unreloaded' ? `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart, and it may still refuse the bot's connections until it reloads or restarts (${remedy})`
+      : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`}${heldNote}`;
+    return { note, retry: lifted !== 'lifted' && lifted !== 'gone' };
+  } finally {
+    if (!slotHeld) {
+      runLifting.delete(instance.id);
+      releaseFleetBackupBusy(instance.id);
+    }
+  }
 }
 
 function dumpText(dump: FleetFailbackRun['dump']): string {
@@ -557,11 +594,15 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
               if (!standing || standing.role !== 'stand-in' || standing.live) {
                 const held = currentRun(botId);
                 let fenceNote = '';
-                if (held?.fence?.owned === true) {
-                  fenceNote = await liftRunFence(got.bot, held);
-                  if (!fenceNote) saveRun(botId, { fence: null });
+                let retry = false;
+                // A Cancel or Dismiss closing the run lifts the fence itself, once this step lands.
+                if (held?.fence?.owned === true && !closing.has(botId)) {
+                  const lift = await liftRunFence(got.bot, held);
+                  fenceNote = lift ? lift.note : `; its write fence was not lifted, because ${slotRefusal()}`;
+                  retry = !lift || lift.retry;
+                  if (lift && !lift.note) saveRun(botId, { fence: null });
                 }
-                throw new Error(`the bot no longer reports this copy as an ended stand-in lane; nothing has been changed${fenceNote}${fenceNote ? ' (Continue or Dismiss retries the lift)' : ''}`);
+                throw new Error(`the bot no longer reports this copy as an ended stand-in lane; nothing has been changed${fenceNote}${retry ? ' (Continue or Dismiss retries the lift)' : ''}`);
               }
               if (!fenceTried) {
                 fenceTried = true;
@@ -1038,6 +1079,13 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
         ? `The run is past the point of cancellation (${failbackPhaseText(run)}): a promote has already run on this copy, or one of this episode is on record, so nothing here can be put back. Continue finishes the failback, or Dismiss it and use the by-hand routes on this modal`
         : `The run is past the point of cancellation (${failbackPhaseText(run)}): the fleet was already handed back to this node by its promote. Continue finishes the failback (adopt and restart), or Dismiss it and use the by-hand routes on this modal` };
   }
+  // Held from before the runner's last step to the fence lift, so no lane fences this database between the lift's
+  // owner read and its reset.
+  let slot = false;
+  if (run.fence?.owned === true || runners.has(instance.id)) {
+    if (!claimFleetBackupBusy(instance.id)) return closeRefusal(instance.id, 'Cancel');
+    slot = true;
+  }
   closing.set(instance.id, run.startedAt);
   try {
     // A live awaiting-block runner stops at its next check; its step in flight lands first.
@@ -1052,7 +1100,10 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
     const now = containerManager.getBot(instance.id);
     if (!held || !now || held.startedAt !== run.startedAt) return { success: false, error: 'The run record went away while Cancel waited for its last step; look at the Database modal again' };
     // The fence goes before the start: the bot must not boot on a database it cannot write.
-    const fenceNote = await liftRunFence(now, held);
+    const lift = await liftRunFence(now, held, slot);
+    if (slot) { releaseFleetBackupBusy(instance.id); slot = false; }
+    if (!lift) return { success: false, error: `The run is parked but not cancelled: its write fence was not lifted, because ${slotRefusal()}. Cancel again once it ends` };
+    const fenceNote = lift.note;
     const after = currentRun(instance.id) ?? held;
     let startedAgain = false;
     if (after.stoppedByRun) {
@@ -1072,6 +1123,7 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
     return fenceNote ? { success: true, error: `The run is cancelled with nothing destroyed${fenceNote}` } : { success: true };
   } finally {
     closing.delete(instance.id);
+    if (slot) releaseFleetBackupBusy(instance.id);
   }
 }
 
@@ -1092,13 +1144,22 @@ export async function dismissFailback(instance: InstanceConfig): Promise<ActionR
     return { success: true };
   }
   if (run.phase === 'wipe-consent' && !run.consentAt) return { success: false, error: 'This run is waiting for your answer: Continue consents to the wipe, Cancel restores the instance' };
+  // Held from before the runner's last step to the fence lift, as Cancel holds it.
+  let slot = false;
+  if ((run.fence?.owned === true || runners.has(instance.id)) && !destroyedBy(viewed!, run)) {
+    if (!claimFleetBackupBusy(instance.id)) return closeRefusal(instance.id, 'Dismiss');
+    slot = true;
+  }
   closing.set(instance.id, run.startedAt);
   try {
     await runners.get(instance.id);
     const held = currentRun(instance.id);
     const now = containerManager.getBot(instance.id);
     if (!held || !now || held.startedAt !== run.startedAt) return { success: false, error: 'The run record went away while Dismiss waited for its last step; look at the Database modal again' };
-    const fenceNote = await liftRunFence(now, held);
+    const lift = await liftRunFence(now, held, slot);
+    if (slot) { releaseFleetBackupBusy(instance.id); slot = false; }
+    if (!lift) return { success: false, error: `The run was not dismissed: its write fence was not lifted, because ${slotRefusal()}. Dismiss again once it ends` };
+    const fenceNote = lift.note;
     const after = currentRun(instance.id) ?? held;
     const unsaved = closeDeclined(instance.id, after);
     if (unsaved) return { success: false, error: `The run was not dismissed: ${unsaved}${fenceNote}` };
@@ -1109,6 +1170,7 @@ export async function dismissFailback(instance: InstanceConfig): Promise<ActionR
     return fenceNote ? { success: true, error: `The run is dismissed${fenceNote}` } : { success: true };
   } finally {
     closing.delete(instance.id);
+    if (slot) releaseFleetBackupBusy(instance.id);
   }
 }
 

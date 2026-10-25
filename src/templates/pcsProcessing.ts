@@ -1872,21 +1872,23 @@ function dockerEnsureDir(dir: string): void {
  * operator's or the app's (an emptied config included) and is kept; the only
  * thing replaced is an EMPTY directory, which is what Docker creates at a
  * missing file bind source. The file lands whole or not at all: it is written
- * to a temp name beside the target, synced, then linked into place, and link(2)
- * refuses a name that appeared meanwhile. Returns null when delivered, else
- * the kind of entry that was kept.
+ * to a temp name beside the target, synced, then put in place by placeNewFile,
+ * which refuses a name that appeared meanwhile. Returns null when delivered,
+ * else the kind of entry that was kept.
  */
 function seedRepoFile(
   repoSrc: string,
   target: string,
   ensureParent: (dir: string) => void,
   grant: (fd: number) => void,
+  noLink: NoLinkNote,
   replaceIfHash?: string,
 ): string | null {
   const dir = path.dirname(target);
   const base = path.basename(target);
   const tmpPrefix = `.${base}.smdb-seed.`;
   removeStaleSeedTemps(dir, tmpPrefix);
+  settleInterruptedWrite(target);
 
   let st: fs.Stats | null = null;
   try {
@@ -1925,27 +1927,26 @@ function seedRepoFile(
   }
   if (st && st.isFile()) {
     // Replace an override the manager delivered only while it still holds exactly what was delivered.
-    if (fileHash(target) !== replaceIfHash) {
+    if (!replaceIfHash || fileHash(target) !== replaceIfHash) {
       try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
       return 'file';
     }
     try {
-      overwriteInPlace(target, bytes);
+      rewriteFromReady(target, bytes, markReady(tmpPath, target, replaceIfHash, bodyHash(bytes)));
     } finally {
-      try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+      try { fs.unlinkSync(tmpPath); } catch { /* renamed to its ready name, or already gone */ }
     }
     return null;
   }
+  let placed: boolean;
   try {
-    fs.linkSync(tmpPath, target);
-  } catch (e) {
-    try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-    if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
-      try { return entryKind(fs.lstatSync(target)); } catch { return 'entry'; }
-    }
-    throw e;
+    placed = placeNewFile(tmpPath, target, bytes, noLink, grant);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch { /* the file is in place; a stray temp file is harmless */ }
   }
-  try { fs.unlinkSync(tmpPath); } catch { /* the file is in place; a stray temp file is harmless */ }
+  if (!placed) {
+    try { return entryKind(fs.lstatSync(target)); } catch { return 'entry'; }
+  }
   return null;
 }
 
@@ -1963,7 +1964,8 @@ function fileHash(p: string): string | null {
  * a file it wrote from one the bot or the operator changed since.
  */
 /** unbound: config files the deployed compose does not mount (only a build adds the bind). seeded: files this build copied from the repo. */
-export interface DeliveryReport { failed: string[]; delivered: Record<string, string>; unbound: string[]; seeded?: string[] }
+/** linkFallback: this delivery already logged that the filesystem refused a hard link. */
+export interface DeliveryReport { failed: string[]; delivered: Record<string, string>; unbound: string[]; seeded?: string[]; linkFallback?: boolean }
 
 export function newDeliveryReport(): DeliveryReport {
   return { failed: [], delivered: {}, unbound: [] };
@@ -2014,6 +2016,7 @@ export function configFileSources(paths: string[], taken: string[]): Map<string,
  * one last delivered there has nothing new to receive, so it is not a failure.
  */
 function keepExistingConfig(local: string, body: string, delivered: Record<string, string>): { why: string; failed: boolean } | null {
+  settleInterruptedWrite(local);
   let st: fs.Stats;
   try { st = fs.lstatSync(local); } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null;
@@ -2038,6 +2041,149 @@ function removeStaleSeedTemps(dir: string, tmpPrefix: string): void {
   }
 }
 
+// A ready copy is named .<target>.smdb-ready.<old>.<new>: the first 16 hex of the
+// target's hash before the write (ABSENT_HASH when there was no file) and of the body.
+const READY_TAG = '.smdb-ready.';
+const ABSENT_HASH = '0'.repeat(16);
+
+function syncDir(dir: string): void {
+  try {
+    const fd = fs.openSync(dir, 'r');
+    try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  } catch { /* windows and some filesystems refuse a directory fsync */ }
+}
+
+/**
+ * Rename a synced temp file to its ready name before the target is touched, so
+ * a delivery after a crash knows the copy is complete and what the target held.
+ */
+function markReady(tmpPath: string, target: string, oldHash: string | null, newHash: string): string {
+  if (oldHash !== null && !/^[0-9a-f]{64}$/.test(oldHash)) throw new Error(`could not read ${target}; it was kept`);
+  const ready = path.join(path.dirname(target), `.${path.basename(target)}${READY_TAG}${oldHash ? oldHash.slice(0, 16) : ABSENT_HASH}.${newHash.slice(0, 16)}`);
+  fs.renameSync(tmpPath, ready);
+  syncDir(path.dirname(target));
+  return ready;
+}
+
+/**
+ * Settle a write a crash or a failed write left half done. A ready copy beside
+ * the target holds the complete new body. When the target holds what it held
+ * before the write, or the new body whole, the copy is removed. Anything else
+ * may be part of the new body or a change made since, so both are kept and the
+ * error names them. afterFailedWrite: this delivery's own write just failed.
+ */
+function settleInterruptedWrite(target: string, afterFailedWrite = false): void {
+  const dir = path.dirname(target);
+  const prefix = `.${path.basename(target)}${READY_TAG}`;
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    const m = name.startsWith(prefix) ? /^([0-9a-f]{16})\.([0-9a-f]{16})$/.exec(name.slice(prefix.length)) : null;
+    if (!m) continue;
+    const ready = path.join(dir, name);
+    let present = true;
+    try { fs.lstatSync(target); } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`could not inspect ${target} (${e}); it was kept`);
+      present = false;
+    }
+    const now = present ? fileHash(target)?.slice(0, 16) ?? null : ABSENT_HASH;
+    if (now === m[1] || now === m[2]) {
+      fs.unlinkSync(ready);
+      continue;
+    }
+    const copy = fileHash(ready)?.slice(0, 16) === m[2]
+      ? `the complete new body is in ${ready}`
+      : `${ready} should hold the new body but does not match its recorded hash`;
+    const state = present ? 'may hold only part of the new body' : 'is missing';
+    const next = afterFailedWrite ? 'Put' : 'This delivery changed neither file: put';
+    throw new Error(`${target} was being rewritten when the write stopped and ${state}; ${copy}. ${next} the body you want at ${target}, delete ${ready}, then try again`);
+  }
+}
+
+/** Settle after this delivery's write into the target failed; an error names that write's error too. */
+function settleAfterFailedWrite(target: string, writeError: unknown): void {
+  try {
+    settleInterruptedWrite(target, true);
+  } catch (s) {
+    throw new Error(`writing ${target} failed (${(writeError as Error)?.message ?? writeError}); ${(s as Error)?.message ?? s}`);
+  }
+}
+
+/** Called when link(2) is refused and the exclusive-create fallback is used. */
+type NoLinkNote = (code: string, target: string) => void;
+
+// Codes a filesystem without hard links (FAT, exFAT, some network and FUSE mounts) gives for link(2).
+const NO_HARD_LINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV']);
+
+/** One log line per delivery the first time a filesystem refuses a hard link. */
+function noteNoHardLinks(report: DeliveryReport, log: (msg: string) => void, tag: string): NoLinkNote {
+  return (code, target) => {
+    if (report.linkFallback) return;
+    report.linkFallback = true;
+    log(`${tag} The filesystem under ${path.dirname(target)} refused a hard link (${code}); new files in this delivery are created only where no file exists yet`);
+  };
+}
+
+/**
+ * Put a synced temp file's body at an absent target. link(2) refuses a name that
+ * appeared meanwhile; where the filesystem has no hard links, an exclusive create
+ * does the same. Returns false when something appeared at the target, which is
+ * kept. A create that fails halfway removes its own partial file, or keeps it
+ * beside the ready copy and throws naming both.
+ */
+function placeNewFile(tmpPath: string, target: string, bytes: Buffer, noLink: NoLinkNote, grant: (fd: number) => void = () => {}): boolean {
+  try {
+    fs.linkSync(tmpPath, target);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code ?? '';
+    if (code === 'EEXIST') return false;
+    if (!NO_HARD_LINK.has(code)) throw e;
+    noLink(code, target);
+  }
+  const ready = markReady(tmpPath, target, null, bodyHash(bytes));
+  let fd: number;
+  try {
+    fd = fs.openSync(target, 'wx', 0o644);
+  } catch (e) {
+    try { fs.unlinkSync(ready); } catch { /* settled by the next delivery */ }
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw e;
+  }
+  try {
+    try {
+      let off = 0;
+      while (off < bytes.length) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+      try { fs.fchmodSync(fd, 0o644); } catch { /* windows / best effort */ }
+      grant(fd);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    let got: Buffer | null = null;
+    try { got = fs.readFileSync(target); } catch { /* gone or unreadable: settled below */ }
+    if (got && got.length <= bytes.length && bytes.subarray(0, got.length).equals(got)) {
+      try { fs.unlinkSync(target); } catch { /* settled below */ }
+    }
+    settleAfterFailedWrite(target, e);
+    throw e;
+  }
+  try { fs.unlinkSync(ready); } catch { /* settled by the next delivery */ }
+  return true;
+}
+
+/** Rewrite the target in place from bytes whose ready copy is beside it, then drop the copy. */
+function rewriteFromReady(target: string, bytes: Buffer, ready: string): void {
+  try {
+    overwriteInPlace(target, bytes);
+  } catch (e) {
+    settleAfterFailedWrite(target, e);
+    throw e;
+  }
+  try { fs.unlinkSync(ready); } catch { /* settled by the next delivery */ }
+}
+
 function entryKind(st: fs.Stats): string {
   if (st.isFile()) return 'file';
   if (st.isSymbolicLink()) return 'symlink';
@@ -2055,11 +2201,11 @@ function seedSummary(target: string, c: SeedCounts): string {
   return `Delivered directory ${target} (${c.delivered} files delivered, ${c.kept} existing kept)`;
 }
 
-function dockerDeliverFile(repoSrc: string, target: string, replaceIfHash?: string): string | null {
-  return seedRepoFile(repoSrc, target, dockerEnsureDir, () => {}, replaceIfHash);
+function dockerDeliverFile(repoSrc: string, target: string, noLink: NoLinkNote, replaceIfHash?: string): string | null {
+  return seedRepoFile(repoSrc, target, dockerEnsureDir, () => {}, noLink, replaceIfHash);
 }
 
-function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) => void): SeedCounts {
+function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) => void, noLink: NoLinkNote): SeedCounts {
   const counts: SeedCounts = { delivered: 0, kept: 0 };
   dockerEnsureDir(target);
   for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
@@ -2067,11 +2213,11 @@ function dockerDeliverDir(repoSrc: string, target: string, log: (msg: string) =>
     const cs = path.join(repoSrc, entry.name);
     const ct = path.join(target, entry.name);
     if (entry.isDirectory()) {
-      const sub = dockerDeliverDir(cs, ct, log);
+      const sub = dockerDeliverDir(cs, ct, log, noLink);
       counts.delivered += sub.delivered;
       counts.kept += sub.kept;
     } else if (entry.isFile()) {
-      const kept = dockerDeliverFile(cs, ct);
+      const kept = dockerDeliverFile(cs, ct, noLink);
       if (kept) { counts.kept++; log(`[Docker] Kept existing ${kept} ${ct}`); }
       else counts.delivered++;
     }
@@ -2097,8 +2243,9 @@ function configTargetState(target: string): string {
 /**
  * Rewrite an existing file through its own inode: a running container's
  * single-file bind follows the inode, and the file keeps its owner. The caller
- * has already written the same bytes to a synced temp file beside it, so the
- * disk had room for them. If a write fails, the old bytes are put back.
+ * has already written the same bytes to a synced ready copy beside it, so the
+ * disk had room for them. If a write fails, the old bytes are put back; a crash
+ * leaves the ready copy for settleInterruptedWrite.
  */
 function overwriteInPlace(target: string, bytes: Buffer): void {
   const old = fs.readFileSync(target);
@@ -2130,12 +2277,14 @@ function overwriteInPlace(target: string, bytes: Buffer): void {
  * inode and owner) and is not touched when it already holds the body. Nothing
  * at the target is removed except an empty directory, which is what Docker
  * creates at a missing file source. On a failed write the target keeps its old
- * body and the temp file is removed.
+ * body and the temp file is removed; a crash inside the target leaves the ready
+ * copy, which the next delivery settles (settleInterruptedWrite).
  */
-function writeConfigBody(target: string, body: string): void {
+function writeConfigBody(target: string, body: string, noLink: NoLinkNote): void {
   const dir = path.dirname(target);
   const tmpPrefix = `.${path.basename(target)}.smdb-config.`;
   removeStaleSeedTemps(dir, tmpPrefix);
+  settleInterruptedWrite(target);
   const before = configTargetState(target);
   if (before === `file:${bodyHash(body)}`) return;
   const tmpPath = path.join(dir, `${tmpPrefix}${process.pid}.${randomBytes(4).toString('hex')}`);
@@ -2152,7 +2301,7 @@ function writeConfigBody(target: string, body: string): void {
     }
     if (configTargetState(target) !== before) throw new Error(`${target} changed during the write; it was kept`);
     if (before.startsWith('file:')) {
-      overwriteInPlace(target, bytes);
+      rewriteFromReady(target, bytes, markReady(tmpPath, target, before.slice('file:'.length), bodyHash(bytes)));
       return;
     }
     if (before === 'empty-dir') {
@@ -2162,18 +2311,15 @@ function writeConfigBody(target: string, body: string): void {
         throw e;
       }
     }
-    try { fs.linkSync(tmpPath, target); } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`${target} appeared during the write; it was kept`);
-      throw e;
-    }
+    if (!placeNewFile(tmpPath, target, bytes, noLink)) throw new Error(`${target} appeared during the write; it was kept`);
   } finally {
-    try { fs.unlinkSync(tmpPath); } catch { /* renamed into place, or already gone */ }
+    try { fs.unlinkSync(tmpPath); } catch { /* linked or renamed, or already gone */ }
   }
 }
 
-function writeDockerConfig(target: string, body: string): void {
+function writeDockerConfig(target: string, body: string, noLink: NoLinkNote): void {
   dockerEnsureDir(path.dirname(target));
-  writeConfigBody(target, body);
+  writeConfigBody(target, body, noLink);
 }
 
 /** Map a host bind source under hostBotDir back to the manager's local path. */
@@ -2332,6 +2478,7 @@ export function prepareDockerBotFiles(
   droppedGatewayBinds: string[] = [],
 ): string {
   const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
+  const noLink = noteNoHardLinks(report, log, '[Docker]');
   let compose: Record<string, unknown>;
   try {
     compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
@@ -2365,7 +2512,7 @@ export function prepareDockerBotFiles(
           else repoSrc = findConfigTemplate(cand);
         }
         if (repoSrc && fs.statSync(repoSrc).isFile()) {
-          const kept = dockerDeliverFile(repoSrc, target, restore[target]);
+          const kept = dockerDeliverFile(repoSrc, target, noLink, restore[target]);
           if (kept) {
             log(`[Docker] Kept existing ${kept} ${target}`);
             const h = fileHash(target);
@@ -2377,7 +2524,7 @@ export function prepareDockerBotFiles(
             log(restore[target] ? `[Docker] Restored the repo template at ${target}` : `[Docker] Delivered file ${target}`);
           }
         }
-        else if (repoSrc && fs.statSync(repoSrc).isDirectory()) log(`[Docker] ${seedSummary(target, dockerDeliverDir(repoSrc, target, log))}`);
+        else if (repoSrc && fs.statSync(repoSrc).isDirectory()) log(`[Docker] ${seedSummary(target, dockerDeliverDir(repoSrc, target, log, noLink))}`);
         else dockerEnsureDir(target);
       } catch (err) {
         log(`[Docker] Warning: could not prepare ${target}: ${err}`);
@@ -2415,7 +2562,7 @@ export function prepareDockerBotFiles(
             log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}`);
             report.delivered[local] = known[local];
           } else {
-            writeDockerConfig(local, cf.body);
+            writeDockerConfig(local, cf.body, noLink);
             report.delivered[local] = bodyHash(cf.body);
             log(`[Docker] Applied config ${cf.path}`);
           }
@@ -2444,7 +2591,7 @@ export function prepareDockerBotFiles(
             log(`[Docker] Kept existing ${local} for config ${cf.path}: ${keep.why}`);
             report.delivered[local] = restore[local];
           } else {
-            writeDockerConfig(local, cf.body);
+            writeDockerConfig(local, cf.body, noLink);
             report.delivered[local] = bodyHash(cf.body);
           }
         } catch (err) {
@@ -2482,6 +2629,7 @@ export function redeliverDockerConfigFiles(
 ): DeliveryReport {
   if (!configFiles.length) return report;
   const log = logFn || ((msg: string) => console.log(`[Docker] ${msg}`));
+  const noLink = noteNoHardLinks(report, log, '[Docker]');
   let compose: Record<string, unknown>;
   try { compose = parseDocument(composeContent).toJSON() as Record<string, unknown>; } catch {
     report.failed.push(...configFiles.map(c => c.path));
@@ -2502,7 +2650,7 @@ export function redeliverDockerConfigFiles(
         else report.delivered[local] = delivered[local];
         continue;
       }
-      writeDockerConfig(local, cf.body);
+      writeDockerConfig(local, cf.body, noLink);
       report.delivered[local] = bodyHash(cf.body);
     } catch (err) {
       log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
@@ -2675,14 +2823,14 @@ const SKIP_DELIVER = new Set(['node_modules', '.git']);
  * Seed semantics (seedRepoFile): an already-present target is left untouched, so
  * a redeploy never reverts a file the running app or the operator has changed.
  */
-async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void, replaceIfHash?: string): Promise<string | null> {
-  return seedRepoFile(repoSrc, target, (dir) => ensureVolumeDir(dir, '755', true, log), (fd) => grantFd(fd, log), replaceIfHash);
+async function deliverRepoFile(repoSrc: string, target: string, log: (msg: string) => void, noLink: NoLinkNote, replaceIfHash?: string): Promise<string | null> {
+  return seedRepoFile(repoSrc, target, (dir) => ensureVolumeDir(dir, '755', true, log), (fd) => grantFd(fd, log), noLink, replaceIfHash);
 }
 
 /**
  * Recursively copy a repo directory to its AppData bind target.
  */
-async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void): Promise<SeedCounts> {
+async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void, noLink: NoLinkNote): Promise<SeedCounts> {
   const counts: SeedCounts = { delivered: 0, kept: 0 };
   // A repo-provided bind dir is app-managed and a foreign-uid container may need
   // to write into it (e.g. Lavalink downloading plugin jars), so make it writable.
@@ -2692,11 +2840,11 @@ async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string
     const childRepo = path.join(repoSrc, entry.name);
     const childTarget = `${target}/${entry.name}`;
     if (entry.isDirectory()) {
-      const sub = await deliverRepoDir(childRepo, childTarget, log);
+      const sub = await deliverRepoDir(childRepo, childTarget, log, noLink);
       counts.delivered += sub.delivered;
       counts.kept += sub.kept;
     } else if (entry.isFile()) {
-      const kept = await deliverRepoFile(childRepo, childTarget, log);
+      const kept = await deliverRepoFile(childRepo, childTarget, log, noLink);
       if (kept) { counts.kept++; log(`[PCS] Kept existing ${kept} ${childTarget}`); }
       else counts.delivered++;
     }
@@ -2719,6 +2867,7 @@ export async function createVolumeDirectories(
   restore: Record<string, string> = {},
 ): Promise<DeliveryReport> {
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const noLink = noteNoHardLinks(report, log, '[PCS]');
   const pcs = getPCSEnvironment();
 
   let compose: Record<string, unknown>;
@@ -2742,8 +2891,8 @@ export async function createVolumeDirectories(
     for (const volume of service.volumes) {
       let source: string | null = null;
       if (typeof volume === 'string') {
-        const idx = volume.indexOf(':');
-        if (idx > 0) source = volume.slice(0, idx);
+        const s = splitDockerVolume(volume);
+        if (s) source = s.source;
       } else if (volume && typeof volume === 'object') {
         const vol = volume as Record<string, unknown>;
         if (typeof vol.source === 'string' && vol.type !== 'volume') source = vol.source;
@@ -2768,7 +2917,7 @@ export async function createVolumeDirectories(
       }
 
       if (repoSrc && fs.statSync(repoSrc).isFile()) {
-        const kept = await deliverRepoFile(repoSrc, target, log, restore[target]);
+        const kept = await deliverRepoFile(repoSrc, target, log, noLink, restore[target]);
         if (kept) {
           log(`[PCS] Kept existing ${kept} at volume path: ${target}`);
           const h = fileHash(target);
@@ -2780,7 +2929,7 @@ export async function createVolumeDirectories(
           log(restore[target] ? `[PCS] Restored the repo template at volume path: ${target}` : `[PCS] Delivered file to volume path: ${target}`);
         }
       } else if (repoSrc && fs.statSync(repoSrc).isDirectory()) {
-        log(`[PCS] ${seedSummary(target, await deliverRepoDir(repoSrc, target, log))}`);
+        log(`[PCS] ${seedSummary(target, await deliverRepoDir(repoSrc, target, log, noLink))}`);
       } else {
         ensureVolumeDir(target, '755', true, log);
         log(`[PCS] Created volume directory: ${target}`);
@@ -2926,6 +3075,7 @@ export async function writeConfigFiles(
 ): Promise<DeliveryReport> {
   if (!files.length) return report;
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const noLink = noteNoHardLinks(report, log, '[PCS]');
   const pcs = getPCSEnvironment();
   const appDir = `${pcs.DATA_ROOT}/AppData/${appName}`;
   const sources = configFileSources(files.map(f => f.path), []);
@@ -2947,7 +3097,7 @@ export async function writeConfigFiles(
         continue;
       }
       mkdirForApp(path.dirname(filePath), log);
-      writeConfigBody(filePath, f.body);
+      writeConfigBody(filePath, f.body, noLink);
       report.delivered[filePath] = bodyHash(f.body);
       grantToApp(filePath, { mode: '644', log });
       log(`[PCS] Wrote config file to ${filePath}`);
@@ -3003,6 +3153,7 @@ export async function applyUserConfigOverrides(
   const handled = new Set<string>();
   if (!configFiles.length) return handled;
   const log = logFn || ((msg: string) => console.log(`[PCS] ${msg}`));
+  const noLink = noteNoHardLinks(report, log, '[PCS]');
   const pcs = getPCSEnvironment();
   const appDataPrefix = `${pcs.DATA_ROOT}/AppData`;
 
@@ -3025,8 +3176,8 @@ export async function applyUserConfigOverrides(
       let src: string | null = null;
       let dest: string | null = null;
       if (typeof vol === 'string') {
-        const idx = vol.indexOf(':');
-        if (idx > 0) { src = vol.slice(0, idx); dest = vol.slice(idx + 1).split(':')[0]; }
+        const s = splitDockerVolume(vol);
+        if (s) { src = s.source; dest = s.dest; }
       } else if (vol && typeof vol === 'object') {
         const v = vol as Record<string, unknown>;
         if (typeof v.source === 'string' && typeof v.target === 'string' && v.type !== 'volume') { src = v.source; dest = v.target; }
@@ -3049,7 +3200,7 @@ export async function applyUserConfigOverrides(
         continue;
       }
       ensureVolumeDir(path.dirname(source), '755', true, log);
-      writeConfigBody(source, cf.body);
+      writeConfigBody(source, cf.body, noLink);
       report.delivered[source] = bodyHash(cf.body);
       grantToApp(source, { mode: '644', log });
       log(`[PCS] Delivered user config to ${source} (bind ${cf.path})`);

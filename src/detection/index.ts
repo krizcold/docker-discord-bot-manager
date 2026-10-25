@@ -9,7 +9,7 @@ import { parseDocument } from 'yaml';
 import { BotType, DatabaseKind, DetectedConfigFile, DetectionResult, PackageManager, SystemDep } from '../types';
 import { configFileFormat, extractConfigKeys, scanSourceForEnvVars } from '../env/manager';
 import { findConfigTemplate } from '../config/configTemplates';
-import { frontingGateway } from '../templates/pcsProcessing';
+import { frontingGateway, splitDockerVolume } from '../templates/pcsProcessing';
 
 /**
  * Detect bot type from repository path
@@ -443,8 +443,7 @@ function findInContainerPath(repoPath: string, targetName: string): string | nul
         for (const vol of service.volumes) {
           let target: string | null = null;
           if (typeof vol === 'string') {
-            const parts = vol.split(':');
-            if (parts.length >= 2) target = parts[1];
+            target = splitDockerVolume(vol)?.dest || null;
           } else if (vol && typeof vol === 'object' && typeof vol.target === 'string') {
             target = vol.target;
           }
@@ -487,8 +486,8 @@ function detectComposeConfigFiles(repoPath: string): DetectedConfigFile[] {
         let src: string | null = null;
         let dest: string | null = null;
         if (typeof vol === 'string') {
-          const idx = vol.indexOf(':');
-          if (idx > 0) { src = vol.slice(0, idx); dest = vol.slice(idx + 1).split(':')[0]; }
+          const s = splitDockerVolume(vol);
+          if (s) { src = s.source; dest = s.dest; }
         } else if (vol && typeof vol === 'object' && typeof vol.source === 'string' && typeof vol.target === 'string' && vol.type !== 'volume') {
           src = vol.source; dest = vol.target;
         }

@@ -310,7 +310,7 @@ export function processComposeForCasaOS(
       const labels = service.labels as Record<string, string>;
       labels['managed-by'] = 'discord-bot-manager';
       labels['bot-id'] = bot.id;
-      labels['bot-name'] = bot.displayName;
+      labels['bot-name'] = composeEnvValue(bot.displayName);
     }
 
     // Ports → expose conversion
@@ -598,10 +598,10 @@ export function processComposeForCasaOS(
       main: mainServiceName || 'bot',
       author: 'discord-bot-manager',
       developer: 'discord-bot-manager',
-      tagline: { en_us: `Discord Bot: ${bot.displayName}` },
+      tagline: { en_us: `Discord Bot: ${composeEnvValue(bot.displayName)}` },
       category: 'Utilities',
-      description: { en_us: `Managed Discord bot: ${bot.displayName}` },
-      title: { en_us: bot.displayName },
+      description: { en_us: `Managed Discord bot: ${composeEnvValue(bot.displayName)}` },
+      title: { en_us: composeEnvValue(bot.displayName) },
     };
   }
 
@@ -613,7 +613,7 @@ export function processComposeForCasaOS(
   // CasaOS tile with no name. Guarantee a display title and a main service.
   const xcTitle = xcasaos.title as Record<string, unknown> | undefined;
   if (!xcTitle || !xcTitle.en_us) {
-    xcasaos.title = { en_us: bot.displayName || appName };
+    xcasaos.title = { en_us: composeEnvValue(bot.displayName || appName) };
   }
   if (!xcasaos.main) {
     xcasaos.main = mainServiceName || 'bot';
@@ -939,7 +939,7 @@ export function processComposeForDocker(
       }
       labels['managed-by'] = 'discord-bot-manager';
       labels['bot-id'] = bot.id;
-      labels['bot-name'] = bot.displayName;
+      labels['bot-name'] = composeEnvValue(bot.displayName);
     }
 
     // Published ports stay usable but bind to localhost (see bindPortToLocalhost).
@@ -1341,7 +1341,8 @@ function setServiceLabel(service: Record<string, unknown>, key: string, value: s
   else (service.labels as Record<string, string>)[key] = value;
 }
 
-function setServiceEnv(service: Record<string, unknown>, key: string, value: string): void {
+function setServiceEnv(service: Record<string, unknown>, key: string, raw: string): void {
+  const value = composeEnvValue(raw);
   if (!service.environment) service.environment = {};
   if (Array.isArray(service.environment)) {
     const arr = service.environment as unknown[];

@@ -131,16 +131,10 @@ export function validateRequiredVariables(compose: string, bot: BotConfig): stri
 export function extractVariables(compose: string): string[] {
   const variables = new Set<string>();
 
-  // Match ${VAR} format
-  const bracketMatches = compose.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g);
-  for (const match of bracketMatches) {
-    variables.add(match[1]);
-  }
-
-  // Match $VAR format (word boundary)
-  const dollarMatches = compose.matchAll(/\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])/g);
-  for (const match of dollarMatches) {
-    variables.add(match[1]);
+  // '$$' is compose's escape for one '$' and starts no name, as in applyVariableSubstitution
+  for (const match of compose.matchAll(/\$\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])/g)) {
+    const name = match[1] ?? match[2];
+    if (name !== undefined) variables.add(name);
   }
 
   return Array.from(variables).sort();

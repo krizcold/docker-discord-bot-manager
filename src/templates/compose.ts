@@ -153,7 +153,7 @@ export function generateCompose(
     labels: {
       'managed-by': 'discord-bot-manager',
       'bot-id': bot.id,
-      'bot-name': bot.displayName
+      'bot-name': composeEnvValue(bot.displayName)
     }
   };
 
@@ -193,10 +193,10 @@ export function generateCompose(
     build: 'bot',
     author: 'discord-bot-manager',
     developer: 'discord-bot-manager',
-    tagline: { en_us: `Discord Bot: ${bot.displayName}` },
+    tagline: { en_us: `Discord Bot: ${composeEnvValue(bot.displayName)}` },
     category: 'Utilities',
-    description: { en_us: `Managed Discord bot: ${bot.displayName}` },
-    title: { en_us: bot.displayName },
+    description: { en_us: `Managed Discord bot: ${composeEnvValue(bot.displayName)}` },
+    title: { en_us: composeEnvValue(bot.displayName) },
     is_uncontrolled: false,
     store_app_id: appName
   };
@@ -650,7 +650,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
   }
   // Add Bot Manager update token
   if (bot.updateToken) {
-    envMap['BOT_MANAGER_UPDATE_TOKEN'] = bot.updateToken;
+    envMap['BOT_MANAGER_UPDATE_TOKEN'] = composeEnvValue(bot.updateToken);
   }
 
   const compose: ComposeFile = {
@@ -665,7 +665,7 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
         labels: {
           'managed-by': 'discord-bot-manager',
           'bot-id': bot.id,
-          'bot-name': bot.displayName
+          'bot-name': composeEnvValue(bot.displayName)
         },
         volumes: [{
           type: 'bind',
@@ -691,10 +691,10 @@ export function generateImageCompose(bot: BotConfig, botDir: string, dataTarget:
       main: 'bot',
       author: 'discord-bot-manager',
       developer: 'discord-bot-manager',
-      tagline: { en_us: `Discord Bot: ${bot.displayName}` },
+      tagline: { en_us: `Discord Bot: ${composeEnvValue(bot.displayName)}` },
       category: 'Utilities',
-      description: { en_us: `Managed Discord bot: ${bot.displayName}` },
-      title: { en_us: bot.displayName },
+      description: { en_us: `Managed Discord bot: ${composeEnvValue(bot.displayName)}` },
+      title: { en_us: composeEnvValue(bot.displayName) },
       is_uncontrolled: false,
       store_app_id: appName
     }

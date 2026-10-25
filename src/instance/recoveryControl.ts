@@ -168,6 +168,10 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
   if (state === 'unknown') {
     return { ok: false, unknown: true, error: `could not read the rsync daemon's state, so it was left as it is: ${inspect.stderr.trim().split('\n').pop() || inspect.stdout.trim() || 'no answer'}` };
   }
+  // A :ro mount still mints an absent volume, and the daemon would serve its empty directory as the database.
+  const volState = await (await import('./fleetReplica')).dockerVolumeState(fleetDb.volume);
+  if (volState === 'absent') return { ok: false, error: `the source database volume ${fleetDb.volume} is gone, so the rsync daemon was not started: there is no database here to send` };
+  if (volState === 'unknown') return { ok: false, error: `can't confirm whether the source database volume ${fleetDb.volume} exists (docker did not answer), so the rsync daemon was not started` };
   await docker(['rm', '-f', name]);
   // The config rides an env var: a real multi-line value survives argv+env
   // verbatim, where printf-escape games do not (POSIX %s never expands \n).

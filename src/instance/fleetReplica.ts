@@ -314,7 +314,7 @@ export function autoReseedAllowed(rec: FleetDbReplicaRecord, now: number = Date.
 // 'absent' only when docker itself says "no such volume": any other failure
 // (daemon down, spawn EAGAIN) is 'unknown', which the caller must refuse on -
 // inferring absence from an arbitrary error skips a dump gate over real data.
-function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown'> {
+export function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown'> {
   return new Promise(resolve => {
     execFile('docker', ['volume', 'inspect', name], (err, _stdout, stderr) => {
       if (!err) return resolve('exists');

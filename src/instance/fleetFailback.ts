@@ -264,6 +264,8 @@ async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Pr
   const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
   const lifted = await fleetBackup.liftConsentFence(instance.id, target, remedy);
   return lifted === 'lifted' ? ''
+    : lifted === 'gone' ? `; its database volume ${target.volume} is gone, so no write fence remains on it`
+    : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
     : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY until its container restarts'
     : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`;
 }

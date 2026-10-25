@@ -3442,12 +3442,20 @@ export async function rescueLeftoverRefusal(botId: string): Promise<{ success: f
   const left = instance?.recoveryRescueLeft;
   if (!instance || !left) return null;
   const volume = instance.fleetDb?.volume;
+  const day = new Date(left.at).toISOString().slice(0, 10);
+  // The probe's docker run would mint an absent volume and read it as clean.
+  const volState = volume ? await (await import('../instance/fleetReplica')).dockerVolumeState(volume) : 'exists';
+  if (volState === 'absent') {
+    return { success: false, error: `A rescue cancelled on ${day} left a mark on this instance, and its database volume ${volume} is gone, so it was not started and the mark is kept: a start would create an empty volume under that name. Decommission this database on its Database modal and provision a new one` };
+  }
+  if (volState === 'unknown') {
+    return { success: false, error: `A rescue cancelled on ${day} left a mark on this instance, and this manager can't confirm whether its database volume ${volume} exists (docker did not answer), so the instance was not started; retry in a moment` };
+  }
   const probe = !volume ? { ok: true, out: 'clean' } : await new Promise<{ ok: boolean; out: string }>(resolve => {
     execFile('docker', ['run', '--rm', '-v', `${volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
       'if test -f /pgdata/rescue.inprogress; then echo partial; elif test -f /pgdata/standby.signal; then echo standby; else echo clean; fi'],
       { timeout: 60_000 }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message).trim().split('\n').pop() || 'no answer' : String(stdout).trim() }));
   });
-  const day = new Date(left.at).toISOString().slice(0, 10);
   if (probe.ok && probe.out === 'clean') {
     try {
       const registry = loadRegistry();

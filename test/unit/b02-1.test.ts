@@ -13,9 +13,11 @@ const tmpData = vi.hoisted(() => {
 });
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
-  const execFile = (_cmd: string, args: string[], _opts: any, cb: any) => {
+  const execFile = (_cmd: string, args: string[], opts: any, cb?: any) => {
+    const done = typeof opts === 'function' ? opts : cb;
     calls.push(args);
-    cb(new Error('fake'), '', args[0] === 'inspect' ? `Error: No such object: ${args[args.length - 1]}` : 'fake');
+    if (args[0] === 'volume' && args[1] === 'inspect') return done(null, '[]', '');
+    done(new Error('fake'), '', args[0] === 'inspect' ? `Error: No such object: ${args[args.length - 1]}` : 'fake');
   };
   return { ...real, execFile };
 });

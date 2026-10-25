@@ -366,13 +366,17 @@ function asResult(op: Promise<{ success: boolean; error?: string }>): Promise<{ 
 
 type RestoreFleetDb = { containerName: string; user: string; db: string; volume: string };
 
+export type FenceLift = 'lifted' | 'stripped' | 'failed' | 'gone' | 'unknown';
+
 /**
  * Lift the restore write fence. ALTER SYSTEM persists in the volume's
  * auto.conf, so when the live lift fails the file is stripped instead (the
  * recovery channel's fallback): the LIVE state then stays read-only until the
- * container restarts, which is why 'stripped' is not 'lifted'.
+ * container restarts, which is why 'stripped' is not 'lifted'. 'gone': the
+ * volume is gone, so no fence remains; 'unknown': docker did not say whether
+ * the volume exists, so nothing was mounted and the fence can't be confirmed.
  */
-async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'stripped' | 'failed'> {
+async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<FenceLift> {
   // The maintenance db, not the target db: the fence is cluster-level, and
   // the lift must work while the target db is dropped mid-restore.
   const unfence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
@@ -380,6 +384,9 @@ async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'st
     '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
     '-c', 'SELECT pg_reload_conf()']);
   if (unfence.ok) return 'lifted';
+  // The strip's docker run would mint an absent volume.
+  const volState = await (await import('./fleetReplica')).dockerVolumeState(fleetDb.volume);
+  if (volState !== 'exists') return volState === 'absent' ? 'gone' : 'unknown';
   const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine',
     '-c', "sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"]);
   return strip.ok ? 'stripped' : 'failed';
@@ -388,10 +395,10 @@ async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<'lifted' | 'st
 /** Lift and keep the per-bot stuck-fence warning truthful. A restart only
  * clears a STRIPPED fence; a 'failed' one survives in auto.conf and would be
  * re-applied by the restart, so its remedy is a retried lift instead. */
-async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a restore', failedRemedy = 'running the restore again retries the lift'): Promise<'lifted' | 'stripped' | 'failed'> {
+async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a restore', failedRemedy = 'running the restore again retries the lift'): Promise<FenceLift> {
   const failback = lane === 'a failback';
   const result = await liftRestoreFence(fleetDb);
-  if (result === 'lifted') {
+  if (result === 'lifted' || result === 'gone') {
     clearStuck(botId, fleetDb.containerName);
     recordFailbackFence(botId, fleetDb.containerName, false);
     return result;
@@ -401,6 +408,8 @@ async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a re
   const unsavedNote = unsaved ? '; this manager could not save that the failback owns this fence, so after a manager restart the next run there leaves it on' : '';
   setStuck(botId, fleetDb, (result === 'stripped'
     ? `The database is READ-ONLY (${lane} write fence could not be lifted live); restart the instance to clear it`
+    : result === 'unknown'
+    ? `This manager can't confirm whether the database is still READ-ONLY (${lane} write fence could not be lifted live, and docker did not answer whether the volume ${fleetDb.volume} exists); ${failedRemedy}`
     : `The database is READ-ONLY (${lane} write fence could not be lifted or stripped); ${failedRemedy}`) + unsavedNote);
   return result;
 }
@@ -433,12 +442,14 @@ export async function fenceForConsent(target: ConsentFenceTarget): Promise<{ ok:
 }
 
 /** Lift a consent fence; one that sticks is named on the instance, on the database it sits on, as the restore's is. */
-export function liftConsentFence(botId: string, target: ConsentFenceTarget, failedRemedy: string): Promise<'lifted' | 'stripped' | 'failed'> {
+export function liftConsentFence(botId: string, target: ConsentFenceTarget, failedRemedy: string): Promise<FenceLift> {
   return liftAndTrack(botId, target, 'a failback', failedRemedy);
 }
 
-function liftNote(result: 'lifted' | 'stripped' | 'failed', remedy = 'running a restore again retries the lift'): string {
+function liftNote(result: FenceLift, volume: string, remedy = 'running a restore again retries the lift'): string {
   return result === 'lifted' ? ''
+    : result === 'gone' ? `; the database volume ${volume} is gone, so no write fence remains on it`
+    : result === 'unknown' ? `; the write fence could not be lifted live, and docker did not answer whether the database volume ${volume} exists, so this manager can't confirm whether the database is still READ-ONLY (${remedy})`
     : result === 'stripped' ? '; the write fence could not be lifted live, so the database is READ-ONLY until its container restarts'
     : `; the write fence could not be lifted, so the database stays READ-ONLY (${remedy})`;
 }
@@ -455,17 +466,17 @@ export async function fencedSafetyDump(instance: InstanceConfig, prefix: string,
   foreignFenceSet(instance.id, fleetDb.containerName);
   if (!fence.ok) {
     const lifted = await liftAndTrack(instance.id, fleetDb, lane, remedy);
-    return { success: false, error: `the write fence could not be applied (${fence.stderr.trim().split('\n').pop() || 'unknown reason'}), so no dump was taken${liftNote(lifted, remedy)}` };
+    return { success: false, error: `the write fence could not be applied (${fence.stderr.trim().split('\n').pop() || 'unknown reason'}), so no dump was taken${liftNote(lifted, fleetDb.volume, remedy)}` };
   }
   const dump = await runFleetDump(instance, prefix);
   if (dump.success && dump.file) return { success: true, file: dump.file };
   const lifted = await liftAndTrack(instance.id, fleetDb, lane, remedy);
-  return { success: false, error: `${dump.error || 'unknown reason'}${liftNote(lifted, remedy)}` };
+  return { success: false, error: `${dump.error || 'unknown reason'}${liftNote(lifted, fleetDb.volume, remedy)}` };
 }
 
 /** Lift a lane's fence from a database its destroy left standing; the text names a fence left on. */
 export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, lane: string, remedy: string): Promise<string> {
-  return liftNote(await liftAndTrack(botId, fleetDb, lane, remedy), remedy);
+  return liftNote(await liftAndTrack(botId, fleetDb, lane, remedy), fleetDb.volume, remedy);
 }
 
 /** Whether a failback or drop-back run on this instance left its fence on this database (the persisted record, or this process's when its save was refused). */
@@ -1128,12 +1139,12 @@ export async function restoreFleetBackup(
   let fenced = false;
   let sidecarStartedAlone = false;
   // The answer names the state after the second attempt, so the finally has no lift left to change it.
-  const finalLift = async (): Promise<'lifted' | 'stripped' | 'failed'> => {
+  const finalLift = async (): Promise<FenceLift> => {
     let result = await liftAndTrack(botId, fleetDb);
     if (result !== 'lifted') {
       const retry = await liftAndTrack(botId, fleetDb);
       // A strip that landed stays in the file, so a failed second strip does not undo it.
-      if (retry === 'failed' && result === 'stripped') setStuck(botId, fleetDb, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+      if ((retry === 'failed' || retry === 'unknown') && result === 'stripped') setStuck(botId, fleetDb, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
       else result = retry;
     }
     fenced = false;
@@ -1234,6 +1245,7 @@ export async function restoreFleetBackup(
       const cleared = await finalLift();
       const note = await undo();
       const fenceWarning = cleared === 'lifted' ? ''
+        : cleared === 'gone' || cleared === 'unknown' ? liftNote(cleared, fleetDb.volume)
         : cleared === 'stripped' ? '; the database may be READ-ONLY until its container restarts'
           : '; the database may stay READ-ONLY (a fence that could not be lifted or stripped survives a restart; running a restore again retries the lift)';
       return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${fenceWarning}${note}`, steps };
@@ -1243,7 +1255,7 @@ export async function restoreFleetBackup(
     const refuse = async (refused: string, detail: string) => {
       const cleared = await finalLift();
       const note = await undo();
-      return { success: false, error: `${refused}${note ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared)}${note}`, steps };
+      return { success: false, error: `${refused}${note ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared, fleetDb.volume)}${note}`, steps };
     };
 
     // 4. Pre-restore safety dump UNDER the fence, so it holds every write the
@@ -1434,6 +1446,8 @@ export async function restoreFleetBackup(
     if (lift !== 'lifted') {
       console.error(`[FleetBackup] Restore fence on ${fleetDb.containerName}: ${lift === 'stripped'
         ? 'live lift failed; auto.conf stripped, the database stays read-only until its container restarts'
+        : lift === 'gone' ? `live lift failed and the volume ${fleetDb.volume} is gone`
+        : lift === 'unknown' ? `live lift failed and docker did not answer whether the volume ${fleetDb.volume} exists`
         : 'could not be lifted or stripped'}`);
     }
 
@@ -1450,7 +1464,7 @@ export async function restoreFleetBackup(
     }
     const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';
 
-    if (lift !== 'lifted') return { success: false, error: `Restored, but ${lift === 'stripped' ? 'the write fence could not be lifted live: the database is READ-ONLY until its container restarts' : 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift'} (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
+    if (lift !== 'lifted') return { success: false, error: `${lift === 'gone' ? `The restore ran, but the database volume ${fleetDb.volume} is gone now, so this manager can't confirm that the restored data exists` : lift === 'unknown' ? `Restored, but the write fence could not be lifted live, and docker did not answer whether the database volume ${fleetDb.volume} exists, so this manager can't confirm whether the database is still READ-ONLY; running a restore again retries the lift` : `Restored, but ${lift === 'stripped' ? 'the write fence could not be lifted live: the database is READ-ONLY until its container restarts' : 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift'}`} (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
     const warning = `${termWarning}${noticeWarning}${startWarning}`;
     return { success: true, ...(warning ? { warning: warning.slice(2) } : {}), steps };
   } finally {

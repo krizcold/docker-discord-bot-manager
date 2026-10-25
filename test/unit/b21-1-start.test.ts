@@ -17,6 +17,10 @@ vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
   const execFile = (cmd: string, args: string[], opts: any, cb?: any) => {
     const done = typeof opts === 'function' ? opts : cb;
+    if (cmd === 'docker' && args[0] === 'volume' && args[1] === 'inspect') {
+      setImmediate(() => done(null, '[]', ''));
+      return { stdin: null };
+    }
     if (cmd === 'docker' && args[0] === 'run' && args.join(' ').includes('standby.signal')) {
       st.checks++;
       setImmediate(() => (st.volume === null ? done(new Error('daemon down'), '', 'Cannot connect to the Docker daemon') : done(null, `${st.volume}\n`, '')));

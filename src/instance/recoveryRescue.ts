@@ -131,6 +131,19 @@ async function volumeHasDatabase(volume: string): Promise<boolean> {
   return probe.ok && probe.stdout.trim() === 'yes';
 }
 
+/** Parks the rescue back at the bulk pass: what was copied so far cannot be trusted. */
+class CopyDiscarded extends Error {}
+
+/** Throws when a running container other than the rescue's own rsync client mounts the database volume. */
+async function refuseForeignMounts(instance: InstanceConfig): Promise<void> {
+  const ps = await docker(['ps', '--filter', `volume=${instance.fleetDb!.volume}`, '--format', '{{.Names}}']);
+  if (!ps.ok) throw new Error(`docker could not say whether a container mounts the database volume: ${ps.stderr.trim().split('\n').pop()}`);
+  const names = ps.stdout.split('\n').map(n => n.trim()).filter(n => n && n !== rsyncClientName(instance));
+  if (names.length > 0) {
+    throw new CopyDiscarded(`the database container was started outside the manager during the copy (${names.join(', ')} mounts the database volume); the copy is discarded: stop that container, then Continue, and the rescue copies again from the bulk pass`);
+  }
+}
+
 // ─── Phase record plumbing ───
 
 function saveRescue(botId: string, patch: Partial<RecoveryRescueRecord>): RecoveryRescueRecord | null {
@@ -256,7 +269,7 @@ export function startSwap(
   return { success: true };
 }
 
-export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string }> {
+export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string }> {
   if (!instance.recoveryRescue) return { success: false, error: 'No rescue is running on this instance' };
   // Past promote there is no standby to fall back to: this copy IS the
   // primary now, and the only way out is forward (Continue re-enters the
@@ -288,6 +301,10 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
   setTimeout(() => { void docker(['rm', '-f', rsyncClientName(instance)]); }, 15_000).unref();
   // The seeded/partial volume stays as-is: the operator decides what happens
   // next (re-run, disarm, or normal re-provision paths).
+  const released = containerManager.releaseFleetDbFromLane(instance.id);
+  if (!released.success) {
+    return { success: true, warning: `The rescue was cancelled, but ${released.error}; the database does not start from the app until it is back` };
+  }
   return { success: true };
 }
 
@@ -352,6 +369,11 @@ async function runRescue(botId: string): Promise<void> {
         else return;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof CopyDiscarded) {
+          console.warn(`[RecoveryRescue] ${instance.displayName}: ${message}`);
+          saveRescue(botId, { phase: 'bulk', parked: true, lastError: message });
+          return;
+        }
         if (!saveRescue(botId, { lastError: message })) {
           console.warn(`[RecoveryRescue] ${instance.displayName} phase ${phase} failed: ${message}; the rescue record is gone, so nothing retries`);
           return;
@@ -370,15 +392,16 @@ async function runRescue(botId: string): Promise<void> {
 
 // ─── Phases ───
 
-/** Stop the sidecar and PROVE it stopped: rsync over a running postgres is the one corruption this phase exists to prevent. Missing container = stopped. */
-async function stopSidecarHard(containerName: string): Promise<void> {
-  const stop = await docker(['stop', containerName]);
-  if (!stop.ok && !/no such container/i.test(stop.stderr)) {
-    throw new Error(`could not stop the database container: ${stop.stderr.trim().split('\n').pop()}`);
+/** Remove the sidecar container and PROVE it gone: a stopped one is a start away (a CasaOS tile click or restart), and rsync under a running postgres is the corruption this phase exists to prevent. The volume stays. */
+async function removeSidecarHard(containerName: string): Promise<void> {
+  const rm = await docker(['rm', '-f', containerName]);
+  if (!rm.ok && !/no such container/i.test(rm.stderr)) {
+    throw new Error(`could not remove the database container: ${rm.stderr.trim().split('\n').pop()}`);
   }
   const state = await docker(['inspect', '--format', '{{.State.Running}}', containerName]);
-  if (state.ok && state.stdout.trim() === 'true') {
-    throw new Error('the database container is still running after the stop');
+  if (state.ok) throw new Error('the database container is still present after its removal');
+  if (!/no such (container|object)/i.test(state.stderr)) {
+    throw new Error(`docker could not confirm the database container is gone: ${state.stderr.trim().split('\n').pop()}`);
   }
 }
 
@@ -394,6 +417,9 @@ async function phasePreflight(instance: InstanceConfig): Promise<void> {
     // The stale copy gets one dump beside the ordinary backups; best effort
     // by the same ruling as the re-seed lane (the operator already accepted
     // losing the diverged tail, the dump is a safety net not a precondition).
+    // A retried preflight finds the service taken out by the earlier attempt; the volume is not rewritten yet.
+    const back = containerManager.releaseFleetDbFromLane(instance.id);
+    if (!back.success) throw new Error(back.error);
     const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
     const dump = started.success ? await runFleetDump(instance, 'pre-rescue-') : { success: false, error: started.error };
     if (!dump.success) console.warn(`[RecoveryRescue] Could not dump the stale copy before the rescue of ${instance.id}: ${dump.error}`);
@@ -401,7 +427,12 @@ async function phasePreflight(instance: InstanceConfig): Promise<void> {
   const live = await containerManager.runningNonSidecarContainers(instance.id);
   if (live === null) throw new Error('docker could not say whether the instance is running, so its database was not stopped');
   if (live.length > 0) throw new Error(`the instance is running (${live.join(', ')}); stop it, and the rescue retries`);
-  await stopSidecarHard(fleetDb.containerName);
+  // A cancel during the dump released nothing; no await between this check and the hold, so a later cancel undoes it.
+  if (!containerManager.getBot(instance.id)?.recoveryRescue) throw new Error('rescue cancelled');
+  // Out of the compose first, then the container: nothing the app file lists can bring it back during the copy.
+  const held = containerManager.holdFleetDbForLane(instance.id);
+  if (!held.success) throw new Error(held.error);
+  await removeSidecarHard(fleetDb.containerName);
   const mark = await volExec(fleetDb.volume, `touch ${PGDATA}/rescue.inprogress`);
   if (!mark.ok) throw new Error(`could not mark the volume: ${mark.stderr.trim()}`);
   saveRescue(instance.id, { phase: 'bulk', dumpDone: true, lastError: undefined });
@@ -420,6 +451,7 @@ async function rsyncPass(instance: InstanceConfig, pass: 'bulk' | 'consistent'):
   const fleetDb = instance.fleetDb!;
   const channel = instance.recoveryChannel!;
   const name = rsyncClientName(instance);
+  await refuseForeignMounts(instance);
   const state = await docker(['inspect', '--format', '{{.State.Running}} {{index .Config.Labels "rescue-pass"}}', name]);
   // Only a BULK pass may be adopted: a running consistent-pass container from
   // before a manager crash predates the CURRENT backup window (backup-start
@@ -485,6 +517,7 @@ async function phaseConsistent(instance: InstanceConfig): Promise<void> {
   }
   if (!stopResult?.labelfile) throw new Error('pg_backup_stop returned no backup label; re-running the consistent pass');
   const label = String(stopResult.labelfile);
+  await refuseForeignMounts(instance);
   // The transfer excludes the ephemeral dirs' CONTENTS, so an OUTDATED
   // receiver's stale leftovers (foreign replication slots above all) survive
   // rsync --delete and must go explicitly.
@@ -509,10 +542,15 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   // verify the cert, so the source's self-signed pair passes).
   const conninfo = `host=${channel.containerName} port=5432 user=${replicator.user} password=${replicator.password} application_name=recovery_rescue sslmode=require`;
   const config = `primary_conninfo = '${conninfo}'\nprimary_slot_name = '${prepared.body.slot}'\n`;
+  // Once released, the database container running is this phase's own start of a retried attempt.
+  if (containerManager.fleetDbHeldForLane(instance.id)) await refuseForeignMounts(instance);
   const write = await volExec(fleetDb.volume,
     `touch ${PGDATA}/standby.signal && rm -f ${PGDATA}/rescue.inprogress && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
+  // Back in the compose only now: from here on a start from the app file starts the copy as a standby.
+  const released = containerManager.releaseFleetDbFromLane(instance.id);
+  if (!released.success) throw new Error(released.error);
   const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
   if (!started.success) {
     // Early recovery legitimately refuses connections past the ready wait;
@@ -661,6 +699,8 @@ async function phaseTeardown(instance: InstanceConfig): Promise<void> {
  * it clears only once the role reset answered.
  */
 async function phaseFlip(instance: InstanceConfig): Promise<void> {
+  const released = containerManager.releaseFleetDbFromLane(instance.id);
+  if (!released.success) throw new Error(released.error);
   const step = instance.recoveryRescue!.flipStep;
   if (!step) {
     await fileCopyAsPrimary(instance);

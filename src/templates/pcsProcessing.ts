@@ -1792,6 +1792,56 @@ export function removeFleetPostgresService(composeContent: string): string {
   return stringify(compose, { lineWidth: 0 });
 }
 
+/**
+ * Take the service whose container_name is containerName out of a compose, with every depends_on entry naming it;
+ * the top-level volume and network declarations stay. Null key when no service has that container name.
+ */
+export function takeServiceOut(composeContent: string, containerName: string): { content: string; key: string | null } {
+  const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
+  const services = compose?.services as Record<string, Record<string, unknown>> | undefined;
+  const key = services
+    ? Object.keys(services).find(k => services[k] && typeof services[k] === 'object' && services[k].container_name === containerName) ?? null
+    : null;
+  if (!services || !key) return { content: composeContent, key: null };
+  delete services[key];
+  dropDependency(services, key);
+  return { content: stringify(compose, { lineWidth: 0 }), key };
+}
+
+/**
+ * Put the service `key` back into the current compose as the original compose declares it, with the depends_on
+ * entries the original's services had on it (for those still present); everything else in the current compose
+ * is kept. Unchanged when the current compose already has the service.
+ */
+export function putServiceBack(currentContent: string, originalContent: string, key: string): string {
+  const current = parseDocument(currentContent).toJSON() as Record<string, unknown>;
+  const original = parseDocument(originalContent).toJSON() as Record<string, unknown>;
+  const origServices = original?.services as Record<string, Record<string, unknown>> | undefined;
+  const svc = origServices?.[key];
+  if (!svc || typeof svc !== 'object') throw new Error(`the kept compose has no service ${key}`);
+  if (!current || typeof current !== 'object') throw new Error('the deployed compose is not a mapping');
+  if (!current.services || typeof current.services !== 'object') current.services = {};
+  const services = current.services as Record<string, Record<string, unknown>>;
+  if (services[key]) return currentContent;
+  services[key] = svc;
+  for (const [name, orig] of Object.entries(origServices!)) {
+    const cur = services[name];
+    if (name === key || !cur || typeof cur !== 'object' || !orig || typeof orig !== 'object') continue;
+    const deps = orig.depends_on;
+    const entry = Array.isArray(deps) ? (deps.includes(key) ? { condition: 'service_started' } : undefined)
+      : deps && typeof deps === 'object' ? (deps as Record<string, unknown>)[key] : undefined;
+    if (entry === undefined) continue;
+    if (Array.isArray(cur.depends_on)) {
+      if (!cur.depends_on.includes(key)) cur.depends_on.push(key);
+    } else if (cur.depends_on && typeof cur.depends_on === 'object') {
+      (cur.depends_on as Record<string, unknown>)[key] = entry;
+    } else {
+      cur.depends_on = Array.isArray(deps) ? [key] : { [key]: entry };
+    }
+  }
+  return stringify(current, { lineWidth: 0 });
+}
+
 /** Remove the standby service (record removal); the named volume stays declared-free (data retention). */
 export function removeFleetPostgresReplicaService(composeContent: string): string {
   let compose: Record<string, unknown>;

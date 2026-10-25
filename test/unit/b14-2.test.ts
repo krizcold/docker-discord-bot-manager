@@ -68,7 +68,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   return {
     ...real,
     runningNonSidecarContainers: async () => [],
-    runningInstanceContainers: async (id: string) => (real.getBot(id)?.status === 'running' ? [`${id}-app`] : []),
+    runningInstanceContainers: async (id: string) => (real.getBot(id)?.status === 'running' && !pg.events.includes(`stop:${id}`) ? [`${id}-app`] : []),
     deployedComposeExists: () => true,
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
     stopBot: async (id: string) => { pg.events.push(`stop:${id}`); return { success: true }; },

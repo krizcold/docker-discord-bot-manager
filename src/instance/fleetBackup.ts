@@ -985,6 +985,19 @@ export async function raiseGuildTerms(fleetDb: RestoreFleetDb, floor: number): P
   return { ok: true, guilds: raise.stdout.split('\n').map(s => s.trim()).filter(Boolean) };
 }
 
+/** The sharers docker runs now and their containers, each one's own database sidecar aside; null when docker did not answer for one. */
+async function sharersRunning(sharing: InstanceConfig[]): Promise<{ ids: string[]; names: string[] } | null> {
+  const ids: string[] = [];
+  const names: string[] = [];
+  for (const b of sharing) {
+    const live = await containerManager.runningInstanceContainers(b.id);
+    if (live === null) return null;
+    if (live.length > 0) ids.push(b.id);
+    names.push(...live);
+  }
+  return { ids, names };
+}
+
 /**
  * Restore a dump into the instance's sidecar. Refused while another lane holds the database (a rescue, an armed
  * recovery channel, a failback, transfer or seed run, an op lock on an instance that shares it). In order: the
@@ -1076,15 +1089,19 @@ export async function restoreFleetBackup(
   };
 
   // Past the drop the database may be missing or partial: the fence stays on and the stopped instances stay down.
-  const keepFenced = (reason: string) => {
+  const keepFenced = (reason: string, guards = 'a database that may be missing or partial', runningNow: string[] = []) => {
     fenced = false;
     release();
-    const stopped = steps.stopped.length > 0 ? steps.stopped.map(nameOf).join(', ') : 'none were running';
+    const stillStopped = steps.stopped.filter(id => !runningNow.includes(id));
+    const runs = runningNow.length > 0 ? `${runningNow.map(nameOf).join(', ')} runs now. ` : '';
+    const kept = stillStopped.length > 0
+      ? ` and the stopped instances stay stopped (${stillStopped.map(nameOf).join(', ')})`
+      : steps.stopped.length > 0 ? '' : ' and the stopped instances stay stopped (none were running)';
     const back = steps.preRestoreDump
       ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
       : 'no pre-restore dump was taken, because the database was missing';
     setStuck(botId, fleetDb, `The database is READ-ONLY: a restore of ${file} failed (${reason}), so its write fence stays on; restore a dump again (${back})`);
-    return `${reason}. The write fence stays on and the stopped instances stay stopped (${stopped}), so nothing writes to a database that may be missing or partial; restore a dump again: ${back}`;
+    return `${reason}. ${runs}The write fence stays on${kept}, so nothing writes to ${guards}; restore a dump again: ${back}`;
   };
 
   try {
@@ -1195,6 +1212,15 @@ export async function restoreFleetBackup(
         return await refuse(`The pre-restore control term ${floor} could not be kept on disk, so the restore was refused`,
           `${kept}; free space under ${DATA_DIR} and retry (this manager holds the term in memory until it restarts)`);
       }
+    }
+
+    const outside = await sharersRunning(sharing);
+    if (outside === null) {
+      return await refuse('Docker could not say whether an instance sharing the database was started during the restore, so the restore was refused', 'retry in a moment');
+    }
+    if (outside.names.length > 0) {
+      return await refuse('An instance sharing the database was started outside the manager during the restore, so the restore was refused',
+        `${outside.names.join(', ')} runs now; stop it and keep it stopped (also from CasaOS) until the restore ends, then retry`);
     }
 
     // The notice a manager restart mid-restore leaves standing; a finished restore replaces or clears it.
@@ -1309,6 +1335,16 @@ export async function restoreFleetBackup(
       }
       steps.guildsRaised = raised.guilds;
       steps.leaseTerm = floor + 1;
+    }
+
+    // An instance started meanwhile (a CasaOS tile click) read the database while it was dropped and rebuilt.
+    const startedMeanwhile = await sharersRunning(sharing);
+    if (startedMeanwhile === null || startedMeanwhile.names.length > 0) {
+      const reason = startedMeanwhile === null
+        ? "docker could not say whether an instance sharing the database was started during the restore, so the manager can't confirm that none read it while it was rebuilt"
+        : `${startedMeanwhile.names.join(', ')} was started outside the manager during the restore and may act on what it read while the database was rebuilt; stop it`;
+      setRestoreError(botId, file, reason, `The dump was restored, but the write fence stays on so nothing writes from what was read mid-restore (${back})`);
+      return { success: false, error: `The dump was restored, but ${keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
     }
 
     lastErrors.delete(botId);

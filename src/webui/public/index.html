@@ -3397,6 +3397,7 @@
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
           <div class="env-tip">Pulls the database from the sender machine through the tunnel: a resumable bulk copy while the sender keeps serving, then a short consistent pass, then this copy follows the sender as a live standby until you swap.</div>
+          <div class="env-tip">From the preflight dump until the copy turns into a standby, this app's compose file (on CasaOS, its app file) does not list the database and its container is removed. Do not start the app from CasaOS until the rescue ends: a database container started during the copy parks the rescue and the copy starts again.</div>
           <button class="btn btn-danger btn-small" onclick="startRecoveryRescue('${botId}')">Start rescue</button>
         </div>`;
       }
@@ -3427,6 +3428,7 @@
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
           <div class="env-tip" style="color:var(--${rescue.parked ? 'danger' : rescue.caughtUp ? 'success' : 'text-secondary'});">${escapeHtml(phaseText)}</div>
           ${rescue.lastError ? `<div class="env-tip" style="color:var(--warning);">${escapeHtml(rescue.lastError)}</div>` : ''}
+          <div class="env-tip">From the preflight dump until the copy turns into a standby, this app's compose file (on CasaOS, its app file) does not list the database and its container is removed. Do not start the app from CasaOS until the rescue ends: a database container started during the copy parks the rescue and the copy starts again.</div>
           <div style="display:flex;gap:8px;">
             ${rescue.parked ? `<button class="btn btn-primary btn-small" onclick="startRecoveryRescue('${botId}')">Continue</button>` : ''}
             ${swapReady ? `<button class="btn btn-danger btn-small" onclick="startRecoverySwap('${botId}')">Swap now</button>` : ''}
@@ -3471,7 +3473,7 @@
       if (!confirm('Cancel the rescue?\n\nThe copy stops where it is (a later rescue resumes incrementally). The database on this machine stays in whatever state the rescue left it.')) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/recovery-rescue`);
-        showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue cancelled.' : (res.error || 'Failed to cancel'));
+        showMessage(res.success ? (res.warning ? 'error' : 'success') : 'error', res.success ? (res.warning || 'Rescue cancelled.') : (res.error || 'Failed to cancel'));
       } catch (err) {
         showNoAnswer('rescue cancel');
       }
@@ -4354,7 +4356,7 @@
 
     async function restoreFleetBackupFile(botId, file) {
       const sharers = await restoreSharersText(botId);
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines see the database go read-only, then briefly absent, until it finishes. Do not start any of these instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);

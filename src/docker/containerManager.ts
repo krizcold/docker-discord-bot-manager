@@ -88,6 +88,8 @@ import {
   fixPostDeployOwnership,
   executeInstallCommand,
   removeFleetPostgresService,
+  takeServiceOut,
+  putServiceBack,
   platformNetworkNames,
   splitDockerVolume
 } from '../templates/pcsProcessing';
@@ -1157,6 +1159,59 @@ export async function removeFleetDbReplicaService(botId: string, containerName: 
     }
   }
   return { success: true };
+}
+
+function laneHeldComposePath(botId: string): string {
+  return path.join(getBotDir(botId), 'docker-compose.lane-held.json');
+}
+
+export function fleetDbHeldForLane(botId: string): boolean {
+  return fs.existsSync(laneHeldComposePath(botId));
+}
+
+/**
+ * Take the fleet database service out of the deployed compose (on CasaOS, the app file a tile click or a CasaOS
+ * restart starts from) while a lane rewrites its volume. The compose as it was is kept beside the bot first, so
+ * releaseFleetDbFromLane can put the service back. A repeated hold finds no service and keeps the first kept copy;
+ * a kept copy left by an earlier lane is replaced by the compose as it is now.
+ */
+export function holdFleetDbForLane(botId: string): LaneResult {
+  const fleetDb = getBot(botId)?.fleetDb;
+  if (!fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  const heldPath = laneHeldComposePath(botId);
+  try {
+    const held = fs.existsSync(heldPath) ? JSON.parse(fs.readFileSync(heldPath, 'utf-8')) as { path: string } : null;
+    const composePath = held?.path ?? resolveComposePath(botId, resolveAppName(botId));
+    if (!fs.existsSync(composePath)) return { success: true };
+    const content = fs.readFileSync(composePath, 'utf-8');
+    const out = takeServiceOut(content, fleetDb.containerName);
+    if (!out.key) return { success: true };
+    writePrivateFile(heldPath, JSON.stringify({ path: composePath, key: out.key, content }));
+    rewriteComposeFile(composePath, out.content);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: `the database service could not be taken out of the deployed compose: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/** Put back the database service holdFleetDbForLane took out; success with nothing to do when no hold is kept. */
+export function releaseFleetDbFromLane(botId: string): LaneResult {
+  const heldPath = laneHeldComposePath(botId);
+  try {
+    if (!fs.existsSync(heldPath)) return { success: true };
+    const held = JSON.parse(fs.readFileSync(heldPath, 'utf-8')) as { path: string; key: string; content: string };
+    if (typeof held?.path !== 'string' || typeof held.key !== 'string' || typeof held.content !== 'string') {
+      throw new Error(`${heldPath} does not hold a kept compose`);
+    }
+    if (!fs.existsSync(held.path)) throw new Error(`the deployed compose ${held.path} is missing`);
+    const current = fs.readFileSync(held.path, 'utf-8');
+    const restored = putServiceBack(current, held.content, held.key);
+    if (restored !== current) rewriteComposeFile(held.path, restored);
+    fs.unlinkSync(heldPath);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: `the database service could not be put back into the deployed compose (the compose as it was is kept at ${heldPath}): ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 /**

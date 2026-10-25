@@ -46,7 +46,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     ...real,
     runningInstanceContainers: async (id: string) => (id in pg.live ? pg.live[id] : []),
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
-    stopBot: async (id: string) => { pg.events.push(`stop:${id}`); return { success: true }; },
+    stopBot: async (id: string) => { pg.events.push(`stop:${id}`); pg.live[id] = []; return { success: true }; },
     startBot: async (id: string) => { pg.events.push(`start:${id}`); return { success: true }; },
     updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string } | null) => {
       if (pg.saveFails) throw new Error('ENOSPC: no space left on device');

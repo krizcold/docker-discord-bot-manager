@@ -45,13 +45,33 @@ Write-Host "==> Pulling latest code..."
 git -c safe.directory='*' pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw "git pull failed (exit $LASTEXITCODE) - resolve the errors above and re-run." }
 
-Write-Host "==> Rebuilding and recreating..."
+Write-Host "==> Rebuilding..."
 $prevBuildCommit = $env:BUILD_COMMIT
 $env:BUILD_COMMIT = (git -c safe.directory='*' rev-parse HEAD)
-docker compose -f $compose up -d --build
+docker compose -f $compose build
 $composeExit = $LASTEXITCODE
 if ($null -eq $prevBuildCommit) { Remove-Item Env:BUILD_COMMIT -ErrorAction SilentlyContinue } else { $env:BUILD_COMMIT = $prevBuildCommit }
-if ($composeExit -ne 0) { throw "docker compose up failed (exit $composeExit) - see the errors above." }
+if ($composeExit -ne 0) { throw "docker compose build failed (exit $composeExit) - see the errors above." }
+
+# A recreate cuts short any database restore, dump, rescue or operation the manager is running. The manager
+# answers on loopback inside its own container; a manager that is not running has nothing to cut short.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$running = docker ps --format '{{.Names}}' 2>$null
+$ErrorActionPreference = $prevEap
+if ($running -contains 'discordbotmanagerapp') {
+  $probe = "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/manager/lanes').then(r=>r.json()).then(b=>{if(!b||b.success!==true)process.exit(2);console.log(b.blocker||'');}).catch(()=>process.exit(2))"
+  $ErrorActionPreference = 'Continue'
+  $answer = docker exec discordbotmanagerapp node -e $probe 2>$null
+  $probeExit = $LASTEXITCODE
+  $ErrorActionPreference = $prevEap
+  if ($probeExit -ne 0) { throw 'The manager did not say whether a database lane is running, so the stack was not recreated. Wait and re-run, or stop the manager first (docker stop discordbotmanagerapp) and re-run.' }
+  if ("$answer".Trim()) { throw "The stack was not recreated: $("$answer".Trim()), and a recreate would cut it short. Re-run once it ends." }
+}
+
+Write-Host "==> Recreating..."
+docker compose -f $compose up -d
+if ($LASTEXITCODE -ne 0) { throw "docker compose up failed (exit $LASTEXITCODE) - see the errors above." }
 
 # compose recreates Authelia only when its image or compose config changed, not when its
 # bind-mounted files did, so restart it when the pull changed them.

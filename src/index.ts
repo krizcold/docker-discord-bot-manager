@@ -8,11 +8,11 @@
 import { execSync } from 'child_process';
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
-import { syncContainerStates, resetTransientStatuses } from './docker/containerManager';
+import { syncContainerStates, resetTransientStatuses, beginShutdown } from './docker/containerManager';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
-import { startFleetBackupScheduler, stopFleetBackupScheduler } from './instance/fleetBackup';
+import { startFleetBackupScheduler, stopFleetBackupScheduler, waitForInFlightLanes } from './instance/fleetBackup';
 import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
 import { parkInterruptedTransfers } from './instance/fleetTransfer';
@@ -144,8 +144,15 @@ async function main(): Promise<void> {
   startStateReconciler(() => wss.clients.size);
 }
 
+// Below the compose files' stop_grace_period, so the exit is the manager's and not docker's kill.
+const SHUTDOWN_LANE_WAIT_MS = 120_000;
+
 // Handle graceful shutdown
+let shuttingDown = false;
 process.on('SIGTERM', () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  beginShutdown();
   console.log('[Shutdown] Received SIGTERM, shutting down...');
   stopSourceUpdater();
   stopInstanceUpdater();
@@ -153,9 +160,12 @@ process.on('SIGTERM', () => {
   stopFleetReplicationHealth();
   stopFleetReplicaAuto();
   stopRecoveryChannelReconciler();
-  stopRecoveryControlServer();
-  stopStateReconciler();
-  process.exit(0);
+  void waitForInFlightLanes(SHUTDOWN_LANE_WAIT_MS).then(lane => {
+    if (lane) console.error(`[Shutdown] Exiting with a lane still running, which is cut short: ${lane}`);
+    stopRecoveryControlServer();
+    stopStateReconciler();
+    process.exit(0);
+  });
 });
 
 process.on('SIGINT', () => {

@@ -30,7 +30,7 @@ describe('the restore request toast', () => {
   it('shows no success styling before the server answers', async () => {
     const messages: string[][] = [];
     let atRequest: string[][] = [];
-    const ctx = runPage(['restoreFleetBackupFile'], {
+    const ctx = runPage(['restoreFleetBackupFile', 'restoreSharersText'], {
       confirm: () => true,
       document: { getElementById: () => ({ querySelectorAll: () => [] }) },
       showMessage: (t: string, m: string) => messages.push([t, m]),

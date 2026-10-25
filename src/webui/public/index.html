@@ -2719,6 +2719,7 @@
       if (!bot?.fleetDb) {
         content.innerHTML = `
           <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
+          ${swappedAwayHtml(bot)}
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
           <div id="fleet-past-backups"></div>
           <div class="modal-actions">
@@ -2744,6 +2745,7 @@
         <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
         <div id="fleet-seed-banner"></div>
         <div id="fleet-backup-error">${fleetBackupErrorHtml(bots.find(b => b.id === botId)?.fleetBackup || fb)}</div>
+        ${swappedAwayHtml(bots.find(b => b.id === botId))}
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
           <label class="toggle-switch">
             <input type="checkbox" id="fleet-backup-enabled" ${fb.enabled ? 'checked' : ''} onchange="saveFleetBackupConfig()">
@@ -2781,6 +2783,26 @@
       return restore + (fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '');
     }
 
+    function swappedAwayHtml(bot) {
+      if (!bot || !bot.recoverySwappedAway) return '';
+      const day = new Date(bot.recoverySwappedAway.at).toISOString().slice(0, 10);
+      return `<div class="error-message">A recovery swap on ${day} handed this database to another machine, so Start and Update are refused: starting this instance would run a second primary on the old copy. Re-seed it as a standby of the new primary, or clear the swap record if that swap never promoted the copy there. <button class="btn btn-secondary btn-small" onclick="clearSwappedAway('${bot.id}')">Clear the swap record</button></div>`;
+    }
+
+    async function clearSwappedAway(botId) {
+      if (!confirm('Clear the swap record?\n\nDo this only if the swap never promoted the copy on the other machine, or once this database follows the new primary. Start and Update then run again, and a started instance writes to this copy.')) return;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/recovery-swapped-away`);
+        if (!res.success) showMessage('error', res.error || 'The swap record could not be cleared');
+        else showMessage('success', 'Swap record cleared');
+      } catch (err) {
+        showNoAnswer('clear');
+      } finally {
+        await loadBots();
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
+    }
+
     async function dismissFleetRestoreError(botId) {
       try {
         const res = await api('DELETE', `/bots/${botId}/fleet-backups/restore-error`);
@@ -2797,6 +2819,7 @@
       try {
         const res = await api('GET', `/bots/${botId}/fleet-backups`);
         const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
+        const rescue = !!bots.find(x => x.id === botId)?.recoveryRescue;
         const emptyText = !fb.enabled
           ? 'No backups. Daily backup is off, so none will be taken until it is turned on.'
           : fb.scoped === false
@@ -2812,7 +2835,9 @@
             <div class="env-row" style="align-items:center;">
               <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
               <span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">${formatBackupSize(b.size)} - ${new Date(b.mtime).toLocaleString()}</span>
-              <button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>
+              ${rescue
+                ? '<span style="color:var(--text-muted);font-size:0.74rem;white-space:nowrap;">Restore is off while a rescue is recorded</span>'
+                : `<button class="btn btn-danger btn-small" onclick="restoreFleetBackupFile('${botId}', ${jsArg(b.file)})">Restore</button>`}
             </div>`).join('');
       } catch (err) {
         return '<div class="error-message">Could not list the backups: the manager could not be reached</div>';
@@ -4327,8 +4352,20 @@
       if (keepEl) keepEl.value = String(fb.keep);
     }
 
+    async function restoreSharersText(botId) {
+      try {
+        const res = await api('GET', `/bots/${botId}/fleet-backups/restore-preview`);
+        if (!res.success || !Array.isArray(res.instances)) return `The manager could not list the instances that share it (${res.error || 'no answer'}); the ones docker shows running when the restore starts are stopped`;
+        const names = res.instances.map(i => `${i.displayName} (${i.running === true ? 'running now' : i.running === false ? 'stopped now' : 'docker did not answer'})`);
+        return `These instances on this manager share it: ${names.join(', ')}. Each one docker shows running when the restore starts is stopped`;
+      } catch (err) {
+        return 'The manager did not answer the list of instances that share it; the ones docker shows running when the restore starts are stopped';
+      }
+    }
+
     async function restoreFleetBackupFile(botId, file) {
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. The instances on this manager that share it are stopped, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, and the stopped instances are restarted. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
+      const sharers = await restoreSharersText(botId);
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines see the database go read-only, then briefly absent, until it finishes.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);
@@ -4337,7 +4374,8 @@
         const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
         if (res.success) {
           const s = res.steps || {};
-          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
+          const leases = Array.isArray(s.guildsRaised) ? `, ${s.guildsRaised.length} guild lease${s.guildsRaised.length === 1 ? '' : 's'} raised to term ${s.leaseTerm}` : ', no guild lease raised (no earlier term was known)';
+          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}${leases}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
           if (res.warning) alert(`Restore finished WITH A WARNING:\n\n${res.warning}\n\n${res.note || ''}`);
         } else {
           showMessage('error', res.error || 'Restore failed');

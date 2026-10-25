@@ -56,6 +56,8 @@ services:
     image: ghcr.io/krizcold/docker-discord-bot-manager:latest
     container_name: discordbotmanagerapp
     restart: unless-stopped
+    # The manager waits up to 120 s on SIGTERM for a running dump, restore or operation.
+    stop_grace_period: 130s
     logging:
       driver: json-file
       options:

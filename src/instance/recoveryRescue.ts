@@ -32,7 +32,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as appLifecycle from './appLifecycle';
-import { runFleetDump } from './fleetBackup';
+import { runFleetDump, claimFleetBackupBusy, releaseFleetBackupBusy, isFleetBackupBusy, raiseGuildTerms } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
 import { hasAppHooks } from './appHookClient';
@@ -153,24 +153,62 @@ function structurallySound(instance: InstanceConfig | null): instance is Instanc
 // ─── The driver ───
 
 const running = new Set<string>();
+const SLOT_PHASES: string[] = ['preflight', 'bulk', 'consistent', 'standby'];
 
 export async function startRescue(
   instance: InstanceConfig,
   confirm: boolean,
 ): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; state?: 'fresh' | 'outdated'; sourceIdentity?: Record<string, unknown> }> {
+  if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL };
   if (!instance.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
   // Teardown removes the channel, and the flip starts the fleet: Continue past them needs neither check.
   const pastChannel = instance.recoveryRescue?.phase === 'teardown' || instance.recoveryRescue?.phase === 'flip';
   if (!pastChannel && instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
-  if (!pastChannel && instance.status === 'running') return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
   if (instance.recoveryRescue) {
     // Re-entry ALWAYS continues the recorded phase (Continue after a manager
     // outage or a parked halt); restarting from preflight would boot postgres
     // over a half-seeded volume to "dump" garbage.
-    if (instance.recoveryRescue.parked) saveRescue(instance.id, { parked: false, lastError: undefined });
+    if (!pastChannel) {
+      const live = await containerManager.runningNonSidecarContainers(instance.id);
+      if (live === null) return { success: false, error: 'Docker could not say whether the instance is running, so the rescue was not continued; retry in a moment' };
+      if (live.length > 0) return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
+    }
+    if (containerManager.getBot(instance.id)?.recoveryRescue?.parked) saveRescue(instance.id, { parked: false, lastError: undefined });
     if (!running.has(instance.id)) void runRescue(instance.id);
     return { success: true };
   }
+
+  const busyOp = containerManager.isBotBusy(instance.id);
+  if (busyOp) return { success: false, error: `Operation '${busyOp}' is in progress on this instance; wait for it before starting a rescue (nothing was changed)` };
+  try {
+    return await containerManager.withExternalBotOp(instance.id, 'rescue', () => startFreshRescue(instance.id, confirm));
+  } catch (err) {
+    return { success: false, error: `${err instanceof Error ? err.message : String(err)}; the rescue was not started` };
+  }
+}
+
+/** Why a fresh rescue must not start now; null when no other lane holds the database. */
+function freshRescueRefusal(instance: InstanceConfig): string | null {
+  if (instance.fleetFailback) return `A ${instance.fleetFailback.mode} run is on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal first`;
+  if (instance.fleetTransfer) return `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it first`;
+  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return 'Provisioning of a standby is running on this instance; wait for it to finish';
+  if (isFleetBackupBusy(instance.id)) return 'A database dump, restore or replication change is running on this instance; wait for it to finish';
+  return null;
+}
+
+async function startFreshRescue(
+  botId: string,
+  confirm: boolean,
+): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; state?: 'fresh' | 'outdated'; sourceIdentity?: Record<string, unknown> }> {
+  const instance = containerManager.getBot(botId);
+  if (!instance?.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
+  if (instance.recoveryRescue) return { success: false, error: 'A rescue was recorded on this instance meanwhile; open it again to continue it' };
+  if (instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
+  const refusal = freshRescueRefusal(instance);
+  if (refusal) return { success: false, error: `${refusal} (nothing was changed)` };
+  const live = await containerManager.runningNonSidecarContainers(instance.id);
+  if (live === null) return { success: false, error: 'Docker could not say whether the instance is running, so the rescue was not started; retry in a moment' };
+  if (live.length > 0) return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
 
   const prepared = await control(instance, 'prepare');
   if (!prepared.ok) return { success: false, error: controlFailure(prepared) };
@@ -270,6 +308,8 @@ export function resumeRecoveryRescues(): void {
 async function runRescue(botId: string): Promise<void> {
   if (running.has(botId)) return;
   running.add(botId);
+  // The phases that rewrite the volume hold the backup slot, so no dump, restore or replication change runs under them.
+  let slotHeld = false;
   try {
     for (;;) {
       const instance = containerManager.getBot(botId);
@@ -281,6 +321,21 @@ async function runRescue(botId: string): Promise<void> {
       }
       if (instance.recoveryRescue!.parked) return;
       const phase = instance.recoveryRescue!.phase;
+      const rewritesVolume = SLOT_PHASES.includes(phase);
+      if (rewritesVolume && !slotHeld) {
+        // The record stays, so the rescue resumes from this phase at the next boot.
+        if (containerManager.isShuttingDown()) return;
+        if (!claimFleetBackupBusy(botId)) {
+          if (!saveRescue(botId, { lastError: 'a database dump, restore or replication change is running on this instance; the rescue waits for it' })) return;
+          await sleep(RETRY_DELAY_MS);
+          if (!containerManager.getBot(botId)?.recoveryRescue) return;
+          continue;
+        }
+        slotHeld = true;
+      } else if (!rewritesVolume && slotHeld) {
+        releaseFleetBackupBusy(botId);
+        slotHeld = false;
+      }
       try {
         if (phase === 'preflight') await phasePreflight(instance);
         else if (phase === 'bulk') await phaseBulk(instance);
@@ -308,6 +363,7 @@ async function runRescue(botId: string): Promise<void> {
       }
     }
   } finally {
+    if (slotHeld) releaseFleetBackupBusy(botId);
     running.delete(botId);
   }
 }
@@ -338,10 +394,13 @@ async function phasePreflight(instance: InstanceConfig): Promise<void> {
     // The stale copy gets one dump beside the ordinary backups; best effort
     // by the same ruling as the re-seed lane (the operator already accepted
     // losing the diverged tail, the dump is a safety net not a precondition).
-    const started = await containerManager.startFleetDbSidecar(instance.id);
+    const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
     const dump = started.success ? await runFleetDump(instance, 'pre-rescue-') : { success: false, error: started.error };
     if (!dump.success) console.warn(`[RecoveryRescue] Could not dump the stale copy before the rescue of ${instance.id}: ${dump.error}`);
   }
+  const live = await containerManager.runningNonSidecarContainers(instance.id);
+  if (live === null) throw new Error('docker could not say whether the instance is running, so its database was not stopped');
+  if (live.length > 0) throw new Error(`the instance is running (${live.join(', ')}); stop it, and the rescue retries`);
   await stopSidecarHard(fleetDb.containerName);
   const mark = await volExec(fleetDb.volume, `touch ${PGDATA}/rescue.inprogress`);
   if (!mark.ok) throw new Error(`could not mark the volume: ${mark.stderr.trim()}`);
@@ -454,7 +513,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
     `touch ${PGDATA}/standby.signal && rm -f ${PGDATA}/rescue.inprogress && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
-  const started = await containerManager.startFleetDbSidecar(instance.id);
+  const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
   if (!started.success) {
     // Early recovery legitimately refuses connections past the ready wait;
     // the container being up is the phase's actual requirement.
@@ -512,7 +571,11 @@ async function phaseQuiesce(instance: InstanceConfig): Promise<void> {
   if (!quiesced.ok) throw new Error(quiesced.error);
   const target = String(quiesced.body.sourceLsn || '');
   if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(target)) throw new Error(`quiesce returned no end-of-WAL (${target || 'empty'})`);
-  saveRescue(instance.id, { phase: 'catchup', swapTargetLsn: target, lastError: undefined });
+  const term = quiesced.body.sourceTerm;
+  if (term !== null && !Number.isSafeInteger(term)) {
+    throw new Error(`the source did not report its control term at quiesce (${JSON.stringify(term ?? null)}), so the copy could not be floored above it`);
+  }
+  saveRescue(instance.id, { phase: 'catchup', swapTargetLsn: target, swapSourceTerm: term, lastError: undefined });
 }
 
 async function phaseCatchup(instance: InstanceConfig): Promise<void> {
@@ -649,6 +712,7 @@ async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {
   const clean = await docker(['exec', fleetDb.containerName, 'sh', '-c',
     `sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf`]);
   if (!clean.ok) throw new Error(`could not clean the standby settings: ${clean.stderr.trim().split('\n').pop()}`);
+  await floorCopyTerms(instance);
 
   const fresh = containerManager.getBot(instance.id);
   if (!fresh) throw new Error('instance disappeared mid-flip');
@@ -668,6 +732,30 @@ async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {
   // The env store alone: container env assembly derives sensitive values from
   // it at read time (the two-store strip).
   if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
+}
+
+/**
+ * Raise the promoted copy's control term and every guild lease above the term the source held at quiesce, in a
+ * read-write session: a lease token the source's fleet still holds (term at most that, any epoch) can then no
+ * longer write, and the master here claims a term above any the source posted. Idempotent, so a retried flip
+ * repeats it harmlessly.
+ */
+async function floorCopyTerms(instance: InstanceConfig): Promise<void> {
+  const fleetDb = instance.fleetDb!;
+  const sourceTerm = instance.recoveryRescue!.swapSourceTerm;
+  if (sourceTerm === null) return;
+  if (sourceTerm === undefined) throw new Error('no source control term was captured at quiesce, so the copy cannot be floored above it');
+  const psql = (sql: string) => docker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+    'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const table = await psql("SELECT to_regclass('smdb_control.term') IS NOT NULL");
+  if (!table.ok) throw new Error(`could not read the copy's control term table: ${table.stderr.trim().split('\n').pop()}`);
+  if (!/^[tf]$/.test(table.stdout.trim())) throw new Error(`the copy's control term table probe answered '${table.stdout.trim()}'`);
+  if (table.stdout.trim() === 't') {
+    const control = await psql(`WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, ${sourceTerm + 1}) RETURNING 1) SELECT count(*) FROM u`);
+    if (!control.ok) throw new Error(`could not raise the copy's control term above ${sourceTerm}: ${control.stderr.trim().split('\n').pop()}`);
+  }
+  const leases = await raiseGuildTerms(fleetDb, sourceTerm);
+  if (!leases.ok) throw new Error(`could not raise the copy's guild leases above term ${sourceTerm}: ${leases.error}`);
 }
 
 /** Throws on a failed start so the driver retries with the record kept; a fleet the operator already started counts as started. */

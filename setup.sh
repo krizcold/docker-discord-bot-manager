@@ -340,6 +340,16 @@ EOF
 ok "Wrote $ENV_FILE"
 
 # ── Deploy ────────────────────────────────────────────────────────────────────
+# A recreate cuts short any database restore, dump, rescue or operation the manager is running. The manager
+# answers on loopback inside its own container; a manager that is not running has nothing to cut short.
+lane_check() {
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx discordbotmanagerapp || return 0
+  local answer
+  answer="$(docker exec discordbotmanagerapp node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/manager/lanes').then(r=>r.json()).then(b=>{if(!b||b.success!==true)process.exit(2);console.log(b.blocker||'');}).catch(()=>process.exit(2))" 2>/dev/null)" \
+    || die "The manager did not say whether a database lane is running, so the stack was not recreated. Wait and re-run, or stop the manager first (docker stop discordbotmanagerapp) and re-run."
+  [ -z "$answer" ] || die "The stack was not recreated: $answer, and a recreate would cut it short. Re-run once it ends."
+}
+lane_check
 info "Starting the stack (the first build can take a few minutes) ..."
 deploy_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BUILD_COMMIT="$(git -c safe.directory='*' rev-parse HEAD 2>/dev/null || true)" docker compose -f "$COMPOSE_FILE" up -d || die "docker compose up failed."

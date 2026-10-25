@@ -700,6 +700,18 @@ export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryResc
   return instance;
 }
 
+/** Throws when the registry cannot be saved. */
+export function updateInstanceRecoverySwappedAway(botId: string, record: { at: number } | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!record && !instance.recoverySwappedAway) return;
+  if (record) instance.recoverySwappedAway = record;
+  else delete instance.recoverySwappedAway;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetReplicaSeedRecord | null): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -956,10 +968,13 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
  * the stale-primary re-seed (PLAN_REPLICATION.md Stage 5) has no database to
  * dump until this runs; the app service is deliberately left down.
  */
-export async function startFleetDbSidecar(botId: string): Promise<LaneResult> {
+export async function startFleetDbSidecar(botId: string, opts: { forRescue?: boolean } = {}): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  if (instance.recoveryRescue && !opts.forRescue) {
+    return { success: false, error: 'A database rescue is recorded on this instance and rewrites its volume; the database was not started' };
+  }
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
@@ -1021,12 +1036,15 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult> {
     }
     const registry = loadRegistry();
     const stored = registry.instances[botId];
+    // With the old copy gone, a swap that handed it away can no longer leave a second primary behind.
     if (stored) {
       delete stored.fleetDb;
+      delete stored.recoverySwappedAway;
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
     }
     delete instance.fleetDb;
+    delete instance.recoverySwappedAway;
     return { success: true };
   } catch (err) {
     return { success: false, error: String(err) };
@@ -1346,6 +1364,56 @@ const activeOps = new Map<string, string>();
 
 export function isBotBusy(botId: string): string | null {
   return activeOps.get(botId) || null;
+}
+
+// Set by SIGTERM: the lanes still running get the bounded wait, and no new one is admitted.
+let shuttingDown = false;
+export const SHUTDOWN_REFUSAL = 'The manager is shutting down, so this was refused and nothing was changed; retry once it is back up';
+
+export function beginShutdown(): void {
+  shuttingDown = true;
+}
+
+export function isShuttingDown(): boolean {
+  return shuttingDown;
+}
+
+/** Every op lock held now, as [botId, op]. */
+export function activeBotOps(): Array<[string, string]> {
+  return Array.from(activeOps.entries());
+}
+
+// Instances a database lane (a fleet restore) holds stopped: Start, Restart, Update and Build refuse on them.
+const databaseHolds = new Map<string, string>();
+
+export function holdForDatabaseLane(botIds: string[], lane: string): void {
+  for (const id of botIds) databaseHolds.set(id, lane);
+}
+
+export function releaseDatabaseLane(botIds: string[]): void {
+  for (const id of botIds) databaseHolds.delete(id);
+}
+
+function swappedAwayRefusal(botId: string, action: string): { success: false; error: string } | null {
+  const swapped = getBot(botId)?.recoverySwappedAway;
+  if (!swapped) return null;
+  const day = new Date(swapped.at).toISOString().slice(0, 10);
+  return { success: false, error: `A recovery swap on ${day} handed this instance's database to another machine, so ${action} would run a second primary on the old copy; re-seed it as a standby of the new primary, or, if that swap never promoted the copy there, clear the swap record on its Database modal first` };
+}
+
+function databaseHoldRefusal(botId: string, action: string): { success: false; error: string } | null {
+  const lane = databaseHolds.get(botId);
+  return lane ? { success: false, error: `${lane} is running on this instance's database; ${action} is refused until it ends` } : null;
+}
+
+/** The recorded database runs a build or update must not run under; null when none is recorded. */
+function databaseRunRefusal(botId: string, action: string): { success: false; error: string } | null {
+  const inst = getBot(botId);
+  if (!inst) return null;
+  if (inst.recoveryRescue) return { success: false, error: `A database rescue is recorded on this instance; finish or cancel it before ${action} (nothing was changed)` };
+  if (inst.fleetFailback) return { success: false, error: `A ${inst.fleetFailback.mode} run is recorded on this instance (${inst.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before ${action} (nothing was changed)` };
+  if (inst.fleetTransfer) return { success: false, error: `A database transfer is recorded on this instance (${inst.fleetTransfer.phase}); let it finish or cancel it before ${action} (nothing was changed)` };
+  return null;
 }
 
 // Status pushes sent inside an op carry its activeOp; once the lock is gone
@@ -3055,6 +3123,18 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
  * would refuse Start in exactly the crashed case this reconcile exists for.
  * Falls back to any-project-container when the app service cannot be resolved.
  */
+/** The instance's running compose containers other than its own fleet sidecar, for an instance with or without one; null when docker did not answer. */
+export async function runningInstanceContainers(botId: string): Promise<string[] | null> {
+  if (getBot(botId)?.fleetDb) return runningNonSidecarContainers(botId);
+  try {
+    const { stdout } = await execAsync(
+      `docker ps --filter "label=com.docker.compose.project=${resolveAppName(botId)}" --format "{{.Names}}"`);
+    return stdout.split('\n').map(s => s.trim()).filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Names of this instance's RUNNING compose containers other than the fleet
  * sidecar. The recovery swap's quiesce (RC-4) works from container truth,
@@ -3158,7 +3238,7 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   if (rescue && !(rescue.phase === 'flip' && rescue.flipStep)) {
     return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
   }
-  return deleteLaneRefusal(botId, 'Start');
+  return swappedAwayRefusal(botId, 'a start') ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
 /** A recorded copy-block retraction reaches the app once its hooks answer after a start; a miss stays recorded. */
@@ -3613,6 +3693,13 @@ export async function stopBot(botId: string): Promise<LaneResult> {
   });
 }
 
+/** Stop for a caller that already holds this instance's op lock under op (withExternalBotOp); refuses when it does not. */
+export async function stopBotInOp(botId: string, op: string): Promise<LaneResult> {
+  if (activeOps.get(botId) !== op) return { success: false, error: `the stop must run under the '${op}' operation, which is not held` };
+  const result = await stopBotImpl(botId);
+  return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
+}
+
 async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
@@ -3762,7 +3849,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  return deleteLaneRefusal(botId, 'Update');
+  return swappedAwayRefusal(botId, 'an update') ?? databaseHoldRefusal(botId, 'Update') ?? databaseRunRefusal(botId, 'updating') ?? deleteLaneRefusal(botId, 'Update');
 }
 
 /** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
@@ -3929,9 +4016,14 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
   return `This instance was deployed under ${deployed} mode, but the manager auto-detected ${current} mode. Building would re-author its data bind, so it would start on the ${current} path while its current data stays under the ${deployed} one. Declare the mode and build again: PUT /api/system/deployment {"mode":"${deployed}"} keeps this instance where its data already is, and {"mode":"${current}"} accepts the detected mode for the whole manager, after which this instance moves on its next build.`;
 }
 
+/** The synchronous refusal a Build answers before touching anything; null when it may proceed. */
+export function buildPreflightRefusal(botId: string): { success: false; error: string } | null {
+  return databaseHoldRefusal(botId, 'Build') ?? databaseRunRefusal(botId, 'building') ?? deleteLaneRefusal(botId, 'Build');
+}
+
 export async function buildBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'build', async () => {
-    const refusal = deleteLaneRefusal(botId, 'Build');
+    const refusal = buildPreflightRefusal(botId);
     if (refusal) return refusal;
     const instance = getBot(botId);
     if (!instance) return { success: false, error: 'Bot not found' };

@@ -20,6 +20,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getDeploymentMode } from '../casaos/detector';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
+import { databaseLaneBlocker } from '../instance/fleetBackup';
 
 const REPO = '/repo';
 // Regenerated on every process start; lets the UI tell "server restarted" apart
@@ -67,6 +68,11 @@ export interface ManagerVersion {
   buildStale?: boolean;
   updateAvailable?: boolean;
   behindBy?: number;
+}
+
+/** The in-flight lane a recreate would cut short, named; null when none runs. */
+export function updateLaneBlocker(): string | null {
+  return databaseLaneBlocker();
 }
 
 let updateInProgress = false;
@@ -484,6 +490,8 @@ async function doManagerUpdate(
     return outcome;
   }
 
+  const lane = updateLaneBlocker();
+  if (lane) throw new Error(`The images were rebuilt, but the stack was not recreated: ${lane}, and a recreate would cut it short. Update again once it ends.`);
   emit('[Update] Recreating the stack - the UI will drop and reconnect in a few seconds...', 'info');
   // A container can't recreate itself in-process, so launch a detached one-shot that
   // runs `compose up -d` after we return. It uses the manager's own image (has compose).

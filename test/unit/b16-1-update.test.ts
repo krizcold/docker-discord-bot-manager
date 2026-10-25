@@ -1,0 +1,110 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The b24-2 harness: the repo at /repo maps to h.repo, git and docker are fakes, and `docker run` records the
+// recreate helper's script instead of launching it.
+const h = vi.hoisted(() => {
+  const nodeOs = require('os') as typeof import('os');
+  const nodeFs = require('fs') as typeof import('fs');
+  const nodePath = require('path') as typeof import('path');
+  const data = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), 'b16-1-update-'));
+  process.env.DATA_DIR = data;
+  return { data, repo: '', script: '', head: 'a'.repeat(40) };
+});
+
+vi.mock('../../src/casaos/detector', () => ({ getDeploymentMode: async () => 'docker' }));
+vi.mock('fs', async (importOriginal) => {
+  const real = await importOriginal<typeof import('fs')>();
+  const map = (p: any) => {
+    const s = String(p).replace(/\\/g, '/');
+    return h.repo && (s === '/repo' || s.startsWith('/repo/')) ? h.repo + s.slice(5) : p;
+  };
+  const existsSync = (p: any) => real.existsSync(map(p));
+  const readFileSync = (p: any, ...rest: any[]) => (real.readFileSync as any)(map(p), ...rest);
+  return { ...real, default: { ...real, existsSync, readFileSync }, existsSync, readFileSync };
+});
+vi.mock('child_process', async (importOriginal) => {
+  const real = await importOriginal<typeof import('child_process')>();
+  const labels = {
+    'com.docker.compose.project': 'dbm', 'com.docker.compose.service': 'manager',
+    'com.docker.compose.project.working_dir': '/srv/dbm', 'com.docker.compose.project.config_files': '/srv/dbm/docker-compose.remote.yml',
+  };
+  const execSync = (cmd: string) => {
+    if (cmd.startsWith('docker inspect')) return JSON.stringify([{ Config: { Labels: labels, Image: 'dbm-manager' } }]);
+    if (cmd.includes('rev-parse HEAD')) return h.head;
+    return '';
+  };
+  const spawn = (cmd: string, args: string[]) => {
+    const child: any = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    if (cmd === 'git' && args.includes('pull')) h.head = 'b'.repeat(40);
+    setImmediate(() => child.emit('close', 0));
+    return child;
+  };
+  const spawnSync = (cmd: string, args: string[]) => {
+    const ok = (stdout: string) => ({ status: 0, stdout, stderr: '' });
+    if (cmd !== 'docker') throw new Error(`unexpected ${cmd}`);
+    if (args[0] === 'compose' && args.includes('--services')) return ok('manager\n');
+    if (args[0] === 'image') return ok('sha256:new');
+    if (args[0] === 'inspect' && args[1] === 'dbm-self-update') return ok('exited 0');
+    if (args[0] === 'inspect') return ok('sha256:new');
+    if (args[0] === 'run') { h.script = args[args.length - 1]; return ok('id'); }
+    return ok('');
+  };
+  return { ...real, execSync, spawn, spawnSync };
+});
+
+import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as selfUpdate from '../../src/manager/selfUpdate';
+
+let tmp: string;
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'b16-1-repo-'));
+  h.repo = path.join(tmp, 'repo').replace(/\\/g, '/');
+  fs.mkdirSync(path.join(h.repo, '.git'), { recursive: true });
+  fs.mkdirSync(path.join(h.repo, 'authelia'));
+  fs.writeFileSync(path.join(h.repo, 'authelia', 'configuration.yml'), 'a: 1\n');
+  fs.writeFileSync(path.join(h.repo, 'authelia', 'users_database.yml'), 'users: {}\n');
+  h.script = '';
+  h.head = 'a'.repeat(40);
+});
+afterEach(() => {
+  vi.useRealTimers();
+  h.repo = '';
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+afterAll(() => { fs.rmSync(h.data, { recursive: true, force: true }); });
+
+async function update(): Promise<Error | null> {
+  vi.useFakeTimers({ toFake: ['setTimeout'] });
+  let err: Error | null = null;
+  const done = selfUpdate.runManagerUpdate(() => {}).catch((e) => { err = e; });
+  for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(10000);
+  await done;
+  return err;
+}
+
+describe('R13-J15: a manager self-update does not recreate the stack under a running lane', () => {
+  it('a held backup slot stops the update before the recreate helper launches', async () => {
+    expect(fleetBackup.claimFleetBackupBusy('x1')).toBe(true);
+    let err: Error | null;
+    try {
+      err = await update();
+    } finally {
+      fleetBackup.releaseFleetBackupBusy('x1');
+    }
+    expect(err?.message).toMatch(/^The images were rebuilt, but the stack was not recreated: a database dump, restore or replication change is running on x1/);
+    expect(h.script).toBe('');
+  });
+
+  it('with no lane running the recreate helper launches', async () => {
+    const err = await update();
+    expect(err).toBeNull();
+    expect(h.script).toMatch(/up -d/);
+  });
+});

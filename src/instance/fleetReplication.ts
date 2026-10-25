@@ -274,7 +274,7 @@ type EnableResult = { success: boolean; error?: string; restartRequired?: boolea
  */
 async function inReplicationLane<T extends { success: boolean; error?: string }>(botId: string, action: string, fn: () => Promise<T>): Promise<T | { success: false; error: string }> {
   if (!fleetBackup.claimFleetBackupBusy(botId)) {
-    return { success: false, error: `A backup, restore or standby re-seed is running on this instance; ${action} is refused until it finishes (nothing was changed)` };
+    return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : `A backup, restore or standby re-seed is running on this instance; ${action} is refused until it finishes (nothing was changed)` };
   }
   let entered = false;
   try {

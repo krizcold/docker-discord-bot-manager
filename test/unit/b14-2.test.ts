@@ -68,6 +68,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   return {
     ...real,
     runningNonSidecarContainers: async () => [],
+    runningInstanceContainers: async (id: string) => (real.getBot(id)?.status === 'running' ? [`${id}-app`] : []),
     deployedComposeExists: () => true,
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
     stopBot: async (id: string) => { pg.events.push(`stop:${id}`); return { success: true }; },
@@ -107,6 +108,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('default_transaction_read_only/d')) return pg.liftFails ? cb(new Error('strip'), '', 'strip refused') : cb(null, '', '');
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
+    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
+    if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
     return cb(null, '', '');
   });

@@ -285,7 +285,7 @@ describe('the rescue flip', () => {
     writeRegistry({
       fleetDb: { ...fleetDb, replication },
       recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 'Chan-Token-0123456789', createdAt: now, tunnelPort: 15433, publicHost: 'primary.invalid', tlsKey: 'k', tlsCert: 'c' },
-      recoveryRescue: { phase: 'flip', startedAt: now, updatedAt: now, swapPublicHost: 'primary.invalid' },
+      recoveryRescue: { phase: 'flip', startedAt: now, updatedAt: now, swapPublicHost: 'primary.invalid', swapSourceTerm: null },
     });
     const res = await startRescue(containerManager.getBot('b1')!, true);
     expect(res.success).toBe(true);
@@ -307,7 +307,7 @@ describe('the swap outcome record', () => {
     writeRegistry({
       fleetDb: { ...fleetDb, replication },
       recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 'Chan-Token-0123456789', createdAt: startedAt, tunnelPort: 15433, publicHost: 'primary.invalid', tlsKey: 'k', tlsCert: 'c' },
-      recoveryRescue: { phase: 'flip', startedAt, updatedAt: startedAt, swapPublicHost: 'primary.invalid' },
+      recoveryRescue: { phase: 'flip', startedAt, updatedAt: startedAt, swapPublicHost: 'primary.invalid', swapSourceTerm: null },
     });
     const res = await startRescue(containerManager.getBot('b1')!, true);
     expect(res.success).toBe(true);

@@ -29,9 +29,10 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   return {
     ...real,
     runningNonSidecarContainers: async () => [],
+    runningInstanceContainers: async () => [],
     startFleetDbSidecar: async () => ({ success: true }),
     updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string } | null) => {
-      if (pg.saveFails) throw new Error('ENOSPC: no space left on device');
+      if (pg.saveFails && notice?.text.includes(' failed: ')) throw new Error('ENOSPC: no space left on device');
       return real.updateInstanceFleetRestoreError(botId, notice);
     },
   };
@@ -47,6 +48,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'inspect') return cb(null, 'true\n', '');
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '0\n', '');
+    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
+    if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE') && pg.recreateFails) return cb(new Error('recreate refused'), '', 'ERROR: disk full');
     return cb(null, '', '');
   });
@@ -182,7 +185,7 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
 });
 
 describe('R28-J9: a restore notice the registry could not save', () => {
-  it('a later scheduled dump keeps the notice and the targeted dump, and only a restart drops them', async () => {
+  it('a later scheduled dump keeps the notice and the targeted dump, and a restart shows the saved unfinished-restore notice', async () => {
     let fb = await freshManager();
     pg.restoreCode = 1;
     pg.saveFails = true;
@@ -198,7 +201,7 @@ describe('R28-J9: a restore notice the registry could not save', () => {
     pg.restoreCode = 1;
     await fb.restoreFleetBackup('a', 'old.dump');
     fb = await freshManager();
-    expect(fb.getFleetRestoreError('a')).toBeNull();
+    expect(fb.getFleetRestoreError('a')).toMatch(/^Restore of old\.dump has not finished/);
   });
 
   it('a successful restore clears the unsaved notice', async () => {

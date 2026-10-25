@@ -414,7 +414,7 @@ describe('the update route', () => {
     const events: [string, any][] = [];
     vi.doMock('../../src/webui/server', () => ({ broadcastToClients: (_w: unknown, type: string, data: unknown) => events.push([type, data]) }));
     vi.doMock('../../src/manager/selfUpdate', () => ({
-      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null,
+      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null, updateLaneBlocker: () => null,
       runManagerUpdate: async () => ({ state: 'noop', message: 'nothing' }), ...stub,
     }));
     const { createManagerRoutes } = await import('../../src/webui/routes/manager');

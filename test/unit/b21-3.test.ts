@@ -99,7 +99,7 @@ const writeRegistry = (extra: Record<string, unknown> = {}, id = 'b1'): void => 
     },
   }));
 };
-const flipRecord = (extra: Record<string, unknown> = {}) => ({ phase: 'flip', startedAt: 1000, updatedAt: 1000, swapPublicHost: 'primary.invalid', ...extra });
+const flipRecord = (extra: Record<string, unknown> = {}) => ({ phase: 'flip', startedAt: 1000, updatedAt: 1000, swapPublicHost: 'primary.invalid', swapSourceTerm: null, ...extra });
 const rescueOf = (id = 'b1') => containerManager.getBot(id)?.recoveryRescue;
 const waitFor = async (cond: () => boolean): Promise<void> => {
   for (let i = 0; i < 400 && !cond(); i++) await new Promise(r => setTimeout(r, 10));

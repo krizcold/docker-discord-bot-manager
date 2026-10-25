@@ -3,7 +3,7 @@
  * RESTful API for managing Discord bot instances
  */
 
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { WebSocketServer } from 'ws';
 import { randomUUID } from 'crypto';
 import * as containerManager from '../../docker/containerManager';
@@ -104,6 +104,12 @@ const FLEET_MASTER_FACTS_TIMEOUT_MS = 3000;
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
+
+  // A lane admitted during SIGTERM's bounded wait would be cut short by the exit; a bot's web-UI ping changes no lane.
+  router.use(function shutdownGate(req: Request, res: Response, next: NextFunction) {
+    if (!containerManager.isShuttingDown() || req.method === 'GET' || req.method === 'HEAD' || /^\/[^/]+\/webui-ready$/.test(req.path)) return next();
+    res.status(503).json({ success: false, error: containerManager.SHUTDOWN_REFUSAL });
+  });
 
   const healthSeen = new Map<string, string>();
   setInterval(() => {
@@ -771,6 +777,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const busyOp = containerManager.isBotBusy(req.params.id);
       if (busyOp) {
         res.status(409).json({ success: false, error: `Operation '${busyOp}' already in progress` });
+        return;
+      }
+
+      const refusal = containerManager.buildPreflightRefusal(req.params.id);
+      if (refusal) {
+        res.status(409).json(refusal);
         return;
       }
 
@@ -1627,6 +1639,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     res.json({ success: true, dismissed: fleetBackup.dismissFleetRestoreError(req.params.id) });
   });
 
+  /** GET /api/bots/:id/fleet-backups/restore-preview - The instances a restore would stop, for its confirm. */
+  router.get('/:id/fleet-backups/restore-preview', async (req: Request, res: Response) => {
+    try {
+      if (!containerManager.getBot(req.params.id)) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json(await fleetBackup.previewFleetRestore(req.params.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   /**
    * POST /api/bots/:id/fleet-backups/restore - Restore a dump into the sidecar.
    * Stops every instance on the same URL, takes a pre-restore safety dump
@@ -1937,6 +1962,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /api/bots/:id/recovery-swapped-away - Clear the record that a swap handed this database away, so Start and Update run again. */
+  router.delete('/:id/recovery-swapped-away', (req: Request, res: Response) => {
+    try {
+      if (!containerManager.getBot(req.params.id)) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      containerManager.updateInstanceRecoverySwappedAway(req.params.id, null);
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: `The swap record could not be cleared: ${String(error)}` });
     }
   });
 

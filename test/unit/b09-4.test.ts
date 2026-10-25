@@ -118,7 +118,7 @@ describe('B09-4 health changes are pushed', () => {
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
       renderSeedBanner: () => {}, renderFleetReplication: () => {}, renderRecoveryChannel: () => {}, api,
     });
-    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml']) vm.runInContext(pageFunction(fn), ctx);
+    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml', 'swappedAwayHtml']) vm.runInContext(pageFunction(fn), ctx);
     return { ctx, boxes };
   };
   const listed = async () => ({ success: true, backups: [{ file: 'new.dump', size: 1, mtime: 1 }] });

@@ -106,17 +106,18 @@ export function dismissFleetRestoreError(botId: string): boolean {
   return true;
 }
 
-// Notices the registry could not save; read after the record.
+// Notices the registry could not save; read before the record, which then holds an older notice or none.
 const unsavedRestoreErrors: Map<string, { file: string; text: string }> = new Map();
 
 function restoreNotice(botId: string): { file: string; text: string } | null {
-  return containerManager.getBot(botId)?.fleetRestoreError || unsavedRestoreErrors.get(botId) || null;
+  return unsavedRestoreErrors.get(botId) || containerManager.getBot(botId)?.fleetRestoreError || null;
 }
 
 function setRestoreError(botId: string, file: string, reason: string, consequence: string): void {
   const text = `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`;
   try {
     containerManager.updateInstanceFleetRestoreError(botId, { file, text });
+    unsavedRestoreErrors.delete(botId);
   } catch (err) {
     console.error(`[FleetBackup] Could not save the restore notice for ${botId}: ${err}`);
     unsavedRestoreErrors.set(botId, { file, text: `${text} (this notice is not saved and a manager restart drops it)` });
@@ -135,13 +136,55 @@ export function getFleetFenceStuck(botId: string): string | null {
  * and the claimer refuses while a dump or restore is in flight.
  */
 export function claimFleetBackupBusy(botId: string): boolean {
-  if (busy.has(botId)) return false;
+  if (busy.has(botId) || containerManager.isShuttingDown()) return false;
   busy.add(botId);
   return true;
 }
 
 export function releaseFleetBackupBusy(botId: string): void {
   busy.delete(botId);
+}
+
+export function isFleetBackupBusy(botId: string): boolean {
+  return busy.has(botId);
+}
+
+/** A held backup slot or op lock, named; null when neither is held. A shutdown waits on these, bounded. */
+export function inFlightLaneBlocker(): string | null {
+  const name = (id: string) => containerManager.getBot(id)?.displayName || id;
+  const slot = Array.from(busy)[0];
+  if (slot) return `a database dump, restore or replication change is running on ${name(slot)}`;
+  const op = containerManager.activeBotOps()[0];
+  if (op) return `operation '${op[1]}' is running on ${name(op[0])}`;
+  return null;
+}
+
+/** Waits, bounded, until inFlightLaneBlocker answers null; the lane still running at the bound, or null. */
+export async function waitForInFlightLanes(boundMs: number, pollMs = 1_000): Promise<string | null> {
+  const deadline = Date.now() + boundMs;
+  let lane = inFlightLaneBlocker();
+  if (lane) console.log(`[Shutdown] Waiting up to ${Math.round(boundMs / 1000)} s: ${lane}`);
+  while (lane && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+    lane = inFlightLaneBlocker();
+  }
+  return lane;
+}
+
+/**
+ * The lane a manager self-update would cut short, named; null when none runs. Parked runs are left out: they
+ * wait for the operator and resume after a restart by design.
+ */
+export function databaseLaneBlocker(): string | null {
+  const inFlight = inFlightLaneBlocker();
+  if (inFlight) return inFlight;
+  for (const b of containerManager.getAllBots()) {
+    if (b.recoveryRescue && !b.recoveryRescue.parked) return `a database rescue is running on ${b.displayName} (${b.recoveryRescue.phase})`;
+    if (b.fleetFailback && !b.fleetFailback.parked) return `a ${b.fleetFailback.mode} run is running on ${b.displayName} (${b.fleetFailback.phase})`;
+    if (b.fleetTransfer && !b.fleetTransfer.parked) return `a database transfer is running on ${b.displayName} (${b.fleetTransfer.phase})`;
+    if (b.fleetDbReplicaSeed && !b.fleetDbReplicaSeed.parked) return `a standby seed is running on ${b.displayName}`;
+  }
+  return null;
 }
 
 /**
@@ -224,22 +267,49 @@ function termFloorPath(botId: string): string {
   return path.join(backupDir(botId), 'term-floor.json');
 }
 
-function readTermFloor(botId: string): number | null {
+// A floor this process observed but could not write to disk; a retry in the same process still uses it.
+const heldFloors: Map<string, number> = new Map();
+
+/** The floor kept on disk or held in memory, whichever is higher (term), and the disk value alone (disk); null when none was kept; an error when the file cannot be read. */
+function readTermFloor(botId: string): { ok: true; term: number | null; disk: number | null } | { ok: false; error: string } {
+  let term: number | null = null;
   try {
     const parsed = JSON.parse(fs.readFileSync(termFloorPath(botId), 'utf-8'));
-    return Number.isInteger(parsed?.term) ? parsed.term : null;
-  } catch {
-    return null;
+    if (!Number.isSafeInteger(parsed?.term)) return { ok: false, error: 'it holds no whole-number term' };
+    term = parsed.term;
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') return { ok: false, error: err?.message || String(err) };
   }
+  const disk = term;
+  const held = heldFloors.get(botId);
+  if (held !== undefined && (term === null || held > term)) term = held;
+  return { ok: true, term, disk };
 }
 
-function writeTermFloor(botId: string, term: number): void {
+/** Write the floor through a synced temp file and a rename; the error text when it was not kept on disk. */
+function writeTermFloor(botId: string, term: number): string | null {
+  const held = heldFloors.get(botId);
+  if (held === undefined || term > held) heldFloors.set(botId, term);
+  const target = termFloorPath(botId);
+  const tmp = `${target}.tmp`;
   try {
     ensurePrivateDir(backupDir(botId));
-    fs.writeFileSync(termFloorPath(botId), JSON.stringify({ term }));
+    fs.writeFileSync(tmp, JSON.stringify({ term }), { mode: PRIVATE_FILE_MODE });
+    syncPath(tmp, 'r+');
+    fs.renameSync(tmp, target);
   } catch (err: any) {
-    console.error(`[FleetBackup] Could not persist the term floor for ${botId}: ${err?.message || err}`);
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    const text = err?.message || String(err);
+    console.error(`[FleetBackup] Could not persist the term floor for ${botId}: ${text}`);
+    return text;
   }
+  try {
+    syncPath(backupDir(botId), 'r');
+  } catch (err: any) {
+    // Windows cannot open a folder to sync it; NTFS journals the rename itself.
+    if (process.platform !== 'win32') return `the floor was written, but its folder could not be synced to disk: ${err?.message || err}`;
+  }
+  return null;
 }
 
 /**
@@ -249,6 +319,7 @@ function writeTermFloor(botId: string, term: number): void {
  * defeating the witness fence the floor exists to serve.
  */
 export function clearTermFloor(botId: string): void {
+  heldFloors.delete(botId);
   try {
     fs.rmSync(termFloorPath(botId), { force: true });
   } catch (err: any) {
@@ -808,25 +879,133 @@ async function runScheduledPrimaryDump(instance: InstanceConfig): Promise<void> 
   await runScheduledDump(instance);
 }
 
+type RestoreSteps = { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; guildsRaised: string[] | null; leaseTerm: number | null; restarted: string[] };
+
+const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
+
+/** host:port/database of a postgres URL, which two instances share a database by; null when it does not parse. */
+function databaseIdentity(url: string): string | null {
+  try {
+    const u = new URL(url);
+    const db = decodeURIComponent(u.pathname.replace(/^\//, ''));
+    if (!u.hostname || !db) return null;
+    return `${u.hostname.toLowerCase()}:${u.port || '5432'}/${db}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Restore a dump into the instance's sidecar. In order: courtesy stop of the
- * managed instances this manager can see on the URL, sidecar brought back
- * alone, write fence, pre-restore safety dump under the fence (refusing the
- * restore if it fails), drop and recreate of the database (pg_restore --clean cannot
- * restore this schema: the partition PK drops it emits are refused as
- * inherited constraints and the run exits 1 even when everything applied; a
- * fresh database makes any restore error a real failure), pg_restore
- * --exit-on-error of the chosen file with the restoring session exempted,
- * fence lifted, stopped instances restarted.
+ * The instances on this manager that share the database: this one always, and every other whose stored URL names
+ * the same host, port and database (a query-string difference such as ?sslmode does not hide one). The key is
+ * resolved PER CANDIDATE: another app spells its DSN differently. It cannot see them all (a worker's DSN lives in
+ * the bot's own env file, and other machines' instances are out of reach entirely), which is why the restore's
+ * fence is the actual protection.
+ */
+function restoreSharers(instance: InstanceConfig, url: string): InstanceConfig[] {
+  const fleetDb = instance.fleetDb!;
+  const aliases = new Set<string>([`${fleetDb.containerName.toLowerCase()}:5432/${fleetDb.db}`]);
+  const ownIdentity = databaseIdentity(url);
+  if (ownIdentity) aliases.add(ownIdentity);
+  if (fleetDb.replication) aliases.add(`${fleetDb.replication.publicHost.toLowerCase()}:${fleetDb.replication.hostPort}/${fleetDb.db}`);
+  return containerManager.getAllBots().filter(b => {
+    if (b.id === instance.id) return true;
+    const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
+    const identity = key ? databaseIdentity((envManager.getEnvVars(b.id)[key] || '').trim()) : null;
+    return identity !== null && aliases.has(identity);
+  });
+}
+
+/**
+ * The instances a restore of this instance's database would stop, for its confirm: each sharer with whether docker
+ * shows it running now (null when docker did not answer). An error when the stored URL cannot be read.
+ */
+export async function previewFleetRestore(botId: string): Promise<{ success: true; instances: Array<{ id: string; displayName: string; running: boolean | null }> } | { success: false; error: string }> {
+  const instance = containerManager.getBot(botId);
+  if (!instance?.fleetDb) return { success: false, error: 'No fleet database record' };
+  const store = envManager.getEnvVarsWithStatus(botId);
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  if (store.corrupt || (urlKey && store.undecryptable.includes(urlKey))) return { success: false, error: 'The stored database URL cannot be read' };
+  const url = urlKey ? (store.vars[urlKey] || '').trim() : '';
+  if (!url) return { success: false, error: 'Instance has no stored database URL' };
+  const instances: Array<{ id: string; displayName: string; running: boolean | null }> = [];
+  for (const b of restoreSharers(instance, url)) {
+    const live = await containerManager.runningInstanceContainers(b.id);
+    instances.push({ id: b.id, displayName: b.displayName, running: live === null ? null : live.length > 0 });
+  }
+  return { success: true, instances };
+}
+
+/** Why a restore must not start while another lane holds this instance's database; null when none does. */
+function restoreAdmissionRefusal(instance: InstanceConfig): string | null {
+  if (instance.recoveryRescue) return 'A database rescue is recorded on this instance; finish or cancel it before restoring a dump';
+  if (instance.recoveryChannel) return `The recovery channel is armed on this instance (${instance.recoveryChannel.mode}); disarm it before restoring a dump`;
+  if (instance.fleetFailback) return `A ${instance.fleetFailback.mode} run is recorded on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before restoring a dump`;
+  if (instance.fleetTransfer) return `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it before restoring a dump`;
+  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return 'A standby seed is running on this instance; wait for it before restoring a dump';
+  return null;
+}
+
+/**
+ * The highest term the live database holds, from its control row and its guild leases: every lease token in
+ * circulation carries a term at or below it. Null when neither table exists; an error when the probe failed.
+ */
+export async function probeLiveTerm(fleetDb: RestoreFleetDb): Promise<{ ok: true; term: number | null } | { ok: false; error: string }> {
+  const psql = (sql: string) => execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const tables = await psql("SELECT to_regclass('smdb_control.term') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL");
+  if (!tables.ok) return { ok: false, error: lastLine(tables.stderr) };
+  const [control, guilds] = tables.stdout.trim().split('|');
+  if (!/^[tf]$/.test(control ?? '') || !/^[tf]$/.test(guilds ?? '')) return { ok: false, error: `the table probe answered '${tables.stdout.trim()}'` };
+  const sources = [
+    control === 't' ? '(SELECT max(term) FROM smdb_control.term)' : null,
+    guilds === 't' ? '(SELECT max(term) FROM smdb_data.guild_ownership)' : null,
+  ].filter((s): s is string => s !== null);
+  if (sources.length === 0) return { ok: true, term: null };
+  const probe = await psql(`SELECT coalesce(GREATEST(${sources.join(', ')}), -1)`);
+  if (!probe.ok) return { ok: false, error: lastLine(probe.stderr) };
+  const term = Number(probe.stdout.trim());
+  if (!Number.isSafeInteger(term)) return { ok: false, error: `the term probe answered '${probe.stdout.trim()}'` };
+  return { ok: true, term: term < 0 ? null : term };
+}
+
+/**
+ * Lift every restored guild lease to term floor+1 in the fence-exempt session, so no lease token minted before the
+ * restore (term at most floor, any epoch) can write over a restored row; the next grant mints above it and hydrates
+ * from the restored rows. The guilds raised, empty when the dump has no lease table.
+ */
+export async function raiseGuildTerms(fleetDb: RestoreFleetDb, floor: number): Promise<{ ok: true; guilds: string[] } | { ok: false; error: string }> {
+  const psql = (sql: string) => execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+    'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const table = await psql("SELECT to_regclass('smdb_data.guild_ownership') IS NOT NULL");
+  if (!table.ok) return { ok: false, error: lastLine(table.stderr) };
+  if (table.stdout.trim() === 'f') return { ok: true, guilds: [] };
+  if (table.stdout.trim() !== 't') return { ok: false, error: `the table probe answered '${table.stdout.trim()}'` };
+  const raise = await psql(`WITH u AS (UPDATE smdb_data.guild_ownership SET term = ${floor + 1}, updated_at = now() WHERE term <= ${floor} RETURNING guild_id) SELECT guild_id FROM u`);
+  if (!raise.ok) return { ok: false, error: lastLine(raise.stderr) };
+  return { ok: true, guilds: raise.stdout.split('\n').map(s => s.trim()).filter(Boolean) };
+}
+
+/**
+ * Restore a dump into the instance's sidecar. Refused while another lane holds the database (a rescue, an armed
+ * recovery channel, a failback, transfer or seed run, an op lock on an instance that shares it). In order: the
+ * instances that share the database are held (Start, Restart, Update and Build refuse) and the ones docker shows
+ * running are stopped, the sidecar is brought back alone, write fence, pre-restore safety dump under the fence
+ * (refusing the restore if it fails), the live term kept on disk (refusing when it cannot be), the restore
+ * recorded, drop and recreate of the database (pg_restore --clean cannot restore this schema: the partition PK
+ * drops it emits are refused as inherited constraints and the run exits 1 even when everything applied; a fresh
+ * database makes any restore error a real failure), pg_restore --exit-on-error of the chosen file with the
+ * restoring session exempted, the control term and every guild lease raised to the kept term, fence lifted,
+ * stopped instances restarted. A failure past the drop keeps the fence on and the instances stopped.
  */
 export async function restoreFleetBackup(
   botId: string,
   file: string
-): Promise<{ success: boolean; error?: string; warning?: string; steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; restarted: string[] } }> {
-  const steps: { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; restarted: string[] } = {
-    stopped: [], preRestoreDump: null, restored: false, termReconciledTo: null, restarted: [],
+): Promise<{ success: boolean; error?: string; warning?: string; steps: RestoreSteps }> {
+  const steps: RestoreSteps = {
+    stopped: [], preRestoreDump: null, restored: false, termReconciledTo: null, guildsRaised: null, leaseTerm: null, restarted: [],
   };
 
+  if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL, steps };
   if (file.includes('/') || file.includes('\\') || file.includes('..') || !file.endsWith('.dump')) {
     return { success: false, error: 'Invalid dump file name', steps };
   }
@@ -851,9 +1030,63 @@ export async function restoreFleetBackup(
   const url = urlKey ? (store.vars[urlKey] || '').trim() : '';
   if (!url) return { success: false, error: 'Instance has no stored database URL', steps };
 
+  const admission = restoreAdmissionRefusal(instance);
+  if (admission) return { success: false, error: `${admission} (nothing was changed)`, steps };
+
+  const floorRead = readTermFloor(botId);
+  if (!floorRead.ok) {
+    return { success: false, error: `The term floor file ${termFloorPath(botId)} could not be read (${floorRead.error}), so the pre-restore control term is unknown and the restore was refused (nothing was changed); repair the file, then retry`, steps };
+  }
+
+  const sharing = restoreSharers(instance, url);
+  for (const b of sharing) {
+    const op = containerManager.isBotBusy(b.id);
+    if (op) return { success: false, error: `Operation '${op}' is running on ${b.displayName}, which shares this database; wait for it before restoring a dump (nothing was changed)`, steps };
+  }
+
   if (busy.has(botId)) return { success: false, error: 'A backup operation is already in progress', steps };
   busy.add(botId);
+  const sharerIds = sharing.map(b => b.id);
+  containerManager.holdForDatabaseLane(sharerIds, 'A database restore');
+  let held = true;
+  const release = () => {
+    if (held) containerManager.releaseDatabaseLane(sharerIds);
+    held = false;
+  };
+  const nameOf = (id: string) => containerManager.getBot(id)?.displayName || id;
   let fenced = false;
+  let sidecarStartedAlone = false;
+
+  // Before the drop nothing was restored: bring back what was stopped, and stop a sidecar this lane started alone.
+  const undo = async (): Promise<string> => {
+    release();
+    const unstarted: string[] = [];
+    for (const id of steps.stopped) {
+      const start = await asResult(containerManager.startBot(id));
+      if (start.success) steps.restarted.push(id);
+      else unstarted.push(nameOf(id));
+    }
+    if (sidecarStartedAlone && !steps.stopped.includes(botId)) {
+      const stop = await execDocker(['stop', fleetDb.containerName]);
+      if (!stop.ok) console.error(`[FleetBackup] Could not stop the database the refused restore started for ${botId}: ${lastLine(stop.stderr)}`);
+    }
+    return unstarted.length > 0
+      ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)`
+      : '';
+  };
+
+  // Past the drop the database may be missing or partial: the fence stays on and the stopped instances stay down.
+  const keepFenced = (reason: string) => {
+    fenced = false;
+    release();
+    const stopped = steps.stopped.length > 0 ? steps.stopped.map(nameOf).join(', ') : 'none were running';
+    const back = steps.preRestoreDump
+      ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
+      : 'no pre-restore dump was taken, because the database was missing';
+    setStuck(botId, fleetDb, `The database is READ-ONLY: a restore of ${file} failed (${reason}), so its write fence stays on; restore a dump again (${back})`);
+    return `${reason}. The write fence stays on and the stopped instances stay stopped (${stopped}), so nothing writes to a database that may be missing or partial; restore a dump again: ${back}`;
+  };
+
   try {
     // 0. A restore must work on a DOWN fleet - that is exactly when it is
     // needed, and starting the whole instance first would boot the bot
@@ -861,29 +1094,28 @@ export async function restoreFleetBackup(
     if (!await isContainerRunning(fleetDb.containerName)) {
       const started = await asResult(containerManager.startFleetDbSidecar(botId));
       if (!started.success) {
+        release();
         return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
       }
+      sidecarStartedAlone = true;
     }
 
-    // 1. Courtesy stop of every running managed instance this manager can see
-    // on this exact URL. It cannot see them all (a worker's DSN lives in the
-    // bot's own env file, and other machines' instances are out of reach
-    // entirely), which is why the fence below is the actual protection. The
-    // key is resolved PER CANDIDATE: another app spells its DSN differently.
-    const sharing = containerManager.getAllBots().filter(b => {
-      const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
-      return !!key && (envManager.getEnvVars(b.id)[key] || '').trim() === url;
-    });
+    // 1. Courtesy stop of every sharing instance docker shows running: the
+    // status record can be stale either way (a crashed bot, a hand-started one).
     for (const b of sharing) {
-      if (b.status !== 'running') continue;
+      const live = await containerManager.runningInstanceContainers(b.id);
+      if (live === null) {
+        const note = await undo();
+        return { success: false, error: `Docker could not say whether instance ${b.displayName} is running, so the restore was refused${note ? '' : ' and nothing was changed'}${note}`, steps };
+      }
+      if (live.length === 0) continue;
       const stop = await asResult(containerManager.stopBot(b.id));
       if (!stop.success) {
-        // Nothing was restored yet: bring back what we already stopped and refuse.
-        for (const id of steps.stopped) {
-          const start = await asResult(containerManager.startBot(id));
-          if (start.success) steps.restarted.push(id);
-        }
-        return { success: false, error: `Could not stop instance ${b.displayName}: ${stop.error}`, steps };
+        const why = stop.error === 'Bot is not running'
+          ? `its record says stopped while docker runs ${live.join(', ')}; stop those containers, then retry`
+          : stop.error;
+        const note = await undo();
+        return { success: false, error: `Could not stop instance ${b.displayName}: ${why}${note}`, steps };
       }
       steps.stopped.push(b.id);
     }
@@ -893,12 +1125,10 @@ export async function restoreFleetBackup(
     if (!await isContainerRunning(fleetDb.containerName)) {
       const started = await asResult(containerManager.startFleetDbSidecar(botId));
       if (!started.success) {
-        for (const id of steps.stopped) {
-          const start = await asResult(containerManager.startBot(id));
-          if (start.success) steps.restarted.push(id);
-        }
-        return { success: false, error: `Could not start the database for the restore: ${started.error}`, steps };
+        const note = await undo();
+        return { success: false, error: `Could not start the database for the restore: ${started.error}${note}`, steps };
       }
+      sidecarStartedAlone = true;
     }
 
     // 3. Write fence, the same one the recovery quiesce uses: writes off
@@ -916,28 +1146,17 @@ export async function restoreFleetBackup(
       // must keep retrying and the operator must hear about the read-only risk.
       const cleared = await liftAndTrack(botId, fleetDb);
       if (cleared === 'lifted') fenced = false;
-      for (const id of steps.stopped) {
-        const start = await asResult(containerManager.startBot(id));
-        if (start.success) steps.restarted.push(id);
-      }
+      const note = await undo();
       const fenceWarning = cleared === 'lifted' ? '' : '; the database may be READ-ONLY until its container restarts';
-      return { success: false, error: `Could not fence the database for the restore: ${fence.stderr.trim().split('\n').pop()}${fenceWarning}`, steps };
+      return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${fenceWarning}${note}`, steps };
     }
 
     // A refusal past the fence lifts it and brings back what was stopped; only then has it changed nothing.
     const refuse = async (refused: string, detail: string) => {
       const cleared = await liftAndTrack(botId, fleetDb);
       fenced = cleared !== 'lifted';
-      const unstarted: string[] = [];
-      for (const id of steps.stopped) {
-        const start = await asResult(containerManager.startBot(id));
-        if (start.success) steps.restarted.push(id);
-        else unstarted.push(containerManager.getBot(id)?.displayName || id);
-      }
-      const stoppedNote = unstarted.length > 0
-        ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)`
-        : '';
-      return { success: false, error: `${refused}${unstarted.length > 0 ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared)}${stoppedNote}`, steps };
+      const note = await undo();
+      return { success: false, error: `${refused}${note ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared)}${note}`, steps };
     };
 
     // 4. Pre-restore safety dump UNDER the fence, so it holds every write the
@@ -947,17 +1166,15 @@ export async function restoreFleetBackup(
     const exists = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
       '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
     if (!exists.ok) {
-      return await refuse('Could not check the database before the restore, so the restore was refused', exists.stderr.trim().split('\n').pop() || 'unknown reason');
+      return await refuse('Could not check the database before the restore, so the restore was refused', lastLine(exists.stderr));
     }
     // The app's control term must never move backwards: the witness fence
     // parks a master whose store term sits below a claim any node ever
     // posted, and only this lane knows the rewind is a deliberate restore
-    // rather than a stale fork (F-R5-1). Capture the live term, keep the
-    // highest value ever seen in the persisted floor (a retry after a failed
-    // restore probes a partial or missing database), and advance the restored
-    // copy to it after pg_restore. Tolerant on purpose: a database without
-    // the table simply skips the reconcile.
-    let liveTerm: number | null = readTermFloor(botId);
+    // rather than a stale fork (F-R5-1). The live term is kept on disk before
+    // the drop (a retry after a failed restore probes a missing or partial
+    // database), and the restored copy is advanced to it after pg_restore.
+    let floor: number | null = floorRead.term;
     if (exists.stdout.trim() !== '0') {
       const safety = await runFleetDump(instance, 'pre-restore-');
       if (!safety.success) {
@@ -966,13 +1183,30 @@ export async function restoreFleetBackup(
       }
       steps.preRestoreDump = safety.file || null;
 
-      const termProbe = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA',
-        '-c', 'SELECT max(term) FROM smdb_control.term']);
-      const parsed = Number.parseInt(termProbe.stdout.trim(), 10);
-      if (termProbe.ok && Number.isInteger(parsed) && (liveTerm === null || parsed > liveTerm)) {
-        liveTerm = parsed;
-        writeTermFloor(botId, parsed);
+      const live = await probeLiveTerm(fleetDb);
+      if (!live.ok) return await refuse('Could not read the control term before the restore, so the restore was refused', live.error);
+      if (live.term !== null && (floor === null || live.term > floor)) floor = live.term;
+    }
+    // A floor held only in memory (an earlier attempt could not write it) is written now too: past the drop, the
+    // probe of a missing or partial database cannot recover it after a manager restart.
+    if (floor !== null && (floorRead.disk === null || floor > floorRead.disk)) {
+      const kept = writeTermFloor(botId, floor);
+      if (kept) {
+        return await refuse(`The pre-restore control term ${floor} could not be kept on disk, so the restore was refused`,
+          `${kept}; free space under ${DATA_DIR} and retry (this manager holds the term in memory until it restarts)`);
       }
+    }
+
+    // The notice a manager restart mid-restore leaves standing; a finished restore replaces or clears it.
+    const back = steps.preRestoreDump ? `the pre-restore dump is ${steps.preRestoreDump}` : 'no pre-restore dump was taken, because the database was missing';
+    try {
+      containerManager.updateInstanceFleetRestoreError(botId, {
+        file,
+        text: `Restore of ${file} has not finished: if it is no longer running (the manager restarted), the database may be missing or hold a partial restore and its write fence is still on; restore a dump again before the bot relies on it (${back})`,
+      });
+      unsavedRestoreErrors.delete(botId);
+    } catch (err) {
+      return await refuse('The restore could not be recorded before the database was dropped, so the restore was refused', err instanceof Error ? err.message : String(err));
     }
 
     // 5. Drop and recreate the database under the fence. pg_restore --clean
@@ -988,15 +1222,9 @@ export async function restoreFleetBackup(
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
     if (!recreate.ok) {
-      setRestoreError(botId, file, `could not recreate the database: ${recreate.stderr.trim().split('\n').pop()}`, 'The database may be missing, or unchanged if the drop itself failed');
-      const cleared = await liftAndTrack(botId, fleetDb);
-      fenced = cleared !== 'lifted';
-      for (const id of steps.stopped) {
-        const start = await asResult(containerManager.startBot(id));
-        if (start.success) steps.restarted.push(id);
-      }
-      const clearWarning = cleared === 'lifted' ? '' : '; additionally the write fence could not be lifted live, so the cluster is READ-ONLY until its container restarts';
-      return { success: false, error: `Could not recreate the database for the restore: ${recreate.stderr.trim().split('\n').pop()}${clearWarning}`, steps };
+      const reason = `could not recreate the database: ${lastLine(recreate.stderr)}`;
+      setRestoreError(botId, file, reason, `The database may be missing, or unchanged if the drop itself failed; its write fence stays on (${back})`);
+      return { success: false, error: `Restore failed: ${keepFenced(reason)}`, steps };
     }
 
     // 6. pg_restore with the dump streamed to stdin. PGOPTIONS exempts this
@@ -1048,39 +1276,49 @@ export async function restoreFleetBackup(
       });
     });
 
-    let termWarning = '';
-    if (restore.success) {
-      steps.restored = true;
-      lastErrors.delete(botId);
-      unsavedRestoreErrors.delete(botId);
-      try {
-        containerManager.updateInstanceFleetRestoreError(botId, null);
-      } catch (err) {
-        console.error(`[FleetBackup] Could not clear the restore notice for ${botId}: ${err}`);
-      }
-      if (liveTerm !== null) {
-        // RETURNING-counted: a psql exit 0 with zero rows updated (a dump
-        // whose term table exists but is empty) must warn, not report success.
-        const bump = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
-          'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
-          '-c', `WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, ${liveTerm}) RETURNING 1) SELECT count(*) FROM u`]);
-        if (bump.ok && Number.parseInt(bump.stdout.trim(), 10) >= 1) {
-          steps.termReconciledTo = liveTerm;
-        } else {
-          termWarning = `; the restored control term could not be advanced to the pre-restore value (${liveTerm})${bump.ok ? ' - the restored dump has no control term row' : ''} - if the master parks on the witness fence, advance smdb_control.term by hand and restart it`;
-          console.error(`[FleetBackup] Term reconcile failed on ${fleetDb.containerName}: ${bump.ok ? 'no term row to advance' : bump.stderr.trim().split('\n').pop()}`);
-        }
-      }
-    } else {
-      setRestoreError(botId, file, restore.error || 'unknown error', 'The database may hold a partial restore');
-    }
-
-    // 7. On a failed restore, terminate any surviving session BEFORE lifting:
-    // a timed-out pg_restore's server-side process is fence-exempt, and left
-    // alive it would keep writing into the unfenced database.
     if (!restore.success) {
+      // 7. Terminate any surviving session before returning: a timed-out
+      // pg_restore's server-side process is fence-exempt, and left alive it
+      // would keep writing into the database.
       await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA',
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+      const reason = restore.error || 'unknown error';
+      setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`);
+      return { success: false, error: `Restore failed: ${keepFenced(reason)}`, steps };
+    }
+    steps.restored = true;
+
+    let termWarning = '';
+    if (floor !== null) {
+      // RETURNING-counted: a psql exit 0 with zero rows updated (a dump
+      // whose term table exists but is empty) must warn, not report success.
+      const bump = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+        'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+        '-c', `WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, ${floor}) RETURNING 1) SELECT count(*) FROM u`]);
+      if (bump.ok && Number.parseInt(bump.stdout.trim(), 10) >= 1) {
+        steps.termReconciledTo = floor;
+      } else {
+        termWarning = `; the restored control term could not be advanced to the pre-restore value (${floor})${bump.ok ? ' - the restored dump has no control term row' : ''} - if the master parks on the witness fence, advance smdb_control.term by hand and restart it`;
+        console.error(`[FleetBackup] Term reconcile failed on ${fleetDb.containerName}: ${bump.ok ? 'no term row to advance' : lastLine(bump.stderr)}`);
+      }
+      const raised = await raiseGuildTerms(fleetDb, floor);
+      if (!raised.ok) {
+        const reason = `the restored guild leases could not be raised above the pre-restore term ${floor} (${raised.error})`;
+        setRestoreError(botId, file, reason, `A node still holding a pre-restore lease could write over the restored rows, so the write fence stays on (${back})`);
+        return { success: false, error: `The dump was restored, but ${keepFenced(reason)}`, steps };
+      }
+      steps.guildsRaised = raised.guilds;
+      steps.leaseTerm = floor + 1;
+    }
+
+    lastErrors.delete(botId);
+    unsavedRestoreErrors.delete(botId);
+    let noticeWarning = '';
+    try {
+      containerManager.updateInstanceFleetRestoreError(botId, null);
+    } catch (err) {
+      console.error(`[FleetBackup] Could not clear the restore notice for ${botId}: ${err}`);
+      noticeWarning = '; the notice that this restore had not finished could not be cleared (dismiss it on the Database modal)';
     }
 
     // 8. Lift the fence BEFORE the restarts, so instances come back to a
@@ -1093,22 +1331,28 @@ export async function restoreFleetBackup(
         ? 'live lift failed; auto.conf stripped, the database stays read-only until its container restarts'
         : 'could not be lifted or stripped'}`);
     }
-    const liftWarning = lift === 'lifted' ? '' : '; additionally the write fence could not be lifted live, so the database is READ-ONLY until its container restarts';
 
-    // 9. Restart the instances stopped in step 2
+    // 9. Restart the instances stopped in step 1
+    release();
+    const unstarted: string[] = [];
     for (const id of steps.stopped) {
       const start = await asResult(containerManager.startBot(id));
       if (start.success) steps.restarted.push(id);
-      else console.error(`[FleetBackup] Failed to restart ${id} after restore: ${start.error}`);
+      else {
+        unstarted.push(nameOf(id));
+        console.error(`[FleetBackup] Failed to restart ${id} after restore: ${start.error}`);
+      }
     }
+    const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';
 
-    if (!restore.success) return { success: false, error: `${restore.error}${liftWarning}`, steps };
-    if (lift !== 'lifted') return { success: false, error: `Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)${termWarning}`, steps };
-    return { success: true, ...(termWarning ? { warning: termWarning.slice(2) } : {}), steps };
+    if (lift !== 'lifted') return { success: false, error: `Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
+    const warning = `${termWarning}${noticeWarning}${startWarning}`;
+    return { success: true, ...(warning ? { warning: warning.slice(2) } : {}), steps };
   } finally {
     // The leftover-lift attempt must finish before the busy gate opens, or a
     // retry's fresh fence could be dissolved by this stale lift mid-restore.
     if (fenced) await liftAndTrack(botId, fleetDb);
+    release();
     busy.delete(botId);
   }
 }

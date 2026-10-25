@@ -24,7 +24,7 @@ import * as containerManager from '../docker/containerManager';
 import { generateCertPair } from './fleetReplication';
 import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
-import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT } from './recoveryControl';
+import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT, releaseQuiesceSlot } from './recoveryControl';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { childFailureText, redactSecrets } from '../config/secretText';
@@ -435,6 +435,7 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       }
     }
     containerManager.updateInstanceRecoveryChannel(instance.id, null);
+    if (record.mode === 'source') releaseQuiesceSlot(instance.id);
     return { success: true };
   } finally {
     arming.delete(instance.id);

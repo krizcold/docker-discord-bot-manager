@@ -275,6 +275,8 @@ export interface RecoveryRescueRecord {
   swapPublicHost?: string;
   /** Flip: 'start' once the copy is filed as the primary (the fleet may start), 'role' once the fleet started and the app is being returned to its configured role. */
   flipStep?: 'start' | 'role';
+  /** Swap (RC-4): the highest term the source's database held at quiesce (control row and guild leases); null when it had neither table. The flip raises the copy above it. */
+  swapSourceTerm?: number | null;
 }
 
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults
@@ -330,6 +332,7 @@ export interface InstanceConfig {
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   recoveryLastSwap?: { startedAt: number; completedAt: number }; // set by the swap's flip alone, startedAt from its rescue record
+  recoverySwappedAway?: { at: number };  // source side: a swap's quiesce handed this database away; Start and Update refuse until the operator clears it
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

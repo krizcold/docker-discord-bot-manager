@@ -1090,7 +1090,7 @@ export function reseedStalePrimary(
   // start (a registry write failing) would otherwise hold the slot until the
   // manager restarts.
   if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
-    return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+    return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
   }
   let started: { success: boolean; error?: string };
   try {
@@ -1164,7 +1164,7 @@ export async function decommissionFleetDb(
         return { success: false, error: `Containers of this instance are still running (${liveContainers.join(', ')}) - stop it fully first` };
       }
       if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
-        return { success: false, error: 'A backup or restore operation is in progress on this database - wait for it to finish' };
+        return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
       }
       try {
         // A volume PROVEN absent has nothing to protect, and starting the

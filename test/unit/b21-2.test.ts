@@ -38,6 +38,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   getAllBots: () => st.bots,
   getBot: (id: string) => st.bots.find(b => b.id === id) ?? null,
   readDeployedCompose: () => 'compose',
+  runningNonSidecarContainers: async () => [],
   updateInstanceRecoveryRescue: (id: string, rec: any) => {
     const b = st.bots.find(x => x.id === id);
     if (b) b.recoveryRescue = rec ?? undefined;

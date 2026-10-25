@@ -22,7 +22,8 @@ import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
-import { foreignFenceSet } from './fleetBackup';
+import { foreignFenceSet, claimFleetBackupBusy, releaseFleetBackupBusy, probeLiveTerm } from './fleetBackup';
+import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 
@@ -158,6 +159,13 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
 
 // ─── The control server ───
 
+// Sources whose quiesce holds the backup slot: from the first quiesce until the teardown or a disarm.
+const quiesceSlots = new Set<string>();
+
+export function releaseQuiesceSlot(botId: string): void {
+  if (quiesceSlots.delete(botId)) releaseFleetBackupBusy(botId);
+}
+
 let server: http.Server | null = null;
 
 function tokenOk(instance: InstanceConfig, offered: string): boolean {
@@ -165,6 +173,86 @@ function tokenOk(instance: InstanceConfig, offered: string): boolean {
   const a = Buffer.from(String(offered || ''));
   const b = Buffer.from(expected);
   return expected.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+type QuiesceAnswer = { code: number; body: Record<string, unknown>; changed: boolean };
+
+/**
+ * Swap phase 1 (RC-4), run under the op lock: stop the SOURCE BOT so nothing writes anymore, but bring the database
+ * straight back up alone - it keeps serving the tunnel until the receiver has replayed everything and promoted.
+ * Container truth throughout: whether the app runs comes from docker, not the status record (a crashed or
+ * hand-started app), the stop is verified against live containers, leftovers are stopped by their exact names
+ * (label-scoped listing, never name filters), and quiesce refuses while anything survives. The sender is recorded
+ * as swapped away before anything stops, so a later Start refuses. Idempotent: a re-entry finds everything down and
+ * re-captures the LSN and the term. changed: false when it refused before anything was stopped or recorded.
+ */
+async function quiesce(instance: InstanceConfig): Promise<QuiesceAnswer> {
+  const fleetDb = instance.fleetDb!;
+  const live = await containerManager.runningNonSidecarContainers(instance.id);
+  if (live === null) return { code: 500, body: { success: false, error: 'could not tell whether the source instance is running, so nothing was stopped' }, changed: false };
+  if (live.length > 0 && hasAppHooks(instance)) {
+    // The source app would return as whatever its own files say (a master override from its promote); the swap is
+    // moving the primary away, so it must return to its configured role and store before it stops. No restart: the
+    // stop follows.
+    const reset = await appLifecycle.resetRole(instance, false);
+    if (!reset.success) {
+      return { code: 500, body: { success: false, error: `the source app did not confirm its return to its configured role (${reset.error}); nothing was stopped, and the quiesce can be retried` }, changed: false };
+    }
+    if (reset.formsCleared === false) console.log(`[RecoveryControl] The source app on ${instance.displayName} cleared its role override and kept its persisted store forms (its environment pins no database URL); the next delivery replaces them`);
+  }
+  const fresh = containerManager.getBot(instance.id);
+  if (!fresh?.recoverySwappedAway) {
+    try {
+      containerManager.updateInstanceRecoverySwappedAway(instance.id, { at: Date.now() });
+    } catch (err) {
+      return { code: 500, body: { success: false, error: `the swap could not be recorded on the source (${err instanceof Error ? err.message : String(err)}), so nothing was stopped` }, changed: false };
+    }
+  }
+  if (live.length > 0) {
+    const stopped = await containerManager.stopBotInOp(instance.id, 'quiesce');
+    if (!stopped.success && stopped.error !== 'Bot is not running') {
+      return { code: 500, body: { success: false, error: `could not stop the source instance: ${stopped.error}` }, changed: true };
+    }
+  }
+  let leftovers = await containerManager.runningNonSidecarContainers(instance.id);
+  if (leftovers === null) return { code: 500, body: { success: false, error: 'could not verify the source containers stopped' }, changed: true };
+  if (leftovers.length > 0) {
+    for (const name of leftovers) await docker(['stop', name]);
+    leftovers = await containerManager.runningNonSidecarContainers(instance.id);
+    if (leftovers === null || leftovers.length > 0) {
+      return { code: 500, body: { success: false, error: `source containers still running after the stop: ${(leftovers || ['unverifiable']).join(', ')}` }, changed: true };
+    }
+  }
+  const up = await containerManager.startFleetDbSidecar(instance.id);
+  if (!up.success) return { code: 500, body: { success: false, error: `the source database did not come back up alone: ${up.error}` }, changed: true };
+  // Fence the DATABASE, not just this machine: fleet workers on other
+  // hosts write here directly through the published port, and a commit
+  // landing after the LSN capture would be silently discarded at promote.
+  // Read-only default (sighup applies it to every session's next
+  // transaction) plus a terminate sweep turns those writes into loud
+  // refusals; replication is untouched. Disarm resets it. The leading
+  // READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
+  // SYSTEM in read-only transactions.
+  // ON_ERROR_STOP: with a -c sequence psql otherwise keeps going and
+  // reports only the LAST command, so a failed ALTER SYSTEM under a
+  // succeeding terminate would read as a successful fence.
+  const fence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
+    '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
+    '-c', 'SELECT pg_reload_conf()',
+    '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+  if (!fence.ok) return { code: 500, body: { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}` }, changed: true };
+  foreignFenceSet(instance.id, fleetDb.containerName);
+  const lsn = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_current_wal_lsn()']);
+  const sourceLsn = lsn.ok ? lsn.stdout.trim() : '';
+  if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(sourceLsn)) {
+    return { code: 500, body: { success: false, error: `could not capture the source end-of-WAL: ${lsn.stderr.trim().split('\n').pop() || 'empty output'}` }, changed: true };
+  }
+  // The receiver floors the promoted copy's terms above this one, so no lease token the source's fleet holds
+  // outranks the copy.
+  const term = await probeLiveTerm(fleetDb);
+  if (!term.ok) return { code: 500, body: { success: false, error: `could not read the source's control term: ${term.error}` }, changed: true };
+  return { code: 200, body: { success: true, sourceLsn, sourceTerm: term.term }, changed: true };
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -271,67 +359,29 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     if (action === 'quiesce') {
-      // Swap phase 1 (RC-4): stop the SOURCE BOT so nothing writes anymore,
-      // but bring the database straight back up alone - it keeps serving the
-      // tunnel until the receiver has replayed everything and promoted.
-      // Container truth throughout: stopBot marks 'stopped' even when its
-      // compose down fails, and a stale registry status would skip the stop
-      // with the bot still writing - either way the captured LSN would fence
-      // nothing. So the stop is verified against live containers, leftovers
-      // are stopped by their exact names (label-scoped listing, never name
-      // filters), and quiesce refuses while anything survives. Idempotent:
-      // a re-entry finds everything down and just re-captures the LSN.
-      if (containerManager.getBot(instance.id)?.status === 'running') {
-        // The source app would return as whatever its own files say (a master
-        // override from its promote); the swap is moving the primary away, so
-        // it is told to return to its configured role and store first. No
-        // restart: the stop follows.
-        const reset = await appLifecycle.resetRole(instance, false);
-        if (!reset.success) console.warn(`[RecoveryControl] The source app did not return to its configured role before the quiesce on ${instance.displayName}: ${reset.error}; demote it after the handback`);
-        else if (reset.formsCleared === false) console.log(`[RecoveryControl] The source app on ${instance.displayName} cleared its role override and kept its persisted store forms (its environment pins no database URL); the next delivery replaces them`);
-        const stopped = await containerManager.stopBot(instance.id);
-        if (!stopped.success && stopped.error !== 'Bot is not running') {
-          send(500, { success: false, error: `could not stop the source instance: ${stopped.error}` });
-          return;
-        }
-      }
-      let leftovers = await containerManager.runningNonSidecarContainers(instance.id);
-      if (leftovers === null) { send(500, { success: false, error: 'could not verify the source containers stopped' }); return; }
-      if (leftovers.length > 0) {
-        for (const name of leftovers) await docker(['stop', name]);
-        leftovers = await containerManager.runningNonSidecarContainers(instance.id);
-        if (leftovers === null || leftovers.length > 0) {
-          send(500, { success: false, error: `source containers still running after the stop: ${(leftovers || ['unverifiable']).join(', ')}` });
-          return;
-        }
-      }
-      const up = await containerManager.startFleetDbSidecar(instance.id);
-      if (!up.success) { send(500, { success: false, error: `the source database did not come back up alone: ${up.error}` }); return; }
-      // Fence the DATABASE, not just this machine: fleet workers on other
-      // hosts write here directly through the published port, and a commit
-      // landing after the LSN capture would be silently discarded at promote.
-      // Read-only default (sighup applies it to every session's next
-      // transaction) plus a terminate sweep turns those writes into loud
-      // refusals; replication is untouched. Disarm resets it. The leading
-      // READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
-      // SYSTEM in read-only transactions.
-      // ON_ERROR_STOP: with a -c sequence psql otherwise keeps going and
-      // reports only the LAST command, so a failed ALTER SYSTEM under a
-      // succeeding terminate would read as a successful fence.
-      const fence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
-        '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
-        '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
-        '-c', 'SELECT pg_reload_conf()',
-        '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
-      if (!fence.ok) { send(500, { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}` }); return; }
-      foreignFenceSet(instance.id, fleetDb.containerName);
-      const lsn = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_current_wal_lsn()']);
-      const sourceLsn = lsn.ok ? lsn.stdout.trim() : '';
-      if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(sourceLsn)) {
-        send(500, { success: false, error: `could not capture the source end-of-WAL: ${lsn.stderr.trim().split('\n').pop() || 'empty output'}` });
+      if (containerManager.isShuttingDown()) {
+        send(503, { success: false, error: containerManager.SHUTDOWN_REFUSAL });
         return;
       }
-      send(200, { success: true, sourceLsn });
+      // The quiesce holds the backup slot until the teardown, so no dump, restore or replication change runs on the
+      // database being handed away, and runs under the op lock, so no Start, Update or restore races it.
+      const claimedNow = !quiesceSlots.has(instance.id);
+      if (claimedNow) {
+        if (!claimFleetBackupBusy(instance.id)) {
+          send(409, { success: false, error: 'a database dump, restore or replication change is running on the source; the quiesce was refused and nothing was stopped' });
+          return;
+        }
+        quiesceSlots.add(instance.id);
+      }
+      let answer: QuiesceAnswer;
+      try {
+        answer = await containerManager.withExternalBotOp(instance.id, 'quiesce', () => quiesce(instance));
+      } catch (err) {
+        answer = { code: 409, body: { success: false, error: `${err instanceof Error ? err.message : String(err)}; the quiesce was refused and nothing was stopped` }, changed: false };
+      }
+      // A re-entry after an earlier quiesce stopped the source keeps the slot whatever this call answers.
+      if (claimedNow && !answer.changed) releaseQuiesceSlot(instance.id);
+      send(answer.code, answer.body);
       return;
     }
     if (action === 'teardown') {
@@ -341,6 +391,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // operator's button would (helpers removed, slot dropped, record
       // cleared). Best effort by design: if it fails, the source operator
       // disarms manually during the handback visit.
+      releaseQuiesceSlot(instance.id);
       send(200, { success: true });
       setTimeout(() => {
         void (async () => {
@@ -359,6 +410,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     send(500, { success: false, error: err instanceof Error ? err.message : String(err) });
   }
 }
+
+export { handle as handleRecoveryControl };
 
 /** Idempotent; called at arm time and boot. The server is harmless while no source record exists (every route re-checks the record + token). */
 export function startRecoveryControlServer(): void {

@@ -14,6 +14,7 @@ const h = vi.hoisted(() => {
     running: 'true' as 'true' | 'false' | 'error',
     probeOk: true,
     onRm: null as null | ((name: string) => void),
+    onPull: null as null | (() => void),
     apply: { success: true } as { success: boolean; error?: string },
     applied: 0,
     marked: [] as string[],
@@ -22,6 +23,7 @@ const h = vi.hoisted(() => {
     promote: null as null | (() => Promise<unknown>),
     removeGate: null as null | Promise<void>,
     removing: false,
+    volume: 'absent' as 'absent' | 'exists',
   };
 });
 
@@ -38,6 +40,7 @@ vi.mock('child_process', async (importOriginal) => {
       if (h.running === 'error') return done(new Error('daemon'), '', 'Cannot connect to the Docker daemon');
       return done(null, `${h.running}\n`, '');
     }
+    if (args[0] === 'pull') h.onPull?.();
     if (args[0] === 'exec') return done(null, 't|streaming|t|0\n', '');
     if (args[0] === 'rm') { h.rms.push(args[2]); h.onRm?.(args[2]); return done(null, '', ''); }
     if (args[0] === 'volume' && args[1] === 'inspect') return done(new Error('fail'), '', 'Error: No such volume');
@@ -62,7 +65,15 @@ vi.mock('child_process', async (importOriginal) => {
     }, 1);
     return child;
   };
-  return { ...real, execFile, exec, spawn, default: { ...real, execFile, exec, spawn } };
+  // dockerClient.volumeState runs the CLI synchronously; without this a row answers whatever the test machine's docker says.
+  const execFileSync = (cmd: string, args: string[], opts: any) => {
+    if (args[0] === 'volume' && args[1] === 'inspect') {
+      if (h.volume === 'exists') return '[]';
+      throw Object.assign(new Error('fail'), { stderr: 'Error: No such volume' });
+    }
+    return real.execFileSync(cmd, args, opts);
+  };
+  return { ...real, execFile, execFileSync, exec, spawn, default: { ...real, execFile, execFileSync, exec, spawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),
@@ -145,6 +156,7 @@ beforeEach(async () => {
   h.running = 'true';
   h.probeOk = true;
   h.onRm = null;
+  h.onPull = null;
   h.apply = { success: true };
   h.applied = 0;
   h.marked.length = 0;
@@ -153,6 +165,7 @@ beforeEach(async () => {
   h.promote = null;
   h.removeGate = null;
   h.removing = false;
+  h.volume = 'absent';
   writeRegistry();
 });
 
@@ -395,23 +408,54 @@ describe('T-FDBVOLw: a seed never clears a volume another instance declares', ()
     b2: { id: 'b2', sanitizedName: 'bot2', displayName: 'Bot 2', titleName: 'Bot 2', status: 'stopped', sourceType: 'git', sourceUrl: 'https://example.invalid/other', createdAt: 'x', updatedAt: 'x', ...extra },
   });
 
-  it('refuses, naming the other instance, and leaves the volume alone', async () => {
-    writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
-    const res = provisionFleetReplica(bot(), 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', PEM, 'standby.invalid', 5440, true);
-    expect(res).toMatchObject({ success: true });
-    await waitFor(() => !bot().fleetDbReplicaSeed || bot().fleetDbReplicaSeed?.parked === true);
-    expect(bot().fleetDbReplicaSeed?.lastError).toContain('Bot 2');
-    expect(bot().fleetDbReplicaSeed?.committed).toBeUndefined();
+  const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
+  const refusedAtRequest = async (res: any, text: string): Promise<void> => {
+    expect(res.success).toBe(false);
+    expect(res.needsConfirm).toBeUndefined();
+    expect(res.error).toContain(text);
+    expect(res.error).toContain('nothing was started');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(bot().fleetDbReplicaSeed).toBeUndefined();
+    expect(h.spawns.length).toBe(0);
     expect(wiped()).toBe(false);
+  };
+
+  it('refuses at the request, naming the other instance, and leaves the volume alone', async () => {
+    h.volume = 'exists';
+    writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
+    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), 'Bot 2');
   });
 
-  it("refuses with can't confirm when another instance's compose cannot be read", async () => {
+  it("refuses at the request with can't confirm when another instance's compose cannot be read", async () => {
+    h.volume = 'exists';
     writeRegistry({}, b2({}));
     fs.mkdirSync(path.join(h.dir, 'bots', 'b2', 'docker-compose.yml'), { recursive: true });
-    const res = provisionFleetReplica(bot(), 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', PEM, 'standby.invalid', 5440, true);
-    expect(res).toMatchObject({ success: true });
-    await waitFor(() => !bot().fleetDbReplicaSeed || bot().fleetDbReplicaSeed?.parked === true);
-    expect(bot().fleetDbReplicaSeed?.lastError).toContain("can't confirm");
+    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), "can't confirm");
+  });
+
+  it('a confirm naming the volume does not override the refusal', async () => {
+    h.volume = 'exists';
+    writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
+    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true, { confirmVolume: REPLICA.volume }), 'Bot 2');
+  });
+
+  it('refuses at the request even when the volume is absent', async () => {
+    writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
+    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), 'Bot 2');
+  });
+
+  it('stops the running seed before the wipe when another instance comes to declare the volume', async () => {
+    h.onPull = () => {
+      const file = path.join(h.dir, 'instances.json');
+      const reg = JSON.parse(fs.readFileSync(file, 'utf8'));
+      Object.assign(reg.instances, b2({ projectVolumes: [REPLICA.volume] }));
+      fs.writeFileSync(file, JSON.stringify(reg));
+    };
+    const res = await provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    expect(res.success).toBe(true);
+    await waitFor(() => bot().fleetDbReplicaSeed?.parked === true);
+    expect(bot().fleetDbReplicaSeed?.lastError).toContain('Bot 2');
+    expect(bot().fleetDbReplicaSeed?.committed).toBeUndefined();
     expect(wiped()).toBe(false);
   });
 });

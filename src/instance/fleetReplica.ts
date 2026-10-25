@@ -831,8 +831,10 @@ function keptVolumeQuestion(instance: InstanceConfig, volume: string): string {
   return `The replica volume ${volume} already exists, and provisioning clears everything in it for good. ${held}`;
 }
 
-/** The volume a first provision may clear: proven absent, or the one the operator's confirm named. */
+/** The volume a first provision may clear: used by no other instance, and proven absent or the one the operator's confirm named. */
 function provisionVolumeRefusal(instance: InstanceConfig, volume: string, confirmVolume: string | undefined): { error: string; needsConfirm?: true; confirmVolume?: string } | null {
+  const shared = containerManager.sharedVolumeReason(volume, instance.id);
+  if (shared) return { error: `Provisioning would clear the replica volume ${volume}, and ${shared}; nothing was started` };
   const state = dockerClient.volumeState(volume);
   if (state === 'absent') return null;
   if (state === 'unknown') return { error: `Docker did not say whether the replica volume ${volume} exists, so the manager can't confirm provisioning would clear nothing; nothing was started, try again` };

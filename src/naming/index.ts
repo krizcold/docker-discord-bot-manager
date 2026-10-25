@@ -10,6 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { InstanceConfig, ResolvedNames, RESERVED_NAMES } from '../types';
+import { storeFileState } from '../config/storeFile';
 
 /**
  * Derive sanitized name from display name.
@@ -83,27 +84,58 @@ function appDataDisplayPath(sanitized: string): string {
   return `${(process.env.DATA_ROOT || '/DATA').replace(/\\/g, '/').replace(/\/+$/, '')}/AppData/${sanitized}/`;
 }
 
+type KeptFolder =
+  | { kind: 'none' }
+  | { kind: 'unchecked'; error: string }
+  | { kind: 'unmarked' }
+  | { kind: 'unreadable'; error: string }
+  | { kind: 'marked'; marker: any };
+
 /**
- * Check if /DATA/AppData/{sanitized} exists and is NOT managed by Bot Manager.
- * Uses the .botmanager marker file inside the AppData folder itself,
- * which survives even if Bot Manager is fully wiped and reinstalled.
+ * What /DATA/AppData/{sanitized} holds for a name no instance owns. The
+ * .botmanager marker inside it survives a full Bot Manager wipe; a marker
+ * that cannot be read or names no instance is reported, never taken as a
+ * Bot Manager folder.
+ */
+function keptFolder(sanitized: string, existingInstances: InstanceConfig[]): KeptFolder {
+  if (existingInstances.some(inst => inst.sanitizedName === sanitized)) return { kind: 'none' };
+  const appDataPath = path.join(process.env.DATA_ROOT || '/DATA', 'AppData', sanitized);
+  try {
+    fs.lstatSync(appDataPath);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return { kind: 'none' };
+    return { kind: 'unchecked', error: error?.code || error?.message || String(error) };
+  }
+
+  const markerPath = path.join(appDataPath, '.botmanager');
+  const state = storeFileState(markerPath);
+  if (state.kind === 'absent') return { kind: 'unmarked' };
+  if (state.kind === 'broken') return { kind: 'unreadable', error: state.error };
+  let text: string;
+  try {
+    text = fs.readFileSync(markerPath, 'utf-8');
+  } catch (error: any) {
+    return { kind: 'unreadable', error: `.botmanager cannot be read (${error?.code || error?.message || error})` };
+  }
+  let marker: any;
+  try {
+    marker = JSON.parse(text);
+  } catch (error: any) {
+    return { kind: 'unreadable', error: `.botmanager cannot be parsed (${error?.message || error})` };
+  }
+  if (!marker || typeof marker !== 'object' || Array.isArray(marker) || typeof marker.instanceId !== 'string' || !marker.instanceId) {
+    return { kind: 'unreadable', error: '.botmanager names no instance' };
+  }
+  return { kind: 'marked', marker };
+}
+
+/**
+ * Check if /DATA/AppData/{sanitized} exists and is NOT a readable Bot Manager
+ * folder: no marker, a marker that cannot be read, or a folder that cannot be checked.
  */
 export function isAppDataOccupied(sanitized: string, existingInstances: InstanceConfig[]): boolean {
-  const dataRoot = process.env.DATA_ROOT || '/DATA';
-  const appDataPath = path.join(dataRoot, 'AppData', sanitized);
-
-  if (!fs.existsSync(appDataPath)) return false;
-
-  // If any existing instance owns this sanitized name, it's tracked (not occupied)
-  const tracked = existingInstances.some(inst => inst.sanitizedName === sanitized);
-  if (tracked) return false;
-
-  // Check for .botmanager marker: if present, this is a Bot Manager folder (allow reuse)
-  const markerPath = path.join(appDataPath, '.botmanager');
-  if (fs.existsSync(markerPath)) return false;
-
-  // Genuinely unknown/external folder: block
-  return true;
+  const kept = keptFolder(sanitized, existingInstances);
+  return kept.kind !== 'none' && kept.kind !== 'marked';
 }
 
 /**
@@ -148,23 +180,20 @@ export function validateName(
     errors.push(`Title name "${titleName}" is already in use`);
   }
 
-  // AppData occupation check
-  if (isAppDataOccupied(sanitizedName, existingInstances)) {
+  const kept = keptFolder(sanitizedName, existingInstances);
+  if (kept.kind === 'unchecked') {
+    errors.push(`${appDataDisplayPath(sanitizedName)} cannot be checked (${kept.error}), so whether it holds another bot's data is unknown`);
+  } else if (kept.kind === 'unreadable') {
+    errors.push(`${appDataDisplayPath(sanitizedName)}: ${kept.error}, so whose data the folder holds is unknown`);
+  } else if (kept.kind === 'unmarked') {
     errors.push(`/DATA/AppData/${sanitizedName}/ exists and is not managed by Bot Manager`);
+  } else if (kept.kind === 'marked' && checks.source && !sameSource(kept.marker, checks.source)) {
+    errors.push(`${appDataDisplayPath(sanitizedName)} holds data kept from ${describeSource(kept.marker)}; this install is from ${describeSource(checks.source)}`);
   }
 
   const foreign = checks.foreignProjects?.get(sanitizedName);
   if (foreign) {
     errors.push(`a docker project named "${sanitizedName}" already exists on this host (containers: ${foreign.join(', ')}); pick another name`);
-  }
-
-  if (checks.source) {
-    const reuse = checkFolderReuse(sanitizedName, existingInstances, checks.source);
-    if (reuse.markerUnreadable) {
-      errors.push(`${appDataDisplayPath(sanitizedName)}.botmanager cannot be read, so whose data that folder holds cannot be checked`);
-    } else if (reuse.sourceMatches === false) {
-      errors.push(`${appDataDisplayPath(sanitizedName)} holds data kept from ${reuse.keptSource}; this install is from ${describeSource(checks.source)}`);
-    }
   }
 
   return { valid: errors.length === 0, errors };
@@ -214,31 +243,17 @@ export function checkFolderReuse(sanitizedName: string, existingInstances: Insta
   keptSource: string | null;
   sourceMatches: boolean | null;
 } {
-  const none = { reuseAvailable: false, marker: null, markerUnreadable: false, keptSource: null, sourceMatches: null };
-  const dataRoot = process.env.DATA_ROOT || '/DATA';
-  const appDataPath = path.join(dataRoot, 'AppData', sanitizedName);
-
-  if (!fs.existsSync(appDataPath)) return none;
-  if (existingInstances.some(i => i.sanitizedName === sanitizedName)) return none;
-
-  const markerPath = path.join(appDataPath, '.botmanager');
-  if (!fs.existsSync(markerPath)) {
-    return { reuseAvailable: true, marker: null, markerUnreadable: false, keptSource: null, sourceMatches: null };
-  }
-  let marker: any;
-  try {
-    marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
-  } catch {
-    marker = null;
-  }
-  if (!marker || typeof marker !== 'object') {
-    return { reuseAvailable: true, marker: null, markerUnreadable: true, keptSource: null, sourceMatches: null };
-  }
+  const kept = keptFolder(sanitizedName, existingInstances);
+  const unknown = { marker: null, keptSource: null, sourceMatches: null };
+  if (kept.kind === 'none') return { reuseAvailable: false, markerUnreadable: false, ...unknown };
+  if (kept.kind === 'unchecked') return { reuseAvailable: false, markerUnreadable: true, ...unknown };
+  if (kept.kind === 'unmarked') return { reuseAvailable: true, markerUnreadable: false, ...unknown };
+  if (kept.kind === 'unreadable') return { reuseAvailable: true, markerUnreadable: true, ...unknown };
   return {
     reuseAvailable: true,
-    marker,
+    marker: kept.marker,
     markerUnreadable: false,
-    keptSource: describeSource(marker),
-    sourceMatches: source ? sameSource(marker, source) : null,
+    keptSource: describeSource(kept.marker),
+    sourceMatches: source ? sameSource(kept.marker, source) : null,
   };
 }

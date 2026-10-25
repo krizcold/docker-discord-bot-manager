@@ -668,6 +668,12 @@ interface ValidatedIntake {
   port: number;
 }
 
+/** A port collision cannot be ruled out while the registry, the only list of ports in use here, cannot be read. */
+function portUnconfirmed(port: number): string | null {
+  const fault = containerManager.registryFault();
+  return fault ? `Host port ${port} cannot be confirmed free, so nothing was changed: ${fault}` : null;
+}
+
 /** Shape checks shared by both intake paths, so the two cannot drift apart. */
 function validateIntake(
   primaryDsn: string,
@@ -872,6 +878,8 @@ export function provisionFleetReplica(
   const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
   if (!validated.ok) return { success: false, error: validated.error };
   const { dsn: parsedDsn, port } = validated.intake;
+  const registryUnread = portUnconfirmed(port);
+  if (registryUnread) return { success: false, error: registryUnread };
   const collision = containerManager.getAllBots().find(other =>
     other.fleetDb?.replication?.hostPort === port
     || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port)
@@ -1555,6 +1563,8 @@ export function reseedStalePrimary(
   const validated = validateIntake(primaryDsn, certPem, publicHost, hostPort);
   if (!validated.ok) return { success: false, error: validated.error };
   const { dsn: parsedDsn, port } = validated.intake;
+  const registryUnread = portUnconfirmed(port);
+  if (registryUnread) return { success: false, error: registryUnread };
   // This instance's own primary record is exempt: its port frees up the moment
   // the retire below runs, and reusing it is the normal outcome.
   const collision = containerManager.getAllBots().find(other =>

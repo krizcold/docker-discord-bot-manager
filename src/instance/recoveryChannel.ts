@@ -210,6 +210,8 @@ async function armReceiverImpl(
   }
   const port = tunnelPort ?? DEFAULT_TUNNEL_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { success: false, error: 'Invalid port' };
+  const fault = containerManager.registryFault();
+  if (fault) return { success: false, error: `Host port ${port} cannot be confirmed free, so nothing was changed: ${fault}` };
   const collision = containerManager.getAllBots().find(other =>
     other.fleetDb?.replication?.hostPort === port
     || other.fleetDbReplica?.hostPort === port
@@ -284,6 +286,8 @@ async function armSourceImpl(
   if (!token) return { success: false, error: 'Channel token is missing' };
   // Directional guard, manager side: sending TO your own published receiver
   // would loop the channel onto this machine.
+  const fault = containerManager.registryFault();
+  if (fault) return { success: false, error: `Whether that receiver is on this machine cannot be confirmed, so nothing was changed: ${fault}` };
   const samehost = containerManager.getAllBots().find(other =>
     other.recoveryChannel?.mode === 'receiver' && other.recoveryChannel.publicHost === host && other.recoveryChannel.tunnelPort === port);
   if (samehost) {

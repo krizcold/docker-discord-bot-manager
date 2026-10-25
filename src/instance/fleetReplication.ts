@@ -30,7 +30,7 @@ import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
-import * as fleetBackup from './fleetBackup';
+import * as fleetBackupGuards from './fleetBackupGuards';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -126,10 +126,10 @@ function psql(containerName: string, user: string, db: string, sql: string): Pro
 
 /** Why pg_hba.conf must not be rewritten now: a lane's write fence stands in it, or that could not be read. Null when it may be. */
 export async function fenceLinesRefusal(containerName: string, user: string, db: string): Promise<string | null> {
-  const read = await psql(containerName, user, db, fleetBackup.FENCE_HBA_COUNT_SQL);
+  const read = await psql(containerName, user, db, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
   const count = read.ok ? read.stdout.trim() : '';
   if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
-  return Number(count) > 0 ? `a write fence stands in pg_hba.conf (lines ending in ${fleetBackup.WRITE_FENCE_MARK}), and the lane that set it lifts it when it finishes` : null;
+  return Number(count) > 0 ? `a write fence stands in pg_hba.conf (lines ending in ${fleetBackupGuards.WRITE_FENCE_MARK}), and the lane that set it lifts it when it finishes` : null;
 }
 
 /** SQL on stdin, for a statement that must stay out of every command line. */
@@ -281,7 +281,7 @@ type EnableResult = { success: boolean; error?: string; restartRequired?: boolea
  * beside it.
  */
 async function inReplicationLane<T extends { success: boolean; error?: string }>(botId: string, action: string, fn: () => Promise<T>): Promise<T | { success: false; error: string }> {
-  if (!fleetBackup.claimFleetBackupBusy(botId)) {
+  if (!fleetBackupGuards.claimFleetBackupBusy(botId)) {
     return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : `A backup, restore or standby re-seed is running on this instance; ${action} is refused until it finishes (nothing was changed)` };
   }
   let entered = false;
@@ -291,7 +291,7 @@ async function inReplicationLane<T extends { success: boolean; error?: string }>
     if (entered) throw err;
     return { success: false, error: `${err instanceof Error ? err.message : String(err)}; ${action} is refused until it finishes (nothing was changed)` };
   } finally {
-    fleetBackup.releaseFleetBackupBusy(botId);
+    fleetBackupGuards.releaseFleetBackupBusy(botId);
   }
 }
 

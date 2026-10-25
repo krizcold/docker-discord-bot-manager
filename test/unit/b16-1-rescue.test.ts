@@ -53,6 +53,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
 
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as rescue from '../../src/instance/recoveryRescue';
 
 function receiver(extra: Record<string, unknown> = {}): any {
@@ -79,13 +80,13 @@ afterEach(() => { vi.unstubAllGlobals(); });
 
 describe('R8-J1: a fresh rescue refuses while another lane holds the database', () => {
   it('refuses while a dump, restore or replication change holds the backup slot', async () => {
-    expect(fleetBackup.claimFleetBackupBusy('b1')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);
     try {
       const r = await rescue.startRescue(st.bots[0], true);
       expect(r.success).toBe(false);
       expect(r.error).toMatch(/dump, restore or replication change is running on this instance.*nothing was changed/);
     } finally {
-      fleetBackup.releaseFleetBackupBusy('b1');
+      fleetBackupGuards.releaseFleetBackupBusy('b1');
     }
     expect(st.fetched).toBe(0);
     expect(st.bots[0].recoveryRescue).toBeUndefined();
@@ -144,11 +145,11 @@ describe('R8-J1: the phases that rewrite the volume hold the backup slot', () =>
     st.bots = [receiver({ id: 'k1', sanitizedName: 'k1', recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1 } })];
     rescue.resumeRecoveryRescues();
     await vi.waitFor(() => expect(st.calls.some(a => a.includes('k1-recovery-rsync'))).toBe(true));
-    expect(fleetBackup.claimFleetBackupBusy('k1')).toBe(false);
+    expect(fleetBackupGuards.claimFleetBackupBusy('k1')).toBe(false);
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/dump, restore or replication change is running on Bot 1/);
     st.bots[0].recoveryRescue = undefined;
     open();
-    await vi.waitFor(() => expect(fleetBackup.isFleetBackupBusy('k1')).toBe(false));
+    await vi.waitFor(() => expect(fleetBackupGuards.isFleetBackupBusy('k1')).toBe(false));
   });
 
   it('a rescue at standby holds the slot and frees it at streaming', async () => {
@@ -160,11 +161,11 @@ describe('R8-J1: the phases that rewrite the volume hold the backup slot', () =>
     });
     st.bots = [receiver({ id: 'k2', sanitizedName: 'k2', recoveryRescue: { phase: 'standby', startedAt: 1, updatedAt: 1 } })];
     rescue.resumeRecoveryRescues();
-    await vi.waitFor(() => expect(fleetBackup.isFleetBackupBusy('k2')).toBe(true));
-    expect(fleetBackup.claimFleetBackupBusy('k2')).toBe(false);
+    await vi.waitFor(() => expect(fleetBackupGuards.isFleetBackupBusy('k2')).toBe(true));
+    expect(fleetBackupGuards.claimFleetBackupBusy('k2')).toBe(false);
     open();
     await vi.waitFor(() => expect(st.bots[0].recoveryRescue?.phase).toBe('streaming'));
-    await vi.waitFor(() => expect(fleetBackup.isFleetBackupBusy('k2')).toBe(false));
+    await vi.waitFor(() => expect(fleetBackupGuards.isFleetBackupBusy('k2')).toBe(false));
     st.bots[0].recoveryRescue = undefined;
   });
 

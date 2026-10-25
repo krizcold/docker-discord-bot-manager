@@ -87,7 +87,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
 });
 
 import * as rescue from '../../src/instance/recoveryRescue';
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as recoveryControl from '../../src/instance/recoveryControl';
 
 const fleetDb = { containerName: 'bot1-db', user: 'u', db: 'd', volume: 'bot1-vol' };
@@ -374,7 +374,7 @@ describe('R23-J3: the swap\'s quiesce checks the copy is the sender\'s', () => {
     expect(none.code).toBe(400);
     expect(st.events).not.toContain('stop-source');
     expect(st.events).not.toContain('swapped-away');
-    expect(fleetBackup.isFleetBackupBusy('s1')).toBe(false);
+    expect(fleetBackupGuards.isFleetBackupBusy('s1')).toBe(false);
   });
 
   it('the sender\'s prepare answer carries its checkpoint and store id', async () => {

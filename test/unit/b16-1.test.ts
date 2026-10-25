@@ -127,6 +127,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
@@ -408,9 +409,9 @@ describe('R8-J1 and R9-J3: the database lanes refuse while a run is recorded', (
 describe('R13-J15: a manager self-update waits for a running lane', () => {
   it('names a running restore, an op lock and an unparked run, and nothing when all is quiet', async () => {
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
-    expect(fleetBackup.claimFleetBackupBusy('a')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/dump, restore or replication change is running on a/);
-    fleetBackup.releaseFleetBackupBusy('a');
+    fleetBackupGuards.releaseFleetBackupBusy('a');
     let release: () => void = () => {};
     const held = containerManager.withExternalBotOp('w', 'build', () => new Promise<void>(r => { release = r; }));
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/operation 'build' is running on w/);
@@ -461,13 +462,13 @@ describe('R9-J3: a sender a swap moved away from refuses a later start', () => {
 
 describe('R13-J15: the update scripts and a shutdown wait for a running lane', () => {
   it('a shutdown waits for the backup slot to clear, bounded', async () => {
-    expect(fleetBackup.claimFleetBackupBusy('a')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
     const waiting = (fleetBackup as any).waitForInFlightLanes(5_000, 10) as Promise<string | null>;
-    setTimeout(() => fleetBackup.releaseFleetBackupBusy('a'), 50);
+    setTimeout(() => fleetBackupGuards.releaseFleetBackupBusy('a'), 50);
     expect(await waiting).toBeNull();
-    expect(fleetBackup.claimFleetBackupBusy('a')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
     const bounded = await (fleetBackup as any).waitForInFlightLanes(50, 10);
-    fleetBackup.releaseFleetBackupBusy('a');
+    fleetBackupGuards.releaseFleetBackupBusy('a');
     expect(bounded).toMatch(/dump, restore or replication change is running on a/);
   });
 
@@ -478,15 +479,15 @@ describe('R13-J15: the update scripts and a shutdown wait for a running lane', (
 
   it('the lanes route answers what a recreate would cut short', async () => {
     vi.resetModules();
-    const fb = await import('../../src/instance/fleetBackup');
+    const guards = await import('../../src/instance/fleetBackupGuards');
     const { createManagerRoutes } = await import('../../src/webui/routes/manager');
     const router: any = createManagerRoutes({} as any);
     const layer = router.stack.find((l: any) => l.route?.path === '/lanes' && l.route?.methods?.get);
     expect(layer).toBeDefined();
     const res: any = { code: 200, body: null, status(c: number) { this.code = c; return this; }, json(b: unknown) { this.body = b; return this; } };
-    expect(fb.claimFleetBackupBusy('a')).toBe(true);
+    expect(guards.claimFleetBackupBusy('a')).toBe(true);
     await layer.route.stack[0].handle({}, res, () => {});
-    fb.releaseFleetBackupBusy('a');
+    guards.releaseFleetBackupBusy('a');
     expect(res.body).toEqual({ success: true, blocker: 'a database dump, restore or replication change is running on a' });
     await layer.route.stack[0].handle({}, res, () => {});
     expect(res.body).toEqual({ success: true, blocker: null });

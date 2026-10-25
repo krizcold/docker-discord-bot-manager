@@ -84,7 +84,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as fleetReplication from '../../src/instance/fleetReplication';
 import { enableFleetReplication, disableFleetReplication } from '../../src/instance/fleetReplication';
 
@@ -160,7 +160,7 @@ describe('the replication lane is serialized per instance', () => {
   });
 
   it('refuses Enable and Disable while a backup or restore holds the busy slot', async () => {
-    expect(fleetBackup.claimFleetBackupBusy('b1')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);
     try {
       const res = await enable();
       expect(res.success).toBe(false);
@@ -170,7 +170,7 @@ describe('the replication lane is serialized per instance', () => {
       expect(off.success).toBe(false);
       expect(h.calls).toEqual([]);
     } finally {
-      fleetBackup.releaseFleetBackupBusy('b1');
+      fleetBackupGuards.releaseFleetBackupBusy('b1');
     }
   });
 });

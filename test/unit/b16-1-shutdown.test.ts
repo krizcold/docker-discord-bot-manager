@@ -23,6 +23,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as recoveryRescue from '../../src/instance/recoveryRescue';
 import { createBotRoutes } from '../../src/webui/routes/bots';
 
@@ -49,14 +50,14 @@ describe('R13-J15: a shutting-down manager admits no new lane', () => {
   it('before SIGTERM every lane is admitted', async () => {
     expect(containerManager.isShuttingDown()).toBe(false);
     expect((await gate('POST', '/a/start')).passed).toBe(true);
-    expect(fleetBackup.claimFleetBackupBusy('a')).toBe(true);
-    fleetBackup.releaseFleetBackupBusy('a');
+    expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
+    fleetBackupGuards.releaseFleetBackupBusy('a');
   });
 
   it('after SIGTERM the backup slot, a restore, a rescue and the bot routes refuse, and nothing runs', async () => {
     containerManager.beginShutdown();
     tmp.docker.length = 0;
-    expect(fleetBackup.claimFleetBackupBusy('a')).toBe(false);
+    expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(false);
     const restore = await fleetBackup.restoreFleetBackup('a', 'fleet-2026-10-24.dump');
     expect(restore.success).toBe(false);
     expect(restore.error).toMatch(/^The manager is shutting down/);

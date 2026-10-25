@@ -19,6 +19,7 @@ import * as containerManager from '../docker/containerManager';
 import * as dockerClient from '../docker/dockerClient';
 import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
+import * as fleetBackupGuards from './fleetBackupGuards';
 import * as fleetFailback from './fleetFailback';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
@@ -1695,18 +1696,18 @@ export function reseedStalePrimary(
   // interleaving with the wipe is what the slot exists to prevent. The lane's
   // own pre-reseed dump does not claim it. The slot is released whenever the
   // start does not hand the run to the op lock.
-  if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+  if (!fleetBackupGuards.claimFleetBackupBusy(instance.id)) {
     return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
   }
   let started: { success: boolean; error?: string };
   try {
-    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', preflight, () => fleetBackup.releaseFleetBackupBusy(instance.id), confirmVolume);
+    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', preflight, () => fleetBackupGuards.releaseFleetBackupBusy(instance.id), confirmVolume);
   } catch (err) {
-    fleetBackup.releaseFleetBackupBusy(instance.id);
+    fleetBackupGuards.releaseFleetBackupBusy(instance.id);
     throw err;
   }
   if (!started.success) {
-    fleetBackup.releaseFleetBackupBusy(instance.id);
+    fleetBackupGuards.releaseFleetBackupBusy(instance.id);
     return started;
   }
   return { success: true, started: true };
@@ -1802,7 +1803,7 @@ export async function decommissionFleetDb(
       if (liveContainers.length > 0) {
         return { success: false, error: `Containers of this instance are still running (${liveContainers.join(', ')}) - stop it fully first` };
       }
-      if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
+      if (!fleetBackupGuards.claimFleetBackupBusy(instance.id)) {
         return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
       }
       try {
@@ -1860,7 +1861,7 @@ export async function decommissionFleetDb(
         fleetBackup.clearTermFloor(instance.id);
         return warning ? { success: true, dumpFile, warning } : { success: true, dumpFile };
       } finally {
-        fleetBackup.releaseFleetBackupBusy(instance.id);
+        fleetBackupGuards.releaseFleetBackupBusy(instance.id);
       }
     });
   } catch (err) {

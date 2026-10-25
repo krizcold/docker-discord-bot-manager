@@ -34,6 +34,7 @@ import * as fleetReplica from './fleetReplica';
 import * as fleetTransfer from './fleetTransfer';
 import * as recoveryRescue from './recoveryRescue';
 import { REPLICATION_ROLE } from './fleetReplication';
+import { busy, externalClaims, FENCE_HBA_COUNT_SQL, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
 const FACTS_TIMEOUT_MS = 10_000;
@@ -100,11 +101,6 @@ function recordFailbackFence(botId: string, containerName: string, left: boolean
     return false;
   }
 }
-// Instances with a dump or restore in flight
-const busy: Set<string> = new Set();
-/** The slots another module took through claimFleetBackupBusy; this module's own dumps and restores are not in it. */
-const externalClaims = new Set<string>();
-
 export function getFleetBackupError(botId: string): string | null {
   return lastErrors.get(botId) || null;
 }
@@ -143,28 +139,6 @@ function setRestoreError(botId: string, file: string, reason: string, consequenc
 /** The write fences a restore, drop-back or failback left on, one text per database; null when none. */
 export function getFleetFenceStuck(botId: string): string | null {
   return Array.from(fenceStuck.get(botId)?.values() ?? [], e => e.text).join('; ') || null;
-}
-
-/**
- * Cross-module claim of the per-instance backup-op slot, so a destructive
- * lane (decommission) and this module's own dump/restore can never
- * interleave: restore and the scheduled dump refuse while it is claimed,
- * and the claimer refuses while a dump or restore is in flight.
- */
-export function claimFleetBackupBusy(botId: string): boolean {
-  if (busy.has(botId) || containerManager.isShuttingDown()) return false;
-  busy.add(botId);
-  externalClaims.add(botId);
-  return true;
-}
-
-export function releaseFleetBackupBusy(botId: string): void {
-  busy.delete(botId);
-  externalClaims.delete(botId);
-}
-
-export function isFleetBackupBusy(botId: string): boolean {
-  return busy.has(botId);
 }
 
 /**
@@ -425,16 +399,11 @@ export type FenceLift = 'lifted' | 'stripped' | 'failed' | 'unreloaded' | 'locke
 export type FenceLayers = { readOnly: boolean; hba: boolean };
 const BOTH_LAYERS: FenceLayers = { readOnly: true, hba: true };
 
-/** Every pg_hba line the write fence writes ends with this; a lift removes each line that does. */
-export const WRITE_FENCE_MARK = '# smdb-write-fence';
 /** The sidecar's pg_hba.conf (its volume sits at the image's PGDATA); the fence refuses a database that reads another file. */
 export const FENCE_HBA_FILE = '/var/lib/postgresql/data/pg_hba.conf';
 export const FENCE_PGDATA = path.posix.dirname(FENCE_HBA_FILE);
 /** How long the fence waits for the reloaded pg_hba to refuse a TCP connection, and the gap between probes. */
 export const fenceTiming = { probeDeadlineMs: 15_000, probeGapMs: 250 };
-
-/** The count of pg_hba lines the write fence wrote, as the server reads its own pg_hba file. */
-export const FENCE_HBA_COUNT_SQL = `SELECT count(*) FROM regexp_split_to_table(pg_read_file(current_setting('hba_file')), E'\\n') AS line WHERE line LIKE '%${WRITE_FENCE_MARK}'`;
 
 /** The fence's pg_hba lines: the managed replication role over TLS (only when ssl is on), then a reject for every other TCP client. */
 function fenceHbaLines(ssl: boolean): string[] {

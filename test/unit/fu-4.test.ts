@@ -108,7 +108,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 const { cancelReplicaSeed, getFleetReplicaStatus, provisionFleetReplica, reseedStalePrimary, reseedStandby, retryHeldSeedRecords } = fleetReplica;
 
 const REPLICA = {
@@ -228,8 +228,8 @@ describe('B22-2s: a seed whose first record write is refused frees what its call
     const res = reseedStalePrimary(bot(), DSN, PEM, 'standby.invalid', 5440, true);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/^The seed did not start: its record could not be saved/);
-    expect(fleetBackup.claimFleetBackupBusy('b1')).toBe(true);
-    fleetBackup.releaseFleetBackupBusy('b1');
+    expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);
+    fleetBackupGuards.releaseFleetBackupBusy('b1');
     expect(containerManager.isBotBusy('b1')).toBeNull();
   });
 

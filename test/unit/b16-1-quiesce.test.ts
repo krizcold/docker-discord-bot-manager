@@ -73,7 +73,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
 });
 
 import * as containerManager from '../../src/docker/containerManager';
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as recoveryControl from '../../src/instance/recoveryControl';
 
 function source(extra: Record<string, unknown> = {}): any {
@@ -98,7 +98,7 @@ async function call(action: string): Promise<{ code: number; body: any }> {
 
 beforeEach(() => {
   recoveryControl.releaseQuiesceSlot?.('s1');
-  fleetBackup.releaseFleetBackupBusy('s1');
+  fleetBackupGuards.releaseFleetBackupBusy('s1');
   st.bots = [source()];
   st.events.length = 0;
   st.live = ['src1-app'];
@@ -111,9 +111,9 @@ beforeEach(() => {
 
 describe('R9-J3: the quiesce holds the database lanes off and decides from docker', () => {
   it('refuses while a dump, restore or replication change holds the backup slot, and stops nothing', async () => {
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(true);
     const r = await call('quiesce');
-    fleetBackup.releaseFleetBackupBusy('s1');
+    fleetBackupGuards.releaseFleetBackupBusy('s1');
     expect(r.code).toBe(409);
     expect(r.body.error).toMatch(/dump, restore or replication change is running/);
     expect(st.events).toEqual([]);
@@ -128,8 +128,8 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     expect(r.code).toBe(409);
     expect(r.body.error).toMatch(/Operation 'update' is already in progress/);
     expect(st.events).toEqual([]);
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(true);
-    fleetBackup.releaseFleetBackupBusy('s1');
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(true);
+    fleetBackupGuards.releaseFleetBackupBusy('s1');
   });
 
   it('holds the op lock while it runs', async () => {
@@ -160,8 +160,8 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     expect(r.code).toBe(500);
     expect(r.body.error).toMatch(/could not tell whether the source instance is running/);
     expect(st.events).toEqual([]);
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(true);
-    fleetBackup.releaseFleetBackupBusy('s1');
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(true);
+    fleetBackupGuards.releaseFleetBackupBusy('s1');
   });
 
   it('refuses until the role reset lands, and stops nothing', async () => {
@@ -175,13 +175,13 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
   it('claims the backup slot from the quiesce until the teardown', async () => {
     const r = await call('quiesce');
     expect(r.code).toBe(200);
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(false);
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(false);
     const again = await call('quiesce');
     expect(again.code).toBe(200);
     const bye = await call('teardown');
     expect(bye.code).toBe(200);
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(true);
-    fleetBackup.releaseFleetBackupBusy('s1');
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(true);
+    fleetBackupGuards.releaseFleetBackupBusy('s1');
   });
 
   it('a re-entry that refuses after an earlier quiesce stopped the source keeps the slot', async () => {
@@ -189,7 +189,7 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     st.live = null;
     const again = await call('quiesce');
     expect(again.code).toBe(500);
-    expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(false);
+    expect(fleetBackupGuards.claimFleetBackupBusy('s1')).toBe(false);
   });
 });
 
@@ -252,6 +252,6 @@ describe('R13-J15: a shutting-down source refuses a quiesce', () => {
     expect(r.body.error).toMatch(/^The manager is shutting down/);
     expect(st.events).toEqual([]);
     expect(st.bots[0].recoverySwappedAway).toBeUndefined();
-    expect(fleetBackup.isFleetBackupBusy('s1')).toBe(false);
+    expect(fleetBackupGuards.isFleetBackupBusy('s1')).toBe(false);
   });
 });

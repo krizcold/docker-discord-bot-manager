@@ -76,7 +76,7 @@ vi.mock('child_process', async (importOriginal) => {
   return { ...real, execSync, execFile, spawn, spawnSync };
 });
 
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as selfUpdate from '../../src/manager/selfUpdate';
 
 let tmp: string;
@@ -115,12 +115,12 @@ async function update(): Promise<Error | null> {
 
 describe('FU-8: the recreate checks the lanes again after its last await', () => {
   it('a lane claimed while the old helper is removed stops the launch', async () => {
-    h.onRm = () => { fleetBackup.claimFleetBackupBusy('x2'); };
+    h.onRm = () => { fleetBackupGuards.claimFleetBackupBusy('x2'); };
     let err: Error | null;
     try {
       err = await update();
     } finally {
-      fleetBackup.releaseFleetBackupBusy('x2');
+      fleetBackupGuards.releaseFleetBackupBusy('x2');
     }
     expect(err?.message).toMatch(/^The images were rebuilt, but the stack was not recreated: .*x2/);
     expect(h.script).toBe('');

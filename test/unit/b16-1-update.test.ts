@@ -73,7 +73,7 @@ vi.mock('child_process', async (importOriginal) => {
   return { ...real, execSync, execFile, spawn, spawnSync };
 });
 
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as selfUpdate from '../../src/manager/selfUpdate';
 
 let tmp: string;
@@ -105,12 +105,12 @@ async function update(): Promise<Error | null> {
 
 describe('R13-J15: a manager self-update does not recreate the stack under a running lane', () => {
   it('a held backup slot stops the update before the recreate helper launches', async () => {
-    expect(fleetBackup.claimFleetBackupBusy('x1')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('x1')).toBe(true);
     let err: Error | null;
     try {
       err = await update();
     } finally {
-      fleetBackup.releaseFleetBackupBusy('x1');
+      fleetBackupGuards.releaseFleetBackupBusy('x1');
     }
     expect(err?.message).toMatch(/^The images were rebuilt, but the stack was not recreated: a database dump, restore or replication change is running on x1/);
     expect(h.script).toBe('');

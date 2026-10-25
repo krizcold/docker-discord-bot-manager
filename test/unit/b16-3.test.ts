@@ -77,7 +77,7 @@ import * as path from 'path';
 import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
 import * as rescue from '../../src/instance/recoveryRescue';
-import { isFleetBackupBusy } from '../../src/instance/fleetBackup';
+import { isFleetBackupBusy } from '../../src/instance/fleetBackupGuards';
 import { putServiceBack, takeServiceOut } from '../../src/templates/pcsProcessing';
 
 const composePath = (id: string) => path.join(tmp.dir, 'DATA', 'AppData', 'casaos', 'apps', id, 'docker-compose.yml');

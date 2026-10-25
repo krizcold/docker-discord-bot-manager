@@ -65,10 +65,13 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   deployedComposeExists: () => true,
   applyFleetDbReplicaService: async () => ({ success: false, error: 'fake apply failure' }),
 }));
-vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
+vi.mock('../../src/instance/fleetBackupGuards', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetBackupGuards')>()),
   claimFleetBackupBusy: () => true,
   releaseFleetBackupBusy: () => {},
+}));
+vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
   clearTermFloor: () => {},
   runFleetDump: async () => ({ success: true, file: 'fake.dump' }),
 }));

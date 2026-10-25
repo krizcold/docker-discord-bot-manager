@@ -167,31 +167,34 @@ describe('B20-1t: the backup tick skips while its previous run is in flight', ()
 describe('B16-1w: a manager stop does not wait on the slot a quiesced recovery source holds', () => {
   it('the shutdown wait passes a quiesced source slot at once, and a self-update still refuses on it', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    expect(fb.claimFleetBackupBusy('s')).toBe(true);
+    const guards = await import('../../src/instance/fleetBackupGuards');
+    expect(guards.claimFleetBackupBusy('s')).toBe(true);
     try {
       const began = Date.now();
       expect(await fb.waitForInFlightLanes(2_000, 10)).toBeNull();
       expect(Date.now() - began).toBeLessThan(1_000);
       expect(fb.databaseLaneBlocker()).toMatch(/running on s$/);
     } finally {
-      fb.releaseFleetBackupBusy('s');
+      guards.releaseFleetBackupBusy('s');
     }
   });
 
   it('a slot held on any other instance is still waited on', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    expect(fb.claimFleetBackupBusy('a')).toBe(true);
+    const guards = await import('../../src/instance/fleetBackupGuards');
+    expect(guards.claimFleetBackupBusy('a')).toBe(true);
     try {
       expect(await fb.waitForInFlightLanes(50, 10)).toMatch(/running on a$/);
     } finally {
-      fb.releaseFleetBackupBusy('a');
+      guards.releaseFleetBackupBusy('a');
     }
   });
 
   it('a quiesced source whose op lock is held is still waited on', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
+    const guards = await import('../../src/instance/fleetBackupGuards');
     const cm = await import('../../src/docker/containerManager');
-    expect(fb.claimFleetBackupBusy('s')).toBe(true);
+    expect(guards.claimFleetBackupBusy('s')).toBe(true);
     let release: () => void = () => {};
     const op = cm.withExternalBotOp('s', 'quiesce', () => new Promise<void>((r) => { release = r; }));
     try {
@@ -199,7 +202,7 @@ describe('B16-1w: a manager stop does not wait on the slot a quiesced recovery s
     } finally {
       release();
       await op;
-      fb.releaseFleetBackupBusy('s');
+      guards.releaseFleetBackupBusy('s');
     }
   });
 });

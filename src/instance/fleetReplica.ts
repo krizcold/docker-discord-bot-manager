@@ -98,6 +98,31 @@ type HeldSeed = { startedAt: number; patch: Partial<FleetReplicaSeedRecord>; don
 const heldSeeds = new Map<string, HeldSeed>();
 /** What a finished seed left for the operator to do, by seed: shown on the standby panel until dismissed or a new seed starts. */
 const seedNotes = new Map<string, { startedAt: number; text: string }>();
+/** The standby record a failed first provision built and could not clear, by seed: cleared on the next health tick or the seed's Dismiss. */
+const heldReplicaClears = new Map<string, { startedAt: number; containerName: string; writeError: string }>();
+
+function replicaClearHeld(botId: string, startedAt: number): boolean {
+  return heldReplicaClears.get(botId)?.startedAt === startedAt;
+}
+
+/** Clears the held standby record while it is still the one that seed built; throws when the registry refuses. */
+function clearHeldReplica(botId: string): void {
+  const held = heldReplicaClears.get(botId);
+  if (!held) return;
+  const bot = containerManager.getBot(botId);
+  const rec = bot?.fleetDbReplica;
+  if (!bot || bot.fleetDbReplicaSeed?.startedAt !== held.startedAt || !seedBuiltRecord(rec, held) || rec?.containerName !== held.containerName) {
+    heldReplicaClears.delete(botId);
+    return;
+  }
+  try {
+    containerManager.updateInstanceFleetDbReplica(botId, null);
+  } catch (err) {
+    held.writeError = errorText(err);
+    throw err;
+  }
+  heldReplicaClears.delete(botId);
+}
 
 function holdSeed(botId: string, startedAt: number, patch: Partial<FleetReplicaSeedRecord>, err: unknown, done = false): void {
   const prior = heldSeeds.get(botId);
@@ -129,9 +154,14 @@ export function seedView(instance: InstanceConfig): FleetReplicaSeedRecord | nul
   const seed = instance.fleetDbReplicaSeed ?? null;
   if (!seed || seedDone(instance)) return null;
   const held = heldSeeds.get(instance.id);
-  if (!held || held.startedAt !== seed.startedAt) return seed;
-  const view = { ...seed, ...held.patch };
-  if (held.patch.parked) view.lastError = `${held.patch.lastError || 'the seed stopped'}; its record could not be written (${held.writeError})`;
+  const clear = heldReplicaClears.get(instance.id);
+  const cleared = !!clear && clear.startedAt === seed.startedAt;
+  if ((!held || held.startedAt !== seed.startedAt) && !cleared) return seed;
+  const view = held && held.startedAt === seed.startedAt ? { ...seed, ...held.patch } : { ...seed };
+  if (held && held.startedAt === seed.startedAt && held.patch.parked) view.lastError = `${held.patch.lastError || 'the seed stopped'}; its record could not be written (${held.writeError})`;
+  if (view.parked && clear && cleared) {
+    view.lastError = `${view.lastError || 'the seed stopped'}; the standby record could not be cleared (${clear.writeError}), so the manager clears it on its next health tick, and Dismiss clears it now`;
+  }
   return view;
 }
 
@@ -145,6 +175,13 @@ export function retryHeldSeedRecords(): void {
       else saveSeed(botId, {});
     } catch (err) {
       held.writeError = errorText(err);
+    }
+  }
+  for (const botId of [...heldReplicaClears.keys()]) {
+    try {
+      clearHeldReplica(botId);
+    } catch {
+      // Still held, under the new error; the next tick tries again.
     }
   }
 }
@@ -697,19 +734,24 @@ function startProvisioning(
   const priorRecord = containerManager.getBot(instance.id)?.fleetDbReplica;
   const inherited = priorRecord?.copyCleared === true
     || (prior?.committed === true && !seedBuiltRecord(priorRecord, prior));
-  containerManager.updateInstanceFleetDbReplicaSeed(instance.id, {
-    purpose,
-    phase: 'preparing',
-    startedAt: now,
-    updatedAt: now,
-    ...(inherited ? { committed: true } : {}),
-    publicHost: record.publicHost,
-    hostPort: record.hostPort,
-    primaryHost: record.primaryHost,
-    primaryPort: record.primaryPort,
-    slot: record.slot,
-  });
+  try {
+    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, {
+      purpose,
+      phase: 'preparing',
+      startedAt: now,
+      updatedAt: now,
+      ...(inherited ? { committed: true } : {}),
+      publicHost: record.publicHost,
+      hostPort: record.hostPort,
+      primaryHost: record.primaryHost,
+      primaryPort: record.primaryPort,
+      slot: record.slot,
+    });
+  } catch (err) {
+    return { success: false, error: `The seed did not start: its record could not be saved (${errorText(err)}); nothing was cleared or stopped` };
+  }
   heldSeeds.delete(instance.id);
+  heldReplicaClears.delete(instance.id);
   seedNotes.delete(instance.id);
   const ownsRecord = (): boolean => seedRecord(instance.id)?.startedAt === now;
   void containerManager.withExternalBotOp(instance.id, 'replica-seed', async () => {
@@ -728,7 +770,7 @@ function startProvisioning(
       // A record still naming this slot means the standby's own copy survived
       // and may yet stream on it; anything else leaves it retaining WAL for a
       // copy that does not exist.
-      if (containerManager.getBot(instance.id)?.fleetDbReplica?.slot !== record.slot) {
+      if (containerManager.getBot(instance.id)?.fleetDbReplica?.slot !== record.slot || replicaClearHeld(instance.id, now)) {
         await dropInactiveSlot(instance, intake.dsn, hostCertPathFor(instance.id), record.slot);
       }
       throw err;
@@ -1146,7 +1188,15 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
     // A first provision leaves no half record behind; either re-seed keeps the
     // standby's record, because the copy is complete and only its service is
     // down, and the record is what makes a rebuild re-inject that service.
-    if (purpose === 'provision') containerManager.updateInstanceFleetDbReplica(instance.id, null);
+    if (purpose === 'provision') {
+      try {
+        containerManager.updateInstanceFleetDbReplica(instance.id, null);
+      } catch (err) {
+        if (typeof builtBy !== 'number') throw new Error(`standby service start failed: ${apply.error}; the standby record could not be cleared (${errorText(err)}), so Remove replica clears it`);
+        heldReplicaClears.set(instance.id, { startedAt: builtBy, containerName: record.containerName, writeError: errorText(err) });
+        console.warn(`[FleetReplica] ${instance.id}: the standby record could not be cleared after its service failed to start (${errorText(err)}); it is cleared on the next health tick`);
+      }
+    }
     throw new Error(`standby service start failed: ${apply.error}`);
   }
   // The app learns its standby from its container environment, which only
@@ -1535,6 +1585,10 @@ export function reseedStalePrimary(
   const preflight = async () => {
     throwIfCancelled(instance.id);
     const fleetDb = instance.fleetDb!;
+    // The status record can say stopped while docker runs the bot on this database.
+    const live = await containerManager.runningNonSidecarContainers(instance.id);
+    if (live === null) throw new Error("docker did not say which containers of this instance run, so the manager can't confirm the bot is stopped; nothing was destroyed, retry");
+    if (live.length > 0) throw new Error(`containers of this instance still run (${live.join(', ')}); stop them, then re-seed again; nothing was destroyed`);
     // Asked again ahead of the dump and the retire: a volume made since the
     // request was never part of what the operator confirmed.
     const replicaState = await dockerVolumeState(record.volume);
@@ -1612,9 +1666,8 @@ export function reseedStalePrimary(
   // Held across the whole run, the way decommission holds it: the dump, the
   // retire and the seed take minutes, and a restore or the scheduled dump
   // interleaving with the wipe is what the slot exists to prevent. The lane's
-  // own pre-reseed dump does not claim it. A throw out of the synchronous
-  // start (a registry write failing) would otherwise hold the slot until the
-  // manager restarts.
+  // own pre-reseed dump does not claim it. The slot is released whenever the
+  // start does not hand the run to the op lock.
   if (!fleetBackup.claimFleetBackupBusy(instance.id)) {
     return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
   }
@@ -2205,6 +2258,13 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
     if (!stillThisRun()) {
       return { success: false, error: 'A new seed run started on this instance while the stopped one was being dismissed, so the new run was left as it is; look again' };
     }
+    if (replicaClearHeld(instance.id, seed.startedAt)) {
+      try {
+        clearHeldReplica(instance.id);
+      } catch (err) {
+        return { success: false, error: `The standby record this seed built still could not be cleared (${errorText(err)}), so the stopped seed was not dismissed; the manager retries on its next health tick` };
+      }
+    }
     try {
       clearSeed(instance.id);
     } catch (err) {
@@ -2244,7 +2304,8 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
   const rec = instance?.fleetDbReplica;
   const parked = seed.parked === true;
   const afterRetire = !!instance && seedAfterRetire(instance);
-  const whole = parked && seedBuiltRecord(rec, seed);
+  const clearHeld = parked && replicaClearHeld(botId, seed.startedAt);
+  const whole = parked && seedBuiltRecord(rec, seed) && !clearHeld;
   let tail = '';
   if (whole && rec) {
     const next = instance?.fleetFailback ? 'Continue on the run card starts its container' : 'pressing Build on its card, then Apply (or Start if the instance is stopped), starts its container';
@@ -2255,19 +2316,21 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
         ? `Its standby container is not running. Dismissing this note keeps the copy, and ${next}.`
         : `The manager can't confirm whether its standby container is running (docker did not answer). Dismissing this note keeps the copy; if the container is not running, ${next}.`;
   }
-  const gone = seed.purpose === 'reseed-stale-primary'
-    ? (whole
-      ? `This instance's own database has already been retired. The copy from the stand-in is complete. ${tail}`
-      : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
-    : seed.purpose === 'reseed-standby'
+  const gone = clearHeld
+    ? `${afterRetire ? "This machine's own database was already retired earlier in the failback run. " : ''}The standby service did not start. Dismissing this note clears the standby record that start left; the replica volume stays.`
+    : seed.purpose === 'reseed-stale-primary'
       ? (whole
-        ? `The copy is complete. ${tail}`
-        : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
-      : whole
-        ? `${afterRetire ? 'This machine\'s own database was already retired earlier in the failback run. ' : ''}The copy is complete and kept on record. ${tail}`
-        : afterRetire
-          ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
-          : 'The partial copy is discarded; nothing else on this instance is affected.';
+        ? `This instance's own database has already been retired. The copy from the stand-in is complete. ${tail}`
+        : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
+      : seed.purpose === 'reseed-standby'
+        ? (whole
+          ? `The copy is complete. ${tail}`
+          : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
+        : whole
+          ? `${afterRetire ? 'This machine\'s own database was already retired earlier in the failback run. ' : ''}The copy is complete and kept on record. ${tail}`
+          : afterRetire
+            ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
+            : 'The partial copy is discarded; nothing else on this instance is affected.';
   const committed = seed.committed === true;
   if (parked) return `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`;
   return `Cancel this seed?\n\nThe copy stops at its next step.\n\n${committed ? gone : 'Nothing has been deleted by this run yet.'}`;
@@ -2384,7 +2447,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (trigger === 'operator') patchLedger(instance.id, () => undefined);
   ledgerAttempt(instance.id, trigger);
   const refuse = (error: string): { success: false; error: string } => {
-    ledgerFailure(instance.id, error);
+    ledgerOrWarn(instance.id, () => ledgerFailure(instance.id, error));
     return { success: false, error };
   };
 

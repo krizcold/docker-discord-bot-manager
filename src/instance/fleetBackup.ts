@@ -1064,6 +1064,17 @@ export async function raiseGuildTerms(fleetDb: RestoreFleetDb, floor: number): P
   return { ok: true, guilds: raise.stdout.split('\n').map(s => s.trim()).filter(Boolean) };
 }
 
+/** Stops the named containers of an instance and asks docker again: null when none runs, else what is left or unknown. */
+async function stopListedContainers(botId: string, names: string[]): Promise<string | null> {
+  for (const name of names) {
+    const stop = await execDocker(['stop', name]);
+    if (!stop.ok) console.warn(`[FleetBackup] Could not stop ${name}: ${lastLine(stop.stderr)}`);
+  }
+  const after = await containerManager.runningInstanceContainers(botId);
+  if (after === null) return "docker did not answer after the stop, so the manager can't confirm they stopped";
+  return after.length > 0 ? `docker still runs ${after.join(', ')} after the stop` : null;
+}
+
 /** The sharers docker runs now and their containers, each one's own database sidecar aside; null when docker did not answer for one. */
 async function sharersRunning(sharing: InstanceConfig[]): Promise<{ ids: string[]; names: string[] } | null> {
   const ids: string[] = [];
@@ -1218,12 +1229,19 @@ export async function restoreFleetBackup(
       }
       if (live.length === 0) continue;
       const stop = await asResult(containerManager.stopBot(b.id));
+      if (!stop.success && stop.error === 'Bot is not running') {
+        // The record says stopped while docker runs it: the containers docker named are stopped by name.
+        const left = await stopListedContainers(b.id, live);
+        steps.stopped.push(b.id);
+        if (left !== null) {
+          const note = await undo();
+          return { success: false, error: `Could not stop instance ${b.displayName}: its record says stopped while docker ran ${live.join(', ')}, and ${left}; the restore was refused${note}`, steps };
+        }
+        continue;
+      }
       if (!stop.success) {
-        const why = stop.error === 'Bot is not running'
-          ? `its record says stopped while docker runs ${live.join(', ')}; stop those containers, then retry`
-          : stop.error;
         const note = await undo();
-        return { success: false, error: `Could not stop instance ${b.displayName}: ${why}${note}`, steps };
+        return { success: false, error: `Could not stop instance ${b.displayName}: ${stop.error}${note}`, steps };
       }
       steps.stopped.push(b.id);
     }

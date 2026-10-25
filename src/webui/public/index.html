@@ -3900,12 +3900,14 @@
       // caughtUp compares this copy's received and replayed positions, never the primary's: it means caught up only while streaming.
       const lagText = live.caughtUp === true
         ? (live.receiverStatus === 'streaming' ? ', caught up' : '; it replayed everything received before the link dropped')
-        : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s` : '';
+        : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s`
+        : live.clockSkewSeconds != null ? `; this machine's clock runs ${live.clockSkewSeconds}s behind the primary's, so the time behind cannot be read` : '';
       // Every branch above the last means this copy has stopped protecting the
       // fleet, which must not read as an ordinary status line. An absent live
       // block means the state could not be read at all (the reason rides
       // lastError above), which must not claim the container is down.
       const laggingBehind = live.caughtUp !== true && live.replayLagSeconds != null && live.replayLagSeconds > 60;
+      const lagUnreadable = live.caughtUp !== true && live.replayLagSeconds == null && live.clockSkewSeconds != null;
       const stateHtml = !r.live
         ? ''
         : !live.running
@@ -3927,7 +3929,7 @@
             ? `<div class="env-tip" style="color:var(--warning);">${live.receiverStatus === 'streaming' ? `Receiver: streaming${lagText}` : `Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')}); it is down`}. This copy keeps its place while a stand-in serves the fleet (below).</div>`
           : live.receiverStatus !== 'streaming'
             ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
-            : `<div class="env-tip" style="color:var(--${laggingBehind ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
+            : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
       // The block a stand-in hands out (20.5, F33): the returning master is
       // re-seeded from this copy by hand until the failback lane exists.
       const standInBlockHtml = !(standingIn && standing.live && standing.holdsWrites) ? ''

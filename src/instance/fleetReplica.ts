@@ -38,8 +38,16 @@ function slotNameFor(instance: InstanceConfig): string {
   return `${FLEET_SLOT_PREFIX}_${instance.id.replace(/-/g, '')}`;
 }
 const DEFAULT_HOST_PORT = 15432;
-/** The app's own freshness window for the slot fact; duplicated rather than imported, because the health module reads this one. */
+/** The app's own freshness window for the slot fact. */
 const SLOT_FACT_FRESH_MS = 5 * 60_000;
+/** Past this the standby's clock runs behind the primary's so far that a time-based lag is not shown. */
+const CLOCK_SKEW_BOUND_SECONDS = 5;
+
+/** A slot fact is fresh inside the app's window; one received in the future comes from a skewed clock and is not. */
+export function slotFactFresh(receivedAt: unknown, now = Date.now()): boolean {
+  const at = Number(receivedAt);
+  return typeof receivedAt === 'number' && Number.isFinite(at) && at <= now && now - at <= SLOT_FACT_FRESH_MS;
+}
 const PGDATA = '/var/lib/postgresql/data';
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 const SEED_TIMEOUT_MS = 30 * 60 * 1000;
@@ -567,7 +575,10 @@ export interface FleetReplicaStatus {
     /** Everything received has been replayed. On an idle primary the
      * time-based lag below inflates; this is the honest signal. */
     caughtUp: boolean | null;
+    /** now() minus the primary's last commit time: two clocks, so never negative, and null when they disagree past the bound. */
     replayLagSeconds: number | null;
+    /** How far the standby's clock runs behind the primary's, when that is past the bound. */
+    clockSkewSeconds?: number;
   };
 }
 
@@ -643,12 +654,15 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
             COALESCE(EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::text, '');`]);
   if (probe.ok) {
     const [inRec, recv, caught, lag] = probe.stdout.trim().split('|');
+    const rawLag = lag ? Number(lag) : null;
+    const skewed = rawLag !== null && rawLag < -CLOCK_SKEW_BOUND_SECONDS;
     status.live = {
       running: true,
       inRecovery: inRec === 't',
       receiverStatus: recv || null,
       caughtUp: caught === '' ? null : caught === 't',
-      replayLagSeconds: lag ? Number(lag) : null,
+      replayLagSeconds: rawLag === null || !Number.isFinite(rawLag) || skewed ? null : Math.max(0, rawLag),
+      ...(skewed ? { clockSkewSeconds: Math.round(-rawLag) } : {}),
     };
   } else {
     const running = await containerRunning(rec.containerName);
@@ -2026,6 +2040,19 @@ export async function adoptPromotedReplica(
     return { success: false, error: `Could not recover the fleet database credentials from this instance (neither the manager env nor ${appEnvFile} carries a usable database URL), so the database cannot be adopted` };
   }
 
+  // A copy can carry the write fence's pg_hba lines (copied before the copy
+  // sites stripped them, or a fence stood on the source); enable refuses on
+  // them and they shut out every outside client. The reload before the enable
+  // applies the stripped file.
+  const fence = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
+    execFile('docker', ['exec', '-u', 'root', rec.containerName, 'sh', '-c', fleetBackup.stripFenceHbaScript(PGDATA)], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
+      resolve({ ok: !err, stderr: String(stderr || err || '') });
+    });
+  });
+  if (!fence.ok) {
+    return { success: false, error: `The write fence's lines could not be removed from this copy's pg_hba.conf (${probeErrorTail(fence.stderr)}), so the standby was not adopted; nothing was changed` };
+  }
+
   // The copy's catalog still holds the replication role its seed used, and
   // every standby of this lineage pins that credential and the certificate the
   // seed minted for this endpoint (B6 map F30). Filing them makes enable keep
@@ -2523,7 +2550,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     if (!authorised) {
       const fact = facts.facts?.standbySlot;
       const leftBehind = fact?.sourceIsCurrentMaster === false
-        && Number.isFinite(fact.receivedAt) && Date.now() - Number(fact.receivedAt) <= SLOT_FACT_FRESH_MS;
+        && slotFactFresh(fact.receivedAt);
       if (!leftBehind) {
         return refuse(`The copy block names ${dsn.host}:${dsn.port} but this standby follows ${rec.primaryHost}:${rec.primaryPort}, and the bot does not report its source as a former master; remove the replica and provision it from the new primary instead`);
       }

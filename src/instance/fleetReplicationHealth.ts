@@ -13,7 +13,7 @@
 
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
-import { getFleetReplicaStatus, publishStandInCopyBlock, retryHeldSeedRecords, seedPurposeLabel } from './fleetReplica';
+import { getFleetReplicaStatus, publishStandInCopyBlock, slotFactFresh, retryHeldSeedRecords, seedPurposeLabel } from './fleetReplica';
 import * as fleetFailback from './fleetFailback';
 import { retryHeldTransferRecords } from './fleetTransfer';
 import { retryHeldRescueRecords } from './recoveryRescue';
@@ -26,8 +26,6 @@ const TICK_INTERVAL_MS = 60_000;
 const LAG_WARN_SECONDS = 60;
 /** A facts read on the tick must not hang it: the hook's default timeout is sized for a promote. */
 const FACTS_TIMEOUT_MS = 10_000;
-/** Matches the app's own freshness window for the slot fact. */
-const SLOT_FACT_FRESH_MS = 5 * 60_000;
 
 export type ReplicationSeverity = 'ok' | 'warn' | 'error';
 
@@ -261,7 +259,7 @@ function readSlotFact(instance: InstanceConfig, result: FactsRead | null): Stand
   // master this copy no longer follows is news about the FLEET (20.19 F5), not
   // a verdict on the slot, so the lost verdict is forced false there.
   if (fact.sourceIsCurrentMaster !== true && fact.sourceIsCurrentMaster !== false) return null;
-  if (!Number.isFinite(fact.receivedAt) || Date.now() - Number(fact.receivedAt) > SLOT_FACT_FRESH_MS) return null;
+  if (!slotFactFresh(fact.receivedAt)) return null;
   // The survivor verdict is only as fresh as the copy's own last READING of
   // its source, which a rebuilt copy does not repeat at once: a fact whose
   // source was read before this copy was built names the primary the REPLACED
@@ -425,6 +423,10 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     return { ...base, severity: 'error', message: `Not streaming from the primary (${live.receiverStatus || 'no connection'}); the copy is falling behind`, lagSeconds: round(live.replayLagSeconds) };
   }
   const lag = live.replayLagSeconds;
+  if (live.clockSkewSeconds !== undefined) {
+    const skew = `this machine's clock runs ${live.clockSkewSeconds}s behind the primary's, so the time behind cannot be read`;
+    return { ...base, severity: live.caughtUp === true ? 'ok' : 'warn', message: live.caughtUp === true ? `Streaming, caught up (${skew})` : `Streaming; ${skew}`, lagSeconds: null };
+  }
   if (live.caughtUp !== true && lag !== null && lag > LAG_WARN_SECONDS) {
     return { ...base, severity: 'warn', message: `${Math.round(lag)}s behind the primary`, lagSeconds: round(lag) };
   }

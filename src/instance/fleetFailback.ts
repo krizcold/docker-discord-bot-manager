@@ -245,10 +245,11 @@ async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Pr
   if (run.fence?.owned !== true || destroyedBy(instance, run)) return '';
   const target = consentTarget(instance, run);
   if (!target) return '';
-  const lifted = await fleetBackup.liftConsentFence(instance.id, target, run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it');
+  const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
+  const lifted = await fleetBackup.liftConsentFence(instance.id, target, remedy);
   return lifted === 'lifted' ? ''
     : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY until its container restarts'
-    : '; its write fence could not be lifted, so the database stays READ-ONLY';
+    : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`;
 }
 
 function dumpText(dump: FleetFailbackRun['dump']): string {

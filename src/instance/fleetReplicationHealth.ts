@@ -13,7 +13,7 @@
 
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
-import { getFleetReplicaStatus, publishStandInCopyBlock, seedPurposeLabel, AUTO_RESEED_MAX_ATTEMPTS } from './fleetReplica';
+import { getFleetReplicaStatus, publishStandInCopyBlock, seedPurposeLabel } from './fleetReplica';
 import * as fleetFailback from './fleetFailback';
 import { FactsRead, getAppFacts, postureFromRead, StandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
@@ -411,12 +411,7 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
   // slot can never be resumed, whereas "not streaming" alone cannot tell a
   // lost slot from a primary that is merely offline.
   if (slot?.lost) {
-    const ledger = status.autoReseed;
-    const who = ledger?.trigger === 'operator' ? 'the last manual re-seed' : 'the automatic re-seed';
-    const auto = ledger?.lastError
-      ? `; ${who} ${ledger.attempts >= AUTO_RESEED_MAX_ATTEMPTS ? `stopped after ${ledger.attempts} attempts` : `failed (attempt ${ledger.attempts})`}: ${ledger.lastError}`
-      : '; the manager re-seeds it automatically from the copy block the bot holds';
-    return { ...base, severity: 'error', message: `The primary reports replication slot ${slot.slotName} as lost (its retained WAL passed the bound); this copy can never catch up${auto}`, lagSeconds: null };
+    return { ...base, severity: 'error', message: `The primary reports replication slot ${slot.slotName} as lost (its retained WAL passed the bound); this copy can never catch up${lostSlotReseedText(status, read)}`, lagSeconds: null };
   }
   if (slot && slot.walStatus === 'absent') {
     return { ...base, severity: 'error', message: `The primary has no replication slot named ${slot.slotName} any more; this copy cannot resume streaming and must be re-seeded`, lagSeconds: null };
@@ -432,6 +427,23 @@ async function sampleReplica(instance: InstanceConfig): Promise<ReplicationHealt
     return { ...base, severity: 'warn', message: `${Math.round(lag)}s behind the primary`, lagSeconds: round(lag) };
   }
   return { ...base, severity: 'ok', message: live.caughtUp === true ? 'Streaming, caught up' : 'Streaming', lagSeconds: round(lag) };
+}
+
+/** What the automatic re-seed will do about a lost slot: the last failure, then the attempts left, or why none will succeed. */
+function lostSlotReseedText(status: Awaited<ReturnType<typeof getFleetReplicaStatus>>, read: FactsRead | null): string {
+  const ledger = status.autoReseed;
+  const who = ledger?.trigger === 'operator' ? 'the last manual re-seed' : 'the automatic re-seed';
+  const last = ledger?.lastError ? `; ${who} failed (attempt ${ledger.attempts}): ${ledger.lastError}` : '';
+  const outlook = status.autoReseedOutlook;
+  if (outlook?.none) return `${last}; ${outlook.none}`;
+  // Only a designated backup is sent the copy block; without one every attempt refuses.
+  if (read?.success && read.facts && !read.facts.copyBlock?.dsn) {
+    return `${last}; this node holds no copy block for the primary (only a designated backup receives one), so the automatic re-seed cannot succeed: remove the replica and provision it again from the copy block on the primary's Database modal`;
+  }
+  const when = !outlook?.nextAt || outlook.nextAt <= Date.now() ? 'at its next check' : `from ${new Date(outlook.nextAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  const left = outlook ? `${outlook.remaining} automatic attempt${outlook.remaining === 1 ? '' : 's'} left, the next ${when}` : 'the manager re-seeds it automatically';
+  const block = read?.success && read.facts ? 'from the copy block the bot holds' : 'from the copy block the bot holds, if it holds one (the bot did not answer, so this could not be confirmed)';
+  return `${last}; ${left}, ${block}`;
 }
 
 async function runTick(): Promise<void> {

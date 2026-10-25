@@ -507,18 +507,41 @@ async function seedStuckFences(): Promise<void> {
     if (parked !== 'drop-back' && copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
       const onCopy = await execDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
       if (onCopy.ok && onCopy.stdout.trim() === 'on') {
+        const recovery = await execDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
+        const inRecovery = recovery.ok ? recovery.stdout.trim() : '';
+        const remedy = inRecovery === 't' ? 're-seeding this copy on its Database modal clears it'
+          : inRecovery === 'f' ? 'this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf()) or let a drop-back run re-seed it'
+            : 'whether this copy is still a standby could not be read: re-seeding on its Database modal clears a standby, and a promoted copy is lifted only by hand';
         setStuck(instance.id, { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume },
-          'The copy is READ-ONLY: a write fence (a drop-back\'s, a promote\'s or a swap\'s) is on; re-seeding this copy on its Database modal clears it');
+          `The copy is READ-ONLY: a write fence (a drop-back's, a promote's or a swap's) is on; ${remedy}`);
       }
     }
     const db = instance.fleetDb;
     if (parked === 'failback' || !db || isStuck(instance.id, db.containerName)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
     const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-    if (probe.ok && probe.stdout.trim() === 'on') {
-      setStuck(instance.id, db, 'The database is READ-ONLY (a write fence was not lifted); restart the instance to clear it, or run a restore again to retry the lift');
-    }
+    if (probe.ok && probe.stdout.trim() === 'on') setStuck(instance.id, db, `The database is READ-ONLY (a write fence was not lifted); ${await seededFenceRemedy(instance, db)}`);
   }
+}
+
+/** Whether the fence setting is saved in postgresql.auto.conf, so a restart re-applies it; null when that cannot be read. */
+async function fencePersisted(db: RestoreFleetDb): Promise<boolean | null> {
+  const read = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
+  const text = read.ok ? read.stdout.trim() : '';
+  return /^\d+$/.test(text) ? Number(text) > 0 : null;
+}
+
+/** The remedy for a fence found on at start, from the lane that owns it and whether a restart clears it. */
+async function seededFenceRemedy(instance: InstanceConfig, db: RestoreFleetDb): Promise<string> {
+  const lane = instance.recoveryChannel?.mode === 'source'
+    ? 'disarming the recovery channel on its Database modal lifts it'
+    : instance.fleetFailback && failbackFenceLeft(instance.id, db.containerName)
+      ? `the ${instance.fleetFailback.mode} run on this instance owns it, and the run's exits on its Database modal lift it`
+      : restoreRetryRemedy(instance);
+  const persisted = await fencePersisted(db);
+  if (persisted === false) return `the setting is not saved in its configuration, so restarting the instance clears it, or ${lane}`;
+  if (persisted === true) return `the setting is saved in its configuration, so a restart keeps it on; ${lane}`;
+  return `whether a restart clears it could not be confirmed (its saved configuration could not be read); ${lane}`;
 }
 
 /** Clear a failback record whose database is gone or reads unfenced; one that cannot be asked is kept for the next check. */
@@ -960,14 +983,25 @@ export async function previewFleetRestore(botId: string): Promise<{ success: tru
   return { success: true, instances };
 }
 
+/** The lane that holds this instance's database against a restore: the refusal, and the step that clears it; null when none does. */
+function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string } | null {
+  if (instance.recoveryRescue) return { refusal: 'A database rescue is recorded on this instance; finish or cancel it before restoring a dump', step: 'finish or cancel the database rescue' };
+  if (instance.recoveryChannel) return { refusal: `The recovery channel is armed on this instance (${instance.recoveryChannel.mode}); disarm it before restoring a dump`, step: `disarm the recovery channel (${instance.recoveryChannel.mode})` };
+  if (instance.fleetFailback) return { refusal: `A ${instance.fleetFailback.mode} run is recorded on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before restoring a dump`, step: `Continue, Cancel or Dismiss the ${instance.fleetFailback.mode} run on the Database modal` };
+  if (instance.fleetTransfer) return { refusal: `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it before restoring a dump`, step: 'let the database transfer finish or cancel it' };
+  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
+  return null;
+}
+
 /** Why a restore must not start while another lane holds this instance's database; null when none does. */
 function restoreAdmissionRefusal(instance: InstanceConfig): string | null {
-  if (instance.recoveryRescue) return 'A database rescue is recorded on this instance; finish or cancel it before restoring a dump';
-  if (instance.recoveryChannel) return `The recovery channel is armed on this instance (${instance.recoveryChannel.mode}); disarm it before restoring a dump`;
-  if (instance.fleetFailback) return `A ${instance.fleetFailback.mode} run is recorded on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before restoring a dump`;
-  if (instance.fleetTransfer) return `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it before restoring a dump`;
-  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return 'A standby seed is running on this instance; wait for it before restoring a dump';
-  return null;
+  return restoreAdmissionBlock(instance)?.refusal ?? null;
+}
+
+/** A restore retry as a fence remedy, after the step a restore would first refuse on. */
+function restoreRetryRemedy(instance: InstanceConfig): string {
+  const block = restoreAdmissionBlock(instance);
+  return block ? `${block.step}, then run a restore again to retry the lift` : 'running a restore again retries the lift';
 }
 
 /**
@@ -1093,6 +1127,18 @@ export async function restoreFleetBackup(
   const nameOf = (id: string) => containerManager.getBot(id)?.displayName || id;
   let fenced = false;
   let sidecarStartedAlone = false;
+  // The answer names the state after the second attempt, so the finally has no lift left to change it.
+  const finalLift = async (): Promise<'lifted' | 'stripped' | 'failed'> => {
+    let result = await liftAndTrack(botId, fleetDb);
+    if (result !== 'lifted') {
+      const retry = await liftAndTrack(botId, fleetDb);
+      // A strip that landed stays in the file, so a failed second strip does not undo it.
+      if (retry === 'failed' && result === 'stripped') setStuck(botId, fleetDb, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+      else result = retry;
+    }
+    fenced = false;
+    return result;
+  };
 
   // Before the drop nothing was restored: bring back what was stopped, and stop a sidecar this lane started alone.
   const undo = async (): Promise<string> => {
@@ -1183,19 +1229,19 @@ export async function restoreFleetBackup(
     foreignFenceSet(botId, fleetDb.containerName);
     if (!fence.ok) {
       // A half-applied fence must not survive the refusal. Only a LIVE lift
-      // clears it; 'stripped' cleans the persisted copy alone, so the finally
-      // must keep retrying and the operator must hear about the read-only risk.
-      const cleared = await liftAndTrack(botId, fleetDb);
-      if (cleared === 'lifted') fenced = false;
+      // clears it; 'stripped' cleans the persisted copy alone, so the operator
+      // must hear about the read-only risk.
+      const cleared = await finalLift();
       const note = await undo();
-      const fenceWarning = cleared === 'lifted' ? '' : '; the database may be READ-ONLY until its container restarts';
+      const fenceWarning = cleared === 'lifted' ? ''
+        : cleared === 'stripped' ? '; the database may be READ-ONLY until its container restarts'
+          : '; the database may stay READ-ONLY (a fence that could not be lifted or stripped survives a restart; running a restore again retries the lift)';
       return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${fenceWarning}${note}`, steps };
     }
 
     // A refusal past the fence lifts it and brings back what was stopped; only then has it changed nothing.
     const refuse = async (refused: string, detail: string) => {
-      const cleared = await liftAndTrack(botId, fleetDb);
-      fenced = cleared !== 'lifted';
+      const cleared = await finalLift();
       const note = await undo();
       return { success: false, error: `${refused}${note ? '' : ', and nothing was changed'}: ${detail}${liftNote(cleared)}${note}`, steps };
     };
@@ -1384,8 +1430,7 @@ export async function restoreFleetBackup(
     // 8. Lift the fence BEFORE the restarts, so instances come back to a
     // writable database. 'stripped' cleans only the persisted copy: the LIVE
     // cluster stays read-only until its container restarts.
-    const lift = await liftAndTrack(botId, fleetDb);
-    fenced = lift !== 'lifted';
+    const lift = await finalLift();
     if (lift !== 'lifted') {
       console.error(`[FleetBackup] Restore fence on ${fleetDb.containerName}: ${lift === 'stripped'
         ? 'live lift failed; auto.conf stripped, the database stays read-only until its container restarts'
@@ -1405,7 +1450,7 @@ export async function restoreFleetBackup(
     }
     const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';
 
-    if (lift !== 'lifted') return { success: false, error: `Restored, but the write fence could not be lifted live: the database is READ-ONLY until its container restarts (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
+    if (lift !== 'lifted') return { success: false, error: `Restored, but ${lift === 'stripped' ? 'the write fence could not be lifted live: the database is READ-ONLY until its container restarts' : 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift'} (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
     const warning = `${termWarning}${noticeWarning}${startWarning}`;
     return { success: true, ...(warning ? { warning: warning.slice(2) } : {}), steps };
   } finally {

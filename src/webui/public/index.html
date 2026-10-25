@@ -3916,6 +3916,16 @@
       const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
       const ownParkedReseed = !!(r.parkedSeed && r.parkedSeed.purpose === 'reseed-standby' && !r.parkedSeed.cancelled);
       const wholeParkedReseed = ownParkedReseed && r.parkedSeed.copyWhole === true;
+      // What the automatic re-seed will still do: the attempts left and the next time, or why none will fire or succeed.
+      const outlook = r.autoReseedOutlook || null;
+      const noBlock = !!(facts && facts.copyBlockPresent === false);
+      const autoReseedText = outlook && outlook.none
+        ? `The automatic re-seed will not run: ${escapeHtml(outlook.none)}.`
+        : noBlock
+        ? `This node holds no copy block for the primary (only a designated backup receives one), so the automatic re-seed cannot succeed: remove the replica and provision it again from the copy block on the primary's Database modal.`
+        : outlook
+        ? `The manager re-seeds it automatically from the copy block the bot holds${facts ? '' : `, if it holds one (the bot facts are unread, so this cannot be confirmed)`}: ${outlook.remaining} attempt${outlook.remaining === 1 ? '' : 's'} left, the next ${!outlook.nextAt || outlook.nextAt <= Date.now() ? 'at its next check' : 'from ' + new Date(outlook.nextAt).toLocaleString()}.`
+        : '';
       // A stand-in's own slot fact describes the master it covers, stale for
       // minutes after that master died; every remedy it would name is refused.
       const slotHtml = standingIn
@@ -3949,7 +3959,7 @@
         : slot.sourceIsCurrentMaster === false
         ? `<div class="error-message">This copy follows a primary that is no longer the fleet's master, so it protects a database the fleet has left. <b>Re-seed now</b> repoints it at the current primary; the whole copy is rebuilt, because the replication credential rotated with the handover.</div>`
         : slot.lost
-          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. ${stopped ? 'Re-seeding it has stopped after repeated failures; see below.' : 'The manager re-seeds it automatically from the copy block the bot holds.'}</div>`
+          ? `<div class="error-message">The primary reports slot <b>${escapeHtml(slot.slotName)}</b> as <b>lost</b> (its retained WAL passed the bound): this copy can never catch up. ${autoReseedText}</div>`
           : slot.walStatus === 'absent'
             ? `<div class="error-message">The primary has no replication slot named <b>${escapeHtml(slot.slotName)}</b> any more: this copy cannot resume streaming. Remove the replica and provision it again.</div>`
             : slot.walStatus === 'unreserved'
@@ -3967,7 +3977,7 @@
       const ledgerHtml = !led
         ? ''
         : led.lastError
-          ? `<div class="error-message">${ledWho} attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${stopped ? ' It has stopped after repeated failures; fix the cause, then use Re-seed now.' : cancelled ? ' It was cancelled, so nothing retries it; use Re-seed now when you want it.' : (slot && slot.lost) || (ownParkedReseed && !wholeParkedReseed) ? ' It retries periodically until it succeeds.' : wholeParkedReseed ? ' The copy it built is complete and on record, so the automatic re-seed does not retry it.' : ''}</div>`
+          ? `<div class="error-message">${ledWho} attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${stopped ? ' It has stopped after repeated failures; fix the cause, then use Re-seed now.' : cancelled ? ' It was cancelled, so nothing retries it; use Re-seed now when you want it.' : wholeParkedReseed ? ' The copy it built is complete and on record, so the automatic re-seed does not retry it.' : (slot && slot.lost) || ownParkedReseed ? ' ' + autoReseedText : ''}</div>`
           : led.lastSuccessAt
             ? `<div class="env-tip">Last re-seed completed at ${new Date(led.lastSuccessAt).toLocaleString()}.</div>`
             : `<div class="env-tip">${ledWho} attempt ${led.attempts} started at ${new Date(led.lastAttemptAt).toLocaleString()}.</div>`;

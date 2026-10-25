@@ -844,6 +844,15 @@ export function updateInstanceFleetRestoreError(botId: string, notice: { file: s
   saveRegistry(registry);
 }
 
+export function updateInstanceFleetOwnDbRetired(botId: string, at: string): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  instance.fleetOwnDbRetiredAt = at;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceFleetLastPosture(botId: string, record: InstanceConfig['fleetLastPosture'] | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -963,6 +972,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   // The seed record and any transfer run are about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
   delete stored.fleetTransfer;
+  delete stored.fleetOwnDbRetiredAt;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   const live = getBot(botId);
@@ -971,6 +981,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
     delete live.fleetTransfer;
+    delete live.fleetOwnDbRetiredAt;
   }
   // A standby deployed before the app depended on it: order compose down now,
   // so the restart this adopt asks for stops the app before its database.
@@ -4553,10 +4564,12 @@ function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord): void {
   const inst = registry.instances[instance.id];
   if (inst) {
     inst.fleetDb = record;
+    delete inst.fleetOwnDbRetiredAt;
     inst.updatedAt = new Date().toISOString();
     saveRegistry(registry);
   }
   instance.fleetDb = record;
+  delete instance.fleetOwnDbRetiredAt;
 }
 
 function buildGitInstance(instance: InstanceConfig, emit: EmitFn, isCasaOS: boolean): Promise<LaneResult> {

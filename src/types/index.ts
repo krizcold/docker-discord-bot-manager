@@ -350,6 +350,7 @@ export interface InstanceConfig {
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   fleetTransfer?: FleetTransferRun;    // seed-first transfer in flight or parked (20.19 F21); cleared when the promote is handed to the app
   fleetFailback?: FleetFailbackRun;    // failback or drop-back run in flight or parked (20.5, B6-i); cleared when it finishes, is cancelled or dismissed
+  fleetOwnDbRetiredAt?: string;       // ISO time a re-seed as a stale primary retired this machine's own fleet database; cleared when a database record is stamped or a standby is adopted as the primary
   fleetLastPosture?: { posture: import('../instance/appLifecycle').StandInPosture | null; readAt: number }; // the stand-in posture the bot last answered; absent until one was read
   fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it
   copyBlockRetract?: { host: string; port: number; since: string }; // a Disable or decommission whose bot has not confirmed it dropped the copy block naming this endpoint; cleared once it does

@@ -227,6 +227,22 @@ function ledgerFailure(botId: string, error: string): void {
   patchLedger(botId, current => (current ? { ...current, lastError: error } : undefined));
 }
 
+/** Record that a re-seed retired this machine's own database; a refused save leaves Provision's role gate in force. */
+function markOwnDbRetired(botId: string): void {
+  try {
+    containerManager.updateInstanceFleetOwnDbRetired(botId, new Date().toISOString());
+  } catch (error) {
+    console.warn(`[FleetReplica] ${botId}: could not record that its own database was retired: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** Retire this node's stale database for a re-seed; a removed volume opens Provision's role gate even when the retire then failed. */
+export async function retireStaleOwnDb(botId: string): Promise<Awaited<ReturnType<typeof containerManager.retireFleetDbSidecar>>> {
+  const retired = await containerManager.retireFleetDbSidecar(botId);
+  if (retired.success || retired.volumeRemoved) markOwnDbRetired(botId);
+  return retired;
+}
+
 /** Record that this standby's copy is gone (or back), for readers that outlive the seed record. */
 function setCopyCleared(botId: string, cleared: boolean): void {
   const rec = containerManager.getBot(botId)?.fleetDbReplica;
@@ -257,6 +273,23 @@ function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, co
     return;
   }
   saveSeed(botId, { parked: true, cancelRequested: false, cancelled: true, lastError: what });
+}
+
+/** What the automatic re-seed will still do for this standby: the attempts left and when the next may fire, or why none will. */
+export function autoReseedOutlook(instance: InstanceConfig, now: number = Date.now()): FleetReplicaAutoReseedOutlook {
+  const ledger = instance.fleetDbReplica?.autoReseed;
+  const attempts = ledger?.attempts ?? 0;
+  if (attempts >= AUTO_RESEED_MAX_ATTEMPTS) return { remaining: 0, nextAt: null, none: `it stopped after ${attempts} attempts; fix the cause, then use Re-seed now` };
+  if (instance.fleetDbReplicaSeed?.cancelled === true) return { remaining: 0, nextAt: null, none: 'the last re-seed was cancelled, so nothing retries it; use Re-seed now when you want it' };
+  if (instance.fleetFailback) return { remaining: 0, nextAt: null, none: `a ${instance.fleetFailback.mode} run holds this copy, so the automatic re-seed does not run until that run ends` };
+  return { remaining: AUTO_RESEED_MAX_ATTEMPTS - attempts, nextAt: ledger ? Math.max(now, ledger.lastAttemptAt + AUTO_RESEED_SPACING_MS) : now, none: null };
+}
+
+export interface FleetReplicaAutoReseedOutlook {
+  remaining: number;
+  nextAt: number | null;
+  /** Why no automatic attempt will fire; null while one may. */
+  none: string | null;
 }
 
 /** Whether the automatic re-seed may fire for this standby: under the cap and past the spacing. */
@@ -384,6 +417,8 @@ export interface FleetReplicaStatus {
   autoReseed?: FleetReplicaAutoReseedLedger;
   /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
   autoReseedStopped?: boolean;
+  /** The automatic attempts left and the next one's time, or why none will fire. */
+  autoReseedOutlook?: FleetReplicaAutoReseedOutlook;
   lastError?: string;
   /** The standby could not be read (live stays absent): the last line docker or psql gave. */
   probeError?: string;
@@ -438,6 +473,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
     status.autoReseed = rec.autoReseed;
     status.autoReseedStopped = rec.autoReseed.attempts >= AUTO_RESEED_MAX_ATTEMPTS;
   }
+  status.autoReseedOutlook = autoReseedOutlook(instance);
   status.record = {
     containerName: rec.containerName,
     publicHost: rec.publicHost,
@@ -659,7 +695,9 @@ export function provisionFleetReplica(
   // machine's own database (a decline recorded at seeding or later): the node
   // still follows another node's database by posture, and this lane is the
   // by-hand exit the run's park text names. The settle clears the decline.
-  const afterRetire = instance.fleetFailbackDeclined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(instance.fleetFailbackDeclined.phase);
+  // A re-seed as a stale primary that retired this machine's own database leaves the same posture, run or no run.
+  const afterRetire = (instance.fleetFailbackDeclined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(instance.fleetFailbackDeclined.phase))
+    || (!!instance.fleetOwnDbRetiredAt && !instance.fleetDb);
   if (!inRun && !afterRetire && !controlPlane.roleEnv.dialsOut.includes(folded)) {
     return { success: false, error: `A replica belongs beside a fleet worker (set ${controlPlane.roleEnv.key} to ${controlPlane.roleEnv.dialsOut.join(' or ')} first)` };
   }
@@ -1367,7 +1405,7 @@ export function reseedStalePrimary(
       // The dump above takes minutes, so a cancel filed during it is honoured
       // here, with the sidecar running and the record intact.
       throwIfCancelled(instance.id);
-      const retired = await containerManager.retireFleetDbSidecar(instance.id);
+      const retired = await retireStaleOwnDb(instance.id);
       if (!retired.success) {
         if (retired.volumeRemoved) {
           fenced = false;

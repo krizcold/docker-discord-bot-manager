@@ -27,8 +27,10 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 import { probeErrorTail } from '../config/secretText';
+import { readStandInPosture, StandInRead } from './appLifecycle';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
+const FACTS_TIMEOUT_MS = 10_000;
 const REFIRE_GUARD_MS = 23 * 60 * 60 * 1000; // prevents double-fire within the hour window
 const DUMP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
@@ -41,6 +43,10 @@ let intervalHandle: ReturnType<typeof setInterval> | null = null;
 const lastAttempts: Map<string, number> = new Map();
 // Last dump error per instance (in-memory, surfaced on the bot card)
 const lastErrors: Map<string, string> = new Map();
+// A standby copy that has left recovery, or stands in (read-only too), is dumped under this prefix.
+const COPY_PREFIX = 'standin-';
+const lastCopyAttempts: Map<string, number> = new Map();
+const copyErrors: Map<string, string> = new Map();
 // A stuck restore write fence, tracked apart from lastErrors: a read-only
 // database still DUMPS successfully, so the nightly dump's success would wipe
 // a warning parked in the shared slot while the fence still stands.
@@ -522,9 +528,10 @@ export function isValidFleetBackupKeep(keep: unknown): keep is number {
  * dump just written. When any dump is dated in the future (a clock step
  * back), every dump is kept. The keep
  * is the larger of the tick's and the one stored now, so a Keep raised during
- * the dump holds.
+ * the dump holds. The primary's dumps and the copy's standin- dumps are
+ * trimmed apart, each to the newest `keep` of its own.
  */
-function trimFleetBackups(botId: string, tickKeep: number, justWritten: string): void {
+function trimFleetBackups(botId: string, tickKeep: number, justWritten: string, family: '' | typeof COPY_PREFIX = ''): void {
   const dir = backupDir(botId);
   let trimmable: Array<{ file: string }>;
   let keep: number;
@@ -543,7 +550,8 @@ function trimFleetBackups(botId: string, tickKeep: number, justWritten: string):
       console.warn(`[FleetBackup] Kept every dump for ${botId}: a dump is dated in the future, so the clock may have stepped back`);
       return;
     }
-    trimmable = all.filter(f => !f.file.startsWith('pre-') && f.file !== target && f.file !== justWritten);
+    trimmable = all.filter(f => !f.file.startsWith('pre-') && f.file.startsWith(COPY_PREFIX) === (family === COPY_PREFIX)
+      && f.file !== target && f.file !== justWritten);
   } catch (err) {
     console.warn(`[FleetBackup] Kept every dump for ${botId}: ${err}`);
     return;
@@ -578,13 +586,20 @@ export async function runFleetDump(
 ): Promise<{ success: boolean; file?: string; error?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'No fleet database record' };
+  return dumpDatabase(instance.id, fleetDb, prefix);
+}
 
+async function dumpDatabase(
+  botId: string,
+  fleetDb: { containerName: string; user: string; db: string },
+  prefix: string
+): Promise<{ success: boolean; file?: string; error?: string }> {
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running') };
   }
 
-  const dir = backupDir(instance.id);
+  const dir = backupDir(botId);
   ensurePrivateDir(dir);
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -670,33 +685,127 @@ async function runScheduledDump(instance: InstanceConfig): Promise<void> {
   }
 }
 
+/** When the newest standin- dump was written; null when there is none. Throws when the folder cannot be read. */
+function lastCopyDump(botId: string): { file: string; mtime: number } | null {
+  return listFleetBackups(botId).find(f => f.file.startsWith(COPY_PREFIX)) ?? null;
+}
+
+/** The copy's scheduled-dump state for its banner; null for an instance without a standby copy. */
+export function copyBackupInfo(instance: InstanceConfig): {
+  enabled: boolean; hour: number; keep: number; lastAt: number | null; lastFile: string | null; stale: boolean; lastError: string | null; listError: string | null;
+} | null {
+  if (!instance.fleetDbReplica) return null;
+  const config = effectiveFleetBackup(instance);
+  let last: { file: string; mtime: number } | null = null;
+  let listError: string | null = null;
+  try {
+    last = lastCopyDump(instance.id);
+  } catch (err: any) {
+    listError = `${err?.message || err}, so the last dump of this copy cannot be named`;
+  }
+  return {
+    enabled: config.enabled,
+    hour: config.hour,
+    keep: config.keep,
+    lastAt: last ? last.mtime : null,
+    lastFile: last ? last.file : null,
+    stale: !!last && Date.now() - last.mtime > STALE_AFTER_MS,
+    lastError: copyErrors.get(instance.id) ?? null,
+    listError,
+  };
+}
+
+/** true when the copy takes writes (out of recovery), false while it follows a primary; an error when it cannot be read. */
+async function copyTakesWrites(rec: { containerName: string; user: string; db: string }): Promise<{ writes: boolean } | { error: string }> {
+  const probe = await execDocker(['exec', rec.containerName, 'psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery()']);
+  const answer = probe.stdout.trim();
+  if (probe.ok && (answer === 't' || answer === 'f')) return { writes: answer === 'f' };
+  return { error: probe.ok ? 'unexpected answer from the copy' : probeErrorTail(probe.stderr) || 'no answer from the copy' };
+}
+
+/**
+ * A copy still in recovery is dumped while it stands in live (its primary is gone, so it may be the only copy left)
+ * and while the app does not answer, since a stand-in cannot then be ruled out.
+ */
+function copyMayBeAlone(read: StandInRead): boolean {
+  if (read.read === 'unanswered') return true;
+  return read.read === 'ok' && read.posture?.role === 'stand-in' && read.posture.live === true;
+}
+
+async function runScheduledCopyDump(instance: InstanceConfig): Promise<void> {
+  const rec = instance.fleetDbReplica;
+  if (!rec || rec.copyCleared) return;
+  if (instance.fleetDbReplicaSeed && !instance.fleetDbReplicaSeed.parked) return;
+  let last = 0;
+  try { last = lastCopyDump(instance.id)?.mtime ?? 0; } catch { /* an unreadable folder fails the dump below, which reports it */ }
+  if (Date.now() - Math.max(lastCopyAttempts.get(instance.id) || 0, last) < REFIRE_GUARD_MS) return;
+  lastCopyAttempts.set(instance.id, Date.now());
+  if (!rec.user || !rec.db) {
+    copyErrors.set(instance.id, 'the standby record has no database identity, so whether this copy takes writes could not be read and no scheduled dump of it ran');
+    return;
+  }
+  const target = { containerName: rec.containerName, user: rec.user, db: rec.db };
+  busy.add(instance.id);
+  try {
+    const role = await copyTakesWrites(target);
+    if ('error' in role) {
+      copyErrors.set(instance.id, `could not read whether this copy takes writes (${role.error}), so no scheduled dump of it ran`);
+      console.error(`[FleetBackup] Could not read the role of the copy for ${instance.displayName} (${instance.id}): ${role.error}`);
+      return;
+    }
+    if (!role.writes && !copyMayBeAlone(await readStandInPosture(instance, FACTS_TIMEOUT_MS))) {
+      copyErrors.delete(instance.id);
+      lastCopyAttempts.delete(instance.id);
+      return;
+    }
+    const result = await dumpDatabase(instance.id, target, COPY_PREFIX);
+    if (result.success) {
+      copyErrors.delete(instance.id);
+      trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!, COPY_PREFIX);
+      console.log(`[FleetBackup] Dumped the copy of ${instance.displayName} (${instance.id}) -> ${result.file}`);
+    } else {
+      copyErrors.set(instance.id, result.error || 'unknown error');
+      console.error(`[FleetBackup] Dump of the copy failed for ${instance.displayName} (${instance.id}): ${result.error}`);
+    }
+  } finally {
+    busy.delete(instance.id);
+  }
+}
+
 async function runFleetBackupTick(): Promise<void> {
   const fault = containerManager.registryFault();
   if (fault) { console.warn(`[FleetBackup] Tick skipped: ${fault}`); return; }
   await reprobeStuckFences();
   const currentHour = new Date().getHours();
   for (const instance of containerManager.getAllBots()) {
-    if (!instance.fleetDb || busy.has(instance.id)) continue;
     const config = effectiveFleetBackup(instance);
     if (!config.enabled || currentHour !== config.hour) continue;
-    // A broken store would silently unscope the dump guard and stop the
-    // nightly safety net with no surfaced signal; record the stoppage loudly.
-    const scopeCheck = backupScopeUnverifiable(instance);
-    if (scopeCheck.corrupt || scopeCheck.urlUndecryptable) {
-      lastErrors.set(instance.id, scopeCheck.corrupt
-        ? 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope'
-        : 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope');
-      console.error(`[FleetBackup] Skipping the scheduled dump for ${instance.displayName} (${instance.id}): env store unreadable or the database URL undecryptable`);
-      continue;
+    if (instance.fleetDb && !busy.has(instance.id)) await runScheduledPrimaryDump(instance);
+    if (instance.fleetDbReplica && !busy.has(instance.id)) {
+      const fresh = containerManager.getBot(instance.id);
+      if (fresh) await runScheduledCopyDump(fresh);
     }
-    if (!isFleetBackupScoped(instance)) continue;
-
-    const last = Math.max(lastAttempts.get(instance.id) || 0, instance.lastFleetBackupAt || 0);
-    if (Date.now() - last < REFIRE_GUARD_MS) continue;
-
-    lastAttempts.set(instance.id, Date.now());
-    await runScheduledDump(instance);
   }
+}
+
+async function runScheduledPrimaryDump(instance: InstanceConfig): Promise<void> {
+  // A broken store would silently unscope the dump guard and stop the
+  // nightly safety net with no surfaced signal; record the stoppage loudly.
+  const scopeCheck = backupScopeUnverifiable(instance);
+  if (scopeCheck.corrupt || scopeCheck.urlUndecryptable) {
+    lastErrors.set(instance.id, scopeCheck.corrupt
+      ? 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope'
+      : 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope');
+    console.error(`[FleetBackup] Skipping the scheduled dump for ${instance.displayName} (${instance.id}): env store unreadable or the database URL undecryptable`);
+    return;
+  }
+  if (!isFleetBackupScoped(instance)) return;
+
+  const last = Math.max(lastAttempts.get(instance.id) || 0, instance.lastFleetBackupAt || 0);
+  if (Date.now() - last < REFIRE_GUARD_MS) return;
+
+  lastAttempts.set(instance.id, Date.now());
+  await runScheduledDump(instance);
 }
 
 /**

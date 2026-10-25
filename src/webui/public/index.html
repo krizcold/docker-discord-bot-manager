@@ -2882,6 +2882,42 @@
       return seed && seed.safetyDump ? `<div class="env-tip">A safety dump of this database, taken under a write fence, is kept with the backups as ${escapeHtml(seed.safetyDump)}.</div>` : '';
     }
 
+    // A copy that takes writes or stands in is dumped on the instance's schedule as standin-*.dump; since is when it
+    // began taking writes or standing in, when known. Mode 'data' words it for a read-only stand-in; 'failure' shows the failures alone.
+    function copyDumpHtml(info, since, mode) {
+      if (!info) return '';
+      const failed = (info.lastError ? `<div class="error-message">The last scheduled dump of this copy did not complete: ${escapeHtml(info.lastError)}.</div>` : '')
+        + (info.listError ? `<div class="error-message">${escapeHtml(info.listError)}.</div>` : '');
+      if (mode === 'failure') return failed;
+      const readOnly = mode === 'data';
+      if (!info.enabled && info.lastAt) return `${failed}<div class="error-message">Last dump of this copy: ${escapeHtml(new Date(info.lastAt).toLocaleString())} (${escapeHtml(info.lastFile || '')}). Scheduled dumps are off for this instance, so no further dumps run${readOnly ? '' : ' and the writes this copy took since then are in no dump'}.</div>`;
+      if (!info.enabled && info.listError) return `${failed}<div class="error-message">Scheduled dumps are off for this instance, so no further dumps run.</div>`;
+      if (!info.enabled) return `${failed}<div class="error-message">Scheduled dumps are off for this instance, so ${readOnly ? 'the data this copy holds is in no dump this manager keeps' : 'the writes this copy takes are in no dump'}.</div>`;
+      const next = `the next scheduled dump runs at ${String(info.hour).padStart(2, '0')}:00`;
+      if (info.lastAt) {
+        const when = escapeHtml(new Date(info.lastAt).toLocaleString());
+        return failed + (info.stale
+          ? `<div class="error-message">Last dump of this copy: ${when} (${escapeHtml(info.lastFile || '')}), more than 36 hours ago; ${readOnly ? 'this manager keeps no newer dump of the data this copy holds' : 'the writes it took since then are in no dump'}.</div>`
+          : `<div class="env-tip">Last dump of this copy: ${when} (${escapeHtml(info.lastFile || '')}); ${next}.</div>`);
+      }
+      if (info.listError) return `${failed}<div class="env-tip">The next scheduled dump runs at ${String(info.hour).padStart(2, '0')}:00.</div>`;
+      return failed + (since && Date.now() - since > 36 * 60 * 60 * 1000
+        ? (readOnly
+          ? `<div class="error-message">No dump of this copy yet, and it has stood in since ${escapeHtml(new Date(since).toLocaleString())}; the data this copy holds is in no dump this manager keeps.</div>`
+          : `<div class="error-message">No dump of this copy yet, and it has taken writes since ${escapeHtml(new Date(since).toLocaleString())}; those writes are in no dump.</div>`)
+        : `<div class="env-tip">No dump of this copy yet; ${next}.</div>`);
+    }
+
+    // The copy's dump line: shown while the copy is out of recovery or stands in live, and whenever its last scheduled dump failed.
+    function copyDumpLineHtml(r, standing, info) {
+      const live = (r && r.live) || {};
+      const writes = live.running === true && live.inRecovery === false;
+      const standsIn = !!(standing && standing.role === 'stand-in' && standing.live);
+      if (writes) return copyDumpHtml(info, standing && standing.role === 'stand-in' && standing.holdsWrites ? standing.since : null);
+      if (standsIn) return copyDumpHtml(info, standing.since, 'data');
+      return info && info.lastError ? copyDumpHtml(info, null, 'failure') : '';
+    }
+
     function seedWarningHtml(warning) {
       return warning ? `<div class="error-message">${escapeHtml(warning)}</div>` : '';
     }
@@ -3816,6 +3852,7 @@
       const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
       const isCopy = !!(r.live && r.live.inRecovery === true);
       const transferHtml = (appHooks && isCopy && !runLive && !runHeld) ? replicaTransferHtml(botId, facts, factsError) : '';
+      const copyDumpLine = copyDumpLineHtml(r, standing, res.copyBackup);
       // The re-seed ledger (20.14): who asked last, why it stopped, or when it last ran.
       const ledWho = led && led.trigger === 'operator' ? 'Re-seed now' : 'Automatic re-seed';
       const ledgerHtml = !led
@@ -3841,6 +3878,7 @@
         <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
         ${consentHtml}
         ${stateHtml}
+        ${copyDumpLine}
         ${standInBlockHtml}
         ${slotHtml}
         ${ledgerHtml}

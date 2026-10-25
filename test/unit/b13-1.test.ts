@@ -20,7 +20,7 @@ const pageFunction = (name: string): string => {
   }
 };
 const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml', 'transferPhaseText', 'failbackRunHtml', 'seedAfterRetire']
-  .concat(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText'].filter((n) => pageHtml.includes(`function ${n}(`)));
+  .concat(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText', 'copyDumpHtml', 'copyDumpLineHtml'].filter((n) => pageHtml.includes(`function ${n}(`)));
 
 const record = { primaryHost: 'p.example', primaryPort: 15432, publicHost: 'h.example', hostPort: 15433 };
 const liveCopy = { running: true, inRecovery: true, receiverStatus: 'streaming', caughtUp: true };

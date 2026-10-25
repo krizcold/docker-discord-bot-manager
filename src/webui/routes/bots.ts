@@ -1822,7 +1822,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         if (built.success && built.dsn && built.cert) block = { dsn: built.dsn, cert: built.cert };
         else blockError = built.error ?? 'block unavailable';
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

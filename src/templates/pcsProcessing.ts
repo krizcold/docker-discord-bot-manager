@@ -273,6 +273,8 @@ export function processComposeForCasaOS(
     sidecarInjected = true;
   }
 
+  if (mainServiceName) yieldAppContainerName(services, mainServiceName, appName);
+
   // Known infrastructure service names that get low cpu_shares (10)
   const infraServiceNames = new Set(['redis', 'postgres', 'db', 'mongo', 'mongodb', 'mariadb', 'mysql', 'lavalink']);
 
@@ -652,6 +654,7 @@ export function processComposeForCasaOS(
   const networkNotes = namespaceNamedNetworks(compose, appName);
 
   // ── Single stringify ──
+  assertUniqueContainerNames(services);
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected, networkNotes };
 }
 
@@ -762,6 +765,45 @@ function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: stri
     }
   }
   return volume;
+}
+
+/**
+ * The main service takes the app name as its container name, so any other
+ * service holding it moves to <appName>-<service key>, and a container:<name>
+ * reference to it follows.
+ */
+function yieldAppContainerName(services: Record<string, Record<string, unknown>>, mainName: string, appName: string): void {
+  let moved: string | undefined;
+  for (const [key, service] of Object.entries(services)) {
+    if (key === mainName || !service || typeof service !== 'object' || service.container_name !== appName) continue;
+    moved = `${appName}-${key}`;
+    service.container_name = moved;
+  }
+  if (!moved) return;
+  const to = moved;
+  const follow = (ref: unknown): unknown => {
+    if (typeof ref !== 'string') return ref;
+    const m = /^container:([^:]+)(:.*)?$/.exec(ref);
+    return m && m[1] === appName ? `container:${to}${m[2] ?? ''}` : ref;
+  };
+  for (const [key, service] of Object.entries(services)) {
+    if (key === mainName || !service || typeof service !== 'object') continue;
+    for (const field of ['network_mode', 'ipc', 'pid']) {
+      if (service[field] !== undefined) service[field] = follow(service[field]);
+    }
+    if (Array.isArray(service.volumes_from)) service.volumes_from = (service.volumes_from as unknown[]).map(follow);
+  }
+}
+
+function assertUniqueContainerNames(services: Record<string, Record<string, unknown>>): void {
+  const owner = new Map<string, string>();
+  for (const [key, service] of Object.entries(services)) {
+    const name = service && typeof service === 'object' ? service.container_name : undefined;
+    if (typeof name !== 'string' || !name) continue;
+    const other = owner.get(name);
+    if (other) throw new Error(`Services "${other}" and "${key}" would both get the container name "${name}"; give one of them another container_name in the compose file.`);
+    owner.set(name, key);
+  }
 }
 
 /**
@@ -1157,6 +1199,7 @@ export function processComposeForDocker(
 
   capServiceLogs(services);
   const networkNotes = namespaceNamedNetworks(compose, appName);
+  assertUniqueContainerNames(services);
   return { content: stringify(compose, { lineWidth: 0 }), sidecarInjected: false, droppedGatewayBinds, networkNotes };
 }
 

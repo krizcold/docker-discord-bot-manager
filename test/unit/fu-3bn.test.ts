@@ -105,8 +105,9 @@ describe('FU-3bn a named compose gets per-instance container names too', () => {
     it(`${mode} mode: two instances of the source share no container name`, () => {
       const one = names(deployed(named, 'coolbot', mode)).filter(n => n !== 'musicdb');
       const two = names(deployed(named, 'second', mode)).filter(n => n !== 'musicdb');
-      expect(one.length).toBe(3);
-      expect(two.length).toBe(3);
+      const count = mode === 'casaos' ? 4 : 3;
+      expect(one.length).toBe(count);
+      expect(two.length).toBe(count);
       for (const n of one) expect(two).not.toContain(n);
     });
 

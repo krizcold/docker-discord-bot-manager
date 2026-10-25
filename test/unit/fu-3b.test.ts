@@ -179,7 +179,7 @@ describe('B15-3n a compose with no top-level name gets per-instance container na
       expect(app.volumes_from).toEqual(['container:one-vpn:ro', 'container:one-vpn', 'gluetun', 'container:other']);
     });
 
-    it(`${mode} mode: a service only on fixed-name networks keeps its container name and gets no alias`, () => {
+    it(`${mode} mode: a fixed-name network named per instance carries the alias, a platform network does not`, () => {
       const compose = [
         'services:',
         '  db:',
@@ -193,12 +193,13 @@ describe('B15-3n a compose with no top-level name gets per-instance container na
         '  backend:',
         '    name: shared-backend',
         '  default:',
-        '    name: shared-default',
+        '    name: dbm_internal',
         '',
       ].join('\n');
       const doc = processed(compose, 'one', mode);
-      expect(doc.services.db.container_name).toBe('musicdb');
-      expect(doc.services.db.networks.backend?.aliases).toBeUndefined();
+      expect(doc.networks.backend.name).toBe('one_backend');
+      expect(doc.services.db.container_name).toBe('one-musicdb');
+      expect(doc.services.db.networks.backend.aliases).toEqual(['musicdb']);
       expect(doc.services.cache.container_name).toBe('musiccache');
       expect(doc.services.cache.networks?.default?.aliases).toBeUndefined();
     });

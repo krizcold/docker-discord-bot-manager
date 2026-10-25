@@ -245,10 +245,8 @@ export function processComposeForCasaOS(
 
   // ── Ensure name field ──
   delete compose.version;
-  if (!compose.name) {
-    scopeContainerNames(compose, appName);
-    compose.name = appName;
-  }
+  scopeContainerNames(compose, appName);
+  if (!compose.name) compose.name = appName;
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) {
@@ -767,22 +765,27 @@ function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: stri
 }
 
 /**
- * A compose with no top-level name gets no name substitution, so a fixed
- * container_name would be shared by every instance of the source and the second
- * one would fail to start. Each one not already scoped to this instance is
- * prefixed with the app name, and the repo's name stays resolvable as an alias
- * on the project's own networks (never on an external or fixed-name one, where
- * instances meet). A service with none of those networks keeps its name, since
- * nothing would carry the alias. A `container:<name>` reference follows the rename.
+ * A fixed container_name the name substitution did not scope (any in a compose
+ * with no top-level name; in a named one, any without the compose name) would be
+ * shared by every instance of the source and the second one would fail to start.
+ * Each one not already scoped to this instance is prefixed with the app name, and
+ * the repo's name stays resolvable as an alias on the project's own networks,
+ * which namespaceNamedNetworks keeps per instance; never on an external or
+ * platform network, where instances meet. A service with none of those networks
+ * keeps its name, since nothing would carry the alias. A `container:<name>`
+ * reference follows the rename.
  */
 function scopeContainerNames(compose: Record<string, unknown>, appName: string): void {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services || typeof services !== 'object') return;
   const declared = (compose.networks && typeof compose.networks === 'object' ? compose.networks : {}) as Record<string, unknown>;
+  const platform = platformNetworkNames();
   const projectNetwork = (net: string): boolean => {
     if (!(net in declared)) return net === 'default';
     const cfg = declared[net] as Record<string, unknown> | null;
-    return !cfg || typeof cfg !== 'object' || (!cfg.external && typeof cfg.name !== 'string');
+    if (!cfg || typeof cfg !== 'object') return true;
+    if (cfg.external) return false;
+    return typeof cfg.name !== 'string' || !(platform.includes(cfg.name) || platform.includes(net));
   };
   const renamed = new Map<string, string>();
   for (const [key, service] of Object.entries(services)) {
@@ -982,10 +985,8 @@ export function processComposeForDocker(
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
 
   delete compose.version;
-  if (!compose.name) {
-    scopeContainerNames(compose, appName);
-    compose.name = appName;
-  }
+  scopeContainerNames(compose, appName);
+  if (!compose.name) compose.name = appName;
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) {
@@ -2911,6 +2912,15 @@ function mkdirForApp(dirPath: string, log?: (msg: string) => void): void {
 
 // ─── Volume Directory Creation ─────────────────────────────────────────────
 
+function ownedByOther(dirPath: string): boolean {
+  try {
+    const uid = fs.lstatSync(dirPath).uid;
+    return uid !== 0 && uid !== parseInt(getPCSEnvironment().PUID, 10);
+  } catch {
+    return true;
+  }
+}
+
 /**
  * Ensure a volume directory exists under AppData with platform ownership.
  * Non-recursive (contents are never re-chowned). `preserveExisting` (default)
@@ -2918,7 +2928,8 @@ function mkdirForApp(dirPath: string, log?: (msg: string) => void): void {
  * (e.g. Postgres chowning its data dir to uid 999, mode 0700) is never clobbered
  * on redeploy. `mode` lets a delivered dir a container must write to be made
  * group-writable (e.g. a Lavalink plugins dir it downloads into at startup, with
- * the PGID group from joinAppGroup).
+ * the PGID group from joinAppGroup). With preserveExisting false, an existing
+ * dir owned by neither root nor PUID still keeps its owner and mode.
  */
 function ensureVolumeDir(
   dirPath: string,
@@ -2926,7 +2937,9 @@ function ensureVolumeDir(
   preserveExisting = true,
   log?: (msg: string) => void,
 ): void {
-  if (preserveExisting && fs.existsSync(dirPath)) return;
+  if (fs.existsSync(dirPath)) {
+    if (preserveExisting || ownedByOther(dirPath)) return;
+  }
   mkdirForApp(dirPath, log);
   grantToApp(dirPath, { mode, log });
 }

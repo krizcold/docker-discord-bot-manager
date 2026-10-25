@@ -30,6 +30,7 @@ import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
+import * as fleetBackup from './fleetBackup';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -46,15 +47,64 @@ const EXEC_TIMEOUT_MS = 30_000;
 // 10/8 and 192.168/16 are real-LAN ranges and deliberately absent - traffic
 // arriving through the published port keeps its LAN source address, so listing
 // them would let off-host clients skip TLS. Everything else is hostssl with
-// scram. First match wins.
-const PG_HBA_CONTENT = `# Managed by discord-bot-manager (replication posture). Do not edit.
+// scram. First match wins. keptPlain holds the addresses outside 172.16/12 that
+// a running bot on a custom address pool may still dial its old URL from: they
+// keep non-TLS access until a start finds none of them connected that way
+// (narrowKeptPlainHba).
+export function pgHbaContent(keptPlain: string[] = []): string {
+  const kept = keptPlain.map(addr => {
+    const cidr = `${addr}/${addr.includes(':') ? 128 : 32}`;
+    return `host    all             all             ${cidr.padEnd(24)}scram-sha-256\n`;
+  }).join('');
+  return `# Managed by discord-bot-manager (replication posture). Do not edit.
 local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 host    all             all             172.16.0.0/12           scram-sha-256
-hostssl all             all             0.0.0.0/0               scram-sha-256
+${kept}hostssl all             all             0.0.0.0/0               scram-sha-256
 hostssl replication     all             0.0.0.0/0               scram-sha-256
 `;
+}
+
+function admittedWithoutTls(addr: string): boolean {
+  if (addr === '::1') return true;
+  const m = /^(?:::ffff:)?(\d+)\.(\d+)\.\d+\.\d+$/i.exec(addr);
+  if (!m) return false;
+  return Number(m[1]) === 127 || (Number(m[1]) === 172 && Number(m[2]) >= 16 && Number(m[2]) <= 31);
+}
+
+/** The addresses of live TCP clients without TLS that the narrowed pg_hba would refuse on their next connection. */
+async function plainClientsOutsidePool(containerName: string, user: string, db: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
+  const read = await psql(containerName, user, db,
+    `SELECT COALESCE(string_agg(DISTINCT host(a.client_addr), ' '), '') FROM pg_stat_activity a JOIN pg_stat_ssl s ON s.pid = a.pid WHERE a.client_addr IS NOT NULL AND NOT s.ssl;`);
+  if (!read.ok) return { ok: false, error: read.stderr.trim() };
+  const addrs = read.stdout.trim().split(/\s+/).filter(a => a !== '' && /^[0-9A-Fa-f:.]+$/.test(a) && !admittedWithoutTls(a));
+  return { ok: true, addrs: [...new Set(addrs)].sort() };
+}
+
+/**
+ * The addresses outside 172.16/12 of the project's running containers other
+ * than the sidecar: on a first Enable the bot may hold no connection at that
+ * moment (its pool closes idle ones) and still dial without TLS later.
+ */
+function ownContainersOutsidePool(projectName: string, sidecarName: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
+  return new Promise(resolve => {
+    execFile('docker', ['ps', '-q', '--filter', `label=com.docker.compose.project=${projectName}`], (psErr, psOut, psStderr) => {
+      if (psErr) return resolve({ ok: false, error: probeErrorTail(String(psStderr || psErr)) });
+      const ids = String(psOut).split('\n').map(line => line.trim()).filter(Boolean);
+      if (ids.length === 0) return resolve({ ok: true, addrs: [] });
+      execFile('docker', ['inspect', '-f', '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}', ...ids], (err, stdout, stderr) => {
+        if (err) return resolve({ ok: false, error: probeErrorTail(String(stderr || err)) });
+        const addrs = String(stdout).split('\n').flatMap(line => {
+          const [name, ...rest] = line.trim().split(/\s+/);
+          if (!name || name.replace(/^\//, '') === sidecarName) return [];
+          return rest.filter(a => /^[0-9A-Fa-f:.]+$/.test(a) && !admittedWithoutTls(a));
+        });
+        resolve({ ok: true, addrs });
+      });
+    });
+  });
+}
 
 function dbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
@@ -145,23 +195,43 @@ export function generateCertPair(dir: string, publicHost: string): Promise<{ ok:
  * pinned cert pair into PGDATA when absent or when the host it names changed.
  * The caller's pg_reload_conf picks the new pair up (ssl files reload on
  * sighup). `certHost` is the record's memory of what the cert names.
+ * Both files are written under .new names and renamed into place only once
+ * both are written, so a failed write leaves the installed pair as it was; a
+ * .new file left behind marks an install that stopped between the renames and
+ * forces a fresh pair. rotated: a pair was installed over an existing cert.
  */
-async function ensureServerCert(containerName: string, publicHost: string, certHost: string | undefined): Promise<string | null> {
+async function ensureServerCert(containerName: string, publicHost: string, certHost: string | undefined): Promise<{ error: string | null; rotated: boolean }> {
+  const crt = `${PGDATA}/server.crt`;
+  const key = `${PGDATA}/server.key`;
   if (certHost === publicHost) {
-    const present = await dbExec(containerName, ['test', '-f', `${PGDATA}/server.crt`]);
-    if (present.ok) return null;
+    const present = await dbExec(containerName, ['sh', '-c', `test -f ${crt} && test -f ${key} && test ! -e ${crt}.new && test ! -e ${key}.new`]);
+    if (present.ok) return { error: null, rotated: false };
   }
+  // A probe docker could not run counts as a cert present: telling the
+  // operator standbys may need the new block is the safe side.
+  const had = await dbExec(containerName, ['test', '-f', crt]);
+  const hadCert = had.ok || had.stderr.trim() !== '';
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cert-'));
   try {
     const gen = await generateCertPair(dir, publicHost);
-    if (!gen.ok) return `certificate generation failed: ${gen.error}`;
-    for (const file of ['server.key', 'server.crt']) {
-      const content = fs.readFileSync(path.join(dir, file), 'utf-8');
-      const put = await dbExec(containerName, ['sh', '-c',
-        `cat > ${PGDATA}/${file} && chown postgres:postgres ${PGDATA}/${file} && chmod 600 ${PGDATA}/${file}`], content);
-      if (!put.ok) return `certificate install failed (${file}): ${put.stderr.trim()}`;
+    if (!gen.ok) return { error: `certificate generation failed: ${gen.error}`, rotated: false };
+    const keyPem = fs.readFileSync(path.join(dir, 'server.key'), 'utf-8');
+    const crtPem = fs.readFileSync(path.join(dir, 'server.crt'), 'utf-8');
+    try {
+      if (!new crypto.X509Certificate(crtPem).checkPrivateKey(crypto.createPrivateKey(keyPem))) {
+        return { error: 'the generated key does not match the generated certificate (nothing was installed)', rotated: false };
+      }
+    } catch (err) {
+      return { error: `the generated certificate pair could not be read (nothing was installed): ${err instanceof Error ? err.message : String(err)}`, rotated: false };
     }
-    return null;
+    for (const [file, content] of [[key, keyPem], [crt, crtPem]]) {
+      const put = await dbExec(containerName, ['sh', '-c',
+        `cat > ${file}.new && chown postgres:postgres ${file}.new && chmod 600 ${file}.new`], content);
+      if (!put.ok) return { error: `certificate install failed (${path.posix.basename(file)}; the installed pair was not changed): ${put.stderr.trim()}`, rotated: false };
+    }
+    const swap = await dbExec(containerName, ['sh', '-c', `mv -f ${key}.new ${key} && mv -f ${crt}.new ${crt}`]);
+    if (!swap.ok) return { error: `certificate install failed while moving the new pair into place, so the key and certificate on disk may not match (the configuration was not reloaded; press Enable again to install a fresh pair): ${swap.stderr.trim()}`, rotated: false };
+    return { error: null, rotated: hadCert };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -174,13 +244,58 @@ async function ensureServerCert(containerName: string, publicHost: string, certH
  * freshly enabled primary has none until a standby seeds. The published port and the public-URL env apply on the next
  * instance restart.
  */
-export async function enableFleetReplication(
+export function enableFleetReplication(
   instance: InstanceConfig,
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
-  opts: { rotateCert?: boolean } = {},
-): Promise<{ success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean }> {
+  opts: { rotateCert?: boolean; fromRescue?: boolean } = {},
+): Promise<EnableResult> {
+  return inReplicationLane<EnableResult>(instance.id, 'Enable', () => {
+    const fresh = containerManager.getBot(instance.id);
+    if (!fresh) return Promise.resolve({ success: false, error: 'Bot not found (nothing was changed)' });
+    return enableInLane(fresh, publicHost, hostPort, slotWalKeepMb, opts);
+  });
+}
+
+type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number };
+
+/**
+ * One replication lane per instance: Enable, Disable and the internal
+ * enablers (adopt, failback adopt, rescue flip) take the instance's op lock,
+ * so a start, rebuild, seed or decommission and a second Enable or Disable
+ * refuse while one runs, and the backup slot, so no dump or restore runs
+ * beside it.
+ */
+async function inReplicationLane<T extends { success: boolean; error?: string }>(botId: string, action: string, fn: () => Promise<T>): Promise<T | { success: false; error: string }> {
+  if (!fleetBackup.claimFleetBackupBusy(botId)) {
+    return { success: false, error: `A backup, restore or standby re-seed is running on this instance; ${action} is refused until it finishes (nothing was changed)` };
+  }
+  let entered = false;
+  try {
+    return await containerManager.withExternalBotOp(botId, 'replication', () => { entered = true; return fn(); });
+  } catch (err) {
+    if (entered) throw err;
+    return { success: false, error: `${err instanceof Error ? err.message : String(err)}; ${action} is refused until it finishes (nothing was changed)` };
+  } finally {
+    fleetBackup.releaseFleetBackupBusy(botId);
+  }
+}
+
+/** The recovery lanes log in as the replication role: a new credential or a revoked login would cut them off. */
+function recoveryRefusal(instance: InstanceConfig, action: string): string | null {
+  if (instance.recoveryChannel) return `A recovery channel is armed on this instance and logs in as the replication role; disarm it before you ${action} (nothing was changed)`;
+  if (instance.recoveryRescue) return `A recovery rescue is recorded on this instance and its channel logs in as the replication role; finish or cancel it before you ${action} (nothing was changed)`;
+  return null;
+}
+
+async function enableInLane(
+  instance: InstanceConfig,
+  publicHost: string,
+  hostPort: number | undefined,
+  slotWalKeepMb: number | undefined,
+  opts: { rotateCert?: boolean; fromRescue?: boolean },
+): Promise<EnableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
   // Record check FIRST: everything past the preflight mutates the live
@@ -220,18 +335,42 @@ export async function enableFleetReplication(
   if (fleetDb.replication && !fleetDb.replication.password) {
     return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable replication and re-enable it to mint a fresh credential (existing standbys must then be re-seeded).' };
   }
+  // The rescue flip runs while its own record exists, and its channel is
+  // disarmed by then.
+  if (!fleetDb.replication && !opts.fromRescue) {
+    const recovery = recoveryRefusal(instance, 'enable replication');
+    if (recovery) return { success: false, error: recovery };
+  }
+  const recordAtStart = JSON.stringify(fleetDb);
+
+  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  if (!live.ok) return { success: false, error: `could not read which clients connect without TLS (nothing was changed): ${live.error}` };
+  // With a record, the bot already got the TLS URL at a start since, or its
+  // addresses are in keptPlain; only a start may drop a kept line.
+  let own: string[] = [];
+  if (!fleetDb.replication) {
+    const containers = await ownContainersOutsidePool(instance.sanitizedName, fleetDb.containerName);
+    if (!containers.ok) return { success: false, error: `could not read the addresses of this instance's containers (nothing was changed): ${containers.error}` };
+    own = containers.addrs;
+  }
+  const plain = { addrs: [...new Set([...live.addrs, ...(fleetDb.replication?.keptPlain ?? []), ...own])].sort() };
 
   const previousCertHost = fleetDb.replication?.certHost;
   // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
   // rescue rsyncs the SOURCE's pair in), so the certHost shortcut would keep
   // a cert naming the other machine and the copy block could never verify.
-  const certErr = await ensureServerCert(fleetDb.containerName, host, opts.rotateCert ? undefined : previousCertHost);
-  if (certErr) return { success: false, error: certErr };
-  const certRotated = previousCertHost !== undefined && previousCertHost !== host;
+  const cert = await ensureServerCert(fleetDb.containerName, host, opts.rotateCert ? undefined : previousCertHost);
+  if (cert.error) return { success: false, error: cert.error };
+  const certRotated = cert.rotated;
+  const failed = (error: string): EnableResult => ({
+    success: false,
+    certRotated,
+    error: certRotated ? `${error} (a new server certificate is already installed and the database loads it at its next reload or restart; existing standbys then need the new copy block)` : error,
+  });
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
   const exists = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
-  if (!exists.ok) return { success: false, error: `database setup failed: ${exists.stderr.trim()}` };
+  if (!exists.ok) return failed(`database setup failed: ${exists.stderr.trim()}`);
   // The verifier, never the password, and outside a DO block: a failing
   // statement inside one is echoed whole in the CONTEXT line, which the
   // quiet session settings do not hold back.
@@ -239,22 +378,24 @@ export async function enableFleetReplication(
   const verb = exists.stdout.trim() === '0' ? 'CREATE' : 'ALTER';
   const setup = await psqlScript(fleetDb.containerName, fleetDb.user, fleetDb.db,
     `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`);
-  if (!setup.ok) return { success: false, error: `database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}` };
+  if (!setup.ok) return failed(`database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}`);
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
   const ssl = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
-  if (!ssl.ok) return { success: false, error: `enabling ssl failed: ${ssl.stderr.trim()}` };
+  if (!ssl.ok) return failed(`enabling ssl failed: ${ssl.stderr.trim()}`);
   // Restart-only setting (no re-initdb): makes pg_rewind possible on every
   // cluster that has ever run enable (reopened ruling R6).
   const hints = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET wal_log_hints = on;');
-  if (!hints.ok) return { success: false, error: `enabling wal_log_hints failed: ${hints.stderr.trim()}` };
+  if (!hints.ok) return failed(`enabling wal_log_hints failed: ${hints.stderr.trim()}`);
   const keep = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
-  if (!keep.ok) return { success: false, error: `setting the WAL retention bound failed: ${keep.stderr.trim()}` };
+  if (!keep.ok) return failed(`setting the WAL retention bound failed: ${keep.stderr.trim()}`);
 
-  const hba = await dbExec(fleetDb.containerName, ['sh', '-c', `cat > ${PGDATA}/pg_hba.conf && chown postgres:postgres ${PGDATA}/pg_hba.conf`], PG_HBA_CONTENT);
-  if (!hba.ok) return { success: false, error: `pg_hba rewrite failed: ${hba.stderr.trim()}` };
+  const hbaFile = `${PGDATA}/pg_hba.conf`;
+  const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+  if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
   const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
-  if (!reload.ok) return { success: false, error: `config reload failed: ${reload.stderr.trim()}` };
+  if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
 
   const replication: FleetDbReplication = {
     role: REPLICATION_ROLE,
@@ -263,6 +404,7 @@ export async function enableFleetReplication(
     publicHost: host,
     certHost: host,
     slotWalKeepMb: keepMb,
+    ...(plain.addrs.length > 0 ? { keptPlain: plain.addrs } : {}),
   };
   // F1: the stored URL stays the container-name form (the public form cannot
   // hairpin from containers sharing a docker network with the sidecar, which
@@ -273,12 +415,20 @@ export async function enableFleetReplication(
   // address pools allocates outside it; hostssl covers every subnet.
   const localUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   const publicUrl = canonicalFleetUrl(instance, replication, dbPassword);
-  // The env store alone: container env assembly derives sensitive values from
-  // it at read time (the two-store strip), so no record mirror exists to sync.
-  envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
-  containerManager.updateInstanceFleetDbReplication(instance.id, replication);
+  const changed = `the database already has the replication role, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
+  if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
+    return { success: false, certRotated, error: `The instance's database record changed while this Enable ran, so the record and the database URL were not written; ${changed}. Check the Replication section, then press Enable again` };
+  }
+  try {
+    // The env store alone: container env assembly derives sensitive values from
+    // it at read time (the two-store strip), so no record mirror exists to sync.
+    envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
+    containerManager.updateInstanceFleetDbReplication(instance.id, replication);
+  } catch (err) {
+    return { success: false, certRotated, error: `The database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); ${changed}. Press Enable again once the store can be written` };
+  }
   forgetProbes(instance.id);
-  return { success: true, restartRequired: true, certRotated };
+  return { success: true, restartRequired: true, certRotated, ...(plain.addrs.length > 0 ? { plainClientsKept: plain.addrs.length } : {}) };
 }
 
 /**
@@ -290,11 +440,26 @@ export async function enableFleetReplication(
  * drop the record and revert the URL to the private sidecar form. Cert and
  * ssl=on stay in PGDATA. Port unpublish applies on the next restart.
  */
-export async function disableFleetReplication(
+export function disableFleetReplication(
   instance: InstanceConfig,
-): Promise<{ success: boolean; error?: string; restartRequired?: boolean; warning?: string }> {
+): Promise<DisableResult> {
+  return inReplicationLane<DisableResult>(instance.id, 'Disable', () => {
+    const fresh = containerManager.getBot(instance.id);
+    if (!fresh) return Promise.resolve({ success: false, error: 'Bot not found (nothing was changed)' });
+    return disableInLane(fresh);
+  });
+}
+
+type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string };
+
+async function disableInLane(
+  instance: InstanceConfig,
+): Promise<DisableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
+  const recovery = recoveryRefusal(instance, 'disable replication');
+  if (recovery) return { success: false, error: recovery };
+  const disableRecordAtStart = JSON.stringify(fleetDb);
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
@@ -312,6 +477,16 @@ export async function disableFleetReplication(
   if (streaming.stdout.trim() !== '') {
     return { success: false, error: `Standbys are still streaming on slot(s) ${streaming.stdout.trim()}; stop or remove them first (nothing was disabled)` };
   }
+  // A seed's base backup and a stream without a slot hold no active slot,
+  // and revoking the login would cut them off mid-copy.
+  const senders = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+    `SELECT COALESCE(string_agg(COALESCE(host(client_addr), 'a local socket'), ', ' ORDER BY client_addr), '') FROM pg_stat_replication WHERE usename = '${REPLICATION_ROLE}';`);
+  if (!senders.ok) {
+    return { success: false, error: `could not read the replication connections (nothing was disabled): ${senders.stderr.trim()}` };
+  }
+  if (senders.stdout.trim() !== '') {
+    return { success: false, error: `Replication connections of the ${REPLICATION_ROLE} role are open from ${senders.stdout.trim()} (a standby streaming without a slot, or a seed copying the database); stop or remove them first (nothing was disabled)` };
+  }
   // A live armed setting means the instance's bot is holding writes for a
   // copy, and only that bot may release them, once it has recorded the relax
   // on the witness (B7-F23's full partition); relaxing here would release
@@ -326,9 +501,17 @@ export async function disableFleetReplication(
   // Every refusal above changed nothing. From here on each step changes the
   // database, so the record says a Disable is under way until it finishes:
   // an interrupted one is then shown, and pressing Disable again finishes it.
+  const before = containerManager.getBot(instance.id);
+  const lateRecovery = before ? recoveryRefusal(before, 'disable replication') : null;
+  if (lateRecovery) return { success: false, error: lateRecovery };
+  if (JSON.stringify(before?.fleetDb) !== disableRecordAtStart) {
+    return { success: false, error: "The instance's database record changed while this Disable ran its checks (nothing was disabled); check the Replication section, then press Disable replication again" };
+  }
+  let markedRecord: string;
   try {
     const marked = containerManager.updateInstanceFleetDbReplication(instance.id, { ...fleetDb.replication, disablingSince: fleetDb.replication.disablingSince ?? new Date().toISOString() });
     if (!marked?.fleetDb?.replication) return { success: false, error: 'The instance record is gone (nothing was disabled)' };
+    markedRecord = JSON.stringify(containerManager.getBot(instance.id)?.fleetDb);
   } catch (err) {
     return { success: false, error: `could not record that a Disable is under way (nothing was disabled): ${String(err)}` };
   }
@@ -367,6 +550,9 @@ export async function disableFleetReplication(
     return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
   }
 
+  if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== markedRecord) {
+    return { success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the replication login is revoked. Check the Replication section, then press Disable replication again to finish it" };
+  }
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
@@ -383,6 +569,38 @@ export async function disableFleetReplication(
     return { success: true, restartRequired: true, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
   }
   return { success: true, restartRequired: true };
+}
+
+/**
+ * Run by the start lane once the containers are up: drops the non-TLS lines an
+ * Enable kept for clients that were still on the old URL, once none of those
+ * clients connects without TLS any more. Returns a warning, or null.
+ */
+export async function narrowKeptPlainHba(botId: string): Promise<string | null> {
+  const instance = containerManager.getBot(botId);
+  const fleetDb = instance?.fleetDb;
+  const repl = fleetDb?.replication;
+  if (!fleetDb || !repl?.keptPlain?.length) return null;
+  const notNarrowed = 'the database still admits non-TLS connections from the addresses Enable kept, and the next start tries again';
+  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  if (!live.ok) return `Could not read which clients connect to the database without TLS (${live.error}), so ${notNarrowed}`;
+  const plain = { addrs: live.addrs.filter(a => repl.keptPlain!.includes(a)) };
+  const hbaFile = `${PGDATA}/pg_hba.conf`;
+  const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+  if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
+  const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
+  if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;
+  const { keptPlain: _kept, ...rest } = repl;
+  try {
+    containerManager.updateInstanceFleetDbReplication(botId, plain.addrs.length > 0 ? { ...rest, keptPlain: plain.addrs } : rest);
+  } catch (err) {
+    console.warn(`[FleetReplication] ${botId}: pg_hba is narrowed, but the record could not be updated: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (plain.addrs.length > 0) {
+    return `${plain.addrs.length} client(s) still connect to the database without TLS from outside 172.16.0.0/12, so the database keeps admitting them that way; the next start checks again`;
+  }
+  return null;
 }
 
 export interface FleetReplicationStatus {

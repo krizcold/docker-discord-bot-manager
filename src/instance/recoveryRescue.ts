@@ -657,7 +657,7 @@ async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {
   // rotateCert: the rsync passes delivered the SOURCE's server.crt/key, and a
   // surviving certHost record would make enable keep them - then the copy
   // block's verify-full DSN could never match and the handback re-seed dies.
-  const enabled = await enableFleetReplication(fresh, host, fresh.fleetDb?.replication?.hostPort, undefined, { rotateCert: true });
+  const enabled = await enableFleetReplication(fresh, host, fresh.fleetDb?.replication?.hostPort, undefined, { rotateCert: true, fromRescue: true });
   if (!enabled.success) throw new Error(`the copy is primary but enabling replication failed: ${enabled.error}`);
   const stored = envManager.getEnvVars(instance.id);
   const repointUrl = (stored[dbSpec.env.url] || '').trim();

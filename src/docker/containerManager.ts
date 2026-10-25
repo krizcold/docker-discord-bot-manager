@@ -3195,6 +3195,14 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
     }
     const laneUncleared = clearFinishedLane(botId);
     if (laneUncleared) result.warning = result.warning ? `${result.warning}; ${laneUncleared}` : laneUncleared;
+    if (getBot(botId)?.fleetDb?.replication?.keptPlain?.length) {
+      // Imported here: fleetReplication imports this module.
+      const narrowed = await (await import('../instance/fleetReplication')).narrowKeptPlainHba(botId).catch(err => `pg_hba could not be narrowed: ${err instanceof Error ? err.message : String(err)}`);
+      if (narrowed) {
+        logCollectors.get(botId).addLog(`[Start] ${narrowed}`, 'warning');
+        result.warning = result.warning ? `${result.warning}; ${narrowed}` : narrowed;
+      }
+    }
   }
   if (!applyInPlace) return result;
 

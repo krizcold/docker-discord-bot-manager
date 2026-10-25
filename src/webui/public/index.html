@@ -2919,7 +2919,7 @@
             <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
             <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
             <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached standby may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
-            <button class="btn btn-primary btn-small" onclick="enableFleetReplication('${botId}')">Enable</button>
+            <button class="btn btn-primary btn-small" id="fleet-repl-enable" onclick="enableFleetReplication('${botId}')">Enable</button>
           </div>
           <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
             <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
@@ -3014,7 +3014,7 @@
           <div class="env-tip">On each standby machine's manager, open the standby instance's Database button, paste both into its Database Replica section and press Provision. That button shows only on an instance whose Fleet Role is Backup Master or Co-worker; a designated backup can instead use the block its bot already holds.</div>
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
         <div style="margin-top:6px;">
-          <button class="btn btn-danger btn-small" onclick="disableFleetReplication('${botId}')">Disable replication</button>
+          <button class="btn btn-danger btn-small" id="fleet-repl-disable" onclick="disableFleetReplication('${botId}')">Disable replication</button>
         </div>
         ${((bots.find(b => b.id === botId) || {}).appHooks === true) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
@@ -3091,6 +3091,17 @@
       }
     }
 
+    // Every Enable reply, whichever button sent it: a rotated certificate and a
+    // kept non-TLS line are independent facts.
+    function fleetReplEnableNotes(res) {
+      let notes = '';
+      if (res.certRotated) notes += ' A new server certificate was installed: existing standbys must be set up again with the new copy block.';
+      if (res.plainClientsKept) {
+        notes += ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.`;
+      }
+      return notes;
+    }
+
     async function enableFleetReplication(botId) {
       const host = (document.getElementById('fleet-repl-host')?.value || '').trim();
       const portRaw = (document.getElementById('fleet-repl-port')?.value || '').trim();
@@ -3100,14 +3111,12 @@
       const payload = { enabled: true, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       if (keepRaw !== '') payload.slotWalKeepMb = Number(keepRaw);
+      const btn = document.getElementById('fleet-repl-enable');
+      if (btn) btn.disabled = true;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
         if (res.success) {
-          // Compose, never branch past one: a rotated certificate and a failed
-          // hand-off are independent facts and the operator needs both.
-          const base = res.certRotated
-            ? 'Replication updated with a NEW certificate (the host changed) - existing standbys must be re-set-up with the new block. Restart the instance to apply.'
-            : 'Replication enabled. Restart the instance to publish the port and apply the new database URL.';
+          const base = `Replication enabled. Restart the instance to publish the port and apply the new database URL.${fleetReplEnableNotes(res)}`;
           if (res.copyBlockError) {
             showMessage('error', `${base} However, the copy block could not be handed to the bot (${res.copyBlockError}), so designated backups will not be seeded automatically; reopen this panel once the instance is running.`);
           } else {
@@ -3118,6 +3127,8 @@
         }
       } catch (err) {
         showNoAnswer('replication change');
+      } finally {
+        if (btn) btn.disabled = false;
       }
       renderFleetReplication(botId);
       loadBots();
@@ -3129,9 +3140,16 @@
         const r = res && res.replication;
         if (!r || !r.enabled) { showMessage('error', 'Replication is not enabled'); return; }
         const apply = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: true, publicHost: r.publicHost, hostPort: r.hostPort, slotWalKeepMb: 4096 });
-        showMessage(apply.success ? 'success' : 'error', apply.success
-          ? 'WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.'
-          : (apply.error || 'Failed to apply the bound'));
+        if (!apply.success) {
+          showMessage('error', apply.error || 'Failed to apply the bound');
+        } else {
+          const base = `WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.${fleetReplEnableNotes(apply)}`;
+          if (apply.copyBlockError) {
+            showMessage('error', `${base} However, the copy block could not be handed to the bot (${apply.copyBlockError}), so designated backups will not be seeded automatically; reopen this panel once the instance is running.`);
+          } else {
+            showMessage('success', base);
+          }
+        }
       } catch (err) {
         showNoAnswer('WAL bound change');
       }
@@ -3150,7 +3168,9 @@
     }
 
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nRefused while any standby is still streaming: stop or remove standbys first. Inactive standby slots are dropped, the replication login is revoked, and the published port closes and the database URL reverts on the next restart.')) return;
+      if (!confirm('Disable replication?\n\nRefused while a standby streams or a seed copies this database, while a recovery channel is armed or a rescue is recorded, and while a backup or restore runs. Otherwise the inactive standby slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
+      const btn = document.getElementById('fleet-repl-disable');
+      if (btn) btn.disabled = true;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
         if (res.success && res.warning) {
@@ -3162,6 +3182,8 @@
         }
       } catch (err) {
         showNoAnswer('replication change');
+      } finally {
+        if (btn) btn.disabled = false;
       }
       renderFleetReplication(botId);
       loadBots();

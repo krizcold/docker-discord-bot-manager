@@ -1677,7 +1677,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json(await fleetReplica.decommissionFleetDb(bot.id));
+      const repl = bot.fleetDb?.replication;
+      const result: Awaited<ReturnType<typeof fleetReplica.decommissionFleetDb>> & { copyBlockNote?: string } = await fleetReplica.decommissionFleetDb(bot.id);
+      if (result.success && repl) result.copyBlockNote = await appLifecycle.retractCopyBlockOf(bot.id, { host: repl.publicHost, port: repl.hostPort });
+      res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1696,9 +1699,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const status = await fleetReplication.getFleetReplicationStatus(bot);
-      // The Database modal hits this on every open, which is what makes 20.14's
-      // automatic copy-block delivery actually reach a long-running master: the
-      // block is published only by the manager, and nothing else calls it.
+      if (bot.copyBlockRetract) void appLifecycle.settleCopyBlockRetract(bot.id).catch(() => undefined);
+      // The Database modal hits this on every open, so a master that missed
+      // the publish at Enable, adopt or a rescue gets the current block here.
       // Deliberately NOT awaited - the hook budget is promote-sized, and the
       // operator asked for a status, not a publish. The next open reconciles.
       if (status.enabled && bot.fleetDb?.replication && !containerManager.isBotBusy(bot.id)) {
@@ -1760,34 +1763,30 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
       }
-      let result;
+      let result: { success: boolean; error?: string; copyBlockNote?: string; copyBlockError?: string };
+      const admit = (fresh: InstanceConfig) => appLifecycle.followerHoldRefusal(fresh, enabled ? 'Enable' : 'Disable');
       if (enabled) {
         if (!publicHost || typeof publicHost !== 'string') {
           res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
           return;
         }
-        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb);
-        // Hand the fresh block to the app straight away so designated backups
-        // get it on their next register (20.14). Best effort: replication is
-        // enabled either way, and GET /app-facts republishes if this missed.
-        // Only worth attempting, and only worth reporting, when the app could
-        // possibly answer: on a stopped instance the hook is expected to fail
-        // and the next Database-panel open publishes it.
-        if (result.success && bot.status === 'running') {
-          const fresh = containerManager.getBot(req.params.id);
-          if (fresh) {
-            const delivered = await appLifecycle.deliverCopyBlock(fresh);
-            if (!delivered.success) {
-              console.warn(`[Bots] Copy block not delivered to ${fresh.sanitizedName}: ${delivered.error}`);
-              // Replication IS enabled either way, so this is not a failure of
-              // the operator's action; say so rather than silently implying
-              // backups will be seeded automatically.
-              (result as Record<string, unknown>).copyBlockError = delivered.error;
-            }
+        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb, { admit });
+        // Replication is enabled either way, so a missed delivery is a note on
+        // the reply, never a failure of the operator's action.
+        const fresh = result.success ? containerManager.getBot(req.params.id) : null;
+        if (fresh) {
+          const copy = await appLifecycle.deliverCopyBlockToTarget(fresh);
+          if (copy.error) {
+            console.warn(`[Bots] Copy block not delivered to ${fresh.sanitizedName}: ${copy.error}`);
+            result.copyBlockError = copy.error;
+          } else {
+            result.copyBlockNote = copy.note;
           }
         }
       } else {
-        result = await fleetReplication.disableFleetReplication(bot);
+        const repl = bot.fleetDb?.replication;
+        result = await fleetReplication.disableFleetReplication(bot, { admit });
+        if (result.success && repl) result.copyBlockNote = await appLifecycle.retractCopyBlockOf(bot.id, { host: repl.publicHost, port: repl.hostPort });
       }
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
@@ -2018,15 +2017,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await fleetReplica.adoptPromotedReplica(bot);
+      const result: Awaited<ReturnType<typeof fleetReplica.adoptPromotedReplica>> & { copyBlockNote?: string; copyBlockError?: string } = await fleetReplica.adoptPromotedReplica(bot);
       if (result.success) {
         // This machine now mints its own block; without republishing, its app
         // would keep relaying the OLD master's, and backups would re-seed from
         // a database that no longer leads the fleet.
         const fresh = containerManager.getBot(req.params.id);
         if (fresh?.fleetDb?.replication) {
-          const delivered = await appLifecycle.deliverCopyBlock(fresh);
-          if (!delivered.success) console.warn(`[Bots] Copy block not republished after adopt on ${fresh.sanitizedName}: ${delivered.error}`);
+          const copy = await appLifecycle.deliverCopyBlockToTarget(fresh);
+          if (copy.error) {
+            console.warn(`[Bots] Copy block not republished after adopt on ${fresh.sanitizedName}: ${copy.error}`);
+            result.copyBlockError = copy.error;
+          } else {
+            result.copyBlockNote = copy.note;
+          }
         }
         broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       }
@@ -2157,9 +2161,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * GET /:id/app-facts - what this instance's app concluded (superseded, retire
-   * instruction, promote phase, copy block). Opportunistically republishes the
-   * copy block when the app has none and this manager can produce one, which is
-   * what makes 20.14's automatic delivery actually happen: nothing else writes it.
+   * instruction, promote phase, copy block). Sends a recorded copy-block
+   * retraction first, then republishes the block when the app is its target and
+   * holds anything other than the whole current block.
    */
   router.get('/:id/app-facts', async (req: Request, res: Response) => {
     try {
@@ -2168,6 +2172,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
+      if (bot.copyBlockRetract) await appLifecycle.settleCopyBlockRetract(bot.id);
       const result = await appLifecycle.getAppFacts(bot);
       if (result.success && result.facts?.copyBlockTarget === true
           && bot.fleetDb?.replication && !containerManager.isBotBusy(bot.id)) {

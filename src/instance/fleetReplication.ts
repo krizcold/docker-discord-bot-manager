@@ -249,14 +249,19 @@ export function enableFleetReplication(
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
-  opts: { rotateCert?: boolean; fromRescue?: boolean } = {},
+  opts: { rotateCert?: boolean; fromRescue?: boolean; admit?: Admission } = {},
 ): Promise<EnableResult> {
-  return inReplicationLane<EnableResult>(instance.id, 'Enable', () => {
+  return inReplicationLane<EnableResult>(instance.id, 'Enable', async () => {
     const fresh = containerManager.getBot(instance.id);
-    if (!fresh) return Promise.resolve({ success: false, error: 'Bot not found (nothing was changed)' });
+    if (!fresh) return { success: false, error: 'Bot not found (nothing was changed)' };
+    const refused = opts.admit ? await opts.admit(fresh) : null;
+    if (refused) return { success: false, error: refused };
     return enableInLane(fresh, publicHost, hostPort, slotWalKeepMb, opts);
   });
 }
+
+/** A caller's own refusal, read inside the lane before anything runs; null admits. */
+type Admission = (instance: InstanceConfig) => Promise<string | null>;
 
 type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number };
 
@@ -442,10 +447,13 @@ async function enableInLane(
  */
 export function disableFleetReplication(
   instance: InstanceConfig,
+  opts: { admit?: Admission } = {},
 ): Promise<DisableResult> {
-  return inReplicationLane<DisableResult>(instance.id, 'Disable', () => {
+  return inReplicationLane<DisableResult>(instance.id, 'Disable', async () => {
     const fresh = containerManager.getBot(instance.id);
-    if (!fresh) return Promise.resolve({ success: false, error: 'Bot not found (nothing was changed)' });
+    if (!fresh) return { success: false, error: 'Bot not found (nothing was changed)' };
+    const refused = opts.admit ? await opts.admit(fresh) : null;
+    if (refused) return { success: false, error: refused };
     return disableInLane(fresh);
   });
 }

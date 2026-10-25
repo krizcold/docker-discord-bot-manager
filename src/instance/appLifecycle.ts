@@ -232,31 +232,125 @@ export function unansweredRemedy(error: string): string {
 }
 
 /**
- * Deliver when what the app holds is missing or no longer names this machine's
- * endpoint. A promoted node inherits the OLD master's block, so "already has
- * one" is not "has the right one", and keying on the endpoint keeps a steady
- * fleet from paying a docker exec on every poll.
- *
- * It does NOT detect a rotated certificate behind an unchanged host and port:
- * the sites that rotate in place call deliverCopyBlock directly instead.
+ * Deliver when what the app holds is not the whole current block: a promoted
+ * node inherits the OLD master's block, and a re-enable or a rescue can change
+ * the credential or the certificate behind an unchanged host and port.
  */
 export async function ensureCopyBlockCurrent(
   instance: InstanceConfig,
-  held: { dsn: string } | null,
+  held: { dsn: string; cert: string } | null,
 ): Promise<ActionResult & { delivered: boolean }> {
-  const replication = instance.fleetDb?.replication;
-  if (!replication) return { success: true, delivered: false };
-  if (held?.dsn) {
-    try {
-      const url = new URL(held.dsn);
-      const port = url.port || '5432';
-      if (url.hostname === replication.publicHost && port === String(replication.hostPort)) {
-        return { success: true, delivered: false };
-      }
-    } catch { /* unparseable means stale by definition */ }
+  if (!instance.fleetDb?.replication) return { success: true, delivered: false };
+  const block = await getReplicaCopyBlock(instance);
+  if (!block.success || !block.dsn || !block.cert) {
+    return { success: false, delivered: false, error: block.error || 'could not assemble the copy block' };
   }
-  const published = await deliverCopyBlock(instance);
+  if (held && held.dsn === block.dsn && String(held.cert ?? '').trim() === block.cert.trim()) {
+    return { success: true, delivered: false };
+  }
+  const published = await publishCopyBlock(instance, { dsn: block.dsn, cert: block.cert });
   return { ...published, delivered: published.success };
+}
+
+const COPY_BLOCK_FACTS_TIMEOUT_MS = 10_000;
+const REGISTRATION_NOTE = 'a designated backup that is already registered receives it only at its next registration (a restart of either bot)';
+const PANEL_RETRY = 'opening the Replication section publishes it once the bot answers as the fleet\'s master';
+
+/**
+ * Hand the block to this node's app only when the app says it is the node that
+ * relays it: a block published onto any other node would overwrite the one its
+ * master relayed. The note says what happened, for the operator's reply.
+ */
+export async function deliverCopyBlockToTarget(instance: InstanceConfig): Promise<{ delivered: boolean; note: string; error?: string }> {
+  if (!instance.fleetDb?.replication) return { delivered: false, note: 'Replication is not enabled on this instance, so no copy block was handed to the bot.' };
+  if (!hasAppHooks(instance)) return { delivered: false, note: 'This app declares no lifecycle hooks, so its bot relays no copy block; set standbys up from the block in the Replication section.' };
+  if (instance.status !== 'running') return { delivered: false, note: `The copy block was not handed to the bot because the instance is not running; ${PANEL_RETRY}.` };
+  const read = await getAppFacts(instance, COPY_BLOCK_FACTS_TIMEOUT_MS);
+  if (!read.success) return { delivered: false, note: `Can't confirm the bot is the fleet's master (${read.error}), so the copy block was not handed to it; ${PANEL_RETRY}.` };
+  if (read.facts?.copyBlockTarget !== true) return { delivered: false, note: `The bot is not the fleet's master, so the copy block was not handed to it (only the master relays one); ${PANEL_RETRY}.` };
+  const delivered = await deliverCopyBlock(instance);
+  if (!delivered.success) return { delivered: false, note: '', error: delivered.error || 'the app refused' };
+  return { delivered: true, note: `The bot holds the current copy block; ${REGISTRATION_NOTE}.` };
+}
+
+/**
+ * Enable and Disable by the operator: a node behind a stand-in follows the
+ * fleet's database on another node, so its own database is not the fleet's and
+ * a failback run owns its replication posture.
+ */
+export async function followerHoldRefusal(instance: InstanceConfig, action: string): Promise<string | null> {
+  if (instance.fleetFailback) return `A failback run is recorded on this instance; ${action} is refused until it finishes or is cancelled (nothing was changed)`;
+  if (!hasAppHooks(instance)) return null;
+  const read = await getAppFacts(instance, COPY_BLOCK_FACTS_TIMEOUT_MS);
+  const unread = !read.success ? read.error || 'no answer' : read.facts?.running !== true ? 'the bot process is not running' : null;
+  if (unread) return `Can't confirm this node's bot holds no follower hold (${unread}), so ${action} is refused; ${unansweredRemedy(unread)} then try again (nothing was changed)`;
+  if (read.facts?.followerHold) return `This node's bot is in a follower hold behind the node holding the fleet, so this database is not the fleet's; ${action} is refused until the failback promotes this node back (nothing was changed)`;
+  return null;
+}
+
+function blockEndpoint(dsn: string): { host: string; port: number } | null {
+  try {
+    const url = new URL(dsn);
+    return url.hostname ? { host: url.hostname, port: Number(url.port) || 5432 } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Send a recorded retraction once the bot answers. Only a held block naming the
+ * recorded endpoint is cleared; any other block was relayed by another master.
+ * A replication posture on that endpoint again owns the block, so the record is
+ * dropped unsent. Returns whether the retraction is still pending, and why.
+ */
+export async function settleCopyBlockRetract(botId: string): Promise<{ pending: boolean; reason?: string }> {
+  const instance = containerManager.getBot(botId);
+  const pending = instance?.copyBlockRetract;
+  if (!instance || !pending) return { pending: false };
+  const same = (): boolean => JSON.stringify(containerManager.getBot(botId)?.copyBlockRetract) === JSON.stringify(pending);
+  const drop = (): { pending: boolean; reason?: string } => {
+    try {
+      if (same()) containerManager.updateInstanceCopyBlockRetract(botId, null);
+      return { pending: false };
+    } catch (err) {
+      return { pending: true, reason: `the record could not be saved: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  };
+  const ownsEndpoint = (inst: InstanceConfig | null | undefined): boolean => {
+    const repl = inst?.fleetDb?.replication;
+    return !!repl && repl.publicHost === pending.host && repl.hostPort === pending.port;
+  };
+  if (ownsEndpoint(instance)) return drop();
+  if (!hasAppHooks(instance)) return drop();
+  if (containerManager.isBotBusy(botId)) return { pending: true, reason: 'a lifecycle operation is running on this instance' };
+  const read = await getAppFacts(instance, COPY_BLOCK_FACTS_TIMEOUT_MS);
+  if (!read.success) return { pending: true, reason: read.error };
+  const now = containerManager.getBot(botId);
+  if (!same()) return { pending: !!now?.copyBlockRetract };
+  if (ownsEndpoint(now)) return drop();
+  const held = read.facts?.copyBlock;
+  const at = held?.dsn ? blockEndpoint(held.dsn) : null;
+  if (!at || at.host !== pending.host || at.port !== pending.port) return drop();
+  const cleared = fromHook(await callAppHook(instance, 'copy-block', 'POST', { clear: true }));
+  if (!cleared.success) return { pending: true, reason: cleared.unknown ? `can't confirm the bot dropped it: ${cleared.error}` : cleared.error };
+  return drop();
+}
+
+/**
+ * After a Disable or a decommission: record the retraction first, so a bot
+ * that does not answer now still receives it, then try to send it. Returns the
+ * operator's note.
+ */
+export async function retractCopyBlockOf(botId: string, endpoint: { host: string; port: number }): Promise<string> {
+  try {
+    containerManager.updateInstanceCopyBlockRetract(botId, { host: endpoint.host, port: endpoint.port, since: new Date().toISOString() });
+  } catch (err) {
+    return `Can't confirm the bot dropped this database's copy block: the retraction could not be recorded (${err instanceof Error ? err.message : String(err)}).`;
+  }
+  const settled = await settleCopyBlockRetract(botId).catch(err => ({ pending: true, reason: err instanceof Error ? err.message : String(err) }));
+  const backups = 'Backups that received the block earlier keep their copy.';
+  if (!settled.pending) return `The bot no longer holds a copy block for this database. ${backups}`;
+  return `The bot may still hold this database's copy block (${settled.reason}); the manager sends it the retraction once the bot answers, at its next start or when its Database modal is opened. ${backups}`;
 }
 
 /**

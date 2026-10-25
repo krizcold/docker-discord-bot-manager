@@ -3029,16 +3029,21 @@
       // listed whether or not a standby of this primary is attached.
       const slotsHtml = !live ? '' : fleetSlotsHtml
         + otherSlots.map(s => `<div class="env-tip">Slot <b>${escapeHtml(s.slot)}</b> (${s.slot === 'recovery_channel' ? 'recovery channel' : 'not a fleet standby'}): ${escapeHtml(s.walStatus)}${s.active ? ', active' : ''}</div>`).join('');
+      // Behind a stand-in this database is not the fleet's, and a failback run
+      // owns its posture: the server refuses Enable and Disable, so neither
+      // they nor the block this database would hand out are offered.
+      const held = covered || !!failback;
       const keepTip = live && live.slotWalKeep === '-1'
-        ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span> <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`
+        ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span>${held ? '' : ` <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`}`
         : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
+      const heldHtml = `<div class="env-tip">${failback ? 'A failback run is recorded on this instance' : 'This node follows the node holding the fleet'}, so this database is not the fleet's: its replica setup block, Disable replication and the WAL bound are not offered until ${failback ? 'the run finishes or is cancelled' : 'the failback promotes this node back'}.</div>`;
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : r.probeError ? ` - <span style="color:var(--warning)">could not read the database (${escapeHtml(r.probeError)})</span>` : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
-        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the standby slots dropped). Press Disable replication to finish it.</div>` : ''}
+        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the standby slots dropped). ${held ? 'Disable replication finishes it once it is offered again.' : 'Press Disable replication to finish it.'}</div>` : ''}
         ${reachHtml}
         ${coveredHtml}${failbackHtml}${failbackOpenHtml}
         ${slotsHtml}
-        ${block ? `
+        ${held ? heldHtml : block ? `
         <div style="margin-top:6px;">
           <div style="display:flex;align-items:center;gap:8px;">
             <span style="font-size:0.78rem;color:var(--text-secondary);">Replica setup block</span>
@@ -3049,9 +3054,9 @@
           <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
           <div class="env-tip">On each standby machine's manager, open the standby instance's Database button, paste both into its Database Replica section and press Provision. That button shows only on an instance whose Fleet Role is Backup Master or Co-worker; a designated backup can instead use the block its bot already holds.</div>
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
-        <div style="margin-top:6px;">
+        ${held ? '' : `<div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" id="fleet-repl-disable" onclick="disableFleetReplication('${botId}')">Disable replication</button>
-        </div>
+        </div>`}
         ${((bots.find(b => b.id === botId) || {}).appHooks === true) ? `
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Stand this machine down</div>
@@ -3094,10 +3099,11 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
         if (!res.success) { showMessage('error', res.error || 'Decommission refused'); return; }
-        if (res.warning) { showMessage('error', `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}`); return; }
-        showMessage('success', res.dumpFile
-          ? `Database decommissioned; safety dump kept: ${res.dumpFile}`
-          : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list)');
+        const copyNote = res.copyBlockNote ? ` ${res.copyBlockNote}` : '';
+        if (res.warning) { showMessage('error', `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}${copyNote}`); return; }
+        showMessage('success', (res.dumpFile
+          ? `Database decommissioned; safety dump kept: ${res.dumpFile}.`
+          : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list).') + copyNote);
       } catch (err) {
         showNoAnswer('decommission');
       } finally {
@@ -3127,13 +3133,18 @@
       }
     }
 
-    // Every Enable reply, whichever button sent it: a rotated certificate and a
-    // kept non-TLS line are independent facts.
+    // Every Enable reply, whichever button sent it: a rotated certificate, a
+    // kept non-TLS line and the copy block's delivery are independent facts.
     function fleetReplEnableNotes(res) {
       let notes = '';
       if (res.certRotated) notes += ' A new server certificate was installed: existing standbys must be set up again with the new copy block.';
       if (res.plainClientsKept) {
         notes += ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.`;
+      }
+      if (res.copyBlockError) {
+        notes += ` However, the copy block could not be handed to the bot (${res.copyBlockError}), so designated backups will not be seeded from it automatically; opening the Replication section retries it once the bot answers as the fleet's master.`;
+      } else if (res.copyBlockNote) {
+        notes += ` ${res.copyBlockNote}`;
       }
       return notes;
     }
@@ -3152,12 +3163,7 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
         if (res.success) {
-          const base = `Replication enabled. Restart the instance to publish the port and apply the new database URL.${fleetReplEnableNotes(res)}`;
-          if (res.copyBlockError) {
-            showMessage('error', `${base} However, the copy block could not be handed to the bot (${res.copyBlockError}), so designated backups will not be seeded automatically; reopen this panel once the instance is running.`);
-          } else {
-            showMessage('success', base);
-          }
+          showMessage(res.copyBlockError ? 'error' : 'success', `Replication enabled. Restart the instance to publish the port and apply the new database URL.${fleetReplEnableNotes(res)}`);
         } else {
           showMessage('error', res.error || 'Failed to enable replication');
         }
@@ -3179,12 +3185,7 @@
         if (!apply.success) {
           showMessage('error', apply.error || 'Failed to apply the bound');
         } else {
-          const base = `WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.${fleetReplEnableNotes(apply)}`;
-          if (apply.copyBlockError) {
-            showMessage('error', `${base} However, the copy block could not be handed to the bot (${apply.copyBlockError}), so designated backups will not be seeded automatically; reopen this panel once the instance is running.`);
-          } else {
-            showMessage('success', base);
-          }
+          showMessage(apply.copyBlockError ? 'error' : 'success', `WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.${fleetReplEnableNotes(apply)}`);
         }
       } catch (err) {
         showNoAnswer('WAL bound change');
@@ -3204,15 +3205,16 @@
     }
 
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nRefused while a standby streams or a seed copies this database, while a recovery channel is armed or a rescue is recorded, and while a backup or restore runs. Otherwise the inactive standby slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
+      if (!confirm('Disable replication?\n\nRefused while a standby streams or a seed copies this database, while a recovery channel is armed or a rescue is recorded, while a backup or restore runs, and while a failback run is recorded or the bot follows a stand-in. Otherwise the inactive standby slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
       const btn = document.getElementById('fleet-repl-disable');
       if (btn) btn.disabled = true;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
+        const copyNote = res.copyBlockNote ? ` ${res.copyBlockNote}` : '';
         if (res.success && res.warning) {
-          showMessage('error', `${res.warning}. Restart the instance to apply.`);
+          showMessage('error', `${res.warning}. Restart the instance to apply.${copyNote}`);
         } else if (res.success) {
-          showMessage('success', 'Replication disabled. Restart the instance to apply.');
+          showMessage('success', `Replication disabled. Restart the instance to apply.${copyNote}`);
         } else {
           showMessage('error', res.error || 'Failed to disable replication');
         }
@@ -3712,8 +3714,9 @@
 
       if (!r.record) {
         // The block a designated backup already holds makes both the paste and
-        // the standby-first step of a transfer unnecessary (20.14, 20.19 F15/F21).
-        const fromFactsHtml = (answered && answered.copyBlockPresent && !runLive) ? `
+        // the standby-first step of a transfer unnecessary (20.14, 20.19 F15/F21),
+        // but only while the bot says it names the database the fleet follows.
+        const fromFactsHtml = (answered && answered.copyBlockPresent && answered.copyBlockCurrent === true && !runLive) ? `
           <div class="env-tip">This node already holds the primary's copy block (delivered over the fleet channel), so nothing needs pasting. Give this machine's public host and port below, then either provision the standby, or transfer in one action: the standby is seeded and caught up first, then this side is promoted.</div>
           <div style="margin-bottom:8px;display:flex;gap:6px;flex-wrap:wrap;">
             <button class="btn btn-primary btn-small" onclick="provisionFleetReplicaFromFacts('${botId}')">Provision from the block</button>
@@ -4178,7 +4181,10 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
         if (res.success) {
-          showMessage('success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the replica block to the other machine.`);
+          const copyNote = res.copyBlockError
+            ? ` However, the copy block could not be handed to the bot (${res.copyBlockError}); opening the Replication section retries it once the bot answers as the fleet's master.`
+            : res.copyBlockNote ? ` ${res.copyBlockNote}` : '';
+          showMessage(res.copyBlockError ? 'error' : 'success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the replica block to the other machine.${copyNote}`);
         } else {
           showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to adopt the database'}`);
         }

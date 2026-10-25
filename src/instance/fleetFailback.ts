@@ -544,7 +544,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
                 : f?.running !== true ? 'the bot process is not running'
                 : !hold ? 'the bot reports no follower hold'
                 : hold.namesThisNode !== true ? 'the bot has not registered with the node holding the fleet yet; the failback needs that node reachable'
-                : f.copyBlockFollowed !== true ? `the stand-in ${shortId(hold.standInNodeId)} has not relayed its copy block to this node yet (its manager publishes it when the Database modal there is opened or on its next health tick); Continue once it has, or Cancel this run and follow the by-hand route on this modal`
+                : f.copyBlockFollowed !== true ? `the stand-in ${shortId(hold.standInNodeId)} has not relayed its copy block to this node yet (its manager publishes it on its next health tick, and this node receives it only at its next registration with the stand-in, a restart of either bot); Continue once it has, or Cancel this run and follow the by-hand route on this modal`
                 : 'the copy block is in hand but the divergence verdict never arrived');
             }
             await sleep(POLL_MS);

@@ -779,6 +779,17 @@ export function updateInstanceFleetFailback(botId: string, run: FleetFailbackRun
   saveRegistry(registry);
 }
 
+/** Set or clear the copy-block retraction a bot has not confirmed yet. Throws when the registry cannot be saved. */
+export function updateInstanceCopyBlockRetract(botId: string, pending: InstanceConfig['copyBlockRetract'] | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (pending) instance.copyBlockRetract = pending;
+  else delete instance.copyBlockRetract;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceFleetFailbackDeclined(botId: string, decline: FleetFailbackDecline | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -3150,6 +3161,22 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   return deleteLaneRefusal(botId, 'Start');
 }
 
+/** A recorded copy-block retraction reaches the app once its hooks answer after a start; a miss stays recorded. */
+async function sendCopyBlockRetract(botId: string): Promise<void> {
+  try {
+    // Imported here: appLifecycle imports this module.
+    const lifecycle = await import('../instance/appLifecycle');
+    const instance = getBot(botId);
+    if (!instance) return;
+    const up = await lifecycle.waitForAppHook(instance, 90_000);
+    if (!up.success) return;
+    const settled = await lifecycle.settleCopyBlockRetract(botId);
+    if (settled.pending) console.warn(`[Start] ${instance.displayName}: the copy-block retraction is still pending (${settled.reason}); opening its Database modal sends it again`);
+  } catch (err) {
+    console.warn(`[Start] the copy-block retraction for ${botId} could not be sent: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 async function startBotImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
@@ -3203,6 +3230,7 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
         result.warning = result.warning ? `${result.warning}; ${narrowed}` : narrowed;
       }
     }
+    if (getBot(botId)?.copyBlockRetract) void sendCopyBlockRetract(botId);
   }
   if (!applyInPlace) return result;
 

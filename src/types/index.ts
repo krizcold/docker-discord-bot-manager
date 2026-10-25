@@ -322,6 +322,7 @@ export interface InstanceConfig {
   fleetFailback?: FleetFailbackRun;    // failback or drop-back run in flight or parked (20.5, B6-i); cleared when it finishes, is cancelled or dismissed
   fleetLastPosture?: { posture: import('../instance/appLifecycle').StandInPosture | null; readAt: number }; // the stand-in posture the bot last answered; absent until one was read
   fleetFailbackDeclined?: FleetFailbackDecline; // the operator declined the automatic run for a stand-in episode; a re-arm or a later episode clears it
+  copyBlockRetract?: { host: string; port: number; since: string }; // a Disable or decommission whose bot has not confirmed it dropped the copy block naming this endpoint; cleared once it does
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
   fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it

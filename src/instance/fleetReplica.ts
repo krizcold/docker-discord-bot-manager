@@ -633,7 +633,7 @@ export async function provisionFleetReplicaFromFacts(
   // The app's own verdict: a block inherited from a former master names a
   // fenced database, and a standby seeded from it would follow the wrong side.
   if (facts.facts?.copyBlockCurrent === false) {
-    return { success: false, error: 'The block this node holds names a database that is not the one the fleet follows now (it came from a former master); wait for the current primary\'s manager to publish its block, or paste that block instead' };
+    return { success: false, error: 'The block this node holds names a database that is not the one the fleet follows now (it came from a former master). The current primary\'s block reaches this node only at its next registration with that primary, once that primary\'s manager has published it (opening its Replication section does): restart this bot after that, or paste that block instead' };
   }
   if (facts.facts?.copyBlockCurrent !== true) {
     return { success: false, error: 'The app did not say whether its block is current; paste the block from the primary machine instead' };
@@ -1686,7 +1686,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   // block inherited from a former master names the very primary this standby
   // still follows, so it passes that check while naming a fenced database.
   if (facts.facts?.copyBlockCurrent === false) {
-    return refuse('The block this node holds names a database that is not the one the fleet follows now (it came from a former master); wait for the current primary\'s manager to publish its block, then re-seed');
+    return refuse('The block this node holds names a database that is not the one the fleet follows now (it came from a former master). The current primary\'s block reaches this node only at its next registration with that primary, once that primary\'s manager has published it (opening its Replication section does): restart this bot after that, then re-seed');
   }
   const validated = validateIntake(block.dsn, block.cert, rec.publicHost, rec.hostPort);
   if (!validated.ok) return refuse(`The copy block the bot holds is unusable: ${validated.error}`);

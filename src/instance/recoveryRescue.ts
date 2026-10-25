@@ -686,10 +686,10 @@ async function startFlippedFleet(instance: InstanceConfig): Promise<void> {
 
 async function returnAppToRole(instance: InstanceConfig): Promise<void> {
   const current = () => containerManager.getBot(instance.id) || instance;
-  // The certificate rotated behind an unchanged host and port, which the
-  // endpoint-keyed freshness check cannot see, so the copy block is pushed
-  // explicitly once the app answers. Its hooks answer when its web server
-  // listens, not when the start returns.
+  // The certificate rotated, so the copy block is pushed once the app answers
+  // and before the role reset restarts it: backups receive a block only when
+  // they register, and they re-register with the restarted bot. Its hooks
+  // answer when its web server listens, not when the start returns.
   const answering = await appLifecycle.waitForAppHook(current(), APP_HOOK_WAIT_MS);
   if (!answering.success) {
     parkFlip(instance, `The fleet started, but ${answering.error}; check the app, then Continue to publish the copy block and return it to its configured role`);
@@ -697,7 +697,7 @@ async function returnAppToRole(instance: InstanceConfig): Promise<void> {
   }
   const republished = await appLifecycle.deliverCopyBlock(current());
   if (!republished.success) {
-    console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; open the Database panel on this instance to publish it`);
+    console.warn(`[RecoveryRescue] Copy block not republished after the cert rotation: ${republished.error}; once the role reset below has restarted the bot as the fleet's master, opening the Replication section on this instance publishes it, and each designated backup receives it only at its next registration (a restart of either bot)`);
   }
   // The app booted in whatever role and store its own files last recorded
   // (a demote's co-worker override, the forms it followed as a co-worker);

@@ -13,6 +13,7 @@
  */
 
 import YAML from 'yaml';
+import { composeEnvValue, splitDockerVolume } from '../templates/pcsProcessing';
 
 export interface NameSubstitutionResult {
   content: string;
@@ -48,6 +49,7 @@ export function substituteComposeNames(
 
   const rename = (s: string): string => replaceInString(s, originalName, newSanitizedName);
   const renameList = (list: unknown[]): unknown[] => list.map(part => typeof part === 'string' ? rename(part) : part);
+  const renameText = (s: string): string => replaceInString(s, originalName, composeEnvValue(newSanitizedName));
 
   // 1. name: field
   if (doc.name && typeof doc.name === 'string') {
@@ -179,11 +181,11 @@ export function substituteComposeNames(
     // Title: set to titleName if provided
     if (titleName && xcasaos.title && typeof xcasaos.title === 'object') {
       for (const lang of Object.keys(xcasaos.title)) {
-        xcasaos.title[lang] = titleName;
+        xcasaos.title[lang] = composeEnvValue(titleName);
       }
     } else if (xcasaos.title && typeof xcasaos.title === 'object') {
       for (const lang of Object.keys(xcasaos.title)) {
-        if (typeof xcasaos.title[lang] === 'string') xcasaos.title[lang] = rename(xcasaos.title[lang]);
+        if (typeof xcasaos.title[lang] === 'string') xcasaos.title[lang] = renameText(xcasaos.title[lang]);
       }
     }
 
@@ -191,7 +193,7 @@ export function substituteComposeNames(
     for (const field of ['tagline', 'description'] as const) {
       if (xcasaos[field] && typeof xcasaos[field] === 'object') {
         for (const lang of Object.keys(xcasaos[field])) {
-          if (typeof xcasaos[field][lang] === 'string') xcasaos[field][lang] = rename(xcasaos[field][lang]);
+          if (typeof xcasaos[field][lang] === 'string') xcasaos[field][lang] = renameText(xcasaos[field][lang]);
         }
       }
     }
@@ -245,16 +247,15 @@ function replaceAppDataPath(volumeStr: string, originalName: string, newName: st
 }
 
 function isNamedVolumeSource(source: string): boolean {
-  return source !== '' && !/^[./~$]/.test(source);
+  return source !== '' && !/^[./~$]/.test(source) && !/^[A-Za-z]:[\\/]/.test(source);
 }
 
 /** "source:target[:mode]", or a bare container path for an anonymous volume. */
 function renameShortVolume(vol: string, renameSource: (s: string) => string, rename: (s: string) => string): string {
-  const parts = vol.split(':');
-  if (parts.length === 1) return rename(vol);
-  parts[0] = renameSource(parts[0]);
-  parts[1] = rename(parts[1]);
-  return parts.join(':');
+  const split = splitDockerVolume(vol);
+  if (!split) return rename(vol);
+  const mode = vol.slice(split.source.length + 1 + split.dest.length);
+  return `${renameSource(split.source)}:${rename(split.dest)}${mode}`;
 }
 
 /**

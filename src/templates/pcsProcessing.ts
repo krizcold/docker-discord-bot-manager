@@ -203,11 +203,10 @@ function rewriteBindSource(source: string, appData: string, dataRoot: string): s
  * prefix) are left untouched.
  */
 function rewriteVolumeString(volume: string, appData: string, dataRoot: string): string {
-  const firstColon = volume.indexOf(':');
-  if (firstColon <= 0) return volume;
-  const source = volume.slice(0, firstColon);
+  const source = splitDockerVolume(volume)?.source;
+  if (!source) return volume;
   if (!source.startsWith('/') && !source.startsWith('.')) return volume;
-  return rewriteBindSource(source, appData, dataRoot) + volume.slice(firstColon);
+  return rewriteBindSource(source, appData, dataRoot) + volume.slice(source.length);
 }
 
 /**
@@ -220,9 +219,8 @@ function rewriteVolumeString(volume: string, appData: string, dataRoot: string):
 function isBuildContextOverlay(volume: unknown): boolean {
   let source: string | undefined;
   if (typeof volume === 'string') {
-    const firstColon = volume.indexOf(':');
-    if (firstColon <= 0) return false;
-    source = volume.slice(0, firstColon);
+    source = splitDockerVolume(volume)?.source;
+    if (!source) return false;
   } else if (volume && typeof volume === 'object') {
     const vol = volume as Record<string, unknown>;
     if (vol.type === 'volume') return false;
@@ -248,6 +246,7 @@ export function processComposeForCasaOS(
   // ── Ensure name field ──
   delete compose.version;
   if (!compose.name) {
+    scopeContainerNames(compose, appName);
     compose.name = appName;
   }
 
@@ -364,16 +363,16 @@ export function processComposeForCasaOS(
         if (typeof service.labels === 'object' && !Array.isArray(service.labels)) {
           const labels = service.labels as Record<string, string>;
           // Gateway-routed domain (custom CA)
-          labels['caddy_0'] = `${appName}-${pcs.APP_DOMAIN}`;
+          labels['caddy_0'] = composeEnvValue(`${appName}-${pcs.APP_DOMAIN}`);
           labels['caddy_0.import'] = 'gateway_tls';
           labels['caddy_0.reverse_proxy'] = `{{upstreams ${webPort}}}`;
           // nip.io direct access (custom CA)
           if (pcs.APP_PUBLIC_IP_DASH) {
-            labels['caddy_1'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.nip.io`;
+            labels['caddy_1'] = composeEnvValue(`${appName}-${pcs.APP_PUBLIC_IP_DASH}.nip.io`);
             labels['caddy_1.import'] = 'gateway_tls';
             labels['caddy_1.reverse_proxy'] = `{{upstreams ${webPort}}}`;
             // sslip.io direct access (Let's Encrypt, no gateway_tls)
-            labels['caddy_2'] = `${appName}-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`;
+            labels['caddy_2'] = composeEnvValue(`${appName}-${pcs.APP_PUBLIC_IP_DASH}.sslip.io`);
             labels['caddy_2.reverse_proxy'] = `{{upstreams ${webPort}}}`;
           }
         }
@@ -414,6 +413,7 @@ export function processComposeForCasaOS(
           }
           return volume;
         });
+        joinAppGroup(service, appData, pcs.PGID);
       }
     }
 
@@ -620,7 +620,7 @@ export function processComposeForCasaOS(
   }
 
   if (pcs.APP_DOMAIN) {
-    xcasaos.hostname = `${appName}${pcs.REF_SEPARATOR}${pcs.APP_DOMAIN}`;
+    xcasaos.hostname = composeEnvValue(`${appName}${pcs.REF_SEPARATOR}${pcs.APP_DOMAIN}`);
   }
 
   // scheme and port_map for CasaOS web UI routing
@@ -751,12 +751,11 @@ function rewriteDockerBindSource(source: string, hostBotDir: string, dataRoot: s
 
 function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: string): unknown {
   if (typeof volume === 'string') {
-    const i = volume.indexOf(':');
-    if (i <= 0) return volume;
-    const src = volume.slice(0, i);
+    const src = splitDockerVolume(volume)?.source;
+    if (!src) return volume;
     const rewritten = rewriteDockerBindSource(src, hostBotDir, dataRoot);
     if (rewritten === src) return volume;
-    return rewritten + volume.slice(i);
+    return rewritten + volume.slice(src.length);
   }
   if (volume && typeof volume === 'object') {
     const v = volume as Record<string, unknown>;
@@ -765,6 +764,98 @@ function rewriteDockerVolume(volume: unknown, hostBotDir: string, dataRoot: stri
     }
   }
   return volume;
+}
+
+/**
+ * A compose with no top-level name gets no name substitution, so a fixed
+ * container_name would be shared by every instance of the source and the second
+ * one would fail to start. Each one not already scoped to this instance is
+ * prefixed with the app name, and the repo's name stays resolvable as an alias
+ * on the project's own networks (never on an external or fixed-name one, where
+ * instances meet). A service with none of those networks keeps its name, since
+ * nothing would carry the alias. A `container:<name>` reference follows the rename.
+ */
+function scopeContainerNames(compose: Record<string, unknown>, appName: string): void {
+  const services = compose.services as Record<string, Record<string, unknown>> | undefined;
+  if (!services || typeof services !== 'object') return;
+  const declared = (compose.networks && typeof compose.networks === 'object' ? compose.networks : {}) as Record<string, unknown>;
+  const projectNetwork = (net: string): boolean => {
+    if (!(net in declared)) return net === 'default';
+    const cfg = declared[net] as Record<string, unknown> | null;
+    return !cfg || typeof cfg !== 'object' || (!cfg.external && typeof cfg.name !== 'string');
+  };
+  const renamed = new Map<string, string>();
+  for (const [key, service] of Object.entries(services)) {
+    if (!service || typeof service !== 'object') continue;
+    const fixed = service.container_name;
+    if (typeof fixed !== 'string' || !fixed || fixed === appName || fixed.startsWith(`${appName}-`)) continue;
+    const rename = (): void => {
+      service.container_name = `${appName}-${fixed}`;
+      renamed.set(fixed, service.container_name as string);
+    };
+    if (fixed === key || service.network_mode !== undefined) { rename(); continue; }
+    let nets: Record<string, unknown> | undefined;
+    if (service.networks === undefined) nets = { default: null };
+    else if (Array.isArray(service.networks)) nets = Object.fromEntries((service.networks as unknown[]).filter((n): n is string => typeof n === 'string').map(n => [n, null]));
+    else if (service.networks && typeof service.networks === 'object') nets = service.networks as Record<string, unknown>;
+    if (!nets || !Object.keys(nets).some(projectNetwork)) continue;
+    rename();
+    for (const net of Object.keys(nets)) {
+      if (!projectNetwork(net)) continue;
+      const cfg = (nets[net] && typeof nets[net] === 'object' ? nets[net] : {}) as Record<string, unknown>;
+      const aliases = Array.isArray(cfg.aliases) ? cfg.aliases as unknown[] : [];
+      if (!aliases.includes(fixed)) aliases.push(fixed);
+      cfg.aliases = aliases;
+      nets[net] = cfg;
+    }
+    service.networks = nets;
+  }
+  const follow = (ref: unknown): unknown => {
+    if (typeof ref !== 'string') return ref;
+    const m = /^container:([^:]+)(:.*)?$/.exec(ref);
+    const to = m && renamed.get(m[1]);
+    return to ? `container:${to}${m![2] ?? ''}` : ref;
+  };
+  for (const service of Object.values(services)) {
+    if (!service || typeof service !== 'object') continue;
+    for (const field of ['network_mode', 'ipc', 'pid']) {
+      if (service[field] !== undefined) service[field] = follow(service[field]);
+    }
+    if (Array.isArray(service.volumes_from)) service.volumes_from = (service.volumes_from as unknown[]).map(follow);
+  }
+}
+
+/**
+ * The directories the manager delivers belong to PUID:PGID and are group- but
+ * not world-writable, so a service that binds one and runs under its own uid
+ * (a Lavalink image downloading plugins) is given the PGID group to write there.
+ */
+function joinAppGroup(service: Record<string, unknown>, appDir: string, pgid: string): void {
+  if (!/^\d+$/.test(pgid) || !Array.isArray(service.volumes)) return;
+  const root = appDir.replace(/\/+$/, '');
+  const bindsAppDir = (service.volumes as unknown[]).some(v => {
+    let src: string | undefined;
+    if (typeof v === 'string') src = splitDockerVolume(v)?.source;
+    else if (v && typeof v === 'object' && (v as Record<string, unknown>).type !== 'volume') {
+      const s = (v as Record<string, unknown>).source;
+      if (typeof s === 'string') src = s;
+    }
+    return !!src && (src === root || src.startsWith(`${root}/`));
+  });
+  if (!bindsAppDir) return;
+  if (service.group_add === undefined) service.group_add = [pgid];
+  else if (Array.isArray(service.group_add) && !(service.group_add as unknown[]).some(g => String(g) === pgid)) {
+    (service.group_add as unknown[]).push(pgid);
+  }
+}
+
+function networkAliasesOf(service: Record<string, unknown> | undefined): string[] {
+  const nets = service?.networks;
+  if (!nets || typeof nets !== 'object' || Array.isArray(nets)) return [];
+  return Object.values(nets as Record<string, unknown>).flatMap(cfg =>
+    cfg && typeof cfg === 'object' && Array.isArray((cfg as Record<string, unknown>).aliases)
+      ? ((cfg as Record<string, unknown>).aliases as unknown[]).filter((a): a is string => typeof a === 'string')
+      : []);
 }
 
 /** Platform ingress labels (Yundera Caddy / caddy-docker-proxy): `caddy`, `caddy.*`, `caddy_N`, `caddy_N.*`. */
@@ -827,7 +918,8 @@ export function frontingGateway(compose: Record<string, unknown>): { gateway: st
   if (!backendHost || isNaN(backendPort)) return null;
   const backendName = services[backendHost]
     ? backendHost
-    : Object.keys(services).find(n => services[n]?.container_name === backendHost);
+    : Object.keys(services).find(n => services[n]?.container_name === backendHost)
+      ?? Object.keys(services).find(n => networkAliasesOf(services[n]).includes(backendHost));
   if (!backendName || backendName === mainName) return null;
   return { gateway: mainName, backend: backendName, backendPort };
 }
@@ -890,7 +982,10 @@ export function processComposeForDocker(
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
 
   delete compose.version;
-  if (!compose.name) compose.name = appName;
+  if (!compose.name) {
+    scopeContainerNames(compose, appName);
+    compose.name = appName;
+  }
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) {
@@ -958,6 +1053,7 @@ export function processComposeForDocker(
       if (hostBotDir) kept = kept.map(v => rewriteDockerVolume(v, hostBotDir, pcs.DATA_ROOT));
       if (kept.length === 0) delete service.volumes;
       else service.volumes = kept;
+      if (hostBotDir) joinAppGroup(service, hostBotDir, pcs.PGID);
     }
 
     // Strip the external `pcs` network (CasaOS-only); keep project-local networks.
@@ -1237,7 +1333,7 @@ export function attachBotToProxy(
 
   if (!svc.labels || Array.isArray(svc.labels) || typeof svc.labels !== 'object') svc.labels = {};
   const labels = svc.labels as Record<string, string>;
-  labels['caddy'] = host;
+  labels['caddy'] = composeEnvValue(host);
   labels['caddy.reverse_proxy'] = `{{upstreams ${containerPort}}}`;
   if (opts.forwardAuth) {
     labels['caddy.forward_auth'] = 'authelia:9091';
@@ -1335,7 +1431,8 @@ function labelValueOf(labels: unknown, key: string): string | null {
   return null;
 }
 
-function setServiceLabel(service: Record<string, unknown>, key: string, value: string): void {
+function setServiceLabel(service: Record<string, unknown>, key: string, raw: string): void {
+  const value = composeEnvValue(raw);
   if (!service.labels) service.labels = {};
   if (Array.isArray(service.labels)) (service.labels as unknown[]).push(`${key}=${value}`);
   else (service.labels as Record<string, string>)[key] = value;
@@ -1525,7 +1622,7 @@ export function attachFleetToProxy(
   if (!svc.labels || Array.isArray(svc.labels) || typeof svc.labels !== 'object') svc.labels = {};
   const labels = svc.labels as Record<string, string>;
   const prefix = `caddy_${nextCaddySiteIndex(labels)}`;
-  labels[prefix] = host;
+  labels[prefix] = composeEnvValue(host);
   labels[`${prefix}.reverse_proxy`] = `{{upstreams ${controlPort}}}`;
 
   if (Array.isArray(svc.networks)) {
@@ -1862,9 +1959,29 @@ export function removeFleetPostgresReplicaService(composeContent: string): strin
 
 // ─── Docker-mode volume + config-file delivery (Node fs) ──
 
+/**
+ * mkdir -p for a docker-mode delivery. What it creates goes to PUID:PGID, mode
+ * 775 (a service under another uid writes through joinAppGroup). An existing
+ * directory owned by root or PUID loses only the world-write bit; one a service
+ * took for its own uid is left as it is.
+ */
 function dockerEnsureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true });
-  try { fs.chmodSync(dir, 0o777); } catch { /* windows / best effort */ }
+  const created = fs.mkdirSync(dir, { recursive: true, mode: 0o775 });
+  if (process.platform === 'win32') return;   // bind-mount ownership is virtualized on Docker Desktop
+  if (created) {
+    grantToApp(created, { recursive: true });
+    for (let level = path.resolve(dir); ; level = path.dirname(level)) {
+      grantToApp(level, { mode: '775' });
+      if (level === path.resolve(created) || path.dirname(level) === level) break;
+    }
+    return;
+  }
+  let st: fs.Stats;
+  try { st = fs.lstatSync(dir); } catch { return; }
+  const puid = parseInt(getPCSEnvironment().PUID, 10);
+  if (!st.isDirectory() || !(st.mode & 0o002) || (st.uid !== 0 && st.uid !== puid)) return;
+  try { fs.chmodSync(dir, st.mode & 0o7775); }
+  catch (e) { console.warn(`[Docker] Warning: could not take the world-write bit off ${dir} (${e})`); }
 }
 
 /**
@@ -2788,7 +2905,7 @@ export function grantFd(fd: number, log?: (msg: string) => void): void {
  * never touches pre-existing parents.
  */
 function mkdirForApp(dirPath: string, log?: (msg: string) => void): void {
-  const created = fs.mkdirSync(dirPath, { recursive: true });
+  const created = fs.mkdirSync(dirPath, { recursive: true, mode: 0o755 });
   if (created) grantToApp(created, { recursive: true, log });
 }
 
@@ -2800,7 +2917,8 @@ function mkdirForApp(dirPath: string, log?: (msg: string) => void): void {
  * skips an already-present dir, so a service that took ownership of its bind mount
  * (e.g. Postgres chowning its data dir to uid 999, mode 0700) is never clobbered
  * on redeploy. `mode` lets a delivered dir a container must write to be made
- * world-writable (e.g. a Lavalink plugins dir it downloads into at startup).
+ * group-writable (e.g. a Lavalink plugins dir it downloads into at startup, with
+ * the PGID group from joinAppGroup).
  */
 function ensureVolumeDir(
   dirPath: string,
@@ -2833,8 +2951,9 @@ async function deliverRepoFile(repoSrc: string, target: string, log: (msg: strin
 async function deliverRepoDir(repoSrc: string, target: string, log: (msg: string) => void, noLink: NoLinkNote): Promise<SeedCounts> {
   const counts: SeedCounts = { delivered: 0, kept: 0 };
   // A repo-provided bind dir is app-managed and a foreign-uid container may need
-  // to write into it (e.g. Lavalink downloading plugin jars), so make it writable.
-  ensureVolumeDir(target, '777', false, log);
+  // to write into it (e.g. Lavalink downloading plugin jars): it is group-writable,
+  // and joinAppGroup gives that container the group.
+  ensureVolumeDir(target, '775', false, log);
   for (const entry of fs.readdirSync(repoSrc, { withFileTypes: true })) {
     if (SKIP_DELIVER.has(entry.name)) continue;
     const childRepo = path.join(repoSrc, entry.name);

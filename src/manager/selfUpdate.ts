@@ -392,14 +392,30 @@ const FETCH_WAIT_MS = 30000;
 const FETCH_TERM_MS = 10 * 60 * 1000;
 let fetchInFlight: Promise<void> | null = null;
 
-/** git ends a stalled transfer itself (low-speed limit, ssh keepalive); a fetch past FETCH_TERM_MS gets SIGTERM, on which git removes its lock files. A read waits at most FETCH_WAIT_MS ('running') and joins a fetch still running. */
+/** The fetch env: an ssh keepalive only when the operator set no ssh command of their own (env or core.sshCommand); an unreadable config adds none. */
+async function fetchEnv(): Promise<NodeJS.ProcessEnv | undefined> {
+  if (process.env.GIT_SSH_COMMAND || process.env.GIT_SSH) return undefined;
+  try {
+    if (await gitAsync(['config', '--get', 'core.sshCommand'])) return undefined;
+  } catch (err) {
+    if ((err as { code?: unknown })?.code !== 1) return undefined;
+  }
+  return { ...process.env, GIT_SSH_COMMAND: 'ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4' };
+}
+
+/** git ends a stalled transfer itself (low-speed limit, ssh keepalive); a fetch past FETCH_TERM_MS gets SIGTERM, on which git removes its lock files. A read waits at most FETCH_WAIT_MS ('running') and joins a fetch still running. No fetch starts while an update runs. */
 async function fetchUpstream(): Promise<'done' | 'running'> {
   if (!fetchInFlight) {
-    fetchInFlight = gitAsync(['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=60', 'fetch', '--quiet'], {
-      writes: true,
-      termAfterMs: FETCH_TERM_MS,
-      env: { ...process.env, GIT_SSH_COMMAND: 'ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4' },
-    }).then(() => {}).finally(() => { fetchInFlight = null; });
+    if (updateInProgress) throw new Error('an update is running');
+    fetchInFlight = (async () => {
+      const env = await fetchEnv();
+      if (updateInProgress) throw new Error('an update is running');
+      await gitAsync(['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=60', 'fetch', '--quiet'], {
+        writes: true,
+        termAfterMs: FETCH_TERM_MS,
+        ...(env ? { env } : {}),
+      });
+    })().finally(() => { fetchInFlight = null; });
   }
   const run = fetchInFlight;
   let timer: NodeJS.Timeout | undefined;
@@ -460,6 +476,22 @@ async function readManagerVersion(): Promise<ManagerVersion> {
   }
 }
 
+/** Waits for a version read's fetch to settle before the pull; the manager SIGTERMs it at FETCH_TERM_MS, and one still running a minute past that refuses the update. */
+async function settleFetch(emit: Emit): Promise<void> {
+  const run = fetchInFlight;
+  if (!run) return;
+  emit('[Update] Waiting for a running git fetch to finish...', 'info');
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<'late'>((resolve) => { timer = setTimeout(() => resolve('late'), FETCH_TERM_MS + 60000); });
+  try {
+    if (await Promise.race([run.then(() => 'settled' as const, () => 'settled' as const), late]) === 'late') {
+      throw new Error(`Nothing was pulled: a git fetch started by a version check has run for over ${Math.round((FETCH_TERM_MS + 60000) / 60000)} minutes. Check the version again, then update.`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Pull + rebuild + recreate. Streams progress via emit(). RESOLVES with the outcome
  * when nothing needed applying, when the recreate applied without replacing this
@@ -517,6 +549,7 @@ async function doManagerUpdate(
     throw new Error(`An earlier recreate (the ${HELPER} container) is still running; wait for it to finish, then check the version again.`);
   }
 
+  await settleFetch(emit);
   emit('[Update] Fetching latest code...', 'info');
   await preserveLocalUsersDb();
   const oldHead = await gitAsync(['rev-parse', 'HEAD']);

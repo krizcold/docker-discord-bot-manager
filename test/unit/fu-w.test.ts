@@ -48,7 +48,7 @@ vi.mock('../../src/casaos/detector', () => ({ getDeploymentMode: async () => 'do
 
 import * as recoveryControl from '../../src/instance/recoveryControl';
 import * as recoveryChannel from '../../src/instance/recoveryChannel';
-import * as fleetBackup from '../../src/instance/fleetBackup';
+import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 
 const bounded = (opts: any) => typeof opts?.timeout === 'number' && opts.timeout > 0;
 const callsOf = (match: (args: string[]) => boolean) => st.calls.filter(c => match(c.args));
@@ -75,7 +75,7 @@ async function call(action: string): Promise<{ code: number; body: any }> {
 
 beforeEach(() => {
   recoveryControl.releaseQuiesceSlot('s1');
-  fleetBackup.releaseFleetBackupBusy('s1');
+  fleetBackupGuards.releaseFleetBackupBusy('s1');
   st.bots = [source()];
   st.calls.length = 0;
   st.live = [[]];

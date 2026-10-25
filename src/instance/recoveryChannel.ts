@@ -105,7 +105,8 @@ async function databaseIdentity(instance: InstanceConfig): Promise<Record<string
   return systemId ? { systemId, timeline: Number(timeline), checkpointLsn, capturedAt: Date.now() } : {};
 }
 
-async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string }> {
+/** left: what a failed spawn could not remove or could not read, still running with only this record naming it. */
+async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string; left?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'instance no longer has a managed fleet database; disarm the recovery channel' };
   // A key-loss-scrubbed credential would spawn a relay that exits fatally and
@@ -155,9 +156,13 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
     // the rescue, disarm/delete already remove it by name.
     const daemon = await ensureRsyncDaemon(instance, image.image!, network.network!);
     if (!daemon.ok) {
-      await docker(['rm', '-f', record.containerName]);
-      if (!daemon.unknown) await docker(['rm', '-f', rsyncContainerName(instance)]);
-      return { ok: false, error: daemon.error };
+      const left: string[] = [];
+      for (const name of daemon.unknown ? [record.containerName] : [record.containerName, rsyncContainerName(instance)]) {
+        const rm = await docker(['rm', '-f', name]);
+        if (!rm.ok && !/no such container/i.test(rm.stderr)) left.push(`${name} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`);
+      }
+      if (daemon.unknown) left.push(`docker did not say whether the rsync daemon ${rsyncContainerName(instance)} runs`);
+      return { ok: false, error: daemon.error, left: left.length > 0 ? left.join('; and ') : undefined };
     }
   }
   return { ok: true };
@@ -239,11 +244,7 @@ async function armReceiverImpl(
     return { success: false, error: 'Instance disappeared while arming' };
   }
   const spawned = await spawnRelay(instance, record);
-  if (!spawned.ok) {
-    await docker(['rm', '-f', record.containerName]);
-    containerManager.updateInstanceRecoveryChannel(instance.id, null);
-    return { success: false, error: spawned.error };
-  }
+  if (!spawned.ok) return rollBackArm(instance, record, spawned);
   return { success: true, block: { host, port, cert: tlsCert, token: record.token } };
 }
 
@@ -301,12 +302,31 @@ async function armSourceImpl(
     return { success: false, error: 'Instance disappeared while arming' };
   }
   const spawned = await spawnRelay(instance, record);
-  if (!spawned.ok) {
-    await docker(['rm', '-f', record.containerName]);
-    containerManager.updateInstanceRecoveryChannel(instance.id, null);
-    return { success: false, error: spawned.error };
-  }
+  if (!spawned.ok) return rollBackArm(instance, record, spawned);
   return { success: true };
+}
+
+/** The record clears only once the rollback proved everything gone; otherwise it stays as disarming, naming what is left. */
+async function rollBackArm(
+  instance: InstanceConfig,
+  record: RecoveryChannelRecord,
+  spawned: { error?: string; left?: string },
+): Promise<{ success: false; error: string }> {
+  let left = spawned.left;
+  if (!left) {
+    const rm = await docker(['rm', '-f', record.containerName]);
+    if (!rm.ok && !/no such container/i.test(rm.stderr)) left = `${record.containerName} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`;
+  }
+  if (!left) {
+    containerManager.updateInstanceRecoveryChannel(instance.id, null);
+    return { success: false, error: spawned.error ?? 'the arm failed' };
+  }
+  try {
+    containerManager.updateInstanceRecoveryChannel(instance.id, { ...record, disarmingAt: Date.now(), disarmLeft: `the arm was rolled back, but ${left}` });
+  } catch (err) {
+    return { success: false, error: `${spawned.error}. The arm could not be rolled back: ${left}, and the record could not be marked as disarming (${err instanceof Error ? err.message : String(err)}). The channel stays on record as armed and the manager will try to start it again; Disarm removes it` };
+  }
+  return { success: false, error: `${spawned.error}. The arm was rolled back, but ${left}; the channel stays on record, and Disarm removes what is left` };
 }
 
 export interface RecoveryChannelStatus {
@@ -503,7 +523,10 @@ export async function reconcileRecoveryChannels(): Promise<void> {
     if (arming.has(snapshot.id)) continue;
     const inspect = await docker(['inspect', '--format', '{{.State.Running}}', snapshot.recoveryChannel.containerName]);
     const state = containerStateOf(inspect);
-    if (state === 'running') continue;
+    if (state === 'running') {
+      if (snapshot.recoveryChannel.mode === 'source') await reconcileRsyncDaemon(snapshot);
+      continue;
+    }
     if (state === 'unknown') {
       // A respawn removes the helper first; over an unread state that could cut a live transfer.
       console.warn(`[RecoveryChannel] Could not read the state of relay ${snapshot.recoveryChannel.containerName}, so it was left as it is: ${inspect.stderr.trim().split('\n').pop() || 'docker did not answer'}`);
@@ -526,10 +549,40 @@ export async function reconcileRecoveryChannels(): Promise<void> {
       const spawned = await spawnRelay(fresh, record);
       console.log(spawned.ok
         ? `[RecoveryChannel] Respawned relay ${record.containerName}`
-        : `[RecoveryChannel] Could not respawn relay ${record.containerName}: ${spawned.error}`);
+        : `[RecoveryChannel] Could not respawn relay ${record.containerName}: ${spawned.error}${spawned.left ? `; ${spawned.left}` : ''}`);
     } finally {
       arming.delete(snapshot.id);
     }
+  }
+}
+
+/** The seed daemon belongs to an armed source: one that died or was removed while the relay runs is started again. */
+async function reconcileRsyncDaemon(snapshot: InstanceConfig): Promise<void> {
+  const name = rsyncContainerName(snapshot);
+  const inspect = await docker(['inspect', '--format', '{{.State.Running}}', name]);
+  const state = containerStateOf(inspect);
+  if (state === 'running') return;
+  if (state === 'unknown') {
+    console.warn(`[RecoveryChannel] Could not read the state of rsync daemon ${name}, so it was left as it is: ${inspect.stderr.trim().split('\n').pop() || 'docker did not answer'}`);
+    return;
+  }
+  console.warn(`[RecoveryChannel] The rsync daemon ${name} of the armed source channel on ${snapshot.displayName} is ${state === 'absent' ? 'missing' : 'stopped'}`);
+  if (arming.has(snapshot.id)) return;
+  arming.add(snapshot.id);
+  try {
+    const fresh = containerManager.getBot(snapshot.id);
+    const record = fresh?.recoveryChannel;
+    if (!fresh || !record || record.disarmingAt || record.mode !== 'source') return;
+    const image = await selfImage();
+    const network = image.ok && fresh.fleetDb ? await sidecarNetwork(fresh.fleetDb.containerName) : null;
+    const daemon = image.ok && network?.ok
+      ? await ensureRsyncDaemon(fresh, image.image!, network.network!)
+      : { ok: false, error: !image.ok ? image.error : network ? network.error : 'no managed fleet database' };
+    console.log(daemon.ok
+      ? `[RecoveryChannel] Started rsync daemon ${name} again`
+      : `[RecoveryChannel] Could not start rsync daemon ${name} again: ${daemon.error}`);
+  } finally {
+    arming.delete(snapshot.id);
   }
 }
 

@@ -8,7 +8,7 @@
  */
 import * as containerManager from '../docker/containerManager';
 import { getReplicationHealth } from './fleetReplicationHealth';
-import { autoReseedAllowed, reseedStandby } from './fleetReplica';
+import { autoReseedAllowed, reseedStandby, seedBuiltRecord } from './fleetReplica';
 
 const TICK_INTERVAL_MS = 60_000;
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -32,8 +32,9 @@ async function runTick(): Promise<void> {
     // The ruled re-fire of a stopped re-seed cannot ride the slot fact: the
     // seed drops and re-creates the slot before it copies, and a standby
     // whose copy was cleared reports nothing at all. Its own parked record is
-    // the trigger, and the ledger is what stops it.
-    const parkedReseed = seed?.parked === true && seed.purpose === 'reseed-standby';
+    // the trigger, and the ledger is what stops it. A run that stopped after
+    // refiling the standby whole left a complete copy, which is no trigger.
+    const parkedReseed = seed?.parked === true && seed.purpose === 'reseed-standby' && !seedBuiltRecord(rec, seed);
     if (!parkedReseed && getReplicationHealth(instance.id)?.slot?.lost !== true) continue;
     // The ledger is judged from live state: an operator's click during this
     // same tick is invisible to the snapshot the loop started with.

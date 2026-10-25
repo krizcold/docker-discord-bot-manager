@@ -165,7 +165,8 @@ describe('re-seeding a stale primary', () => {
     expect(parked.fleetDbReplicaSeed?.parked).toBe(true);
     expect((await getFleetReplicaStatus(parked)).pinsWarning).toContain(composePath);
 
-    await cancelReplicaSeed(parked);
+    const shown = parked.fleetDbReplicaSeed!;
+    await cancelReplicaSeed(parked, { startedAt: shown.startedAt, parked: true, committed: shown.committed === true, confirm: true });
     const after = containerManager.getBot('b1')!;
     expect(after.fleetDbReplicaSeed?.parked && !after.fleetDbReplicaSeed?.cancelled).toBeFalsy();
     expect((await getFleetReplicaStatus(after)).pinsWarning).toContain(composePath);

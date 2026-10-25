@@ -2132,7 +2132,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   /**
    * DELETE /api/bots/:id/fleet-replica/seed - Cancel the seed in flight
    * (preparing or seeding), or dismiss a parked one. Past the copy the answer
-   * is to remove the standby afterwards.
+   * is to remove the standby afterwards. Body { startedAt, parked } names the
+   * run the view showed; a needsConfirm answer carries the question and the
+   * seed it was worded from, and the confirmed call adds { committed, confirm }.
    */
   router.delete('/:id/fleet-replica/seed', async (req: Request, res: Response) => {
     try {
@@ -2141,7 +2143,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await fleetReplica.cancelReplicaSeed(bot);
+      const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, unknown>;
+      const result = await fleetReplica.cancelReplicaSeed(bot, {
+        startedAt: typeof body.startedAt === 'number' ? body.startedAt : undefined,
+        parked: typeof body.parked === 'boolean' ? body.parked : undefined,
+        committed: typeof body.committed === 'boolean' ? body.committed : undefined,
+        confirm: body.confirm === true,
+      });
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {

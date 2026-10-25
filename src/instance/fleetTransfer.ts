@@ -76,7 +76,7 @@ export async function transferSide(instance: InstanceConfig, opts: TransferOptio
     // the operator's confirmLag reaches it and a dead primary is the failover
     // the app names, never a catch-up wait it can never satisfy.
     if (!active || active.phase === 'promoting' || opts.confirmLag === true || opts.confirmLineage === true || opts.confirmReachability === true) {
-      const result = await promoteSide(instance, { confirmLag: opts.confirmLag, confirmLineage: opts.confirmLineage, confirmReachability: opts.confirmReachability, retireOldMaster: opts.retireOldMaster });
+      const result = await fleetReplica.whilePromoting(instance.id, () => promoteSide(instance, { confirmLag: opts.confirmLag, confirmLineage: opts.confirmLineage, confirmReachability: opts.confirmReachability, retireOldMaster: opts.retireOldMaster }));
       if (result.success && active) {
         containerManager.updateInstanceFleetTransfer(instance.id, null);
         containerManager.broadcastBotUpdated(instance.id);
@@ -201,7 +201,7 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
     saveRun(botId, { phase: 'promoting' });
     const bot = containerManager.getBot(botId);
     if (!bot) return;
-    const result = await promoteSide(bot, { confirmLag: false, retireOldMaster: currentRun(botId)?.retireOldMaster === true });
+    const result = await fleetReplica.whilePromoting(botId, () => promoteSide(bot, { confirmLag: false, retireOldMaster: currentRun(botId)?.retireOldMaster === true }));
     if (!result.success) {
       // The primary died between the copy and the promote: the app wants the
       // lag acknowledged, which is the operator's answer, given by pressing

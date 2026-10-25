@@ -889,6 +889,16 @@ export async function applyFleetDbReplicaService(botId: string): Promise<LaneRes
 }
 
 /**
+ * The standby record as it stands now, not as the build's snapshot had it: a
+ * Remove replica that landed during the build must not be written back. The
+ * snapshot is kept only when the instance cannot be read at all.
+ */
+function standbyRecordNow(botId: string, snapshot: InstanceConfig): FleetDbReplicaRecord | undefined {
+  const fresh = getBot(botId);
+  return fresh ? fresh.fleetDbReplica : snapshot.fleetDbReplica;
+}
+
+/**
  * Replace a deployed compose whole (tmp plus rename), so a manager killed
  * mid-write never leaves a torn file; the old file's mode and owner carry over.
  */
@@ -1843,7 +1853,7 @@ function composeVolumeNames(botId: string, appName: string): string[] | null {
  * volume (a keep-data delete and a reinstall under the same name, a restored
  * record); removing it then destroys the other bot's data.
  */
-function sharedVolumeReason(volume: string, botId: string): string | null {
+export function sharedVolumeReason(volume: string, botId: string): string | null {
   const registry = loadRegistry();
   if (brokenRegistryLoads.has(registry)) return `the manager can't confirm no other bot uses it (the instance registry cannot be read)`;
   const others = Object.entries(registry.instances).filter(([id, other]) => id !== botId && other.id !== botId);
@@ -3103,9 +3113,17 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     if (replicaSvc && typeof replicaSvc === 'object' && instance.fleetDbReplica) {
       replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
     }
+    // A standby removed while a build wrote its snapshot back must not return
+    // on this start; an adopted copy keeps the service key under fleetDb.
+    const unrecordedReplica = !!replicaSvc && typeof replicaSvc === 'object' && !instance.fleetDbReplica
+      && !(instance.fleetDb && replicaSvc.container_name === instance.fleetDb.containerName);
 
     capServiceLogs(services);
-    const yaml = YAML.stringify(compose, { lineWidth: 0 });
+    let yaml = YAML.stringify(compose, { lineWidth: 0 });
+    if (unrecordedReplica) {
+      yaml = removeFleetPostgresReplicaService(yaml);
+      console.warn(`[ContainerManager] ${instance.id}: the compose named a standby service that no record holds, so it was taken out of the compose; its data volume is kept`);
+    }
     if (privateFile) writePrivateFile(composePath, yaml);
     else rewriteComposeFile(composePath, yaml);
     return null;
@@ -4176,10 +4194,11 @@ async function buildDockerImageInstance(
 
   // Same rule as the git lanes: a rebuilt compose missing the standby service
   // would destroy the replica on the next up --remove-orphans.
-  if (instance.fleetDbReplica && !instance.fleetDbReplica.copyCleared) {
-    composeContent = addFleetPostgresReplicaService(composeContent, botForCompose, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
-    emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
-  } else if (instance.fleetDbReplica) {
+  const standby = standbyRecordNow(botId, instance);
+  if (standby && !standby.copyCleared) {
+    composeContent = addFleetPostgresReplicaService(composeContent, botForCompose, standby, { mode: isCasaOS ? 'casaos' : 'docker' });
+    emit(`[Fleet] Managed Postgres standby attached (${standby.containerName})`, 'info');
+  } else if (standby) {
     emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
 
@@ -4540,10 +4559,11 @@ async function buildGitInstanceHeld(
   // Re-inject the standby on every rebuild, in EVERY compose lane: compose up
   // runs --remove-orphans, so a rebuilt compose missing this service would
   // destroy the replica.
-  if (instance.fleetDbReplica && !instance.fleetDbReplica.copyCleared) {
-    composeContent = addFleetPostgresReplicaService(composeContent, botWithEnv, instance.fleetDbReplica, { mode: isCasaOS ? 'casaos' : 'docker' });
-    emit(`[Fleet] Managed Postgres standby attached (${instance.fleetDbReplica.containerName})`, 'info');
-  } else if (instance.fleetDbReplica) {
+  const standby = standbyRecordNow(botId, instance);
+  if (standby && !standby.copyCleared) {
+    composeContent = addFleetPostgresReplicaService(composeContent, botWithEnv, standby, { mode: isCasaOS ? 'casaos' : 'docker' });
+    emit(`[Fleet] Managed Postgres standby attached (${standby.containerName})`, 'info');
+  } else if (standby) {
     emit('[Fleet] Managed Postgres standby left out: its copy was cleared for a re-seed that has not finished', 'info');
   }
 

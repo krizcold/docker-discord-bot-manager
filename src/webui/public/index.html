@@ -2882,13 +2882,12 @@
         return;
       }
       const r = res.replica || null;
-      const hint = seedAfterRetire(res.failback || null, res.failbackDeclined || null) ? 'after-retire' : '';
       if (r && r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
           ? '<div class="env-tip">Cancelling at the next step...</div>'
           : p.cancelable
-            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(p.startedAt)}, false)">Cancel</button></div>`
             : '';
         still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${seedDumpHtml(p)}${cancelHtml}`;
         setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
@@ -2897,7 +2896,7 @@
       if (r && r.parkedSeed) {
         const k = r.parkedSeed;
         still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}${seedDumpHtml(k)}
-          <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${k.committed ? 'true' : 'false'}, '${k.purpose}', '${hint}')">Dismiss</button></div></div>`;
+          <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(k.startedAt)}, true)">Dismiss</button></div></div>`;
         return;
       }
       still.innerHTML = seedWarningHtml(r && r.pinsWarning);
@@ -3668,14 +3667,9 @@
       // A parked seed (failed, or interrupted by a manager restart) stays on
       // show until the operator retries or dismisses it.
       const parked = r.parkedSeed || null;
-      const hint = seedAfterRetire(res.failback || null, res.failbackDeclined || null) ? 'after-retire' : '';
-      // A provision seed's record does not survive a failed apply, so its parked
-      // record with a whole copy is a manager restart in the apply window, and
-      // the retire warning is the one to keep.
-      const parkedHint = parked && parked.committed && parked.copyWhole === true && parked.purpose !== 'provision' ? (res.failback ? 'copy-whole-run' : 'copy-whole') : hint;
       const errHtml = seedWarningHtml(r.pinsWarning) + (parked
         ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}${seedDumpHtml(parked)}
-             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', true, ${parked.committed ? 'true' : 'false'}, '${parked.purpose}', '${parkedHint}')">Dismiss</button></div></div>`
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(parked.startedAt)}, true)">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>`
         : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '');
       // A seed-first transfer (20.19 F21) in flight or parked; a live one keeps
@@ -3703,7 +3697,7 @@
         const cancelHtml = p.cancelRequested
           ? '<div class="env-tip">Cancelling at the next step...</div>'
           : p.cancelable
-            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', false, ${p.committed ? 'true' : 'false'}, '${p.purpose}', '${hint}')">Cancel</button></div>`
+            ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(p.startedAt)}, false)">Cancel</button></div>`
             : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
         body.innerHTML = `
           ${errHtml}
@@ -3835,6 +3829,7 @@
       const stopped = !!(led && led.lastError && r.autoReseedStopped);
       const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
       const ownParkedReseed = !!(r.parkedSeed && r.parkedSeed.purpose === 'reseed-standby' && !r.parkedSeed.cancelled);
+      const wholeParkedReseed = ownParkedReseed && r.parkedSeed.copyWhole === true;
       // A stand-in's own slot fact describes the master it covers, stale for
       // minutes after that master died; every remedy it would name is refused.
       const slotHtml = standingIn
@@ -3886,7 +3881,7 @@
       const ledgerHtml = !led
         ? ''
         : led.lastError
-          ? `<div class="error-message">${ledWho} attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${stopped ? ' It has stopped after repeated failures; fix the cause, then use Re-seed now.' : cancelled ? ' It was cancelled, so nothing retries it; use Re-seed now when you want it.' : (slot && slot.lost) || ownParkedReseed ? ' It retries periodically until it succeeds.' : ''}</div>`
+          ? `<div class="error-message">${ledWho} attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${stopped ? ' It has stopped after repeated failures; fix the cause, then use Re-seed now.' : cancelled ? ' It was cancelled, so nothing retries it; use Re-seed now when you want it.' : (slot && slot.lost) || (ownParkedReseed && !wholeParkedReseed) ? ' It retries periodically until it succeeds.' : wholeParkedReseed ? ' The copy it built is complete and on record, so the automatic re-seed does not retry it.' : ''}</div>`
           : led.lastSuccessAt
             ? `<div class="env-tip">Last re-seed completed at ${new Date(led.lastSuccessAt).toLocaleString()}.</div>`
             : `<div class="env-tip">${ledWho} attempt ${led.attempts} started at ${new Date(led.lastAttemptAt).toLocaleString()}.</div>`;
@@ -3912,7 +3907,7 @@
         ${ledgerHtml}
         <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
-          ${(standingIn && standing.live) || runHeld ? '' : `<button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}', ${removeMayHoldWrites ? 'true' : 'false'}, ${unanswered ? 'true' : 'false'})">Remove replica</button>`}
+          ${(standingIn && standing.live) || runHeld || runLive ? '' : `<button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}', ${removeMayHoldWrites ? 'true' : 'false'}, ${unanswered ? 'true' : 'false'})">Remove replica</button>`}
           ${reseedHtml}
         </div>
         ${transferHtml}`;
@@ -4250,33 +4245,24 @@
       return false;
     }
 
-    // hint: 'after-retire' (a failback run retired this machine's own database
-    // earlier), 'copy-whole' or 'copy-whole-run' (the re-seed rebuilt the copy
-    // and only its service failed to start; with a run on the instance,
-    // Continue starts it), '' otherwise.
-    async function cancelReplicaSeed(botId, parked, committed, purpose, hint) {
-      const wholeNext = hint === 'copy-whole-run' ? 'Continue on the run card starts its container' : 'pressing Build on its card, then Apply (or Start if the instance is stopped), starts its container';
-      const gone = purpose === 'reseed-stale-primary'
-        ? (hint === 'copy-whole-run' || hint === 'copy-whole'
-          ? `This instance's own database has already been retired. The copy from the stand-in is complete; only its container failed to start. Dismissing this note keeps the copy, and ${wholeNext}.`
-          : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
-        : purpose === 'reseed-standby'
-          ? (hint === 'copy-whole-run' || hint === 'copy-whole'
-            ? `The copy is complete; only its container failed to start. Dismissing this note keeps the copy, and ${wholeNext}.`
-            : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
-          : hint === 'after-retire'
-            ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
-            : 'The partial copy is discarded; nothing else on this instance is affected.';
-      const warn = committed ? `\n\n${gone}` : '\n\nNothing has been deleted by this run yet.';
-      const question = parked
-        ? `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`
-        : `Cancel this seed?\n\nThe copy stops at its next step.${warn}`;
-      if ((!parked || committed) && !confirm(question)) return;
+    // The press names the run it was rendered for; the server words the
+    // question from its own record and refuses a run or state that differs.
+    async function cancelReplicaSeed(botId, startedAt, parked) {
+      let body = { startedAt, parked };
+      let settled = false;
       try {
-        const res = await api('DELETE', `/bots/${botId}/fleet-replica/seed`);
-        // The server decides which branch it took: the view may be stale.
-        if (res.success) showMessage('success', res.dismissed ? 'Dismissed' : 'Cancel requested');
-        else showMessage('error', res.error || 'Failed to cancel the seed');
+        for (let round = 0; round < 3 && !settled; round++) {
+          const res = await api('DELETE', `/bots/${botId}/fleet-replica/seed`, body);
+          if (res.needsConfirm && res.seed) {
+            if (!confirm(res.error)) { settled = true; break; }
+            body = { startedAt: res.seed.startedAt, parked: res.seed.parked, committed: res.seed.committed, confirm: true };
+            continue;
+          }
+          settled = true;
+          if (res.success) showMessage('success', res.dismissed ? 'Dismissed' : 'Cancel requested');
+          else showMessage('error', res.error || 'Failed to cancel the seed');
+        }
+        if (!settled) showMessage('error', 'The seed changed each time it was confirmed, so nothing was cancelled; look again');
       } catch (err) {
         showNoAnswer('seed cancel');
       }

@@ -91,6 +91,49 @@ function seedRunning(botId: string): boolean {
   return seed !== null && seed.parked !== true;
 }
 
+/** The standby record is the whole copy this seed built: refiled at 'starting', and nothing cleared it since. */
+export function seedBuiltRecord(rec: FleetDbReplicaRecord | null | undefined, seed: Pick<FleetReplicaSeedRecord, 'startedAt'> | null | undefined): boolean {
+  return !!rec && !!seed && rec.copyCleared !== true && typeof rec.seededBy === 'number' && rec.seededBy === seed.startedAt;
+}
+
+/**
+ * Transfers asking the app to promote this instance's copy right now. The
+ * request leaves no record while it waits, and removing the copy mid-promote
+ * takes the fleet's next database away.
+ */
+const promotesInFlight = new Map<string, number>();
+
+export async function whilePromoting<T>(botId: string, fn: () => Promise<T>): Promise<T> {
+  promotesInFlight.set(botId, (promotesInFlight.get(botId) ?? 0) + 1);
+  try {
+    return await fn();
+  } finally {
+    const left = (promotesInFlight.get(botId) ?? 1) - 1;
+    if (left > 0) promotesInFlight.set(botId, left);
+    else promotesInFlight.delete(botId);
+  }
+}
+
+/** Why a Remove replica must not run now, from the live record; null when nothing is in flight. */
+function removalHold(botId: string, containerName: string): string | null {
+  const now = containerManager.getBot(botId);
+  if (!now?.fleetDbReplica || now.fleetDbReplica.containerName !== containerName) {
+    return 'The standby record changed while the removal was being checked; look again';
+  }
+  const held = runHold(now);
+  if (held) return held;
+  if (seedRunning(botId)) return 'A seed is running on this standby; wait for it to finish';
+  const busyOp = containerManager.isBotBusy(botId);
+  if (busyOp) return `Operation '${busyOp}' is running on this instance; wait for it to finish`;
+  const run = now.fleetTransfer;
+  if (run && !run.parked) return `A transfer is running on this instance (${run.phase}); wait for it to finish`;
+  if (run?.phase === 'promoting') {
+    return 'A transfer stopped while the app was promoting this copy, and the app may still be promoting it; check its Fleet view, then Continue or Dismiss the transfer first';
+  }
+  if (promotesInFlight.has(botId)) return 'A Transfer is asking the app to promote this copy right now; wait for its answer';
+  return null;
+}
+
 class SeedCancelled extends Error {}
 /** The record the run was started for is gone or is a different standby now. */
 class SeedSuperseded extends Error {}
@@ -296,9 +339,9 @@ function hostCertPathFor(botId: string): string {
 
 export interface FleetReplicaStatus {
   present: boolean;
-  provisioning?: { phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean; safetyDump?: string };
+  provisioning?: { startedAt: number; phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean; safetyDump?: string };
   /** A seed no runner owns any more (it failed, or a manager restart interrupted it): Retry or Dismiss. */
-  parkedSeed?: { purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean; safetyDump?: string };
+  parkedSeed?: { startedAt: number; purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean; safetyDump?: string };
   /** A retire of the database env pins left them in a compose it could not edit, and a compose still sets one the store does not hold. */
   pinsWarning?: string;
   /** The automatic re-seed's attempt ledger, from the standby record. */
@@ -328,6 +371,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
   };
   if (seed && !seed.parked) {
     status.provisioning = {
+      startedAt: seed.startedAt,
       phase: seed.phase,
       purpose: seed.purpose,
       forSeconds: Math.round((Date.now() - seed.startedAt) / 1000),
@@ -338,14 +382,15 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
     };
   } else if (seed) {
     status.parkedSeed = {
+      startedAt: seed.startedAt,
       purpose: seed.purpose,
       phase: seed.phase,
       lastError: seed.lastError || 'stopped',
       at: seed.updatedAt,
       committed: seed.committed === true,
       cancelled: seed.cancelled === true,
-      // A committed seed that stopped after its refile left the copy whole and only its service down.
-      copyWhole: !!instance.fleetDbReplica && instance.fleetDbReplica.copyCleared !== true,
+      // A seed that stopped after its refile left the copy whole; at most its service is down.
+      copyWhole: seedBuiltRecord(instance.fleetDbReplica, seed),
       ...(seed.safetyDump ? { safetyDump: seed.safetyDump } : {}),
     };
   }
@@ -465,9 +510,12 @@ function startProvisioning(
   const now = Date.now();
   // committed describes the VOLUME, not this run: a re-seed starting over a
   // stopped one whose wipe already ran inherits it, so the cancel warning does
-  // not lapse while the copy is still gone.
-  const inherited = seedRecord(instance.id)?.committed === true
-    || containerManager.getBot(instance.id)?.fleetDbReplica?.copyCleared === true;
+  // not lapse while the copy is still gone. A stopped run that refiled the
+  // standby whole leaves nothing gone, so it passes nothing on.
+  const prior = seedRecord(instance.id);
+  const priorRecord = containerManager.getBot(instance.id)?.fleetDbReplica;
+  const inherited = priorRecord?.copyCleared === true
+    || (prior?.committed === true && !seedBuiltRecord(priorRecord, prior));
   containerManager.updateInstanceFleetDbReplicaSeed(instance.id, {
     purpose,
     phase: 'preparing',
@@ -489,6 +537,7 @@ function startProvisioning(
     // The probe can take a minute, and the preflight past it destroys; a cancel
     // filed while it ran is honoured here, with everything still in place.
     throwIfCancelled(instance.id);
+    assertVolumeOwnedHere(instance.id, record.volume);
     if (preflight) await preflight();
     try {
       await runProvisioning(instance, record, intake.dsn, intake.cert, purpose);
@@ -733,6 +782,12 @@ async function assertSeedableSource(instance: InstanceConfig, dsn: ParsedDsn, ce
   }
 }
 
+/** The seed clears the volume whole, so a volume another instance uses or declares is refused, and so is one that cannot be checked. */
+function assertVolumeOwnedHere(botId: string, volume: string): void {
+  const shared = containerManager.sharedVolumeReason(volume, botId);
+  if (shared) throw new Error(`the seed stopped before clearing the replica volume ${volume}: ${shared}`);
+}
+
 async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaRecord, dsn: ParsedDsn, certPem: string, purpose: FleetReplicaSeedPurpose): Promise<void> {
   const hostCertPath = hostCertPathFor(instance.id);
   const seedName = seedContainerName(instance);
@@ -748,6 +803,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // provision, and on a re-seed the verified-stale copy 20.14 rules wipeable.
   // Past this point cancelling cannot put it back.
   throwIfCancelled(instance.id);
+  assertVolumeOwnedHere(instance.id, record.volume);
   saveSeed(instance.id, { committed: true });
   setCopyCleared(instance.id, true);
   const wipe = await volExec(record.volume, `find ${PGDATA} -mindepth 1 -maxdepth 1 -exec rm -rf {} +`);
@@ -879,6 +935,8 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'No replica on this instance' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
+  const hold = removalHold(instance.id, rec.containerName);
+  if (hold) return { success: false, error: hold };
   // A stand-in's copy IS the fleet's database (20.5): removing it takes the
   // fleet down. Judged from the app's fact alone (B6 map F34). Not refused
   // when the app is silent, and not on an ended lane: this removal keeps the
@@ -890,11 +948,19 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   if (standing?.role === 'stand-in' && standing.live) {
     return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing it would take the fleet's database down. It returns to standby duty through the failback, or by hand after a manual promote or demote` };
   }
-  const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
-  if (!removed.success) return removed;
-  containerManager.updateInstanceFleetDbReplica(instance.id, null);
-  containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
-  return { success: true };
+  // The posture read can take seconds; a seed, a build or a transfer that
+  // started meanwhile would write back or wipe what this removal leaves.
+  const holdAfterRead = removalHold(instance.id, rec.containerName);
+  if (holdAfterRead) return { success: false, error: holdAfterRead };
+  // Claimed in the same synchronous segment as the check above: a seed, build
+  // or adopt entering during the docker rm then refuses on isBotBusy.
+  return containerManager.withExternalBotOp(instance.id, 'replica-remove', async () => {
+    const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
+    if (!removed.success) return removed;
+    containerManager.updateInstanceFleetDbReplica(instance.id, null);
+    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+    return { success: true };
+  });
 }
 /**
  * Stop pinning the fleet database on a node that no longer hosts it. A worker
@@ -1520,10 +1586,47 @@ export async function publishStandInCopyBlock(instance: InstanceConfig, facts: A
  * runner clears the record at its next boundary check), or dismiss a parked
  * one. Past the copy (configuring, starting) the standby is seconds from
  * serving, so the answer is "remove it afterwards", never a half-built one.
+ *
+ * The caller names the run it showed (startedAt, parked) and, once asked,
+ * confirms the committed state the question was worded from; any difference
+ * is refused or asked again, because a view can be minutes old.
  */
-export async function cancelReplicaSeed(instance: InstanceConfig): Promise<{ success: boolean; error?: string; dismissed?: boolean }> {
+export interface SeedCancelRequest {
+  startedAt?: number;
+  parked?: boolean;
+  committed?: boolean;
+  confirm?: boolean;
+}
+
+export interface SeedCancelResult {
+  success: boolean;
+  error?: string;
+  dismissed?: boolean;
+  needsConfirm?: boolean;
+  seed?: { startedAt: number; purpose: FleetReplicaSeedPurpose; parked: boolean; committed: boolean };
+}
+
+export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedCancelRequest = {}): Promise<SeedCancelResult> {
   const seed = seedRecord(instance.id);
-  if (!seed) return { success: false, error: 'No seed is running on this instance' };
+  if (!seed) {
+    return { success: false, error: request.startedAt === undefined ? 'No seed is running on this instance' : 'The seed this view showed is no longer on record (it finished, or was dismissed elsewhere); look again' };
+  }
+  const parked = seed.parked === true;
+  const committed = seed.committed === true;
+  const shown = { startedAt: seed.startedAt, purpose: seed.purpose, parked, committed };
+  if (request.startedAt !== undefined && request.startedAt !== seed.startedAt) {
+    return { success: false, error: 'A different seed run is on this instance since this view loaded; look again before cancelling or dismissing it', seed: shown };
+  }
+  if (request.parked !== undefined && request.parked !== parked) {
+    return { success: false, error: parked ? 'The seed this view showed as running has stopped since; look again' : 'The stopped seed this view showed is running again; look again', seed: shown };
+  }
+  if (!parked && (seed.phase === 'configuring' || seed.phase === 'starting')) {
+    return { success: false, error: 'Too late to cancel: the copy is complete and the standby is starting; remove the replica afterwards instead' };
+  }
+  const asks = !parked || committed;
+  if (request.startedAt === undefined || (asks && (request.confirm !== true || request.committed !== committed))) {
+    return { success: false, needsConfirm: true, error: await seedCancelQuestion(instance.id, seed), seed: shown };
+  }
   const sweep = async (): Promise<string | null> => {
     let refused: string | null = null;
     for (const name of seedHelperNames(instance)) {
@@ -1532,16 +1635,24 @@ export async function cancelReplicaSeed(instance: InstanceConfig): Promise<{ suc
     }
     return refused;
   };
-  if (seed.parked) {
+  if (parked) {
     // Best effort, unlike the live branch below: a seed container that outlived
     // its runner can only be writing into a volume the wipe already emptied and
     // no service is on, so a wedged daemon must not block clearing the record.
-    await sweep();
+    // A run started during the sweep owns the record and these names.
+    const stillThisRun = (): boolean => {
+      const now = seedRecord(instance.id);
+      return !!now && now.startedAt === seed.startedAt && now.parked === true;
+    };
+    for (const name of seedHelperNames(instance)) {
+      if (!stillThisRun()) break;
+      await dockerRmForce(name);
+    }
+    if (!stillThisRun()) {
+      return { success: false, error: 'A new seed run started on this instance while the stopped one was being dismissed, so the new run was left as it is; look again' };
+    }
     containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
     return { success: true, dismissed: true };
-  }
-  if (seed.phase === 'configuring' || seed.phase === 'starting') {
-    return { success: false, error: 'Too late to cancel: the copy is complete and the standby is starting; remove the replica afterwards instead' };
   }
   saveSeed(instance.id, { cancelRequested: true });
   const refused = await sweep();
@@ -1557,6 +1668,49 @@ export async function cancelReplicaSeed(instance: InstanceConfig): Promise<{ suc
   return { success: true };
 }
 
+/** A failback run past its wipe consent, or a decline at seeding or later, retired this machine's own database earlier. */
+function seedAfterRetire(instance: InstanceConfig): boolean {
+  const run = instance.fleetFailback;
+  if (run) return run.mode === 'failback' && run.consentAt !== null;
+  const declined = instance.fleetFailbackDeclined;
+  return declined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(declined.phase);
+}
+
+/** The question a Cancel or Dismiss asks, worded from the record and, for a whole copy, from its container's state now. */
+async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): Promise<string> {
+  const instance = containerManager.getBot(botId);
+  const rec = instance?.fleetDbReplica;
+  const parked = seed.parked === true;
+  const afterRetire = !!instance && seedAfterRetire(instance);
+  const whole = parked && seedBuiltRecord(rec, seed);
+  let tail = '';
+  if (whole && rec) {
+    const next = instance?.fleetFailback ? 'Continue on the run card starts its container' : 'pressing Build on its card, then Apply (or Start if the instance is stopped), starts its container';
+    const running = await containerRunning(rec.containerName);
+    tail = running === true
+      ? 'Its standby container is running. Dismissing this note keeps the copy.'
+      : running === false
+        ? `Its standby container is not running. Dismissing this note keeps the copy, and ${next}.`
+        : `The manager can't confirm whether its standby container is running (docker did not answer). Dismissing this note keeps the copy; if the container is not running, ${next}.`;
+  }
+  const gone = seed.purpose === 'reseed-stale-primary'
+    ? (whole
+      ? `This instance's own database has already been retired. The copy from the stand-in is complete. ${tail}`
+      : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
+    : seed.purpose === 'reseed-standby'
+      ? (whole
+        ? `The copy is complete. ${tail}`
+        : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
+      : whole
+        ? `${afterRetire ? 'This machine\'s own database was already retired earlier in the failback run. ' : ''}The copy is complete and kept on record. ${tail}`
+        : afterRetire
+          ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
+          : 'The partial copy is discarded; nothing else on this instance is affected.';
+  const committed = seed.committed === true;
+  if (parked) return `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`;
+  return `Cancel this seed?\n\nThe copy stops at its next step.\n\n${committed ? gone : 'Nothing has been deleted by this run yet.'}`;
+}
+
 /**
  * Boot: a seed the previous manager process owned has no runner any more and
  * its pg_basebackup cannot be re-attached, so it is parked (kept for display,
@@ -1568,7 +1722,10 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
     const seed = instance.fleetDbReplicaSeed;
     if (!seed || seed.parked) continue;
     const withdrawn = seed.cancelRequested === true;
-    console.log(`[FleetReplica] ${instance.displayName} was seeding (${seed.phase}) when the manager stopped - ${withdrawn ? 'settling the cancel the operator had filed' : 'parking it'}`);
+    // Caught after the refile: the copy is whole and on record, and only the
+    // service start the run was awaiting is left, so that is what runs now.
+    const rebuilt = !withdrawn && seed.phase === 'starting' && seedBuiltRecord(instance.fleetDbReplica, seed);
+    console.log(`[FleetReplica] ${instance.displayName} was seeding (${seed.phase}) when the manager stopped - ${withdrawn ? 'settling the cancel the operator had filed' : rebuilt ? 'its copy is complete and on record, so its standby is started again' : 'parking it'}`);
     for (const name of seedHelperNames(instance)) {
       const result = await dockerRmForce(name);
       // Best effort by design: the record must be parked even with the daemon
@@ -1581,6 +1738,20 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
     // that anything may resume.
     if (withdrawn) {
       settleCancelledSeed(instance.id, seed.purpose, seed.committed === true);
+      continue;
+    }
+    if (rebuilt) {
+      const apply = await containerManager.applyFleetDbReplicaService(instance.id)
+        .catch((err: unknown) => ({ success: false, error: err instanceof Error ? err.message : String(err) }));
+      if (apply.success) {
+        if (seed.purpose === 'provision') await containerManager.markPendingApplyIfRunning(instance.id);
+        if (seedRecord(instance.id)?.startedAt === seed.startedAt) containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+        if (seed.purpose === 'reseed-standby') ledgerSuccess(instance.id);
+        continue;
+      }
+      const failed = `the manager restarted while the standby was starting, and starting it again failed: ${apply.error}`;
+      saveSeed(instance.id, { parked: true, lastError: failed });
+      if (seed.purpose === 'reseed-standby') ledgerFailure(instance.id, failed);
       continue;
     }
     const message = `the manager restarted during the seed (phase ${seed.phase})`;

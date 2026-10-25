@@ -161,7 +161,7 @@ beforeEach(() => {
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: {
     a: { id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
-    w: { id: 'w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
+    w: { id: 'w', sanitizedName: 'bot-w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
 });

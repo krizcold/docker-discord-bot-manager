@@ -102,6 +102,17 @@ const HEALTH_PUSH_MS = 15000;
 
 const FLEET_MASTER_FACTS_TIMEOUT_MS = 3000;
 
+const UPDATE_HEAD_UNREAD = "The source checkout's current commit could not be read, so the manager can't confirm whether an update is available.";
+const UPDATE_SOURCE_MISSING = "The bot's source is not in the source list, so the manager can't confirm whether an update is available.";
+
+/** The deployed value of one env key, or null when the deployed compose is unreadable, lacks it or holds two values. */
+function deployedEnvValue(botId: string, key: string): string | null {
+  const deployed = containerManager.deployedComposeEnvValues(botId, [key], true);
+  if (deployed === null || deployed.length === 0) return null;
+  const values = new Set(deployed.map(d => d.value.trim()));
+  return values.size === 1 ? [...values][0] : null;
+}
+
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
 
@@ -148,20 +159,31 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       // Join source info + compute commits-behind for bots that are behind
+      const heads = new Map<string, Promise<string | null>>();
       const botsWithSource = await Promise.all(bots.map(async bot => {
         let source = null;
         let updateAvailable = false;
+        let updateCantConfirm: string | undefined;
+        let sourceHead: string | null = null;
         let behindBy = 0;
 
         if (bot.sourceId) {
           source = sourceManager.getSource(bot.sourceId);
-          if (source && bot.lastBuiltCommit && source.lastCommitHash) {
-            updateAvailable = bot.lastBuiltCommit !== source.lastCommitHash;
-            if (updateAvailable) {
-              behindBy = await sourceManager.getCommitsBehind(bot.sourceId, bot.lastBuiltCommit);
+          if (source && bot.lastBuiltCommit) {
+            if (!heads.has(bot.sourceId)) heads.set(bot.sourceId, sourceManager.readSourceHead(bot.sourceId));
+            const head = await heads.get(bot.sourceId)!;
+            sourceHead = head;
+            if (head === null) {
+              updateCantConfirm = UPDATE_HEAD_UNREAD;
+            } else {
+              updateAvailable = bot.lastBuiltCommit !== head;
+              if (updateAvailable) {
+                behindBy = await sourceManager.getCommitsBehind(bot.sourceId, bot.lastBuiltCommit);
+              }
             }
           }
         }
+        if (!source && bot.lastBuiltCommit) updateCantConfirm = UPDATE_SOURCE_MISSING;
 
         // CasaOS Open link: docker mode already carries publicUrl/hostPort; on CasaOS
         // neither exists, so derive the gateway URL from the bot's Caddy host here.
@@ -203,6 +225,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           appHooks: hasAppHooks(bot),
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
+          ...(updateCantConfirm ? { updateCantConfirm } : {}),
+          sourceHead,
           behindBy,
           webOpenUrl,
           // Effective readiness (ping or grace fallback) drives the Open button.
@@ -327,8 +351,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const env = envManager.getEnvVars(bot.id);
           const folded = foldedRoleValue(cp.roleEnv, env[cp.roleEnv.key]);
           if (cp.roleEnv.dialTargetOrder.indexOf(folded) <= 0) continue;
-          const secret = (env[cp.groupSecretEnv] || '').trim();
-          if (secret === '') continue;
+          const secret = deployedEnvValue(bot.id, cp.groupSecretEnv);
+          if (!secret) continue;
           const addrs = fleetAddrsOf(bot, cp.urlScheme);
           if (!addrs) continue;
           secondaries.push({ id: bot.id, localUrl: addrs.localUrl, publicUrl: addrs.publicUrl, secret });
@@ -361,7 +385,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const controlSecret = cp.groupSecretEnv ? (env[cp.groupSecretEnv] || '').trim() : '';
           // Positions in dialTargetOrder are disjoint, so a node cannot match
           // both lists; the id filter stays as a cheap invariant guard.
-          const peers = controlSecret === '' ? [] : secondaries.filter(b => b.secret === controlSecret && b.id !== bot.id);
+          const runSecret = cp.groupSecretEnv ? deployedEnvValue(bot.id, cp.groupSecretEnv) : null;
+          const peers = !runSecret ? [] : secondaries.filter(b => b.secret === runSecret && b.id !== bot.id);
           // The wizard fills only the secret the node was deployed with.
           let secretUnfilled: string | null = null;
           if (cp.groupSecretEnv && controlSecret !== '') {
@@ -417,18 +442,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       let source = null;
       let repoInfo = null;
       let updateAvailable = false;
+      let updateCantConfirm: string | undefined;
 
       if (bot.sourceId) {
         source = sourceManager.getSource(bot.sourceId);
         if (source) {
           repoInfo = await sourceManager.getSourceRepoInfo(bot.sourceId);
-          if (bot.lastBuiltCommit && source.lastCommitHash) {
-            updateAvailable = bot.lastBuiltCommit !== source.lastCommitHash;
+          if (bot.lastBuiltCommit) {
+            const head = await sourceManager.readSourceHead(bot.sourceId);
+            if (head === null) updateCantConfirm = UPDATE_HEAD_UNREAD;
+            else updateAvailable = bot.lastBuiltCommit !== head;
           }
         }
       }
+      if (!source && bot.lastBuiltCommit) updateCantConfirm = UPDATE_SOURCE_MISSING;
 
-      res.json({ success: true, bot: withActiveOp(publicBot(bot)), source, repoInfo, updateAvailable });
+      res.json({ success: true, bot: withActiveOp(publicBot(bot)), source, repoInfo, updateAvailable, ...(updateCantConfirm ? { updateCantConfirm } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1072,17 +1101,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       // Fetch source first to ensure we have the latest remote state
       let fetchBehindBy = 0;
+      let fetched = true;
       try {
         const fetchResult = await sourceManager.fetchSource(bot.sourceId);
         fetchBehindBy = fetchResult.behindBy;
       } catch (err) {
+        fetched = false;
         console.warn(`[API] Failed to fetch source for update check: ${err}`);
       }
 
-      const source = sourceManager.getSource(bot.sourceId);
-      if (!source || !source.lastCommitHash) {
-        // Source not cloned or no commit info; can't determine
-        res.json({ success: true, hasUpdates: false, behindBy: 0 });
+      if (!sourceManager.getSource(bot.sourceId)) {
+        res.json({ success: true, hasUpdates: false, behindBy: 0, cantConfirm: UPDATE_SOURCE_MISSING });
+        return;
+      }
+      const head = await sourceManager.readSourceHead(bot.sourceId);
+      if (head === null) {
+        res.json({ success: true, hasUpdates: false, behindBy: 0, cantConfirm: UPDATE_HEAD_UNREAD });
         return;
       }
 
@@ -1092,8 +1126,16 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const hasUpdates = bot.lastBuiltCommit !== source.lastCommitHash;
-      res.json({ success: true, hasUpdates, behindBy: hasUpdates ? fetchBehindBy || 1 : 0 });
+      if (bot.lastBuiltCommit !== head) {
+        const behindBy = await sourceManager.getCommitsBehind(bot.sourceId, bot.lastBuiltCommit);
+        res.json({ success: true, hasUpdates: true, behindBy: behindBy || 1 });
+        return;
+      }
+      if (!fetched) {
+        res.json({ success: true, hasUpdates: false, behindBy: 0, cantConfirm: "The source could not be fetched from its repository, so the manager can't confirm whether an update is available." });
+        return;
+      }
+      res.json({ success: true, hasUpdates: false, behindBy: 0 });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1262,7 +1304,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(409).json({ success: false, error: `Bot operation in progress (${activeOp}); retry when it completes` });
         return;
       }
+      const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+      const deployedBefore = containerManager.deployedComposeEnvValues(req.params.id, [req.params.key]);
+      const held = has(envManager.getEnvVars(req.params.id), req.params.key) || has(bot.envVars || {}, req.params.key)
+        || deployedBefore === null || deployedBefore.length > 0;
       const unedited = containerManager.removeEnvKeyEverywhere(req.params.id, req.params.key);
+      // A running bot keeps the env it was deployed with until Apply or Restart applies the removal.
+      let pendingUnrecorded = '';
+      if (held) {
+        try {
+          await containerManager.markPendingApplyIfRunning(req.params.id);
+        } catch (err) {
+          pendingUnrecorded = err instanceof Error ? err.message : String(err);
+        }
+      }
+      const notApplied = containerManager.getBot(req.params.id)?.pendingApply === true;
       const validation = envManager.hasRequiredEnvVars(req.params.id, bot.tokenVarName);
       broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       if (unedited.length > 0) {
@@ -1274,7 +1330,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         });
         return;
       }
-      res.json({ success: true, valid: validation.valid, missing: validation.missing });
+      res.json({
+        success: true, valid: validation.valid, missing: validation.missing,
+        ...(notApplied ? { notApplied: true } : {}),
+        ...(notApplied && held ? { message: `${req.params.key} removed. The running bot keeps the env it started with until you Apply or Restart it.` } : {}),
+        ...(pendingUnrecorded ? { warning: `Removed, but could not record that the running bot needs Apply or Restart to apply it: ${pendingUnrecorded}` } : {}),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

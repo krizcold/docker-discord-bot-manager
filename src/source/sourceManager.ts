@@ -279,52 +279,62 @@ async function createSourceCloned(request: CreateSourceRequest): Promise<SourceM
   const repoPath = getSourceRepoPath(sourceId);
   fs.mkdirSync(sourceDir, { recursive: true });
 
-  // Clone repository (auto-detects the default branch when none is given)
-  console.log(`[SourceManager] Cloning ${getDisplayUrl(request.url)} (branch: ${request.branch || 'auto'})`);
-  const branch = await cloneRepo(request.url, repoPath, request.branch);
-  console.log(`[SourceManager] Repository cloned to ${repoPath} (branch: ${branch})`);
+  let source: SourceMeta;
+  try {
+    // Clone repository (auto-detects the default branch when none is given)
+    console.log(`[SourceManager] Cloning ${getDisplayUrl(request.url)} (branch: ${request.branch || 'auto'})`);
+    const branch = await cloneRepo(request.url, repoPath, request.branch);
+    console.log(`[SourceManager] Repository cloned to ${repoPath} (branch: ${branch})`);
 
-  // Raw backup
-  createSourceRawBackup(sourceId);
+    try {
+      createSourceRawBackup(sourceId);
+    } catch (err: any) {
+      throw new Error(`The source was not added: the raw copy of the clone failed (${err?.message || err})`);
+    }
+    try {
+      const composePath = hasExistingCompose(repoPath);
+      if (composePath) fs.writeFileSync(getOriginalComposePath(sourceId), fs.readFileSync(composePath, 'utf-8'));
+    } catch (err: any) {
+      throw new Error(`The source was not added: the compose copy of the clone failed (${err?.message || err})`);
+    }
 
-  // Save original compose if exists
-  const composePath = hasExistingCompose(repoPath);
-  if (composePath) {
-    const composeContent = fs.readFileSync(composePath, 'utf-8');
-    fs.writeFileSync(getOriginalComposePath(sourceId), composeContent);
+    const headCommit = await readHeadCommit(repoPath);
+    const composeName = extractComposeName(repoPath);
+
+    source = {
+      id: sourceId,
+      url: request.url,
+      branch,
+      lastCommitHash: headCommit?.hash || null,
+      lastCommitMessage: headCommit?.message || null,
+      lastCommitDate: headCommit?.date || null,
+      lastChecked: now,
+      autoUpdate: true,
+      composeName,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Loaded after the last await, so a registry write made during the clone is kept.
+    const registry = loadSourceRegistry();
+    const key = normalizeSourceUrl(request.url);
+    if (Object.values(registry.sources).some(s => !!s.url && normalizeSourceUrl(s.url) === key)) {
+      throw new Error('A source with this URL already exists');
+    }
+    registry.sources[sourceId] = source;
+    saveSourceRegistry(registry);
+  } catch (err) {
+    // No registry entry names this new folder, so a failed add removes all of it.
+    try {
+      fs.rmSync(sourceDir, { recursive: true, force: true });
+    } catch (rmErr: any) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`${message}; its unregistered folder ${sourceDir} could not be removed (${rmErr?.message || rmErr})`);
+    }
+    throw err;
   }
 
-  // Read HEAD commit
-  const headCommit = await readHeadCommit(repoPath);
-
-  // Extract compose name
-  const composeName = extractComposeName(repoPath);
-
-  const source: SourceMeta = {
-    id: sourceId,
-    url: request.url,
-    branch,
-    lastCommitHash: headCommit?.hash || null,
-    lastCommitMessage: headCommit?.message || null,
-    lastCommitDate: headCommit?.date || null,
-    lastChecked: now,
-    autoUpdate: true,
-    composeName,
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  // Loaded after the last await, so a registry write made during the clone is kept.
-  const registry = loadSourceRegistry();
-  const key = normalizeSourceUrl(request.url);
-  if (Object.values(registry.sources).some(s => !!s.url && normalizeSourceUrl(s.url) === key)) {
-    fs.rmSync(sourceDir, { recursive: true, force: true });
-    throw new Error('A source with this URL already exists');
-  }
-  registry.sources[sourceId] = source;
-  saveSourceRegistry(registry);
-
-  console.log(`[SourceManager] Source ${sourceId} created (composeName: ${composeName || 'none'})`);
+  console.log(`[SourceManager] Source ${sourceId} created (composeName: ${source.composeName || 'none'})`);
 
   // Re-associate orphaned instances
   await reAssociateInstances(sourceId, request.url);

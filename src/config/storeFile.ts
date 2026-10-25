@@ -89,12 +89,32 @@ export function corruptCopyNote(filePath: string): string {
   return `the damaged bytes are kept beside it as ${copy}`;
 }
 
+/**
+ * Run the steps that write tmp and rename it over its target. When a step
+ * throws, tmp is removed (it may hold a second copy of secrets) and the step's
+ * error is rethrown; a failed removal is logged, never thrown over it.
+ */
+function replaceViaTmp(tmp: string, steps: () => void): void {
+  try {
+    steps();
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (cleanupErr: any) {
+      if (cleanupErr?.code !== 'ENOENT') console.error(`[Files] Could not remove ${tmp} after a failed write: ${cleanupErr}`);
+    }
+    throw err;
+  }
+}
+
 /** Atomic write: temp file, then rename over the target. */
 export function writeFileAtomic(filePath: string, data: string, mode?: number): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp`;
-  fs.writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
-  fs.renameSync(tmp, filePath);
+  replaceViaTmp(tmp, () => {
+    fs.writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
+    fs.renameSync(tmp, filePath);
+  });
 }
 
 /**
@@ -102,7 +122,8 @@ export function writeFileAtomic(filePath: string, data: string, mode?: number): 
  * so a root manager never takes a file away from the account that reads it.
  * The tmp file gets the owner and mode before the rename, so no moment leaves
  * the target root-owned. A symlinked path is written through to its target.
- * mode is the result's mode; omitted, the old file's mode carries over.
+ * mode is the result's mode; omitted, the old file's mode carries over. A mode
+ * that cannot be set and an owner that cannot be kept are both logged.
  */
 export function writeFileKeepingOwner(filePath: string, data: string, mode?: number): void {
   let target = filePath;
@@ -114,20 +135,22 @@ export function writeFileKeepingOwner(filePath: string, data: string, mode?: num
   } catch { /* a new file keeps the default owner */ }
   const finalMode = mode ?? (before ? before.mode & 0o7777 : undefined);
   const tmp = `${target}.tmp`;
-  fs.writeFileSync(tmp, data, finalMode === undefined ? undefined : { mode: finalMode });
-  if (before) {
-    try {
-      fs.chownSync(tmp, before.uid, before.gid);
-    } catch (err) {
-      console.warn(`[Files] Could not keep the owner ${before.uid}:${before.gid} of ${target}: ${err}`);
+  replaceViaTmp(tmp, () => {
+    fs.writeFileSync(tmp, data, finalMode === undefined ? undefined : { mode: finalMode });
+    if (before) {
+      try {
+        fs.chownSync(tmp, before.uid, before.gid);
+      } catch (err) {
+        console.warn(`[Files] Could not keep the owner ${before.uid}:${before.gid} of ${target}: ${err}`);
+      }
     }
-  }
-  if (finalMode !== undefined) {
-    try {
-      fs.chmodSync(tmp, finalMode);
-    } catch (err) {
-      console.warn(`[Files] Could not set mode ${finalMode.toString(8)} on ${target}: ${err}`);
+    if (finalMode !== undefined) {
+      try {
+        fs.chmodSync(tmp, finalMode);
+      } catch (err) {
+        console.warn(`[Files] Could not set mode ${finalMode.toString(8)} on ${target}: ${err}`);
+      }
     }
-  }
-  fs.renameSync(tmp, target);
+    fs.renameSync(tmp, target);
+  });
 }

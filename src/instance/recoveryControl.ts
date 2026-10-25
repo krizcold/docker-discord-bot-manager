@@ -54,6 +54,30 @@ function rsyncdName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-recovery-rsyncd`;
 }
 
+/** The fleet store's id (smdb_data.meta store_id): null when the database holds no fleet store; ok false when it could not be read. */
+export async function readStoreId(fleetDb: { containerName: string; user: string; db: string }): Promise<{ ok: true; storeId: string | null } | { ok: false; error: string }> {
+  const psql = (sql: string) => docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const table = await psql("SELECT to_regclass('smdb_data.meta') IS NOT NULL");
+  if (!table.ok || !/^[tf]$/.test(table.stdout.trim())) return { ok: false, error: `could not read the store table: ${table.stderr.trim().split('\n').pop() || table.stdout.trim() || 'no answer'}` };
+  if (table.stdout.trim() === 'f') return { ok: true, storeId: null };
+  const row = await psql("SELECT value FROM smdb_data.meta WHERE key = 'store_id'");
+  if (!row.ok) return { ok: false, error: `could not read the store id: ${row.stderr.trim().split('\n').pop() || 'no answer'}` };
+  const raw = row.stdout.trim();
+  if (!raw) return { ok: true, storeId: null };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === 'string' && parsed) return { ok: true, storeId: parsed };
+  } catch { /* answered below */ }
+  return { ok: false, error: 'the store id row holds no readable id' };
+}
+
+/** This database's own system identifier; null when it could not be read. */
+export async function readSystemId(fleetDb: { containerName: string; user: string; db: string }): Promise<string | null> {
+  const probe = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT system_identifier FROM pg_control_system()']);
+  const id = probe.ok ? probe.stdout.trim() : '';
+  return /^\d+$/.test(id) ? id : null;
+}
+
 // ─── Persistent backup session (one per instance) ───
 
 interface BackupSession {
@@ -186,8 +210,15 @@ type QuiesceAnswer = { code: number; body: Record<string, unknown>; changed: boo
  * as swapped away before anything stops, so a later Start refuses. Idempotent: a re-entry finds everything down and
  * re-captures the LSN and the term. changed: false when it refused before anything was stopped or recorded.
  */
-async function quiesce(instance: InstanceConfig): Promise<QuiesceAnswer> {
+async function quiesce(instance: InstanceConfig, receiverSystemId: string): Promise<QuiesceAnswer> {
   const fleetDb = instance.fleetDb!;
+  // The receiver's standby must be a physical copy of this database: a channel re-armed against another sender would
+  // otherwise stop this fleet for a swap that promotes something else.
+  const own = await readSystemId(fleetDb);
+  if (!own) return { code: 500, body: { success: false, error: 'could not read the source database\'s system id, so nothing was stopped' }, changed: false };
+  if (own !== receiverSystemId) {
+    return { code: 409, body: { success: false, identityMismatch: true, error: `the receiver's copy (system id ${receiverSystemId}) is not a copy of this database (system id ${own}), so nothing was stopped` }, changed: false };
+  }
   const live = await containerManager.runningNonSidecarContainers(instance.id);
   if (live === null) return { code: 500, body: { success: false, error: 'could not tell whether the source instance is running, so nothing was stopped' }, changed: false };
   if (live.length > 0 && hasAppHooks(instance)) {
@@ -260,7 +291,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     res.writeHead(code, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(body));
   };
-  const match = /^\/control\/(prepare|backup-start|backup-stop|status|quiesce|teardown)$/.exec(req.url || '');
+  const url = new URL(req.url || '/', 'http://control');
+  const match = /^\/control\/(prepare|backup-start|backup-stop|status|quiesce|teardown)$/.exec(url.pathname);
   if (!match) { send(404, { success: false, error: 'unknown route' }); return; }
   const action = match[1];
   // The receiver cannot know this machine's instance ids; the channel token
@@ -295,15 +327,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // probe, and the slot must not exist before the operator commits.
       // backup-start mints it RESERVED, the only form that retains WAL.
       const identity = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
-        "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), pg_current_wal_lsn()"]);
-      const [systemId, timeline, lsn] = identity.ok ? identity.stdout.trim().split('|') : ['', '', ''];
+        "SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()), (SELECT checkpoint_lsn FROM pg_control_checkpoint()), pg_current_wal_lsn()"]);
+      const [systemId, timeline, checkpointLsn, lsn] = identity.ok ? identity.stdout.trim().split('|') : ['', '', '', ''];
       const repl = fleetDb.replication;
       if (!repl) { send(409, { success: false, error: 'replication posture missing on the source (adopt/enable first)' }); return; }
+      // The receiver compares these with its own database before anything is overwritten, and refuses on identityError.
+      const store = systemId ? await readStoreId(fleetDb) : { ok: false as const, error: 'the database did not answer' };
       send(200, {
         success: true,
         slot: RECOVERY_SLOT,
         replicator: { user: repl.role, password: repl.password },
-        identity: { systemId, timeline: Number(timeline), lsn },
+        identity: { systemId, timeline: Number(timeline), checkpointLsn, lsn, ...(store.ok ? { storeId: store.storeId } : {}) },
+        ...(!systemId
+          ? { identityError: `could not read the database identity: ${identity.stderr.trim().split('\n').pop() || 'no answer'}` }
+          : !store.ok ? { identityError: store.error } : {}),
       });
       return;
     }
@@ -359,6 +396,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     if (action === 'quiesce') {
+      const receiverSystemId = url.searchParams.get('systemId') || '';
+      if (!/^\d+$/.test(receiverSystemId)) {
+        send(400, { success: false, error: 'the receiver sent no system id for its copy, so nothing was stopped' });
+        return;
+      }
       if (containerManager.isShuttingDown()) {
         send(503, { success: false, error: containerManager.SHUTDOWN_REFUSAL });
         return;
@@ -375,7 +417,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       let answer: QuiesceAnswer;
       try {
-        answer = await containerManager.withExternalBotOp(instance.id, 'quiesce', () => quiesce(instance));
+        answer = await containerManager.withExternalBotOp(instance.id, 'quiesce', () => quiesce(instance, receiverSystemId));
       } catch (err) {
         answer = { code: 409, body: { success: false, error: `${err instanceof Error ? err.message : String(err)}; the quiesce was refused and nothing was stopped` }, changed: false };
       }

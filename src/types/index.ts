@@ -255,6 +255,20 @@ export interface RecoveryChannelRecord {
 // persisted phase model: a manager death mid-seed resumes the phase, every
 // phase is idempotently re-enterable. Lives beside the receiver channel
 // record and is cleared by cancel or the RC-4 swap.
+export interface RescueIdentity {
+  systemId: string;
+  timeline: number;
+  checkpointLsn?: string;
+  /** smdb_data.meta store_id; null when the database holds no fleet store, absent when it was not read. */
+  storeId?: string | null;
+}
+
+/** A cancelled rescue left the volume as a partial copy or as a standby of the sender; Start refuses until the volume is clean again. */
+export interface RecoveryRescueLeft {
+  at: number;
+  state: 'partial' | 'standby';
+}
+
 export interface RecoveryRescueRecord {
   phase: 'preflight' | 'bulk' | 'consistent' | 'standby' | 'streaming'
     | 'quiesce' | 'catchup' | 'promote' | 'teardown' | 'flip';
@@ -263,8 +277,16 @@ export interface RecoveryRescueRecord {
   /** Structural halt (channel/database record gone): the phase is KEPT so Continue re-enters it, never restarts from scratch. */
   parked?: boolean;
   lastError?: string;
-  /** OUTDATED receivers only: the stale copy was dumped before the overwrite. */
-  dumpDone?: boolean;
+  /** The safety dump of this machine's database before the overwrite: true once taken (dumpFile names it), false when it failed (dumpError says why). */
+  dumpOk?: boolean;
+  dumpFile?: string;
+  dumpError?: string;
+  /** Why no dump was taken: the volume held no database, held a partial copy from an earlier rescue, or the operator chose to overwrite after a failed dump. */
+  dumpSkipped?: 'empty' | 'partial' | 'waived';
+  /** The sender's identity the operator confirmed, the warnings acknowledged, and this machine's store id read before the dump (null: no store). */
+  identity?: { source: RescueIdentity; acked: string[]; localStoreId?: string | null };
+  /** When the first rsync pass was started: from then on the volume holds a partial copy and is marked as such. */
+  passStartedAt?: number;
   /** Streaming phase telemetry, refreshed by the monitor loop. */
   caughtUp?: boolean;
   lagBytes?: number;
@@ -334,6 +356,7 @@ export interface InstanceConfig {
   fleetConsentFenceLeft?: string[];    // containers whose write fence a failback or drop-back run set and has not seen lifted; the next run there owns it
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
+  recoveryRescueLeft?: RecoveryRescueLeft; // a cancelled rescue left a partial copy or a standby; kept while a new rescue runs; cleared by a finished swap, a retire, or a start that finds the volume clean
   recoveryLastSwap?: { startedAt: number; completedAt: number }; // set by the swap's flip alone, startedAt from its rescue record
   recoverySwappedAway?: { at: number };  // source side: a swap's quiesce handed this database away; Start and Update refuse until the operator clears it
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults

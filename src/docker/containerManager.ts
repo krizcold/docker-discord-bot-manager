@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord, RecoveryRescueLeft,
   ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig, InstanceLane,
 } from '../types';
 import * as dockerClient from './dockerClient';
@@ -690,13 +690,21 @@ export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryCh
   return instance;
 }
 
-export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null, lastSwap?: { startedAt: number; completedAt: number }): InstanceConfig | null {
+/** What an earlier cancelled rescue left stays marked while a new one runs; a cancel's left replaces it, and a finished swap clears it. */
+export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null, lastSwap?: { startedAt: number; completedAt: number }, left?: RecoveryRescueLeft): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
-  if (rescue) instance.recoveryRescue = rescue;
-  else delete instance.recoveryRescue;
-  if (lastSwap) instance.recoveryLastSwap = lastSwap;
+  if (rescue) {
+    instance.recoveryRescue = rescue;
+  } else {
+    delete instance.recoveryRescue;
+    if (left) instance.recoveryRescueLeft = left;
+  }
+  if (lastSwap) {
+    instance.recoveryLastSwap = lastSwap;
+    delete instance.recoveryRescueLeft;
+  }
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
@@ -1094,6 +1102,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     if (stored) {
       delete stored.fleetDb;
       delete stored.recoverySwappedAway;
+      delete stored.recoveryRescueLeft;
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
     }
@@ -1102,6 +1111,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
   }
   delete instance.fleetDb;
   delete instance.recoverySwappedAway;
+  delete instance.recoveryRescueLeft;
   return { success: true, volumeRemoved: true };
 }
 
@@ -3397,6 +3407,46 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   return swappedAwayRefusal(botId, 'a start') ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
+/**
+ * A cancelled rescue that left a partial copy or a standby of the sender refuses a start: Postgres would run on files
+ * that are not a consistent database, or as a read-only follower of a channel that may be gone. The volume is asked
+ * each time, so a volume put right by hand (or by a finished rescue) starts again and the mark is cleared.
+ */
+export async function rescueLeftoverRefusal(botId: string): Promise<{ success: false; error: string } | null> {
+  const instance = getBot(botId);
+  const left = instance?.recoveryRescueLeft;
+  if (!instance || !left) return null;
+  const volume = instance.fleetDb?.volume;
+  const probe = !volume ? { ok: true, out: 'clean' } : await new Promise<{ ok: boolean; out: string }>(resolve => {
+    execFile('docker', ['run', '--rm', '-v', `${volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
+      'if test -f /pgdata/rescue.inprogress; then echo partial; elif test -f /pgdata/standby.signal; then echo standby; else echo clean; fi'],
+      { timeout: 60_000 }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message).trim().split('\n').pop() || 'no answer' : String(stdout).trim() }));
+  });
+  const day = new Date(left.at).toISOString().slice(0, 10);
+  if (probe.ok && probe.out === 'clean') {
+    try {
+      const registry = loadRegistry();
+      const stored = registry.instances[botId];
+      if (stored) {
+        delete stored.recoveryRescueLeft;
+        saveRegistry(registry);
+      }
+      delete instance.recoveryRescueLeft;
+    } catch (err) {
+      return { success: false, error: `The volume a rescue cancelled on ${day} left behind is clean again, but that could not be recorded (${errorText(err)}), so the instance was not started; retry` };
+    }
+    return null;
+  }
+  const remedy = 'Start a rescue again to finish the copy, or decommission this database on its Database modal and provision a new one';
+  if (probe.ok && probe.out === 'partial') {
+    return { success: false, error: `A rescue cancelled on ${day} left a partial copy of the sender's database on this instance's volume, so it was not started: Postgres would run on files that are not a consistent database. ${remedy}` };
+  }
+  if (probe.ok && probe.out === 'standby') {
+    return { success: false, error: `A rescue cancelled on ${day} left this instance's database as a standby of the sender (read-only, following a channel that may be gone), so it was not started. ${remedy}` };
+  }
+  return { success: false, error: `A rescue cancelled on ${day} may have left a partial copy on this instance's volume, and docker could not check it (${probe.ok ? `it answered '${probe.out}'` : probe.out}), so the instance was not started; retry in a moment` };
+}
+
 /** A recorded copy-block retraction reaches the app once its hooks answer after a start; a miss stays recorded. */
 async function sendCopyBlockRetract(botId: string): Promise<void> {
   try {
@@ -3416,7 +3466,7 @@ async function sendCopyBlockRetract(botId: string): Promise<void> {
 async function startBotImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  const rescueRefusal = startPreflightRefusal(botId);
+  const rescueRefusal = startPreflightRefusal(botId) ?? await rescueLeftoverRefusal(botId);
   if (rescueRefusal) return rescueRefusal;
   if (instance.fleetDb?.retiringAt) return { success: false, error: unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
@@ -3943,7 +3993,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
 
 export async function restartBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'restart', async () => {
-    const rescueRefusal = startPreflightRefusal(botId);
+    const rescueRefusal = startPreflightRefusal(botId) ?? await rescueLeftoverRefusal(botId);
     if (rescueRefusal) return rescueRefusal;
     try {
       writeLane(botId, newLane('restart', true));

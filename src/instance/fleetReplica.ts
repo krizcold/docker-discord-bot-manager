@@ -1148,6 +1148,10 @@ export function reseedStalePrimary(
           saveSeed(instance.id, { safetyDump: dump.file });
         }
       }
+      if (!opts.dumpDone && fenced) {
+        const foreign = await reseedIdentityRefusal(instance, fleetDb, validated.intake.dsn);
+        if (foreign) throw new Error(`${foreign}; nothing was destroyed`);
+      }
       // Re-check just before the destructive step: the dump above can take
       // minutes, and a store that corrupted meanwhile would make the pins
       // retire below throw AFTER the database was destroyed.
@@ -1204,6 +1208,39 @@ export function reseedStalePrimary(
     return started;
   }
   return { success: true, started: true };
+}
+
+/**
+ * Why the pasted primary must not replace this stale copy: a primary that took over from this machine is a physical
+ * copy of it (the same system id) on a later timeline. A different cluster or a lower timeline is refused, and so is
+ * an identity that could not be read on either side. Null when the two match.
+ */
+async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNullable<InstanceConfig['fleetDb']>, dsn: ParsedDsn): Promise<string | null> {
+  const local = await new Promise<{ ok: boolean; out: string }>(resolve => {
+    execFile('docker', ['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c',
+      'SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint())'],
+    { timeout: PROBE_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
+  });
+  const [localId, localTl] = local.ok ? local.out.trim().split('|') : ['', ''];
+  if (!/^\d+$/.test(localId) || !/^\d+$/.test(localTl)) {
+    return `this database's identity could not be read (${local.out.trim().split('\n').pop() || 'no answer'}), so it cannot be compared with the pasted primary's`;
+  }
+  const probeName = primaryProbeContainerName(instance);
+  await dockerRmForce(probeName);
+  const ident = await runPrimaryClient(probeName, dsn, [`${hostCertPathFor(instance.id)}:/primary-ca.crt:ro`], 'psql',
+    [`${seedDsnFor(dsn)}&replication=true`, '-Atc', 'IDENTIFY_SYSTEM'], PROBE_TIMEOUT_MS);
+  const [primaryId, primaryTl] = ident.ok ? ident.stdout.trim().split('|') : ['', ''];
+  if (!/^\d+$/.test(primaryId) || !/^\d+$/.test(primaryTl)) {
+    const reason = (ident.stderr.trim().split('\n').map(l => l.trim()).filter(Boolean)[0] || 'no answer').split(dsn.password).join('***');
+    return `the pasted primary's identity could not be read (${reason}), so it cannot be compared with this database's`;
+  }
+  if (primaryId !== localId) {
+    return `the pasted primary's database (system id ${primaryId}) is not a copy of this one (system id ${localId}), so it did not take over from this machine. Paste the block of the machine that took over, or decommission this database and provision a standby instead`;
+  }
+  if (Number(primaryTl) < Number(localTl)) {
+    return `the pasted primary is on timeline ${primaryTl}, below this database's timeline ${localTl}: this copy was promoted after the two parted and may hold the newer writes`;
+  }
+  return null;
 }
 
 const RESEED_LIFT_REMEDY = 'retrying the re-seed retries the lift';

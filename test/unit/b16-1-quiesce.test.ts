@@ -19,6 +19,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'stop') st.events.push(`docker-stop:${args[1]}`);
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) st.events.push('fence');
     if (sql.includes('SELECT pg_current_wal_lsn()')) out = '0/3000000';
+    if (sql.includes('SELECT system_identifier FROM pg_control_system()')) out = '7001';
     if (sql.includes("to_regclass('smdb_control.term')")) out = st.termTables;
     if (sql.includes('SELECT coalesce(GREATEST(')) out = st.term;
     setImmediate(() => cb(null, `${out}\n`, ''));
@@ -75,7 +76,7 @@ async function call(action: string): Promise<{ code: number; body: any }> {
   const handle = (recoveryControl as any).handleRecoveryControl as (req: any, res: any) => Promise<void>;
   let code = 0;
   let text = '';
-  await handle({ url: `/control/${action}`, headers: { 'x-recovery-token': 'tok' } }, {
+  await handle({ url: `/control/${action}${action === 'quiesce' ? '?systemId=7001' : ''}`, headers: { 'x-recovery-token': 'tok' } }, {
     writeHead: (c: number) => { code = c; },
     end: (t: string) => { text = t; },
   });

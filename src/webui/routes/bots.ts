@@ -1982,9 +1982,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * GET/POST/DELETE /api/bots/:id/recovery-rescue - The receiver-side rescue
-   * (RC-3). POST {confirm?} starts or continues it; without confirm it
-   * answers needsConfirm + fresh/outdated + the source identity so the UI can
-   * show the right sentence. DELETE cancels (the volume stays as-is).
+   * (RC-3). POST {confirm?, acknowledge?, withoutDump?} starts or continues
+   * it; without confirm (or with a warning not acknowledged) it answers
+   * needsConfirm + fresh/outdated/partial + both identities + the warnings so
+   * the UI can show the right sentences. DELETE cancels (the volume stays as-is).
    */
   router.get('/:id/recovery-rescue', (req: Request, res: Response) => {
     const bot = containerManager.getBot(req.params.id);
@@ -1992,7 +1993,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.status(404).json({ success: false, error: 'Bot not found' });
       return;
     }
-    res.json({ success: true, rescue: recoveryRescue.getRescueStatus(bot) });
+    res.json({ success: true, rescue: recoveryRescue.getRescueStatus(bot), leftover: bot.recoveryRescueLeft?.state ?? null });
   });
 
   router.post('/:id/recovery-rescue', async (req: Request, res: Response) => {
@@ -2002,7 +2003,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await recoveryRescue.startRescue(bot, req.body?.confirm === true);
+      const acknowledge = Array.isArray(req.body?.acknowledge) ? req.body.acknowledge.filter((k: unknown): k is string => typeof k === 'string') : [];
+      const result = await recoveryRescue.startRescue(bot, req.body?.confirm === true, { acknowledge, withoutDump: req.body?.withoutDump === true });
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {

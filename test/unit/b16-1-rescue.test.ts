@@ -16,7 +16,9 @@ vi.mock('child_process', async (importOriginal) => {
     const sql = args.join(' ');
     const out = sql.includes("to_regclass('smdb_data.guild_ownership')") || sql.includes("to_regclass('smdb_control.term')") ? 't\n'
       : sql.includes('UPDATE smdb_control.term') ? '1\n'
-        : '';
+        : sql.includes('then echo partial') ? 'empty\n'
+          : sql.includes('SELECT system_identifier FROM pg_control_system()') ? '7001\n'
+            : '';
     const gate = st.gate && st.gate.match(args) ? st.gate.open : Promise.resolve();
     void gate.then(() => setImmediate(() => cb(null, out, '')));
     return { stdin: null };

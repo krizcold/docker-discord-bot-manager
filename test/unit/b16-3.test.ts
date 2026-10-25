@@ -28,7 +28,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (st.onCall) st.onCall(args);
     const ok = (out: string) => setImmediate(() => cb(null, out, ''));
     const fail = (text: string) => setImmediate(() => cb(new Error(text), '', text));
-    if (st.hasDb && args[0] === 'run' && args.some(a => a.includes('PG_VERSION'))) ok('yes\n');
+    if (args[0] === 'run' && args.some(a => a.includes('then echo partial'))) ok(st.hasDb ? 'database\n' : 'empty\n');
+    else if (args.join(' ').includes("to_regclass('smdb_data.meta')")) ok('f\n');
     else if (args[0] === 'ps') ok(st.mounts);
     else if (args[0] === 'inspect' && args.includes('{{.Config.Image}}')) ok('relay:1\n');
     else if (args[0] === 'inspect' && args.some(a => a.includes('.NetworkSettings.Networks'))) ok('pcs\n');
@@ -232,7 +233,8 @@ describe('R11-J7: a rescue keeps its database out of CasaOS reach while it rewri
     containerManager.holdFleetDbForLane('r5');
     st.bots = [receiver('r5', 'bulk', { recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1, parked: true } })];
     const r = await rescue.cancelRescue(st.bots[0]);
-    expect(r).toEqual({ success: true });
+    expect(r).toMatchObject({ success: true });
+    expect(r.warning).toBeUndefined();
     expect(compose('r5').services['fleet-postgres'].container_name).toBe('bot1-db');
     expect(fs.existsSync(held('r5'))).toBe(false);
   });
@@ -240,7 +242,7 @@ describe('R11-J7: a rescue keeps its database out of CasaOS reach while it rewri
   it('a cancel during the pre-rescue dump leaves the database in the app file and its container in place', async () => {
     st.hasDb = true;
     const bot = receiver('r7', 'preflight', { recoveryRescue: { phase: 'preflight', startedAt: 1, updatedAt: 1 } });
-    st.onDump = async () => { expect(await rescue.cancelRescue(bot)).toEqual({ success: true }); };
+    st.onDump = async () => { expect((await rescue.cancelRescue(bot)).warning).toBeUndefined(); };
     await runUntil(bot, () => ran(a => a[0] === 'runFleetDump') && !isFleetBackupBusy('r7'));
     expect(bot.recoveryRescue).toBeUndefined();
     expect(compose('r7').services['fleet-postgres'].container_name).toBe('bot1-db');

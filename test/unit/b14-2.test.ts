@@ -108,6 +108,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('default_transaction_read_only/d')) return pg.liftFails ? cb(new Error('strip'), '', 'strip refused') : cb(null, '', '');
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
+    if (sql.includes('pg_control_system()')) return cb(null, '7001|2\n', '');
     if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
     if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
@@ -128,7 +129,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (isDump) pg.events.push('dump');
     const code = isDump && pg.dumpFails ? 1 : 0;
     setTimeout(() => {
-      child.stdout.end(isDump && !pg.dumpFails ? 'dump' : args.includes('SELECT pg_is_in_recovery()') ? 'f\n' : '');
+      child.stdout.end(isDump && !pg.dumpFails ? 'dump' : args.includes('SELECT pg_is_in_recovery()') ? 'f\n' : args.includes('IDENTIFY_SYSTEM') ? '7001|3|0/3000000|\n' : '');
       child.stderr.end(code ? 'pg_dump: error: connection lost' : '');
       setTimeout(() => child.emit('close', code), 5);
     }, 5);

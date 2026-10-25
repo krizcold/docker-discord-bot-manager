@@ -52,6 +52,7 @@ vi.mock('child_process', async (importOriginal) => {
       pg.fenced.set(args[1], true); return cb(null, '0\n', '');
     }
     if (args[0] === 'exec' && sql.includes('FROM pg_database WHERE datname')) return cb(null, '0\n', '');
+    if (args[0] === 'exec' && sql.includes('SELECT system_identifier FROM pg_control_system()')) return cb(null, '7001\n', '');
     // A manager restart during the restore: the recreate never answers.
     if (args[0] === 'exec' && sql.includes('DROP DATABASE')) { pg.onRecreate?.(); return; }
     if (args[0] === 'run') return cb(new Error('strip refused'), '', 'strip refused');
@@ -195,7 +196,7 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     rc.startRecoveryControlServer();
     await new Promise(r => setTimeout(r, 100));
     try {
-      const res = await fetch(`http://127.0.0.1:${rc.RECOVERY_CONTROL_PORT}/control/quiesce`, { method: 'POST', headers: { 'x-recovery-token': 'tok' } });
+      const res = await fetch(`http://127.0.0.1:${rc.RECOVERY_CONTROL_PORT}/control/quiesce?systemId=7001`, { method: 'POST', headers: { 'x-recovery-token': 'tok' } });
       await res.text();
       return { fb, status: res.status };
     } finally { rc.stopRecoveryControlServer(); }

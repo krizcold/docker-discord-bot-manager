@@ -3258,7 +3258,7 @@
     async function readRecoveryRescue(botId) {
       try {
         const rr = await api('GET', `/bots/${botId}/recovery-rescue`);
-        return rr && rr.success ? { rescue: rr.rescue || null } : { failed: true };
+        return rr && rr.success ? { rescue: rr.rescue || null, leftover: rr.leftover || null } : { failed: true };
       } catch (err) { return { failed: true }; }
     }
     function pollRecoveryChannel(botId, seq) {
@@ -3293,7 +3293,7 @@
         }
         if (tail.rescue) {
           recoveryLastPhase[botId] = { phase: tail.rescue.phase, startedAt: tail.rescue.startedAt, waits: 0 };
-          body.innerHTML = renderRescueBlock(botId, tail.rescue);
+          body.innerHTML = renderRescueBlock(botId, tail.rescue, tail.leftover);
           pollRecoveryChannel(botId, seq);
           return;
         }
@@ -3347,12 +3347,14 @@
         return;
       }
       let rescue = null;
+      let rescueLeftover = null;
       let rescueReadFailed = false;
       if (ch.mode === 'receiver') {
         const rr = await readRecoveryRescue(botId);
         if (seq !== recoveryChannelSeq || !body.isConnected || fleetBackupBotId !== botId) return;
         rescueReadFailed = !!rr.failed;
         rescue = rr.rescue || null;
+        rescueLeftover = rr.leftover || null;
         if (rescue) recoveryLastPhase[botId] = { phase: rescue.phase, startedAt: rescue.startedAt, waits: 0 };
         else if (!rescueReadFailed) delete recoveryLastPhase[botId];
       }
@@ -3384,14 +3386,14 @@
         </div>
         <input type="hidden" id="rc-arm-block" value="${escapeHtml(JSON.stringify(ch.block))}">
         <div class="env-tip">Paste it into "Arm sender" on the machine that holds the good database.</div>` : ''}
-        ${ch.mode !== 'receiver' ? '' : rescueReadFailed ? '<div class="error-message">Could not read the rescue state; retrying</div>' : renderRescueBlock(botId, rescue)}
+        ${ch.mode !== 'receiver' ? '' : rescueReadFailed ? '<div class="error-message">Could not read the rescue state; retrying</div>' : renderRescueBlock(botId, rescue, rescueLeftover)}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" onclick="disarmRecoveryChannel('${botId}')">Disarm this side</button>
         </div>`;
       pollRecoveryChannel(botId, seq);
     }
 
-    function renderRescueBlock(botId, rescue) {
+    function renderRescueBlock(botId, rescue, leftover) {
       if (!rescue) {
         return `
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
@@ -3423,16 +3425,25 @@
         }[rescue.phase] || rescue.phase;
       const pastPromote = ['promote', 'teardown', 'flip'].includes(rescue.phase);
       const swapReady = rescue.phase === 'streaming' && rescue.caughtUp && rescue.senderAttached === true && !rescue.parked;
+      const dumpFailedPark = rescue.parked && rescue.phase === 'preflight' && rescue.dumpOk === false;
+      const dumpText = rescue.dumpOk === true ? `Safety dump of this machine's database: ${rescue.dumpFile || 'taken'} (kept with the backups)`
+        : rescue.dumpSkipped === 'waived' ? `No safety dump: it failed (${rescue.dumpError || 'no reason recorded'}) and the overwrite went ahead without one, as chosen`
+        : rescue.dumpOk === false ? `Safety dump failed: ${rescue.dumpError || 'no reason recorded'}`
+        : rescue.dumpSkipped === 'empty' ? 'No safety dump: this machine\'s volume held no database'
+        : rescue.dumpSkipped === 'partial' ? 'No safety dump: this machine\'s volume held a partial copy from an earlier rescue, not a database'
+        : 'Safety dump: not taken yet';
       return `
         <div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Rescue</div>
           <div class="env-tip" style="color:var(--${rescue.parked ? 'danger' : rescue.caughtUp ? 'success' : 'text-secondary'});">${escapeHtml(phaseText)}</div>
           ${rescue.lastError ? `<div class="env-tip" style="color:var(--warning);">${escapeHtml(rescue.lastError)}</div>` : ''}
+          <div class="env-tip" style="color:var(--${rescue.dumpOk === false || rescue.dumpSkipped === 'waived' ? 'warning' : 'text-secondary'});">${escapeHtml(dumpText)}</div>
           <div class="env-tip">From the preflight dump until the copy turns into a standby, this app's compose file (on CasaOS, its app file) does not list the database and its container is removed. Do not start the app from CasaOS until the rescue ends: a database container started during the copy parks the rescue and the copy starts again.</div>
           <div style="display:flex;gap:8px;">
-            ${rescue.parked ? `<button class="btn btn-primary btn-small" onclick="startRecoveryRescue('${botId}')">Continue</button>` : ''}
+            ${rescue.parked ? `<button class="btn btn-primary btn-small" onclick="startRecoveryRescue('${botId}')">${dumpFailedPark ? 'Retry the dump' : 'Continue'}</button>` : ''}
+            ${dumpFailedPark ? `<button class="btn btn-danger btn-small" onclick="overwriteWithoutDump('${botId}')">Overwrite without a dump</button>` : ''}
             ${swapReady ? `<button class="btn btn-danger btn-small" onclick="startRecoverySwap('${botId}')">Swap now</button>` : ''}
-            ${pastPromote ? '' : `<button class="btn btn-danger btn-small" onclick="cancelRecoveryRescue('${botId}')">Cancel rescue</button>`}
+            ${pastPromote ? '' : `<button class="btn btn-danger btn-small" onclick="cancelRecoveryRescue('${botId}', '${escapeHtml(rescue.phase)}', ${rescue.passStartedAt ? 'true' : 'false'}, '${leftover || (rescue.dumpSkipped === 'partial' ? 'partial' : '')}')">Cancel rescue</button>`}
           </div>
         </div>`;
     }
@@ -3456,11 +3467,25 @@
         let res = await api('POST', `/bots/${botId}/recovery-rescue`, {});
         if (!res.success && res.needsConfirm) {
           const src = res.sourceIdentity || {};
+          const here = res.localIdentity || {};
+          const sender = `system id ${src.systemId || '?'}, timeline ${src.timeline || '?'}, store id ${src.storeId || 'none'}`;
           const sentence = res.state === 'outdated'
-            ? `Rescue INTO this machine?\n\nThis machine's database is treated as STALE: it is dumped once (kept with the backups) and then REPLACED by the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}). Anything written here after the failover is discarded.`
-            : `Rescue INTO this machine?\n\nThis machine has no managed database yet; it will be seeded from the sender's database (id ${src.systemId || '?'}, timeline ${src.timeline || '?'}).`;
+            ? `Rescue INTO this machine?\n\nThis machine's database (system id ${here.systemId || "can't be read"}, timeline ${here.timeline || '?'}) is dumped once (kept with the backups) and then REPLACED by the sender's database (${sender}). Whatever this machine's database holds that the sender's does not is discarded. If the dump fails, nothing is replaced until you choose.\n\nThe store ids are compared once this machine's database starts for the dump, and a different store stops the rescue before anything is replaced.`
+            : res.state === 'partial'
+              ? `Rescue INTO this machine?\n\nThis machine's volume holds a partial copy left by an earlier rescue, which is not a database and cannot be dumped. The copy continues over it from the sender's database (${sender}).`
+              : `Rescue INTO this machine?\n\nThis machine's volume holds no database; it will be seeded from the sender's database (${sender}).`;
           if (!confirm(sentence)) return;
-          res = await api('POST', `/bots/${botId}/recovery-rescue`, { confirm: true });
+          const acknowledge = [];
+          for (const ack of res.acks || []) {
+            if (!confirm(`${ack.text}.\n\nReplace this machine's database with the sender's anyway?`)) return;
+            acknowledge.push(ack.key);
+          }
+          res = await api('POST', `/bots/${botId}/recovery-rescue`, { confirm: true, acknowledge });
+          if (!res.success && res.needsConfirm) {
+            showMessage('error', 'The identities changed while you confirmed; nothing was started. Start the rescue again to see what they report now.');
+            renderRecoveryChannel(botId);
+            return;
+          }
         }
         showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue running; it survives restarts on both ends and resumes after interruptions.' : (res.error || 'Failed to start the rescue'));
       } catch (err) {
@@ -3469,11 +3494,33 @@
       renderRecoveryChannel(botId);
     }
 
-    async function cancelRecoveryRescue(botId) {
-      if (!confirm('Cancel the rescue?\n\nThe copy stops where it is (a later rescue resumes incrementally). The database on this machine stays in whatever state the rescue left it.')) return;
+    async function overwriteWithoutDump(botId) {
+      if (!confirm('Overwrite without a dump?\n\nThe safety dump of this machine\'s database failed. Going on REPLACES that database with the sender\'s and keeps no copy of it: whatever it holds that the sender\'s does not is lost for good.\n\nIf the database did not start for the dump, its store id was not compared with the sender\'s either.')) return;
+      try {
+        const res = await api('POST', `/bots/${botId}/recovery-rescue`, { withoutDump: true });
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Rescue continuing without a safety dump.' : (res.error || 'Failed to continue the rescue'));
+      } catch (err) {
+        showNoAnswer('rescue');
+      }
+      renderRecoveryChannel(botId);
+    }
+
+    async function cancelRecoveryRescue(botId, phase, passStarted, leftover) {
+      const standby = ['standby', 'streaming', 'quiesce', 'catchup'].includes(phase);
+      const what = standby
+        ? 'This machine\'s database is now a standby copy of the sender: the cancel stops its container, and Start stays refused on this instance until a rescue finishes the swap or the database is decommissioned.'
+        : passStarted
+          ? 'The copy stops where it is (a later rescue resumes incrementally). This machine\'s volume holds a partial copy, so Start stays refused on this instance until a rescue finishes the copy or the database is decommissioned.'
+          : leftover === 'partial'
+            ? 'This rescue has copied nothing yet, but this machine\'s volume still holds the partial copy an earlier rescue left, so Start stays refused on this instance until a rescue finishes the copy or the database is decommissioned.'
+            : leftover === 'standby'
+              ? 'This rescue has copied nothing yet, but this machine\'s volume still holds the standby copy of the sender an earlier cancelled rescue left, so Start stays refused on this instance until a rescue finishes the swap or the database is decommissioned.'
+              : 'No copy has begun, so this machine\'s database is left as it is.';
+      const swap = phase === 'quiesce' || phase === 'catchup' ? '\n\nThe swap had begun: the sender\'s fleet is stopped and its database is read-only. On the sender machine, disarm the channel (which lifts the read-only fence) and clear the swap record on its Database modal before starting it.' : '';
+      if (!confirm(`Cancel the rescue?\n\n${what}${swap}`)) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/recovery-rescue`);
-        showMessage(res.success ? (res.warning ? 'error' : 'success') : 'error', res.success ? (res.warning || 'Rescue cancelled.') : (res.error || 'Failed to cancel'));
+        showMessage(res.success ? (res.warning ? 'error' : 'success') : 'error', res.success ? (res.warning || res.note || 'Rescue cancelled.') : (res.error || 'Failed to cancel'));
       } catch (err) {
         showNoAnswer('rescue cancel');
       }
@@ -4180,7 +4227,7 @@
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (refuseWhileChecking(botId)) return;
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (read-only, sessions closed), then DELETED and replaced with a fresh copy of the new primary. If the dump fails, nothing is deleted. Anything written here after the failover is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {

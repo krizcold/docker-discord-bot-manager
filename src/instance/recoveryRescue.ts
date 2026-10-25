@@ -35,8 +35,9 @@ import * as appLifecycle from './appLifecycle';
 import { runFleetDump, claimFleetBackupBusy, releaseFleetBackupBusy, isFleetBackupBusy, raiseGuildTerms } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
+import { readStoreId, readSystemId } from './recoveryControl';
 import { hasAppHooks } from './appHookClient';
-import { InstanceConfig, RecoveryRescueRecord } from '../types';
+import { InstanceConfig, RecoveryRescueRecord, RescueIdentity } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
@@ -126,9 +127,70 @@ function volExec(volume: string, script: string, stdin?: string): Promise<{ ok: 
     '-v', `${volume}:${PGDATA}`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script], stdin);
 }
 
-async function volumeHasDatabase(volume: string): Promise<boolean> {
-  const probe = await volExec(volume, `test -f ${PGDATA}/PG_VERSION && echo yes || echo no`);
-  return probe.ok && probe.stdout.trim() === 'yes';
+const MARKER = `${PGDATA}/rescue.inprogress`;
+
+/** partial: an rsync pass of a rescue has started on the volume (the marker), so it holds no consistent database to dump. */
+type VolumeState = 'empty' | 'database' | 'partial';
+
+async function volumeState(volume: string): Promise<{ ok: true; state: VolumeState } | { ok: false; error: string }> {
+  const probe = await volExec(volume, `if test -f ${MARKER}; then echo partial; elif test -f ${PGDATA}/PG_VERSION; then echo database; else echo empty; fi`);
+  const answer = probe.ok ? probe.stdout.trim() : '';
+  if (answer === 'empty' || answer === 'database' || answer === 'partial') return { ok: true, state: answer };
+  return { ok: false, error: probe.ok ? `the volume check answered '${answer}'` : probe.stderr.trim().split('\n').pop() || 'no answer' };
+}
+
+/** This machine's database identity read from pg_control on the volume, so the database need not run. */
+async function localControlIdentity(volume: string): Promise<{ ok: true; identity: RescueIdentity } | { ok: false; error: string }> {
+  const probe = await volExec(volume, `pg_controldata ${PGDATA}`);
+  if (!probe.ok) return { ok: false, error: probe.stderr.trim().split('\n').pop() || 'pg_controldata failed' };
+  const field = (label: string) => {
+    const line = probe.stdout.split('\n').find(l => l.startsWith(`${label}:`));
+    return line ? line.slice(label.length + 1).trim() : '';
+  };
+  const systemId = field('Database system identifier');
+  const timeline = Number(field("Latest checkpoint's TimeLineID"));
+  if (!/^\d+$/.test(systemId) || !Number.isInteger(timeline)) return { ok: false, error: 'pg_controldata gave no system id or timeline' };
+  return { ok: true, identity: { systemId, timeline, checkpointLsn: field('Latest checkpoint location') || undefined } };
+}
+
+export interface IdentityCheck {
+  refusal?: string;
+  /** Warnings the operator must acknowledge, each by key, before the overwrite. */
+  acks: { key: string; text: string }[];
+}
+
+/**
+ * The sender's database against this machine's before an overwrite. A different fleet store is refused; a different
+ * cluster, a sender on a lower timeline, or an identity that could not be read here each need an explicit
+ * acknowledgement. local null: this machine's volume holds no database worth comparing (empty, or a partial copy).
+ */
+export function compareIdentities(
+  source: Partial<RescueIdentity> | undefined,
+  sourceError: string | undefined,
+  local: { identity: RescueIdentity } | { error: string } | null,
+): IdentityCheck {
+  if (sourceError || !source?.systemId) return { refusal: `The sender did not report its database identity (${sourceError || 'no system id'}), so it cannot be compared with this machine's`, acks: [] };
+  if (source.storeId === undefined) return { refusal: 'The sender did not report its store id, so it cannot be compared with this machine\'s', acks: [] };
+  if (!local) return { acks: [] };
+  if ('error' in local) {
+    return { acks: [{ key: 'local-unreadable', text: `This machine's database identity could not be read (${local.error}), so whether the sender holds a copy of the same database can't be confirmed` }] };
+  }
+  const here = local.identity;
+  if (typeof here.storeId === 'string' && source.storeId !== here.storeId) {
+    return {
+      refusal: source.storeId === null
+        ? `The sender's database holds no fleet store, and this machine's holds store ${here.storeId}`
+        : `The sender holds a different fleet store (store id ${source.storeId}) from this machine's (store id ${here.storeId})`,
+      acks: [],
+    };
+  }
+  const acks: IdentityCheck['acks'] = [];
+  if (source.systemId !== here.systemId) {
+    acks.push({ key: 'system-id', text: `The sender's database is a different cluster (system id ${source.systemId}) from this machine's (system id ${here.systemId}), so neither is a copy that branched from the other` });
+  } else if (typeof source.timeline === 'number' && source.timeline < here.timeline) {
+    acks.push({ key: 'timeline', text: `The sender's database is on timeline ${source.timeline}, below this machine's timeline ${here.timeline}: this machine's copy was promoted after the two parted, so it may hold the newer writes` });
+  }
+  return { acks };
 }
 
 /** Parks the rescue back at the bulk pass: what was copied so far cannot be trusted. */
@@ -167,16 +229,47 @@ function structurallySound(instance: InstanceConfig | null): instance is Instanc
 
 const running = new Set<string>();
 const SLOT_PHASES: string[] = ['preflight', 'bulk', 'consistent', 'standby'];
+// From phaseStandby on, the copy may run as a standby of the sender.
+const STANDBY_PHASES: string[] = ['standby', 'streaming', 'quiesce', 'catchup'];
 
+function rescueAlive(botId: string): boolean {
+  return !!containerManager.getBot(botId)?.recoveryRescue;
+}
+
+function throwIfCancelled(botId: string): void {
+  if (!rescueAlive(botId)) throw new Error('rescue cancelled');
+}
+
+type StartAnswer = {
+  success: boolean;
+  error?: string;
+  needsConfirm?: boolean;
+  state?: 'fresh' | 'outdated' | 'partial';
+  sourceIdentity?: Record<string, unknown>;
+  localIdentity?: RescueIdentity;
+  acks?: { key: string; text: string }[];
+};
+
+/**
+ * Start or Continue. acknowledge: the warning keys the operator confirmed on a fresh start (compareIdentities).
+ * withoutDump: Continue a rescue parked on a failed safety dump by overwriting with no dump, which the operator chose.
+ */
 export async function startRescue(
   instance: InstanceConfig,
   confirm: boolean,
-): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; state?: 'fresh' | 'outdated'; sourceIdentity?: Record<string, unknown> }> {
+  opts: { acknowledge?: string[]; withoutDump?: boolean } = {},
+): Promise<StartAnswer> {
   if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL };
   if (!instance.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
   // Teardown removes the channel, and the flip starts the fleet: Continue past them needs neither check.
   const pastChannel = instance.recoveryRescue?.phase === 'teardown' || instance.recoveryRescue?.phase === 'flip';
   if (!pastChannel && instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
+  if (opts.withoutDump) {
+    const r = instance.recoveryRescue;
+    if (!r || r.phase !== 'preflight' || r.dumpOk !== false || !r.parked) {
+      return { success: false, error: 'Overwriting without a dump applies only to a rescue parked on a failed safety dump; nothing was changed' };
+    }
+  }
   if (instance.recoveryRescue) {
     // Re-entry ALWAYS continues the recorded phase (Continue after a manager
     // outage or a parked halt); restarting from preflight would boot postgres
@@ -186,7 +279,8 @@ export async function startRescue(
       if (live === null) return { success: false, error: 'Docker could not say whether the instance is running, so the rescue was not continued; retry in a moment' };
       if (live.length > 0) return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
     }
-    if (containerManager.getBot(instance.id)?.recoveryRescue?.parked) saveRescue(instance.id, { parked: false, lastError: undefined });
+    if (opts.withoutDump) saveRescue(instance.id, { dumpSkipped: 'waived', parked: false, lastError: undefined });
+    else if (containerManager.getBot(instance.id)?.recoveryRescue?.parked) saveRescue(instance.id, { parked: false, lastError: undefined });
     if (!running.has(instance.id)) void runRescue(instance.id);
     return { success: true };
   }
@@ -194,7 +288,7 @@ export async function startRescue(
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is in progress on this instance; wait for it before starting a rescue (nothing was changed)` };
   try {
-    return await containerManager.withExternalBotOp(instance.id, 'rescue', () => startFreshRescue(instance.id, confirm));
+    return await containerManager.withExternalBotOp(instance.id, 'rescue', () => startFreshRescue(instance.id, confirm, opts.acknowledge ?? []));
   } catch (err) {
     return { success: false, error: `${err instanceof Error ? err.message : String(err)}; the rescue was not started` };
   }
@@ -209,10 +303,7 @@ function freshRescueRefusal(instance: InstanceConfig): string | null {
   return null;
 }
 
-async function startFreshRescue(
-  botId: string,
-  confirm: boolean,
-): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; state?: 'fresh' | 'outdated'; sourceIdentity?: Record<string, unknown> }> {
+async function startFreshRescue(botId: string, confirm: boolean, acknowledged: string[]): Promise<StartAnswer> {
   const instance = containerManager.getBot(botId);
   if (!instance?.fleetDb) return { success: false, error: 'This instance has no managed fleet database to receive into' };
   if (instance.recoveryRescue) return { success: false, error: 'A rescue was recorded on this instance meanwhile; open it again to continue it' };
@@ -225,18 +316,29 @@ async function startFreshRescue(
   if (instance.fleetDb.retiringAt) return { success: false, error: containerManager.unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
   const prepared = await control(instance, 'prepare');
   if (!prepared.ok) return { success: false, error: controlFailure(prepared) };
-  const outdated = await volumeHasDatabase(instance.fleetDb.volume);
-  if (!confirm) {
+  const vol = await volumeState(instance.fleetDb.volume);
+  if (!vol.ok) return { success: false, error: `Docker could not say whether this machine's database volume holds a database (${vol.error}), so the rescue was not started; retry in a moment` };
+  const local = vol.state === 'database' ? await localControlIdentity(instance.fleetDb.volume) : null;
+  const source = prepared.body.identity as Partial<RescueIdentity> | undefined;
+  const check = compareIdentities(source, prepared.body.identityError, local && (local.ok ? { identity: local.identity } : { error: local.error }));
+  if (check.refusal) return { success: false, error: `${check.refusal}; the rescue was refused and nothing was changed` };
+  const confirmed = confirm && check.acks.every(a => acknowledged.includes(a.key));
+  if (!confirmed) {
     // FRESH vs OUTDATED is a prompt difference by design (Section 15): the
     // mechanism is identical, the operator confirms a different sentence.
     return {
       success: false,
       needsConfirm: true,
-      state: outdated ? 'outdated' : 'fresh',
+      state: vol.state === 'database' ? 'outdated' : vol.state === 'partial' ? 'partial' : 'fresh',
       sourceIdentity: prepared.body.identity,
+      ...(local?.ok ? { localIdentity: local.identity } : {}),
+      acks: check.acks,
     };
   }
-  const record: RecoveryRescueRecord = { phase: 'preflight', startedAt: Date.now(), updatedAt: Date.now() };
+  const record: RecoveryRescueRecord = {
+    phase: 'preflight', startedAt: Date.now(), updatedAt: Date.now(),
+    identity: { source: { systemId: source!.systemId!, timeline: Number(source!.timeline), checkpointLsn: source!.checkpointLsn, storeId: source!.storeId }, acked: check.acks.map(a => a.key) },
+  };
   containerManager.updateInstanceRecoveryRescue(instance.id, record);
   void runRescue(instance.id);
   return { success: true };
@@ -269,7 +371,7 @@ export function startSwap(
   return { success: true };
 }
 
-export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string }> {
+export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string; note?: string }> {
   if (!instance.recoveryRescue) return { success: false, error: 'No rescue is running on this instance' };
   // Past promote there is no standby to fall back to: this copy IS the
   // primary now, and the only way out is forward (Continue re-enters the
@@ -294,18 +396,39 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
   if (['promote', 'teardown', 'flip'].includes(fresh.recoveryRescue.phase)) {
     return { success: false, error: 'The swap advanced past promotion while cancelling; finish it (Continue) instead' };
   }
-  containerManager.updateInstanceRecoveryRescue(instance.id, null);
+  const phase = fresh.recoveryRescue.phase;
+  const left = STANDBY_PHASES.includes(phase) ? 'standby' as const : fresh.recoveryRescue.passStartedAt ? 'partial' as const : null;
+  const earlier = fresh.recoveryRescueLeft?.state ?? (fresh.recoveryRescue.dumpSkipped === 'partial' ? 'partial' as const : null);
+  const mark = left ?? (earlier && !fresh.recoveryRescueLeft ? earlier : null);
+  containerManager.updateInstanceRecoveryRescue(instance.id, null, undefined, mark ? { at: Date.now(), state: mark } : undefined);
   // A driver mid-rsyncPass may recreate the client in a narrow window; its
   // next poll sees the cleared record and removes it again. Sweep once more
   // for the window where the driver died between create and poll.
   setTimeout(() => { void docker(['rm', '-f', rsyncClientName(instance)]); }, 15_000).unref();
   // The seeded/partial volume stays as-is: the operator decides what happens
   // next (re-run, disarm, or normal re-provision paths).
-  const released = containerManager.releaseFleetDbFromLane(instance.id);
-  if (!released.success) {
-    return { success: true, warning: `The rescue was cancelled, but ${released.error}; the database does not start from the app until it is back` };
+  const warnings: string[] = [];
+  const container = fresh.fleetDb?.containerName;
+  if (left === 'standby' && container) {
+    // The copy runs as a standby of the sender once phaseStandby started it; stopped so it no longer follows the channel.
+    const stop = await docker(['stop', container]);
+    if (!stop.ok && !/no such container/i.test(stop.stderr)) {
+      warnings.push(`the database container could not be stopped (${stop.stderr.trim().split('\n').pop()}), so the copy keeps following the sender until it is stopped`);
+    }
   }
-  return { success: true };
+  const released = containerManager.releaseFleetDbFromLane(instance.id);
+  if (!released.success) warnings.push(`${released.error}; the database does not start from the app until it is back`);
+  const note = left === 'partial'
+    ? 'Rescue cancelled. This machine\'s volume holds a partial copy of the sender\'s database, so Start is refused until a rescue finishes the copy or the database is decommissioned.'
+    : left === 'standby'
+      ? 'Rescue cancelled. This machine\'s database is a standby copy of the sender, so Start is refused until a rescue finishes the swap or the database is decommissioned.'
+      : earlier === 'partial'
+        ? 'Rescue cancelled before it copied anything. This machine\'s volume still holds the partial copy of the sender\'s database that an earlier rescue left, so Start is refused until a rescue finishes the copy or the database is decommissioned.'
+        : earlier === 'standby'
+          ? 'Rescue cancelled before it copied anything. This machine\'s volume still holds the standby copy of the sender that an earlier cancelled rescue left, so Start is refused until a rescue finishes the swap or the database is decommissioned.'
+          : 'Rescue cancelled before any copy began; this machine\'s database was not changed.';
+  if (warnings.length) return { success: true, note, warning: `The rescue was cancelled, but ${warnings.join('; and ')}` };
+  return { success: true, note };
 }
 
 export function getRescueStatus(instance: InstanceConfig): RecoveryRescueRecord | null {
@@ -405,37 +528,81 @@ async function removeSidecarHard(containerName: string): Promise<void> {
   }
 }
 
+/**
+ * The safety dump is a precondition of the overwrite: a dump that fails parks the rescue here with the volume
+ * untouched, and only the operator's explicit choice (Continue retries it, Overwrite without a dump waives it) moves
+ * on. A partial copy from an earlier rescue's pass is not a database to dump. The sender's identity is compared with
+ * this machine's again right before the container is removed.
+ */
 async function phasePreflight(instance: InstanceConfig): Promise<void> {
   const fleetDb = instance.fleetDb!;
   const rescue = instance.recoveryRescue!;
-  // The marker survives cancel + restart cycles inside the volume itself: a
-  // half-seeded PGDATA still has PG_VERSION, and "dumping" it would boot
-  // postgres over inconsistent data.
-  const marker = await volExec(fleetDb.volume, `test -f ${PGDATA}/rescue.inprogress && echo yes || echo no`);
-  const alreadyMidRescue = marker.ok && marker.stdout.trim() === 'yes';
-  if (!rescue.dumpDone && !alreadyMidRescue && await volumeHasDatabase(fleetDb.volume)) {
-    // The stale copy gets one dump beside the ordinary backups; best effort
-    // by the same ruling as the re-seed lane (the operator already accepted
-    // losing the diverged tail, the dump is a safety net not a precondition).
+  const vol = await volumeState(fleetDb.volume);
+  if (!vol.ok) throw new Error(`docker could not say what the database volume holds (${vol.error}); nothing was changed`);
+  if (vol.state !== 'database') {
+    if (rescue.dumpSkipped !== vol.state) saveRescue(instance.id, { dumpSkipped: vol.state });
+  } else if (rescue.dumpOk !== true && rescue.dumpSkipped !== 'waived') {
     // A retried preflight finds the service taken out by the earlier attempt; the volume is not rewritten yet.
     const back = containerManager.releaseFleetDbFromLane(instance.id);
     if (!back.success) throw new Error(back.error);
     const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
-    const dump = started.success ? await runFleetDump(instance, 'pre-rescue-') : { success: false, error: started.error };
-    if (!dump.success) console.warn(`[RecoveryRescue] Could not dump the stale copy before the rescue of ${instance.id}: ${dump.error}`);
+    throwIfCancelled(instance.id);
+    if (started.success) {
+      const store = await readStoreId(fleetDb);
+      if (!store.ok) throw new Error(`this machine's store id could not be read for the comparison with the sender's (${store.error}); nothing was changed`);
+      const identity = containerManager.getBot(instance.id)?.recoveryRescue?.identity;
+      if (identity) saveRescue(instance.id, { identity: { ...identity, localStoreId: store.storeId } });
+    }
+    const dump = started.success
+      ? await runFleetDump(instance, 'pre-rescue-')
+      : { success: false, file: undefined, error: `the database did not start for it: ${started.error}` };
+    throwIfCancelled(instance.id);
+    if (!dump.success) {
+      console.warn(`[RecoveryRescue] ${instance.displayName}: the safety dump before the rescue failed: ${dump.error}; the rescue waits for the operator`);
+      saveRescue(instance.id, {
+        parked: true, dumpOk: false, dumpError: dump.error,
+        lastError: `The safety dump of this machine's database failed (${dump.error}), so nothing was overwritten. Continue retries the dump; Overwrite without a dump replaces the database with no copy kept`,
+      });
+      return;
+    }
+    saveRescue(instance.id, { dumpOk: true, dumpFile: dump.file, dumpError: undefined });
+  }
+  if (vol.state === 'database') {
+    const mismatch = await overwriteIdentityRefusal(instance);
+    if (mismatch) {
+      saveRescue(instance.id, { parked: true, lastError: `${mismatch}; nothing was overwritten. Cancel the rescue, and start it again to confirm what the two databases report now` });
+      return;
+    }
   }
   const live = await containerManager.runningNonSidecarContainers(instance.id);
   if (live === null) throw new Error('docker could not say whether the instance is running, so its database was not stopped');
   if (live.length > 0) throw new Error(`the instance is running (${live.join(', ')}); stop it, and the rescue retries`);
   // A cancel during the dump released nothing; no await between this check and the hold, so a later cancel undoes it.
-  if (!containerManager.getBot(instance.id)?.recoveryRescue) throw new Error('rescue cancelled');
+  throwIfCancelled(instance.id);
   // Out of the compose first, then the container: nothing the app file lists can bring it back during the copy.
   const held = containerManager.holdFleetDbForLane(instance.id);
   if (!held.success) throw new Error(held.error);
   await removeSidecarHard(fleetDb.containerName);
-  const mark = await volExec(fleetDb.volume, `touch ${PGDATA}/rescue.inprogress`);
-  if (!mark.ok) throw new Error(`could not mark the volume: ${mark.stderr.trim()}`);
-  saveRescue(instance.id, { phase: 'bulk', dumpDone: true, lastError: undefined });
+  saveRescue(instance.id, { phase: 'bulk', lastError: undefined });
+}
+
+/** Why the overwrite must not go ahead: the sender or this machine reports an identity that was not confirmed at the start. */
+async function overwriteIdentityRefusal(instance: InstanceConfig): Promise<string | null> {
+  const confirmed = containerManager.getBot(instance.id)?.recoveryRescue?.identity;
+  if (!confirmed) return 'The rescue record holds no confirmed identity of the sender';
+  const prepared = await control(instance, 'prepare');
+  if (!prepared.ok) throw new Error(controlFailure(prepared));
+  const source = prepared.body.identity as Partial<RescueIdentity> | undefined;
+  if (!prepared.body.identityError && source?.systemId && (source.systemId !== confirmed.source.systemId || source.storeId !== confirmed.source.storeId)) {
+    return `The sender now reports a different database (system id ${source.systemId}, store id ${source.storeId ?? 'none'}) from the one confirmed at the start (system id ${confirmed.source.systemId}, store id ${confirmed.source.storeId ?? 'none'})`;
+  }
+  const local = await localControlIdentity(instance.fleetDb!.volume);
+  const check = compareIdentities(source, prepared.body.identityError,
+    local.ok ? { identity: { ...local.identity, ...(confirmed.localStoreId !== undefined ? { storeId: confirmed.localStoreId } : {}) } } : { error: local.error });
+  if (check.refusal) return check.refusal;
+  const unconfirmed = check.acks.filter(a => !confirmed.acked.includes(a.key));
+  if (unconfirmed.length) return `${unconfirmed.map(a => a.text).join('; ')}, which was not confirmed at the start`;
+  return null;
 }
 
 /**
@@ -496,6 +663,11 @@ async function rsyncPass(instance: InstanceConfig, pass: 'bulk' | 'consistent'):
 }
 
 async function phaseBulk(instance: InstanceConfig): Promise<void> {
+  // Stamp, then mark, then copy: a marked volume always has a stamped pass, so a cancel that finds no stamp leaves a
+  // volume no pass has touched, and a later preflight that finds the marker knows a pass did start.
+  if (!instance.recoveryRescue!.passStartedAt && !saveRescue(instance.id, { passStartedAt: Date.now() })) throw new Error('rescue cancelled');
+  const mark = await volExec(instance.fleetDb!.volume, `touch ${MARKER}`);
+  if (!mark.ok) throw new Error(`could not mark the volume: ${mark.stderr.trim()}`);
   await rsyncPass(instance, 'bulk');
   saveRescue(instance.id, { phase: 'consistent', lastError: undefined });
 }
@@ -515,9 +687,11 @@ async function phaseConsistent(instance: InstanceConfig): Promise<void> {
     const stopped = await control(instance, 'backup-stop');
     if (stopped.ok) stopResult = stopped.body.result;
   }
+  throwIfCancelled(instance.id);
   if (!stopResult?.labelfile) throw new Error('pg_backup_stop returned no backup label; re-running the consistent pass');
   const label = String(stopResult.labelfile);
   await refuseForeignMounts(instance);
+  throwIfCancelled(instance.id);
   // The transfer excludes the ephemeral dirs' CONTENTS, so an OUTDATED
   // receiver's stale leftovers (foreign replication slots above all) survive
   // rsync --delete and must go explicitly.
@@ -533,6 +707,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   const channel = instance.recoveryChannel!;
   const prepared = await control(instance, 'prepare');
   if (!prepared.ok) throw new Error(controlFailure(prepared));
+  throwIfCancelled(instance.id);
   const replicator = prepared.body.replicator;
   // sslmode=disable is safe here: the wire is plaintext only between local
   // containers on each machine; the cross-host leg is the tunnel's TLS.
@@ -544,14 +719,22 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   const config = `primary_conninfo = '${conninfo}'\nprimary_slot_name = '${prepared.body.slot}'\n`;
   // Once released, the database container running is this phase's own start of a retried attempt.
   if (containerManager.fleetDbHeldForLane(instance.id)) await refuseForeignMounts(instance);
+  throwIfCancelled(instance.id);
   const write = await volExec(fleetDb.volume,
-    `touch ${PGDATA}/standby.signal && rm -f ${PGDATA}/rescue.inprogress && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
+    `touch ${PGDATA}/standby.signal && rm -f ${MARKER} && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
+  // A cancel during the write has already put the database back in the compose and must not find a standby started after it.
+  throwIfCancelled(instance.id);
   // Back in the compose only now: from here on a start from the app file starts the copy as a standby.
   const released = containerManager.releaseFleetDbFromLane(instance.id);
   if (!released.success) throw new Error(released.error);
   const started = await containerManager.startFleetDbSidecar(instance.id, { forRescue: true });
+  if (!rescueAlive(instance.id)) {
+    // Cancelled during the start: the cancel's stop may have run before the container came up.
+    await docker(['stop', fleetDb.containerName]);
+    throw new Error('rescue cancelled');
+  }
   if (!started.success) {
     // Early recovery legitimately refuses connections past the ready wait;
     // the container being up is the phase's actual requirement.
@@ -605,7 +788,14 @@ const CATCHUP_NO_SENDER_PARK_MS = 10 * 60_000;
 
 /** The source bot stops (its database keeps serving the tunnel) and hands back its end-of-WAL: everything before that LSN is the database, everything after quiesce is nothing. Idempotent, so a re-entry just re-captures the LSN. */
 async function phaseQuiesce(instance: InstanceConfig): Promise<void> {
-  const quiesced = await control(instance, 'quiesce');
+  // The sender checks this against its own before it stops anything.
+  const systemId = await readSystemId(instance.fleetDb!);
+  if (!systemId) throw new Error('could not read the system id of this machine\'s copy, so the sender was not asked to stop');
+  const quiesced = await control(instance, `quiesce?systemId=${systemId}`);
+  if (!quiesced.ok && quiesced.body?.identityMismatch === true) {
+    saveRescue(instance.id, { parked: true, lastError: `The sender refused the swap: ${quiesced.error}. Cancel the rescue and check which machine the channel is armed against` });
+    return;
+  }
   if (!quiesced.ok) throw new Error(quiesced.error);
   const target = String(quiesced.body.sourceLsn || '');
   if (!/^[0-9A-F]+\/[0-9A-F]+$/i.test(target)) throw new Error(`quiesce returned no end-of-WAL (${target || 'empty'})`);

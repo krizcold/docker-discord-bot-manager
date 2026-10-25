@@ -60,6 +60,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) { pg.events.push('fence'); return cb(null, '0\n', ''); }
     if (sql.includes('ALTER SYSTEM RESET')) { pg.events.push('lift'); return cb(null, '', ''); }
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
+    if (sql.includes('pg_control_system()')) return cb(null, '7001|2\n', '');
     return cb(null, '', '');
   };
   const exec = (_cmd: string, opts: any, cb?: any) => {
@@ -76,7 +77,7 @@ vi.mock('child_process', async (importOriginal) => {
     const isDump = args.includes('pg_dump');
     if (isDump) pg.events.push('dump');
     setTimeout(() => {
-      child.stdout.end(isDump ? 'dump' : args.includes('SELECT pg_is_in_recovery()') ? 'f\n' : '');
+      child.stdout.end(isDump ? 'dump' : args.includes('SELECT pg_is_in_recovery()') ? 'f\n' : args.includes('IDENTIFY_SYSTEM') ? '7001|3|0/3000000|\n' : '');
       child.stderr.end('');
       setTimeout(() => child.emit('close', 0), 5);
     }, 5);

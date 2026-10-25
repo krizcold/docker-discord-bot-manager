@@ -430,7 +430,7 @@ describe('R13-J15: a manager self-update waits for a running lane', () => {
     vi.doMock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
     vi.doMock('../../src/casaos/detector', () => ({ getDeploymentMode: async () => 'docker' }));
     vi.doMock('../../src/manager/selfUpdate', () => ({
-      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null,
+      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null, updateRunning: () => false,
       updateLaneBlocker: () => 'a database dump, restore or replication change is running on a',
       runManagerUpdate: async () => { ran = true; return { state: 'noop', message: '' }; },
     }));

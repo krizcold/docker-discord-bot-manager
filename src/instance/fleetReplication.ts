@@ -89,11 +89,11 @@ async function plainClientsOutsidePool(containerName: string, user: string, db: 
  */
 function ownContainersOutsidePool(projectName: string, sidecarName: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
   return new Promise(resolve => {
-    execFile('docker', ['ps', '-q', '--filter', `label=com.docker.compose.project=${projectName}`], (psErr, psOut, psStderr) => {
+    execFile('docker', ['ps', '-q', '--filter', `label=com.docker.compose.project=${projectName}`], { timeout: EXEC_TIMEOUT_MS }, (psErr, psOut, psStderr) => {
       if (psErr) return resolve({ ok: false, error: probeErrorTail(String(psStderr || psErr)) });
       const ids = String(psOut).split('\n').map(line => line.trim()).filter(Boolean);
       if (ids.length === 0) return resolve({ ok: true, addrs: [] });
-      execFile('docker', ['inspect', '-f', '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}', ...ids], (err, stdout, stderr) => {
+      execFile('docker', ['inspect', '-f', '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}', ...ids], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) return resolve({ ok: false, error: probeErrorTail(String(stderr || err)) });
         const addrs = String(stdout).split('\n').flatMap(line => {
           const [name, ...rest] = line.trim().split(/\s+/);
@@ -133,7 +133,7 @@ function psqlScript(containerName: string, user: string, db: string, sql: string
 type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
 function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout, stderr) => {
+    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ running: String(stdout).trim() === 'true' });
       const text = String(stderr || err || '');
       resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });

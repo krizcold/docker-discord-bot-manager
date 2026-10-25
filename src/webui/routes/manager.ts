@@ -8,7 +8,7 @@ import { randomUUID } from 'crypto';
 import { Router, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
 import { broadcastToClients } from '../server';
-import { getManagerVersion, runManagerUpdate, isUpdateInProgress, updateBlocker, updateLaneBlocker } from '../../manager/selfUpdate';
+import { getManagerVersion, runManagerUpdate, isUpdateInProgress, updateBlocker, updateLaneBlocker, updateRunning } from '../../manager/selfUpdate';
 import { getDeploymentMode } from '../../casaos/detector';
 
 export function createManagerRoutes(wss: WebSocketServer): Router {
@@ -35,7 +35,7 @@ export function createManagerRoutes(wss: WebSocketServer): Router {
       res.status(400).json({ success: false, error: 'Updates are managed by the platform (Yundera/CasaOS).' });
       return;
     }
-    if (isUpdateInProgress()) {
+    if (await isUpdateInProgress()) {
       res.status(409).json({ success: false, inProgress: true, error: 'An update is already in progress.' });
       return;
     }
@@ -44,9 +44,14 @@ export function createManagerRoutes(wss: WebSocketServer): Router {
       res.status(409).json({ success: false, error: `The manager was not updated: ${lane}, and the update would cut it short. Update again once it ends.` });
       return;
     }
-    const blocker = updateBlocker();
+    const blocker = await updateBlocker();
     if (blocker) {
       res.status(400).json({ success: false, error: blocker });
+      return;
+    }
+    // The checks above awaited docker; a second request may have started an update meanwhile.
+    if (updateRunning()) {
+      res.status(409).json({ success: false, inProgress: true, error: 'An update is already in progress.' });
       return;
     }
     const opId = randomUUID();

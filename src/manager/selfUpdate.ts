@@ -13,7 +13,7 @@
  * recreate untouched, so users and MFA seeds are preserved. Sessions are not: they
  * live in Authelia's memory, so a restart or recreate of Authelia logs admins out.
  */
-import { spawn, execFile, execSync, spawnSync } from 'child_process';
+import { spawn, execFile, execSync } from 'child_process';
 import { randomUUID, createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -76,16 +76,22 @@ export function updateLaneBlocker(): string | null {
 }
 
 let updateInProgress = false;
-export function isUpdateInProgress(): boolean {
-  return updateInProgress || helperRunning();
+export async function isUpdateInProgress(): Promise<boolean> {
+  return updateInProgress || await helperRunning();
+}
+
+/** Whether this process runs an update now; synchronous, so a route can check it with no await before it starts one. */
+export function updateRunning(): boolean {
+  return updateInProgress;
 }
 
 const HELPER = 'dbm-self-update';
+const DOCKER_READ_MS = 10000;
 
 /** status 'missing' only when docker confirms the helper does not exist; '' when inspect failed otherwise. */
-function helperState(): { status: string; exitCode: number } {
+async function helperState(): Promise<{ status: string; exitCode: number }> {
   try {
-    const [status, code] = dockerOut(['container', 'inspect', HELPER, '--format', '{{.State.Status}} {{.State.ExitCode}}']).split(' ');
+    const [status, code] = (await dockerOut(['container', 'inspect', HELPER, '--format', '{{.State.Status}} {{.State.ExitCode}}'])).split(' ');
     return { status, exitCode: Number(code) };
   } catch (err) {
     return { status: /no such (container|object)/i.test(String(err)) ? 'missing' : '', exitCode: NaN };
@@ -96,12 +102,12 @@ function isLive(status: string): boolean {
   return status === 'running' || status === 'created' || status === 'restarting';
 }
 
-function helperRunning(): boolean {
-  return isLive(helperState().status);
+async function helperRunning(): Promise<boolean> {
+  return isLive((await helperState()).status);
 }
 
-function helperLogs(): string {
-  try { return execSync(`docker logs ${HELPER}`, { encoding: 'utf-8', timeout: 10000 }).trim(); } catch { return ''; }
+async function helperLogs(): Promise<string> {
+  try { return await dockerOut(['logs', HELPER]); } catch { return ''; }
 }
 
 function upHint(composeFile: string): string {
@@ -141,33 +147,37 @@ function writeUpdate(u: Omit<StoredUpdate, 'bootId'>): void {
   }
 }
 
+function currentOpId(): string | null {
+  try { return JSON.parse(fs.readFileSync(updateFile(), 'utf-8'))?.opId ?? null; } catch { return null; }
+}
+
 /** The last update; one recorded by an earlier process is judged by this build's stamp. */
-export function readLastUpdate(): LastUpdate | null {
+export async function readLastUpdate(): Promise<LastUpdate | null> {
   let u: StoredUpdate;
   try { u = JSON.parse(fs.readFileSync(updateFile(), 'utf-8')); } catch { return null; }
   if (!u || typeof u.opId !== 'string' || typeof u.state !== 'string') return null;
   const { bootId, composeFile = 'docker-compose.remote.yml', imageId, ...last } = u;
   const judged = (state: UpdateState, message: string): LastUpdate => {
     const out = { ...last, state, message };
-    writeUpdate({ ...out, composeFile, imageId });
+    if (!updateInProgress && currentOpId() === last.opId) writeUpdate({ ...out, composeFile, imageId });
     return out;
   };
-  const fromExitedHelper = (exitCode: number): LastUpdate | null => {
-    if (exitCode === 3) return judged('failed', autheliaRestartFailed(composeFile, helperLogs()));
-    if (exitCode !== 0) return judged('failed', recreateFailed(composeFile, helperLogs()));
+  const fromExitedHelper = async (exitCode: number): Promise<LastUpdate | null> => {
+    if (exitCode === 3) return judged('failed', autheliaRestartFailed(composeFile, await helperLogs()));
+    if (exitCode !== 0) return judged('failed', recreateFailed(composeFile, await helperLogs()));
     return null;
   };
   if (bootId === BOOT_ID) {
     if (last.state !== 'pending' || updateInProgress) return last;
-    const helper = helperState();
+    const helper = await helperState();
     if (isLive(helper.status)) return last;
     if (helper.status === 'exited' || helper.status === 'dead') {
-      const failed = fromExitedHelper(helper.status === 'dead' ? 1 : helper.exitCode);
+      const failed = await fromExitedHelper(helper.status === 'dead' ? 1 : helper.exitCode);
       if (failed) return failed;
       let running = '';
-      try { running = dockerOut(['inspect', selfContainerId(), '--format', '{{.Image}}']); } catch { /* compared below */ }
+      try { running = await dockerOut(['inspect', selfContainerId(), '--format', '{{.Image}}']); } catch { /* compared below */ }
       if (imageId && running === imageId) return judged('applied', 'Update applied without a manager restart.');
-      return judged('failed', recreateFailed(composeFile, helperLogs()));
+      return judged('failed', recreateFailed(composeFile, await helperLogs()));
     }
     if (helper.status !== 'missing') return last;
     return judged('unknown', `The recreate helper is gone, so whether the update applied cannot be confirmed; check the stack, or run on the host:  ${upHint(composeFile)}`);
@@ -176,10 +186,10 @@ export function readLastUpdate(): LastUpdate | null {
     return { ...last, state: 'interrupted', message: 'The manager restarted before the update reached the recreate step, so the update did not finish.' };
   }
   if (last.state === 'restarting' || last.state === 'pending') {
-    const helper = helperState();
+    const helper = await helperState();
     if (isLive(helper.status)) return { ...last, state: 'pending', message: 'The recreate is still running; this page reconnects when it finishes.' };
     if (helper.status === 'exited' || helper.status === 'dead') {
-      const failed = fromExitedHelper(helper.status === 'dead' ? 1 : helper.exitCode);
+      const failed = await fromExitedHelper(helper.status === 'dead' ? 1 : helper.exitCode);
       if (failed) return failed;
     }
     const built = buildStamp();
@@ -212,10 +222,24 @@ function gitOut(args: string[]): string {
   return execSync(`git -c safe.directory='*' -C "${REPO}" ${args.join(' ')}`, { encoding: 'utf-8', timeout: 30000 }).trim();
 }
 
-function dockerOut(args: string[]): string {
-  const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 10000 });
-  if (r.status !== 0) throw new Error((r.stderr || '').trim() || `docker ${args[0]} failed`);
-  return (r.stdout || '').trim();
+/** One docker CLI call off the event loop. A read passes a timeout; a call that changes the stack passes none. */
+function dockerCall(args: string[], opts: { timeout?: number; cwd?: string } = {}): Promise<{ status: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile('docker', args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+      const timedOut = !!err && (err as { killed?: boolean }).killed === true;
+      resolve({
+        status: err ? 1 : 0,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || '') || (timedOut ? `docker ${args[0]} did not answer within ${(opts.timeout || 0) / 1000} s` : err ? err.message : ''),
+      });
+    });
+  });
+}
+
+async function dockerOut(args: string[]): Promise<string> {
+  const r = await dockerCall(args, { timeout: DOCKER_READ_MS });
+  if (r.status !== 0) throw new Error(r.stderr.trim() || `docker ${args[0]} failed`);
+  return r.stdout.trim();
 }
 
 function isGitRepo(): boolean {
@@ -227,9 +251,9 @@ function selfContainerId(): string {
 }
 
 /** Read this container's compose deployment from its own labels (no host config needed). */
-function inspectSelf(): SelfInfo | null {
+async function inspectSelf(): Promise<SelfInfo | null> {
   try {
-    const raw = execSync(`docker inspect ${selfContainerId()}`, { encoding: 'utf-8', timeout: 10000 });
+    const raw = await dockerOut(['inspect', selfContainerId()]);
     const c = JSON.parse(raw)[0];
     const labels = (c?.Config?.Labels || {}) as Record<string, string>;
     const project = labels['com.docker.compose.project'];
@@ -270,9 +294,9 @@ export function recreateScript(project: string, composeFile: string, restartAuth
   return restartAuthelia ? `${up} && { ${compose} restart authelia || exit 3; }` : up;
 }
 
-function composeHasService(self: SelfInfo, service: string): boolean {
-  const r = spawnSync('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'config', '--services'], { cwd: REPO, encoding: 'utf-8', timeout: 10000 });
-  return r.status === 0 && (r.stdout || '').split('\n').map((l) => l.trim()).includes(service);
+async function composeHasService(self: SelfInfo, service: string): Promise<boolean> {
+  const r = await dockerCall(['compose', '-p', self.project, '-f', self.composeFile, 'config', '--services'], { cwd: REPO, timeout: DOCKER_READ_MS });
+  return r.status === 0 && r.stdout.split('\n').map((l) => l.trim()).includes(service);
 }
 
 /** Stream a child process's stdout+stderr to emit(), line by line. */
@@ -294,23 +318,24 @@ let versionInFlight: Promise<ManagerVersion> | null = null;
 
 export async function getManagerVersion(): Promise<ManagerVersion> {
   // Never run git while an update is pulling/mutating the repo.
-  const live = () => ({ updateInProgress: isUpdateInProgress(), lastUpdate: readLastUpdate() });
-  if (updateInProgress) return { ...(versionCache || { supported: true, bootId: BOOT_ID }), ...live() };
-  if (versionCache && Date.now() - versionCacheAt < VERSION_TTL_MS) return { ...versionCache, ...live() };
+  const live = async () => ({ updateInProgress: await isUpdateInProgress(), lastUpdate: await readLastUpdate() });
+  if (updateInProgress) return { ...(versionCache || { supported: true, bootId: BOOT_ID }), ...(await live()) };
+  if (versionCache && Date.now() - versionCacheAt < VERSION_TTL_MS) return { ...versionCache, ...(await live()) };
   if (!versionInFlight) {
     versionInFlight = readManagerVersion()
       .then((v) => { versionCache = v; versionCacheAt = Date.now(); return v; })
       .finally(() => { versionInFlight = null; });
   }
-  return { ...(await versionInFlight), ...live() };
+  const version = await versionInFlight;
+  return { ...version, ...(await live()) };
 }
 
 /** Why this manager cannot update itself, or null when it can. */
-export function updateBlocker(): string | null {
+export async function updateBlocker(): Promise<string | null> {
   if (!isGitRepo()) return 'Self-update needs the repo mounted at /repo (rebuild from docker-compose).';
-  const self = inspectSelf();
+  const self = await inspectSelf();
   if (!self) return 'Could not read this container\'s compose labels (is it compose-managed?).';
-  const r = spawnSync('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'config', '--format', 'json'], { cwd: REPO, encoding: 'utf-8', timeout: 10000 });
+  const r = await dockerCall(['compose', '-p', self.project, '-f', self.composeFile, 'config', '--format', 'json'], { cwd: REPO, timeout: DOCKER_READ_MS });
   let build: unknown;
   try {
     if (r.status !== 0) throw new Error((r.stderr || '').trim() || 'docker compose config failed');
@@ -327,28 +352,28 @@ export function updateBlocker(): string | null {
  * declared service needs a running container with the current config hash and
  * the current id of its image. Anything that cannot be compared counts as a change.
  */
-export function stackNeedsApply(self: SelfInfo): string | null {
+export async function stackNeedsApply(self: SelfInfo): Promise<string | null> {
   // The running labels were hashed on the host, where relative binds resolve
   // against hostRepoDir; resolve them the same way here.
   const compose = ['compose', '-p', self.project, '--project-directory', self.hostRepoDir, '-f', `${REPO}/${self.composeFile}`];
   if (fs.existsSync(`${REPO}/.env`)) compose.push('--env-file', `${REPO}/.env`);
-  const hashes = spawnSync('docker', [...compose, 'config', '--hash', '*'], { cwd: REPO, encoding: 'utf-8', timeout: 10000 });
+  const hashes = await dockerCall([...compose, 'config', '--hash', '*'], { cwd: REPO, timeout: DOCKER_READ_MS });
   if (hashes.status !== 0) return 'the stack config could not be read';
   const want = new Map<string, string>();
-  for (const line of (hashes.stdout || '').split('\n')) {
+  for (const line of hashes.stdout.split('\n')) {
     const [svc, hash] = line.trim().split(/\s+/);
     if (svc && hash) want.set(svc, hash);
   }
   if (want.size === 0) return 'the stack config could not be read';
   let ids: string[];
   try {
-    ids = dockerOut([...compose, 'ps', '-a', '-q']).split('\n').map((l) => l.trim()).filter(Boolean);
+    ids = (await dockerOut([...compose, 'ps', '-a', '-q'])).split('\n').map((l) => l.trim()).filter(Boolean);
   } catch { return 'the stack containers could not be listed'; }
   const have = new Map<string, string[]>();
   for (const id of ids) {
     try {
-      const parts = dockerOut(['inspect', id, '--format',
-        '{{index .Config.Labels "com.docker.compose.service"}} {{index .Config.Labels "com.docker.compose.config-hash"}} {{.Image}} {{.Config.Image}} {{.State.Running}}']).split(' ');
+      const parts = (await dockerOut(['inspect', id, '--format',
+        '{{index .Config.Labels "com.docker.compose.service"}} {{index .Config.Labels "com.docker.compose.config-hash"}} {{.Image}} {{.Config.Image}} {{.State.Running}}'])).split(' ');
       have.set(parts[0], parts.slice(1));
     } catch { return 'a stack container could not be inspected'; }
   }
@@ -359,7 +384,7 @@ export function stackNeedsApply(self: SelfInfo): string | null {
     if (cHash !== hash) return `service ${svc} runs an older compose config`;
     if (running !== 'true') return `service ${svc} is not running`;
     let current = '';
-    try { current = dockerOut(['image', 'inspect', imageRef, '--format', '{{.Id}}']); } catch { return `the image of service ${svc} could not be read`; }
+    try { current = await dockerOut(['image', 'inspect', imageRef, '--format', '{{.Id}}']); } catch { return `the image of service ${svc} could not be read`; }
     if (current !== imageId) return `service ${svc} runs an older image`;
   }
   return null;
@@ -385,7 +410,7 @@ async function readManagerVersion(): Promise<ManagerVersion> {
     const buildStale = built !== '' && built !== head && await isAncestor(built, head);
     const currentCommit = (built || head).slice(0, 7);
     const stamp = { stamped: built !== '', buildCommit: built };
-    const blocker = updateBlocker();
+    const blocker = await updateBlocker();
     if (blocker) return { supported: false, bootId: BOOT_ID, reason: blocker, currentCommit, ...stamp };
     let behindBy = 0;
     let checked = true;
@@ -398,8 +423,8 @@ async function readManagerVersion(): Promise<ManagerVersion> {
       const e = err as { stderr?: string; message?: string };
       fetchError = String(e?.stderr || e?.message || err).trim().split('\n')[0] || 'git fetch failed';
     }
-    const self = inspectSelf();
-    const stackPending = self ? stackNeedsApply(self) !== null : true;
+    const self = await inspectSelf();
+    const stackPending = self ? await stackNeedsApply(self) !== null : true;
     const updateAvailable = behindBy > 0 || buildStale || stackPending;
     return {
       supported: true, bootId: BOOT_ID, branch, currentCommit, repoCommit: head.slice(0, 7), buildStale, updateAvailable, behindBy,
@@ -461,9 +486,9 @@ async function doManagerUpdate(
 ): Promise<UpdateOutcome> {
   if (await getDeploymentMode() !== 'docker') throw new Error('Self-update is only available in standalone docker mode.');
   if (!isGitRepo()) throw new Error('Repo not mounted at /repo; cannot self-update.');
-  const self = inspectSelf();
+  const self = await inspectSelf();
   if (!self) throw new Error('Could not read this container\'s compose labels (is it compose-managed?).');
-  if (helperRunning()) {
+  if (await helperRunning()) {
     throw new Error(`An earlier recreate (the ${HELPER} container) is still running; wait for it to finish, then check the version again.`);
   }
 
@@ -473,7 +498,7 @@ async function doManagerUpdate(
   const oldAuthHash = autheliaConfigHash(REPO);
   await streamProc('git', ['-c', 'safe.directory=*', '-C', REPO, 'pull', '--ff-only'], emit);
   const newHead = gitOut(['rev-parse', 'HEAD']);
-  const restartAuthelia = autheliaConfigHash(REPO) !== oldAuthHash && composeHasService(self, 'authelia');
+  const restartAuthelia = autheliaConfigHash(REPO) !== oldAuthHash && await composeHasService(self, 'authelia');
 
   emit('[Update] Rebuilding the stack images...', 'info');
   await streamProc('docker', ['compose', '-p', self.project, '-f', self.composeFile, 'build', '--build-arg', `BUILD_COMMIT=${newHead}`], emit, REPO);
@@ -481,17 +506,18 @@ async function doManagerUpdate(
   // When HEAD did not move and every service already runs its current image and
   // config, `compose up -d` is a no-op: the process would survive and a blind
   // watchdog would falsely report failure. Finish here instead.
-  const newImageId = dockerOut(['image', 'inspect', self.image, '--format', '{{.Id}}']);
+  const newImageId = await dockerOut(['image', 'inspect', self.image, '--format', '{{.Id}}']);
   const runningImageId = () => dockerOut(['inspect', selfContainerId(), '--format', '{{.Image}}']);
-  if (oldHead === newHead && newImageId === runningImageId() && stackNeedsApply(self) === null) {
+  if (oldHead === newHead && newImageId === await runningImageId() && await stackNeedsApply(self) === null) {
     const outcome = noopOutcome(newHead, self);
     if (outcome.state === 'failed') throw new Error(outcome.message);
     emit(outcome.message, 'success');
     return outcome;
   }
 
+  const laneRefusal = (lane: string) => new Error(`The images were rebuilt, but the stack was not recreated: ${lane}, and a recreate would cut it short. Update again once it ends.`);
   const lane = updateLaneBlocker();
-  if (lane) throw new Error(`The images were rebuilt, but the stack was not recreated: ${lane}, and a recreate would cut it short. Update again once it ends.`);
+  if (lane) throw laneRefusal(lane);
   emit('[Update] Recreating the stack - the UI will drop and reconnect in a few seconds...', 'info');
   // A container can't recreate itself in-process, so launch a detached one-shot that
   // runs `compose up -d` after we return. It uses the manager's own image (has compose).
@@ -499,21 +525,23 @@ async function doManagerUpdate(
   // (`.:/repo`, `./authelia`) to real host paths; HOST_DATA_DIR covers the standalone
   // case (no .env). The same-path trick is Linux-only - on Windows the host path is not
   // a valid Linux mount target, so `docker run` fails at launch and we fall back.
-  if (helperRunning()) throw new Error(`An earlier recreate (the ${HELPER} container) is still running; wait for it to finish, then update again.`);
-  spawnSync('docker', ['rm', HELPER], { encoding: 'utf-8' });   // free the name of the exited helper (keeps its logs until now)
+  if (await helperRunning()) throw new Error(`An earlier recreate (the ${HELPER} container) is still running; wait for it to finish, then update again.`);
+  await dockerCall(['rm', HELPER]);   // free the name of the exited helper (keeps its logs until now)
   const script = recreateScript(self.project, self.composeFile, restartAuthelia);
-  const r = spawnSync('docker', [
+  const laneNow = updateLaneBlocker();
+  if (laneNow) throw laneRefusal(laneNow);
+  const r = await dockerCall([
     'run', '-d', '--name', HELPER, ...LOG_CAP_RUN_ARGS,
     '-e', `HOST_DATA_DIR=${process.env.HOST_DATA_DIR || ''}`,
     '-v', '/var/run/docker.sock:/var/run/docker.sock',
     '-v', `${self.hostRepoDir}:${self.hostRepoDir}`,
     '-w', self.hostRepoDir, self.image, 'sh', '-c', script,
-  ], { encoding: 'utf-8' });
+  ]);
   if (r.status !== 0) {
     // Most likely a Docker Desktop host-path that didn't round-trip. The rebuild
     // already succeeded, so tell the operator how to finish it by hand.
     throw new Error(
-      `Rebuilt OK, but could not launch the auto-recreate (${(r.stderr || '').trim() || 'docker run failed'}). ` +
+      `Rebuilt OK, but could not launch the auto-recreate (${r.stderr.trim() || 'docker run failed'}). ` +
       `Finish it from the host with:  ${upHint(self.composeFile)}`,
     );
   }
@@ -538,26 +566,26 @@ async function doManagerUpdate(
     let exitCode = NaN;
     status = '';
     try {
-      const parts = dockerOut(['inspect', HELPER, '--format', '{{.State.Status}} {{.State.ExitCode}}']).split(' ');
+      const parts = (await dockerOut(['inspect', HELPER, '--format', '{{.State.Status}} {{.State.ExitCode}}'])).split(' ');
       status = parts[0];
       exitCode = Number(parts[1]);
     } catch { continue; }
     if (status !== 'exited') continue;
-    if (exitCode === 3) throw new Error(autheliaRestartFailed(self.composeFile, helperLogs()));
-    if (exitCode !== 0) throw new Error(failMsg(helperLogs()));
+    if (exitCode === 3) throw new Error(autheliaRestartFailed(self.composeFile, await helperLogs()));
+    if (exitCode !== 0) throw new Error(failMsg(await helperLogs()));
     await sleep(6000);   // grace tick: a real recreate kills this process during it
-    if (runningImageId() === newImageId) {
+    if (await runningImageId() === newImageId) {
       emit('[Update] Applied without a manager restart.', 'success');
       return { state: 'applied', message: 'Update applied without a manager restart.' };
     }
-    throw new Error(failMsg(helperLogs()));
+    throw new Error(failMsg(await helperLogs()));
   }
   if (status !== '' && status !== 'exited' && status !== 'dead') {
-    const last = helperLogs().split('\n').pop() || 'no output yet';
+    const last = (await helperLogs()).split('\n').pop() || 'no output yet';
     const message = `The recreate is still running (${last}); this page reconnects when it finishes.`;
     emit(`[Update] ${message}`, 'warning');
     onPending(newHead, message, { composeFile: self.composeFile, imageId: newImageId });
     return { state: 'pending', message };
   }
-  throw new Error(failMsg(helperLogs()));
+  throw new Error(failMsg(await helperLogs()));
 }

@@ -38,7 +38,13 @@ vi.mock('child_process', async (importOriginal) => {
     if (cmd.includes('rev-parse HEAD')) return h.head;
     return '';
   };
-  const execFile = (_cmd: string, args: string[], _opts: unknown, cb: (e: unknown, r?: unknown) => void) => {
+  const execFile = (cmd: string, args: string[], _opts: unknown, cb: (e: unknown, r?: unknown, r2?: unknown) => void) => {
+    if (cmd === 'docker') {
+      const viaExec = (args[0] === 'inspect' && args.length === 2) || args[0] === 'logs';
+      const r = viaExec ? { status: 0, stdout: String(execSync(`docker ${args.join(' ')}`)), stderr: '' } : spawnSync(cmd, args);
+      queueMicrotask(() => cb(r.status === 0 ? null : Object.assign(new Error(r.stderr), { stderr: r.stderr }), r.stdout, r.stderr));
+      return;
+    }
     if (args.includes('fetch') && h.fetchFails) {
       const err: any = new Error('Command failed: git fetch');
       err.stderr = 'fatal: unable to access the remote: Could not resolve host\n';
@@ -176,7 +182,7 @@ describe('the version answer says what it could check', () => {
   it('a manager service with no build section answers supported:false', async () => {
     h.build = false;
     const mod = await load();
-    expect(mod.updateBlocker()).toContain('pulled image (dbm-manager)');
+    expect(await mod.updateBlocker()).toContain('pulled image (dbm-manager)');
     const v = await mod.getManagerVersion();
     expect(v.supported).toBe(false);
   });
@@ -223,7 +229,7 @@ describe('the recreate helper', () => {
     h.helper = 'running';
     h.newHead = B;
     const mod = await load();
-    expect(mod.isUpdateInProgress()).toBe(true);
+    expect(await mod.isUpdateInProgress()).toBe(true);
     const { err } = await update(mod);
     expect(err?.message).toContain('still running');
     expect(h.calls.some((c) => c[1] === 'rm')).toBe(false);
@@ -241,7 +247,7 @@ describe('the recreate helper', () => {
     expect(err).toBeNull();
     expect(outcome?.state).toBe('pending');
     expect(outcome?.message).toContain('The recreate is still running (Container dbm-caddy Recreate)');
-    expect(mod.readLastUpdate()?.state).toBe('pending');
+    expect((await mod.readLastUpdate())?.state).toBe('pending');
   });
 });
 
@@ -256,28 +262,30 @@ describe('the outcome of an update survives the restart', () => {
     h.newHead = B;
     const mod = await load();
     const targets: string[] = [];
+    let atRestart: Promise<unknown> | null = null;
     vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] });
-    const p = mod.runManagerUpdate(() => {}, (t) => { targets.push(t); expect(mod.readLastUpdate()).toMatchObject({ state: 'restarting', target: B }); }).catch(() => {});
+    const p = mod.runManagerUpdate(() => {}, (t) => { targets.push(t); atRestart = mod.readLastUpdate(); }).catch(() => {});
     for (let i = 0; i < 12; i++) await vi.advanceTimersByTimeAsync(10000);
     await p;
     expect(targets).toEqual([B]);
+    expect(await atRestart).toMatchObject({ state: 'restarting', target: B });
   });
 
   it('a restarted manager whose stamp equals the target reads applied', async () => {
     recorded('restarting', B);
     process.env.MANAGER_BUILD_COMMIT = B;
-    expect((await load()).readLastUpdate()?.state).toBe('applied');
+    expect((await (await load()).readLastUpdate())?.state).toBe('applied');
   });
 
   it('a restarted manager on another commit reads not-applied', async () => {
     recorded('restarting', B);
-    expect((await load()).readLastUpdate()).toMatchObject({ state: 'not-applied' });
+    expect(await (await load()).readLastUpdate()).toMatchObject({ state: 'not-applied' });
   });
 
   it('a restarted unstamped manager reads unknown, never applied', async () => {
     recorded('restarting', B);
     process.env.MANAGER_BUILD_COMMIT = '';
-    const lu = (await load()).readLastUpdate();
+    const lu = await (await load()).readLastUpdate();
     expect(lu?.state).toBe('unstamped');
     expect(lu?.message).toContain('whether the update applied is unknown');
   });
@@ -320,14 +328,14 @@ describe('a recreate still running at the deadline is judged when its helper exi
 
   it('a helper still running keeps the update pending', async () => {
     const mod = await pendingUpdate();
-    expect(mod.readLastUpdate()?.state).toBe('pending');
+    expect((await mod.readLastUpdate())?.state).toBe('pending');
   });
 
   it('a helper that exits non-zero reads failed with the whole-stack hint, and the judgement is kept', async () => {
     const mod = await pendingUpdate();
     h.helper = 'exited';
     h.helperExit = 1;
-    const lu = mod.readLastUpdate();
+    const lu = await mod.readLastUpdate();
     expect(lu?.state).toBe('failed');
     expect(lu?.message).toContain('docker compose -f docker-compose.remote.yml up -d');
     expect(stored().state).toBe('failed');
@@ -336,7 +344,7 @@ describe('a recreate still running at the deadline is judged when its helper exi
   it('a helper that exits 0 with the target image running reads applied', async () => {
     const mod = await pendingUpdate();
     h.helper = 'exited';
-    expect(mod.readLastUpdate()).toMatchObject({ state: 'applied' });
+    expect(await mod.readLastUpdate()).toMatchObject({ state: 'applied' });
     expect(stored().state).toBe('applied');
   });
 
@@ -344,23 +352,23 @@ describe('a recreate still running at the deadline is judged when its helper exi
     const mod = await pendingUpdate();
     h.helper = 'exited';
     h.runningImage = 'sha256:old';
-    expect(mod.readLastUpdate()?.state).toBe('failed');
+    expect((await mod.readLastUpdate())?.state).toBe('failed');
   });
 
   it('an inspect error other than a missing helper keeps the update pending and records nothing', async () => {
     const mod = await pendingUpdate();
     h.helperErr = 'error during connect: context deadline exceeded';
-    expect(mod.readLastUpdate()?.state).toBe('pending');
+    expect((await mod.readLastUpdate())?.state).toBe('pending');
     expect(stored().state).toBe('pending');
     h.helperErr = '';
     h.helper = 'exited';
-    expect(mod.readLastUpdate()?.state).toBe('applied');
+    expect((await mod.readLastUpdate())?.state).toBe('applied');
   });
 
   it('a helper confirmed missing reads unknown', async () => {
     const mod = await pendingUpdate();
     h.helperErr = 'Error response from daemon: No such container: dbm-self-update';
-    expect(mod.readLastUpdate()?.state).toBe('unknown');
+    expect((await mod.readLastUpdate())?.state).toBe('unknown');
     expect(stored().state).toBe('unknown');
   });
 });
@@ -377,7 +385,7 @@ describe('a restarted manager also reads the helper', () => {
     process.env.MANAGER_BUILD_COMMIT = B;
     h.helper = 'exited';
     h.helperExit = 3;
-    const lu = (await load()).readLastUpdate();
+    const lu = await (await load()).readLastUpdate();
     expect(lu?.state).toBe('failed');
     expect(lu?.message).toContain('docker compose -f docker-compose.remote.yml restart authelia');
   });
@@ -387,7 +395,7 @@ describe('a restarted manager also reads the helper', () => {
     process.env.MANAGER_BUILD_COMMIT = B;
     h.helper = 'exited';
     h.helperExit = 1;
-    const lu = (await load()).readLastUpdate();
+    const lu = await (await load()).readLastUpdate();
     expect(lu?.state).toBe('failed');
     expect(lu?.message).toContain('Container dbm-caddy Recreate');
     expect(lu?.message).toContain('up -d');
@@ -397,14 +405,14 @@ describe('a restarted manager also reads the helper', () => {
     recorded('restarting', B);
     process.env.MANAGER_BUILD_COMMIT = B;
     h.helper = 'running';
-    expect((await load()).readLastUpdate()?.state).toBe('pending');
+    expect((await (await load()).readLastUpdate())?.state).toBe('pending');
   });
 
   it('a helper that exited 0 leaves the judgement to the build stamp', async () => {
     recorded('restarting', B);
     process.env.MANAGER_BUILD_COMMIT = B;
     h.helper = 'exited';
-    expect((await load()).readLastUpdate()?.state).toBe('applied');
+    expect((await (await load()).readLastUpdate())?.state).toBe('applied');
   });
 });
 
@@ -414,7 +422,7 @@ describe('the update route', () => {
     const events: [string, any][] = [];
     vi.doMock('../../src/webui/server', () => ({ broadcastToClients: (_w: unknown, type: string, data: unknown) => events.push([type, data]) }));
     vi.doMock('../../src/manager/selfUpdate', () => ({
-      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null, updateLaneBlocker: () => null,
+      getManagerVersion: async () => ({}), isUpdateInProgress: () => false, updateBlocker: () => null, updateLaneBlocker: () => null, updateRunning: () => false,
       runManagerUpdate: async () => ({ state: 'noop', message: 'nothing' }), ...stub,
     }));
     const { createManagerRoutes } = await import('../../src/webui/routes/manager');

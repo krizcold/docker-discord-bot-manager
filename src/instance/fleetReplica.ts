@@ -48,6 +48,8 @@ const PULL_TIMEOUT_MS = 10 * 60 * 1000;
 const PROBE_TIMEOUT_MS = 60_000;
 // Generous: volExec calls run under `docker run`, and slow disks are real.
 const EXEC_TIMEOUT_MS = 120_000;
+/** A docker read (inspect, ps): a hung CLI must not hold its caller; a timed-out read is unknown. */
+const READ_TIMEOUT_MS = 30_000;
 
 /** Attempts the automatic re-seed makes before it stops and asks (20.14). */
 export const AUTO_RESEED_MAX_ATTEMPTS = 3;
@@ -436,7 +438,7 @@ export function autoReseedAllowed(rec: FleetDbReplicaRecord, now: number = Date.
 // inferring absence from an arbitrary error skips a dump gate over real data.
 export function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown'> {
   return new Promise(resolve => {
-    execFile('docker', ['volume', 'inspect', name], (err, _stdout, stderr) => {
+    execFile('docker', ['volume', 'inspect', name], { timeout: READ_TIMEOUT_MS }, (err, _stdout, stderr) => {
       if (!err) return resolve('exists');
       resolve(String(stderr || '').toLowerCase().includes('no such volume') ? 'absent' : 'unknown');
     });
@@ -453,7 +455,7 @@ function remintedVolumeRefusal(fleetDb: NonNullable<InstanceConfig['fleetDb']>):
   if (!fleetDb.retiringAt) return Promise.resolve(null);
   const began = Date.parse(fleetDb.retiringAt);
   return new Promise(resolve => {
-    execFile('docker', ['volume', 'inspect', '--format', '{{.CreatedAt}}', fleetDb.volume], (err, stdout) => {
+    execFile('docker', ['volume', 'inspect', '--format', '{{.CreatedAt}}', fleetDb.volume], { timeout: READ_TIMEOUT_MS }, (err, stdout) => {
       const created = err ? NaN : Date.parse(String(stdout).trim());
       if (Number.isNaN(created) || Number.isNaN(began)) {
         return resolve(`a removal of this database began at ${fleetDb.retiringAt}, and docker did not say when the volume ${fleetDb.volume} was created, so it cannot be told apart from one made after the removal; try again`);

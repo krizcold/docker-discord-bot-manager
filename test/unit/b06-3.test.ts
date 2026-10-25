@@ -26,7 +26,8 @@ vi.mock('fs', async (importOriginal) => {
 
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
-  const execFile = vi.fn((_cmd: string, _args: string[], cb: (err: Error | null, stdout: string) => void) => cb(null, 'true\n'));
+  const execFile = vi.fn((_cmd: string, _args: string[], optsOrCb: unknown, maybeCb?: unknown) =>
+    ((typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (err: Error | null, stdout: string) => void)(null, 'true\n'));
   const spawn = vi.fn(() => {
     const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; kill: () => void };
     child.stdout = new PassThrough();

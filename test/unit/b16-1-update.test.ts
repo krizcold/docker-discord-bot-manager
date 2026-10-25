@@ -56,7 +56,16 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'run') { h.script = args[args.length - 1]; return ok('id'); }
     return ok('');
   };
-  return { ...real, execSync, spawn, spawnSync };
+  const execFile = (cmd: string, args: string[], opts: any, cb: (e: unknown, r?: unknown, r2?: unknown) => void) => {
+    if (cmd === 'docker') {
+      const viaExec = (args[0] === 'inspect' && args.length === 2) || args[0] === 'logs';
+      const r = viaExec ? { status: 0, stdout: String(execSync(`docker ${args.join(' ')}`)), stderr: '' } : spawnSync(cmd, args);
+      queueMicrotask(() => cb(r.status === 0 ? null : Object.assign(new Error(r.stderr), { stderr: r.stderr }), r.stdout, r.stderr));
+      return;
+    }
+    return (real.execFile as any)(cmd, args, opts, cb);
+  };
+  return { ...real, execSync, execFile, spawn, spawnSync };
 });
 
 import * as fleetBackup from '../../src/instance/fleetBackup';

@@ -37,11 +37,14 @@ const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
 const FACTS_TIMEOUT_MS = 10_000;
 const REFIRE_GUARD_MS = 23 * 60 * 60 * 1000; // prevents double-fire within the hour window
 const DUMP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+/** A docker read (inspect, a SELECT or SHOW): a hung CLI must not hold its lane; a timed-out read is unknown. */
+const READ_TIMEOUT_MS = 30_000;
 const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
+let tickRunning = false;
 
 // Last dump attempt per instance (in-memory; persisted success lives on the record)
 const lastAttempts: Map<string, number> = new Map();
@@ -92,6 +95,8 @@ function recordFailbackFence(botId: string, containerName: string, left: boolean
 }
 // Instances with a dump or restore in flight
 const busy: Set<string> = new Set();
+/** The slots another module took through claimFleetBackupBusy; this module's own dumps and restores are not in it. */
+const externalClaims = new Set<string>();
 
 export function getFleetBackupError(botId: string): string | null {
   return lastErrors.get(botId) || null;
@@ -142,21 +147,36 @@ export function getFleetFenceStuck(botId: string): string | null {
 export function claimFleetBackupBusy(botId: string): boolean {
   if (busy.has(botId) || containerManager.isShuttingDown()) return false;
   busy.add(botId);
+  externalClaims.add(botId);
   return true;
 }
 
 export function releaseFleetBackupBusy(botId: string): void {
   busy.delete(botId);
+  externalClaims.delete(botId);
 }
 
 export function isFleetBackupBusy(botId: string): boolean {
   return busy.has(botId);
 }
 
-/** A held backup slot or op lock, named; null when neither is held. A shutdown waits on these, bounded. */
-export function inFlightLaneBlocker(): string | null {
+/**
+ * A slot a recovery source's quiesce left held: the source is swapped away and nothing runs on it under its op
+ * lock. The slot only waits for the receiver's teardown, so a shutdown waiting on it would wait out its whole bound.
+ */
+function quiescedSourceSlot(botId: string): boolean {
+  const instance = containerManager.getBot(botId);
+  return !!instance?.recoverySwappedAway && instance.recoveryChannel?.mode === 'source' && externalClaims.has(botId)
+    && !containerManager.activeBotOps().some(([id]) => id === botId);
+}
+
+/**
+ * A held backup slot or op lock, named; null when neither is held. A shutdown waits on these, bounded, and passes
+ * over a quiesced source's slot (passQuiesced); a self-update does not, since the recreate would drop that slot.
+ */
+export function inFlightLaneBlocker(opts: { passQuiesced?: boolean } = {}): string | null {
   const name = (id: string) => containerManager.getBot(id)?.displayName || id;
-  const slot = Array.from(busy)[0];
+  const slot = Array.from(busy).find(id => !opts.passQuiesced || !quiescedSourceSlot(id));
   if (slot) return `a database dump, restore or replication change is running on ${name(slot)}`;
   const op = containerManager.activeBotOps()[0];
   if (op) return `operation '${op[1]}' is running on ${name(op[0])}`;
@@ -166,11 +186,14 @@ export function inFlightLaneBlocker(): string | null {
 /** Waits, bounded, until inFlightLaneBlocker answers null; the lane still running at the bound, or null. */
 export async function waitForInFlightLanes(boundMs: number, pollMs = 1_000): Promise<string | null> {
   const deadline = Date.now() + boundMs;
-  let lane = inFlightLaneBlocker();
+  for (const id of busy) {
+    if (quiescedSourceSlot(id)) console.log(`[Shutdown] Not waiting on ${containerManager.getBot(id)?.displayName || id}: the backup slot is held for the swap's quiesce, which nothing runs under now; the receiver's teardown or a disarm releases it`);
+  }
+  let lane = inFlightLaneBlocker({ passQuiesced: true });
   if (lane) console.log(`[Shutdown] Waiting up to ${Math.round(boundMs / 1000)} s: ${lane}`);
   while (lane && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pollMs));
-    lane = inFlightLaneBlocker();
+    lane = inFlightLaneBlocker({ passQuiesced: true });
   }
   return lane;
 }
@@ -340,7 +363,7 @@ export function clearTermFloor(botId: string): void {
 type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
 function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], (err, stdout, stderr) => {
+    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ running: String(stdout).trim() === 'true' });
       const text = String(stderr || err || '');
       resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });
@@ -357,12 +380,17 @@ function dbDownText(state: ContainerState, stopped: string): string {
   return state.running === null ? `Could not probe the database container (${state.error})` : stopped;
 }
 
-function execDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+function execDocker(args: string[], timeout?: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    execFile('docker', args, { maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr) });
+    execFile('docker', args, { maxBuffer: 4 * 1024 * 1024, ...(timeout ? { timeout } : {}) }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr || (err?.killed ? `docker did not answer within ${(timeout ?? 0) / 1000} s` : '')) });
     });
   });
+}
+
+/** A docker call that only reads; one that changes data runs through execDocker with no bound, since killing it mid-write is worse than the wait. */
+function readDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return execDocker(args, READ_TIMEOUT_MS);
 }
 
 // stopBot/startBot THROW on an op-lock conflict; inside the restore lane a
@@ -506,7 +534,7 @@ export function foreignFenceSet(botId: string, containerName: string): void {
 
 /** Whether the database holds the write fence now; null when it cannot be asked. */
 export async function writeFenced(target: ConsentFenceTarget): Promise<boolean | null> {
-  const probe = await execDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
+  const probe = await readDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
   return probe.ok ? probe.stdout.trim() === 'on' : null;
 }
 
@@ -525,9 +553,9 @@ async function seedStuckFences(): Promise<void> {
     // reading 'on' is a drop-back's that was never lifted.
     const copy = instance.fleetDbReplica;
     if (parked !== 'drop-back' && copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
-      const onCopy = await execDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
+      const onCopy = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
       if (onCopy.ok && onCopy.stdout.trim() === 'on') {
-        const recovery = await execDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
+        const recovery = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
         const inRecovery = recovery.ok ? recovery.stdout.trim() : '';
         const remedy = inRecovery === 't' ? 're-seeding this copy on its Database modal clears it'
           : inRecovery === 'f' ? 'this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf()) or let a drop-back run re-seed it'
@@ -539,14 +567,14 @@ async function seedStuckFences(): Promise<void> {
     const db = instance.fleetDb;
     if (parked === 'failback' || !db || isStuck(instance.id, db.containerName)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
-    const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
+    const probe = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
     if (probe.ok && probe.stdout.trim() === 'on') setStuck(instance.id, db, `The database is READ-ONLY (a write fence was not lifted); ${await seededFenceRemedy(instance, db)}`);
   }
 }
 
 /** Whether the fence setting is saved in postgresql.auto.conf, so a restart re-applies it; null when that cannot be read. */
 async function fencePersisted(db: RestoreFleetDb): Promise<boolean | null> {
-  const read = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
+  const read = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
   const text = read.ok ? read.stdout.trim() : '';
   return /^\d+$/.test(text) ? Number(text) > 0 : null;
 }
@@ -570,7 +598,7 @@ async function checkFailbackRecord(botId: string, containerName: string): Promis
   const db = instance ? [instance.fleetDb, instance.fleetDbReplica].find(d => d?.containerName === containerName) : undefined;
   if (!db?.user) { recordFailbackFence(botId, containerName, false); return; }
   const probe = await isContainerRunning(containerName)
-    ? await execDocker(['exec', containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only'])
+    ? await readDocker(['exec', containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only'])
     : null;
   if (probe?.ok && probe.stdout.trim() === 'off') recordFailbackFence(botId, containerName, false);
 }
@@ -601,7 +629,7 @@ async function reprobeStuckFences(): Promise<void> {
       // A database the instance no longer records is gone, and its warning with it.
       if (instance.fleetDb?.containerName !== db.containerName && instance.fleetDbReplica?.containerName !== db.containerName) { clearStuck(id, db.containerName); continue; }
       if (!await isContainerRunning(db.containerName)) continue;
-      const probe = await execDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
+      const probe = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
       if (probe.ok && probe.stdout.trim() === 'off') { clearStuck(id, db.containerName); recordFailbackFence(id, db.containerName, false); }
     }
   }
@@ -855,7 +883,7 @@ export function copyBackupInfo(instance: InstanceConfig): {
 
 /** true when the copy takes writes (out of recovery), false while it follows a primary; an error when it cannot be read. */
 async function copyTakesWrites(rec: { containerName: string; user: string; db: string }): Promise<{ writes: boolean } | { error: string }> {
-  const probe = await execDocker(['exec', rec.containerName, 'psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery()']);
+  const probe = await readDocker(['exec', rec.containerName, 'psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery()']);
   const answer = probe.stdout.trim();
   if (probe.ok && (answer === 't' || answer === 'f')) return { writes: answer === 'f' };
   return { error: probe.ok ? 'unexpected answer from the copy' : probeErrorTail(probe.stderr) || 'no answer from the copy' };
@@ -1030,7 +1058,7 @@ function restoreRetryRemedy(instance: InstanceConfig): string {
  * circulation carries a term at or below it. Null when neither table exists; an error when the probe failed.
  */
 export async function probeLiveTerm(fleetDb: RestoreFleetDb): Promise<{ ok: true; term: number | null } | { ok: false; error: string }> {
-  const psql = (sql: string) => execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const psql = (sql: string) => readDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
   const tables = await psql("SELECT to_regclass('smdb_control.term') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL");
   if (!tables.ok) return { ok: false, error: lastLine(tables.stderr) };
   const [control, guilds] = tables.stdout.trim().split('|');
@@ -1290,7 +1318,7 @@ export async function restoreFleetBackup(
     // drop below removes. A MISSING database (a prior recreate failure) has
     // no data to protect and dumping it would refuse every retry, so
     // existence is probed first; an unanswerable probe still refuses.
-    const exists = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+    const exists = await readDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
       '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
     if (!exists.ok) {
       return await refuse('Could not check the database before the restore, so the restore was refused', lastLine(exists.stderr));
@@ -1517,9 +1545,11 @@ export function startFleetBackupScheduler(): void {
   });
 
   intervalHandle = setInterval(() => {
+    if (tickRunning) return;
+    tickRunning = true;
     runFleetBackupTick().catch(err => {
       console.error('[FleetBackup] Tick error:', err);
-    });
+    }).finally(() => { tickRunning = false; });
   }, TICK_INTERVAL_MS);
 }
 

@@ -362,8 +362,8 @@ describe('FU-O row 10: the sender keeps the receiver\'s cancel with its swap rec
     vi.resetModules();
     const cm = await import('../../src/docker/containerManager');
     cm.updateInstanceRecoverySwappedAway('a', { at: 5 });
-    cm.updateInstanceRecoverySwapAbandoned('a', { at: 6, phase: 'catchup', fenced: true });
-    expect(onDisk().recoverySwapAbandoned).toEqual({ at: 6, phase: 'catchup', fenced: true });
+    cm.updateInstanceRecoverySwapAbandoned('a', { at: 6, phase: 'catchup', cleared: false, left: null });
+    expect(onDisk().recoverySwapAbandoned).toEqual({ at: 6, phase: 'catchup', cleared: false, left: null });
     cm.updateInstanceRecoverySwappedAway('a', null);
     expect(onDisk().recoverySwappedAway).toBeUndefined();
     expect(onDisk().recoverySwapAbandoned).toBeUndefined();

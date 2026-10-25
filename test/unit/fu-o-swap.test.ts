@@ -46,6 +46,14 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
       const b = st.bots.find(x => x.id === id);
       if (b) b.recoverySwapAbandoned = record ?? undefined;
     },
+    recordRecoverySwapCancel: (id: string, record: any) => {
+      st.saved.push({ id, record });
+      const b = st.bots.find(x => x.id === id);
+      if (b) {
+        b.recoverySwapAbandoned = record;
+        if (record.cleared) delete b.recoverySwappedAway;
+      }
+    },
     broadcastBotUpdated: () => {},
   };
 });
@@ -116,7 +124,7 @@ describe('FU-O row 9: a swap cancelled at quiesce or catchup tells the sender', 
     expect(unreachable.note).toMatch(/The sender was not told; on the sender machine, disarm the channel and clear the swap record before starting it\.$/);
     st.answer = 'refused';
     st.bots = [receiver('catchup')];
-    expect((await rescue.cancelRescue(st.bots[0])).note).toMatch(/The sender was not told/);
+    expect((await rescue.cancelRescue(st.bots[0])).note).toMatch(/The sender did not complete the cancel \(no armed source channel matches that token\); on the sender machine, disarm the channel and clear the swap record before starting it\.$/);
   });
 
   it('a sender that holds no swap record was never stopped or fenced, so the note does not ask the operator to disarm it', async () => {
@@ -158,18 +166,8 @@ describe('FU-O row 10: the sender records an abandoned swap', () => {
     const r = await call('abandon?phase=catchup', 'tok');
     expect(r.code).toBe(200);
     expect(st.saved).toHaveLength(1);
-    expect(st.saved[0]).toMatchObject({ id: 's1', record: { phase: 'catchup', fenced: true } });
+    expect(st.saved[0]).toMatchObject({ id: 's1', record: { phase: 'catchup' } });
     expect(st.bots[0].recoverySwapAbandoned.at).toBeGreaterThan(0);
-  });
-
-  it('saves whether a fence stood: off when both layers read off, unknown when the read failed', async () => {
-    st.fence = 'off|0||';
-    st.bots = [source()];
-    expect((await call('abandon?phase=quiesce', 'tok')).code).toBe(200);
-    st.fence = null;
-    st.bots = [source()];
-    expect((await call('abandon?phase=quiesce', 'tok')).code).toBe(200);
-    expect(st.saved.map(x => (x.record as { fenced: unknown }).fenced)).toEqual([false, null]);
   });
 
   it('a source with no swap record answers noSwap', async () => {
@@ -222,14 +220,11 @@ describe('FU-O row 10: the sender records an abandoned swap', () => {
     };
     const ctx = vm.createContext({ escapeHtml: (s: string) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;') });
     vm.runInContext(`${fn('swapAbandonedText')}\n${fn('swappedAwayHtml')}`, ctx);
-    const modal = (fenced: boolean | null) => vm.runInContext('swappedAwayHtml', ctx)(source({ recoverySwapAbandoned: { at: Date.UTC(2026, 9, 25, 9, 30), phase: 'catchup', fenced } })) as string;
+    const modal = vm.runInContext('swappedAwayHtml', ctx)(source({ recoverySwapAbandoned: { at: Date.UTC(2026, 9, 25, 9, 30), phase: 'catchup', cleared: false, left: null } })) as string;
     const cancelled = 'The receiving machine cancelled this swap on 2026-10-25 at the catch-up step, before it promoted its copy.';
-    expect(modal(true)).toContain(`${cancelled} This database was still fenced when the cancel arrived: Disarm the recovery channel below (it lifts the layers the swap set and names any layer another lane holds), then clear the swap record and start the instance.`);
-    expect(modal(false)).toContain(`${cancelled} This database was not fenced when the cancel arrived: clear the swap record, then start the instance.`);
-    expect(modal(false)).not.toMatch(/still fenced|Disarm/);
-    expect(modal(null)).toContain(`${cancelled} Whether this database is still fenced could not be confirmed`);
+    expect(modal).toContain(`${cancelled} The swap record stays, so Start is refused. Disarm the recovery channel below (it lifts the layers the swap set), then clear the swap record and start the instance.`);
     expect(vm.runInContext('swappedAwayHtml', ctx)(source())).not.toContain('cancelled this swap');
     const badge = pageHtml.slice(pageHtml.indexOf('const fenceBadge = '), pageHtml.indexOf('// Replication health'));
-    expect(badge).toMatch(/bot\.recoverySwappedAway && bot\.recoverySwapAbandoned[\s\S]*Swap cancelled/);
+    expect(badge).toMatch(/bot\.recoverySwapAbandoned[\s\S]*bot\.recoverySwappedAway \|\| bot\.recoverySwapAbandoned\.left[\s\S]*Swap cancelled/);
   });
 });

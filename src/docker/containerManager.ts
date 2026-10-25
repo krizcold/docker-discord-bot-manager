@@ -18,7 +18,7 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord, RecoveryRescueLeft,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord, RecoveryRescueLeft, RecoverySwapAbandoned,
   ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig, InstanceLane,
 } from '../types';
 import * as dockerClient from './dockerClient';
@@ -751,13 +751,24 @@ export function updateInstanceRecoverySwappedAway(botId: string, record: { at: n
 }
 
 /** The receiver cancelled the swap this source's record names (null clears it). Throws when the registry cannot be saved. */
-export function updateInstanceRecoverySwapAbandoned(botId: string, record: { at: number; phase: 'quiesce' | 'catchup'; fenced: boolean | null } | null): void {
+export function updateInstanceRecoverySwapAbandoned(botId: string, record: RecoverySwapAbandoned | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return;
   if (!record && !instance.recoverySwapAbandoned) return;
   if (record) instance.recoverySwapAbandoned = record;
   else delete instance.recoverySwapAbandoned;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** The cancel's outcome in one save: its notice, and the swap record cleared when record.cleared. Throws when the registry cannot be saved. */
+export function recordRecoverySwapCancel(botId: string, record: RecoverySwapAbandoned): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  instance.recoverySwapAbandoned = record;
+  if (record.cleared) delete instance.recoverySwappedAway;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
 }

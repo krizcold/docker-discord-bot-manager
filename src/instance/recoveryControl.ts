@@ -22,7 +22,7 @@ import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
-import { applyWriteFence, fenceLayers, foreignFenceSet, newFenceOwner, probeLiveTerm } from './fleetBackup';
+import { applyWriteFence, foreignFenceSet, heldText, newFenceOwner, probeLiveTerm } from './fleetBackup';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
@@ -195,6 +195,8 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
 
 // Sources whose quiesce holds the backup slot: from the first quiesce until the teardown or a disarm.
 const quiesceSlots = new Set<string>();
+// Sources whose teardown answered and whose disarm has not ended.
+const teardownPending = new Set<string>();
 
 export function releaseQuiesceSlot(botId: string): void {
   if (quiesceSlots.delete(botId)) releaseFleetBackupBusy(botId);
@@ -286,7 +288,7 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
   // landing after the LSN capture would be silently discarded at promote.
   // The shared write fence refuses every outside connection and ends every
   // session; the managed role's physical replication stays, so the stream
-  // reaches the captured LSN. Disarm lifts it. The swap takes over a layer a
+  // reaches the captured LSN. A cancel or Disarm lifts it. The swap takes over a layer a
   // failback, drop-back or earlier swap run left, so that run's Cancel cannot
   // open the source under the catch-up; a restore's, re-seed's, decommission's
   // or no lane's layer stays as it is (it fences the database all the same).
@@ -306,6 +308,38 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
   const term = await probeLiveTerm(fleetDb);
   if (!term.ok) return { code: 500, body: { success: false, error: `could not read the source's control term: ${term.error}` }, changed: true };
   return { code: 200, body: { success: true, sourceLsn, sourceTerm: term.term }, changed: true };
+}
+
+type AbandonAnswer = { code: number; body: Record<string, unknown>; cleared: boolean };
+
+/**
+ * The receiver's cancel, run under the op lock and the backup slot: lift the layers that name this swap's owner, then
+ * save the outcome. The swap record clears only when no layer of this swap's may stay; a layer another lane owns
+ * stays on and is named in left.
+ */
+async function abandon(instance: InstanceConfig, phase: 'quiesce' | 'catchup'): Promise<AbandonAnswer> {
+  const fresh = containerManager.getBot(instance.id);
+  const swap = fresh?.recoverySwappedAway;
+  const fleetDb = fresh?.fleetDb;
+  if (!swap || !fleetDb) return { code: 409, body: { success: false, noSwap: true, error: 'this source holds no swap record, so there is no swap to mark cancelled' }, cleared: false };
+  const { liftSwapFence } = await import('./recoveryChannel');
+  const lift = await liftSwapFence(fleetDb, newFenceOwner('swap', swap.at), 'the cancel');
+  const heldNote = lift.held.readOnly || lift.held.hba ? heldText(lift.held, 'the cancel') : null;
+  const cleared = lift.problem === null;
+  const left = lift.problem === null ? heldNote : heldNote ? `${lift.problem}; and ${heldNote}` : lift.problem;
+  try {
+    containerManager.recordRecoverySwapCancel(instance.id, { at: Date.now(), phase, cleared, left });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      code: 500,
+      body: { success: false, error: cleared
+        ? `the swap's write fence was lifted, but the cancel could not be recorded on the source (${reason}), so the swap record stays and Start stays refused there`
+        : `the cancel could not be recorded on the source (${reason}); the swap record stays, as ${left}` },
+      cleared: false,
+    };
+  }
+  return { code: 200, body: { success: true, cleared, left }, cleared };
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -427,6 +461,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         send(503, { success: false, error: containerManager.SHUTDOWN_REFUSAL });
         return;
       }
+      // The teardown's disarm releases the slot when it ends, so a quiesce under it would run without one.
+      if (teardownPending.has(instance.id)) {
+        send(409, { success: false, error: 'the source is tearing down the swap it handed away, so the quiesce was refused and nothing was stopped' });
+        return;
+      }
       // The quiesce holds the backup slot until the teardown, so no dump, restore or replication change runs on the
       // database being handed away, and runs under the op lock, so no Start, Update or restore races it.
       const claimedNow = !quiesceSlots.has(instance.id);
@@ -449,11 +488,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return;
     }
     if (action === 'abandon') {
-      // The receiver cancelled the swap before it promoted its copy. This side stays as the swap left it (the
-      // operator decides what comes next); the record only tells the operator, with whether a fence stands.
+      // The receiver cancelled the swap before it promoted its copy: this side lifts the swap's own fence and clears
+      // its swap record, and leaves the channel armed and the bot stopped for its operator to start.
       const phase = url.searchParams.get('phase') || '';
       if (phase !== 'quiesce' && phase !== 'catchup') {
         send(400, { success: false, error: 'the receiver named no cancelled swap phase (quiesce or catchup)' });
+        return;
+      }
+      if (teardownPending.has(instance.id)) {
+        send(409, { success: false, error: 'the source is tearing down the swap it handed away, so the cancel was refused and nothing was changed' });
         return;
       }
       // A quiesce still running may yet record the swap and set the fence, so neither absence can be trusted now.
@@ -465,16 +508,28 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         send(409, { success: false, noSwap: true, error: 'this source holds no swap record, so there is no swap to mark cancelled' });
         return;
       }
-      const layers = await fenceLayers(fleetDb);
-      const fenced = layers === null ? null : layers.readOnly || layers.hba;
-      try {
-        containerManager.updateInstanceRecoverySwapAbandoned(instance.id, { at: Date.now(), phase, fenced });
-      } catch (err) {
-        send(500, { success: false, error: `the cancelled swap could not be recorded on the source (${err instanceof Error ? err.message : String(err)})` });
+      if (containerManager.isShuttingDown()) {
+        send(503, { success: false, error: containerManager.SHUTDOWN_REFUSAL });
         return;
       }
-      containerManager.broadcastBotUpdated(instance.id);
-      send(200, { success: true });
+      // The backup slot is held from the lift's owner read to the record's save, so no lane fences the database in
+      // between; a quiesce of this swap already holds it.
+      const viaQuiesce = quiesceSlots.has(instance.id);
+      if (!viaQuiesce && !claimFleetBackupBusy(instance.id)) {
+        send(409, { success: false, error: 'another database operation holds the backup slot of this source, so the cancel was refused and nothing was changed: the swap\'s write fence and the swap record stay' });
+        return;
+      }
+      let answer: { code: number; body: Record<string, unknown>; cleared: boolean };
+      try {
+        answer = await containerManager.withExternalBotOp(instance.id, 'abandon', () => abandon(instance, phase));
+      } catch (err) {
+        answer = { code: 409, body: { success: false, error: `${err instanceof Error ? err.message : String(err)}; the cancel was refused and nothing was changed` }, cleared: false };
+      } finally {
+        if (!viaQuiesce) releaseFleetBackupBusy(instance.id);
+      }
+      if (answer.cleared) releaseQuiesceSlot(instance.id);
+      if (answer.code === 200) containerManager.broadcastBotUpdated(instance.id);
+      send(answer.code, answer.body);
       return;
     }
     if (action === 'teardown') {
@@ -487,6 +542,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // held until that disarm ends, so no lane fences the database between
       // the disarm's owner read and its reset.
       send(200, { success: true });
+      teardownPending.add(instance.id);
       setTimeout(() => {
         void (async () => {
           try {
@@ -499,6 +555,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
               : `[RecoveryControl] Source-side disarm after the swap failed (${fresh.displayName}): ${disarmed.error}`);
           } finally {
             releaseQuiesceSlot(instance.id);
+            teardownPending.delete(instance.id);
           }
         })();
       }, 2_000).unref();

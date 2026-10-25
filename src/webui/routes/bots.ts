@@ -2115,6 +2115,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /** DELETE /api/bots/:id/recovery-swap-abandoned - Dismiss a cancelled swap's notice; the swap record, if one stands, stays. */
+  router.delete('/:id/recovery-swap-abandoned', (req: Request, res: Response) => {
+    try {
+      if (!containerManager.getBot(req.params.id)) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      containerManager.updateInstanceRecoverySwapAbandoned(req.params.id, null);
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ success: false, error: `The cancelled swap notice could not be dismissed: ${String(error)}` });
+    }
+  });
+
   /**
    * GET/POST/DELETE /api/bots/:id/recovery-rescue - The receiver-side rescue
    * (RC-3). POST {confirm?, acknowledge?, withoutDump?} starts or continues

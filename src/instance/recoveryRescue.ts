@@ -72,8 +72,8 @@ function sleep(ms: number): Promise<void> {
 
 const ABANDON_TIMEOUT_MS = 15_000;
 
-/** answered: an HTTP reply came back from the source (a refusal carries its reason); false when the call failed or timed out before any reply. */
-async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST', timeoutMs = 150_000): Promise<{ ok: boolean; answered: boolean; body?: any; error?: string }> {
+/** answered: an HTTP reply came back from the source (a refusal carries its reason); false when the call failed or timed out before any reply. timedOut: the wait ran out, so the request may have reached the source. */
+async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST', timeoutMs = 150_000): Promise<{ ok: boolean; answered: boolean; timedOut?: boolean; body?: any; error?: string }> {
   const record = instance.recoveryChannel;
   if (!record || record.mode !== 'receiver') return { ok: false, answered: false, error: 'no armed receiver channel' };
   // The listener helper's control lane; both this manager and the helper sit
@@ -93,7 +93,8 @@ async function control(instance: InstanceConfig, action: string, method: 'GET' |
     }
     return { ok: true, answered: true, body };
   } catch (err) {
-    return { ok: false, answered: false, error: `control ${action} unreachable: ${err instanceof Error ? err.message : String(err)}` };
+    const timedOut = (err as { name?: string } | null)?.name === 'TimeoutError';
+    return { ok: false, answered: false, timedOut, error: `control ${action} unreachable: ${err instanceof Error ? err.message : String(err)}` };
   }
 }
 
@@ -438,6 +439,21 @@ export function startSwap(
   return { success: true };
 }
 
+/** What the sender did with the cancel, as the cancel note's last sentences. */
+function senderCancelText(told: { ok: boolean; answered: boolean; timedOut?: boolean; body?: any; error?: string }): string {
+  const cleanup = 'on the sender machine, disarm the channel and clear the swap record before starting it.';
+  if (told.timedOut) return ` The sender did not answer within ${ABANDON_TIMEOUT_MS / 1000} s, so whether it lifted its fence and cleared its swap record can't be confirmed; its Database modal shows what it did, and if its swap record still stands there, disarm the channel and clear the swap record before starting it.`;
+  if (!told.answered) return ` The sender was not told; ${cleanup}`;
+  if (!told.ok) return ` The sender did not complete the cancel (${told.error}); ${cleanup}`;
+  const left = typeof told.body?.left === 'string' && told.body.left ? told.body.left : null;
+  if (told.body?.cleared === true) {
+    return left
+      ? ` No write fence this swap set stays on the sender's database, and its swap record is cleared, but on the sender ${left}. The cancel left its instance stopped until its operator starts it.`
+      : " No write fence this swap set stays on the sender's database, and its swap record is cleared; the cancel left its instance stopped until its operator starts it.";
+  }
+  return ` The sender kept its swap record, so Start stays refused there${left ? `: ${left}` : ''}. On the sender machine, disarm the channel (it lifts the layers the swap set), then clear the swap record before starting it.`;
+}
+
 export async function cancelRescue(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string; note?: string }> {
   if (!instance.recoveryRescue) return { success: false, error: 'No rescue is running on this instance' };
   // Past promote there is no standby to fall back to: this copy IS the
@@ -500,9 +516,9 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
         : earlier === 'standby'
           ? 'Rescue cancelled before it copied anything. This machine\'s volume still holds the standby copy of the sender that an earlier cancelled rescue left, so Start is refused until a rescue finishes the swap or the database is decommissioned.'
           : 'Rescue cancelled before any copy began; this machine\'s database was not changed.';
-  const untold = told && !told.ok && !nothingToTell ? ' The sender was not told; on the sender machine, disarm the channel and clear the swap record before starting it.' : '';
-  if (warnings.length) return { success: true, note: note + untold, warning: `The rescue was cancelled, but ${warnings.join('; and ')}` };
-  return { success: true, note: note + untold };
+  const sender = !told || nothingToTell ? '' : senderCancelText(told);
+  if (warnings.length) return { success: true, note: note + sender, warning: `The rescue was cancelled, but ${warnings.join('; and ')}` };
+  return { success: true, note: note + sender };
 }
 
 /** A runner can outlive its record by one docker call after a Cancel. */

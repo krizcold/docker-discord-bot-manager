@@ -418,6 +418,31 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
   return status;
 }
 
+const FENCED_TEXT = 'READ-ONLY or refusing every connection but the manager\'s';
+
+/**
+ * Lift the swap layers that name owner ('swap:*' for any swap). problem says what may stay on when the lift failed or
+ * can't be confirmed; held is a layer another lane owns, left on. The caller holds the backup slot.
+ */
+export async function liftSwapFence(fleetDb: NonNullable<InstanceConfig['fleetDb']>, owner: string, actor: string): Promise<{ problem: string | null; held: FenceHeld }> {
+  const held: FenceHeld = { readOnly: false, hba: false, holder: null };
+  const lifted = await liftOwnedFence(fleetDb, owner, { readOnly: true, hba: true }, held);
+  if (lifted === 'unknown') {
+    const volume = await volumeState(fleetDb.volume);
+    return { held, problem: `docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists${volume.error ? ` (${volume.error})` : ''}, so ${actor} can't confirm whether the database is still ${FENCED_TEXT}` };
+  }
+  if (lifted === 'failed' || lifted === 'locked' || lifted === 'unreloaded') {
+    return { held, problem: `the write fence on ${fleetDb.containerName} could not be lifted (${held.detail || 'docker did not answer'}), so the database may stay ${FENCED_TEXT}` };
+  }
+  if (lifted === 'stripped' && held.fromFiles) {
+    // A database that runs on keeps the fence it loaded until it restarts.
+    const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
+    if (state === 'running') return { held, problem: `the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database may stay ${FENCED_TEXT} until its container restarts` };
+    if (state === 'unknown') return { held, problem: `the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay ${FENCED_TEXT} until its container restarts` };
+  }
+  return { held, problem: null };
+}
+
 /** Disarm THIS side only: removes the helper (and the seed daemon if RC-3 left one) and clears the record. The other machine disarms itself. */
 export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string }> {
   const record = instance.recoveryChannel;
@@ -471,32 +496,20 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       // record may be cleared first; a layer another lane or no lane owns
       // stays on and the answer names it. The shared lift takes the pg_hba
       // lines first and strips the volume files when the database is down.
-      const held: FenceHeld = { readOnly: false, hba: false, holder: null };
-      const fencedText = 'READ-ONLY or refusing every connection but the manager\'s';
       // The backup slot is held from the lift's owner read to its reset, so no restore, re-seed or decommission
       // fences this database in between; a swap's quiesce already holds it.
       const slot = !holdsQuiesceSlot(instance.id);
       if (slot && !claimFleetBackupBusy(instance.id)) {
         left.push(`the write fence on ${fleetDb.containerName} was not lifted, because ${containerManager.isShuttingDown() ? 'the manager is shutting down' : 'another database operation holds the backup slot of this instance'}, so a swap's fence on it, if one is there, stays on`);
       } else {
-        let lifted: Awaited<ReturnType<typeof liftOwnedFence>>;
+        let lift: { problem: string | null; held: FenceHeld };
         try {
-          lifted = await liftOwnedFence(fleetDb, 'swap:*', { readOnly: true, hba: true }, held);
+          lift = await liftSwapFence(fleetDb, 'swap:*', 'the disarm');
         } finally {
           if (slot) releaseFleetBackupBusy(instance.id);
         }
-        if (lifted === 'unknown') {
-          const volume = await volumeState(fleetDb.volume);
-          left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists${volume.error ? ` (${volume.error})` : ''}, so the disarm can't confirm whether the database is still ${fencedText}`);
-        } else if (lifted === 'failed' || lifted === 'locked' || lifted === 'unreloaded') {
-          left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${held.detail || 'docker did not answer'}), so the database may stay ${fencedText}`);
-        } else if (lifted === 'stripped' && held.fromFiles) {
-          // A database that runs on keeps the fence it loaded until it restarts.
-          const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
-          if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database may stay ${fencedText} until its container restarts`);
-          else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay ${fencedText} until its container restarts`);
-        }
-        if (held.readOnly || held.hba) heldNote = heldText(held, 'the disarm');
+        if (lift.problem) left.push(lift.problem);
+        if (lift.held.readOnly || lift.held.hba) heldNote = heldText(lift.held, 'the disarm');
       }
       const dbState = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
       const dbDown = dbState === 'stopped' || dbState === 'absent';

@@ -276,6 +276,17 @@ export interface RecoveryRescueLeft {
   state: 'partial' | 'standby';
 }
 
+/**
+ * What the sender did when the receiver cancelled its swap. cleared: the swap's own fence layers were lifted and the
+ * swap record cleared. left: a layer another lane owns that stays on (cleared), or why the swap record stays (not cleared).
+ */
+export interface RecoverySwapAbandoned {
+  at: number;
+  phase: 'quiesce' | 'catchup';
+  cleared: boolean;
+  left: string | null;
+}
+
 export interface RecoveryRescueRecord {
   phase: 'preflight' | 'bulk' | 'consistent' | 'standby' | 'streaming'
     | 'quiesce' | 'catchup' | 'promote' | 'teardown' | 'flip';
@@ -372,7 +383,7 @@ export interface InstanceConfig {
   recoveryRescueLeft?: RecoveryRescueLeft; // a cancelled rescue left a partial copy or a standby; kept while a new rescue runs; cleared by a finished swap, a retire, or a start that finds the volume clean
   recoveryLastSwap?: { startedAt: number; completedAt: number }; // set by the swap's flip alone, startedAt from its rescue record
   recoverySwappedAway?: { at: number };  // source side: a swap's quiesce handed this database away; Start and Update refuse until the operator clears it
-  recoverySwapAbandoned?: { at: number; phase: 'quiesce' | 'catchup'; fenced: boolean | null }; // source side: the receiver cancelled that swap before it promoted; fenced: whether a fence layer stood then (null: unread); clears with recoverySwappedAway
+  recoverySwapAbandoned?: RecoverySwapAbandoned; // source side: the receiver cancelled that swap before it promoted; kept after the swap record clears, until the operator dismisses it or a new quiesce starts
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

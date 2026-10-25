@@ -3371,9 +3371,12 @@
         : live.tunnelUp
           ? `<div class="env-tip" style="color:var(--success);">Tunnel UP${live.streams ? `, ${live.streams} active stream${live.streams === 1 ? '' : 's'}` : ''} - ${mb(live.bytesIn)} MB in / ${mb(live.bytesOut)} MB out${live.peerIdentity && live.peerIdentity.systemId ? ` - peer database ${escapeHtml(String(live.peerIdentity.systemId))} (timeline ${escapeHtml(String(live.peerIdentity.timeline || '?'))}${live.peerIdentity.capturedAt ? `, as of ${escapeHtml(new Date(live.peerIdentity.capturedAt).toLocaleString())}` : ''})` : ''}</div>${refusalHtml}`
           : `<div class="env-tip" style="color:var(--warning);">Tunnel DOWN${live.lastError ? `: ${escapeHtml(live.lastError)}` : ''} - ${ch.mode === 'source' ? 'redialing until the receiver answers' : 'waiting for the sender to dial in'}</div>${refusalHtml}`;
+      const disarmHtml = ch.disarming
+        ? `<div class="error-message">A disarm began ${escapeHtml(new Date(ch.disarming.at).toLocaleString())} and did not finish${ch.disarming.left ? `: ${escapeHtml(ch.disarming.left)}` : ''}. The manager no longer restarts this channel; Disarm this side again to retry.</div>`
+        : '';
       body.innerHTML = `
         <div class="env-tip">Armed as <b>${ch.mode === 'receiver' ? 'RECEIVER (this database gets replaced)' : 'SENDER (this database is the good copy)'}</b>${ch.mode === 'receiver' ? ` - listening on <b>${escapeHtml(ch.publicHost || '')}:${ch.tunnelPort}</b>` : ` - dialing <b>${escapeHtml(ch.endpoint || '')}</b>`}</div>
-        ${stateHtml}
+        ${disarmHtml || stateHtml}
         ${ch.mode === 'receiver' && ch.block ? `
         <div style="display:flex;align-items:center;gap:8px;margin-top:6px;">
           <span style="font-size:0.78rem;color:var(--text-secondary);">Arm block for the sender machine</span>

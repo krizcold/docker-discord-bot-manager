@@ -325,6 +325,8 @@ export interface RecoveryChannelStatus {
   } | null;
   /** Why the helper's status file could not be read while it runs. */
   liveError?: string;
+  /** A disarm began and did not finish: when, and what it could not undo (null when it stopped before saying). */
+  disarming?: { at: number; left: string | null };
 }
 
 export async function getRecoveryChannelStatus(instance: InstanceConfig): Promise<RecoveryChannelStatus> {
@@ -342,6 +344,7 @@ export async function getRecoveryChannelStatus(instance: InstanceConfig): Promis
       ? { host: record.publicHost, port: record.tunnelPort, cert: record.tlsCert, token: record.token }
       : undefined,
   };
+  if (record.disarmingAt) status.disarming = { at: record.disarmingAt, left: record.disarmLeft ?? null };
   const inspect = await docker(['inspect', '--format', '{{.State.Running}}', record.containerName]);
   status.containerState = containerStateOf(inspect);
   status.containerRunning = status.containerState === 'running';
@@ -390,19 +393,35 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
   if (arming.has(instance.id)) return { success: false, error: 'An arm request is running for this instance; retry in a moment' };
   arming.add(instance.id);
   try {
+    // Stamped before the first rm, so the reconciler stops respawning the
+    // helper while the record is kept for whatever the disarm cannot undo.
+    const disarming: RecoveryChannelRecord = { ...record, disarmingAt: record.disarmingAt ?? Date.now() };
+    try {
+      containerManager.updateInstanceRecoveryChannel(instance.id, disarming);
+    } catch (err) {
+      return { success: false, error: `the disarm could not be recorded (${err instanceof Error ? err.message : String(err)}); nothing was removed` };
+    }
+    const keep = (left: string): { success: false; error: string } => {
+      try {
+        containerManager.updateInstanceRecoveryChannel(instance.id, { ...disarming, disarmLeft: left });
+      } catch (err) {
+        console.warn(`[RecoveryChannel] Could not record what the disarm left on ${instance.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return { success: false, error: `The disarm did not finish: ${left}. The channel stays on record, and Disarm retries these steps` };
+    };
     // The record only clears once the containers are PROVEN gone: disarm is
     // consent revocation, and clearing over a failed rm would leave a live
     // tunnel no record points at.
     for (const name of [record.containerName, rsyncContainerName(instance)]) {
       const rm = await docker(['rm', '-f', name]);
       if (!rm.ok && !/no such container/i.test(rm.stderr)) {
-        return { success: false, error: `could not remove ${name}: ${rm.stderr.trim().split('\n').pop()}` };
+        return keep(`could not remove ${name}: ${rm.stderr.trim().split('\n').pop()}`);
       }
     }
     // Source side: the rescue's reserved slot must not keep retaining WAL
     // after consent is revoked. The walsender may outlive the relay rm by a
-    // moment, so terminate it first and retry the drop once - nothing ever
-    // drops this slot again after the record clears below.
+    // moment, so terminate it first and retry the drop once.
+    const left: string[] = [];
     if (record.mode === 'source' && instance.fleetDb) {
       const fleetDb = instance.fleetDb;
       // Lift the quiesce write fence if a swap set it. The disarm button is
@@ -414,26 +433,44 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       // SYSTEM in read-only transactions.
       // The fence and the slot are cluster-level, so these sessions use the
       // maintenance db: they must keep working when the fleet database itself
-      // is missing (a restore whose recreate failed), or the slot would leak
-      // and retain WAL forever once the record clears below.
+      // is missing (a restore whose recreate failed).
       const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
         '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
         '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
         '-c', 'SELECT pg_reload_conf()']);
       if (!unfence.ok) {
         const strip = await docker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
-          "sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"]);
-        if (!strip.ok) console.warn(`[RecoveryChannel] Could not lift the write fence on ${fleetDb.containerName} while disarming: ${strip.stderr.trim().split('\n').pop()}`);
+          "f=/pgdata/postgresql.auto.conf; grep -q '^default_transaction_read_only' \"$f\" 2>/dev/null || exit 0; sed -i '/^default_transaction_read_only/d' \"$f\" && echo stripped"]);
+        if (!strip.ok) {
+          left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${strip.stderr.trim().split('\n').pop() || 'docker did not answer'}), so the database may stay READ-ONLY`);
+        } else if (strip.stdout.includes('stripped')) {
+          // A database that runs on keeps the fence it loaded until it restarts.
+          const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
+          if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database stays READ-ONLY until its container restarts`);
+          else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay READ-ONLY until its container restarts`);
+        }
       }
-      for (let attempt = 0; attempt < 2; attempt++) {
+      const dbState = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
+      const dbDown = dbState === 'stopped' || dbState === 'absent';
+      let dropError = '';
+      for (let attempt = 0; !dbDown && attempt < 2; attempt++) {
+        if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 2_000));
         await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
           "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = 'recovery_channel' AND active_pid IS NOT NULL"]);
         const drop = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-c',
           "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = 'recovery_channel'"]);
-        if (drop.ok) break;
-        await new Promise(resolve => setTimeout(resolve, 2_000));
+        if (drop.ok) { dropError = ''; break; }
+        dropError = drop.stderr.trim().split('\n').pop() || 'docker did not answer';
+      }
+      if (dbDown) {
+        left.push('the replication slot recovery_channel could not be checked or dropped because the database is not running; a stopped database holds no WAL for it, and Disarm drops the slot once the database runs again');
+      } else if (dropError && dbState === 'unknown') {
+        left.push(`the replication slot recovery_channel could not be checked or dropped (${dropError}), and docker did not say whether the database runs, so the slot may keep holding WAL on this database`);
+      } else if (dropError) {
+        left.push(`the replication slot recovery_channel could not be dropped (${dropError}), so it keeps holding WAL on this database`);
       }
     }
+    if (left.length > 0) return keep(`the relay was removed, but ${left.join('; and ')}`);
     containerManager.updateInstanceRecoveryChannel(instance.id, null);
     if (record.mode === 'source') releaseQuiesceSlot(instance.id);
     return { success: true };
@@ -451,7 +488,7 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
  */
 export async function reconcileRecoveryChannels(): Promise<void> {
   for (const snapshot of containerManager.getAllBots()) {
-    if (!snapshot.recoveryChannel) continue;
+    if (!snapshot.recoveryChannel || snapshot.recoveryChannel.disarmingAt) continue;
     if (arming.has(snapshot.id)) continue;
     const inspect = await docker(['inspect', '--format', '{{.State.Running}}', snapshot.recoveryChannel.containerName]);
     const state = containerStateOf(inspect);
@@ -474,7 +511,7 @@ export async function reconcileRecoveryChannels(): Promise<void> {
     try {
       const fresh = containerManager.getBot(snapshot.id);
       const record = fresh?.recoveryChannel;
-      if (!fresh || !record) continue;
+      if (!fresh || !record || record.disarmingAt) continue;
       const spawned = await spawnRelay(fresh, record);
       console.log(spawned.ok
         ? `[RecoveryChannel] Respawned relay ${record.containerName}`

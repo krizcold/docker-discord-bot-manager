@@ -209,7 +209,7 @@ async function startFreshRescue(
   const live = await containerManager.runningNonSidecarContainers(instance.id);
   if (live === null) return { success: false, error: 'Docker could not say whether the instance is running, so the rescue was not started; retry in a moment' };
   if (live.length > 0) return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
-
+  if (instance.fleetDb.retiringAt) return { success: false, error: containerManager.unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
   const prepared = await control(instance, 'prepare');
   if (!prepared.ok) return { success: false, error: controlFailure(prepared) };
   const outdated = await volumeHasDatabase(instance.fleetDb.volume);

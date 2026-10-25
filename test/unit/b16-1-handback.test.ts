@@ -39,7 +39,7 @@ describe('R9-J3: re-seeding a swapped-away sender as a standby ends the swap ref
     } }, null, 2));
     expect(containerManager.startPreflightRefusal('a')?.error).toMatch(/recovery swap on 2026-10-24/);
     const retired = await containerManager.retireFleetDbSidecar('a');
-    expect(retired).toEqual({ success: true });
+    expect(retired).toEqual({ success: true, volumeRemoved: true });
     expect(containerManager.getBot('a')?.fleetDb).toBeUndefined();
     expect(containerManager.getBot('a')?.recoverySwappedAway).toBeUndefined();
     expect(containerManager.startPreflightRefusal('a')).toBeNull();

@@ -55,6 +55,7 @@ export interface FleetDbRecord {
   db: string;
   volume: string;
   replication?: FleetDbReplication;
+  retiringAt?: string;                 // ISO time a retire first began removing this database; leaves with the record once a retire finishes
 }
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).
@@ -246,6 +247,8 @@ export interface RecoveryChannelRecord {
   endpointHost?: string;               // receiver's host:port from the arm block
   endpointPort?: number;
   pinCert?: string;                    // receiver's cert, pinned
+  disarmingAt?: number;                // a disarm began: the reconciler no longer restarts this channel
+  disarmLeft?: string;                 // what the last disarm could not undo
 }
 
 // Receiver-side rescue state (PLAN_REPLICATION.md Section 18, RC-3). The

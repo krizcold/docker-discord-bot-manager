@@ -972,16 +972,22 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   return { success: true };
 }
 
+export function unfinishedRetireRefusal(retiringAt: string): string {
+  return `The fleet database of this instance was being removed (since ${retiringAt}) and the removal did not finish, so its volume may already be gone and a start would create an empty database in its place. Run the decommission or the re-seed again to finish it`;
+}
+
 /**
  * Bring ONLY the managed database sidecar up and wait for it to accept
  * connections. Stopping an instance takes its whole compose project down, so
  * the stale-primary re-seed (PLAN_REPLICATION.md Stage 5) has no database to
  * dump until this runs; the app service is deliberately left down.
+ * retireRetry: the caller proved the volume predates the retiring mark.
  */
-export async function startFleetDbSidecar(botId: string, opts: { forRescue?: boolean } = {}): Promise<LaneResult> {
+export async function startFleetDbSidecar(botId: string, opts: { forRescue?: boolean; retireRetry?: boolean } = {}): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  if (fleetDb.retiringAt && !opts.retireRetry) return { success: false, error: unfinishedRetireRefusal(fleetDb.retiringAt) };
   if (instance.recoveryRescue && !opts.forRescue) {
     return { success: false, error: 'A database rescue is recorded on this instance and rewrites its volume; the database was not started' };
   }
@@ -1020,30 +1026,66 @@ export async function startFleetDbSidecar(botId: string, opts: { forRescue?: boo
  * half of a failed-over pair stops hosting the fleet database and follows the
  * new primary instead. Service, container, volume and record all go, because
  * a kept volume with no record naming it is debris no UI could ever clear.
- * The caller has already dumped whatever it wanted to keep.
+ * The caller has already dumped whatever it wanted to keep. volumeRemoved is
+ * set once the volume is gone, also on a failure after that point.
  */
-export async function retireFleetDbSidecar(botId: string): Promise<LaneResult> {
+export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & { volumeRemoved?: boolean }> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
   const shared = sharedVolumeReason(fleetDb.volume, botId);
   if (shared) return { success: false, error: `database volume ${fleetDb.volume} kept: ${shared}; nothing was removed` };
+  const composePath = resolveComposePath(botId, resolveAppName(botId));
+  // Read before anything is removed, so a compose that cannot be stripped
+  // refuses with the database whole.
+  const unread = strippedDeployedCompose(composePath, removeFleetDbServices).error;
+  if (unread) return { success: false, error: `the deployed compose could not be read (${unread}); nothing was removed` };
+  // The mark goes on the record BEFORE the container and the volume: a
+  // failure after the volume removal leaves a record that Start, a failback
+  // Cancel and the next decommission read as a database being destroyed.
+  const markedHere = !fleetDb.retiringAt;
+  const retiringAt = fleetDb.retiringAt ?? new Date().toISOString();
   try {
-    // Container and volume go FIRST: if either fails, the compose service is
-    // still declared and the record kept, so a retry can start the sidecar
-    // and dump again. Both strippers run because an adopted standby's
-    // database rides the 'fleet-postgres-replica' service key until its next
-    // rebuild; callers guard that no real standby record exists, so any
-    // replica-keyed service here IS this database (or recordless debris).
-    await execAsync(`docker rm -f "${fleetDb.containerName}"`).catch(() => { /* already gone */ });
-    if (!dockerClient.removeVolume(fleetDb.volume)) {
-      return { success: false, error: `could not remove the old database volume ${fleetDb.volume}; the container may still be running` };
+    setFleetDbRetiringAt(botId, retiringAt);
+  } catch (err) {
+    return { success: false, error: `the retire could not be recorded (${errorText(err)}); nothing was removed` };
+  }
+  instance.fleetDb = { ...fleetDb, retiringAt };
+  // A failure before the volume removal leaves the database whole, so the
+  // mark this call set comes off again.
+  const keptWhole = (reason: string): LaneResult => {
+    if (!markedHere) return { success: false, error: reason };
+    try {
+      setFleetDbRetiringAt(botId, null);
+      instance.fleetDb = fleetDb;
+      return { success: false, error: reason };
+    } catch (err) {
+      return { success: false, error: `${reason}; the record still marks the database as being removed (${errorText(err)}), so Start refuses until a retry finishes` };
     }
-    const appName = resolveAppName(botId);
-    const composePath = resolveComposePath(botId, appName);
-    if (fs.existsSync(composePath)) {
-      rewriteComposeFile(composePath, removeFleetPostgresReplicaService(removeFleetPostgresService(fs.readFileSync(composePath, 'utf-8'))));
+  };
+  // Container and volume go FIRST: if either fails, the compose service is
+  // still declared and the record kept, so a retry can start the sidecar and
+  // dump again. Both strippers run because an adopted standby's database
+  // rides the 'fleet-postgres-replica' service key until its next rebuild;
+  // callers guard that no real standby record exists, so any replica-keyed
+  // service here IS this database (or recordless debris).
+  try {
+    await execAsync(`docker rm -f "${fleetDb.containerName}"`);
+  } catch (err) {
+    if (!/no such container/i.test(errorText(err))) {
+      return keptWhole(`could not remove the database container ${fleetDb.containerName} (${errorText(err)}); its volume and record were kept`);
     }
+  }
+  if (!dockerClient.removeVolume(fleetDb.volume)) {
+    if (dockerClient.volumeState(fleetDb.volume) === 'exists') {
+      return keptWhole(`could not remove the old database volume ${fleetDb.volume}; the container may still be running`);
+    }
+    return { success: false, error: `can't confirm whether the old database volume ${fleetDb.volume} was removed (docker did not answer); the record keeps it marked as being removed` };
+  }
+  try {
+    const stripped = strippedDeployedCompose(composePath, removeFleetDbServices);
+    if (stripped.error) throw new Error(`the deployed compose could not be read: ${stripped.error}`);
+    if (stripped.content !== null) rewriteComposeFile(composePath, stripped.content);
     const registry = loadRegistry();
     const stored = registry.instances[botId];
     // With the old copy gone, a swap that handed it away can no longer leave a second primary behind.
@@ -1053,27 +1095,68 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult> {
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
     }
-    delete instance.fleetDb;
-    delete instance.recoverySwappedAway;
-    return { success: true };
   } catch (err) {
-    return { success: false, error: String(err) };
+    return { success: false, volumeRemoved: true, error: `the database volume ${fleetDb.volume} was removed, but its compose or record could not be updated: ${errorText(err)}` };
   }
+  delete instance.fleetDb;
+  delete instance.recoverySwappedAway;
+  return { success: true, volumeRemoved: true };
+}
+
+function removeFleetDbServices(content: string): string {
+  return removeFleetPostgresReplicaService(removeFleetPostgresService(content));
+}
+
+function errorText(err: unknown): string {
+  const e = err as { stderr?: unknown; message?: unknown } | null;
+  const text = String(e?.stderr || e?.message || err).trim();
+  return text.split('\n').pop() || text;
+}
+
+/** The deployed compose passed through strip; content null when none is deployed, error on any other read failure. */
+function strippedDeployedCompose(composePath: string, strip: (content: string) => string): { content: string | null; error?: string } {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(composePath, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return { content: null };
+    return { content: null, error: errorText(err) };
+  }
+  try {
+    return { content: strip(raw) };
+  } catch (err) {
+    return { content: null, error: errorText(err) };
+  }
+}
+
+function setFleetDbRetiringAt(botId: string, at: string | null): void {
+  const registry = loadRegistry();
+  const stored = registry.instances[botId]?.fleetDb;
+  if (!stored) throw new Error('the instance record no longer names this database');
+  if (at) stored.retiringAt = at;
+  else delete stored.retiringAt;
+  registry.instances[botId].updatedAt = new Date().toISOString();
+  saveRegistry(registry);
 }
 
 /** Remove the standby service from the deployed compose and its container; the volume stays. */
 export async function removeFleetDbReplicaService(botId: string, containerName: string): Promise<LaneResult> {
-  const appName = resolveAppName(botId);
-  const composePath = resolveComposePath(botId, appName);
+  const composePath = resolveComposePath(botId, resolveAppName(botId));
+  const stripped = strippedDeployedCompose(composePath, removeFleetPostgresReplicaService);
+  if (stripped.error) return { success: false, error: `the deployed compose could not be read (${stripped.error}); the standby was left as it is` };
   try {
-    if (fs.existsSync(composePath)) {
-      rewriteComposeFile(composePath, removeFleetPostgresReplicaService(fs.readFileSync(composePath, 'utf-8')));
-    }
-    await execAsync(`docker rm -f "${containerName}"`).catch(() => { /* already gone */ });
-    return { success: true };
+    if (stripped.content !== null) rewriteComposeFile(composePath, stripped.content);
   } catch (err) {
-    return { success: false, error: String(err) };
+    return { success: false, error: `the standby service could not be removed from the deployed compose (${errorText(err)}); the standby was left as it is` };
   }
+  try {
+    await execAsync(`docker rm -f "${containerName}"`);
+  } catch (err) {
+    if (!/no such container/i.test(errorText(err))) {
+      return { success: false, error: `the standby service was removed from the deployed compose, but its container ${containerName} could not be removed: ${errorText(err)}` };
+    }
+  }
+  return { success: true };
 }
 
 /**
@@ -3280,6 +3363,7 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
   if (!instance) return { success: false, error: 'Bot not found' };
   const rescueRefusal = startPreflightRefusal(botId);
   if (rescueRefusal) return rescueRefusal;
+  if (instance.fleetDb?.retiringAt) return { success: false, error: unfinishedRetireRefusal(instance.fleetDb.retiringAt) };
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
   if (instance.status === 'running') {
     // Reconcile against live container state: an externally-stopped bot

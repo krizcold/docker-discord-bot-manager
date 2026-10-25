@@ -264,6 +264,28 @@ function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown
   });
 }
 
+/**
+ * Why an existing volume must not be dumped as this record's database: a
+ * retire that began earlier may have removed the original, and a volume made
+ * after that (a compose up minting it again) is not the database the earlier
+ * attempt dumped. Null when the volume predates the retire, or none began.
+ */
+function remintedVolumeRefusal(fleetDb: NonNullable<InstanceConfig['fleetDb']>): Promise<string | null> {
+  if (!fleetDb.retiringAt) return Promise.resolve(null);
+  const began = Date.parse(fleetDb.retiringAt);
+  return new Promise(resolve => {
+    execFile('docker', ['volume', 'inspect', '--format', '{{.CreatedAt}}', fleetDb.volume], (err, stdout) => {
+      const created = err ? NaN : Date.parse(String(stdout).trim());
+      if (Number.isNaN(created) || Number.isNaN(began)) {
+        return resolve(`a removal of this database began at ${fleetDb.retiringAt}, and docker did not say when the volume ${fleetDb.volume} was created, so it cannot be told apart from one made after the removal; try again`);
+      }
+      resolve(created > began
+        ? `the volume ${fleetDb.volume} was created after a removal of this database began at ${fleetDb.retiringAt}, so it is not the database that removal was meant for. Check what the volume holds, and remove it by hand if it holds nothing to keep`
+        : null);
+    });
+  });
+}
+
 async function volExec(volume: string, script: string, stdin?: string, extraMounts: string[] = []): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   // Named for the same reason the seed is: killing the CLI leaves the
   // container running daemon-side, still writing inside the volume the next
@@ -956,9 +978,13 @@ export async function removeFleetReplica(instance: InstanceConfig): Promise<{ su
   // or adopt entering during the docker rm then refuses on isBotBusy.
   return containerManager.withExternalBotOp(instance.id, 'replica-remove', async () => {
     const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
-    if (!removed.success) return removed;
-    containerManager.updateInstanceFleetDbReplica(instance.id, null);
-    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+    if (!removed.success) return { success: false, error: `${removed.error}; the standby record was kept, so Remove can be retried` };
+    try {
+      containerManager.updateInstanceFleetDbReplica(instance.id, null);
+      containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+    } catch (err) {
+      return { success: false, error: `The standby service and container were removed, but its record could not be cleared: ${err instanceof Error ? err.message : String(err)}` };
+    }
     return { success: true };
   });
 }
@@ -1112,7 +1138,9 @@ export function reseedStalePrimary(
         const volState = await dockerVolumeState(fleetDb.volume);
         if (volState === 'unknown') throw new Error('could not verify the database volume (docker did not answer), so nothing was destroyed; retry');
         if (volState === 'exists') {
-          const started = await containerManager.startFleetDbSidecar(instance.id);
+          const reminted = await remintedVolumeRefusal(fleetDb);
+          if (reminted) throw new Error(`nothing was destroyed: ${reminted}`);
+          const started = await containerManager.startFleetDbSidecar(instance.id, { retireRetry: true });
           if (!started.success) throw new Error(`the database did not come up for the safety dump, so nothing was destroyed: ${started.error}`);
           const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY);
           if (!dump.success) throw new Error(`the safety dump failed, so nothing was destroyed: ${dump.error}`);
@@ -1130,7 +1158,13 @@ export function reseedStalePrimary(
       // here, with the sidecar running and the record intact.
       throwIfCancelled(instance.id);
       const retired = await containerManager.retireFleetDbSidecar(instance.id);
-      if (!retired.success) throw new Error(`could not retire the stale database: ${retired.error}`);
+      if (!retired.success) {
+        if (retired.volumeRemoved) {
+          fenced = false;
+          saveSeed(instance.id, { committed: true });
+        }
+        throw new Error(`could not retire the stale database: ${retired.error}`);
+      }
     } catch (err) {
       if (fenced) {
         const note = await liftFenceLeftStanding(instance.id, fleetDb, 'a re-seed', RESEED_LIFT_REMEDY);
@@ -1138,9 +1172,9 @@ export function reseedStalePrimary(
       }
       throw err;
     }
-    // Committed once the retire reports success: a retire that refuses before
-    // it touches the volume leaves everything in place, and a cancel filed
-    // there must not claim the database is gone.
+    // Committed once the retire reports the volume gone: a retire that refuses
+    // before it touches the volume leaves everything in place, and a cancel
+    // filed there must not claim the database is gone.
     saveSeed(instance.id, { committed: true });
     // BEFORE the seed: if the seed then fails, this node is an ordinary worker
     // that will take the live fleet database from the master's next delivery
@@ -1246,9 +1280,11 @@ export async function decommissionFleetDb(
           return { success: false, error: 'Refused, nothing was destroyed: could not verify the database volume (docker did not answer) - try again' };
         }
         if (volState === 'exists') {
+          const reminted = await remintedVolumeRefusal(instance.fleetDb);
+          if (reminted) return { success: false, error: `Refused, nothing was destroyed: ${reminted}` };
           // The permit. Stopping the instance took the sidecar down with its
           // compose project, so it comes back up alone to be dumped at all.
-          const started = await containerManager.startFleetDbSidecar(instance.id);
+          const started = await containerManager.startFleetDbSidecar(instance.id, { retireRetry: true });
           if (!started.success) {
             return { success: false, error: `Refused, nothing was destroyed: the database did not come up for the pre-decommission dump: ${started.error}. If its container started, it was left running alone for inspection` };
           }
@@ -1263,7 +1299,7 @@ export async function decommissionFleetDb(
 
         const retired = await containerManager.retireFleetDbSidecar(instance.id);
         if (!retired.success) {
-          const note = dumpFile ? await liftFenceLeftStanding(instance.id, instance.fleetDb, 'a decommission', DECOMMISSION_LIFT_REMEDY) : '';
+          const note = dumpFile && !retired.volumeRemoved ? await liftFenceLeftStanding(instance.id, instance.fleetDb, 'a decommission', DECOMMISSION_LIFT_REMEDY) : '';
           return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}${note}`, dumpFile };
         }
         let warning: string | undefined;
@@ -1905,8 +1941,8 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     }
     const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
     if (!removed.success) throw new Error(`could not stop the stale standby: ${removed.error}`);
-    // That removal tolerates a failed rm; the wipe below runs inside the same
-    // volume, so the standby postgres must be PROVEN gone, unknown included.
+    // The wipe below runs inside the same volume, so the standby postgres
+    // must be PROVEN gone, unknown included.
     if (await containerRunning(rec.containerName) !== false) {
       throw new Error('the standby database container is still present after the stop, so its copy cannot be cleared safely');
     }

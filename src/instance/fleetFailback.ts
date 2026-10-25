@@ -822,7 +822,8 @@ export async function continueFailback(instance: InstanceConfig, opts: { consent
 /**
  * Whether the run's wipe began, from the records the lanes stamp rather than
  * from the phase: the wipe never runs without consent, the primary record is
- * deleted only after its volume is retired, the seed's committed flag describes
+ * marked retiring before its volume is touched and deleted only after the
+ * volume is retired, the seed's committed flag describes
  * the volume and the copy-clear flag the standby's. A run parked at seeding by
  * a refusal before the lane touched anything is still cancelable.
  */
@@ -841,7 +842,7 @@ function destroyedBy(instance: InstanceConfig, run: FleetFailbackRun): boolean {
   // has the operator dismiss that record: the copy's own filing is the evidence.
   return run.mode === 'drop-back'
     ? committed || !instance.fleetDbReplica || instance.fleetDbReplica.copyCleared === true || copyBuiltByRun(instance.fleetDbReplica, run)
-    : committed || !instance.fleetDb;
+    : committed || !instance.fleetDb || !!instance.fleetDb.retiringAt;
 }
 
 /** The copy names the seed that built it, and the run names the seed it started: the same seed wiped before it copied. */

@@ -2266,6 +2266,29 @@ export function declaredBindReadOnly(composeContent: string, target: string): bo
   return modes.size === 1 ? [...modes][0] : undefined;
 }
 
+/**
+ * Every bind source of the compose that covers or sits inside dir, relative to
+ * dir ('' for dir itself or a parent of it), for configFileSources' `taken`.
+ */
+function boundSourcesIn(services: Record<string, Record<string, unknown>>, dir: string): string[] {
+  const norm = (p: string): string => path.posix.normalize(p.replace(/\\/g, '/')).replace(/\/+$/, '');
+  const base = norm(dir);
+  const taken: string[] = [];
+  for (const svc of Object.values(services)) {
+    if (!Array.isArray(svc.volumes)) continue;
+    for (const v of svc.volumes as unknown[]) {
+      let src: string | null = null;
+      if (typeof v === 'string') { const s = splitDockerVolume(v); if (s) src = s.source; }
+      else if (v && typeof v === 'object') { const o = v as Record<string, unknown>; if (typeof o.source === 'string' && o.type !== 'volume') src = o.source; }
+      if (!src) continue;
+      const clean = norm(src);
+      if (clean === base || base.startsWith(clean + '/')) taken.push('');
+      else if (clean.startsWith(base + '/')) taken.push(clean.slice(base.length + 1));
+    }
+  }
+  return taken;
+}
+
 /** Collect declared bind {target -> hostSource} pairs whose source is under prefix. */
 function dockerDeclaredBinds(services: Record<string, Record<string, unknown>>, prefix: string): Map<string, string> {
   const map = new Map<string, string>();
@@ -2369,7 +2392,7 @@ export function prepareDockerBotFiles(
     const targetSvc = targetName && targetName !== STATUS_PAGE_SERVICE ? services[targetName] : undefined;
     const sources = configFileSources(
       configFiles.filter(cf => !declared.has(cf.path) && !droppedGatewayBinds.includes(cf.path)).map(cf => cf.path),
-      [...declared.values()].map(s => s.slice(prefix.length)),
+      boundSourcesIn(services, hostBotDir),
     );
     for (const cf of configFiles) {
       if (droppedGatewayBinds.includes(cf.path)) {
@@ -2868,20 +2891,7 @@ export function addConfigFileBinds(
   const volumes = service.volumes as unknown[];
 
   const appDir = `${pcs.DATA_ROOT}/AppData/${appName}`;
-  const taken: string[] = [];
-  for (const svc of Object.values(services)) {
-    if (!Array.isArray(svc.volumes)) continue;
-    for (const v of svc.volumes as unknown[]) {
-      let src: string | null = null;
-      if (typeof v === 'string') { const s = splitDockerVolume(v); if (s) src = s.source; }
-      else if (v && typeof v === 'object') { const o = v as Record<string, unknown>; if (typeof o.source === 'string' && o.type !== 'volume') src = o.source; }
-      if (src === null) continue;
-      const clean = src.replace(/\/+$/, '');
-      if (clean === appDir || appDir.startsWith(clean + '/')) taken.push('');
-      else if (clean.startsWith(appDir + '/')) taken.push(clean.slice(appDir.length + 1));
-    }
-  }
-  const sources = configFileSources(files.map(f => f.path), taken);
+  const sources = configFileSources(files.map(f => f.path), boundSourcesIn(services, appDir));
 
   for (const f of files) {
     const exists = volumes.some(

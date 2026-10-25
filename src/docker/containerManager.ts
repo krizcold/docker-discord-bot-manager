@@ -332,7 +332,6 @@ function saveRegistrySync(registry: InstanceRegistry): void {
     throw new Error(`The instance registry (instances.json) cannot be read, so nothing was saved: a save would erase every bot it lists. Repair or replace instances.json (${corruptCopyNote(REGISTRY_FILE)}).`);
   }
   try {
-    fs.mkdirSync(path.dirname(REGISTRY_FILE), { recursive: true });
     const instances: InstanceRegistry['instances'] = {};
     for (const [id, inst] of Object.entries(registry.instances)) {
       instances[id] = withRecordSecretsEncrypted(withStoredErrorsScrubbed(inst));
@@ -340,9 +339,7 @@ function saveRegistrySync(registry: InstanceRegistry): void {
     // Atomic write: a truncated/interrupted write (e.g. the container killed mid-save
     // during a rebuild) would otherwise corrupt the file, and the next load would
     // silently fall back to an empty registry and then persist it - losing every bot.
-    const tmp = `${REGISTRY_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ ...registry, instances }, null, 2));
-    fs.renameSync(tmp, REGISTRY_FILE);
+    writeFileAtomic(REGISTRY_FILE, JSON.stringify({ ...registry, instances }, null, 2));
   } catch (error) {
     console.error('[ContainerManager] Failed to save registry:', error);
     throw error;
@@ -354,6 +351,24 @@ function saveRegistrySync(registry: InstanceRegistry): void {
 // and then revert another's field (e.g. the reconciler clobbering lastBuiltCommit).
 function saveRegistry(registry: InstanceRegistry): void {
   saveRegistrySync(registry);
+}
+
+/** Point the orphaned instances whose source URL matches at a newly added source. */
+export function reassociateWithSource(sourceId: string, matchesUrl: (instanceSourceUrl: string) => boolean): void {
+  const registry = loadRegistry();
+  if (brokenRegistryLoads.has(registry)) {
+    console.warn(`[ContainerManager] No bot was re-associated with source ${sourceId}: ${registryFault() || 'the instance registry (instances.json) cannot be read'}`);
+    return;
+  }
+  const matched = Object.values(registry.instances).filter(inst => inst.sourceId === null && !!inst.sourceUrl && matchesUrl(inst.sourceUrl));
+  if (matched.length === 0) return;
+  const now = new Date().toISOString();
+  for (const inst of matched) {
+    inst.sourceId = sourceId;
+    inst.updatedAt = now;
+  }
+  saveRegistry(registry);
+  for (const inst of matched) console.log(`[ContainerManager] Re-associated instance ${inst.id} (${inst.displayName}) with source ${sourceId}`);
 }
 
 // ─── Registry Accessors ───

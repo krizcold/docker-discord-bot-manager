@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getEnvPath } from '../git/repoManager';
 import { encrypt, decryptOrNull } from '../env/manager';
-import { storeFileState, preserveCorruptCopy } from './storeFile';
+import { storeFileState, preserveCorruptCopy, writeFileAtomic } from './storeFile';
 
 export interface BotConfigFile {
   path: string;       // in-container mount path, e.g. /app/config.json
@@ -152,10 +152,7 @@ export function setConfigFiles(botId: string, files: BotConfigFile[]): void {
 
   // Atomic: this file is the only home of the bodies, so a kill mid-save must
   // not leave it truncated.
-  const p = storageFile(botId);
-  const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(storage, null, 2));
-  fs.renameSync(tmp, p);
+  writeFileAtomic(storageFile(botId), JSON.stringify(storage, null, 2));
   console.log(`[ConfigFiles] Saved ${storage.files.length} config file(s) for bot ${botId}`);
 }
 
@@ -185,11 +182,7 @@ export function clearBuiltMounts(botId: string): void {
 }
 
 export function setBuiltMounts(botId: string, mounts: string[]): void {
-  const p = builtMountsFile(botId);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify([...mounts].sort(), null, 2));
-  fs.renameSync(tmp, p);
+  writeFileAtomic(builtMountsFile(botId), JSON.stringify([...mounts].sort(), null, 2));
 }
 
 function deliveredFile(botId: string): string {
@@ -215,9 +208,5 @@ export function getDeliveredOverrides(botId: string): Record<string, string> {
 }
 
 export function setDeliveredOverrides(botId: string, record: Record<string, string>): void {
-  const p = deliveredFile(botId);
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(record, null, 2));
-  fs.renameSync(tmp, p);
+  writeFileAtomic(deliveredFile(botId), JSON.stringify(record, null, 2));
 }

@@ -12,8 +12,7 @@ import { v4 as uuidv4 } from 'uuid';
 import simpleGit, { SimpleGit } from 'simple-git';
 import { SourceMeta, SourceRegistry, CreateSourceRequest, UpdateSourceRequest } from '../types';
 import { hasExistingCompose, extractAppName } from '../templates/compose';
-import { isSensitive } from '../env/manager';
-import { storeFileState, preserveCorruptCopy, corruptCopyNote } from '../config/storeFile';
+import { storeFileState, preserveCorruptCopy, corruptCopyNote, writeFileAtomic } from '../config/storeFile';
 import { redactSecrets } from '../config/secretText';
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
@@ -68,10 +67,7 @@ function saveSourceRegistry(registry: SourceRegistry): void {
   if (brokenSourceLoads.has(registry) || storeFileState(REGISTRY_FILE).kind === 'broken') {
     throw new Error(`The source registry (sources.json) cannot be read, so nothing was saved: a save would erase every source it lists. Repair or replace sources.json (${corruptCopyNote(REGISTRY_FILE)}).`);
   }
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${REGISTRY_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(registry, null, 2));
-  fs.renameSync(tmp, REGISTRY_FILE);
+  writeFileAtomic(REGISTRY_FILE, JSON.stringify(registry, null, 2));
 }
 
 // ─── Path Helpers ───
@@ -331,7 +327,7 @@ async function createSourceCloned(request: CreateSourceRequest): Promise<SourceM
   console.log(`[SourceManager] Source ${sourceId} created (composeName: ${composeName || 'none'})`);
 
   // Re-associate orphaned instances
-  reAssociateInstances(sourceId, request.url);
+  await reAssociateInstances(sourceId, request.url);
 
   return source;
 }
@@ -595,44 +591,15 @@ export async function getSourceRepoInfo(sourceId: string): Promise<{
 // ─── Re-association ───
 
 /**
- * Re-associate orphaned instances when a source is added with a matching URL.
- * Reads instances.json directly to avoid circular dependency with containerManager.
+ * Re-associate orphaned instances when a source is added with a matching URL,
+ * through containerManager's registry save (imported at call time: it imports
+ * this module).
  */
-function reAssociateInstances(sourceId: string, sourceUrl: string): void {
-  const instancesFile = path.join(DATA_DIR, 'instances.json');
-  if (!fs.existsSync(instancesFile)) return;
-
+async function reAssociateInstances(sourceId: string, sourceUrl: string): Promise<void> {
+  const key = normalizeSourceUrl(sourceUrl);
   try {
-    const data = JSON.parse(fs.readFileSync(instancesFile, 'utf-8'));
-    let changed = false;
-
-    for (const inst of Object.values(data.instances || {}) as any[]) {
-      if (inst.sourceId === null && inst.sourceUrl) {
-        // Normalize URLs for comparison (strip trailing .git and trailing slash)
-        const normalize = (u: string) => u.replace(/\/+$/, '').replace(/\.git$/, '').replace(/\/\/([^@]+)@/, '//');
-        if (normalize(inst.sourceUrl) === normalize(sourceUrl)) {
-          inst.sourceId = sourceId;
-          inst.updatedAt = new Date().toISOString();
-          changed = true;
-          console.log(`[SourceManager] Re-associated instance ${inst.id} (${inst.displayName}) with source ${sourceId}`);
-        }
-      }
-    }
-
-    if (changed) {
-      // Same persistence boundary as the registry save: sensitive env values
-      // never persist in the record (the two-store strip), and this direct
-      // write must not round-trip a legacy record's plaintext past the scrub.
-      for (const inst of Object.values(data.instances || {}) as any[]) {
-        if (!inst.envVars) continue;
-        for (const key of Object.keys(inst.envVars)) {
-          if (isSensitive(key)) delete inst.envVars[key];
-        }
-      }
-      const tmp = `${instancesFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-      fs.renameSync(tmp, instancesFile);
-    }
+    const { reassociateWithSource } = await import('../docker/containerManager');
+    reassociateWithSource(sourceId, u => normalizeSourceUrl(u) === key);
   } catch (err) {
     console.warn('[SourceManager] Failed to re-associate instances:', err);
   }

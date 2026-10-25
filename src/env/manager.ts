@@ -232,13 +232,7 @@ function refuseCorrupt(botId: string, corrupt: boolean): void {
  * (the same hazard the registry save guards against).
  */
 function saveEnvStorage(botId: string, storage: EnvStorage): void {
-  const envPath = getEnvPath(botId);
-  fs.mkdirSync(envPath, { recursive: true });
-
-  const storagePath = path.join(envPath, 'storage.json');
-  const tmp = `${storagePath}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(storage, null, 2));
-  fs.renameSync(tmp, storagePath);
+  writeFileAtomic(path.join(getEnvPath(botId), 'storage.json'), JSON.stringify(storage, null, 2), 0o600);
 }
 
 /**

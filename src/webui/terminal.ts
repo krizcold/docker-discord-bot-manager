@@ -19,7 +19,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { WebSocket } from 'ws';
 import { getBot } from '../docker/containerManager';
 import { getDataPath } from '../git/repoManager';
@@ -411,6 +411,37 @@ const BOUNDED = [
   `bounded() { if [ "$B" = 1 ]; then timeout -s KILL ${CONTAINER_OP_BOUND_S} "$@"; else "$@"; fi; }`,
 ].join('\n');
 
+// Settles what a save that stopped (a crash) left beside "$p": the backup of
+// what it held before, and the temp file with the new body under the same
+// pid. Both go when "$p" equals either; otherwise the backup is kept and the
+// script stops naming both files. Reads and saves are separate execs, so a
+// backup whose pid is alive may belong to a save still running and is left
+// alone, unless the pid is this script's own (reused after a restart);
+// [ -d /proc/$pid ] also sees another user's process, which kill -0 does not.
+const containerSettle = (tail: string): string[] => [
+  'd=$(dirname "$p"); b=$(basename "$p")',
+  'for bak in "$d/.$b.smdb-backup."*; do',
+  '  [ -f "$bak" ] || continue',
+  '  pid=${bak##*.smdb-backup.}',
+  `  if [ ! -d /proc/$$ ]; then echo "Cannot tell whether a save of $p is still running (no /proc); $bak is kept.${tail}" >&2; exit 1; fi`,
+  `  case $pid in ''|*[!0-9]*) ;; *) if [ "$pid" != "$$" ] && [ -d "/proc/$pid" ]; then echo "A save of $p may still be running (process $pid, which wrote $bak, is alive); try again when it has finished. If no save is running, compare $bak with $p, then delete $bak.${tail}" >&2; exit 1; fi ;; esac`,
+  '  new="$d/.$b.smdb-save.$pid"',
+  '  if [ -f "$p" ] && { cmp -s "$bak" "$p" || { [ -f "$new" ] && cmp -s "$new" "$p"; }; }; then rm -f "$bak" "$new"; continue; fi',
+  '  if [ -e "$p" ]; then s="may hold only part of a save that did not finish"; else s="is missing"; fi',
+  `  echo "$p $s; what it held before that save is in $bak. Compare the two, then delete $bak to edit $p again.${tail}" >&2; exit 1`,
+  'done',
+];
+
+const RESOLVE_LINK = 'if [ -L "$p" ]; then p=$(readlink -f "$p") || { echo "Cannot resolve the link $1" >&2; exit 1; }; fi';
+
+// $1 path, $2 byte cap.
+const CONTAINER_READ = [
+  'p=$1',
+  RESOLVE_LINK,
+  ...containerSettle(''),
+  'exec head -c "$2" -- "$p"',
+].join('\n');
+
 // $1 target path, $2 expected byte count. The body goes to a temp file beside
 // the target (a copy of it first, so mode and owner carry over), its size is
 // checked, and only then is it moved over the target, so the target holds
@@ -421,8 +452,9 @@ const BOUNDED = [
 // write does not land whole.
 const CONTAINER_WRITE = [
   'p=$1; n=$2',
-  'if [ -L "$p" ]; then p=$(readlink -f "$p") || { echo "Cannot resolve the link $1" >&2; exit 1; }; fi',
+  RESOLVE_LINK,
   'if [ -e "$p" ] && [ ! -f "$p" ]; then echo "Not a regular file: $p" >&2; exit 1; fi',
+  ...containerSettle(' Nothing was saved.'),
   'tmp="$(dirname "$p")/.$(basename "$p").smdb-save.$$"',
   'if [ -f "$p" ]; then cp -p "$p" "$tmp" || : > "$tmp"; else : > "$tmp"; fi 2>/dev/null || { echo "Cannot write a temp file in $(dirname "$p"); the file was not changed" >&2; exit 1; }',
   'cat > "$tmp" || { rm -f "$tmp"; exit 1; }',
@@ -435,7 +467,7 @@ const CONTAINER_WRITE = [
   '  esac',
   '  bak="$(dirname "$p")/.$(basename "$p").smdb-backup.$$"',
   '  cp -p "$p" "$bak" 2>/dev/null || { rm -f "$tmp" "$bak"; echo "Cannot write a backup in $(dirname "$p"); the file was not changed" >&2; exit 1; }',
-  '  if cat "$tmp" > "$p" && [ "$(($(wc -c < "$p")))" -eq "$n" ]; then rm -f "$tmp" "$bak"; exit 0; fi',
+  '  if cat "$tmp" > "$p" && [ "$(($(wc -c < "$p")))" -eq "$n" ]; then rm -f "$bak" "$tmp"; exit 0; fi',
   '  rm -f "$tmp"',
   '  if cmp -s "$bak" "$p" 2>/dev/null; then rm -f "$bak"; echo "Cannot write $p in place; the file was not changed" >&2; exit 1; fi',
   '  if cat "$bak" > "$p" && cmp -s "$bak" "$p" 2>/dev/null; then rm -f "$bak"; echo "Writing $p in place failed; the file was restored" >&2; exit 1; fi',
@@ -654,6 +686,10 @@ function localRead(abs: string, realBase: string | null): any {
     const err = e as NodeJS.ErrnoException;
     if (err.code === 'EISDIR') return { success: false, error: 'Cannot read a directory', path: abs };
     if (err.code === 'ENXIO' || err.code === 'ELOOP') return { success: false, error: 'Not a regular file', path: abs };
+    if (err.code === 'ENOENT') {
+      const stopped = settleAt(abs, realBase, ABSENT_TAG);
+      if (stopped) return { success: false, error: stopped, path: abs };
+    }
     return { success: false, error: err.message || 'Failed to read file', path: abs };
   }
   try {
@@ -664,9 +700,12 @@ function localRead(abs: string, realBase: string | null): any {
     const st = fs.fstatSync(fd);
     if (st.isDirectory()) return { success: false, error: 'Cannot read a directory', path: abs };
     if (!st.isFile()) return { success: false, error: 'Not a regular file', path: abs };
-    if (st.size > MAX_FILE_BYTES) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
+    const body = st.size > MAX_FILE_BYTES ? null : readAll(fd, st.size);
+    const stopped = settleAt(toPosix(landed ?? abs), realBase, body ? saveTag(body) : null);
+    if (stopped) return { success: false, error: stopped, path: abs };
+    if (!body) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
 
-    return editableAnswer(abs, readAll(fd, st.size));
+    return editableAnswer(abs, body);
   } catch (e) {
     return { success: false, error: (e as Error).message || 'Failed to read file', path: abs };
   } finally {
@@ -760,11 +799,88 @@ function opError(e: unknown, what: string): string {
   return `${(e as NodeJS.ErrnoException).code || 'Error'}: cannot ${what}`;
 }
 
+// While a save rewrites a file, .<name>.smdb-backup.<old>.<new> beside it holds
+// what the file held before; while a save creates a file without a hard link,
+// .<name>.smdb-ready.<old>.<new> holds the whole new body. <old> and <new> are
+// saveTag of the two bodies, ABSENT_TAG for no file. A crash leaves the copy.
+const SAVE_COPY = /^\.smdb-(backup|ready)\.([0-9a-f]{16})\.([0-9a-f]{16})$/;
+const ABSENT_TAG = '0'.repeat(16);
+const NOTHING_SAVED = ' Nothing was saved.';
+
+function saveTag(body: Buffer): string {
+  return createHash('sha256').update(body).digest('hex').slice(0, 16);
+}
+
+// The bytes of a regular file up to the editor cap, never through a link or a FIFO; null otherwise.
+function readPlainFile(at: string): Buffer | null {
+  let fd: number;
+  try { fd = fs.openSync(at, fs.constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK); } catch { return null; }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
+    const got = readAll(fd, st.size);
+    return got.length === st.size ? got : null;
+  } catch {
+    return null;
+  } finally {
+    try { fs.closeSync(fd); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Settle the copies a save that stopped left beside `name` in the pinned dir.
+ * A copy goes when the file now holds (tag `now`) what it held before that save
+ * or the whole new body. Anything else may be part of that save or a change
+ * made since: the copy is kept and the answer names both files. `now` is null
+ * when the file was not read, which keeps every copy.
+ */
+function settleStoppedSave(at: string, shownDir: string, name: string, now: string | null, tail: string): string | null {
+  let names: string[];
+  try { names = fs.readdirSync(at); } catch (e) {
+    return `${opError(e, `check ${shownDir} for a save that stopped`)}.${tail}`;
+  }
+  const prefix = `.${name}`;
+  const target = `${shownDir}/${name}`;
+  for (const entry of names) {
+    const m = entry.startsWith(prefix) ? SAVE_COPY.exec(entry.slice(prefix.length)) : null;
+    if (!m) continue;
+    try { if (!fs.lstatSync(`${at}/${entry}`).isFile()) continue; } catch { continue; }
+    if (now !== null && (now === m[2] || now === m[3])) {
+      try { fs.unlinkSync(`${at}/${entry}`); } catch { /* checked again by the next open or save */ }
+      continue;
+    }
+    const shown = `${shownDir}/${entry}`;
+    const backup = m[1] === 'backup';
+    const body = readPlainFile(`${at}/${entry}`);
+    const what = backup ? `what ${target} held before that save` : 'the whole body of that save';
+    const copy = !body ? `${what} should be in ${shown}, which could not be read to check it`
+      : saveTag(body) === (backup ? m[2] : m[3]) ? `${what} is in ${shown}`
+      : `${shown} should hold ${what} but does not match its recorded hash`;
+    const state = now === ABSENT_TAG ? 'is missing' : 'may hold only part of a save that did not finish';
+    return `${target} ${state}; ${copy}. Compare the two, then delete ${shown} to edit ${target} again.${tail}`;
+  }
+  return null;
+}
+
+/** settleStoppedSave for a path not yet pinned; null when its folder cannot be pinned. */
+function settleAt(file: string, realBase: string | null, now: string | null): string | null {
+  const safe = safeDir(file, realBase);
+  if ('error' in safe) return null;
+  const dir = pinDir(safe.dir, realBase);
+  if ('error' in dir) return null;
+  try {
+    return settleStoppedSave(dir.at, safe.dir, safe.name, now, '');
+  } finally {
+    try { fs.closeSync(dir.fd); } catch { /* already gone */ }
+  }
+}
+
 /**
  * Write in place with a fsynced backup beside the file first: truncate, write,
  * fsync, read the size back, and put the old bytes back from memory on any
  * failure. The backup is removed only after a confirmed write or a confirmed
- * restore, so the old content always survives somewhere.
+ * restore, so the old content always survives somewhere; after a crash the
+ * next open or save settles it (settleStoppedSave).
  */
 function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buffer, old: fs.Stats): { error?: string } {
   const name = path.posix.basename(dest);
@@ -774,14 +890,16 @@ function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buff
   } catch (e) {
     return { error: `${opError(e, `open ${dest}`)}; the file was not changed` };
   }
-  const backupName = `.${name}.smdb-backup.${process.pid}.${randomBytes(4).toString('hex')}`;
-  const backupAt = `${dir.at}/${backupName}`;
-  const backupShown = `${path.posix.dirname(dest)}/${backupName}`;
   try {
     const st = fs.fstatSync(fd);
     if (st.dev !== old.dev || st.ino !== old.ino || !st.isFile()) return { error: 'Path changed during the operation, retry; the file was not changed' };
     const previous = readAll(fd, st.size);
     if (previous.length !== st.size) return { error: `Could not read all of ${dest}; the file was not changed` };
+    const stopped = settleStoppedSave(dir.at, path.posix.dirname(dest), name, saveTag(previous), NOTHING_SAVED);
+    if (stopped) return { error: stopped };
+    const backupName = `.${name}.smdb-backup.${saveTag(previous)}.${saveTag(bytes)}`;
+    const backupAt = `${dir.at}/${backupName}`;
+    const backupShown = `${path.posix.dirname(dest)}/${backupName}`;
 
     let bfd: number;
     try {
@@ -798,6 +916,7 @@ function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buff
       return { error: `${opError(e, `write a backup beside ${dest}`)}; the file was not changed` };
     }
     try { fs.closeSync(bfd); } catch { /* already gone */ }
+    try { fs.fsyncSync(dir.fd); } catch { /* not supported for directories here */ }
 
     try {
       fs.ftruncateSync(fd, 0);
@@ -818,11 +937,69 @@ function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buff
       try { fs.unlinkSync(backupAt); } catch { /* the restore is confirmed */ }
       return { error: `${why}; the file was restored` };
     }
-    try { fs.unlinkSync(backupAt); } catch { /* the save is confirmed; a stray backup is harmless */ }
+    try { fs.unlinkSync(backupAt); } catch { /* the save is confirmed; the next open or save drops the backup */ }
     return {};
   } finally {
     try { fs.closeSync(fd); } catch { /* already gone */ }
   }
+}
+
+// Codes a filesystem without hard links (FAT, exFAT, some network and FUSE mounts) gives for link(2).
+const NO_HARD_LINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV']);
+
+/**
+ * Put a synced temp file's body at a free name where link(2) is refused. The
+ * temp becomes the ready copy, then an exclusive create refuses a name that
+ * appeared meanwhile. A create that fails removes its own partial file; one it
+ * cannot remove is kept beside the ready copy, and the answer names both.
+ */
+function createNoLink(dir: { fd: number; at: string }, dest: string, tmpPath: string, bytes: Buffer): { error?: string } {
+  const name = path.posix.basename(dest);
+  const at = `${dir.at}/${name}`;
+  const readyAt = `${dir.at}/.${name}.smdb-ready.${ABSENT_TAG}.${saveTag(bytes)}`;
+  try {
+    fs.renameSync(tmpPath, readyAt);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
+    return { error: `${opError(e, `create ${dest}`)}; nothing was saved` };
+  }
+  try { fs.fsyncSync(dir.fd); } catch { /* not supported for directories here */ }
+  let fd: number;
+  try {
+    fd = fs.openSync(at, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW, 0o644);
+  } catch (e) {
+    try { fs.unlinkSync(readyAt); } catch { /* the next open or save drops it */ }
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return { error: `${dest} appeared meanwhile; nothing was saved` };
+    return { error: `${opError(e, `create ${dest}`)}; nothing was saved` };
+  }
+  try {
+    try {
+      writeAll(fd, bytes);
+      const size = fs.fstatSync(fd).size;
+      if (size !== bytes.length) throw new Error(`short write: ${size} of ${bytes.length} bytes`);
+      grantFd(fd);
+      fs.fsyncSync(fd);
+    } finally {
+      try { fs.closeSync(fd); } catch { /* already gone */ }
+    }
+  } catch (e) {
+    const why = (e as NodeJS.ErrnoException).code ? opError(e, `write ${dest}`) : (e as Error).message;
+    const got = readPlainFile(at);
+    if (got && got.length <= bytes.length && bytes.subarray(0, got.length).equals(got)) {
+      try { fs.unlinkSync(at); } catch { /* judged below */ }
+    }
+    let absent = false;
+    try { fs.lstatSync(at); } catch (le) { absent = (le as NodeJS.ErrnoException).code === 'ENOENT'; }
+    if (absent) {
+      try { fs.unlinkSync(readyAt); } catch { /* the next open or save drops it */ }
+      return { error: `${why}; nothing was saved` };
+    }
+    const kept = settleStoppedSave(dir.at, path.posix.dirname(dest), name, null, '');
+    return { error: `${why}; ${kept ?? `${dest} may hold only part of the save`}` };
+  }
+  try { fs.unlinkSync(readyAt); } catch { /* the save is confirmed; the next open or save drops the copy */ }
+  try { fs.fsyncSync(dir.fd); } catch { /* not supported for directories here */ }
+  return {};
 }
 
 /**
@@ -830,7 +1007,8 @@ function writeInPlace(dir: { fd: number; at: string }, dest: string, bytes: Buff
  * bot on its own (by the manager or by the repo's own compose) is held by its
  * inode inside the bot's mount namespace, where the manager cannot see the
  * bind, and a rename would leave the bot on the old file. A new file is
- * written to a temp file, size-checked, fsynced and linked into place.
+ * written to a temp file, size-checked, fsynced and linked into place, or
+ * created exclusively where the filesystem has no hard links (createNoLink).
  */
 function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
   if (bytes.length > MAX_FILE_BYTES) return { success: false, error: TOO_LARGE_TO_SAVE };
@@ -853,6 +1031,8 @@ function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
       return { success: true, path: abs, bytes: bytes.length };
     }
 
+    const stopped = settleStoppedSave(dir.at, path.posix.dirname(dest), name, ABSENT_TAG, NOTHING_SAVED);
+    if (stopped) return { success: false, error: stopped };
     const tmpPath = `${dir.at}/.${name}.smdb-save.${process.pid}.${randomBytes(4).toString('hex')}`;
     let fd: number;
     try {
@@ -878,8 +1058,14 @@ function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
     try {
       fs.linkSync(tmpPath, `${dir.at}/${name}`);
     } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? '';
+      if (NO_HARD_LINK.has(code)) {
+        const made = createNoLink(dir, dest, tmpPath, bytes);
+        if (made.error) return { success: false, error: made.error };
+        return { success: true, path: abs, bytes: bytes.length };
+      }
       try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') return { success: false, error: `${dest} appeared meanwhile; nothing was saved` };
+      if (code === 'EEXIST') return { success: false, error: `${dest} appeared meanwhile; nothing was saved` };
       return { success: false, error: `${opError(e, `create ${dest}`)}; nothing was saved` };
     }
     try { fs.unlinkSync(tmpPath); } catch { /* the save is confirmed; a stray temp file is harmless */ }
@@ -985,7 +1171,7 @@ export async function fsRead(botId: string, target: string, reqPath: string): Pr
 
   if (t.kind === 'local') return localRead(abs, t.jail ? resolvedBase(t.base) : null);
 
-  const { stdout, stderr, code } = await spawnCapture('docker', execArgs(t, ['head', '-c', String(MAX_FILE_BYTES + 1), '--', abs]));
+  const { stdout, stderr, code } = await spawnCapture('docker', execArgs(t, ['sh', '-c', CONTAINER_READ, 'sh', abs, String(MAX_FILE_BYTES + 1)]));
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to read file', path: abs };
   if (stdout.length > MAX_FILE_BYTES) return { success: false, error: 'File too large to edit (over 1 MB)', path: abs, tooLarge: true };
   return editableAnswer(abs, stdout);

@@ -107,12 +107,22 @@ function replaceViaTmp(tmp: string, steps: () => void): void {
   }
 }
 
-/** Atomic write: temp file, then rename over the target. */
+/**
+ * Atomic write: a fresh temp file, then rename over the target. A stale tmp is
+ * removed first: writing into it would keep its mode and follow it if it is a
+ * link. With mode, the tmp is chmodded before the rename, past the umask.
+ */
 export function writeFileAtomic(filePath: string, data: string, mode?: number): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = `${filePath}.tmp`;
   replaceViaTmp(tmp, () => {
-    fs.writeFileSync(tmp, data, mode === undefined ? undefined : { mode });
+    try {
+      fs.unlinkSync(tmp);
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
+    fs.writeFileSync(tmp, data, mode === undefined ? { flag: 'wx' } : { flag: 'wx', mode });
+    if (mode !== undefined) fs.chmodSync(tmp, mode);
     fs.renameSync(tmp, filePath);
   });
 }

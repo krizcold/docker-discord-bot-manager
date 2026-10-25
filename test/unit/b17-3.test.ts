@@ -267,7 +267,7 @@ describe('B17-3 the config editor sends a repo-template card only when it differ
     const blocks: any[] = [];
     const ctx: any = vm.createContext({ window: {}, document: { querySelectorAll: () => blocks } });
     vm.runInContext('const cfTemplateOrig = new Map(); let cfTemplateSeq = 0;\n'
-      + ['escapeHtml', 'buildConfigFileBlockHtml', 'registerTemplateOrig', 'collectConfigFiles'].map(fn).join('\n')
+      + ['escapeHtml', 'buildConfigFileBlockHtml', 'registerTemplateOrig', 'configFileReadOnly', 'collectConfigFiles'].map(fn).join('\n')
       + '\nthis.render = buildConfigFileBlockHtml; this.collect = collectConfigFiles;', ctx);
     return { ctx, blocks };
   };

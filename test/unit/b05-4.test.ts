@@ -123,7 +123,7 @@ describe('B05-4: a save over an undecryptable body asks first', () => {
         querySelectorAll: (s: string) => (s.includes('[data-undecryptable="1"]') || s === '#config-editor-rows .config-file-block' ? [block] : []),
       },
     });
-    vm.runInContext(pageFunction('collectConfigFiles') + '\n' + pageFunction('saveConfigEditor'), ctx);
+    vm.runInContext(pageFunction('configFileReadOnly') + '\n' + pageFunction('collectConfigFiles') + '\n' + pageFunction('saveConfigEditor'), ctx);
     return { ctx, puts, confirms };
   };
 

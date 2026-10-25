@@ -2177,13 +2177,43 @@ export function setBindMode(services: Record<string, Record<string, unknown>>, t
   return touched;
 }
 
-/** Author each config file's read-only choice on the binds the compose declares for it. */
+/** Author each config file's read-only choice on the binds the compose declares for it; an unset choice keeps the compose's mode. */
 export function setDeclaredBindModes(composeContent: string, files: Array<{ path: string; readOnly?: boolean }>): string {
+  const chosen = files.filter(f => typeof f.readOnly === 'boolean');
+  if (chosen.length === 0) return composeContent;
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services) return composeContent;
-  for (const f of files) setBindMode(services, f.path, f.readOnly !== false);
+  for (const f of chosen) setBindMode(services, f.path, f.readOnly as boolean);
   return stringify(compose, { lineWidth: 0 });
+}
+
+/** The mode the compose gives the binds at `target`: undefined when none is there, they disagree, or the compose does not parse. */
+export function declaredBindReadOnly(composeContent: string, target: string): boolean | undefined {
+  let services: Record<string, Record<string, unknown>> | undefined;
+  try {
+    services = (parseDocument(composeContent).toJSON() as Record<string, unknown> | null)?.services as typeof services;
+  } catch {
+    return undefined;
+  }
+  const modes = new Set<boolean>();
+  for (const service of Object.values(services || {})) {
+    if (!service || !Array.isArray(service.volumes)) continue;
+    for (const vol of service.volumes as unknown[]) {
+      if (typeof vol === 'string') {
+        const s = splitDockerVolume(vol);
+        if (!s || s.dest !== target) continue;
+        const head = `${s.source}:${s.dest}`;
+        if (!vol.startsWith(head)) continue;
+        modes.add(vol.slice(head.length).replace(/^:/, '').split(',').includes('ro'));
+      } else if (vol && typeof vol === 'object') {
+        const v = vol as Record<string, unknown>;
+        if (v.type === 'volume' || v.target !== target) continue;
+        modes.add(v.read_only === true);
+      }
+    }
+  }
+  return modes.size === 1 ? [...modes][0] : undefined;
 }
 
 /** Collect declared bind {target -> hostSource} pairs whose source is under prefix. */
@@ -2315,7 +2345,7 @@ export function prepareDockerBotFiles(
             report.delivered[local] = bodyHash(cf.body);
             log(`[Docker] Applied config ${cf.path}`);
           }
-          setBindMode(services, cf.path, cf.readOnly !== false);
+          if (typeof cf.readOnly === 'boolean') setBindMode(services, cf.path, cf.readOnly);
         } catch (err) {
           log(`[Docker] Warning: could not write config ${cf.path}: ${err}`);
           report.failed.push(cf.path);

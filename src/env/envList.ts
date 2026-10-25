@@ -19,7 +19,8 @@ import {
   DetectedEnvVar,
 } from './manager';
 import { findAppCapabilities } from '../config/appCapabilities';
-import { frontingGateway, frontingGatewayBindTargets } from '../templates/pcsProcessing';
+import { declaredBindReadOnly, frontingGateway, frontingGatewayBindTargets } from '../templates/pcsProcessing';
+import { hasExistingCompose } from '../templates/compose';
 import { parseDocument } from 'yaml';
 
 /**
@@ -303,6 +304,24 @@ function composeGatewayBindTargets(repoPath: string | null): string[] {
   return [];
 }
 
+/** Read-only or writable for each path a bind in the compose the build uses gives one mode; other paths are left out. */
+export function repoBindModes(repoPath: string | null, paths: string[]): Map<string, boolean> {
+  const modes = new Map<string, boolean>();
+  const composePath = repoPath ? hasExistingCompose(repoPath) : null;
+  if (!composePath) return modes;
+  let text: string;
+  try {
+    text = fs.readFileSync(composePath, 'utf-8');
+  } catch {
+    return modes;
+  }
+  for (const p of paths) {
+    const ro = declaredBindReadOnly(text, p);
+    if (ro !== undefined) modes.set(p, ro);
+  }
+  return modes;
+}
+
 export interface EditorEnvVar extends EnvFieldMeta {
   key: string;
   displayLabel: string;
@@ -395,6 +414,17 @@ export function buildBotEnvList(
   return result;
 }
 
+export interface EditorConfigFile {
+  path: string;
+  body: string;
+  readOnly?: boolean;      // unset: the operator never chose; see repoReadOnly
+  repoReadOnly?: boolean;  // with readOnly unset, the mode the repo compose gives this path, when one bind gives one
+  enabled: boolean;
+  bodyUndecryptable?: boolean;
+  inactive?: string;
+  fromTemplate?: boolean;
+}
+
 /**
  * Config-editor view: the detected config files a fresh install would offer
  * (default body run through any per-source template modifier), overlaid with the
@@ -407,11 +437,11 @@ export function buildBotConfigList(
   botId: string,
   sourceUrl?: string,
   gateway?: GatewayDeploy
-): Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string; fromTemplate?: boolean }> {
+): EditorConfigFile[] {
   const { files: stored, undecryptable } = configFileManager.getConfigFilesWithStatus(botId);
   const storedByPath = new Map(stored.map(s => [s.path, s]));
   const seen = new Set<string>();
-  const result: Array<{ path: string; body: string; readOnly: boolean; enabled: boolean; bodyUndecryptable?: boolean; inactive?: string; fromTemplate?: boolean }> = [];
+  const result: EditorConfigFile[] = [];
 
   const allDetected = repoPath && fs.existsSync(repoPath) ? (detectBotType(repoPath).configFiles || []) : [];
   const gatewayPaths = new Set(gateway?.dropped ? composeGatewayBindTargets(repoPath) : []);
@@ -424,7 +454,7 @@ export function buildBotConfigList(
     result.push({
       path: cf.inContainerPath,
       body: s ? s.body : applyTemplateModifiers(sourceUrl || '', cf.targetName, cf.format, cf.rawBody),
-      readOnly: s ? s.readOnly !== false : true,
+      ...(s && typeof s.readOnly === 'boolean' ? { readOnly: s.readOnly } : {}),
       enabled: s ? s.enabled !== false : true,
       ...(s && undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
       ...(s ? {} : { fromTemplate: true }),
@@ -435,11 +465,16 @@ export function buildBotConfigList(
     if (seen.has(s.path)) continue;
     seen.add(s.path);
     result.push({
-      path: s.path, body: s.body, readOnly: s.readOnly !== false, enabled: s.enabled !== false,
+      path: s.path, body: s.body, ...(typeof s.readOnly === 'boolean' ? { readOnly: s.readOnly } : {}), enabled: s.enabled !== false,
       ...(undecryptable.includes(s.path) ? { bodyUndecryptable: true } : {}),
       ...(gatewayPaths.has(s.path) ? { inactive: gatewayFileNote(gateway!) } : {}),
     });
   }
 
+  const modes = repoBindModes(repoPath, result.filter(f => f.readOnly === undefined).map(f => f.path));
+  for (const f of result) {
+    const ro = f.readOnly === undefined ? modes.get(f.path) : undefined;
+    if (ro !== undefined) f.repoReadOnly = ro;
+  }
   return result;
 }

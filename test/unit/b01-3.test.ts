@@ -256,9 +256,9 @@ const installPage = (answers: Record<string, any[]>, flushOk = true) => {
     classList: { contains: () => false },
     querySelector: (s: string) => (s === '.env-key' ? { value: 'K' } : { value: 'v', dataset: {} }),
   };
-  const cfBlock = { querySelector: (s: string) => (s === '.cf-path' ? { value: '/app/c.json' } : s === '.cf-body' ? { value: '{}' } : { checked: true }) };
+  const cfBlock = { dataset: {}, querySelector: (s: string) => (s === '.cf-path' ? { value: '/app/c.json' } : s === '.cf-body' ? { value: '{}' } : { checked: true }) };
   const btn = { disabled: false, textContent: '', isConnected: true, dataset: {}, classList: { contains: () => false }, querySelector: () => null };
-  const ctx = runPage(['botLabel', 'guidedReadyToSave', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'doInstall', 'saveConfigEditor'], {
+  const ctx = runPage(['botLabel', 'guidedReadyToSave', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'configFileReadOnly', 'doInstall', 'saveConfigEditor'], {
     document: {
       getElementById: (x: string) => (x === 'install-name' ? { value: 'Bot' } : btn),
       querySelectorAll: (s: string) => (s.includes('env-row') ? [envRow] : [cfBlock]),

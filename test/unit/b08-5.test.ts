@@ -61,7 +61,7 @@ vi.mock('../../src/templates/pcsProcessing', async (importOriginal) => ({
 vi.mock('../../src/config/configFileManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/config/configFileManager')>()),
   getConfigFilesWithStatus: () => ({ files: [{ path: 'a.json', content: '{}' }], undecryptable: [], corrupt: h.cfgCorrupt }),
-  getBuiltMounts: () => ['a.json:ro'],
+  getBuiltMounts: () => ['a.json:default'],
 }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 

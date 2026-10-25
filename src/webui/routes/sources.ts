@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as sourceManager from '../../source/sourceManager';
 import { broadcastToClients } from '../server';
-import { buildWizardEnvList } from '../../env/envList';
+import { buildWizardEnvList, repoBindModes } from '../../env/envList';
 import { getDeploymentMode } from '../../casaos/detector';
 import { frontingGatewayDropped } from '../../templates/pcsProcessing';
 import { applyTemplateModifiers } from '../../config/templateModifiers';
@@ -227,6 +227,7 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
       // (data-driven; the user can still tweak/revert in the wizard). When a
       // source has a guided install manifest for this file, attach it plus the
       // parsed body so the wizard can render the guided form.
+      const repoModes = repoBindModes(repoPath, (detection.configFiles || []).map(cf => cf.inContainerPath));
       const configFiles = (detection.configFiles || []).map(cf => {
         let rawBody = applyTemplateModifiers(source.url, cf.targetName, cf.format, cf.rawBody);
         const manifest = findManifest(source.url, cf.targetName) || null;
@@ -236,7 +237,8 @@ export function createSourceRoutes(wss: WebSocketServer): Router {
           const r = parseConfig(manifest.format, rawBody);
           if (r.ok) parsed = r.data ?? {};
         }
-        return { ...cf, rawBody, manifest, parsed };
+        const repoReadOnly = repoModes.get(cf.inContainerPath);
+        return { ...cf, rawBody, manifest, parsed, ...(repoReadOnly !== undefined ? { repoReadOnly } : {}) };
       });
 
       // When the token is configured via a guided in-file field, the bot's env

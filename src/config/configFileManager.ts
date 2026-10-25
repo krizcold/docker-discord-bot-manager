@@ -15,12 +15,17 @@ import { storeFileState, preserveCorruptCopy } from './storeFile';
 export interface BotConfigFile {
   path: string;       // in-container mount path, e.g. /app/config.json
   body: string;       // verbatim file contents
-  readOnly?: boolean; // default true; the build mounts the file read-only, false mounts it writable
+  readOnly?: boolean; // true mounts the file read-only, false writable; unset keeps the mode of a bind the repo compose declares, and a bind the manager adds is read-only
   enabled?: boolean;  // default true; false = keep the user's choice but do not deliver/override (bot uses its baked-in copy)
 }
 
 interface ConfigFileStorage {
   files: Array<{ path: string; body: string; readOnly?: boolean; enabled?: boolean }>;   // body encrypted
+}
+
+/** The operator's Writable choice, kept only when it is one: anything else stays unset. */
+function writableChoice(f: { readOnly?: unknown }): { readOnly?: boolean } {
+  return typeof f.readOnly === 'boolean' ? { readOnly: f.readOnly } : {};
 }
 
 function storageFile(botId: string): string {
@@ -77,7 +82,7 @@ export function getConfigFilesWithStatus(botId: string): { files: BotConfigFile[
   const files = storage.files.map(f => {
     const body = decryptOrNull(f.body);
     if (body === null) undecryptable.push(f.path);
-    return { path: f.path, body: body ?? '', readOnly: f.readOnly !== false, enabled: f.enabled !== false };
+    return { path: f.path, body: body ?? '', ...writableChoice(f), enabled: f.enabled !== false };
   });
   return { files, undecryptable, corrupt };
 }
@@ -137,11 +142,11 @@ export function setConfigFiles(botId: string, files: BotConfigFile[]): void {
     .map(f => {
       const p = f.path.trim();
       const keep = f.body === '' ? broken.get(p) : undefined;
-      return { path: p, body: keep ? keep.body : encrypt(f.body), readOnly: f.readOnly !== false, enabled: f.enabled !== false };
+      return { path: p, body: keep ? keep.body : encrypt(f.body), ...writableChoice(f), enabled: f.enabled !== false };
     });
   const present = new Set(nextFiles.map(f => f.path));
   for (const [p, old] of broken) {
-    if (!present.has(p)) nextFiles.push({ path: p, body: old.body, readOnly: old.readOnly !== false, enabled: old.enabled !== false });
+    if (!present.has(p)) nextFiles.push({ path: p, body: old.body, ...writableChoice(old), enabled: old.enabled !== false });
   }
   const storage: ConfigFileStorage = { files: nextFiles };
 
@@ -158,9 +163,9 @@ function builtMountsFile(botId: string): string {
   return path.join(getEnvPath(botId), 'builtMounts.json');
 }
 
-/** A config file's mount as the build authors it: 'path:ro' or 'path:rw'. */
+/** A config file's mount as the build authors it: 'path:ro', 'path:rw', or 'path:default' when the Writable choice is unset. */
 export function mountKey(f: { path: string; readOnly?: boolean }): string {
-  return `${f.path}:${f.readOnly !== false ? 'ro' : 'rw'}`;
+  return `${f.path}:${f.readOnly === true ? 'ro' : f.readOnly === false ? 'rw' : 'default'}`;
 }
 
 /** The config file mounts the last finished build authored; null when no build recorded them. Throws when the record is unreadable. */

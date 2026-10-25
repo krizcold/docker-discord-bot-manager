@@ -5152,7 +5152,7 @@
 
       // Auto-render an editable block per detected config template (prefilled).
       const configBlocksHtml = installConfigHints
-        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, true, true, cf.manifest, cf.format, cf.parsed))
+        .map(cf => buildConfigFileBlockHtml(cf.inContainerPath, cf.rawBody, undefined, true, cf.manifest, cf.format, cf.parsed, false, undefined, false, cf.repoReadOnly))
         .join('');
 
       el.innerHTML = `
@@ -5382,8 +5382,15 @@
     const cfTemplateOrig = new Map();
     let cfTemplateSeq = 0;
 
-    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable, inactive, fromTemplate) {
-      const writable = readOnly === false;
+    // readOnly unset: the file keeps the repo compose's mode (repoReadOnly, when the server knows it), or read-only on a bind the manager adds.
+    function buildConfigFileBlockHtml(containerPath, body, readOnly, enabled, manifest, format, parsed, undecryptable, inactive, fromTemplate, repoReadOnly) {
+      const chosen = readOnly === true || readOnly === false;
+      const writable = chosen ? readOnly === false : repoReadOnly === false;
+      const writableTitle = chosen
+        ? 'Mount the file writable so the bot can change it; off mounts it read-only. Takes effect at the next Build (or Update).'
+        : (repoReadOnly === true || repoReadOnly === false)
+          ? `Untouched, the file keeps the mode the repo's compose gives it (${repoReadOnly ? 'read-only' : 'writable'}). On mounts it writable, off read-only, from the next Build (or Update).`
+          : "Untouched, a file the repo's compose mounts keeps the repo's mode, and any other file is mounted read-only. On mounts it writable, off read-only, from the next Build (or Update).";
       const isEnabled = enabled !== false;
       const hasManifest = !!(manifest && window.guidedNextId);
       const expanded = hasManifest || !(body && body.trim());
@@ -5415,7 +5422,8 @@
 
       const idAttr = blockId ? ` id="${blockId}"` : '';
       const guidedAttr = (hasManifest ? ' data-guided="1"' : '') + (undecryptable ? ' data-undecryptable="1"' : '')
-        + (fromTemplate ? ` data-template="${registerTemplateOrig(containerPath, body, readOnly, enabled)}"` : '');
+        + ` data-readonly="${chosen ? String(readOnly) : ''}"`
+        + (fromTemplate ? ` data-template="${registerTemplateOrig(containerPath, body, chosen ? readOnly : undefined, enabled)}"` : '');
       const pathDim = (!hasManifest && !isEnabled) ? ' opacity: 0.45;' : '';
 
       return `<div class="config-file-block"${idAttr}${guidedAttr} style="border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 8px;">
@@ -5431,12 +5439,12 @@
         <div class="cf-collapse${expanded ? '' : ' hidden'}">
           ${inner}
           <div style="display: flex; align-items: center; gap: 18px; margin-top: 8px;">
-            <label class="toggle-row" title="When off, the next Build (or Update) puts the repo default back in place of your edits (a file the bot has changed since is kept).">
+            <label class="toggle-row" title="On, the next Build (or Update) delivers this file over the repo's copy. Off, it puts the repo default back in place of your edits. Either way a file the bot has changed since is kept.">
               <span class="toggle-switch"><input type="checkbox" class="cf-enabled" ${isEnabled ? 'checked' : ''} onchange="onConfigEnabledToggle(this)"><span class="toggle-slider"></span></span>
               Enabled
             </label>
-            <label class="toggle-row" title="Mount the file writable so the bot can change it; off mounts it read-only. Takes effect at the next Build (or Update).">
-              <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''}><span class="toggle-slider"></span></span>
+            <label class="toggle-row" title="${writableTitle}">
+              <span class="toggle-switch"><input type="checkbox" class="cf-writable" ${writable ? 'checked' : ''} onchange="this.closest('.config-file-block').dataset.writableTouched = '1'"><span class="toggle-slider"></span></span>
               Writable
             </label>
           </div>
@@ -5446,8 +5454,16 @@
 
     function registerTemplateOrig(containerPath, body, readOnly, enabled) {
       const key = String(++cfTemplateSeq);
-      cfTemplateOrig.set(key, { path: (containerPath || '').trim(), body: body || '', readOnly: readOnly !== false, enabled: enabled !== false });
+      cfTemplateOrig.set(key, { path: (containerPath || '').trim(), body: body || '', readOnly, enabled: enabled !== false });
       return key;
+    }
+
+    // The card's Writable choice: the toggle once the operator moved it at all, else the value it was loaded with (undefined when unset).
+    function configFileReadOnly(block) {
+      const box = block.querySelector('.cf-writable');
+      const loaded = block.dataset.readonly;
+      if (block.dataset.writableTouched === '1' || loaded === undefined) return !box.checked;
+      return loaded === '' ? undefined : loaded === 'true';
     }
 
     // Path, body, mode and on/off of every card under rootSel; a repo-template card the operator left as loaded is skipped.
@@ -5456,13 +5472,13 @@
       document.querySelectorAll(rootSel + ' .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();
         const body = block.querySelector('.cf-body').value;
-        const readOnly = !block.querySelector('.cf-writable').checked;
+        const readOnly = configFileReadOnly(block);
         const enabled = block.querySelector('.cf-enabled').checked;
         const orig = block.dataset.template ? cfTemplateOrig.get(block.dataset.template) : null;
         if (orig && orig.path === path && orig.body === body && orig.readOnly === readOnly && orig.enabled === enabled) return;
         // Persist disabled rows even with an empty body so the off choice sticks;
         // an enabled row needs real content or it is dropped (never deliver empty).
-        if (path && (body.trim() || !enabled)) files.push({ path, body, readOnly, enabled });
+        if (path && (body.trim() || !enabled)) files.push({ path, body, ...(readOnly === undefined ? {} : { readOnly }), enabled });
       });
       return files;
     }
@@ -5502,7 +5518,7 @@
         }
 
         const files = Array.isArray(res.files) ? res.files : [];
-        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable, f.inactive, f.fromTemplate)).join('');
+        const rowsHtml = files.map(f => buildConfigFileBlockHtml(f.path, f.body, f.readOnly, f.enabled, f.manifest, f.format, f.parsed, f.bodyUndecryptable, f.inactive, f.fromTemplate, f.repoReadOnly)).join('');
 
         content.innerHTML = `
           <h3>Config Files: ${escapeHtml(bot?.displayName || botId)}</h3>
@@ -6117,10 +6133,10 @@
       document.querySelectorAll('#install-config-files .config-file-block').forEach(block => {
         const path = block.querySelector('.cf-path').value.trim();
         const body = block.querySelector('.cf-body').value;
-        const readOnly = !block.querySelector('.cf-writable').checked;
+        const readOnly = configFileReadOnly(block);
         const enabled = block.querySelector('.cf-enabled').checked;
         // Persist a disabled row even with an empty body so the off choice sticks.
-        if (path && (body.trim() || !enabled)) configFiles.push({ path, body, readOnly, enabled });
+        if (path && (body.trim() || !enabled)) configFiles.push({ path, body, ...(readOnly === undefined ? {} : { readOnly }), enabled });
       });
 
       const cancelBtn = document.getElementById('install-cancel');

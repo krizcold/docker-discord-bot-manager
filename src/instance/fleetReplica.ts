@@ -28,7 +28,7 @@ import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyB
 import { hasAppHooks } from './appHookClient';
 import { rescueRunnerLive } from './recoveryRescue';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
-import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
+import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetFailbackRun, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
@@ -77,6 +77,12 @@ function saveSeed(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
   containerManager.updateInstanceFleetDbReplicaSeed(botId, { ...current, ...patch, updatedAt: Date.now() });
 }
 
+/** The run on record now: a caller's snapshot can predate a Cancel or a Dismiss. */
+function liveFailback(instance: InstanceConfig): FleetFailbackRun | null {
+  const now = containerManager.getBot(instance.id);
+  return (now ? now.fleetFailback : instance.fleetFailback) ?? null;
+}
+
 /** A seed a runner owns right now; a parked one blocks nothing. */
 /**
  * A failback or drop-back run owns this instance's database lanes while it is
@@ -84,8 +90,14 @@ function saveSeed(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
  * sequences. Only the run itself (its startedAt token) passes.
  */
 function runHold(instance: InstanceConfig, run?: number): string | null {
-  const active = instance.fleetFailback;
-  if (!active || active.startedAt === run) return null;
+  const active = liveFailback(instance);
+  if (typeof run === 'number') {
+    if (!active) return 'The failback run that asked is no longer on record (it was cancelled or dismissed); nothing was changed';
+    if (active.startedAt === run) {
+      return active.parked ? `The failback run that asked was stopped (${active.lastError || 'parked'}); nothing was changed` : null;
+    }
+  }
+  if (!active) return null;
   const phase = fleetFailback.failbackPhaseText(active);
   if (!active.parked) return `A ${active.mode} run is on this instance (${phase}); wait for it to park or finish (its card on the Database modal then shows its exits)`;
   if (active.phase === 'wipe-consent' && !active.consentAt) {
@@ -690,7 +702,7 @@ export function provisionFleetReplica(
   // role by design and mid-failback follows another node's database by
   // posture, which is what this gate asserts. Keyed on the record, not the
   // bare token, so only the run on this instance holds it.
-  const inRun = typeof opts.run === 'number' && instance.fleetFailback?.startedAt === opts.run;
+  const inRun = typeof opts.run === 'number' && liveFailback(instance)?.startedAt === opts.run;
   // So is the state a dismissed failback leaves once its seed retired this
   // machine's own database (a decline recorded at seeding or later): the node
   // still follows another node's database by posture, and this lane is the
@@ -730,7 +742,7 @@ export function provisionFleetReplica(
   // The failback's wipe consent covers this volume: its stale-primary seed
   // clears the same volume unasked, and a retry after that seed parked
   // finds the volume it made.
-  const confirmVolume = inRun && typeof instance.fleetFailback?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const confirmVolume = inRun && typeof liveFailback(instance)?.consentAt === 'number' ? record.volume : opts.confirmVolume;
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
 
@@ -1353,8 +1365,8 @@ export function reseedStalePrimary(
   const record = replicaRecordFor(instance, validated.intake);
   // The same rule as provisionFleetReplica: the failback run's wipe consent
   // covers the replica volume, and every other caller confirms it by name.
-  const inRun = typeof opts.run === 'number' && instance.fleetFailback?.startedAt === opts.run;
-  const confirmVolume = inRun && typeof instance.fleetFailback?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const inRun = typeof opts.run === 'number' && liveFailback(instance)?.startedAt === opts.run;
+  const confirmVolume = inRun && typeof liveFailback(instance)?.consentAt === 'number' ? record.volume : opts.confirmVolume;
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
 
@@ -2102,7 +2114,8 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (held) return { success: false, error: held };
   // The drop-back run's consent (F32 under F5) is what re-seeds a promoted copy
   // that took the fleet's writes as a stand-in: the operator saw the verdict.
-  const consented = opts.consentedRun !== undefined && instance.fleetFailback?.startedAt === opts.consentedRun && instance.fleetFailback.consentAt !== null;
+  const consenting = liveFailback(instance);
+  const consented = opts.consentedRun !== undefined && consenting?.startedAt === opts.consentedRun && consenting.consentAt !== null;
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to re-seed' };
   if (seedRunning(instance.id)) return { success: false, error: 'A seed is already running on this instance' };

@@ -103,6 +103,7 @@ const HEALTH_PUSH_MS = 15000;
 const FLEET_MASTER_FACTS_TIMEOUT_MS = 3000;
 
 const UPDATE_HEAD_UNREAD = "The source checkout's current commit could not be read, so the manager can't confirm whether an update is available.";
+const UPDATE_BUILT_UNKNOWN = "The manager has no record of the commit this bot was built from, so it can't confirm whether an update is available. Rebuilding the bot records it.";
 const UPDATE_SOURCE_MISSING = "The bot's source is not in the source list, so the manager can't confirm whether an update is available.";
 
 /** The deployed value of one env key, or null when the deployed compose is unreadable, lacks it or holds two values. */
@@ -111,6 +112,15 @@ function deployedEnvValue(botId: string, key: string): string | null {
   if (deployed === null || deployed.length === 0) return null;
   const values = new Set(deployed.map(d => d.value.trim()));
   return values.size === 1 ? [...values][0] : null;
+}
+
+/** The role a bot was deployed with, folded; null when the deployed compose is unreadable or holds two values. */
+function deployedRole(botId: string, roleEnv: Parameters<typeof foldedRoleValue>[0]): string | null {
+  const deployed = containerManager.deployedComposeEnvValues(botId, [roleEnv.key], true);
+  if (deployed === null) return null;
+  const values = new Set(deployed.map(d => foldedRoleValue(roleEnv, d.value)));
+  if (values.size > 1) return null;
+  return values.size === 1 ? [...values][0] : foldedRoleValue(roleEnv, undefined);
 }
 
 export function createBotRoutes(wss: WebSocketServer): Router {
@@ -182,6 +192,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
               }
             }
           }
+          if (source && !bot.lastBuiltCommit) updateCantConfirm = UPDATE_BUILT_UNKNOWN;
         }
         if (!source && bot.lastBuiltCommit) updateCantConfirm = UPDATE_SOURCE_MISSING;
 
@@ -348,9 +359,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         try {
           const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
           if (!cp || !cp.groupSecretEnv) continue;
-          const env = envManager.getEnvVars(bot.id);
-          const folded = foldedRoleValue(cp.roleEnv, env[cp.roleEnv.key]);
-          if (cp.roleEnv.dialTargetOrder.indexOf(folded) <= 0) continue;
+          const folded = deployedRole(bot.id, cp.roleEnv);
+          if (folded === null || cp.roleEnv.dialTargetOrder.indexOf(folded) <= 0) continue;
           const secret = deployedEnvValue(bot.id, cp.groupSecretEnv);
           if (!secret) continue;
           const addrs = fleetAddrsOf(bot, cp.urlScheme);
@@ -373,12 +383,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
           if (!cp) continue;
           const env = envManager.getEnvVars(bot.id);
-          // An explicit value wins; a blank one folds to the record's default
-          // (F4: absent means leader). The record's FIRST dial target leads
-          // the candidate list; the dial list key never implies a role - every
-          // node carries that list, the first target included.
-          const folded = foldedRoleValue(cp.roleEnv, env[cp.roleEnv.key]);
-          if (folded !== cp.roleEnv.dialTargetOrder[0]) continue;
+          // The deployed role decides, not a saved edit not yet applied; a blank one folds to the record's default.
+          const folded = deployedRole(bot.id, cp.roleEnv);
+          if (folded === null || folded !== cp.roleEnv.dialTargetOrder[0]) continue;
           const addrs = fleetAddrsOf(bot, cp.urlScheme);
           if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
 
@@ -452,6 +459,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
             const head = await sourceManager.readSourceHead(bot.sourceId);
             if (head === null) updateCantConfirm = UPDATE_HEAD_UNREAD;
             else updateAvailable = bot.lastBuiltCommit !== head;
+          } else {
+            updateCantConfirm = UPDATE_BUILT_UNKNOWN;
           }
         }
       }
@@ -1100,11 +1109,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       // Fetch source first to ensure we have the latest remote state
-      let fetchBehindBy = 0;
       let fetched = true;
       try {
-        const fetchResult = await sourceManager.fetchSource(bot.sourceId);
-        fetchBehindBy = fetchResult.behindBy;
+        await sourceManager.fetchSource(bot.sourceId);
       } catch (err) {
         fetched = false;
         console.warn(`[API] Failed to fetch source for update check: ${err}`);
@@ -1121,8 +1128,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       if (!bot.lastBuiltCommit) {
-        // Never tracked what commit was built; assume behind
-        res.json({ success: true, hasUpdates: true, behindBy: fetchBehindBy || 1 });
+        res.json({ success: true, hasUpdates: false, behindBy: 0, cantConfirm: UPDATE_BUILT_UNKNOWN });
         return;
       }
 

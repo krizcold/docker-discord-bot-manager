@@ -58,7 +58,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'run') return cb(new Error('strip refused'), '', 'strip refused');
     return cb(null, '', '');
   });
-  return { ...real, execFile, default: { ...real, execFile } };
+  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  return { ...real, execFile: fencedExecFile, default: { ...real, execFile: fencedExecFile } };
 });
 
 import * as fs from 'fs';

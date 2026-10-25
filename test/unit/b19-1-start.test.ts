@@ -35,13 +35,13 @@ vi.mock('child_process', async (importOriginal) => {
     child.stdin.on('data', (d: Buffer) => { call.stdin += d.toString(); });
     child.kill = () => {};
     setTimeout(() => {
-      child.stdout.end(args.join(' ').includes('pg_stat_ssl') ? `${h.plainClients}\n` : '');
+      child.stdout.end(args.join(' ').includes('pg_stat_ssl') ? `${h.plainClients}\n` : args.join(' ').includes('pg_read_file') ? '0\n' : '');
       child.stderr.end('');
       setTimeout(() => child.emit('close', 0), 1);
     }, 2);
     return child;
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync: () => '', spawn };
+  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, execSync: () => '', spawn };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({

@@ -25,6 +25,7 @@ import { generateCertPair } from './fleetReplication';
 import { getDeploymentMode } from '../casaos/detector';
 import { sharedNetworkName } from '../templates/pcsProcessing';
 import { ensureRsyncDaemon, containerStateOf, ContainerState, RECOVERY_CONTROL_PORT, releaseQuiesceSlot } from './recoveryControl';
+import { FENCE_PGDATA, WRITE_FENCE_MARK, stripFenceHbaScript } from './fleetBackup';
 import { InstanceConfig, RecoveryChannelRecord } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { childFailureText, redactSecrets } from '../config/secretText';
@@ -454,31 +455,34 @@ export async function disarmRecoveryChannel(instance: InstanceConfig): Promise<{
       const fleetDb = instance.fleetDb;
       // Lift the quiesce write fence if a swap set it. The disarm button is
       // the source's documented cleanup after a cancelled swap, so this is
-      // where the fence must reliably die: when the database container is
-      // down the exec fails and the fence is stripped from the volume file
-      // instead (auto.conf is a plain file; the next start comes up clean).
-      // The READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
-      // SYSTEM in read-only transactions.
+      // where the fence must reliably die: its pg_hba lines first (a lift that
+      // stops there leaves the read-only default, not a lockout), then the
+      // default. When the database container is down the execs fail and both
+      // are stripped from the volume files instead (the next start comes up
+      // clean).
       // The fence and the slot are cluster-level, so these sessions use the
       // maintenance db: they must keep working when the fleet database itself
       // is missing (a restore whose recreate failed).
+      const hba = await docker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', stripFenceHbaScript(FENCE_PGDATA)]);
       const unfence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+        '-c', 'SELECT pg_reload_conf()',
         '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
         '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
         '-c', 'SELECT pg_reload_conf()']);
-      const volume = unfence.ok ? null : await volumeState(fleetDb.volume);
+      const volume = hba.ok && unfence.ok ? null : await volumeState(fleetDb.volume);
+      const fencedText = 'READ-ONLY or refusing every connection but the manager\'s';
       if (volume && volume.state === 'unknown') {
-        left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists (${volume.error}), so the disarm can't confirm whether the database is still fenced READ-ONLY`);
+        left.push(`docker did not answer whether the volume ${fleetDb.volume} of ${fleetDb.containerName} exists (${volume.error}), so the disarm can't confirm whether the database is still ${fencedText}`);
       } else if (volume && volume.state === 'exists') {
         const strip = await docker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
-          "f=/pgdata/postgresql.auto.conf; grep -q '^default_transaction_read_only' \"$f\" 2>/dev/null || exit 0; sed -i '/^default_transaction_read_only/d' \"$f\" && echo stripped"]);
+          `f=/pgdata/postgresql.auto.conf; s=; if grep -q '^default_transaction_read_only' "$f" 2>/dev/null; then sed -i '/^default_transaction_read_only/d' "$f" || exit 1; s=1; fi; if grep -q '${WRITE_FENCE_MARK}$' /pgdata/pg_hba.conf 2>/dev/null; then ${stripFenceHbaScript('/pgdata')} || exit 1; s=1; fi; [ -z "$s" ] || echo stripped`]);
         if (!strip.ok) {
-          left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${strip.stderr.trim().split('\n').pop() || 'docker did not answer'}), so the database may stay READ-ONLY`);
+          left.push(`the write fence on ${fleetDb.containerName} could not be lifted (${strip.stderr.trim().split('\n').pop() || 'docker did not answer'}), so the database may stay ${fencedText}`);
         } else if (strip.stdout.includes('stripped')) {
           // A database that runs on keeps the fence it loaded until it restarts.
           const state = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));
-          if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database stays READ-ONLY until its container restarts`);
-          else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay READ-ONLY until its container restarts`);
+          if (state === 'running') left.push(`the write fence was removed from the files of ${fleetDb.containerName} but could not be lifted live, so the database may stay ${fencedText} until its container restarts`);
+          else if (state === 'unknown') left.push(`the write fence was removed from the files of ${fleetDb.containerName}, but docker did not say whether the database runs, so it may stay ${fencedText} until its container restarts`);
         }
       }
       const dbState = containerStateOf(await docker(['inspect', '--format', '{{.State.Running}}', fleetDb.containerName]));

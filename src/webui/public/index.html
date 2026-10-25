@@ -1517,7 +1517,7 @@
               ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
               : '';
             const fenceBadge = bot.fenceStuck
-              ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database READ-ONLY</span>`
+              ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database fenced</span>`
               : '';
 
             // Replication health: sampled in the background, so the badge is a
@@ -2794,7 +2794,7 @@
           </label>
         </div>
         <div id="fleet-backup-list">${listHtml}</div>
-        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. The database is fenced read-only and a fresh safety dump is taken under that fence before anything changes (skipped only when the database itself is missing).</div>
+        <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. The database is fenced (it refuses every connection but the manager's and is read-only) and a fresh safety dump is taken under that fence before anything changes (skipped only when the database itself is missing).</div>
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Replication</div>
           <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
@@ -3154,7 +3154,7 @@
      * fresh safety dump succeeds; that dump is the recovery path.
      */
     async function decommissionFleetDb(botId) {
-      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first under a write fence (the database is read-only with its sessions closed while it runs) and kept with the backups; if the fence or the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
+      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first under a write fence (while it runs, the database refuses every connection but the manager\'s, is read-only and has its sessions closed) and kept with the backups; if the fence or the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
       if (!confirm(warning)) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
@@ -3555,7 +3555,7 @@
             : leftover === 'standby'
               ? 'This rescue has copied nothing yet, but this machine\'s volume still holds the standby copy of the sender an earlier cancelled rescue left, so Start stays refused on this instance until a rescue finishes the swap or the database is decommissioned.'
               : 'No copy has begun, so this machine\'s database is left as it is.';
-      const swap = phase === 'quiesce' || phase === 'catchup' ? '\n\nThe swap had begun: the sender\'s fleet is stopped and its database is read-only. On the sender machine, disarm the channel (which lifts the read-only fence) and clear the swap record on its Database modal before starting it.' : '';
+      const swap = phase === 'quiesce' || phase === 'catchup' ? '\n\nThe swap had begun: the sender\'s fleet is stopped and its database is fenced (it refuses every connection but the manager\'s and is read-only). On the sender machine, disarm the channel (which lifts the fence) and clear the swap record on its Database modal before starting it.' : '';
       if (!confirm(`Cancel the rescue?\n\n${what}${swap}`)) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/recovery-rescue`);
@@ -4238,7 +4238,7 @@
       const label = run.mode === 'drop-back' ? 'Drop-back' : 'Failback';
       const secs = Math.round((Date.now() - run.startedAt) / 1000);
       if (run.parked && run.phase === 'wipe-consent' && !run.consentAt) {
-        return `<div class="error-message">${label} run is waiting for your answer: it is ${escapeHtml(failbackPhaseText(run))}. ${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'} shows exactly what the wipe destroys (the divergence verdict${run.mode === 'drop-back' ? '' : ' and the outcome of the dump taken first'}) and asks you to confirm.${run.fence ? (run.fence.ok ? ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} is fenced read-only while this waits, so nothing lands on it unseen.` : ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} could NOT be fenced read-only (${escapeHtml(run.fence.error || 'unknown reason')}), so a write landing on it before you answer is destroyed by the wipe unseen.`) : ''} Cancel ${run.fence && run.fence.ok && run.fence.owned ? 'lifts the fence and ' : ''}${run.mode === 'drop-back' ? 'leaves the copy as it is' : run.stoppedByRun ? 'starts the instance again with the database untouched' : 'leaves the instance stopped, as it was, with the database untouched'} and closes the automatic run for this stand-in episode (${run.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'} on this modal re-arms it).
+        return `<div class="error-message">${label} run is waiting for your answer: it is ${escapeHtml(failbackPhaseText(run))}. ${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'} shows exactly what the wipe destroys (the divergence verdict${run.mode === 'drop-back' ? '' : ' and the outcome of the dump taken first'}) and asks you to confirm.${run.fence ? (run.fence.ok ? ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} is fenced while this waits (it refuses every connection but the manager's and is read-only), so nothing lands on it unseen.` : ` The ${run.mode === 'drop-back' ? 'copy' : 'database'} could NOT be fenced (${escapeHtml(run.fence.error || 'unknown reason')}), so a write landing on it before you answer is destroyed by the wipe unseen.`) : ''} Cancel ${run.fence && run.fence.ok && run.fence.owned ? 'lifts the fence and ' : ''}${run.mode === 'drop-back' ? 'leaves the copy as it is' : run.stoppedByRun ? 'starts the instance again with the database untouched' : 'leaves the instance stopped, as it was, with the database untouched'} and closes the automatic run for this stand-in episode (${run.mode === 'drop-back' ? 'Drop back now' : 'Fail back now'} on this modal re-arms it).
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-danger btn-small" onclick="continueFailback('${botId}')">${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}</button>
                <button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button></div></div>`;
@@ -4317,7 +4317,7 @@
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (refuseWhileChecking(botId)) return;
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
@@ -4494,7 +4494,7 @@
 
     async function restoreFleetBackupFile(botId, file) {
       const sharers = await restoreSharersText(botId);
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database is read-only with its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines see the database go read-only, then briefly absent, until it finishes. Do not start any of these instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
+      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database refuses every connection but the manager's, is read-only and has its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines cannot connect to the database until it finishes. Do not start any of these instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);

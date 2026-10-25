@@ -21,7 +21,7 @@ vi.mock('child_process', async (importOriginal) => {
     const done = typeof opts === 'function' ? opts : cb;
     done(null, { stdout: '', stderr: '' });
   };
-  const mod = { ...real, exec, execFile, execFileSync: () => '', execSync: () => '' };
+  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync: () => '', execSync: () => '' };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
@@ -65,7 +65,7 @@ describe('B20-4vm: a failback run whose fence lift found the volume gone or unre
   it('says it cannot confirm whether the database is READ-ONLY when docker did not answer', async () => {
     h.lift = 'unknown';
     const r = await dismissFailback(containerManager.getBot('b1')!);
-    expect(r.error).toMatch(/can't confirm whether the database is still READ-ONLY: docker did not answer whether its database volume bot1-fleet-postgres-data exists \(its next restore retries the lift\)/);
+    expect(r.error).toMatch(/can't confirm whether the database is still READ-ONLY or refusing the bot's connections: docker did not answer whether its database volume bot1-fleet-postgres-data exists \(its next restore retries the lift\)/);
     expect(r.error).not.toMatch(/stays READ-ONLY/);
   });
 

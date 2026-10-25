@@ -58,7 +58,7 @@ vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
 }));
 vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
-  writeFenced: async () => false,
+  fenceLayers: async () => ({ readOnly: false, hba: false }),
   fenceForConsent: async () => { const r = st.fenceGate ? await st.fenceGate : { ok: true as const }; st.events.push('fence'); return r; },
   liftConsentFence: async () => { const r = st.liftGate ? await st.liftGate : 'lifted'; st.events.push('lift'); return r; },
   failbackFenceLeft: () => false,

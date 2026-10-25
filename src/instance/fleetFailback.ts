@@ -292,8 +292,8 @@ function lineageText(lineage: FleetLineageFact | null, who: string, subject: str
 function fenceText(fence: FleetFailbackRun['fence'], since: string): string {
   if (!fence) return '';
   return fence.ok
-    ? ` It is fenced read-only while this waits, so nothing lands on it after ${since}.`
-    : ` It could NOT be fenced read-only (${fence.error}), so a write landing on it before you answer is not in ${since}, and the wipe destroys it.`;
+    ? ` It is fenced while this waits: it refuses every connection but the manager's and is read-only, so nothing lands on it after ${since}.`
+    : ` It could NOT be fenced (${fence.error}), so a write landing on it before you answer is not in ${since}, and the wipe destroys it.`;
 }
 
 /** The database a run parks on for consent: the primary for a failback, the ended lane's copy for a drop-back. */
@@ -305,27 +305,35 @@ function consentTarget(instance: InstanceConfig, run: FleetFailbackRun): fleetBa
 
 type RunFence = NonNullable<FleetFailbackRun['fence']>;
 
+/** The fence layers a park owns: the ones that were off before it fenced, and both when an earlier run here left them on. */
+export function ownedFenceLayers(prior: fleetBackup.FenceLayers, leftByEarlierRun: boolean): fleetBackup.FenceLayers {
+  return { readOnly: leftByEarlierRun || !prior.readOnly, hba: leftByEarlierRun || !prior.hba };
+}
+
 /**
- * Fence the database the run parks on. The run owns only a fence it set: it
- * is recorded before it is set, so a crash between the two still lifts it,
- * and never downgraded. A fence another lane set (a promote fences the old
- * primary) is that lane's, and the run neither sets nor lifts it. Null: the
- * run lost its record before it set anything.
+ * Fence the database the run parks on. The run owns only the layers it set:
+ * they are recorded before they are set, so a crash between the two still
+ * lifts them, and never downgraded. A layer another lane set (a promote fences
+ * the old primary read-only) is that lane's, and the run never lifts it. Null:
+ * the run lost its record before it set anything.
  */
 async function fenceConsentPark(botId: string, instance: InstanceConfig, run: FleetFailbackRun, owns: () => boolean): Promise<RunFence | null> {
   const target = consentTarget(instance, run);
   const owned = run.fence?.owned === true;
   if (!target) return { ok: false, error: run.mode === 'failback' ? 'no database record' : 'the copy\'s record predates its app identity', at: Date.now(), owned };
+  let ownedLayers = run.fence?.ownedLayers ?? { readOnly: true, hba: true };
   if (!owned) {
-    const prior = await fleetBackup.writeFenced(target);
+    const prior = await fleetBackup.fenceLayers(target);
     if (prior === null) return { ok: false, error: 'the database did not answer whether it is fenced', at: Date.now(), owned: false };
     // One a previous run here left stuck is this run's to lift again.
-    if (prior) return { ok: true, error: null, at: Date.now(), owned: fleetBackup.failbackFenceLeft(botId, target.containerName) };
+    const left = fleetBackup.failbackFenceLeft(botId, target.containerName);
+    if (prior.readOnly && prior.hba) return { ok: true, error: null, at: Date.now(), owned: left, ...(left ? { ownedLayers } : {}) };
     if (!owns()) return null;
-    saveRun(botId, { fence: { ok: false, error: 'the fence was being set', at: Date.now(), owned: true } });
+    ownedLayers = ownedFenceLayers(prior, left);
+    saveRun(botId, { fence: { ok: false, error: 'the fence was being set', at: Date.now(), owned: true, ownedLayers } });
   }
   const fenced = await fleetBackup.fenceForConsent(target);
-  return { ok: fenced.ok, error: fenced.ok ? null : fenced.error, at: Date.now(), owned: true };
+  return { ok: fenced.ok, error: fenced.ok ? null : fenced.error, at: Date.now(), owned: true, ownedLayers };
 }
 
 /** Lift the run's own fence while its database still stands; the note names a fence left behind. */
@@ -334,11 +342,13 @@ async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Pr
   const target = consentTarget(instance, run);
   if (!target) return '';
   const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
-  const lifted = await fleetBackup.liftConsentFence(instance.id, target, remedy);
+  const lifted = await fleetBackup.liftConsentFence(instance.id, target, remedy, run.fence.ownedLayers);
   return lifted === 'lifted' ? ''
     : lifted === 'gone' ? `; its database volume ${target.volume} is gone, so no write fence remains on it`
-    : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
-    : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY until its container restarts'
+    : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
+    : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
+    : lifted === 'locked' ? `; the pg_hba lines of its write fence could not be removed, so the database refuses every connection but the manager's and the bot cannot reach it, through a restart too (${remedy})`
+    : lifted === 'unreloaded' ? `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart, and it may still refuse the bot's connections until it reloads or restarts (${remedy})`
     : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`;
 }
 
@@ -668,7 +678,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           // everything the wipe destroys and nothing lands while the run waits
           // for the consent; Cancel and Dismiss lift it, the wipe takes it
           // away with the files.
-          const fence = up.success ? await fenceConsentPark(botId, fresh, currentRun(botId) ?? run, owns) : { ok: false, error: up.error ?? 'the database did not start', at: Date.now(), owned: run.fence?.owned === true };
+          const fence = up.success ? await fenceConsentPark(botId, fresh, currentRun(botId) ?? run, owns) : { ok: false, error: up.error ?? 'the database did not start', at: Date.now(), owned: run.fence?.owned === true, ...(run.fence?.ownedLayers ? { ownedLayers: run.fence.ownedLayers } : {}) };
           if (!fence) return;
           saveRun(botId, { fence });
           if (!owns()) return;

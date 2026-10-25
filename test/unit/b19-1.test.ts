@@ -69,14 +69,15 @@ vi.mock('child_process', async (importOriginal) => {
       if (h.gate && text.includes('max_slot_wal_keep_size')) await h.gate;
       if (h.onRun) h.onRun(text);
       const fail = !!h.failWhen && h.failWhen.test(text);
-      const { out, code } = fail ? { out: '', code: 1 } : answer(text);
+      const { out, code } = fail ? { out: '', code: 1 } : text.includes('pg_read_file') ? { out: '0\n', code: 0 } : answer(text);
       child.stdout.end(out);
       child.stderr.end(fail ? 'fake failure\n' : '');
       setTimeout(() => child.emit('close', code), 1);
     }, 2);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  return { ...real, execFile: fencedExecFile, spawn, default: { ...real, execFile: fencedExecFile, spawn } };
 });
 
 import * as fs from 'fs';

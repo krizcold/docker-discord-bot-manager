@@ -119,7 +119,8 @@ vi.mock('child_process', async (importOriginal) => {
     })();
     return child;
   });
-  return { ...real, execFile, exec, spawn, default: { ...real, execFile, exec, spawn } };
+  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  return { ...real, execFile: fencedExecFile, exec, spawn, default: { ...real, execFile: fencedExecFile, exec, spawn } };
 });
 
 import * as fs from 'fs';

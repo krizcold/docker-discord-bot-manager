@@ -74,7 +74,7 @@ vi.mock('child_process', async (importOriginal) => {
     child.kill = () => {};
     setTimeout(() => {
       const fail = failing(call);
-      child.stdout.end(fail ? '' : answer(args));
+      child.stdout.end(fail ? '' : args.join(' ').includes('pg_read_file') ? '0\n' : answer(args));
       child.stderr.end(fail ? `${h.failStderr}\n${args.join(' ')}\n${call.stdin}` : '');
       setTimeout(() => child.emit('close', fail ? 1 : 0), 1);
     }, 5);
@@ -84,7 +84,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (cmd === 'docker' && args[0] === 'volume' && args[1] === 'inspect' && args[args.length - 1].endsWith('-fleet-postgres-replica-data')) throw new Error('Error: No such volume');
     return real.execFileSync(cmd, args, opts);
   };
-  return { ...real, execFile, execFileSync, exec, spawn, default: { ...real, execFile, execFileSync, exec, spawn } };
+  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  return { ...real, execFile: fencedExecFile, execFileSync, exec, spawn, default: { ...real, execFile: fencedExecFile, execFileSync, exec, spawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),
@@ -244,6 +245,24 @@ describe('seeding a standby', () => {
       expect(c.args).toContain('PGPASSWORD');
       expect(c.env.PGPASSWORD).toBe(REPL_SECRET);
     }
+  });
+
+  it('B14-2Lb: strips the primary\'s fence lines from the copied pg_hba.conf with its inherited settings', async () => {
+    const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
+    reseedStalePrimary(containerManager.getBot('b1')!, `postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`, pem, 'standby.invalid', 5440, true, { dumpDone: true });
+    await waitFor(() => containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked === true);
+    const seed = h.calls.findIndex(c => c.args.includes('pg_basebackup'));
+    const strip = h.calls.findIndex(c => c.args[0] === 'run' && c.args[c.args.length - 1].includes('/^synchronous_standby_names/d'));
+    expect(seed).toBeGreaterThanOrEqual(0);
+    expect(strip).toBeGreaterThan(seed);
+    const { FENCED_HBA, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
+    const ran = await runOnDataDir(h.calls[strip].args[h.calls[strip].args.length - 1], '/var/lib/postgresql/data', {
+      'pg_hba.conf': FENCED_HBA + MANAGED_HBA,
+      'postgresql.auto.conf': "synchronous_standby_names = 'x'\ndefault_transaction_read_only = 'on'\nwal_log_hints = 'on'\n",
+    });
+    expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
+    expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\n");
+    expect(ran.chowns).toEqual(['postgres:postgres /var/lib/postgresql/data/pg_hba.conf']);
   });
 });
 

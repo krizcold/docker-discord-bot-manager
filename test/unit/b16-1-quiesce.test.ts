@@ -9,6 +9,8 @@ const st = vi.hoisted(() => ({
   saveFails: false,
   termTables: 't|t',
   term: '41',
+  // The fence's settings read; null answers the shared fake's default.
+  fenceSettings: null as string | null,
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -18,14 +20,25 @@ vi.mock('child_process', async (importOriginal) => {
     let out = '';
     if (args[0] === 'stop') st.events.push(`docker-stop:${args[1]}`);
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) st.events.push('fence');
-    if (sql.includes('SELECT pg_current_wal_lsn()')) out = '0/3000000';
+    if (sql.includes('SELECT pg_current_wal_lsn()')) { st.events.push('lsn'); out = '0/3000000'; }
     if (sql.includes('SELECT system_identifier FROM pg_control_system()')) out = '7001';
     if (sql.includes("to_regclass('smdb_control.term')")) out = st.termTables;
     if (sql.includes('SELECT coalesce(GREATEST(')) out = st.term;
     setImmediate(() => cb(null, `${out}\n`, ''));
     return { stdin: null };
   };
-  return { ...real, execFile };
+  const fenced = (await import('./fence-fake')).withFence(execFile as any);
+  const outer = (cmd: string, args: string[], opts: any, cb: (err: any, stdout: string, stderr: string) => void) => {
+    const sql = args.join(' ');
+    if (sql.includes("current_setting('hba_file') ||") && st.fenceSettings !== null) {
+      setImmediate(() => cb(null, `${st.fenceSettings}\n`, ''));
+      return { stdin: null };
+    }
+    if (args[1] === '-u' && args[2] === 'root' && sql.includes('printf')) st.events.push('hba-write');
+    if (args.includes('127.0.0.1')) st.events.push('probe');
+    return fenced(cmd, args, opts, cb);
+  };
+  return { ...real, execFile: outer };
 });
 vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
@@ -93,6 +106,7 @@ beforeEach(() => {
   st.saveFails = false;
   st.termTables = 't|t';
   st.term = '41';
+  st.fenceSettings = null;
 });
 
 describe('R9-J3: the quiesce holds the database lanes off and decides from docker', () => {
@@ -176,6 +190,30 @@ describe('R9-J3: the quiesce holds the database lanes off and decides from docke
     const again = await call('quiesce');
     expect(again.code).toBe(500);
     expect(fleetBackup.claimFleetBackupBusy('s1')).toBe(false);
+  });
+});
+
+describe('B14-2Lb: the quiesce uses the shared write fence', () => {
+  it('writes the pg_hba lines and sees the reject before it captures the LSN', async () => {
+    const r = await call('quiesce');
+    expect(r.code).toBe(200);
+    const fence = st.events.indexOf('fence');
+    expect(fence).toBeGreaterThan(st.events.indexOf('sidecar-up'));
+    expect(st.events.indexOf('hba-write')).toBeGreaterThan(fence);
+    expect(st.events.indexOf('probe')).toBeGreaterThan(st.events.indexOf('hba-write'));
+    expect(st.events.indexOf('lsn')).toBeGreaterThan(st.events.indexOf('probe'));
+  });
+
+  it('a fence refused before it changed anything names the stopped source, not "nothing was changed"', async () => {
+    st.fenceSettings = '/var/lib/postgresql/data/pg_hba.conf|on|0|1';
+    const r = await call('quiesce');
+    expect(r.code).toBe(500);
+    expect(r.body.error).toMatch(/^could not fence the source database: the database has 1 enabled subscription/);
+    expect(r.body.error).not.toMatch(/nothing was changed/);
+    expect(r.body.error).toMatch(/the source instance is stopped and its database was not fenced/);
+    expect(st.events).toContain('stop:s1');
+    expect(st.events).not.toContain('fence');
+    expect(st.events).not.toContain('lsn');
   });
 });
 

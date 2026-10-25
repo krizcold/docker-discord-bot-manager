@@ -99,9 +99,10 @@ describe('B20-4vt: a volume read has a bound, and a timed-out one is unknown', (
 describe('B20-1t, B11-2t: fleetBackup reads have a bound, its writes do not', () => {
   it('the fence read runs with a timeout and a timed-out one cannot be confirmed', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    h.answer = (args) => args.includes('SHOW default_transaction_read_only') ? 'timeout' : { stdout: '' };
-    expect(await fb.writeFenced(fleetDb)).toBeNull();
-    const call = h.calls.find(c => c.args.includes('SHOW default_transaction_read_only'));
+    const isRead = (args: string[]) => args.some(a => a.includes('pg_read_file'));
+    h.answer = (args) => isRead(args) ? 'timeout' : { stdout: '' };
+    expect(await fb.fenceLayers(fleetDb)).toBeNull();
+    const call = h.calls.find(c => isRead(c.args));
     expect(bounded(call!.opts)).toBe(true);
   });
 

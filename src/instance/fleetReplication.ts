@@ -124,6 +124,14 @@ function psql(containerName: string, user: string, db: string, sql: string): Pro
   return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-Atc', sql]);
 }
 
+/** Why pg_hba.conf must not be rewritten now: a lane's write fence stands in it, or that could not be read. Null when it may be. */
+export async function fenceLinesRefusal(containerName: string, user: string, db: string): Promise<string | null> {
+  const read = await psql(containerName, user, db, fleetBackup.FENCE_HBA_COUNT_SQL);
+  const count = read.ok ? read.stdout.trim() : '';
+  if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
+  return Number(count) > 0 ? `a write fence stands in pg_hba.conf (lines ending in ${fleetBackup.WRITE_FENCE_MARK}), and the lane that set it lifts it when it finishes` : null;
+}
+
 /** SQL on stdin, for a statement that must stay out of every command line. */
 function psqlScript(containerName: string, user: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
@@ -331,6 +339,8 @@ async function enableInLane(
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
   }
+  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; nothing was changed, so retry Enable after that` };
   // The caller's password is a fallback for a manager env that holds no database URL (an adopt whose env write was refused).
   const dbPassword = storedDbPassword(instance) || opts.dbPassword || null;
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
@@ -597,6 +607,8 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const repl = fleetDb?.replication;
   if (!fleetDb || !repl?.keptPlain?.length) return null;
   const notNarrowed = 'the database still admits non-TLS connections from the addresses Enable kept, and the next start tries again';
+  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  if (fenced) return `pg_hba was not narrowed: ${fenced}; ${notNarrowed}`;
   const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
   if (!live.ok) return `Could not read which clients connect to the database without TLS (${live.error}), so ${notNarrowed}`;
   const plain = { addrs: live.addrs.filter(a => repl.keptPlain!.includes(a)) };

@@ -22,7 +22,7 @@ import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
-import { foreignFenceSet, claimFleetBackupBusy, releaseFleetBackupBusy, probeLiveTerm } from './fleetBackup';
+import { applyWriteFence, foreignFenceSet, claimFleetBackupBusy, releaseFleetBackupBusy, probeLiveTerm } from './fleetBackup';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
@@ -263,20 +263,14 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
   // Fence the DATABASE, not just this machine: fleet workers on other
   // hosts write here directly through the published port, and a commit
   // landing after the LSN capture would be silently discarded at promote.
-  // Read-only default (sighup applies it to every session's next
-  // transaction) plus a terminate sweep turns those writes into loud
-  // refusals; replication is untouched. Disarm resets it. The leading
-  // READ WRITE escape is defense-in-depth only - PG14+ allows ALTER
-  // SYSTEM in read-only transactions.
-  // ON_ERROR_STOP: with a -c sequence psql otherwise keeps going and
-  // reports only the LAST command, so a failed ALTER SYSTEM under a
-  // succeeding terminate would read as a successful fence.
-  const fence = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
-    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
-    '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
-    '-c', 'SELECT pg_reload_conf()',
-    '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
-  if (!fence.ok) return { code: 500, body: { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}` }, changed: true };
+  // The shared write fence refuses every outside connection and ends every
+  // session; the managed role's physical replication stays, so the stream
+  // reaches the captured LSN. Disarm lifts it.
+  const fence = await applyWriteFence(fleetDb);
+  if (!fence.ok) {
+    const state = fence.changed ? '' : '; the source instance is stopped and its database was not fenced';
+    return { code: 500, body: { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}${state}` }, changed: true };
+  }
   foreignFenceSet(instance.id, fleetDb.containerName);
   const lsn = await docker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-c', 'SELECT pg_current_wal_lsn()']);
   const sourceLsn = lsn.ok ? lsn.stdout.trim() : '';

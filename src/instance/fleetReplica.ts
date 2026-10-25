@@ -1144,9 +1144,10 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // wrong on a copy (B6 map F18, E3): an armed synchronous_standby_names names
   // standbys this cluster does not have, so its first write after any promotion
   // hangs with the database reporting healthy; and a promote fence leaves the
-  // copy read-only at its own next promotion. Stripped, never reset, because
-  // the copy is not running yet.
-  const strip = await volExec(record.volume, `sed -i '/^synchronous_standby_names/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf`);
+  // copy read-only at its own next promotion; a primary fenced during the copy
+  // passes on the pg_hba lines that refuse every outside connection. Stripped,
+  // never reset, because the copy is not running yet.
+  const strip = await volExec(record.volume, `sed -i '/^synchronous_standby_names/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && ${fleetBackup.stripFenceHbaScript(PGDATA)}`);
   if (!strip.ok) throw new Error(`could not strip the primary's own settings from the copy: ${strip.stderr.trim()}`);
   // application_name is the slot name, so the primary's own status ties a
   // streaming link to its slot without reading process ids.
@@ -1731,7 +1732,7 @@ const DECOMMISSION_LIFT_REMEDY = 'running the decommission again retries the lif
 async function liftFenceLeftStanding(botId: string, fleetDb: NonNullable<InstanceConfig['fleetDb']>, lane: string, remedy: string): Promise<string> {
   const volState = await dockerVolumeState(fleetDb.volume);
   if (volState === 'absent') return '';
-  if (volState === 'unknown') return '; whether the database is still fenced read-only could not be confirmed (docker did not answer)';
+  if (volState === 'unknown') return '; whether the database is still fenced (read-only or refusing the bot\'s connections) could not be confirmed (docker did not answer)';
   return fleetBackup.liftLaneFence(botId, fleetDb, lane, remedy);
 }
 

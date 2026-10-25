@@ -213,7 +213,7 @@ export interface FleetFailbackRun {
   /** The pre-wipe dump's outcome, named at the consent park. */
   dump: { ok: boolean; name: string | null; error: string | null; at: number } | null;
   /** The write fence over the database the run parks on for consent (B7-O19): set, or why it could not be. */
-  fence?: { ok: boolean; error: string | null; at: number; owned?: boolean } | null;
+  fence?: { ok: boolean; error: string | null; at: number; owned?: boolean; ownedLayers?: { readOnly: boolean; hba: boolean } } | null;
   consentAt: number | null;
   /** The endpoint the copy block names; the credential stays in the bot's own file. */
   block: { host: string; port: number } | null;

@@ -3601,6 +3601,14 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
         result.warning = result.warning ? `${result.warning}; ${narrowed}` : narrowed;
       }
     }
+    if (getBot(botId)?.fleetDb) {
+      // Imported here: fleetBackup imports this module.
+      const fenced = await (await import('../instance/fleetBackup')).fenceStartWarning(botId).catch(() => null);
+      if (fenced) {
+        logCollectors.get(botId).addLog(`[Start] ${fenced}`, 'warning');
+        result.warning = result.warning ? `${result.warning}; ${fenced}` : fenced;
+      }
+    }
     if (getBot(botId)?.copyBlockRetract) void sendCopyBlockRetract(botId);
   }
   if (!applyInPlace) return result;

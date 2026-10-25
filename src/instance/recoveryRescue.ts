@@ -32,7 +32,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as appLifecycle from './appLifecycle';
-import { runFleetDump, claimFleetBackupBusy, releaseFleetBackupBusy, isFleetBackupBusy, raiseGuildTerms } from './fleetBackup';
+import { runFleetDump, claimFleetBackupBusy, releaseFleetBackupBusy, isFleetBackupBusy, raiseGuildTerms, stripFenceHbaScript } from './fleetBackup';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
 import { readStoreId, readSystemId } from './recoveryControl';
@@ -815,7 +815,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   if (containerManager.fleetDbHeldForLane(instance.id)) await refuseForeignMounts(instance);
   throwIfCancelled(instance.id);
   const write = await volExec(fleetDb.volume,
-    `touch ${PGDATA}/standby.signal && rm -f ${MARKER} && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf`,
+    `touch ${PGDATA}/standby.signal && rm -f ${MARKER} && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf && ${stripFenceHbaScript(PGDATA)}`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
   // A cancel during the write has already put the database back in the compose and must not find a standby started after it.

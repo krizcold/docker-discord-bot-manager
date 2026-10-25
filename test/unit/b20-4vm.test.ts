@@ -51,7 +51,7 @@ vi.mock('child_process', async (importOriginal) => {
     h.calls.push(cmd);
     done(null, { stdout: '', stderr: '' });
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync };
+  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, execSync };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
@@ -189,6 +189,6 @@ describe('B20-4vm: liftRestoreFence strips only a volume docker proved exists', 
     const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'a re-seed', 'retrying the re-seed retries the lift');
     expect(runs()).toHaveLength(1);
     expect(runs()[0]).toContain(`${DB}:/pgdata`);
-    expect(note).toMatch(/READ-ONLY until its container restarts/);
+    expect(note).toMatch(/READ-ONLY, and may still refuse the bot's connections, until its container restarts/);
   });
 });

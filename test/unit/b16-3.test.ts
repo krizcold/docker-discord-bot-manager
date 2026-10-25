@@ -227,6 +227,19 @@ describe('R11-J7: a rescue keeps its database out of CasaOS reach while it rewri
     expect(config).toBeGreaterThanOrEqual(0);
     expect(start).toBeGreaterThan(config);
     expect(fs.existsSync(held('r4'))).toBe(false);
+    // B14-2Lb: the rsynced copy carries the source's pg_hba.conf, fence lines and all; the config write strips them.
+    const { FENCED_HBA, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
+    const script = st.calls[config][st.calls[config].length - 1];
+    const ran = await runOnDataDir(script, '/var/lib/postgresql/data', {
+      'pg_hba.conf': FENCED_HBA + MANAGED_HBA,
+      'postgresql.auto.conf': "default_transaction_read_only = 'on'\nwal_log_hints = 'on'\n",
+      'rescue.inprogress': '',
+    }, "primary_conninfo = 'x'\n");
+    expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
+    expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\nprimary_conninfo = 'x'\n");
+    expect(ran.files['standby.signal']).toBe('');
+    expect(ran.files['rescue.inprogress']).toBeUndefined();
+    expect(ran.chowns).toContain('postgres:postgres /var/lib/postgresql/data/pg_hba.conf');
   });
 
   it('a cancel puts the database back into the app file', async () => {

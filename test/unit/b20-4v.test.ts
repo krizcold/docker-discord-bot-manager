@@ -50,7 +50,7 @@ vi.mock('child_process', async (importOriginal) => {
     h.calls.push(cmd);
     done(null, { stdout: '', stderr: '' });
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync };
+  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, execSync };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
@@ -110,7 +110,7 @@ describe('B20-4v: the disarm fence strip mounts only a volume docker proved exis
     const res = await disarmRecoveryChannel(sourceBot());
     expect(h.calls.filter((c) => c.startsWith('run'))).toEqual([]);
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/can't confirm whether the database is still fenced READ-ONLY/);
+    expect(res.error).toMatch(/can't confirm whether the database is still READ-ONLY or refusing every connection but the manager's/);
     expect(res.error).toMatch(/Cannot connect to the Docker daemon/);
     expect(stored().recoveryChannel?.disarmLeft).toMatch(/can't confirm/);
   });

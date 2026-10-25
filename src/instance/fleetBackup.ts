@@ -11,8 +11,9 @@
  * order: courtesy stop of the managed instances this manager can see on the
  * URL, sidecar brought back alone (it is a service of the instance's own
  * compose project, so stopping the host takes it down too), WRITE FENCE
- * (read-only + terminate sessions - the sweep cannot see a consumer whose DSN
- * lives in the bot's own store, so the fence is the actual protection),
+ * (read-only, pg_hba refusing every outside connection, sessions ended - the
+ * sweep cannot see a consumer whose DSN lives in the bot's own store, so the
+ * fence is the actual protection),
  * safety dump under the fence, database dropped and recreated,
  * pg_restore --exit-on-error with the restoring session exempted, fence
  * lifted, stopped instances restarted.
@@ -32,6 +33,7 @@ import * as fleetFailback from './fleetFailback';
 import * as fleetReplica from './fleetReplica';
 import * as fleetTransfer from './fleetTransfer';
 import * as recoveryRescue from './recoveryRescue';
+import { REPLICATION_ROLE } from './fleetReplication';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
 const FACTS_TIMEOUT_MS = 10_000;
@@ -402,39 +404,115 @@ function asResult(op: Promise<{ success: boolean; error?: string }>): Promise<{ 
 }
 
 type RestoreFleetDb = { containerName: string; user: string; db: string; volume: string };
-
-export type FenceLift = 'lifted' | 'stripped' | 'failed' | 'gone' | 'unknown';
+type DockerAnswer = { ok: boolean; stdout: string; stderr: string };
 
 /**
- * Lift the restore write fence. ALTER SYSTEM persists in the volume's
- * auto.conf, so when the live lift fails the file is stripped instead (the
- * recovery channel's fallback): the LIVE state then stays read-only until the
- * container restarts, which is why 'stripped' is not 'lifted'. 'gone': the
- * volume is gone, so no fence remains; 'unknown': docker did not say whether
- * the volume exists, so nothing was mounted and the fence can't be confirmed.
+ * lifted: no layer is left. stripped: the live lift failed and the volume's files no longer hold the fence, so a
+ * restart clears it. failed: the read-only setting could not be lifted or stripped. unreloaded: as failed, and the
+ * fence's pg_hba lines are out of pg_hba.conf but every reload sent failed, so the database may refuse the bot
+ * until it reloads or restarts. locked: the fence's pg_hba lines could not be removed, so the database refuses every
+ * connection but the manager's through a restart too. gone: the volume is gone. unknown: docker did not say whether
+ * the volume exists, so nothing was mounted.
  */
-async function liftRestoreFence(fleetDb: RestoreFleetDb): Promise<FenceLift> {
+export type FenceLift = 'lifted' | 'stripped' | 'failed' | 'unreloaded' | 'locked' | 'gone' | 'unknown';
+
+/** The two layers of the write fence: the read-only default, and the pg_hba lines that refuse every outside connection. */
+export type FenceLayers = { readOnly: boolean; hba: boolean };
+const BOTH_LAYERS: FenceLayers = { readOnly: true, hba: true };
+
+/** Every pg_hba line the write fence writes ends with this; a lift removes each line that does. */
+export const WRITE_FENCE_MARK = '# smdb-write-fence';
+/** The sidecar's pg_hba.conf (its volume sits at the image's PGDATA); the fence refuses a database that reads another file. */
+export const FENCE_HBA_FILE = '/var/lib/postgresql/data/pg_hba.conf';
+export const FENCE_PGDATA = path.posix.dirname(FENCE_HBA_FILE);
+/** How long the fence waits for the reloaded pg_hba to refuse a TCP connection, and the gap between probes. */
+export const fenceTiming = { probeDeadlineMs: 15_000, probeGapMs: 250 };
+
+/** The count of pg_hba lines the write fence wrote, as the server reads its own pg_hba file. */
+export const FENCE_HBA_COUNT_SQL = `SELECT count(*) FROM regexp_split_to_table(pg_read_file(current_setting('hba_file')), E'\\n') AS line WHERE line LIKE '%${WRITE_FENCE_MARK}'`;
+
+/** The fence's pg_hba lines: the managed replication role over TLS (only when ssl is on), then a reject for every other TCP client. */
+function fenceHbaLines(ssl: boolean): string[] {
+  return [
+    ...(ssl ? [`hostssl replication ${REPLICATION_ROLE} all scram-sha-256 ${WRITE_FENCE_MARK}`] : []),
+    `host replication all all reject ${WRITE_FENCE_MARK}`,
+    `host all all all reject ${WRITE_FENCE_MARK}`,
+  ];
+}
+
+/** Rewrites pg_hba.conf through a temp file with the fence's lines first and every older fence line dropped. Run as root. */
+export function fenceHbaScript(ssl: boolean, file = FENCE_HBA_FILE): string {
+  const lines = fenceHbaLines(ssl).map(l => `'${l}'`).join(' ');
+  return `f=${file}; { printf '%s\\n' ${lines} && { grep -v '${WRITE_FENCE_MARK}$' "$f" || [ $? -eq 1 ]; }; } > "$f.fence" && chown postgres:postgres "$f.fence" && chmod 600 "$f.fence" && mv -f "$f.fence" "$f"`;
+}
+
+/** Removes the fence's lines from <dir>/pg_hba.conf, keeping the file postgres-owned and 600; a file with none is left as it is. Run as root. */
+export function stripFenceHbaScript(dir: string): string {
+  return `(f=${dir}/pg_hba.conf; [ -e "$f" ] || exit 0; grep -q '${WRITE_FENCE_MARK}$' "$f"; r=$?; [ $r -eq 1 ] && exit 0; [ $r -eq 0 ] || exit $r; sed -i '/${WRITE_FENCE_MARK}$/d' "$f" && chown postgres:postgres "$f" && chmod 600 "$f")`;
+}
+
+const psqlArgs = (db: RestoreFleetDb, ...commands: string[]) => ['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', ...commands.flatMap(c => ['-c', c])];
+const READ_WRITE_SQL = 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE';
+const RELOAD_SQL = 'SELECT pg_reload_conf()';
+
+/**
+ * Lift the write fence, only the layers named. The pg_hba lines go first, so a lift that stops after them leaves the
+ * read-only default alone and not a lockout. ALTER SYSTEM persists in the volume's auto.conf and the lines in its
+ * pg_hba.conf, so when the live lift fails both files are stripped instead (the recovery channel's fallback): a
+ * running database then keeps what it loaded until it restarts, which is why 'stripped' is not 'lifted'.
+ */
+async function liftRestoreFence(fleetDb: RestoreFleetDb, layers: FenceLayers = BOTH_LAYERS): Promise<FenceLift> {
   // The maintenance db, not the target db: the fence is cluster-level, and
   // the lift must work while the target db is dropped mid-restore.
-  const unfence = await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
-    '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
-    '-c', 'ALTER SYSTEM RESET default_transaction_read_only',
-    '-c', 'SELECT pg_reload_conf()']);
-  if (unfence.ok) return 'lifted';
+  const hba = layers.hba ? await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', stripFenceHbaScript(FENCE_PGDATA)]) : null;
+  const reload = await execDocker(psqlArgs(fleetDb, RELOAD_SQL));
+  const reset = layers.readOnly ? await execDocker(psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM RESET default_transaction_read_only', RELOAD_SQL)) : reload;
+  // The reset's own reload also applies the stripped pg_hba file.
+  const live = reset.ok;
+  const reloaded = reload.ok || reset.ok;
+  if (hba?.ok !== false && live) return 'lifted';
+  // The lines are out of the file and only the reload failed, which a restart also does.
+  if (hba?.ok === true && !layers.readOnly) return 'stripped';
   // The strip's docker run would mint an absent volume.
   const volState = await (await import('./fleetReplica')).dockerVolumeState(fleetDb.volume);
   if (volState !== 'exists') return volState === 'absent' ? 'gone' : 'unknown';
-  const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine',
-    '-c', "sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"]);
-  return strip.ok ? 'stripped' : 'failed';
+  const script = [
+    ...(layers.readOnly ? ["sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf"] : []),
+    ...(layers.hba ? [stripFenceHbaScript('/pgdata')] : []),
+  ].join(' && ');
+  const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script]);
+  if (!strip.ok) return hba?.ok === false ? 'locked' : hba && !reloaded ? 'unreloaded' : 'failed';
+  // The database answered, so a reload applies the stripped pg_hba file live.
+  if (live && (await execDocker(psqlArgs(fleetDb, RELOAD_SQL))).ok) return 'lifted';
+  return 'stripped';
+}
+
+/** What a database is under the fence layers found on it. */
+function fencedState(layers: FenceLayers, subject: string): string {
+  return layers.hba
+    ? `${subject} refuses every connection but the manager's${layers.readOnly ? ' and is READ-ONLY' : ''}, so the bot cannot reach it`
+    : `${subject} is READ-ONLY`;
+}
+
+/** The stuck-fence warning for a lift that did not land. */
+function stuckLiftText(result: FenceLift, lane: string, volume: string, failedRemedy: string): string {
+  return result === 'stripped'
+    ? `The database is READ-ONLY, and may still refuse the bot's connections, until it restarts (${lane} write fence could not be lifted live); restart the instance to clear it`
+    : result === 'unknown'
+    ? `This manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections (${lane} write fence could not be lifted live, and docker did not answer whether the volume ${volume} exists); ${failedRemedy}`
+    : result === 'locked'
+    ? `The database refuses every connection but the manager's, so the bot cannot reach it (the pg_hba lines of ${lane} write fence could not be removed, and a restart keeps them); ${failedRemedy}`
+    : result === 'unreloaded'
+    ? `The database is READ-ONLY (${lane} write fence could not be lifted or stripped), and it may still refuse the bot's connections until it reloads or restarts (the fence's pg_hba lines are out of pg_hba.conf, but the reload failed); ${failedRemedy}`
+    : `The database is READ-ONLY (${lane} write fence could not be lifted or stripped); ${failedRemedy}`;
 }
 
 /** Lift and keep the per-bot stuck-fence warning truthful. A restart only
- * clears a STRIPPED fence; a 'failed' one survives in auto.conf and would be
- * re-applied by the restart, so its remedy is a retried lift instead. */
-async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a restore', failedRemedy = 'running the restore again retries the lift'): Promise<FenceLift> {
+ * clears a STRIPPED fence; a 'failed', 'unreloaded' or 'locked' one survives in the volume's
+ * files and would be re-applied by the restart, so its remedy is a retried lift instead. */
+async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a restore', failedRemedy = 'running the restore again retries the lift', layers: FenceLayers = BOTH_LAYERS): Promise<FenceLift> {
   const failback = lane === 'a failback';
-  const result = await liftRestoreFence(fleetDb);
+  const result = await liftRestoreFence(fleetDb, layers);
   if (result === 'lifted' || result === 'gone') {
     clearStuck(botId, fleetDb.containerName);
     recordFailbackFence(botId, fleetDb.containerName, false);
@@ -443,26 +521,68 @@ async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, lane = 'a re
   // A run stopped mid-lift is covered by its own run record (fence.owned), so this is saved only once the lift did not land.
   const unsaved = !recordFailbackFence(botId, fleetDb.containerName, failback) && failback;
   const unsavedNote = unsaved ? '; this manager could not save that the failback owns this fence, so after a manager restart the next run there leaves it on' : '';
-  setStuck(botId, fleetDb, (result === 'stripped'
-    ? `The database is READ-ONLY (${lane} write fence could not be lifted live); restart the instance to clear it`
-    : result === 'unknown'
-    ? `This manager can't confirm whether the database is still READ-ONLY (${lane} write fence could not be lifted live, and docker did not answer whether the volume ${fleetDb.volume} exists); ${failedRemedy}`
-    : `The database is READ-ONLY (${lane} write fence could not be lifted or stripped); ${failedRemedy}`) + unsavedNote);
+  setStuck(botId, fleetDb, stuckLiftText(result, lane, fleetDb.volume, failedRemedy) + unsavedNote);
   return result;
 }
 
+const fenceSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/** Polls a TCP login from inside the container until the reloaded pg_hba refuses it; false when it never does by the deadline. */
+async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
+  const until = Date.now() + fenceTiming.probeDeadlineMs;
+  for (;;) {
+    const probe = await readDocker(['exec', db.containerName, 'psql', '-h', '127.0.0.1', '-U', db.user, '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
+    if (!probe.ok && probe.stderr.includes('pg_hba.conf rejects connection')) return true;
+    if (Date.now() >= until) return false;
+    await fenceSleep(fenceTiming.probeGapMs);
+  }
+}
+
+/** Ends every client session and every walsender but the managed role's physical ones; the reason when one did not end, else null. */
+async function sweepSessions(db: RestoreFleetDb): Promise<string | null> {
+  const sweep = await execDocker(psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`));
+  if (!sweep.ok) return `the open sessions could not be ended (${lastLine(sweep.stderr)})`;
+  const kept = sweep.stdout.split('\n').map(l => l.trim().split('|')).filter(([pid, ended]) => /^\d+$/.test(pid) && ended !== 't').map(([pid]) => pid);
+  if (kept.length === 0) return null;
+  // A session that ended between the listing and its terminate also answers false.
+  const left = await readDocker(psqlArgs(db, `SELECT count(*) FROM pg_stat_activity WHERE pid IN (${kept.join(', ')})`));
+  if (left.ok && left.stdout.trim() === '0') return null;
+  return `${kept.length} open session(s) did not end within 5 s of being terminated${left.ok ? '' : ' and whether they ended since could not be read'}`;
+}
+
 /**
- * The write fence the restore and the recovery quiesce use: writes off
- * cluster-wide and every other session ended, so a consumer the caller cannot
- * see cannot write under it. ON_ERROR_STOP so a failed ALTER SYSTEM under a
- * succeeding terminate cannot read as a fence.
+ * The write fence every lane that dumps before a destroy uses, the consent park and the recovery quiesce too: the
+ * read-only default, then pg_hba lines that refuse every TCP connection but the managed role's replication, then
+ * every other session ended, and once more after authentication_timeout (a login accepted before the reload can
+ * finish under the old rules). A session that sets READ WRITE itself passes the default; it cannot pass the lines.
+ * changed: false when it refused before it changed the database; the caller says what it changed before the fence.
  */
-function applyWriteFence(fleetDb: RestoreFleetDb): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
-      '-c', 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE',
-      '-c', 'ALTER SYSTEM SET default_transaction_read_only = on',
-      '-c', 'SELECT pg_reload_conf()',
-      '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+export async function applyWriteFence(fleetDb: RestoreFleetDb): Promise<DockerAnswer & { changed: boolean }> {
+  const refusedBefore = (reason: string) => ({ ok: false, stdout: '', stderr: reason, changed: false });
+  const refused = (reason: string) => ({ ok: false, stdout: '', stderr: reason, changed: true });
+  const read = await readDocker(psqlArgs(fleetDb,
+    "SELECT current_setting('hba_file') || '|' || current_setting('ssl') || '|' || (SELECT setting FROM pg_settings WHERE name = 'authentication_timeout') || '|' || (SELECT count(*) FROM pg_subscription WHERE subenabled)"));
+  if (!read.ok) return refusedBefore(`the database's settings could not be read before the fence (${lastLine(read.stderr)})`);
+  const [hbaFile, ssl, authTimeout, subscriptions] = read.stdout.trim().split('|');
+  if (!/^\d+$/.test(authTimeout ?? '') || !/^\d+$/.test(subscriptions ?? '') || !/^(on|off)$/.test(ssl ?? '')) {
+    return refusedBefore(`the database's settings read back in an unknown form (${read.stdout.trim().slice(0, 200) || 'empty'})`);
+  }
+  if (hbaFile !== FENCE_HBA_FILE) return refusedBefore(`the database reads its pg_hba from ${hbaFile || 'an unnamed file'}, not ${FENCE_HBA_FILE}, so the fence could not refuse outside connections`);
+  if (Number(subscriptions) > 0) return refusedBefore(`the database has ${subscriptions} enabled subscription(s), whose workers write past the fence; disable them (ALTER SUBSCRIPTION ... DISABLE) and retry`);
+  // ON_ERROR_STOP so a failed ALTER SYSTEM cannot read as a fence.
+  const readOnly = await execDocker(psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM SET default_transaction_read_only = on', RELOAD_SQL));
+  if (!readOnly.ok) return { ...readOnly, changed: true };
+  const hba = await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', fenceHbaScript(ssl === 'on')]);
+  if (!hba.ok) return refused(`pg_hba.conf could not be rewritten (${lastLine(hba.stderr)})`);
+  const reload = await execDocker(psqlArgs(fleetDb, RELOAD_SQL));
+  if (!reload.ok) return refused(`the rewritten pg_hba.conf could not be reloaded (${lastLine(reload.stderr)})`);
+  if (!await rejectInForce(fleetDb)) return refused(`the database still did not refuse a TCP connection ${fenceTiming.probeDeadlineMs / 1000} s after the reload of its rewritten pg_hba.conf`);
+  const first = await sweepSessions(fleetDb);
+  if (first) return refused(first);
+  await fenceSleep(Number(authTimeout) * 1000);
+  const second = await sweepSessions(fleetDb);
+  if (second) return refused(second);
+  return { ok: true, stdout: '', stderr: '', changed: true };
 }
 
 /** The database a failback or drop-back run parks on for the operator's consent. */
@@ -478,16 +598,18 @@ export async function fenceForConsent(target: ConsentFenceTarget): Promise<{ ok:
   return fence.ok ? { ok: true } : { ok: false, error: fence.stderr.trim().split('\n').pop() || 'unknown reason' };
 }
 
-/** Lift a consent fence; one that sticks is named on the instance, on the database it sits on, as the restore's is. */
-export function liftConsentFence(botId: string, target: ConsentFenceTarget, failedRemedy: string): Promise<FenceLift> {
-  return liftAndTrack(botId, target, 'a failback', failedRemedy);
+/** Lift the layers of a consent fence the run owns; one that sticks is named on the instance, on the database it sits on, as the restore's is. */
+export function liftConsentFence(botId: string, target: ConsentFenceTarget, failedRemedy: string, layers: FenceLayers = BOTH_LAYERS): Promise<FenceLift> {
+  return liftAndTrack(botId, target, 'a failback', failedRemedy, layers);
 }
 
 function liftNote(result: FenceLift, volume: string, remedy = 'running a restore again retries the lift'): string {
   return result === 'lifted' ? ''
     : result === 'gone' ? `; the database volume ${volume} is gone, so no write fence remains on it`
-    : result === 'unknown' ? `; the write fence could not be lifted live, and docker did not answer whether the database volume ${volume} exists, so this manager can't confirm whether the database is still READ-ONLY (${remedy})`
-    : result === 'stripped' ? '; the write fence could not be lifted live, so the database is READ-ONLY until its container restarts'
+    : result === 'unknown' ? `; the write fence could not be lifted live, and docker did not answer whether the database volume ${volume} exists, so this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections (${remedy})`
+    : result === 'stripped' ? '; the write fence could not be lifted live, so the database is READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
+    : result === 'locked' ? `; the pg_hba lines of the write fence could not be removed, so the database refuses every connection but the manager's and the bot cannot reach it, through a restart too (${remedy})`
+    : result === 'unreloaded' ? `; the write fence could not be lifted, so the database stays READ-ONLY, and it may still refuse the bot's connections until it reloads or restarts (${remedy})`
     : `; the write fence could not be lifted, so the database stays READ-ONLY (${remedy})`;
 }
 
@@ -500,10 +622,11 @@ export async function fencedSafetyDump(instance: InstanceConfig, prefix: string,
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'No fleet database record' };
   const fence = await applyWriteFence(fleetDb);
+  if (!fence.changed) return { success: false, error: `the write fence could not be applied (${lastLine(fence.stderr)}), so no dump was taken` };
   foreignFenceSet(instance.id, fleetDb.containerName);
   if (!fence.ok) {
     const lifted = await liftAndTrack(instance.id, fleetDb, lane, remedy);
-    return { success: false, error: `the write fence could not be applied (${fence.stderr.trim().split('\n').pop() || 'unknown reason'}), so no dump was taken${liftNote(lifted, fleetDb.volume, remedy)}` };
+    return { success: false, error: `the write fence could not be applied (${lastLine(fence.stderr)}), so no dump was taken${liftNote(lifted, fleetDb.volume, remedy)}` };
   }
   const dump = await runFleetDump(instance, prefix);
   if (dump.success && dump.file) return { success: true, file: dump.file };
@@ -532,10 +655,23 @@ export function foreignFenceSet(botId: string, containerName: string): void {
   if (failbackFenceLeft(botId, containerName)) recordFailbackFence(botId, containerName, false);
 }
 
-/** Whether the database holds the write fence now; null when it cannot be asked. */
-export async function writeFenced(target: ConsentFenceTarget): Promise<boolean | null> {
-  const probe = await readDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-  return probe.ok ? probe.stdout.trim() === 'on' : null;
+/** Which layers of the write fence the database holds now; null when it cannot be asked. */
+export async function fenceLayers(target: ConsentFenceTarget): Promise<FenceLayers | null> {
+  const probe = await readDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c',
+    `SELECT current_setting('default_transaction_read_only') || '|' || (${FENCE_HBA_COUNT_SQL})`]);
+  const m = probe.ok ? /^(on|off)\|(\d+)$/.exec(probe.stdout.trim()) : null;
+  return m ? { readOnly: m[1] === 'on', hba: Number(m[2]) > 0 } : null;
+}
+
+const anyLayer = (layers: FenceLayers | null): layers is FenceLayers => layers !== null && (layers.readOnly || layers.hba);
+const noLayer = (layers: FenceLayers | null): boolean => layers !== null && !layers.readOnly && !layers.hba;
+
+/** The Start warning while the fence's pg_hba lines stand on the instance's database; null when they do not or cannot be read. */
+export async function fenceStartWarning(botId: string): Promise<string | null> {
+  const db = containerManager.getBot(botId)?.fleetDb;
+  const layers = db ? await fenceLayers(db) : null;
+  if (!layers?.hba) return null;
+  return `${fencedState(layers, 'The database')}: the pg_hba lines of a write fence (ending in ${WRITE_FENCE_MARK}) are still on it, and a restart keeps them; the lane that set the fence (a restore, re-seed, decommission, failback, drop-back or recovery swap) lifts them when it finishes or is run again`;
 }
 
 /**
@@ -553,22 +689,22 @@ async function seedStuckFences(): Promise<void> {
     // reading 'on' is a drop-back's that was never lifted.
     const copy = instance.fleetDbReplica;
     if (parked !== 'drop-back' && copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
-      const onCopy = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-      if (onCopy.ok && onCopy.stdout.trim() === 'on') {
+      const copyDb = { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume };
+      const onCopy = await fenceLayers(copyDb);
+      if (anyLayer(onCopy)) {
         const recovery = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
         const inRecovery = recovery.ok ? recovery.stdout.trim() : '';
         const remedy = inRecovery === 't' ? 're-seeding this copy on its Database modal clears it'
-          : inRecovery === 'f' ? 'this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf()) or let a drop-back run re-seed it'
+          : inRecovery === 'f' ? `this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf, ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf()) or let a drop-back run re-seed it`
             : 'whether this copy is still a standby could not be read: re-seeding on its Database modal clears a standby, and a promoted copy is lifted only by hand';
-        setStuck(instance.id, { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume },
-          `The copy is READ-ONLY: a write fence (a drop-back's, a promote's or a swap's) is on; ${remedy}`);
+        setStuck(instance.id, copyDb, `${fencedState(onCopy, 'The copy')}: a write fence (a drop-back's, a promote's or a swap's) is on; ${remedy}`);
       }
     }
     const db = instance.fleetDb;
     if (parked === 'failback' || !db || isStuck(instance.id, db.containerName)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
-    const probe = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-    if (probe.ok && probe.stdout.trim() === 'on') setStuck(instance.id, db, `The database is READ-ONLY (a write fence was not lifted); ${await seededFenceRemedy(instance, db)}`);
+    const layers = await fenceLayers(db);
+    if (anyLayer(layers)) setStuck(instance.id, db, `${fencedState(layers, 'The database')} (a write fence was not lifted); ${await seededFenceRemedy(instance, db, layers)}`);
   }
 }
 
@@ -580,12 +716,13 @@ async function fencePersisted(db: RestoreFleetDb): Promise<boolean | null> {
 }
 
 /** The remedy for a fence found on at start, from the lane that owns it and whether a restart clears it. */
-async function seededFenceRemedy(instance: InstanceConfig, db: RestoreFleetDb): Promise<string> {
+async function seededFenceRemedy(instance: InstanceConfig, db: RestoreFleetDb, layers: FenceLayers): Promise<string> {
   const lane = instance.recoveryChannel?.mode === 'source'
     ? 'disarming the recovery channel on its Database modal lifts it'
     : instance.fleetFailback && failbackFenceLeft(instance.id, db.containerName)
       ? `the ${instance.fleetFailback.mode} run on this instance owns it, and the run's exits on its Database modal lift it`
       : restoreRetryRemedy(instance);
+  if (layers.hba) return `its pg_hba lines are saved in pg_hba.conf, so a restart keeps it on; ${lane}`;
   const persisted = await fencePersisted(db);
   if (persisted === false) return `the setting is not saved in its configuration, so restarting the instance clears it, or ${lane}`;
   if (persisted === true) return `the setting is saved in its configuration, so a restart keeps it on; ${lane}`;
@@ -597,10 +734,8 @@ async function checkFailbackRecord(botId: string, containerName: string): Promis
   const instance = containerManager.getBot(botId);
   const db = instance ? [instance.fleetDb, instance.fleetDbReplica].find(d => d?.containerName === containerName) : undefined;
   if (!db?.user) { recordFailbackFence(botId, containerName, false); return; }
-  const probe = await isContainerRunning(containerName)
-    ? await readDocker(['exec', containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only'])
-    : null;
-  if (probe?.ok && probe.stdout.trim() === 'off') recordFailbackFence(botId, containerName, false);
+  const layers = await isContainerRunning(containerName) ? await fenceLayers({ containerName, user: db.user, db: db.db ?? 'postgres', volume: db.volume }) : null;
+  if (noLayer(layers)) recordFailbackFence(botId, containerName, false);
 }
 
 /**
@@ -629,8 +764,7 @@ async function reprobeStuckFences(): Promise<void> {
       // A database the instance no longer records is gone, and its warning with it.
       if (instance.fleetDb?.containerName !== db.containerName && instance.fleetDbReplica?.containerName !== db.containerName) { clearStuck(id, db.containerName); continue; }
       if (!await isContainerRunning(db.containerName)) continue;
-      const probe = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', 'SHOW default_transaction_read_only']);
-      if (probe.ok && probe.stdout.trim() === 'off') { clearStuck(id, db.containerName); recordFailbackFence(id, db.containerName, false); }
+      if (noLayer(await fenceLayers(db))) { clearStuck(id, db.containerName); recordFailbackFence(id, db.containerName, false); }
     }
   }
 }
@@ -1193,7 +1327,9 @@ export async function restoreFleetBackup(
     if (result !== 'lifted') {
       const retry = await liftAndTrack(botId, fleetDb);
       // A strip that landed stays in the file, so a failed second strip does not undo it.
-      if ((retry === 'failed' || retry === 'unknown') && result === 'stripped') setStuck(botId, fleetDb, 'The database is READ-ONLY (a restore write fence could not be lifted live); restart the instance to clear it');
+      const keeps: FenceLift[] = result === 'stripped' ? ['failed', 'unreloaded', 'locked', 'unknown']
+        : result === 'unreloaded' ? ['failed', 'locked', 'unknown'] : [];
+      if (keeps.includes(retry)) setStuck(botId, fleetDb, stuckLiftText(result, 'a restore', fleetDb.volume, 'running the restore again retries the lift'));
       else result = retry;
     }
     fenced = false;
@@ -1218,10 +1354,17 @@ export async function restoreFleetBackup(
       : '';
   };
 
-  // Past the drop the database may be missing or partial: the fence stays on and the stopped instances stay down.
-  const keepFenced = (reason: string, guards = 'a database that may be missing or partial', runningNow: string[] = []) => {
+  // Past the drop the database may be missing or partial: the read-only layer stays on and the stopped instances stay
+  // down. The pg_hba layer goes, so the database is not left refusing every connection for as long as nobody restores.
+  const keepFenced = async (reason: string, guards = 'a database that may be missing or partial', runningNow: string[] = []) => {
     fenced = false;
     release();
+    const opened = await liftRestoreFence(fleetDb, { readOnly: false, hba: true });
+    const access = opened === 'lifted' ? '; the database is READ-ONLY and no longer refuses connections'
+      : opened === 'stripped' || opened === 'failed' ? '; the database is READ-ONLY, and its pg_hba lines are removed from pg_hba.conf, but the running database may still refuse the bot\'s connections until it restarts'
+      : opened === 'locked' ? '; the database is READ-ONLY, and its pg_hba lines could not be removed, so it also refuses every connection but the manager\'s, through a restart too'
+      : opened === 'gone' ? `; the database volume ${fleetDb.volume} is gone`
+      : `; the database is READ-ONLY, and docker did not answer whether the database volume ${fleetDb.volume} exists, so this manager can't confirm whether it still refuses the bot's connections`;
     const stillStopped = steps.stopped.filter(id => !runningNow.includes(id));
     const runs = runningNow.length > 0 ? `${runningNow.map(nameOf).join(', ')} runs now. ` : '';
     const kept = stillStopped.length > 0
@@ -1230,8 +1373,8 @@ export async function restoreFleetBackup(
     const back = steps.preRestoreDump
       ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
       : 'no pre-restore dump was taken, because the database was missing';
-    setStuck(botId, fleetDb, `The database is READ-ONLY: a restore of ${file} failed (${reason}), so its write fence stays on; restore a dump again (${back})`);
-    return `${reason}. ${runs}The write fence stays on${kept}, so nothing writes to ${guards}; restore a dump again: ${back}`;
+    setStuck(botId, fleetDb, `The database is READ-ONLY: a restore of ${file} failed (${reason}), so its write fence stays on${access}; restore a dump again (${back})`);
+    return `${reason}. ${runs}The write fence stays on${kept}, so nothing writes to ${guards}${access}; restore a dump again: ${back}`;
   };
 
   try {
@@ -1293,6 +1436,11 @@ export async function restoreFleetBackup(
     // a throw mid-fence still reaches the finally lift.
     fenced = true;
     const fence = await applyWriteFence(fleetDb);
+    if (!fence.changed) {
+      fenced = false;
+      const note = await undo();
+      return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${note}`, steps };
+    }
     foreignFenceSet(botId, fleetDb.containerName);
     if (!fence.ok) {
       // A half-applied fence must not survive the refusal. Only a LIVE lift
@@ -1302,7 +1450,9 @@ export async function restoreFleetBackup(
       const note = await undo();
       const fenceWarning = cleared === 'lifted' ? ''
         : cleared === 'gone' || cleared === 'unknown' ? liftNote(cleared, fleetDb.volume)
-        : cleared === 'stripped' ? '; the database may be READ-ONLY until its container restarts'
+        : cleared === 'stripped' ? '; the database may be READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
+        : cleared === 'locked' ? '; the database may refuse every connection but the manager\'s, so the bot cannot reach it (pg_hba lines that could not be removed survive a restart; running a restore again retries the lift)'
+        : cleared === 'unreloaded' ? '; the database may stay READ-ONLY (a fence that could not be lifted or stripped survives a restart; running a restore again retries the lift), and it may refuse the bot\'s connections until it reloads or restarts'
           : '; the database may stay READ-ONLY (a fence that could not be lifted or stripped survives a restart; running a restore again retries the lift)';
       return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${fenceWarning}${note}`, steps };
     }
@@ -1388,7 +1538,7 @@ export async function restoreFleetBackup(
     if (!recreate.ok) {
       const reason = `could not recreate the database: ${lastLine(recreate.stderr)}`;
       setRestoreError(botId, file, reason, `The database may be missing, or unchanged if the drop itself failed; its write fence stays on (${back})`);
-      return { success: false, error: `Restore failed: ${keepFenced(reason)}`, steps };
+      return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
 
     // 6. pg_restore with the dump streamed to stdin. PGOPTIONS exempts this
@@ -1448,7 +1598,7 @@ export async function restoreFleetBackup(
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
       const reason = restore.error || 'unknown error';
       setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`);
-      return { success: false, error: `Restore failed: ${keepFenced(reason)}`, steps };
+      return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
     steps.restored = true;
 
@@ -1469,7 +1619,7 @@ export async function restoreFleetBackup(
       if (!raised.ok) {
         const reason = `the restored guild leases could not be raised above the pre-restore term ${floor} (${raised.error})`;
         setRestoreError(botId, file, reason, `A node still holding a pre-restore lease could write over the restored rows, so the write fence stays on (${back})`);
-        return { success: false, error: `The dump was restored, but ${keepFenced(reason)}`, steps };
+        return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
       }
       steps.guildsRaised = raised.guilds;
       steps.leaseTerm = floor + 1;
@@ -1482,7 +1632,7 @@ export async function restoreFleetBackup(
         ? "docker could not say whether an instance sharing the database was started during the restore, so the manager can't confirm that none read it while it was rebuilt"
         : `${startedMeanwhile.names.join(', ')} was started outside the manager during the restore and may act on what it read while the database was rebuilt; stop it`;
       setRestoreError(botId, file, reason, `The dump was restored, but the write fence stays on so nothing writes from what was read mid-restore (${back})`);
-      return { success: false, error: `The dump was restored, but ${keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
+      return { success: false, error: `The dump was restored, but ${await keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
     }
 
     lastErrors.delete(botId);
@@ -1501,9 +1651,11 @@ export async function restoreFleetBackup(
     const lift = await finalLift();
     if (lift !== 'lifted') {
       console.error(`[FleetBackup] Restore fence on ${fleetDb.containerName}: ${lift === 'stripped'
-        ? 'live lift failed; auto.conf stripped, the database stays read-only until its container restarts'
+        ? 'live lift failed; auto.conf and pg_hba.conf stripped, the database stays fenced until its container restarts'
         : lift === 'gone' ? `live lift failed and the volume ${fleetDb.volume} is gone`
         : lift === 'unknown' ? `live lift failed and docker did not answer whether the volume ${fleetDb.volume} exists`
+        : lift === 'locked' ? 'the pg_hba lines could not be removed live or from the volume'
+        : lift === 'unreloaded' ? 'the read-only setting could not be lifted or stripped; the pg_hba lines are out of pg_hba.conf but the reload failed'
         : 'could not be lifted or stripped'}`);
     }
 
@@ -1520,7 +1672,7 @@ export async function restoreFleetBackup(
     }
     const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';
 
-    if (lift !== 'lifted') return { success: false, error: `${lift === 'gone' ? `The restore ran, but the database volume ${fleetDb.volume} is gone now, so this manager can't confirm that the restored data exists` : lift === 'unknown' ? `Restored, but the write fence could not be lifted live, and docker did not answer whether the database volume ${fleetDb.volume} exists, so this manager can't confirm whether the database is still READ-ONLY; running a restore again retries the lift` : `Restored, but ${lift === 'stripped' ? 'the write fence could not be lifted live: the database is READ-ONLY until its container restarts' : 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift'}`} (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
+    if (lift !== 'lifted') return { success: false, error: `${lift === 'gone' ? `The restore ran, but the database volume ${fleetDb.volume} is gone now, so this manager can't confirm that the restored data exists` : lift === 'unknown' ? `Restored, but the write fence could not be lifted live, and docker did not answer whether the database volume ${fleetDb.volume} exists, so this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections; running a restore again retries the lift` : `Restored, but ${lift === 'stripped' ? 'the write fence could not be lifted live: the database is READ-ONLY, and may still refuse the bot\'s connections, until its container restarts' : lift === 'locked' ? 'the pg_hba lines of the write fence could not be removed: the database refuses every connection but the manager\'s, so the bot cannot reach it, a restart does not clear it, and running a restore again retries the lift' : lift === 'unreloaded' ? 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift; it may also refuse the bot\'s connections until it reloads or restarts' : 'the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift'}`} (see manager logs)${termWarning}${noticeWarning}${startWarning}`, steps };
     const warning = `${termWarning}${noticeWarning}${startWarning}`;
     return { success: true, ...(warning ? { warning: warning.slice(2) } : {}), steps };
   } finally {

@@ -17,6 +17,9 @@ const h = vi.hoisted(() => {
     rules: [] as Array<[(args: string[]) => boolean, boolean, string, string]>,
     onExec: null as null | ((cmd: string) => void),
     onVolumeRm: null as null | (() => void),
+    // The root execs the shared fence fake answers, failed as a down container fails them.
+    rootFails: false,
+    runs: [] as string[][],
   };
 });
 
@@ -56,7 +59,20 @@ vi.mock('child_process', async (importOriginal) => {
     if (failure) done(fail(failure[1]));
     else done(null, { stdout: '', stderr: '' });
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync };
+  const fenced = (await import('./fence-fake')).withFence(execFile as any);
+  const outer = (f: string, args: string[], opts: any, cb?: any) => {
+    if (args[0] === 'run') h.runs.push(args);
+    if (args[0] === 'exec' && args[1] === '-u' && args[2] === 'root') {
+      h.calls.push(args.join(' '));
+      if (h.rootFails) {
+        const done = typeof opts === 'function' ? opts : cb;
+        setImmediate(() => done(Object.assign(new Error('docker failed'), { code: 1 }), '', 'Error response from daemon: container is not running'));
+        return { stdin: null };
+      }
+    }
+    return fenced(f, args, opts, cb);
+  };
+  const mod = { ...real, exec, execFile: outer, execFileSync, execSync };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
@@ -109,6 +125,8 @@ beforeEach(() => {
   h.rules = [];
   h.onExec = null;
   h.onVolumeRm = null;
+  h.rootFails = false;
+  h.runs = [];
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(botDir, { recursive: true });
   fs.writeFileSync(composePath, compose);
@@ -263,7 +281,7 @@ describe('R1-J38: the recovery channel disarm reports what remains', () => {
     h.rules.push([isDbInspect, true, 'true\n', '']);
     const res = await disarmRecoveryChannel(sourceBot());
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/READ-ONLY until its container restarts/);
+    expect(res.error).toMatch(/may stay READ-ONLY or refusing every connection but the manager's until its container restarts/);
     expect(stored().recoveryChannel).toMatchObject({ containerName: 'bot1-recovery-relay' });
     expect(typeof stored().recoveryChannel.disarmingAt).toBe('number');
     expect(stored().recoveryChannel.disarmLeft).toMatch(/READ-ONLY/);
@@ -299,6 +317,40 @@ describe('R1-J38: the recovery channel disarm reports what remains', () => {
     const res = await disarmRecoveryChannel(sourceBot());
     expect(res).toEqual({ success: true });
     expect(stored().recoveryChannel).toBeUndefined();
+  });
+
+  it('B14-2Lb: strips the fence lines from pg_hba.conf before the read-only reset', async () => {
+    const res = await disarmRecoveryChannel(sourceBot());
+    expect(res).toEqual({ success: true });
+    const hba = h.calls.findIndex(c => c.startsWith('exec -u root bot1-fleet-postgres sh -c') && c.includes("sed -i '/# smdb-write-fence$/d'"));
+    const reset = h.calls.findIndex(c => c.includes('ALTER SYSTEM RESET default_transaction_read_only'));
+    expect(hba).toBeGreaterThanOrEqual(0);
+    expect(reset).toBeGreaterThan(hba);
+    expect(h.calls[hba]).toContain('f=/var/lib/postgresql/data/pg_hba.conf;');
+  });
+
+  it('B14-2Lb: with the database down, the volume strip removes both layers and keeps pg_hba.conf postgres-owned', async () => {
+    h.rootFails = true;
+    h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'Error response from daemon: container is not running']);
+    h.rules.push([isStrip, true, 'stripped\n', '']);
+    h.rules.push([isDbInspect, false, '', 'Error: No such object: bot1-fleet-postgres']);
+    await disarmRecoveryChannel(sourceBot());
+    const run = h.runs.find(isStrip)!;
+    expect(run.slice(0, 6)).toEqual(['run', '--rm', '-v', `${DB}:/pgdata`, '--entrypoint', 'sh']);
+    const script = run[run.length - 1];
+    expect(script).toContain("sed -i '/^default_transaction_read_only/d' \"$f\"");
+    expect(script).toContain('f=/pgdata/pg_hba.conf;');
+    expect(script).toMatch(/sed -i '\/# smdb-write-fence\$\/d' "\$f" && chown postgres:postgres "\$f" && chmod 600 "\$f"/);
+
+    const { FENCED_HBA, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
+    const ran = await runOnDataDir(script, '/pgdata', {
+      'pg_hba.conf': FENCED_HBA + MANAGED_HBA,
+      'postgresql.auto.conf': "wal_log_hints = 'on'\ndefault_transaction_read_only = 'on'\n",
+    });
+    expect(ran.out.trim()).toBe('stripped');
+    expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
+    expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\n");
+    expect(ran.chowns).toEqual(['postgres:postgres /pgdata/pg_hba.conf']);
   });
 
   it('the reconciler leaves a channel that is being disarmed alone', async () => {

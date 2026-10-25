@@ -3107,8 +3107,26 @@ export async function writeComposeEnvFile(
 
   try { mkdirForApp(dir, log); } catch { /* best effort */ }
 
-  fs.writeFileSync(filePath, lines.join('\n') + '\n');
-  grantToApp(filePath, { mode: '600', log });
+  const tmpPrefix = '.env.tmp.';
+  removeStaleSeedTemps(dir, tmpPrefix);
+  const tmpPath = path.join(dir, `${tmpPrefix}${process.pid}.${randomBytes(4).toString('hex')}`);
+  const bytes = Buffer.from(lines.join('\n') + '\n');
+  try {
+    const fd = fs.openSync(tmpPath, 'wx', 0o600);
+    try {
+      try { fs.fchmodSync(fd, 0o600); } catch { /* windows / best effort */ }
+      grantFd(fd, log);
+      let off = 0;
+      while (off < bytes.length) off += fs.writeSync(fd, bytes, off, bytes.length - off);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, filePath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* never created, or already gone */ }
+    throw new Error(`could not be written: ${e instanceof Error ? e.message : String(e)}; the .env already there, if any, was kept`);
+  }
 
   log(`[PCS] Wrote ${lines.length} env var(s) to ${filePath}`);
   return filePath;

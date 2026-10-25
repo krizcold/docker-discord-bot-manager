@@ -3611,7 +3611,11 @@ async function startGitBot(instance: InstanceConfig): Promise<LaneResult> {
       // Sync env vars into compose before deploy (env changes after build)
       const envErr = syncComposeEnvVars(latestInstance, composePath);
       if (envErr) notApplied.push(`environment variables (${envErr})`);
-      await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
+      try {
+        await writeComposeEnvFile(appName, buildEffectiveEnv(latestInstance), (msg) => emit(msg, 'info'));
+      } catch (err) {
+        notApplied.push(`the .env file (${err instanceof Error ? err.message : String(err)})`);
+      }
 
       // Re-apply edited config files so config changes made while stopped take
       // effect on start (mirrors the env re-sync above). Binds already exist from
@@ -4584,6 +4588,7 @@ async function buildGitInstanceHeld(
 ): Promise<LaneResult> {
   const botId = instance.id;
   let commitUnrecorded: string | null = null;
+  let envFileNotWritten: string | null = null;
   let pinnedCommit: string | null = null;
 
   // Resolve source repo path: fetch from origin first so build uses latest commits
@@ -4926,7 +4931,11 @@ async function buildGitInstanceHeld(
   if (isCasaOS) {
     emit('[PCS] Saving CasaOS metadata...', 'info');
     await saveToCasaOSMetadata(appName, composeContent, (msg) => emit(msg, 'info'));
-    await writeComposeEnvFile(appName, buildEffectiveEnv(instance), (msg) => emit(msg, 'info'));
+    try {
+      await writeComposeEnvFile(appName, buildEffectiveEnv(instance), (msg) => emit(msg, 'info'));
+    } catch (err) {
+      envFileNotWritten = `the .env file (${err instanceof Error ? err.message : String(err)}; the next start writes it again)`;
+    }
     if (sidecarInjected) {
       emit('[PCS] Writing status page...', 'info');
       await writeStatusPage(appName, generateStatusPageHtml(instance), (msg) => emit(msg, 'info'));
@@ -4961,7 +4970,11 @@ async function buildGitInstanceHeld(
   }
 
   recordBuiltMounts(botId, configFiles, emit);
-  return finishBuild(botId, emit, instance.status, instance.displayName, commitUnrecorded);
+  const built = await finishBuild(botId, emit, instance.status, instance.displayName, commitUnrecorded);
+  if (!envFileNotWritten) return built;
+  const notWritten = `The build completed, but these changes were not applied: ${envFileNotWritten}`;
+  emit(`[Warning] ${notWritten}`, 'warning');
+  return { ...built, warning: [notWritten, built.warning].filter(Boolean).join('; '), notApplied: [envFileNotWritten] };
 }
 
 // ─── Logs & Stats ───

@@ -1483,9 +1483,9 @@ export async function finishPinsRetire(instance: InstanceConfig): Promise<{ succ
 function livePinsWarning(instance: InstanceConfig): string | null {
   if (!instance.fleetDbPinsWarning) return null;
   const set = containerManager.deployedComposeEnvValues(instance.id, companionEnvKeys(instance.id));
-  if (set === null) return instance.fleetDbPinsWarning;
+  if (set === undefined) return instance.fleetDbPinsWarning;
   const stored = envManager.getEnvVars(instance.id);
-  const stale = set.some(({ key, value }) => !Object.prototype.hasOwnProperty.call(stored, key) || stored[key] !== value);
+  const stale = (set ?? []).some(({ key, value }) => !Object.prototype.hasOwnProperty.call(stored, key) || stored[key] !== value);
   return stale ? instance.fleetDbPinsWarning : null;
 }
 

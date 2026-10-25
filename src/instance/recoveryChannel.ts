@@ -45,12 +45,17 @@ function rsyncContainerName(instance: InstanceConfig): string {
   return `${instance.sanitizedName}-recovery-rsyncd`;
 }
 
-/** secretEnv: values a `-e NAME` argument (no value) hands the container from the CLI's own environment, so they are in no argv. */
-function docker(args: string[], stdin?: string, secretEnv?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+/** secretEnv: values a `-e NAME` argument (no value) hands the container from the CLI's own environment, so they are in no argv. timedOut: the CLI was killed at DOCKER_TIMEOUT_MS, and the daemon may still carry the call out. */
+function docker(args: string[], stdin?: string, secretEnv?: Record<string, string>): Promise<{ ok: boolean; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise(resolve => {
     const env = secretEnv ? { ...process.env, ...secretEnv } : undefined;
     const child = execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, ...(env ? { env } : {}) },
-      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: err ? childFailureText(stderr, err) : String(stderr || '') }));
+      (err, stdout, stderr) => resolve({
+        ok: !err,
+        stdout: String(stdout || ''),
+        stderr: err ? childFailureText(stderr, err) : String(stderr || ''),
+        timedOut: !!err && (err as { killed?: boolean }).killed === true,
+      }));
     if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
@@ -106,8 +111,8 @@ async function databaseIdentity(instance: InstanceConfig): Promise<Record<string
   return systemId ? { systemId, timeline: Number(timeline), checkpointLsn, capturedAt: Date.now() } : {};
 }
 
-/** left: what a failed spawn could not remove or could not read, still running with only this record naming it. */
-async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string; left?: string }> {
+/** left: what a failed spawn could not remove or could not read, still running with only this record naming it; runTimedOut: the relay's docker run did not answer. */
+async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecord): Promise<{ ok: boolean; error?: string; left?: string; runTimedOut?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'instance no longer has a managed fleet database; disarm the recovery channel' };
   // A key-loss-scrubbed credential would spawn a relay that exits fatally and
@@ -151,7 +156,7 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
   const secrets: Record<string, string> = { RELAY_TOKEN: record.token };
   if (record.mode === 'receiver') secrets.RELAY_TLS_KEY = record.tlsKey!;
   const run = await docker(args, undefined, secrets);
-  if (!run.ok) return { ok: false, error: `could not start the relay container: ${redactSecrets(run.stderr.trim(), Object.values(secrets)).split('\n').pop()}` };
+  if (!run.ok) return { ok: false, error: `could not start the relay container: ${redactSecrets(run.stderr.trim(), Object.values(secrets)).split('\n').pop()}`, runTimedOut: run.timedOut };
   if (record.mode === 'source') {
     // The seed daemon belongs to the armed state: arm = fully ready to serve
     // the rescue, disarm/delete already remove it by name.
@@ -160,7 +165,8 @@ async function spawnRelay(instance: InstanceConfig, record: RecoveryChannelRecor
       const left: string[] = [];
       for (const name of daemon.unknown ? [record.containerName] : [record.containerName, rsyncContainerName(instance)]) {
         const rm = await docker(['rm', '-f', name]);
-        if (!rm.ok && !/no such container/i.test(rm.stderr)) left.push(`${name} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`);
+        if (daemon.runTimedOut && name === rsyncContainerName(instance)) left.push(`docker did not answer the start of ${name} within ${DOCKER_TIMEOUT_MS / 1000} s, so it may still be created after the removal`);
+        else if (!rm.ok && !/no such container/i.test(rm.stderr)) left.push(`${name} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`);
       }
       if (daemon.unknown) left.push(`docker did not say whether the rsync daemon ${rsyncContainerName(instance)} runs`);
       return { ok: false, error: daemon.error, left: left.length > 0 ? left.join('; and ') : undefined };
@@ -315,12 +321,14 @@ async function armSourceImpl(
 async function rollBackArm(
   instance: InstanceConfig,
   record: RecoveryChannelRecord,
-  spawned: { error?: string; left?: string },
+  spawned: { error?: string; left?: string; runTimedOut?: boolean },
 ): Promise<{ success: false; error: string }> {
   let left = spawned.left;
   if (!left) {
     const rm = await docker(['rm', '-f', record.containerName]);
     if (!rm.ok && !/no such container/i.test(rm.stderr)) left = `${record.containerName} could not be removed (${rm.stderr.trim().split('\n').pop() || 'docker did not answer'})`;
+    // The daemon can still create the container after its killed run, so an rm that found nothing proves nothing.
+    else if (spawned.runTimedOut) left = `docker did not answer the start of ${record.containerName} within ${DOCKER_TIMEOUT_MS / 1000} s, so it may still be created after the removal`;
   }
   if (!left) {
     containerManager.updateInstanceRecoveryChannel(instance.id, null);

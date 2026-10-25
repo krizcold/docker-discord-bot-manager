@@ -63,6 +63,11 @@ vi.mock('child_process', async (importOriginal) => {
       queueMicrotask(() => cb(r.status === 0 ? null : Object.assign(new Error(r.stderr), { stderr: r.stderr }), r.stdout, r.stderr));
       return;
     }
+    if (cmd === 'git') {
+      const stdout = args.includes('rev-parse') ? h.head : args.includes('rev-list') ? '0' : '';
+      queueMicrotask(() => cb(null, { stdout, stderr: '' }));
+      return;
+    }
     return (real.execFile as any)(cmd, args, opts, cb);
   };
   return { ...real, execSync, execFile, spawn, spawnSync };

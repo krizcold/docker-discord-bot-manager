@@ -106,18 +106,18 @@ const UPDATE_HEAD_UNREAD = "The source checkout's current commit could not be re
 const UPDATE_BUILT_UNKNOWN = "The manager has no record of the commit this bot was built from, so it can't confirm whether an update is available. Rebuilding the bot records it.";
 const UPDATE_SOURCE_MISSING = "The bot's source is not in the source list, so the manager can't confirm whether an update is available.";
 
-/** The deployed value of one env key, or null when the deployed compose is unreadable, lacks it or holds two values. */
+/** The deployed value of one env key, or null when the deployed compose is missing or unreadable, lacks it or holds two values. */
 function deployedEnvValue(botId: string, key: string): string | null {
   const deployed = containerManager.deployedComposeEnvValues(botId, [key], true);
-  if (deployed === null || deployed.length === 0) return null;
+  if (!deployed || deployed.length === 0) return null;
   const values = new Set(deployed.map(d => d.value.trim()));
   return values.size === 1 ? [...values][0] : null;
 }
 
-/** The role a bot was deployed with, folded; null when the deployed compose is unreadable or holds two values. */
+/** The role a bot was deployed with, folded; null when the deployed compose is missing, unreadable or holds two values. */
 function deployedRole(botId: string, roleEnv: Parameters<typeof foldedRoleValue>[0]): string | null {
   const deployed = containerManager.deployedComposeEnvValues(botId, [roleEnv.key], true);
-  if (deployed === null) return null;
+  if (!deployed) return null;
   const values = new Set(deployed.map(d => foldedRoleValue(roleEnv, d.value)));
   if (values.size > 1) return null;
   return values.size === 1 ? [...values][0] : foldedRoleValue(roleEnv, undefined);
@@ -399,8 +399,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           let secretUnfilled: string | null = null;
           if (cp.groupSecretEnv && controlSecret !== '') {
             const deployed = containerManager.deployedComposeEnvValues(bot.id, [cp.groupSecretEnv], true);
-            if (deployed === null) secretUnfilled = `The deployed setup of ${bot.displayName} could not be read, so its fleet secret is not filled in. Paste it from that node (its Usage tab > Connect a worker).`;
-            else if (deployed.length === 0 || deployed.some(d => d.value.trim() !== controlSecret)) secretUnfilled = `The saved fleet secret of ${bot.displayName} is not the one it was deployed with, so it is not filled in. Restart ${bot.displayName} to apply its saved settings, then reopen this form.`;
+            if (deployed === undefined) secretUnfilled = `The deployed setup of ${bot.displayName} could not be read, so its fleet secret is not filled in. Paste it from that node (its Usage tab > Connect a worker).`;
+            else if (!deployed || deployed.length === 0 || deployed.some(d => d.value.trim() !== controlSecret)) secretUnfilled = `The saved fleet secret of ${bot.displayName} is not the one it was deployed with, so it is not filled in. Restart ${bot.displayName} to apply its saved settings, then reopen this form.`;
           }
           const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
           const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
@@ -1314,7 +1314,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const has = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
       const deployedBefore = containerManager.deployedComposeEnvValues(req.params.id, [req.params.key]);
       const held = has(envManager.getEnvVars(req.params.id), req.params.key) || has(bot.envVars || {}, req.params.key)
-        || deployedBefore === null || deployedBefore.length > 0;
+        || deployedBefore === undefined || (deployedBefore !== null && deployedBefore.length > 0);
       const unedited = containerManager.removeEnvKeyEverywhere(req.params.id, req.params.key);
       // A running bot keeps the env it was deployed with until Apply or Restart applies the removal.
       let pendingUnrecorded = '';

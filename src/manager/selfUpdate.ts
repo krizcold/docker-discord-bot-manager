@@ -13,7 +13,7 @@
  * recreate untouched, so users and MFA seeds are preserved. Sessions are not: they
  * live in Authelia's memory, so a restart or recreate of Authelia logs admins out.
  */
-import { spawn, execFile, execSync } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import { randomUUID, createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -213,13 +213,10 @@ async function isAncestor(commit: string, head: string): Promise<boolean> {
   }
 }
 
-async function gitAsync(args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', timeout: 30000 });
+/** A git read is killed after 30 s; a call that writes (writes: true) is not, so no killed child leaves the index half written. */
+async function gitAsync(args: string[], opts: { writes?: boolean } = {}): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['-c', 'safe.directory=*', '-C', REPO, ...args], { encoding: 'utf-8', ...(opts.writes ? {} : { timeout: 30000 }) });
   return stdout.trim();
-}
-
-function gitOut(args: string[]): string {
-  return execSync(`git -c safe.directory='*' -C "${REPO}" ${args.join(' ')}`, { encoding: 'utf-8', timeout: 30000 }).trim();
 }
 
 /** One docker CLI call off the event loop. A read passes a timeout; a call that changes the stack passes none. */
@@ -272,8 +269,8 @@ async function inspectSelf(): Promise<SelfInfo | null> {
 }
 
 /** Git refuses to merge over the locally-edited (tracked) users_database.yml; keep ours. */
-function preserveLocalUsersDb(): void {
-  try { gitOut(['update-index', '--skip-worktree', 'authelia/users_database.yml']); } catch { /* best effort */ }
+async function preserveLocalUsersDb(): Promise<void> {
+  try { await gitAsync(['update-index', '--skip-worktree', 'authelia/users_database.yml'], { writes: true }); } catch { /* best effort */ }
 }
 
 const AUTHELIA_FILES = ['configuration.yml', 'users_database.yml'];
@@ -493,11 +490,11 @@ async function doManagerUpdate(
   }
 
   emit('[Update] Fetching latest code...', 'info');
-  preserveLocalUsersDb();
-  const oldHead = gitOut(['rev-parse', 'HEAD']);
+  await preserveLocalUsersDb();
+  const oldHead = await gitAsync(['rev-parse', 'HEAD']);
   const oldAuthHash = autheliaConfigHash(REPO);
   await streamProc('git', ['-c', 'safe.directory=*', '-C', REPO, 'pull', '--ff-only'], emit);
-  const newHead = gitOut(['rev-parse', 'HEAD']);
+  const newHead = await gitAsync(['rev-parse', 'HEAD']);
   const restartAuthelia = autheliaConfigHash(REPO) !== oldAuthHash && await composeHasService(self, 'authelia');
 
   emit('[Update] Rebuilding the stack images...', 'info');

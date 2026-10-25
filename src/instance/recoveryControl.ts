@@ -32,10 +32,16 @@ const RECOVERY_SLOT = 'recovery_channel';
 const DOCKER_TIMEOUT_MS = 30_000;
 const SESSION_QUERY_TIMEOUT_MS = 120_000;
 
-function docker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+/** timedOut: the CLI was killed at DOCKER_TIMEOUT_MS, and the daemon may still carry the call out. */
+function docker(args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise(resolve => {
     execFile('docker', args, { timeout: DOCKER_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 },
-      (err, stdout, stderr) => resolve({ ok: !err, stdout: String(stdout || ''), stderr: String(stderr || err || '') }));
+      (err, stdout, stderr) => resolve({
+        ok: !err,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || err || ''),
+        timedOut: !!err && (err as { killed?: boolean }).killed === true,
+      }));
   });
 }
 
@@ -157,8 +163,8 @@ uid = 0
 gid = 0
 `;
 
-/** unknown: the daemon's state could not be read, so it was left alone (it may be serving a transfer). */
-export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string; unknown?: boolean }> {
+/** unknown: the daemon's state could not be read, so it was left alone (it may be serving a transfer). runTimedOut: its docker run did not answer, so docker may still create it. */
+export async function ensureRsyncDaemon(instance: InstanceConfig, image: string, network: string): Promise<{ ok: boolean; error?: string; unknown?: boolean; runTimedOut?: boolean }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { ok: false, error: 'no managed fleet database' };
   const name = rsyncdName(instance);
@@ -181,7 +187,7 @@ export async function ensureRsyncDaemon(instance: InstanceConfig, image: string,
     '-e', `RSYNCD_CONF=${RSYNCD_CONF}`,
     '--entrypoint', 'sh', image, '-c',
     'printf %s "$RSYNCD_CONF" > /etc/rsyncd.conf && exec rsync --daemon --no-detach']);
-  if (!run.ok) return { ok: false, error: `could not start the rsync daemon: ${run.stderr.trim().split('\n').pop()}` };
+  if (!run.ok) return { ok: false, error: `could not start the rsync daemon: ${run.stderr.trim().split('\n').pop()}`, runTimedOut: run.timedOut };
   return { ok: true };
 }
 

@@ -772,20 +772,23 @@ export function updateInstanceFleetDbPinsWarning(botId: string, warning: string 
 
 /**
  * Every value a deployed compose copy's app service sets for the given keys
- * (one entry per copy that sets it), or null when a copy could not be read.
- * With activeOnly, only the copy a start deploys from is read.
+ * (one entry per copy that sets it): null when no copy exists, undefined when
+ * a copy could not be read. With activeOnly, only the copy a start deploys
+ * from is read.
  */
-export function deployedComposeEnvValues(botId: string, keys: string[], activeOnly = false): Array<{ key: string; value: string }> | null {
+export function deployedComposeEnvValues(botId: string, keys: string[], activeOnly = false): Array<{ key: string; value: string }> | null | undefined {
   const instance = getBot(botId);
-  if (!instance) return [];
+  if (!instance) return null;
   const dataRoot = process.env.DATA_ROOT || '/DATA';
   const found: Array<{ key: string; value: string }> = [];
   const paths = activeOnly ? [resolveComposePath(botId, instance.sanitizedName)] : [
     path.join(getBotDir(botId), 'docker-compose.yml'),
     path.join(dataRoot, 'AppData', 'casaos', 'apps', instance.sanitizedName, 'docker-compose.yml'),
   ];
+  let copies = 0;
   for (const composePath of paths) {
     if (!fs.existsSync(composePath)) continue;
+    copies++;
     try {
       const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
       const appName = compose?.services && typeof compose.services === 'object' ? getAppServiceName(compose) : null;
@@ -802,10 +805,10 @@ export function deployedComposeEnvValues(botId: string, keys: string[], activeOn
         }
       }
     } catch {
-      return null;
+      return undefined;
     }
   }
-  return found;
+  return copies > 0 ? found : null;
 }
 
 export function updateInstanceFleetTransfer(botId: string, run: FleetTransferRun | null): void {
@@ -3361,7 +3364,7 @@ export async function runningInstanceContainers(botId: string): Promise<string[]
   if (getBot(botId)?.fleetDb) return runningNonSidecarContainers(botId);
   try {
     const { stdout } = await execAsync(
-      `docker ps --filter "label=com.docker.compose.project=${resolveAppName(botId)}" --format "{{.Names}}"`);
+      `docker ps --filter "label=com.docker.compose.project=${resolveAppName(botId)}" --format "{{.Names}}"`, { timeout: 10000 });
     return stdout.split('\n').map(s => s.trim()).filter(Boolean);
   } catch {
     return null;
@@ -3384,7 +3387,7 @@ export async function runningNonSidecarContainers(botId: string): Promise<string
   if (!sidecarName) return null;
   try {
     const { stdout } = await execAsync(
-      `docker ps --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}"`);
+      `docker ps --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}"`, { timeout: 10000 });
     return stdout.split('\n').map(s => s.trim()).filter(Boolean)
       .filter(name => name !== sidecarName);
   } catch {
@@ -3407,7 +3410,7 @@ async function runningAppContainerId(botId: string, appName: string): Promise<st
     }
   } catch { /* fall back to the project-wide check */ }
   try {
-    const { stdout } = await execAsync(`docker ps -q ${filters}`);
+    const { stdout } = await execAsync(`docker ps -q ${filters}`, { timeout: 10000 });
     const id = stdout.trim().split('\n')[0]?.trim();
     return id ? id : null;
   } catch {
@@ -3436,7 +3439,7 @@ async function hasRunningContainer(botId: string, appName: string): Promise<bool
 /** Every running container of the project, sorted; undefined when docker could not answer. */
 async function runningProjectContainerIds(appName: string): Promise<string[] | undefined> {
   try {
-    const { stdout } = await execAsync(`docker ps -q --filter "label=com.docker.compose.project=${appName}"`);
+    const { stdout } = await execAsync(`docker ps -q --filter "label=com.docker.compose.project=${appName}"`, { timeout: 10000 });
     return stdout.trim().split('\n').map(line => line.trim()).filter(Boolean).sort();
   } catch {
     return undefined;
@@ -3943,9 +3946,10 @@ async function startDockerImageBot(instance: InstanceConfig, statusBefore: BotSt
       emit(`[Done] Bot deployed (${containerCountText(containerIds)})`, 'success');
     } else {
       const composePath = path.join(botDir, 'docker-compose.yml');
-      const envErr = syncComposeEnvVars(instance, composePath, true);
+      const latestInstance = getBot(botId) || instance;
+      const envErr = syncComposeEnvVars(latestInstance, composePath, true);
       if (envErr) notApplied.push(`environment variables (${envErr})`);
-      const dotenvErr = writeDockerEnvFile(botDir, buildEffectiveEnv(instance));
+      const dotenvErr = writeDockerEnvFile(botDir, buildEffectiveEnv(latestInstance));
       if (dotenvErr) notApplied.push(`the .env file (could not be written: ${dotenvErr}; compose read the .env already there, if any)`);
 
       reapplyConfigFilesDocker(botId, botDir, composePath, emit, notApplied);

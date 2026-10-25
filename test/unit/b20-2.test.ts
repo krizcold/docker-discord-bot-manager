@@ -32,7 +32,7 @@ vi.mock('../../src/env/manager', async (importOriginal) => {
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
-  return { ...real, runningNonSidecarContainers: async () => [], startFleetDbSidecar: async () => ({ success: true }) };
+  return { ...real, runningNonSidecarContainers: async () => [], runningInstanceContainers: async () => [], startFleetDbSidecar: async () => ({ success: true }) };
 });
 
 vi.mock('child_process', async (importOriginal) => {

@@ -166,6 +166,8 @@ describe('FU-W the recovery channel runs its writing docker calls with no timeou
     const answer = st.answer;
     st.answer = (args) => {
       const sql = sqlOf(args);
+      // A swap's read-only layer, named by its owner file, so the disarm's lift resets it.
+      if (sql.includes("pg_read_file('smdb-fence-owner', true)")) return { ok: true, stdout: 'on|swap:1\n' };
       if (sql.includes('ALTER SYSTEM RESET default_transaction_read_only')) return { ok: false, stderr: 'ERROR: lift' };
       if (args[0] === 'run' && sql.includes('postgresql.auto.conf')) return { ok: true, stdout: '' };
       return answer(args);

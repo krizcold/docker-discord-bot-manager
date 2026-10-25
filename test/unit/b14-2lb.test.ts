@@ -32,6 +32,10 @@ const pg = vi.hoisted(() => ({
   restoreFails: false,
   rewrites: [] as string[],
   hbaCount: '0',
+  // The owner file's content; '' when missing.
+  owner: '',
+  // The read-only value the lift reads: on until a reset lands.
+  readOnly: true,
 }));
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
@@ -79,6 +83,16 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[1] === '-u' && args[2] === 'root') {
       const script = args[args.length - 1];
       pg.scripts.push(script);
+      if (script.includes('smdb-fence-owner; printf')) {
+        pg.events.push('owner-write');
+        pg.owner = /printf '%s' '([^']*)'/.exec(script)![1];
+        return cb(null, '', '');
+      }
+      if (script.includes('grep -qx')) {
+        pg.events.push('owner-drop');
+        if (script.includes(`grep -qx '${pg.owner}'`)) pg.owner = '';
+        return cb(null, '', '');
+      }
       if (script.includes('printf')) { pg.events.push('hba-write'); return cb(null, '', ''); }
       pg.events.push('hba-strip');
       return pg.hbaStripFails ? fail(cb, 'sed: permission denied') : cb(null, '', '');
@@ -88,12 +102,22 @@ vi.mock('child_process', async (importOriginal) => {
       return fail(cb, pg.rejects ? 'psql: error: FATAL:  pg_hba.conf rejects connection for host "127.0.0.1"' : 'psql: error: fe_sendauth: no password supplied');
     }
     pg.sql.push(sql);
-    if (sql.includes("current_setting('hba_file') ||")) { pg.events.push('read-settings'); return cb(null, `${pg.settings}\n`, ''); }
-    if (sql.includes('pg_read_file')) { pg.events.push('layers'); return cb(null, `${pg.layers}\n`, ''); }
-    if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) { pg.events.push('read-only'); return cb(null, '', ''); }
+    if (sql.includes("current_setting('hba_file') ||")) {
+      pg.events.push('read-settings');
+      // A test names the first four settings; the layers read unfenced, with the owner file as it is.
+      return cb(null, `${pg.settings.split('|').length === 4 ? `${pg.settings}|off|${pg.owner}|0|` : pg.settings}\n`, '');
+    }
+    if (sql.includes("pg_read_file('smdb-fence-owner', true)") && !sql.includes('regexp_split_to_table')) { pg.events.push('owner-read'); return cb(null, `${pg.readOnly ? 'on' : 'off'}|${pg.owner}\n`, ''); }
+    if (sql.includes('pg_read_file')) { pg.events.push('layers'); return cb(null, `${pg.layers.split('|').length === 2 ? `${pg.layers}|${pg.owner}|` : pg.layers}\n`, ''); }
+    if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) { pg.events.push('read-only'); pg.readOnly = true; return cb(null, '', ''); }
     if (sql.includes('pg_terminate_backend(pid, 5000)')) { pg.events.push('sweep'); return cb(null, pg.sweep, ''); }
     if (sql.includes('pid IN (')) { pg.events.push('recheck'); return cb(null, `${pg.recheck}\n`, ''); }
-    if (sql.includes('ALTER SYSTEM RESET')) { pg.events.push('reset'); return pg.resetFails ? fail(cb, 'ERROR: reset refused') : cb(null, '', ''); }
+    if (sql.includes('ALTER SYSTEM RESET')) {
+      pg.events.push('reset');
+      if (pg.resetFails) return fail(cb, 'ERROR: reset refused');
+      pg.readOnly = false;
+      return cb(null, '', '');
+    }
     if (sql.includes('pg_reload_conf()')) { pg.events.push('reload'); return pg.reloadFails ? fail(cb, 'ERROR: reload refused') : cb(null, '', ''); }
     if (sql.includes("name = 'default_transaction_read_only'")) return cb(null, '0\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
@@ -138,6 +162,8 @@ import { enableFleetReplication, narrowKeptPlainHba } from '../../src/instance/f
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
+// The lane these rows fence and lift as; the owner file names it unless a row says otherwise.
+const OWNER = 'decommission:1';
 const at = (event: string) => pg.events.indexOf(event);
 const count = (event: string) => pg.events.filter(e => e === event).length;
 const bot = () => ({ id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } } as any);
@@ -160,6 +186,8 @@ beforeEach(() => {
   pg.reloadFails = false;
   pg.restoreFails = false;
   pg.hbaCount = '0';
+  pg.owner = OWNER;
+  pg.readOnly = true;
   Object.assign(fleetBackup.fenceTiming ?? {}, { probeDeadlineMs: 15_000, probeGapMs: 1 });
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
@@ -182,15 +210,15 @@ const MANAGED = 'local   all             all                                    
 
 describe('B14-2Lb: the fence refuses every outside connection', () => {
   it('sends the read-only default, the pg_hba lines, the reload, the probe and two sweeps, in that order', async () => {
-    const fence = await fleetBackup.applyWriteFence(primary);
+    const fence = await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     expect(fence.ok).toBe(true);
-    expect(pg.events).toEqual(['read-settings', 'read-only', 'hba-write', 'reload', 'probe', 'sweep', 'sweep']);
+    expect(pg.events).toEqual(['read-settings', 'owner-write', 'read-only', 'hba-write', 'reload', 'probe', 'sweep', 'sweep']);
   });
 
   it('waits the server\'s authentication_timeout before the second sweep', async () => {
     pg.settings = `${HBA}|on|1|0`;
     const started = Date.now();
-    expect((await fleetBackup.applyWriteFence(primary)).ok).toBe(true);
+    expect((await fleetBackup.applyWriteFence(primary, OWNER, 'any')).ok).toBe(true);
     expect(count('sweep')).toBe(2);
     expect(Date.now() - started).toBeGreaterThanOrEqual(950);
   }, 10_000);
@@ -198,32 +226,32 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
   it('puts the fence lines first, and a second fence leaves one block', () => {
     const file = path.join(scratch, 'pg_hba.conf');
     fs.writeFileSync(file, MANAGED);
-    runSh(fleetBackup.fenceHbaScript(true, shPath(file)));
+    runSh(fleetBackup.fenceHbaScript(true, OWNER, shPath(file)));
     const once = fs.readFileSync(file, 'utf8');
-    runSh(fleetBackup.fenceHbaScript(true, shPath(file)));
+    runSh(fleetBackup.fenceHbaScript(true, OWNER, shPath(file)));
     expect(fs.readFileSync(file, 'utf8')).toBe(once);
-    expect(once).toBe('hostssl replication replicator all scram-sha-256 # smdb-write-fence\n'
-      + 'host replication all all reject # smdb-write-fence\nhost all all all reject # smdb-write-fence\n' + MANAGED);
+    expect(once).toBe(`hostssl replication replicator all scram-sha-256 # smdb-fence-owner=${OWNER} # smdb-write-fence\n`
+      + `host replication all all reject # smdb-fence-owner=${OWNER} # smdb-write-fence\nhost all all all reject # smdb-fence-owner=${OWNER} # smdb-write-fence\n` + MANAGED);
     expect(fs.existsSync(`${file}.fence`)).toBe(false);
   });
 
   it('writes the file postgres-owned and 600 through a temp file', () => {
-    const script = fleetBackup.fenceHbaScript(true);
+    const script = fleetBackup.fenceHbaScript(true, OWNER);
     expect(script).toContain(`f=${HBA};`);
     expect(script).toMatch(/> "\$f\.fence" && chown postgres:postgres "\$f\.fence" && chmod 600 "\$f\.fence" && mv -f "\$f\.fence" "\$f"/);
   });
 
   it('writes no hostssl line when ssl is off', async () => {
     pg.settings = `${HBA}|off|0|0`;
-    expect((await fleetBackup.applyWriteFence(primary)).ok).toBe(true);
-    const script = pg.scripts.find(s => s.includes('printf'))!;
+    expect((await fleetBackup.applyWriteFence(primary, OWNER, 'any')).ok).toBe(true);
+    const script = pg.scripts.find(s => s.includes('printf') && s.includes('smdb-write-fence'))!;
     expect(script).not.toContain('hostssl');
-    expect(script).toContain('host all all all reject # smdb-write-fence');
+    expect(script).toContain(`host all all all reject # smdb-fence-owner=${OWNER} # smdb-write-fence`);
   });
 
   it('a database that reads another pg_hba file refuses and changes nothing', async () => {
     pg.settings = '/etc/postgresql/pg_hba.conf|on|60|0';
-    const fence = await fleetBackup.applyWriteFence(primary);
+    const fence = await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     expect(fence).toMatchObject({ ok: false, changed: false });
     expect(fence.stderr).toContain('/etc/postgresql/pg_hba.conf');
     // The caller names what it changed before the fence (a quiesce has stopped the source by then).
@@ -233,14 +261,14 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
 
   it('a lane whose fence refused before any change lifts nothing', async () => {
     pg.settings = '/etc/postgresql/pg_hba.conf|on|60|0';
-    const r = await fleetBackup.fencedSafetyDump(bot(), 'pre-decommission-', 'a decommission', 'running the decommission again retries the lift');
+    const r = await fleetBackup.fencedSafetyDump(bot(), 'pre-decommission-', 'a decommission', 'running the decommission again retries the lift', OWNER);
     expect(r.success).toBe(false);
     expect(pg.events).toEqual(['read-settings']);
   });
 
   it('enabled subscriptions refuse the fence before it changes anything', async () => {
     pg.settings = `${HBA}|on|60|2`;
-    const fence = await fleetBackup.applyWriteFence(primary);
+    const fence = await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     expect(fence).toMatchObject({ ok: false, changed: false });
     expect(fence.stderr).toMatch(/2 enabled subscription/);
     expect(pg.events).toEqual(['read-settings']);
@@ -249,7 +277,7 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
   it('a probe that never sees the reject lifts both layers and refuses, with no dump taken', async () => {
     pg.rejects = false;
     Object.assign(fleetBackup.fenceTiming ?? {}, { probeDeadlineMs: 30 });
-    const r = await fleetBackup.fencedSafetyDump(bot(), 'pre-decommission-', 'a decommission', 'running the decommission again retries the lift');
+    const r = await fleetBackup.fencedSafetyDump(bot(), 'pre-decommission-', 'a decommission', 'running the decommission again retries the lift', OWNER);
     expect(r.success).toBe(false);
     if (!r.success) expect(r.error).toMatch(/did not refuse a TCP connection/);
     expect(count('probe')).toBeGreaterThan(1);
@@ -260,7 +288,7 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
   });
 
   it('ends a walsender that is not the managed role\'s physical one, and keeps that one', async () => {
-    await fleetBackup.applyWriteFence(primary);
+    await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     const sweep = pg.sql.find(s => s.includes('pg_terminate_backend(pid, 5000)'))!;
     expect(sweep).toContain("backend_type = 'client backend'");
     expect(sweep).toContain("backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM 'replicator' AND datname IS NULL)");
@@ -269,12 +297,12 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
   it('a session that did not end refuses the fence; one that ended meanwhile does not', async () => {
     pg.sweep = '42|f\n43|t\n';
     pg.recheck = '1';
-    const kept = await fleetBackup.applyWriteFence(primary);
+    const kept = await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     expect(kept.ok).toBe(false);
     expect(kept.stderr).toMatch(/1 open session\(s\) did not end/);
     pg.recheck = '0';
     pg.events.length = 0;
-    expect((await fleetBackup.applyWriteFence(primary)).ok).toBe(true);
+    expect((await fleetBackup.applyWriteFence(primary, OWNER, 'any')).ok).toBe(true);
     expect(pg.sql.some(s => s.includes('pid IN (42)'))).toBe(true);
   });
 });
@@ -283,15 +311,15 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   const remedy = 'running the decommission again retries the lift';
 
   it('lifts the pg_hba lines before the read-only default', async () => {
-    expect(await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy)).toBe('');
-    expect(pg.events).toEqual(['hba-strip', 'reload', 'reset']);
+    expect(await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy)).toBe('');
+    expect(pg.events).toEqual(['hba-strip', 'reload', 'owner-read', 'reset', 'owner-drop']);
     expect(pg.sql.find(s => s.includes('ALTER SYSTEM RESET'))).toMatch(/-tA -v ON_ERROR_STOP=1 -c SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE -c ALTER SYSTEM RESET default_transaction_read_only -c SELECT pg_reload_conf\(\)/);
   });
 
   it('pg_hba lines that cannot be removed say the bot cannot reach its database', async () => {
     pg.hbaStripFails = true;
     pg.volumeStripFails = true;
-    const note = await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy);
+    const note = await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     expect(note).toMatch(/refuses every connection but the manager's/);
     expect(note).toMatch(/bot cannot reach it/);
     expect(note).toContain(remedy);
@@ -300,21 +328,21 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
 
   it('a live lift that fails after the pg_hba strip strips the files and names a restart', async () => {
     pg.resetFails = true;
-    const note = await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy);
+    const note = await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     expect(at('hba-strip')).toBeLessThan(at('volume-strip'));
     expect(note).toMatch(/READ-ONLY, and may still refuse the bot's connections, until its container restarts/);
   });
 
   it('pg_hba lines the live strip missed are stripped from the volume and reloaded', async () => {
     pg.hbaStripFails = true;
-    expect(await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy)).toBe('');
+    expect(await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy)).toBe('');
     expect(pg.events.slice(-2)).toEqual(['volume-strip', 'reload']);
   });
 
   it('a read-only default that cannot be lifted or stripped stays READ-ONLY', async () => {
     pg.resetFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, remedy, { readOnly: true, hba: false })).toBe('failed');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy, { readOnly: true, hba: false })).toBe('failed');
     expect(pg.events).not.toContain('hba-strip');
   });
 
@@ -322,7 +350,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
     pg.reloadFails = true;
     pg.resetFails = true;
     pg.volumeStripFails = true;
-    const note = await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy);
+    const note = await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     expect(at('hba-strip')).toBe(0);
     expect(note).toMatch(/stays READ-ONLY/);
     expect(note).toMatch(/may still refuse the bot's connections until it reloads or restarts/);
@@ -333,9 +361,9 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   it('a reload that landed before the read-only reset failed is failed, and no text says the reload failed', async () => {
     pg.resetFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, remedy)).toBe('failed');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy)).toBe('failed');
     expect(pg.sql.some(s => /-c SELECT pg_reload_conf\(\)$/.test(s) && !s.includes('ALTER SYSTEM'))).toBe(true);
-    const note = await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy);
+    const note = await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     expect(note).toMatch(/stays READ-ONLY/);
     expect(note).not.toMatch(/reload failed|until it reloads or restarts/);
     expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/READ-ONLY/);
@@ -344,9 +372,9 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
 
   it('a lone reload that fails before a reset whose own reload lands is lifted, with no strip and no warning', async () => {
     pg.reloadFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, remedy)).toBe('lifted');
-    expect(pg.events).toEqual(['hba-strip', 'reload', 'reset']);
-    expect(await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy)).toBe('');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy)).toBe('lifted');
+    expect(pg.events).toEqual(['hba-strip', 'reload', 'owner-read', 'reset', 'owner-drop']);
+    expect(await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy)).toBe('');
     expect(pg.events).not.toContain('volume-strip');
     expect(fleetBackup.getFleetFenceStuck('a') ?? '').not.toMatch(/READ-ONLY|refuse/);
   });
@@ -354,15 +382,15 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   it('an hba-only lift whose reload fails after the strip is stripped, not failed', async () => {
     pg.reloadFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, remedy, { readOnly: false, hba: true })).toBe('stripped');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy, { readOnly: false, hba: true })).toBe('stripped');
     expect(pg.events).not.toContain('reset');
   });
 
   it('the down-container strip removes the lines from both files and chowns pg_hba.conf back to postgres', async () => {
     pg.resetFails = true;
-    await fleetBackup.liftLaneFence('a', primary, 'a decommission', remedy);
+    await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     const script = pg.scripts.find(s => s.includes('/pgdata/postgresql.auto.conf'))!;
-    expect(script).toContain("sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf");
+    expect(script).toContain(`if grep -qx '${OWNER}' /pgdata/smdb-fence-owner 2>/dev/null; then sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf && rm -f /pgdata/smdb-fence-owner`);
     expect(script).toContain('f=/pgdata/pg_hba.conf;');
     expect(script).toMatch(/sed -i '\/# smdb-write-fence\$\/d' "\$f" && chown postgres:postgres "\$f" && chmod 600 "\$f"/);
   });
@@ -371,7 +399,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
     const dir = fs.mkdtempSync(path.join(scratch, 'strip-'));
     const file = path.join(dir, 'pg_hba.conf');
     fs.writeFileSync(file, MANAGED);
-    runSh(fleetBackup.fenceHbaScript(false, shPath(file)));
+    runSh(fleetBackup.fenceHbaScript(false, OWNER, shPath(file)));
     runSh(fleetBackup.stripFenceHbaScript(shPath(dir)));
     expect(fs.readFileSync(file, 'utf8')).toBe(MANAGED);
     runSh(fleetBackup.stripFenceHbaScript(shPath(dir)));
@@ -381,20 +409,23 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
 });
 
 describe('B14-2Lb: a consent park owns the layers it set', () => {
-  it('owns only the layers that were off, or both when an earlier run here left them', () => {
-    expect(ownedFenceLayers({ readOnly: true, hba: false }, false)).toEqual({ readOnly: false, hba: true });
-    expect(ownedFenceLayers({ readOnly: false, hba: true }, false)).toEqual({ readOnly: true, hba: false });
-    expect(ownedFenceLayers({ readOnly: false, hba: false }, false)).toEqual({ readOnly: true, hba: true });
-    expect(ownedFenceLayers({ readOnly: true, hba: true }, true)).toEqual({ readOnly: true, hba: true });
+  it('owns only the layers that were off, or one an earlier run of its lane left', () => {
+    const state = (readOnly: boolean, hba: boolean, readOnlyOwner: string | null = null, hbaOwner: string | null = null) => ({ readOnly, hba, readOnlyOwner, hbaOwner, ownerFile: readOnlyOwner ?? '' });
+    expect(ownedFenceLayers(state(true, false), 'failback:2')).toEqual({ readOnly: false, hba: true });
+    expect(ownedFenceLayers(state(false, true), 'failback:2')).toEqual({ readOnly: true, hba: false });
+    expect(ownedFenceLayers(state(false, false), 'failback:2')).toEqual({ readOnly: true, hba: true });
+    expect(ownedFenceLayers(state(true, true, 'failback:1', 'failback:1'), 'failback:2')).toEqual({ readOnly: true, hba: true });
+    expect(ownedFenceLayers(state(true, true, 'restore:1', 'failback:1'), 'failback:2')).toEqual({ readOnly: false, hba: true });
+    expect(ownedFenceLayers(state(true, true, 'dropback:1', 'dropback:1'), 'failback:2')).toEqual({ readOnly: false, hba: false });
   });
 
   it('lifting only the pg_hba layer leaves the read-only default another lane set', async () => {
-    expect(await fleetBackup.liftConsentFence('a', primary, 'x', { readOnly: false, hba: true })).toBe('lifted');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, 'x', { readOnly: false, hba: true })).toBe('lifted');
     expect(pg.events).toEqual(['hba-strip', 'reload']);
   });
 
   it('lifting only the read-only layer leaves the pg_hba lines another lane set', async () => {
-    expect(await fleetBackup.liftConsentFence('a', primary, 'x', { readOnly: true, hba: false })).toBe('lifted');
+    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, 'x', { readOnly: true, hba: false })).toBe('lifted');
     expect(pg.events).not.toContain('hba-strip');
     expect(pg.events).toContain('reset');
   });
@@ -446,6 +477,7 @@ describe('B14-2Lb: the pg_hba rewriters refuse while the fence lines are present
     const r = await enableFleetReplication(bot(), 'h.example.invalid', 15432);
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/write fence stands in pg_hba\.conf/);
+    expect(r.error).toMatch(/no lane of this manager set its lines; a restore takes them over and lifts them, or remove them by hand/);
     expect(r.error).toMatch(/nothing was changed/);
     expect(pg.spawned.some(s => s.includes('pg_read_file'))).toBe(true);
     expect(pg.spawned.filter(s => /ALTER SYSTEM|ROLE replicator|pg_hba\.conf\.new|pg_reload_conf/.test(s))).toEqual([]);

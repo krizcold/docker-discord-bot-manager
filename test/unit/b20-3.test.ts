@@ -36,6 +36,7 @@ vi.mock('child_process', async (importOriginal) => {
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { fenceOwners } from './fence-fake';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
@@ -61,6 +62,7 @@ beforeEach(() => {
   pg.fenced = new Map([[primary.containerName, true]]);
   pg.saved = 'error';
   pg.inRecovery = 't';
+  fenceOwners.clear();
   seedRegistry();
 });
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
@@ -88,6 +90,7 @@ describe('the stuck-fence warning seeded at start names a remedy that works', ()
   it('an armed recovery channel names its disarm as the remedy', async () => {
     pg.saved = '1';
     seedRegistry({ recoveryChannel: { mode: 'source' } });
+    fenceOwners.set(primary.containerName, 'swap:1729900000000');
     expect(await seededWarning()).toMatch(/disarming the recovery channel/);
   });
 

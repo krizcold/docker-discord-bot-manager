@@ -1170,7 +1170,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // copy read-only at its own next promotion; a primary fenced during the copy
   // passes on the pg_hba lines that refuse every outside connection. Stripped,
   // never reset, because the copy is not running yet.
-  const strip = await volExec(record.volume, `sed -i '/^synchronous_standby_names/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && ${fleetBackup.stripFenceHbaScript(PGDATA)}`);
+  const strip = await volExec(record.volume, `sed -i '/^synchronous_standby_names/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && ${fleetBackup.stripCopiedFenceScript(PGDATA)}`);
   if (!strip.ok) throw new Error(`could not strip the primary's own settings from the copy: ${strip.stderr.trim()}`);
   // application_name is the slot name, so the primary's own status ties a
   // streaming link to its slot without reading process ids.
@@ -1633,6 +1633,7 @@ export function reseedStalePrimary(
     // own fence before it parks for consent (F5), and that consent names the
     // dump's outcome, so it arrives here with the dump done.
     let fenced = false;
+    const fenceOwner = fleetBackup.newFenceOwner('reseed');
     try {
       if (!opts.dumpDone) {
         const volState = await dockerVolumeState(fleetDb.volume);
@@ -1642,7 +1643,7 @@ export function reseedStalePrimary(
           if (reminted) throw new Error(`nothing was destroyed: ${reminted}`);
           const started = await containerManager.startFleetDbSidecar(instance.id, { retireRetry: true });
           if (!started.success) throw new Error(`the database did not come up for the safety dump, so nothing was destroyed: ${started.error}`);
-          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY);
+          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY, fenceOwner);
           if (!dump.success) throw new Error(`the safety dump failed, so nothing was destroyed: ${dump.error}`);
           fenced = true;
           saveSeedOrHold(instance.id, { safetyDump: dump.file });
@@ -1671,7 +1672,7 @@ export function reseedStalePrimary(
       }
     } catch (err) {
       if (fenced) {
-        const note = await liftFenceLeftStanding(instance.id, fleetDb, 'a re-seed', RESEED_LIFT_REMEDY);
+        const note = await liftFenceLeftStanding(instance.id, fleetDb, fenceOwner, 'a re-seed', RESEED_LIFT_REMEDY);
         if (note && err instanceof Error && !(err instanceof SeedCancelled)) err.message += note;
       }
       throw err;
@@ -1754,11 +1755,11 @@ const DECOMMISSION_LIFT_REMEDY = 'running the decommission again retries the lif
  * first: the lift's fallback mounts the volume, which would mint one that the
  * refused destroy had already removed.
  */
-async function liftFenceLeftStanding(botId: string, fleetDb: NonNullable<InstanceConfig['fleetDb']>, lane: string, remedy: string): Promise<string> {
+async function liftFenceLeftStanding(botId: string, fleetDb: NonNullable<InstanceConfig['fleetDb']>, owner: string, lane: string, remedy: string): Promise<string> {
   const volState = await dockerVolumeState(fleetDb.volume);
   if (volState === 'absent') return '';
   if (volState === 'unknown') return '; whether the database is still fenced (read-only or refusing the bot\'s connections) could not be confirmed (docker did not answer)';
-  return fleetBackup.liftLaneFence(botId, fleetDb, lane, remedy);
+  return fleetBackup.liftLaneFence(botId, fleetDb, owner, lane, remedy);
 }
 
 /**
@@ -1815,6 +1816,7 @@ export async function decommissionFleetDb(
         // An unanswerable probe refuses: skipping the gate on a guess is the
         // destroy-without-dump hole this whole design exists to close.
         let dumpFile: string | undefined;
+        const fenceOwner = fleetBackup.newFenceOwner('decommission');
         const volState = await dockerVolumeState(instance.fleetDb.volume);
         if (volState === 'unknown') {
           return { success: false, error: 'Refused, nothing was destroyed: could not verify the database volume (docker did not answer) - try again' };
@@ -1830,7 +1832,7 @@ export async function decommissionFleetDb(
           }
           // Under the write fence, so a writer this manager cannot see (another
           // machine's worker) cannot land a row the dump misses.
-          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-decommission-', 'a decommission', DECOMMISSION_LIFT_REMEDY);
+          const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-decommission-', 'a decommission', DECOMMISSION_LIFT_REMEDY, fenceOwner);
           if (!dump.success) {
             return { success: false, error: `Refused, nothing was destroyed: the pre-decommission dump failed: ${dump.error}. The database was left running alone for inspection` };
           }
@@ -1839,7 +1841,7 @@ export async function decommissionFleetDb(
 
         const retired = await containerManager.retireFleetDbSidecar(instance.id);
         if (!retired.success) {
-          const note = dumpFile && !retired.volumeRemoved ? await liftFenceLeftStanding(instance.id, instance.fleetDb, 'a decommission', DECOMMISSION_LIFT_REMEDY) : '';
+          const note = dumpFile && !retired.volumeRemoved ? await liftFenceLeftStanding(instance.id, instance.fleetDb, fenceOwner, 'a decommission', DECOMMISSION_LIFT_REMEDY) : '';
           return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}${note}`, dumpFile };
         }
         let warning: string | undefined;
@@ -2046,7 +2048,7 @@ export async function adoptPromotedReplica(
   // them and they shut out every outside client. The reload before the enable
   // applies the stripped file.
   const fence = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    execFile('docker', ['exec', '-u', 'root', rec.containerName, 'sh', '-c', fleetBackup.stripFenceHbaScript(PGDATA)], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
+    execFile('docker', ['exec', '-u', 'root', rec.containerName, 'sh', '-c', fleetBackup.stripCopiedFenceScript(PGDATA)], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
       resolve({ ok: !err, stderr: String(stderr || err || '') });
     });
   });

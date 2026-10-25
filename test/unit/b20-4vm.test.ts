@@ -168,7 +168,7 @@ describe('B20-4vm: liftRestoreFence strips only a volume docker proved exists', 
 
   it('runs no strip, mints nothing and says no fence remains when the volume is gone', async () => {
     h.volumes.delete(DB);
-    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'a re-seed', 'retrying the re-seed retries the lift');
+    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'reseed:1', 'a re-seed', 'retrying the re-seed retries the lift');
     expect(runs()).toEqual([]);
     expect(h.volumes.has(DB)).toBe(false);
     expect(note).toMatch(/the database volume bot1-fleet-postgres-data is gone, so no write fence remains on it/);
@@ -178,7 +178,7 @@ describe('B20-4vm: liftRestoreFence strips only a volume docker proved exists', 
 
   it('says it cannot confirm when docker does not answer the volume read', async () => {
     h.rules.push([isVolumeInspect, false, '', DAEMON_DOWN]);
-    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'a re-seed', 'retrying the re-seed retries the lift');
+    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'reseed:1', 'a re-seed', 'retrying the re-seed retries the lift');
     expect(runs()).toEqual([]);
     expect(note).toMatch(/can't confirm whether the database is still READ-ONLY/);
     expect(fleetBackup.getFleetFenceStuck('b1')).toMatch(/can't confirm/);
@@ -186,7 +186,7 @@ describe('B20-4vm: liftRestoreFence strips only a volume docker proved exists', 
 
   it('strips the fence from an existing volume as before', async () => {
     h.rules.push([isStrip, true, '', '']);
-    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'a re-seed', 'retrying the re-seed retries the lift');
+    const note = await fleetBackup.liftLaneFence('b1', fleetDb, 'reseed:1', 'a re-seed', 'retrying the re-seed retries the lift');
     expect(runs()).toHaveLength(1);
     expect(runs()[0]).toContain(`${DB}:/pgdata`);
     expect(note).toMatch(/READ-ONLY, and may still refuse the bot's connections, until its container restarts/);

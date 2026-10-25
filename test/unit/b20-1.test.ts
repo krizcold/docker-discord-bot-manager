@@ -38,6 +38,11 @@ vi.mock('child_process', async (importOriginal) => {
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { fenceOwners } from './fence-fake';
+
+// The owner a failback run that started at 1 names on the layers it sets.
+const OWNER = 'failback:1';
+const rec = (db: { containerName: string }) => ({ containerName: db.containerName, owner: OWNER });
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
@@ -71,6 +76,9 @@ beforeEach(() => {
   pg.down = new Set();
   pg.liftWorks = false;
   pg.onLift = null;
+  fenceOwners.clear();
+  fenceOwners.set(primary.containerName, OWNER);
+  fenceOwners.set(copy.containerName, OWNER);
   seedRegistry();
 });
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
@@ -78,7 +86,7 @@ afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 describe('X15: a failback run\'s stuck consent fence survives a manager restart', () => {
   it('a re-armed run after a restart still owns the fence a failback left stuck', async () => {
     const before = await restartedManager();
-    expect(await before.liftConsentFence('a', primary, 'its next restore retries the lift')).toBe('failed');
+    expect(await before.liftConsentFence('a', primary, OWNER, 'its next restore retries the lift')).toBe('failed');
     expect(before.failbackFenceLeft('a', primary.containerName)).toBe(true);
 
     const after = await restartedManager();
@@ -90,22 +98,23 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
     const fb = await restartedManager();
     let seenAtLift: unknown = 'unset';
     pg.onLift = () => { seenAtLift = onDisk().fleetConsentFenceLeft ?? null; };
-    await fb.liftConsentFence('a', copy, 're-seeding this copy on its Database modal clears it');
+    await fb.liftConsentFence('a', copy, OWNER, 're-seeding this copy on its Database modal clears it');
     expect(seenAtLift).toBeNull();
-    expect(onDisk().fleetConsentFenceLeft).toEqual([copy.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(copy)]);
   });
 
   it('a refused clear does not claim a later fence, and the clear is retried until it lands', async () => {
     const fb = await restartedManager();
-    await fb.liftConsentFence('a', primary, 'x');
+    await fb.liftConsentFence('a', primary, OWNER, 'x');
     pg.liftWorks = true;
     blockSaves();
     try {
-      expect(await fb.liftConsentFence('a', primary, 'x')).toBe('lifted');
+      expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('lifted');
     } finally { unblockSaves(); }
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary)]);
     // Another lane fences the database: this process must not take it for the failback's.
     pg.fenced.set(primary.containerName, true);
+    fenceOwners.set(primary.containerName, 'restore:2');
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(false);
     const tick = await startedWithTick(fb);
     fb.stopFleetBackupScheduler();
@@ -116,13 +125,13 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
 
   it('a record kept at start for a stopped database is reprobed and cleared once it reads unfenced', async () => {
     const first = await restartedManager();
-    await first.liftConsentFence('a', primary, 'x');
+    await first.liftConsentFence('a', primary, OWNER, 'x');
     pg.down.add(primary.containerName);
     const after = await restartedManager();
     const tick = await startedWithTick(after);
     after.stopFleetBackupScheduler();
     await new Promise(r => setTimeout(r, 50));
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary)]);
     expect(after.failbackFenceLeft('a', primary.containerName)).toBe(true);
     // It comes up clean (its restart dropped the stripped setting).
     pg.down.delete(primary.containerName);
@@ -134,21 +143,21 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
 
   it('a lift that lands on the primary leaves the copy stuck-fence warning in place', async () => {
     const fb = await restartedManager();
-    await fb.liftConsentFence('a', copy, 'reseed');
+    await fb.liftConsentFence('a', copy, OWNER, 'reseed');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
     pg.liftWorks = true;
     pg.fenced.set(copy.containerName, true);
     pg.onLift = (c) => { if (c === copy.containerName) throw new Error('the copy must not be lifted here'); };
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('lifted');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('lifted');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
-    expect(onDisk().fleetConsentFenceLeft).toEqual([copy.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(copy)]);
   });
 
   it('a lifted fence clears the record, so a restarted manager does not claim a later fence there', async () => {
     const first = await restartedManager();
-    await first.liftConsentFence('a', primary, 'x');
+    await first.liftConsentFence('a', primary, OWNER, 'x');
     pg.liftWorks = true;
-    expect(await first.liftConsentFence('a', primary, 'x')).toBe('lifted');
+    expect(await first.liftConsentFence('a', primary, OWNER, 'x')).toBe('lifted');
     expect(onDisk().fleetConsentFenceLeft).toBeUndefined();
     const after = await restartedManager();
     expect(after.failbackFenceLeft('a', primary.containerName)).toBe(false);
@@ -156,7 +165,7 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
 
   it('at start a recorded fence that reads off is cleared, so a stale record cannot claim another lane\'s fence', async () => {
     const first = await restartedManager();
-    await first.liftConsentFence('a', primary, 'x');
+    await first.liftConsentFence('a', primary, OWNER, 'x');
     // Lifted outside this manager (its container restarted on a stripped auto.conf).
     pg.fenced.set(primary.containerName, false);
     const after = await restartedManager();
@@ -168,26 +177,26 @@ describe('X15: a failback run\'s stuck consent fence survives a manager restart'
 
   it('each tick rechecks every record, not only the one the warning names', async () => {
     const fb = await restartedManager();
-    await fb.liftConsentFence('a', primary, 'x');
-    await fb.liftConsentFence('a', copy, 'reseed');
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName, copy.containerName]);
+    await fb.liftConsentFence('a', primary, OWNER, 'x');
+    await fb.liftConsentFence('a', copy, OWNER, 'reseed');
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary), rec(copy)]);
     const tick = await startedWithTick(fb);
     fb.stopFleetBackupScheduler();
     await new Promise(r => setTimeout(r, 50));
     pg.fenced.set(primary.containerName, false);
     tick();
-    await vi.waitFor(() => expect(onDisk().fleetConsentFenceLeft).toEqual([copy.containerName]));
+    await vi.waitFor(() => expect(onDisk().fleetConsentFenceLeft).toEqual([rec(copy)]));
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(false);
     expect(fb.failbackFenceLeft('a', copy.containerName)).toBe(true);
   });
 
-  it('a record that could not be saved is named on the stuck-fence warning', async () => {
+  it('a record that could not be saved is held in this process', async () => {
     const fb = await restartedManager();
     // A directory where the temp file goes refuses the save on every platform.
     blockSaves();
     try {
-      expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
-      expect(fb.getFleetFenceStuck('a')).toContain('could not save that the failback owns this fence');
+      expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
+      expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
       expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(true);
     } finally {
       unblockSaves();

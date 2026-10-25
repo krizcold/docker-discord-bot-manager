@@ -7,9 +7,9 @@
  * receiver) owns the whole rescue sequencing; this side only answers.
  *
  * Auth: every request carries the channel token of this instance's armed
- * source record. Narrow by construction: six routes (the RC-4 swap adds
- * quiesce + teardown), nothing else of the manager is reachable through the
- * lane.
+ * source record. Narrow by construction: seven routes (the RC-4 swap adds
+ * quiesce, teardown and abandon), nothing else of the manager is reachable
+ * through the lane.
  *
  * The backup session is a live `docker exec -i psql` child: postgres 15+
  * aborts backup mode when the session that called pg_backup_start dies, which
@@ -22,7 +22,7 @@ import * as crypto from 'crypto';
 import { spawn, execFile, ChildProcess } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import * as appLifecycle from './appLifecycle';
-import { applyWriteFence, foreignFenceSet, probeLiveTerm } from './fleetBackup';
+import { applyWriteFence, fenceLayers, foreignFenceSet, newFenceOwner, probeLiveTerm } from './fleetBackup';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
@@ -242,11 +242,22 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
     if (reset.formsCleared === false) console.log(`[RecoveryControl] The source app on ${instance.displayName} cleared its role override and kept its persisted store forms (its environment pins no database URL); the next delivery replaces them`);
   }
   const fresh = containerManager.getBot(instance.id);
-  if (!fresh?.recoverySwappedAway) {
+  // The fence names this swap by its record's time, so the disarm lifts only what a swap set.
+  let swapAt = fresh?.recoverySwappedAway?.at;
+  if (swapAt === undefined) {
+    swapAt = Date.now();
     try {
-      containerManager.updateInstanceRecoverySwappedAway(instance.id, { at: Date.now() });
+      containerManager.updateInstanceRecoverySwappedAway(instance.id, { at: swapAt });
     } catch (err) {
       return { code: 500, body: { success: false, error: `the swap could not be recorded on the source (${err instanceof Error ? err.message : String(err)}), so nothing was stopped` }, changed: false };
+    }
+  }
+  // A swap started again is no longer the one the receiver cancelled.
+  if (fresh?.recoverySwapAbandoned) {
+    try {
+      containerManager.updateInstanceRecoverySwapAbandoned(instance.id, null);
+    } catch (err) {
+      return { code: 500, body: { success: false, error: `the earlier cancelled swap's record could not be cleared on the source (${err instanceof Error ? err.message : String(err)}), so nothing was stopped` }, changed: false };
     }
   }
   if (live.length > 0) {
@@ -271,8 +282,11 @@ async function quiesce(instance: InstanceConfig, receiverSystemId: string): Prom
   // landing after the LSN capture would be silently discarded at promote.
   // The shared write fence refuses every outside connection and ends every
   // session; the managed role's physical replication stays, so the stream
-  // reaches the captured LSN. Disarm lifts it.
-  const fence = await applyWriteFence(fleetDb);
+  // reaches the captured LSN. Disarm lifts it. The swap takes over a layer a
+  // failback, drop-back or earlier swap run left, so that run's Cancel cannot
+  // open the source under the catch-up; a restore's, re-seed's, decommission's
+  // or no lane's layer stays as it is (it fences the database all the same).
+  const fence = await applyWriteFence(fleetDb, newFenceOwner('swap', swapAt), 'run');
   if (!fence.ok) {
     const state = fence.changed ? '' : '; the source instance is stopped and its database was not fenced';
     return { code: 500, body: { success: false, error: `could not fence the source database: ${fence.stderr.trim().split('\n').pop()}${state}` }, changed: true };
@@ -296,7 +310,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     res.end(JSON.stringify(body));
   };
   const url = new URL(req.url || '/', 'http://control');
-  const match = /^\/control\/(prepare|backup-start|backup-stop|status|quiesce|teardown)$/.exec(url.pathname);
+  const match = /^\/control\/(prepare|backup-start|backup-stop|status|quiesce|teardown|abandon)$/.exec(url.pathname);
   if (!match) { send(404, { success: false, error: 'unknown route' }); return; }
   const action = match[1];
   // The receiver cannot know this machine's instance ids; the channel token
@@ -430,6 +444,35 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       send(answer.code, answer.body);
       return;
     }
+    if (action === 'abandon') {
+      // The receiver cancelled the swap before it promoted its copy. This side stays as the swap left it (the
+      // operator decides what comes next); the record only tells the operator, with whether a fence stands.
+      const phase = url.searchParams.get('phase') || '';
+      if (phase !== 'quiesce' && phase !== 'catchup') {
+        send(400, { success: false, error: 'the receiver named no cancelled swap phase (quiesce or catchup)' });
+        return;
+      }
+      // A quiesce still running may yet record the swap and set the fence, so neither absence can be trusted now.
+      if (containerManager.isBotBusy(instance.id) === 'quiesce') {
+        send(409, { success: false, error: 'a quiesce is still running on the source, so the cancel could not be recorded' });
+        return;
+      }
+      if (!containerManager.getBot(instance.id)?.recoverySwappedAway) {
+        send(409, { success: false, noSwap: true, error: 'this source holds no swap record, so there is no swap to mark cancelled' });
+        return;
+      }
+      const layers = await fenceLayers(fleetDb);
+      const fenced = layers === null ? null : layers.readOnly || layers.hba;
+      try {
+        containerManager.updateInstanceRecoverySwapAbandoned(instance.id, { at: Date.now(), phase, fenced });
+      } catch (err) {
+        send(500, { success: false, error: `the cancelled swap could not be recorded on the source (${err instanceof Error ? err.message : String(err)})` });
+        return;
+      }
+      containerManager.broadcastBotUpdated(instance.id);
+      send(200, { success: true });
+      return;
+    }
     if (action === 'teardown') {
       // Swap teardown (RC-4): the receiver has promoted and no longer needs
       // this side. Answer FIRST - the response still rides the tunnel the
@@ -446,7 +489,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           if (!fresh?.recoveryChannel) return;
           const disarmed = await disarmRecoveryChannel(fresh);
           console.log(disarmed.success
-            ? `[RecoveryControl] Source side disarmed after the swap (${fresh.displayName})`
+            ? `[RecoveryControl] Source side disarmed after the swap (${fresh.displayName})${disarmed.warning ? `: ${disarmed.warning}` : ''}`
             : `[RecoveryControl] Source-side disarm after the swap failed (${fresh.displayName}): ${disarmed.error}`);
         })();
       }, 2_000).unref();

@@ -1543,9 +1543,11 @@
             const restoreBadge = fb && fb.restoreError
               ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
               : '';
-            const fenceBadge = bot.fenceStuck
+            const fenceBadge = (bot.fenceStuck
               ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database fenced</span>`
-              : '';
+              : '') + (bot.recoverySwappedAway && bot.recoverySwapAbandoned
+              ? `<span class="update-badge danger" title="${escapeHtml(swapAbandonedText(bot))}">Swap cancelled</span>`
+              : '');
 
             // Replication health: sampled in the background, so the badge is a
             // cached verdict rather than a probe on every render.
@@ -2847,10 +2849,21 @@
       return restore + (fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '');
     }
 
+    function swapAbandonedText(bot) {
+      const a = bot.recoverySwapAbandoned;
+      const day = new Date(a.at).toISOString().slice(0, 10);
+      const step = a.phase === 'catchup' ? 'the catch-up step' : 'the quiesce step';
+      const cancelled = `The receiving machine cancelled this swap on ${day} at ${step}, before it promoted its copy.`;
+      if (a.fenced === false) return `${cancelled} This database was not fenced when the cancel arrived: clear the swap record, then start the instance.`;
+      if (a.fenced === true) return `${cancelled} This database was still fenced when the cancel arrived: Disarm the recovery channel below (it lifts the layers the swap set and names any layer another lane holds), then clear the swap record and start the instance.`;
+      return `${cancelled} Whether this database is still fenced could not be confirmed (its fence could not be read when the cancel arrived): Disarm the recovery channel below (it lifts any layer the swap set and names any layer another lane holds), then clear the swap record and start the instance.`;
+    }
+
     function swappedAwayHtml(bot) {
       if (!bot || !bot.recoverySwappedAway) return '';
       const day = new Date(bot.recoverySwappedAway.at).toISOString().slice(0, 10);
-      return `<div class="error-message">A recovery swap on ${day} handed this database to another machine, so Start and Update are refused: starting this instance would run a second primary on the old copy. Re-seed it as a standby of the new primary, or clear the swap record if that swap never promoted the copy there. <button class="btn btn-secondary btn-small" onclick="clearSwappedAway('${bot.id}')">Clear the swap record</button></div>`;
+      const abandoned = bot.recoverySwapAbandoned ? `<div class="error-message">${escapeHtml(swapAbandonedText(bot))}</div>` : '';
+      return abandoned + `<div class="error-message">A recovery swap on ${day} handed this database to another machine, so Start and Update are refused: starting this instance would run a second primary on the old copy. Re-seed it as a standby of the new primary, or clear the swap record if that swap never promoted the copy there. <button class="btn btn-secondary btn-small" onclick="clearSwappedAway('${bot.id}')">Clear the swap record</button></div>`;
     }
 
     async function clearSwappedAway(botId) {
@@ -3658,7 +3671,8 @@
       if (!confirm('Disarm the recovery channel on this side?\n\nAn in-flight transfer stops (a later re-arm resumes the copy incrementally). The other machine stays armed until disarmed there.')) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/recovery-channel`);
-        showMessage(res.success ? 'success' : 'error', res.success ? 'Recovery channel disarmed on this side.' : (res.error || 'Failed to disarm'));
+        if (res.success && res.warning) showMessage('warning', res.warning);
+        else showMessage(res.success ? 'success' : 'error', res.success ? 'Recovery channel disarmed on this side.' : (res.error || 'Failed to disarm'));
       } catch (err) {
         showNoAnswer('disarm');
       }

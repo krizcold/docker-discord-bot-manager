@@ -126,6 +126,7 @@ beforeEach(() => {
   h.onExec = null;
   h.onVolumeRm = null;
   h.rootFails = false;
+  (globalThis as { __fenceOwners?: Map<string, string> }).__fenceOwners?.clear();
   h.runs = [];
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(botDir, { recursive: true });
@@ -277,7 +278,7 @@ describe('R1-J38: the recovery channel disarm reports what remains', () => {
 
   it('keeps the record and answers an error when the fence was stripped from the files but the database runs on', async () => {
     h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'psql: error: connection refused']);
-    h.rules.push([isStrip, true, 'stripped\n', '']);
+    h.rules.push([isStrip, true, 'stripped-ro\n', '']);
     h.rules.push([isDbInspect, true, 'true\n', '']);
     const res = await disarmRecoveryChannel(sourceBot());
     expect(res.success).toBe(false);
@@ -320,6 +321,9 @@ describe('R1-J38: the recovery channel disarm reports what remains', () => {
   });
 
   it('B14-2Lb: strips the fence lines from pg_hba.conf before the read-only reset', async () => {
+    const { fenceOwners } = await import('./fence-fake');
+    fenceOwners.set(fleetDb.containerName, 'swap:5');
+    h.rules.push([isExec('SHOW default_transaction_read_only'), true, 'on\n', '']);
     const res = await disarmRecoveryChannel(sourceBot());
     expect(res).toEqual({ success: true });
     const hba = h.calls.findIndex(c => c.startsWith('exec -u root bot1-fleet-postgres sh -c') && c.includes("sed -i '/# smdb-write-fence$/d'"));
@@ -332,22 +336,24 @@ describe('R1-J38: the recovery channel disarm reports what remains', () => {
   it('B14-2Lb: with the database down, the volume strip removes both layers and keeps pg_hba.conf postgres-owned', async () => {
     h.rootFails = true;
     h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'Error response from daemon: container is not running']);
-    h.rules.push([isStrip, true, 'stripped\n', '']);
+    h.rules.push([isStrip, true, 'stripped-ro\n', '']);
     h.rules.push([isDbInspect, false, '', 'Error: No such object: bot1-fleet-postgres']);
     await disarmRecoveryChannel(sourceBot());
     const run = h.runs.find(isStrip)!;
     expect(run.slice(0, 6)).toEqual(['run', '--rm', '-v', `${DB}:/pgdata`, '--entrypoint', 'sh']);
     const script = run[run.length - 1];
-    expect(script).toContain("sed -i '/^default_transaction_read_only/d' \"$f\"");
+    expect(script).toContain("sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf");
     expect(script).toContain('f=/pgdata/pg_hba.conf;');
     expect(script).toMatch(/sed -i '\/# smdb-write-fence\$\/d' "\$f" && chown postgres:postgres "\$f" && chmod 600 "\$f"/);
 
-    const { FENCED_HBA, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
+    const { ownedFencedHba, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
     const ran = await runOnDataDir(script, '/pgdata', {
-      'pg_hba.conf': FENCED_HBA + MANAGED_HBA,
+      'pg_hba.conf': ownedFencedHba('swap:5') + MANAGED_HBA,
       'postgresql.auto.conf': "wal_log_hints = 'on'\ndefault_transaction_read_only = 'on'\n",
+      'smdb-fence-owner': 'swap:5',
     });
-    expect(ran.out.trim()).toBe('stripped');
+    expect(ran.out.trim().split('\n')).toEqual(['stripped-ro', 'stripped-hba']);
+    expect(ran.files['smdb-fence-owner']).toBeUndefined();
     expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
     expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\n");
     expect(ran.chowns).toEqual(['postgres:postgres /pgdata/pg_hba.conf']);

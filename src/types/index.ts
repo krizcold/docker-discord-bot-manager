@@ -366,12 +366,13 @@ export interface InstanceConfig {
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
   fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it
-  fleetConsentFenceLeft?: string[];    // containers whose write fence a failback or drop-back run set and has not seen lifted; the next run there owns it
+  fleetConsentFenceLeft?: Array<{ containerName: string; owner: string }>; // points at a write fence a failback or drop-back run set and has not seen lifted, with the owner its layers name
   recoveryChannel?: RecoveryChannelRecord; // armed recovery-channel side (RC-2); reconciled against its helper container
   recoveryRescue?: RecoveryRescueRecord;   // receiver-side rescue phase state (RC-3); resumed across manager restarts
   recoveryRescueLeft?: RecoveryRescueLeft; // a cancelled rescue left a partial copy or a standby; kept while a new rescue runs; cleared by a finished swap, a retire, or a start that finds the volume clean
   recoveryLastSwap?: { startedAt: number; completedAt: number }; // set by the swap's flip alone, startedAt from its rescue record
   recoverySwappedAway?: { at: number };  // source side: a swap's quiesce handed this database away; Start and Update refuse until the operator clears it
+  recoverySwapAbandoned?: { at: number; phase: 'quiesce' | 'catchup'; fenced: boolean | null }; // source side: the receiver cancelled that swap before it promoted; fenced: whether a fence layer stood then (null: unread); clears with recoverySwappedAway
   fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
   lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
 

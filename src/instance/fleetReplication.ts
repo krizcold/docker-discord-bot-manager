@@ -129,7 +129,13 @@ export async function fenceLinesRefusal(containerName: string, user: string, db:
   const read = await psql(containerName, user, db, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
   const count = read.ok ? read.stdout.trim() : '';
   if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
-  return Number(count) > 0 ? `a write fence stands in pg_hba.conf (lines ending in ${fleetBackupGuards.WRITE_FENCE_MARK}), and the lane that set it lifts it when it finishes` : null;
+  if (Number(count) === 0) return null;
+  const owners = await psql(containerName, user, db, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
+  const owner = owners.ok ? fleetBackupGuards.parseFenceOwner(owners.stdout) : null;
+  const whose = !owners.ok ? 'whose lane set it could not be read'
+    : owner ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, and that lane lifts it when it finishes`
+    : `no lane of this manager set its lines; a restore takes them over and lifts them, or remove them by hand if nothing should hold them`;
+  return `a write fence stands in pg_hba.conf (lines ending in ${fleetBackupGuards.WRITE_FENCE_MARK}); ${whose}`;
 }
 
 /** SQL on stdin, for a statement that must stay out of every command line. */
@@ -408,7 +414,7 @@ async function enableInLane(
 
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
-    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
   const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
@@ -620,7 +626,7 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const plain = { addrs: live.addrs.filter(a => keptPlain.includes(a)) };
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
-    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
   const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;

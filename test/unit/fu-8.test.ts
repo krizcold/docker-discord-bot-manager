@@ -119,7 +119,9 @@ describe('B20-1t, B11-2t: fleetBackup reads have a bound, its writes do not', ()
 
   it('the fence lift (a write) gets no timeout', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    expect(await fb.liftConsentFence('a', fleetDb, 'x')).toBe('lifted');
+    // The read-only layer names the failback run that lifts it.
+    h.answer = (args) => args.join(' ').includes("pg_read_file('smdb-fence-owner', true)") ? { stdout: 'on|failback:1\n' } : { stdout: '' };
+    expect(await fb.liftConsentFence('a', fleetDb, 'failback:1', 'x')).toBe('lifted');
     const lift = h.calls.find(c => c.args.join(' ').includes('ALTER SYSTEM RESET'));
     expect(lift).toBeDefined();
     expect(lift!.opts?.timeout).toBeUndefined();
@@ -141,7 +143,7 @@ describe('B11-2t: fleetReplication reads the container state with a bound', () =
 
 describe('B20-1t: the backup tick skips while its previous run is in flight', () => {
   it('a second tick during a hung first one starts nothing', async () => {
-    seedRegistry({ fleetConsentFenceLeft: [fleetDb.containerName] });
+    seedRegistry({ fleetConsentFenceLeft: [{ containerName: fleetDb.containerName, owner: 'failback:1' }] });
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
     h.answer = (args) => args[0] === 'inspect' ? 'hang' : { stdout: '' };
     let tick: () => void = () => {};

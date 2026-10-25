@@ -32,7 +32,8 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as appLifecycle from './appLifecycle';
-import { runFleetDump, raiseGuildTerms, stripFenceHbaScript } from './fleetBackup';
+import { runFleetDump, raiseGuildTerms, stripCopiedFenceScript } from './fleetBackup';
+import { FENCE_OWNER_FILE } from './fleetBackupGuards';
 import { claimFleetBackupBusy, releaseFleetBackupBusy, isFleetBackupBusy } from './fleetBackupGuards';
 import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
@@ -69,8 +70,10 @@ function sleep(ms: number): Promise<void> {
 
 // ─── Control lane client (the receiver drives the source through the tunnel) ───
 
+const ABANDON_TIMEOUT_MS = 15_000;
+
 /** answered: an HTTP reply came back from the source (a refusal carries its reason); false when the call failed or timed out before any reply. */
-async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST'): Promise<{ ok: boolean; answered: boolean; body?: any; error?: string }> {
+async function control(instance: InstanceConfig, action: string, method: 'GET' | 'POST' = 'POST', timeoutMs = 150_000): Promise<{ ok: boolean; answered: boolean; body?: any; error?: string }> {
   const record = instance.recoveryChannel;
   if (!record || record.mode !== 'receiver') return { ok: false, answered: false, error: 'no armed receiver channel' };
   // The listener helper's control lane; both this manager and the helper sit
@@ -82,7 +85,7 @@ async function control(instance: InstanceConfig, action: string, method: 'GET' |
     const res = await fetch(url, {
       method,
       headers: { 'x-recovery-token': record.token },
-      signal: AbortSignal.timeout(150_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const body: any = await res.json().catch(() => null);
     if (!res.ok || !body || body.success !== true) {
@@ -483,6 +486,11 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
   }
   const released = containerManager.releaseFleetDbFromLane(instance.id);
   if (!released.success) warnings.push(`${released.error}; the database does not start from the app until it is back`);
+  // A swap cancelled at quiesce or catchup may have left the sender stopped, fenced and recorded as swapped away; it is
+  // told, best effort and after this side is safe, with a short wait, as the sender's host is often the one down.
+  const told = phase === 'quiesce' || phase === 'catchup' ? await control(fresh, `abandon?phase=${phase}`, 'POST', ABANDON_TIMEOUT_MS) : null;
+  // A sender that holds no swap record was never stopped or fenced by this swap: there is nothing to tell it.
+  const nothingToTell = told !== null && told.answered && told.body?.noSwap === true;
   const note = left === 'partial'
     ? 'Rescue cancelled. This machine\'s volume holds a partial copy of the sender\'s database, so Start is refused until a rescue finishes the copy or the database is decommissioned.'
     : left === 'standby'
@@ -492,8 +500,9 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
         : earlier === 'standby'
           ? 'Rescue cancelled before it copied anything. This machine\'s volume still holds the standby copy of the sender that an earlier cancelled rescue left, so Start is refused until a rescue finishes the swap or the database is decommissioned.'
           : 'Rescue cancelled before any copy began; this machine\'s database was not changed.';
-  if (warnings.length) return { success: true, note, warning: `The rescue was cancelled, but ${warnings.join('; and ')}` };
-  return { success: true, note };
+  const untold = told && !told.ok && !nothingToTell ? ' The sender was not told; on the sender machine, disarm the channel and clear the swap record before starting it.' : '';
+  if (warnings.length) return { success: true, note: note + untold, warning: `The rescue was cancelled, but ${warnings.join('; and ')}` };
+  return { success: true, note: note + untold };
 }
 
 /** A runner can outlive its record by one docker call after a Cancel. */
@@ -816,7 +825,7 @@ async function phaseStandby(instance: InstanceConfig): Promise<void> {
   if (containerManager.fleetDbHeldForLane(instance.id)) await refuseForeignMounts(instance);
   throwIfCancelled(instance.id);
   const write = await volExec(fleetDb.volume,
-    `touch ${PGDATA}/standby.signal && rm -f ${MARKER} && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf && ${stripFenceHbaScript(PGDATA)}`,
+    `touch ${PGDATA}/standby.signal && rm -f ${MARKER} && sed -i '/^primary_conninfo/d;/^primary_slot_name/d;/^default_transaction_read_only/d' ${PGDATA}/postgresql.auto.conf && cat >> ${PGDATA}/postgresql.auto.conf && chown postgres:postgres ${PGDATA}/standby.signal ${PGDATA}/postgresql.auto.conf && ${stripCopiedFenceScript(PGDATA)}`,
     config);
   if (!write.ok) throw new Error(`could not author the standby config: ${write.stderr.trim()}`);
   // A cancel during the write has already put the database back in the compose and must not find a standby started after it.
@@ -1036,7 +1045,7 @@ async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {
     + `ALTER ROLE "${fleetDb.user}" WITH LOGIN PASSWORD '${verifier}';\n`);
   if (!alter.ok) throw new Error(`could not reconcile the database credentials: ${redactSecrets(alter.stderr.trim(), [password, verifier]).split('\n').pop()}`);
   const clean = await docker(['exec', fleetDb.containerName, 'sh', '-c',
-    `sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf`]);
+    `sed -i '/^primary_conninfo/d;/^primary_slot_name/d' ${PGDATA}/postgresql.auto.conf && rm -f ${PGDATA}/${FENCE_OWNER_FILE}`]);
   if (!clean.ok) throw new Error(`could not clean the standby settings: ${clean.stderr.trim().split('\n').pop()}`);
   await floorCopyTerms(instance);
 

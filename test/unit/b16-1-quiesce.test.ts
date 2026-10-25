@@ -34,7 +34,7 @@ vi.mock('child_process', async (importOriginal) => {
       setImmediate(() => cb(null, `${st.fenceSettings}\n`, ''));
       return { stdin: null };
     }
-    if (args[1] === '-u' && args[2] === 'root' && sql.includes('printf')) st.events.push('hba-write');
+    if (args[1] === '-u' && args[2] === 'root' && sql.includes('printf') && sql.includes('smdb-write-fence')) st.events.push('hba-write');
     if (args.includes('127.0.0.1')) st.events.push('probe');
     return fenced(cmd, args, opts, cb);
   };
@@ -205,7 +205,7 @@ describe('B14-2Lb: the quiesce uses the shared write fence', () => {
   });
 
   it('a fence refused before it changed anything names the stopped source, not "nothing was changed"', async () => {
-    st.fenceSettings = '/var/lib/postgresql/data/pg_hba.conf|on|0|1';
+    st.fenceSettings = '/var/lib/postgresql/data/pg_hba.conf|on|0|1|off||0|';
     const r = await call('quiesce');
     expect(r.code).toBe(500);
     expect(r.body.error).toMatch(/^could not fence the source database: the database has 1 enabled subscription/);

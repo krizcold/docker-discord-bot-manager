@@ -28,6 +28,7 @@ import * as containerManager from '../docker/containerManager';
 import * as fleetBackup from './fleetBackup';
 import * as fleetReplica from './fleetReplica';
 import { enableFleetReplication } from './fleetReplication';
+import { fenceOwnerLane } from './fleetBackupGuards';
 import { ActionResult, AppFacts, deliverCopyBlock, FactsRead, getAppFacts, postureFromRead, StandInPosture, transfer as promoteSide, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { FleetDbReplicaRecord, FleetFailbackDecline, FleetFailbackMode, FleetFailbackPhase, FleetFailbackRun, FleetLineageFact, InstanceConfig } from '../types';
@@ -305,9 +306,20 @@ function consentTarget(instance: InstanceConfig, run: FleetFailbackRun): fleetBa
 
 type RunFence = NonNullable<FleetFailbackRun['fence']>;
 
-/** The fence layers a park owns: the ones that were off before it fenced, and both when an earlier run here left them on. */
-export function ownedFenceLayers(prior: fleetBackup.FenceLayers, leftByEarlierRun: boolean): fleetBackup.FenceLayers {
-  return { readOnly: leftByEarlierRun || !prior.readOnly, hba: leftByEarlierRun || !prior.hba };
+/** The owner a run names on the fence layers it sets: its lane and its startedAt. */
+export function runFenceOwner(run: Pick<FleetFailbackRun, 'mode' | 'startedAt'>): string {
+  return fleetBackup.newFenceOwner(run.mode === 'failback' ? 'failback' : 'dropback', run.startedAt);
+}
+
+/**
+ * The fence layers a park owns: the ones that were off before it fenced, and one an earlier run of its own lane left
+ * on (the layer names that lane). A layer another lane or no lane owns (a promote fences the old primary read-only
+ * from the app, with no owner) is not the run's.
+ */
+export function ownedFenceLayers(prior: fleetBackup.FenceState, owner: string): fleetBackup.FenceLayers {
+  const lane = fenceOwnerLane(owner);
+  const ours = (layerOwner: string | null) => layerOwner !== null && fenceOwnerLane(layerOwner) === lane;
+  return { readOnly: !prior.readOnly || ours(prior.readOnlyOwner), hba: !prior.hba || ours(prior.hbaOwner) };
 }
 
 /**
@@ -325,14 +337,13 @@ async function fenceConsentPark(botId: string, instance: InstanceConfig, run: Fl
   if (!owned) {
     const prior = await fleetBackup.fenceLayers(target);
     if (prior === null) return { ok: false, error: 'the database did not answer whether it is fenced', at: Date.now(), owned: false };
-    // One a previous run here left stuck is this run's to lift again.
-    const left = fleetBackup.failbackFenceLeft(botId, target.containerName);
-    if (prior.readOnly && prior.hba) return { ok: true, error: null, at: Date.now(), owned: left, ...(left ? { ownedLayers } : {}) };
+    // A layer an earlier run of this lane left (it names that lane) is this run's to take over and lift.
+    ownedLayers = ownedFenceLayers(prior, runFenceOwner(run));
+    if (!ownedLayers.readOnly && !ownedLayers.hba) return { ok: true, error: null, at: Date.now(), owned: false };
     if (!owns()) return null;
-    ownedLayers = ownedFenceLayers(prior, left);
     saveRun(botId, { fence: { ok: false, error: 'the fence was being set', at: Date.now(), owned: true, ownedLayers } });
   }
-  const fenced = await fleetBackup.fenceForConsent(target);
+  const fenced = await fleetBackup.fenceForConsent(target, runFenceOwner(run));
   return { ok: fenced.ok, error: fenced.ok ? null : fenced.error, at: Date.now(), owned: true, ownedLayers };
 }
 
@@ -342,14 +353,17 @@ async function liftRunFence(instance: InstanceConfig, run: FleetFailbackRun): Pr
   const target = consentTarget(instance, run);
   if (!target) return '';
   const remedy = run.mode === 'failback' ? 'its next restore retries the lift' : 're-seeding this copy on its Database modal clears it';
-  const lifted = await fleetBackup.liftConsentFence(instance.id, target, remedy, run.fence.ownedLayers);
-  return lifted === 'lifted' ? ''
+  const held: fleetBackup.FenceHeld = { readOnly: false, hba: false, holder: null };
+  const lifted = await fleetBackup.liftConsentFence(instance.id, target, runFenceOwner(run), remedy, run.fence.ownedLayers, held);
+  const heldNote = held.readOnly || held.hba ? `; ${fleetBackup.heldText(held, 'the run')}` : '';
+  if (lifted === 'held') return heldNote;
+  return `${lifted === 'lifted' ? ''
     : lifted === 'gone' ? `; its database volume ${target.volume} is gone, so no write fence remains on it`
     : lifted === 'unknown' ? `; its write fence could not be lifted live, and this manager can't confirm whether the database is still READ-ONLY or refusing the bot's connections: docker did not answer whether its database volume ${target.volume} exists (${remedy})`
     : lifted === 'stripped' ? '; its write fence could not be lifted live, so the database stays READ-ONLY, and may still refuse the bot\'s connections, until its container restarts'
     : lifted === 'locked' ? `; the pg_hba lines of its write fence could not be removed, so the database refuses every connection but the manager's and the bot cannot reach it, through a restart too (${remedy})`
     : lifted === 'unreloaded' ? `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart, and it may still refuse the bot's connections until it reloads or restarts (${remedy})`
-    : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`;
+    : `; its write fence could not be lifted or stripped, so the database stays READ-ONLY through a restart (${remedy})`}${heldNote}`;
 }
 
 function dumpText(dump: FleetFailbackRun['dump']): string {

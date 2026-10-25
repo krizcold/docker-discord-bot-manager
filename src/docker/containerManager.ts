@@ -742,9 +742,21 @@ export function updateInstanceRecoverySwappedAway(botId: string, record: { at: n
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return;
-  if (!record && !instance.recoverySwappedAway) return;
+  if (!record && !instance.recoverySwappedAway && !instance.recoverySwapAbandoned) return;
   if (record) instance.recoverySwappedAway = record;
-  else delete instance.recoverySwappedAway;
+  else { delete instance.recoverySwappedAway; delete instance.recoverySwapAbandoned; }
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** The receiver cancelled the swap this source's record names (null clears it). Throws when the registry cannot be saved. */
+export function updateInstanceRecoverySwapAbandoned(botId: string, record: { at: number; phase: 'quiesce' | 'catchup'; fenced: boolean | null } | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!record && !instance.recoverySwapAbandoned) return;
+  if (record) instance.recoverySwapAbandoned = record;
+  else delete instance.recoverySwapAbandoned;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
 }
@@ -883,14 +895,16 @@ export function updateInstanceFleetLastPosture(botId: string, record: InstanceCo
   saveRegistry(registry);
 }
 
-/** Record or clear that a failback or drop-back run owns the write fence on this database. Throws when the registry cannot be saved. */
-export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, left: boolean): void {
+/** Record (with the owner its layers name) or clear (owner null) that a failback or drop-back run left its write fence on this database. Throws when the registry cannot be saved. */
+export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, owner: string | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return;
   const now = instance.fleetConsentFenceLeft ?? [];
-  if (now.includes(containerName) === left) return;
-  const next = left ? [...now, containerName] : now.filter(c => c !== containerName);
+  const at = now.find(e => e.containerName === containerName);
+  if (owner ? at?.owner === owner : !at) return;
+  const rest = now.filter(e => e.containerName !== containerName);
+  const next = owner ? [...rest, { containerName, owner }] : rest;
   if (next.length) instance.fleetConsentFenceLeft = next;
   else delete instance.fleetConsentFenceLeft;
   instance.updatedAt = new Date().toISOString();
@@ -1144,6 +1158,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     if (stored) {
       delete stored.fleetDb;
       delete stored.recoverySwappedAway;
+      delete stored.recoverySwapAbandoned;
       delete stored.recoveryRescueLeft;
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
@@ -1153,6 +1168,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
   }
   delete instance.fleetDb;
   delete instance.recoverySwappedAway;
+  delete instance.recoverySwapAbandoned;
   delete instance.recoveryRescueLeft;
   return { success: true, volumeRemoved: true };
 }

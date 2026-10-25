@@ -64,6 +64,11 @@ vi.mock('child_process', async (importOriginal) => {
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { fenceOwners } from './fence-fake';
+
+// The owner a failback run that started at 1 names on the layers it sets.
+const OWNER = 'failback:1';
+const rec = (db: { containerName: string }) => ({ containerName: db.containerName, owner: OWNER });
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
@@ -99,6 +104,9 @@ beforeEach(() => {
   pg.onLift = null;
   pg.fenceFails = false;
   pg.onRecreate = null;
+  fenceOwners.clear();
+  fenceOwners.set(primary.containerName, OWNER);
+  fenceOwners.set(copy.containerName, OWNER);
   seedRegistry();
 });
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
@@ -106,28 +114,28 @@ afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 describe('X26: one stuck-fence warning per database, and a foreign fence is not the failback\'s', () => {
   it('a stuck fence shows on its own reader, never as a backup failure', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
     expect(fb.getFleetBackupError('a')).toBeNull();
   });
 
   it('a lift on the copy leaves the primary\'s stuck-fence warning in place', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
-    expect(await fb.liftConsentFence('a', copy, 'reseed')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('failed');
     pg.liftWorks = true;
     pg.onLift = (c) => { if (c === primary.containerName) throw new Error('the primary must not be lifted here'); };
-    expect(await fb.liftConsentFence('a', copy, 'reseed')).toBe('lifted');
+    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('lifted');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
   });
 
   it('a lift on the primary leaves the copy\'s warning, whichever stuck first', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', copy, 'reseed')).toBe('failed');
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
     pg.liftWorks = true;
     pg.onLift = (c) => { if (c === copy.containerName) throw new Error('the copy must not be lifted here'); };
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('lifted');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('lifted');
     expect(fb.getFleetFenceStuck('a')).toContain('reseed');
   });
 
@@ -148,7 +156,7 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
 
   it('a foreign fence over a failback\'s stuck one passes it to that lane, so the re-armed run does not lift it', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(true);
     fb.foreignFenceSet('a', primary.containerName);
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(false);
@@ -159,11 +167,11 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
 
   it('a foreign fence whose record clear is refused still is not the failback\'s, and the clear lands later', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
     blockSaves();
     try { fb.foreignFenceSet('a', primary.containerName); } finally { unblockSaves(); }
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(false);
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary)]);
     const tick = await startedWithTick(fb);
     fb.stopFleetBackupScheduler();
     tick();
@@ -172,8 +180,8 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
 
   it("a restore over a failback's stuck fence owns it from the moment it is set, not only from its lift", async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName]);
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary)]);
     const dir = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'x.dump'), 'dump');
@@ -191,7 +199,7 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     reg.instances.a.recoveryChannel = { mode: 'source', token: 'tok' };
     fs.writeFileSync(REGISTRY, JSON.stringify(reg, null, 2));
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, 'x')).toBe('failed');
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(true);
     const rc = await import('../../src/instance/recoveryControl');
     rc.startRecoveryControlServer();
@@ -203,11 +211,25 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     } finally { rc.stopRecoveryControlServer(); }
   }
 
-  it('a recovery quiesce whose fence is set clears the failback record', async () => {
+  it('a recovery quiesce takes over a failback\'s layer and clears the failback record', async () => {
     const { fb } = await quiesce();
     expect(pg.fenced.get(primary.containerName)).toBe(true);
+    expect(fenceOwners.get(primary.containerName)).toMatch(/^swap:\d+$/);
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(false);
     expect(onDisk().fleetConsentFenceLeft).toBeUndefined();
+  });
+
+  it('the failback Cancel after a quiesce took over its layer is held and sends no reset', async () => {
+    const { fb } = await quiesce();
+    expect(fenceOwners.get(primary.containerName)).toMatch(/^swap:\d+$/);
+    pg.liftWorks = true;
+    const resets: string[] = [];
+    pg.onLift = (c) => { resets.push(c); };
+    const held: import('../../src/instance/fleetBackup').FenceHeld = { readOnly: false, hba: false, holder: null };
+    expect(await fb.liftConsentFence('a', primary, OWNER, 'x', { readOnly: true, hba: true }, held)).toBe('held');
+    expect(resets).toEqual([]);
+    expect(pg.fenced.get(primary.containerName)).toBe(true);
+    expect(held.holder).toMatch(/^swap:\d+$/);
   });
 
   it('a recovery quiesce whose fence fails keeps the failback record', async () => {
@@ -215,6 +237,6 @@ describe('X26: one stuck-fence warning per database, and a foreign fence is not 
     const { fb, status } = await quiesce();
     expect(status).toBe(500);
     expect(fb.failbackFenceLeft('a', primary.containerName)).toBe(true);
-    expect(onDisk().fleetConsentFenceLeft).toEqual([primary.containerName]);
+    expect(onDisk().fleetConsentFenceLeft).toEqual([rec(primary)]);
   });
 });

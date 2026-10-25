@@ -249,7 +249,7 @@ export function enableFleetReplication(
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
-  opts: { rotateCert?: boolean; fromRescue?: boolean; admit?: Admission } = {},
+  opts: { rotateCert?: boolean; fromRescue?: boolean; admit?: Admission; dbPassword?: string } = {},
 ): Promise<EnableResult> {
   return inReplicationLane<EnableResult>(instance.id, 'Enable', async () => {
     const fresh = containerManager.getBot(instance.id);
@@ -299,7 +299,7 @@ async function enableInLane(
   publicHost: string,
   hostPort: number | undefined,
   slotWalKeepMb: number | undefined,
-  opts: { rotateCert?: boolean; fromRescue?: boolean },
+  opts: { rotateCert?: boolean; fromRescue?: boolean; dbPassword?: string },
 ): Promise<EnableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
@@ -331,7 +331,8 @@ async function enableInLane(
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
   }
-  const dbPassword = storedDbPassword(instance);
+  // The caller's password is a fallback for a manager env that holds no database URL (an adopt whose env write was refused).
+  const dbPassword = storedDbPassword(instance) || opts.dbPassword || null;
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   // An existing posture whose password reads empty is a key-loss scrub, not an
   // absent credential: minting a fresh one here would silently rotate the
@@ -564,14 +565,20 @@ async function disableInLane(
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
   const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
-  envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
   let unedited: string[] = [];
-  if (dbEnv.publicUrl) {
-    envManager.deleteEnvVar(instance.id, dbEnv.publicUrl);
-    containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
-    unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
+  try {
+    envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
+    if (dbEnv.publicUrl) {
+      envManager.deleteEnvVar(instance.id, dbEnv.publicUrl);
+      containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
+      unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
+    }
+    containerManager.updateInstanceFleetDbReplication(instance.id, null);
+  } catch (err) {
+    // The disabling mark stays on the record, so the card shows the Disable as unfinished.
+    forgetProbes(instance.id);
+    return { success: false, error: `Replication is off on the database (the slots are dropped and the replication login is revoked), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
   }
-  containerManager.updateInstanceFleetDbReplication(instance.id, null);
   forgetProbes(instance.id);
   if (unedited.length > 0) {
     return { success: true, restartRequired: true, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };

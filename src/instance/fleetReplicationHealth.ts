@@ -13,8 +13,10 @@
 
 import * as containerManager from '../docker/containerManager';
 import { getFleetReplicationStatus } from './fleetReplication';
-import { getFleetReplicaStatus, publishStandInCopyBlock, seedPurposeLabel } from './fleetReplica';
+import { getFleetReplicaStatus, publishStandInCopyBlock, retryHeldSeedRecords, seedPurposeLabel } from './fleetReplica';
 import * as fleetFailback from './fleetFailback';
+import { retryHeldTransferRecords } from './fleetTransfer';
+import { retryHeldRescueRecords } from './recoveryRescue';
 import { FactsRead, getAppFacts, postureFromRead, StandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
 import { InstanceConfig } from '../types';
@@ -446,7 +448,19 @@ function lostSlotReseedText(status: Awaited<ReturnType<typeof getFleetReplicaSta
   return `${last}; ${left}, ${block}`;
 }
 
+/** The records a runner could not write (a refused park or clear) are written again here, before any verdict reads them. */
+function retryHeldRecords(): void {
+  for (const retry of [retryHeldSeedRecords, retryHeldTransferRecords, fleetFailback.retryHeldFailbackRecords, retryHeldRescueRecords]) {
+    try {
+      retry();
+    } catch (err) {
+      console.warn(`[FleetReplication] A held record could not be written again: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 async function runTick(): Promise<void> {
+  retryHeldRecords();
   const instances = containerManager.getAllBots();
   const live = new Set<string>();
   for (const record of instances) {
@@ -477,8 +491,9 @@ async function runTick(): Promise<void> {
       // and the form for that re-seed only renders on a stopped instance.
       const covered = lastPosture(instance);
       // The failback run stopped it: the run's record leads the word.
-      if (instance.fleetFailback) {
-        cache.set(instance.id, { role: 'primary', severity: 'warn', message: fleetFailback.stoppedText(instance.fleetFailback), lagSeconds: null, checkedAt: Date.now(), ...(covered?.role === 'covered' ? { standIn: covered } : {}) });
+      const run = fleetFailback.failbackView(containerManager.getBot(instance.id) ?? instance);
+      if (run) {
+        cache.set(instance.id, { role: 'primary', severity: 'warn', message: fleetFailback.stoppedText(run), lagSeconds: null, checkedAt: Date.now(), ...(covered?.role === 'covered' ? { standIn: covered } : {}) });
         continue;
       }
       cache.set(instance.id, covered?.role === 'covered'
@@ -522,7 +537,7 @@ async function runTick(): Promise<void> {
 /** While a failback or drop-back run owns the instance, its phase leads every verdict: the run is what the operator acts on. */
 function withRun(instance: InstanceConfig, verdict: ReplicationHealth): ReplicationHealth {
   const bot = containerManager.getBot(instance.id);
-  const run = bot?.fleetFailback;
+  const run = bot ? fleetFailback.failbackView(bot) : null;
   if (!run) {
     // A declined run leaves the by-hand verdict in force, led by the decline.
     const decline = bot ? fleetFailback.activeDecline(bot, verdict.standIn) : null;

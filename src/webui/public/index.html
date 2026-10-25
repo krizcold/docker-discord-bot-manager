@@ -3439,7 +3439,9 @@
       const flipText = rescue.flipStep === 'role' ? 'the fleet started; returning the app to its configured role'
         : rescue.flipStep === 'start' ? 'this database is the primary; starting the fleet'
         : 'filing this database as the primary';
-      const phaseText = rescue.parked
+      const phaseText = rescue.runnerStopped
+        ? `STOPPED at ${rescue.phase === 'flip' ? `flip (${flipText})` : rescue.phase}: no runner drives it; Continue re-enters that phase`
+        : rescue.parked
         ? `PARKED at ${rescue.phase === 'flip' ? `flip (${flipText})` : rescue.phase} - fix the cause, then Continue to re-enter that phase`
         : {
           preflight: 'Preflight: dumping the stale copy before the overwrite',
@@ -3755,14 +3757,19 @@
       const parked = r.parkedSeed || null;
       const errHtml = seedWarningHtml(r.pinsWarning) + (parked
         ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}${seedDumpHtml(parked)}
-             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(parked.startedAt)}, true)">Dismiss</button></div></div>`
+             <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">${parked.pinsUnretired && parked.pinsUnretired.length ? `<button class="btn btn-primary btn-small" onclick="finishPinsRetire('${botId}')">Finish retire</button>` : ''}<button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(parked.startedAt)}, true)">Dismiss</button></div></div>`
+        : r.seedNote ? `<div class="error-message">${escapeHtml(r.seedNote)}
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(r.seedNoteStartedAt)}, true)">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>`
         : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '');
       // A seed-first transfer (20.19 F21) in flight or parked; a live one keeps
       // this panel polling, a parked one shows its reason until dismissed.
       const run = res.transfer || null;
       const runLive = !!(run && !run.parked);
-      const transferRunHtml = !run ? '' : run.parked
+      const transferRunHtml = !run ? '' : run.clearPending
+        ? `<div class="error-message">${escapeHtml(run.lastError || 'The app accepted the promote; the transfer record is not cleared yet')}
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="dismissTransfer('${botId}')">Dismiss</button></div></div>`
+        : run.parked
         ? `<div class="error-message">Transfer stopped while <b>${escapeHtml(transferPhaseText(run.phase))}</b>: ${escapeHtml(run.lastError || 'unknown reason')}${namesAnExit(run.lastError) ? '' : ' Continuing picks up from where it stopped.'}
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-primary btn-small" onclick="appTransfer('${botId}', ${run.retireOldMaster === true}, ${!r.record}, true)">Continue transfer</button>
@@ -4062,7 +4069,8 @@
           res = await api('POST', `/bots/${botId}/app-transfer`, body);
         }
         if (!res.success) { showMessage('error', res.error || `${label} failed`); return; }
-        showMessage('success', res.resumed
+        if (res.warning) showMessage('warning', res.warning);
+        else showMessage('success', res.resumed
           ? `${label} continued; progress shows in this panel`
           : res.seedFirst
           ? `${label} started: the standby is seeded from the primary first; progress shows in this panel`
@@ -4082,6 +4090,19 @@
       if (phase === 'catching-up') return 'waiting for the copy to catch up';
       if (phase === 'promoting') return 'promoting this side';
       return phase;
+    }
+
+    async function finishPinsRetire(botId) {
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-replica/finish-retire`);
+        if (!res.success) showMessage('error', res.error || 'Failed to remove the env pins');
+        else if (res.warning) showMessage('warning', res.warning);
+        else showMessage('success', 'The env pins are removed');
+      } catch (err) {
+        showNoAnswer('pins retire');
+      }
+      renderFleetReplica(botId);
+      loadBots();
     }
 
     async function dismissTransfer(botId) {
@@ -4218,6 +4239,10 @@
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
                <button class="btn btn-danger btn-small" onclick="continueFailback('${botId}')">${run.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}</button>
                <button class="btn btn-secondary btn-small" onclick="cancelFailback('${botId}')">Cancel</button></div></div>`;
+      }
+      if (run.finished) {
+        return `<div class="error-message">${escapeHtml(run.lastError || `The ${label.toLowerCase()} finished; its run record is not cleared yet`)}
+             <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="dismissFailback('${botId}')">Dismiss</button></div></div>`;
       }
       if (run.parked) {
         // Cancelable is the server's word, from the records that prove whether the wipe began.

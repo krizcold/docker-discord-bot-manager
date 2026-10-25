@@ -1,4 +1,6 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+afterEach(() => { fb.live = false; });
 
 const h = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -51,6 +53,12 @@ vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
   capabilityRefusal: () => null,
 }));
+// A run these rows file as live stands for one whose runner runs in this process.
+const fb = vi.hoisted(() => ({ live: false }));
+vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
+  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
+});
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 // A fake docker: volumes answer from h.volumes (the primary's exists unless set), this database and the pasted
@@ -240,12 +248,14 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   });
 
   it('a failback run that holds the wipe consent counts the volume as confirmed', () => {
+    fb.live = true;
     writeRegistry({ fleetFailback: { mode: 'failback', phase: 'seeding', startedAt: 111, updatedAt: 111, standInNodeId: null, episode: null, lineage: null, dump: null, consentAt: 222, block: null, serve: null, stoppedByRun: false } });
     h.volumes.set(REPLICA_VOL, 'exists');
     expect(start({ dumpDone: true, run: 111 })).toMatchObject({ success: true, started: true });
   });
 
   it('a failback run without the consent still asks', () => {
+    fb.live = true;
     writeRegistry({ fleetFailback: { mode: 'failback', phase: 'seeding', startedAt: 111, updatedAt: 111, standInNodeId: null, episode: null, lineage: null, dump: null, consentAt: null, block: null, serve: null, stoppedByRun: false } });
     h.volumes.set(REPLICA_VOL, 'exists');
     expect(start({ dumpDone: true, run: 111 })).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });

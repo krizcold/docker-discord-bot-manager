@@ -54,6 +54,12 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     },
   };
 });
+// An unparked run a row files stands for one whose runner runs in this process.
+const fb = vi.hoisted(() => ({ live: false }));
+vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
+  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
+});
 
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
@@ -410,7 +416,10 @@ describe('R13-J15: a manager self-update waits for a running lane', () => {
     release();
     await held;
     writeRegistry({ fleetFailback: { mode: 'failback', phase: 'seeding' } });
+    fb.live = true;
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/failback run is running on a/);
+    fb.live = false;
+    expect(fleetBackup.databaseLaneBlocker()).toBeNull();
     writeRegistry({ fleetFailback: { mode: 'failback', phase: 'wipe-consent', parked: true } });
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
   });

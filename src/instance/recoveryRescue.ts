@@ -37,6 +37,7 @@ import { enableFleetReplication } from './fleetReplication';
 import { disarmRecoveryChannel } from './recoveryChannel';
 import { readStoreId, readSystemId } from './recoveryControl';
 import { hasAppHooks } from './appHookClient';
+import { seedView } from './fleetReplica';
 import { InstanceConfig, RecoveryRescueRecord, RescueIdentity } from '../types';
 import { LOG_CAP_RUN_ARGS } from '../templates/logCaps';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier } from '../config/secretText';
@@ -221,7 +222,50 @@ function saveRescue(botId: string, patch: Partial<RecoveryRescueRecord>): Recove
     for (const key of PROBE_TELEMETRY) if (!(key in patch)) delete next[key];
   }
   containerManager.updateInstanceRecoveryRescue(botId, next);
+  heldRescues.delete(botId);
   return next;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** A runner's write the registry refused: kept in memory for the status, and a park is written again on the next health tick. */
+type HeldRescue = { startedAt: number; patch: Partial<RecoveryRescueRecord>; phase: RecoveryRescueRecord['phase']; error: string; writeError: string };
+const heldRescues = new Map<string, HeldRescue>();
+
+function saveOrHold(botId: string, patch: Partial<RecoveryRescueRecord>, error: string): 'saved' | 'held' | 'gone' {
+  try {
+    return saveRescue(botId, patch) ? 'saved' : 'gone';
+  } catch (err) {
+    const current = containerManager.getBot(botId)?.recoveryRescue;
+    if (!current) return 'gone';
+    heldRescues.set(botId, { startedAt: current.startedAt, patch, phase: patch.phase ?? current.phase, error, writeError: errorText(err) });
+    console.warn(`[RecoveryRescue] ${botId}: the rescue record could not be written (${errorText(err)}); ${patch.parked ? 'the park is held in memory and written again on the next health tick' : 'the rescue keeps retrying'}`);
+    return 'held';
+  }
+}
+
+function parkRescue(botId: string, patch: Partial<RecoveryRescueRecord> & { parked: true }): void {
+  saveOrHold(botId, patch, patch.lastError || 'parked');
+}
+
+function heldPark(botId: string): boolean {
+  return heldRescues.get(botId)?.patch.parked === true;
+}
+
+/** Health tick: a park the registry refused is written again once no runner holds the rescue. */
+export function retryHeldRescueRecords(): void {
+  for (const [botId, held] of [...heldRescues]) {
+    const current = containerManager.getBot(botId)?.recoveryRescue;
+    if (!current || current.startedAt !== held.startedAt) { heldRescues.delete(botId); continue; }
+    if (!held.patch.parked || running.has(botId)) continue;
+    try {
+      saveRescue(botId, held.patch);
+    } catch (err) {
+      held.writeError = errorText(err);
+    }
+  }
 }
 
 /** Structural preconditions; failing any parks the rescue rather than retrying. Teardown and flip run after promote and tolerate a half-gone (or gone) channel - teardown is what removes it. */
@@ -273,7 +317,7 @@ export async function startRescue(
   const pastChannel = instance.recoveryRescue?.phase === 'teardown' || instance.recoveryRescue?.phase === 'flip';
   if (!pastChannel && instance.recoveryChannel?.mode !== 'receiver') return { success: false, error: 'Arm the recovery channel receiver first' };
   if (opts.withoutDump) {
-    const r = instance.recoveryRescue;
+    const r = getRescueStatus(instance);
     if (!r || r.phase !== 'preflight' || r.dumpOk !== false || !r.parked) {
       return { success: false, error: 'Overwriting without a dump applies only to a rescue parked on a failed safety dump; nothing was changed' };
     }
@@ -287,8 +331,14 @@ export async function startRescue(
       if (live === null) return { success: false, error: 'Docker could not say whether the instance is running, so the rescue was not continued; retry in a moment' };
       if (live.length > 0) return { success: false, error: 'Stop the instance first: the rescue replaces the database it runs on' };
     }
-    if (opts.withoutDump) saveRescue(instance.id, { dumpSkipped: 'waived', parked: false, lastError: undefined });
-    else if (containerManager.getBot(instance.id)?.recoveryRescue?.parked) saveRescue(instance.id, { parked: false, lastError: undefined });
+    // A park the registry refused is still the state the operator continues from.
+    const held = heldRescues.get(instance.id)?.patch ?? {};
+    try {
+      if (opts.withoutDump) saveRescue(instance.id, { ...held, dumpSkipped: 'waived', parked: false, lastError: undefined });
+      else if (containerManager.getBot(instance.id)?.recoveryRescue?.parked || held.parked) saveRescue(instance.id, { ...held, parked: false, lastError: undefined });
+    } catch (err) {
+      return { success: false, error: `The rescue record could not be written (${errorText(err)}), so the rescue was not continued; nothing was changed` };
+    }
     if (!running.has(instance.id)) void runRescue(instance.id);
     return { success: true };
   }
@@ -306,7 +356,8 @@ export async function startRescue(
 function freshRescueRefusal(instance: InstanceConfig): string | null {
   if (instance.fleetFailback) return `A ${instance.fleetFailback.mode} run is on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal first`;
   if (instance.fleetTransfer) return `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it first`;
-  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return 'Provisioning of a standby is running on this instance; wait for it to finish';
+  const seed = seedView(instance);
+  if (seed && seed.parked !== true) return 'Provisioning of a standby is running on this instance; wait for it to finish';
   if (isFleetBackupBusy(instance.id)) return 'A database dump, restore or replication change is running on this instance; wait for it to finish';
   return null;
 }
@@ -413,6 +464,7 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
   const earlier = fresh.recoveryRescueLeft?.state ?? (fresh.recoveryRescue.dumpSkipped === 'partial' ? 'partial' as const : null);
   const mark = left ?? (earlier && !fresh.recoveryRescueLeft ? earlier : null);
   containerManager.updateInstanceRecoveryRescue(instance.id, null, undefined, mark ? { at: Date.now(), state: mark } : undefined);
+  heldRescues.delete(instance.id);
   // A driver mid-rsyncPass may recreate the client in a narrow window; its
   // next poll sees the cleared record and removes it again. Sweep once more
   // for the window where the driver died between create and poll.
@@ -448,8 +500,24 @@ export function rescueRunnerLive(botId: string): boolean {
   return running.has(botId);
 }
 
+/** The record as the operator must read it: a write the registry refused, and a record no runner of this process drives. */
 export function getRescueStatus(instance: InstanceConfig): RecoveryRescueRecord | null {
-  return instance.recoveryRescue ?? null;
+  const record = instance.recoveryRescue;
+  if (!record) return null;
+  const held = heldRescues.get(instance.id);
+  if (held && held.startedAt === record.startedAt) {
+    return {
+      ...record,
+      ...held.patch,
+      lastError: held.patch.parked
+        ? `the run stopped at ${held.phase}: ${held.error}; its record could not be written (${held.writeError})`
+        : `${held.phase} failed: ${held.error}; its record could not be written (${held.writeError}), and the rescue retries every ${RETRY_DELAY_MS / 1000}s`,
+    };
+  }
+  if (!record.parked && !running.has(instance.id)) {
+    return { ...record, parked: true, runnerStopped: true, lastError: `the rescue's runner stopped at ${record.phase}${record.lastError ? `; its last error: ${record.lastError}` : ''}` };
+  }
+  return record;
 }
 
 /** Boot resume: re-enter every recorded phase that is not parked. */
@@ -458,7 +526,11 @@ export function resumeRecoveryRescues(): void {
     const rescue = instance.recoveryRescue;
     if (!rescue || rescue.parked) continue;
     console.log(`[RecoveryRescue] Resuming rescue for ${instance.displayName} at phase ${rescue.phase}`);
-    saveRescue(instance.id, Object.fromEntries(PROBE_TELEMETRY.map(key => [key, undefined])));
+    try {
+      saveRescue(instance.id, Object.fromEntries(PROBE_TELEMETRY.map(key => [key, undefined])));
+    } catch (err) {
+      console.warn(`[RecoveryRescue] ${instance.displayName}: the probe telemetry could not be cleared (${errorText(err)}); the rescue resumes with it`);
+    }
     void runRescue(instance.id);
   }
 }
@@ -474,18 +546,19 @@ async function runRescue(botId: string): Promise<void> {
       const instance = containerManager.getBot(botId);
       if (!structurallySound(instance)) {
         if (containerManager.getBot(botId)?.recoveryRescue) {
-          saveRescue(botId, { parked: true, lastError: 'the channel or the database record disappeared mid-rescue' });
+          parkRescue(botId, { parked: true, lastError: 'the channel or the database record disappeared mid-rescue' });
         }
         return;
       }
-      if (instance.recoveryRescue!.parked) return;
+      if (instance.recoveryRescue!.parked || heldPark(botId)) return;
       const phase = instance.recoveryRescue!.phase;
       const rewritesVolume = SLOT_PHASES.includes(phase);
       if (rewritesVolume && !slotHeld) {
         // The record stays, so the rescue resumes from this phase at the next boot.
         if (containerManager.isShuttingDown()) return;
         if (!claimFleetBackupBusy(botId)) {
-          if (!saveRescue(botId, { lastError: 'a database dump, restore or replication change is running on this instance; the rescue waits for it' })) return;
+          const waiting = 'a database dump, restore or replication change is running on this instance; the rescue waits for it';
+          if (saveOrHold(botId, { lastError: waiting }, waiting) === 'gone') return;
           await sleep(RETRY_DELAY_MS);
           if (!containerManager.getBot(botId)?.recoveryRescue) return;
           continue;
@@ -513,10 +586,11 @@ async function runRescue(botId: string): Promise<void> {
         const message = err instanceof Error ? err.message : String(err);
         if (err instanceof CopyDiscarded) {
           console.warn(`[RecoveryRescue] ${instance.displayName}: ${message}`);
-          saveRescue(botId, { phase: 'bulk', parked: true, lastError: message });
+          parkRescue(botId, { phase: 'bulk', parked: true, lastError: message });
           return;
         }
-        if (!saveRescue(botId, { caughtUp: undefined, lagBytes: undefined, lastError: message })) {
+        // A refused write keeps the retry: the record on disk still names this phase, so the next boot resumes it too.
+        if (saveOrHold(botId, { caughtUp: undefined, lagBytes: undefined, lastError: message }, message) === 'gone') {
           console.warn(`[RecoveryRescue] ${instance.displayName} phase ${phase} failed: ${message}; the rescue record is gone, so nothing retries`);
           return;
         }
@@ -579,7 +653,7 @@ async function phasePreflight(instance: InstanceConfig): Promise<void> {
     throwIfCancelled(instance.id);
     if (!dump.success) {
       console.warn(`[RecoveryRescue] ${instance.displayName}: the safety dump before the rescue failed: ${dump.error}; the rescue waits for the operator`);
-      saveRescue(instance.id, {
+      parkRescue(instance.id, {
         parked: true, dumpOk: false, dumpError: dump.error,
         lastError: `The safety dump of this machine's database failed (${dump.error}), so nothing was overwritten. Continue retries the dump; Overwrite without a dump replaces the database with no copy kept`,
       });
@@ -590,7 +664,7 @@ async function phasePreflight(instance: InstanceConfig): Promise<void> {
   if (vol.state === 'database') {
     const mismatch = await overwriteIdentityRefusal(instance);
     if (mismatch) {
-      saveRescue(instance.id, { parked: true, lastError: `${mismatch}; nothing was overwritten. Cancel the rescue, and start it again to confirm what the two databases report now` });
+      parkRescue(instance.id, { parked: true, lastError: `${mismatch}; nothing was overwritten. Cancel the rescue, and start it again to confirm what the two databases report now` });
       return;
     }
   }
@@ -772,7 +846,7 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
       // A surviving record with a vanished channel/database must park loudly,
       // not leave a stale "catching up" with no driver behind it.
       if (containerManager.getBot(instance.id)?.recoveryRescue) {
-        saveRescue(instance.id, { parked: true, lastError: 'the channel or the database record disappeared mid-streaming' });
+        parkRescue(instance.id, { parked: true, lastError: 'the channel or the database record disappeared mid-streaming' });
       }
       return;
     }
@@ -782,7 +856,7 @@ async function phaseMonitor(instance: InstanceConfig): Promise<void> {
       // The slot invalidated (retained WAL passed the source's bound): the
       // standby can never resume from it. Loud park beats an eternal
       // "catching up" - the fallback is a fresh seed (cancel + re-run).
-      saveRescue(instance.id, { parked: true, caughtUp: false, lastError: 'the recovery slot on the source was invalidated (WAL bound exceeded); cancel and re-run the rescue to seed fresh' });
+      parkRescue(instance.id, { parked: true, caughtUp: false, lastError: 'the recovery slot on the source was invalidated (WAL bound exceeded); cancel and re-run the rescue to seed fresh' });
       return;
     }
     const sourceLsn = status.ok ? String(status.body.sourceLsn || '') : '';
@@ -814,7 +888,7 @@ async function phaseQuiesce(instance: InstanceConfig): Promise<void> {
   if (!systemId) throw new Error('could not read the system id of this machine\'s copy, so the sender was not asked to stop');
   const quiesced = await control(instance, `quiesce?systemId=${systemId}`);
   if (!quiesced.ok && quiesced.body?.identityMismatch === true) {
-    saveRescue(instance.id, { parked: true, lastError: `The sender refused the swap: ${quiesced.error}. Cancel the rescue and check which machine the channel is armed against` });
+    parkRescue(instance.id, { parked: true, lastError: `The sender refused the swap: ${quiesced.error}. Cancel the rescue and check which machine the channel is armed against` });
     return;
   }
   if (!quiesced.ok) throw new Error(quiesced.error);
@@ -850,14 +924,14 @@ async function phaseCatchup(instance: InstanceConfig): Promise<void> {
     // unreachable source stays loud in lastError while replay retries.
     const status = await control(fresh, 'status', 'GET');
     if (status.ok && status.body.slotWalStatus === 'lost') {
-      saveRescue(instance.id, { parked: true, lastError: 'the recovery slot on the source was invalidated during catchup; cancel and re-run the rescue to seed fresh' });
+      parkRescue(instance.id, { parked: true, lastError: 'the recovery slot on the source was invalidated during catchup; cancel and re-run the rescue to seed fresh' });
       return;
     }
     if (status.ok && status.body.slotActive !== true) {
       // Proven absence only: an unanswered status read never starts this clock.
       const since = fresh.recoveryRescue!.noSenderSince ?? Date.now();
       if (Date.now() - since >= CATCHUP_NO_SENDER_PARK_MS) {
-        saveRescue(instance.id, { parked: true, noSenderSince: undefined, lagBytes: Number(lag) || 0, lastError: `no walsender has been attached to the recovery slot for ${CATCHUP_NO_SENDER_PARK_MS / 60_000} minutes during catchup; check the standby's connection to the sender, then Continue` });
+        parkRescue(instance.id, { parked: true, noSenderSince: undefined, lagBytes: Number(lag) || 0, lastError: `no walsender has been attached to the recovery slot for ${CATCHUP_NO_SENDER_PARK_MS / 60_000} minutes during catchup; check the standby's connection to the sender, then Continue` });
         return;
       }
       saveRescue(instance.id, { noSenderSince: since, lagBytes: Number(lag) || 0, lastError: 'Standby is up but not receiving from the sender' });
@@ -934,7 +1008,7 @@ function finishFlip(instance: InstanceConfig): void {
 
 function parkFlip(instance: InstanceConfig, reason: string): void {
   console.warn(`[RecoveryRescue] ${instance.displayName}: ${reason}`);
-  saveRescue(instance.id, { parked: true, lastError: reason });
+  parkRescue(instance.id, { parked: true, lastError: reason });
 }
 
 async function fileCopyAsPrimary(instance: InstanceConfig): Promise<void> {

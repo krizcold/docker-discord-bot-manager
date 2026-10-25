@@ -74,7 +74,79 @@ function seedRecord(botId: string): FleetReplicaSeedRecord | null {
 function saveSeed(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
   const current = seedRecord(botId);
   if (!current) return;
-  containerManager.updateInstanceFleetDbReplicaSeed(botId, { ...current, ...patch, updatedAt: Date.now() });
+  const held = heldSeeds.get(botId);
+  const kept = held && held.startedAt === current.startedAt && !held.done ? held.patch : {};
+  containerManager.updateInstanceFleetDbReplicaSeed(botId, { ...current, ...kept, ...patch, updatedAt: Date.now() });
+  heldSeeds.delete(botId);
+}
+
+function clearSeed(botId: string): void {
+  containerManager.updateInstanceFleetDbReplicaSeed(botId, null);
+  heldSeeds.delete(botId);
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * A seed write the registry refused, by seed: a patch the record still lacks
+ * (a commit mark, a park), or the clear of a finished seed. Read into every
+ * view of the seed and written again on the next health tick.
+ */
+type HeldSeed = { startedAt: number; patch: Partial<FleetReplicaSeedRecord>; done: boolean; writeError: string };
+const heldSeeds = new Map<string, HeldSeed>();
+/** What a finished seed left for the operator to do, by seed: shown on the standby panel until dismissed or a new seed starts. */
+const seedNotes = new Map<string, { startedAt: number; text: string }>();
+
+function holdSeed(botId: string, startedAt: number, patch: Partial<FleetReplicaSeedRecord>, err: unknown, done = false): void {
+  const prior = heldSeeds.get(botId);
+  const merged = prior && prior.startedAt === startedAt && !prior.done ? { ...prior.patch, ...patch } : patch;
+  heldSeeds.set(botId, { startedAt, patch: merged, done, writeError: errorText(err) });
+  console.warn(`[FleetReplica] ${botId}: the seed record could not be written (${errorText(err)}); ${done ? 'the seed finished, and its record is cleared on the next health tick' : 'the change is held in memory and written again on the next health tick'}`);
+}
+
+/** saveSeed for a mark that must not be lost: a refusal is held, never thrown. */
+function saveSeedOrHold(botId: string, patch: Partial<FleetReplicaSeedRecord>): void {
+  const current = seedRecord(botId);
+  if (!current) return;
+  try {
+    saveSeed(botId, patch);
+  } catch (err) {
+    holdSeed(botId, current.startedAt, patch, err);
+  }
+}
+
+/** A finished seed whose record clear the registry refused. */
+export function seedDone(instance: InstanceConfig): boolean {
+  const seed = instance.fleetDbReplicaSeed;
+  const held = heldSeeds.get(instance.id);
+  return !!seed && !!held && held.done && held.startedAt === seed.startedAt;
+}
+
+/** The seed as every lane must read it: a finished one whose clear was refused is no seed, and a refused park or mark is merged in. */
+export function seedView(instance: InstanceConfig): FleetReplicaSeedRecord | null {
+  const seed = instance.fleetDbReplicaSeed ?? null;
+  if (!seed || seedDone(instance)) return null;
+  const held = heldSeeds.get(instance.id);
+  if (!held || held.startedAt !== seed.startedAt) return seed;
+  const view = { ...seed, ...held.patch };
+  if (held.patch.parked) view.lastError = `${held.patch.lastError || 'the seed stopped'}; its record could not be written (${held.writeError})`;
+  return view;
+}
+
+/** Health tick: write again what a seed could not. */
+export function retryHeldSeedRecords(): void {
+  for (const [botId, held] of [...heldSeeds]) {
+    const seed = seedRecord(botId);
+    if (!seed || seed.startedAt !== held.startedAt) { heldSeeds.delete(botId); continue; }
+    try {
+      if (held.done) clearSeed(botId);
+      else saveSeed(botId, {});
+    } catch (err) {
+      held.writeError = errorText(err);
+    }
+  }
 }
 
 /** The run on record now: a caller's snapshot can predate a Cancel or a Dismiss. */
@@ -90,7 +162,7 @@ function liveFailback(instance: InstanceConfig): FleetFailbackRun | null {
  * sequences. Only the run itself (its startedAt token) passes.
  */
 function runHold(instance: InstanceConfig, run?: number): string | null {
-  const active = liveFailback(instance);
+  const active = fleetFailback.failbackView(containerManager.getBot(instance.id) ?? instance);
   if (typeof run === 'number') {
     if (!active) return 'The failback run that asked is no longer on record (it was cancelled or dismissed); nothing was changed';
     if (active.startedAt === run) {
@@ -99,6 +171,7 @@ function runHold(instance: InstanceConfig, run?: number): string | null {
   }
   if (!active) return null;
   const phase = fleetFailback.failbackPhaseText(active);
+  if (active.finished) return `A ${active.mode} run finished on this instance, but its record is not cleared yet; Dismiss it on the Database modal first`;
   if (!active.parked) return `A ${active.mode} run is on this instance (${phase}); wait for it to park or finish (its card on the Database modal then shows its exits)`;
   if (active.phase === 'wipe-consent' && !active.consentAt) {
     return `A ${active.mode} run is on this instance (${phase}); answer it on the Database modal first (${active.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}, or Cancel)`;
@@ -108,7 +181,8 @@ function runHold(instance: InstanceConfig, run?: number): string | null {
 }
 
 function seedRunning(botId: string): boolean {
-  const seed = seedRecord(botId);
+  const bot = containerManager.getBot(botId);
+  const seed = bot ? seedView(bot) : null;
   return seed !== null && seed.parked !== true;
 }
 
@@ -263,6 +337,15 @@ function setCopyCleared(botId: string, cleared: boolean): void {
   containerManager.updateInstanceFleetDbReplica(botId, cleared ? { ...rest, copyCleared: true } : rest);
 }
 
+/** The ledger is a count for the automatic re-seed, never the seed's outcome: a refused write is logged. */
+function ledgerOrWarn(botId: string, write: () => void): void {
+  try {
+    write();
+  } catch (err) {
+    console.warn(`[FleetReplica] ${botId}: the re-seed ledger could not be written: ${errorText(err)}`);
+  }
+}
+
 function ledgerSuccess(botId: string): void {
   patchLedger(botId, current => ({ attempts: 0, lastAttemptAt: current?.lastAttemptAt ?? Date.now(), trigger: current?.trigger ?? 'automatic', lastSuccessAt: Date.now() }));
 }
@@ -279,9 +362,9 @@ function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, co
       : 'cancelled after the stale database was retired, so this node is now an ordinary worker without a standby (its pre-reseed dump is in the backups list if it succeeded)';
   // The attempt is already counted, so the ledger must carry its reason or
   // the modal keeps reporting an attempt that is no longer running.
-  if (purpose === 'reseed-standby') ledgerFailure(botId, what);
+  if (purpose === 'reseed-standby') ledgerOrWarn(botId, () => ledgerFailure(botId, what));
   if (!stranded) {
-    containerManager.updateInstanceFleetDbReplicaSeed(botId, null);
+    clearSeed(botId);
     return;
   }
   saveSeed(botId, { parked: true, cancelRequested: false, cancelled: true, lastError: what });
@@ -422,9 +505,12 @@ export interface FleetReplicaStatus {
   present: boolean;
   provisioning?: { startedAt: number; phase: FleetReplicaSeedPhase; purpose: FleetReplicaSeedPurpose; forSeconds: number; cancelable: boolean; cancelRequested: boolean; committed: boolean; safetyDump?: string };
   /** A seed no runner owns any more (it failed, or a manager restart interrupted it): Retry or Dismiss. */
-  parkedSeed?: { startedAt: number; purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean; safetyDump?: string };
+  parkedSeed?: { startedAt: number; purpose: FleetReplicaSeedPurpose; phase: FleetReplicaSeedPhase; lastError: string; at: number; committed: boolean; cancelled: boolean; copyWhole: boolean; safetyDump?: string; pinsUnretired?: string[] };
   /** A retire of the database env pins left them in a compose it could not edit, and a compose still sets one the store does not hold. */
   pinsWarning?: string;
+  /** What a finished seed left undone (its record clear, or the Apply mark), and the seed it belongs to, for Dismiss. */
+  seedNote?: string;
+  seedNoteStartedAt?: number;
   /** The automatic re-seed's attempt ledger, from the standby record. */
   autoReseed?: FleetReplicaAutoReseedLedger;
   /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
@@ -447,11 +533,20 @@ export interface FleetReplicaStatus {
 }
 
 export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<FleetReplicaStatus> {
-  const seed = instance.fleetDbReplicaSeed ?? null;
+  const seed = seedView(instance);
   const status: FleetReplicaStatus = {
     present: !!instance.fleetDbReplica || (!!seed && !seed.parked),
     lastError: seed?.parked ? seed.lastError : undefined,
   };
+  const held = heldSeeds.get(instance.id);
+  const note = seedNotes.get(instance.id);
+  if (seedDone(instance) && held) {
+    status.seedNote = `The standby was provisioned; its seed record could not be cleared (${held.writeError}). The manager clears it on its next health tick, and Dismiss clears it now`;
+    status.seedNoteStartedAt = held.startedAt;
+  } else if (note && !seed) {
+    status.seedNote = note.text;
+    status.seedNoteStartedAt = note.startedAt;
+  }
   if (seed && !seed.parked) {
     status.provisioning = {
       startedAt: seed.startedAt,
@@ -475,6 +570,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
       // A seed that stopped after its refile left the copy whole; at most its service is down.
       copyWhole: seedBuiltRecord(instance.fleetDbReplica, seed),
       ...(seed.safetyDump ? { safetyDump: seed.safetyDump } : {}),
+      ...(seed.pinsUnretired?.length ? { pinsUnretired: seed.pinsUnretired } : {}),
     };
   }
   const pinsWarning = livePinsWarning(instance);
@@ -613,6 +709,8 @@ function startProvisioning(
     primaryPort: record.primaryPort,
     slot: record.slot,
   });
+  heldSeeds.delete(instance.id);
+  seedNotes.delete(instance.id);
   const ownsRecord = (): boolean => seedRecord(instance.id)?.startedAt === now;
   void containerManager.withExternalBotOp(instance.id, 'replica-seed', async () => {
     throwIfCancelled(instance.id);
@@ -637,22 +735,32 @@ function startProvisioning(
     }
   }).then(() => {
     if (!ownsRecord()) return;
-    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
-    if (purpose === 'reseed-standby') ledgerSuccess(instance.id);
+    try {
+      clearSeed(instance.id);
+    } catch (err) {
+      holdSeed(instance.id, now, {}, err, true);
+    }
+    if (purpose === 'reseed-standby') ledgerOrWarn(instance.id, () => ledgerSuccess(instance.id));
   }, err => {
     if (!ownsRecord()) return;
     const message = String(err instanceof Error ? err.message : err);
-    // Nothing of this instance's is left to retry or dismiss.
-    if (err instanceof SeedSuperseded) {
-      containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
-      return;
+    try {
+      // Nothing of this instance's is left to retry or dismiss.
+      if (err instanceof SeedSuperseded) {
+        clearSeed(instance.id);
+        return;
+      }
+      const viewed = containerManager.getBot(instance.id);
+      const seed = viewed ? seedView(viewed) : null;
+      if (err instanceof SeedCancelled || seed?.cancelRequested === true) {
+        settleCancelledSeed(instance.id, purpose, seed?.committed === true);
+        return;
+      }
+      if (purpose === 'reseed-standby') ledgerOrWarn(instance.id, () => ledgerFailure(instance.id, message));
+      saveSeed(instance.id, { parked: true, lastError: message });
+    } catch (writeErr) {
+      holdSeed(instance.id, now, { parked: true, lastError: err instanceof SeedSuperseded ? `${message}; nothing is left to retry, so Dismiss this` : message }, writeErr);
     }
-    if (err instanceof SeedCancelled || seedRecord(instance.id)?.cancelRequested === true) {
-      settleCancelledSeed(instance.id, purpose, seedRecord(instance.id)?.committed === true);
-      return;
-    }
-    saveSeed(instance.id, { parked: true, lastError: message });
-    if (purpose === 'reseed-standby') ledgerFailure(instance.id, message);
   }).finally(() => {
     onSettled?.();
     containerManager.broadcastBotUpdated(instance.id);
@@ -1043,7 +1151,18 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   }
   // The app learns its standby from its container environment, which only
   // a recreate rewrites; the running project is marked so Start applies it.
-  if (purpose === 'provision') await containerManager.markPendingApplyIfRunning(instance.id);
+  // The standby already runs, so a refused mark settles the seed and names the restart instead.
+  if (purpose === 'provision') {
+    try {
+      await containerManager.markPendingApplyIfRunning(instance.id);
+    } catch (err) {
+      const startedAt = seedRecord(instance.id)?.startedAt;
+      if (typeof startedAt === 'number') {
+        seedNotes.set(instance.id, { startedAt, text: `The standby was provisioned and runs, but the manager could not record that the running bot must be recreated to learn it (${errorText(err)}). Restart the instance so the bot picks up its standby` });
+      }
+      console.warn(`[FleetReplica] ${instance.id}: the standby runs, but the Apply mark could not be saved: ${errorText(err)}`);
+    }
+  }
 }
 
 /** Best effort: an inactive slot of this name on the primary is dropped; a failure is logged, never thrown. */
@@ -1128,12 +1247,17 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
   return containerManager.withExternalBotOp(instance.id, 'replica-remove', async () => {
     const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
     if (!removed.success) return { success: false, error: `${removed.error}; the standby record was kept, so Remove can be retried` };
+    let recordCleared = false;
     try {
       containerManager.updateInstanceFleetDbReplicaKept(instance.id, { volume: rec.volume, removedAt: new Date().toISOString(), held: copyState });
       containerManager.updateInstanceFleetDbReplica(instance.id, null);
-      containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+      recordCleared = true;
+      if (containerManager.getBot(instance.id)?.fleetDbReplicaSeed) clearSeed(instance.id);
     } catch (err) {
-      return { success: false, error: `The standby service and container were removed, but its record could not be cleared: ${err instanceof Error ? err.message : String(err)}` };
+      const why = errorText(err);
+      return { success: false, error: recordCleared
+        ? `The standby service, container and record were removed, but the seed record could not be cleared (${why}); Dismiss it on this panel`
+        : `The standby service and container were removed, but its record could not be cleared (${why}); the record is kept, so Remove replica again clears it` };
     }
     return { success: true };
   });
@@ -1239,17 +1363,55 @@ export async function instanceRemovalRefusal(
  * pin). The mode key goes too, otherwise the next rebuild reads it with no URL
  * beside it and mints a fresh sidecar for a node that just stopped having one.
  */
-function retireFleetDbEnvPins(botId: string): string[] {
+function retireFleetDbEnvPins(botId: string): { unedited: string[]; unretired: { key: string; error: string }[] } {
   const unedited = new Set<string>();
+  const unretired: { key: string; error: string }[] = [];
+  // Every key is tried: one refused write must not leave the others pinned.
   for (const key of companionEnvKeys(botId)) {
-    envManager.deleteEnvVar(botId, key);
-    containerManager.removeBotEnvVars(botId, [key]);
-    for (const file of containerManager.removeEnvKeyFromDeployedCompose(botId, key)) unedited.add(file);
+    try {
+      envManager.deleteEnvVar(botId, key);
+      containerManager.removeBotEnvVars(botId, [key]);
+      for (const file of containerManager.removeEnvKeyFromDeployedCompose(botId, key)) unedited.add(file);
+    } catch (err) {
+      unretired.push({ key, error: errorText(err) });
+    }
   }
   // On the instance, not on a seed record: a Dismiss must not clear it while
   // the pins remain.
-  containerManager.updateInstanceFleetDbPinsWarning(botId, unedited.size > 0 ? uneditedPinsWarning([...unedited]) : null);
-  return [...unedited];
+  try {
+    containerManager.updateInstanceFleetDbPinsWarning(botId, unedited.size > 0 ? uneditedPinsWarning([...unedited]) : null);
+  } catch (err) {
+    console.warn(`[FleetReplica] ${botId}: the env pins warning could not be saved: ${errorText(err)}`);
+  }
+  return { unedited: [...unedited], unretired };
+}
+
+function unretiredPinsText(unretired: { key: string; error: string }[]): string {
+  return `the stale database was retired, but the env pins ${unretired.map(p => p.key).join(', ')} could not be removed (${unretired[0].error}), so this node stays pinned to the retired database and the standby was not seeded; Finish retire removes the pins, then Dismiss this and provision the standby from the block`;
+}
+
+/** Finish retire: remove the env pins a stale-primary re-seed could not, and say what the node is now. */
+export async function finishPinsRetire(instance: InstanceConfig): Promise<{ success: boolean; error?: string; warning?: string }> {
+  const bot = containerManager.getBot(instance.id);
+  const seed = bot ? seedView(bot) : null;
+  if (!seed?.parked || !seed.pinsUnretired?.length) return { success: false, error: 'No re-seed on this instance is waiting for its env pins to be removed (nothing was changed)' };
+  const busyOp = containerManager.isBotBusy(instance.id);
+  if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish (nothing was changed)` };
+  const pins = retireFleetDbEnvPins(instance.id);
+  const warning = pins.unedited.length > 0 ? uneditedPinsWarning(pins.unedited) : undefined;
+  if (pins.unretired.length > 0) {
+    const left = pins.unretired.map(p => p.key);
+    saveSeedOrHold(instance.id, { pinsUnretired: left, lastError: unretiredPinsText(pins.unretired) });
+    return { success: false, error: `${left.join(', ')} could still not be removed (${pins.unretired[0].error}); the others are removed. Finish retire again once the store can be written` };
+  }
+  const done = 'the stale database was retired and its env pins are removed now; the seed did not run, so this node is an ordinary worker without a standby: Dismiss this, then provision the standby from the block';
+  try {
+    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, { ...seed, pinsUnretired: undefined, lastError: done, updatedAt: Date.now() });
+    heldSeeds.delete(instance.id);
+  } catch (err) {
+    return { success: true, warning: `The env pins are removed, but the re-seed record still names them: it could not be written (${errorText(err)})${warning ? `. ${warning}` : ''}` };
+  }
+  return warning ? { success: true, warning } : { success: true };
 }
 
 /**
@@ -1401,7 +1563,7 @@ export function reseedStalePrimary(
           const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY);
           if (!dump.success) throw new Error(`the safety dump failed, so nothing was destroyed: ${dump.error}`);
           fenced = true;
-          saveSeed(instance.id, { safetyDump: dump.file });
+          saveSeedOrHold(instance.id, { safetyDump: dump.file });
         }
       }
       if (!opts.dumpDone && fenced) {
@@ -1421,7 +1583,7 @@ export function reseedStalePrimary(
       if (!retired.success) {
         if (retired.volumeRemoved) {
           fenced = false;
-          saveSeed(instance.id, { committed: true });
+          saveSeedOrHold(instance.id, { committed: true });
         }
         throw new Error(`could not retire the stale database: ${retired.error}`);
       }
@@ -1435,13 +1597,17 @@ export function reseedStalePrimary(
     // Committed once the retire reports the volume gone: a retire that refuses
     // before it touches the volume leaves everything in place, and a cancel
     // filed there must not claim the database is gone.
-    saveSeed(instance.id, { committed: true });
+    saveSeedOrHold(instance.id, { committed: true });
     // BEFORE the seed: if the seed then fails, this node is an ordinary worker
     // that will take the live fleet database from the master's next delivery
     // and merely lacks a standby, which beats staying pinned to a database
     // that was just deleted.
-    const unedited = retireFleetDbEnvPins(instance.id);
-    if (unedited.length > 0) console.error(`[FleetReplica] ${instance.id}: ${uneditedPinsWarning(unedited)}`);
+    const pins = retireFleetDbEnvPins(instance.id);
+    if (pins.unedited.length > 0) console.error(`[FleetReplica] ${instance.id}: ${uneditedPinsWarning(pins.unedited)}`);
+    if (pins.unretired.length > 0) {
+      saveSeedOrHold(instance.id, { pinsUnretired: pins.unretired.map(p => p.key) });
+      throw new Error(unretiredPinsText(pins.unretired));
+    }
   };
   // Held across the whole run, the way decommission holds it: the dump, the
   // retire and the seed take minutes, and a restore or the scheduled dump
@@ -1597,8 +1763,12 @@ export async function decommissionFleetDb(
         }
         let warning: string | undefined;
         try {
-          const unedited = retireFleetDbEnvPins(instance.id);
-          if (unedited.length > 0) warning = uneditedPinsWarning(unedited);
+          const pins = retireFleetDbEnvPins(instance.id);
+          const parts = [
+            ...(pins.unedited.length > 0 ? [uneditedPinsWarning(pins.unedited)] : []),
+            ...(pins.unretired.length > 0 ? [`The database env pins ${pins.unretired.map(p => p.key).join(', ')} could not be removed (${pins.unretired[0].error}); delete them in the Env editor`] : []),
+          ];
+          if (parts.length > 0) warning = parts.join('. ');
         } catch (err) {
           // The database is already destroyed and the dump kept: a pins
           // failure must not read as a refusal. Leftover pins only mean a
@@ -1799,22 +1969,47 @@ export async function adoptPromotedReplica(
   const replication = credential && credential.user === REPLICATION_ROLE
     ? { role: credential.user, password: credential.password, hostPort: rec.hostPort, publicHost: rec.publicHost, certHost: rec.certHost }
     : undefined;
-  const adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication);
-  if (!adopted.success) return adopted;
-  const live = containerManager.getBot(instance.id);
-  if (!live) return { success: false, error: 'Bot not found after adopting the record' };
-
-  // The container-name form first, deliberately: it is what marks the sidecar
-  // MANAGED, so a rebuild landing between here and the enable below still keeps
+  // The container-name form, written before the record flip so a refused env
+  // write leaves nothing changed: with the record flipped it is what marks the
+  // sidecar MANAGED, so a rebuild landing before the enable below still keeps
   // the database in the compose. The enable keeps it and adds the public form
   // beside it (F1: same-host consumers cannot dial the public form).
   // Identity from the STAMP (rec.user/rec.db): adoption files an EXISTING
   // byte-copied cluster, whose role and database are whatever provisioning
   // stamped, not whatever the mutable per-source record says today.
-  envManager.setEnvVars(instance.id, {
-    ...(db.env.mode ? { [db.env.mode.key]: db.env.mode.value } : {}),
-    [db.env.url]: `postgresql://${rec.user}:${encodeURIComponent(password)}@${rec.containerName}:5432/${rec.db}?sslmode=no-verify`,
-  });
+  const envKeys = [db.env.url, ...(db.env.mode ? [db.env.mode.key] : [])];
+  let envBefore: envManager.StoredKeys;
+  try {
+    envBefore = envManager.snapshotStoredKeys(instance.id, envKeys);
+    envManager.setEnvVars(instance.id, {
+      ...(db.env.mode ? { [db.env.mode.key]: db.env.mode.value } : {}),
+      [db.env.url]: `postgresql://${rec.user}:${encodeURIComponent(password)}@${rec.containerName}:5432/${rec.db}?sslmode=no-verify`,
+    });
+  } catch (err) {
+    return { success: false, error: `The database URL could not be written to the env store (${errorText(err)}), so the standby was not adopted; nothing was changed` };
+  }
+  // The record flip did not happen: the env store gets its keys back; null, or what was left behind.
+  const putEnvBack = (): string | null => {
+    try {
+      envManager.restoreStoredKeys(instance.id, envBefore);
+      return null;
+    } catch (err) {
+      return `${envKeys.join(' and ')} written for the adopt could not be put back in the env store (${errorText(err)}): set ${envKeys.length === 1 ? 'it' : 'them'} back in the Env editor before the instance next starts`;
+    }
+  };
+  let adopted: { success: boolean; error?: string };
+  try {
+    adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication);
+  } catch (err) {
+    const left = putEnvBack();
+    return { success: false, error: `The instance record could not be written (${errorText(err)}), so the standby was not adopted; ${left ?? 'nothing was changed'}` };
+  }
+  if (!adopted.success) {
+    const left = putEnvBack();
+    return left ? { success: false, error: `${adopted.error}; ${left}` } : adopted;
+  }
+  const live = containerManager.getBot(instance.id);
+  if (!live) return { success: false, error: 'Bot not found after adopting the record' };
 
   // BEFORE the enable, deliberately (B6 map F18/B13): the promoted copy still
   // carries what its seed and its old primary wrote. primary_conninfo and
@@ -1831,7 +2026,7 @@ export async function adoptPromotedReplica(
   const reload = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_reload_conf();']);
   if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${reload.stderr.trim().split('\n').pop()}`);
 
-  const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort);
+  const enabled = await enableFleetReplication(live, rec.publicHost, rec.hostPort, undefined, { dbPassword: password });
   if (!enabled.success) {
     // Leave the adopted record in place: the database IS this machine's now,
     // and the operator can retry Enable from the replication section. Rolling
@@ -1848,8 +2043,21 @@ export async function adoptPromotedReplica(
   for (const key of db.repointedEnv ?? []) {
     if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
   }
-  if (Object.keys(repoints).length) envManager.setEnvVars(instance.id, repoints);
+  if (Object.keys(repoints).length) {
+    try {
+      envManager.setEnvVars(instance.id, repoints);
+    } catch (err) {
+      return { success: false, restartRequired: true, error: `The database was adopted and replication is enabled on it, but ${Object.keys(repoints).join(', ')} could not be repointed (${errorText(err)}) and still hold the old database URL: set ${Object.keys(repoints).length === 1 ? 'it' : 'them'} to the value of ${db.env.url} in the Env editor, then restart the instance` };
+    }
+  }
   return { success: true, restartRequired: true };
+}
+
+/** The fleet database password for an instance whose manager env holds no database URL: the bot's own env file carries it. */
+export async function fleetDbPasswordFallback(instance: InstanceConfig): Promise<string | undefined> {
+  const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
+  if (!db || (envManager.getEnvVars(instance.id)[db.env.url] || '').trim() !== '') return undefined;
+  return fleetPasswordFromBotEnv(await instanceDataDir(instance), db) ?? undefined;
 }
 
 /**
@@ -1936,7 +2144,23 @@ export interface SeedCancelResult {
 }
 
 export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedCancelRequest = {}): Promise<SeedCancelResult> {
-  const seed = seedRecord(instance.id);
+  const bot = containerManager.getBot(instance.id);
+  // A finished seed's leftovers: its record whose clear was refused, or a note. Dismiss clears them and nothing else.
+  const note = seedNotes.get(instance.id);
+  if (bot && request.startedAt !== undefined && seedDone(bot) && bot.fleetDbReplicaSeed?.startedAt === request.startedAt) {
+    try {
+      clearSeed(instance.id);
+    } catch (err) {
+      return { success: false, error: `The standby was provisioned, but its seed record still could not be cleared (${errorText(err)}); the manager retries on its next health tick` };
+    }
+    // A note the same seed left (the Restart note) shows next, with its own Dismiss.
+    return { success: true, dismissed: true };
+  }
+  if (bot && !bot.fleetDbReplicaSeed && note && note.startedAt === request.startedAt) {
+    seedNotes.delete(instance.id);
+    return { success: true, dismissed: true };
+  }
+  const seed = bot ? seedView(bot) : null;
   if (!seed) {
     return { success: false, error: request.startedAt === undefined ? 'No seed is running on this instance' : 'The seed this view showed is no longer on record (it finished, or was dismissed elsewhere); look again' };
   }
@@ -1970,8 +2194,9 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
     // no service is on, so a wedged daemon must not block clearing the record.
     // A run started during the sweep owns the record and these names.
     const stillThisRun = (): boolean => {
-      const now = seedRecord(instance.id);
-      return !!now && now.startedAt === seed.startedAt && now.parked === true;
+      const now = containerManager.getBot(instance.id);
+      const viewed = now ? seedView(now) : null;
+      return !!viewed && viewed.startedAt === seed.startedAt && viewed.parked === true;
     };
     for (const name of seedHelperNames(instance)) {
       if (!stillThisRun()) break;
@@ -1980,10 +2205,18 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
     if (!stillThisRun()) {
       return { success: false, error: 'A new seed run started on this instance while the stopped one was being dismissed, so the new run was left as it is; look again' };
     }
-    containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
+    try {
+      clearSeed(instance.id);
+    } catch (err) {
+      return { success: false, error: `The stopped seed record could not be cleared (${errorText(err)}), so it was not dismissed` };
+    }
     return { success: true, dismissed: true };
   }
-  saveSeed(instance.id, { cancelRequested: true });
+  try {
+    saveSeed(instance.id, { cancelRequested: true });
+  } catch (err) {
+    return { success: false, error: `The cancel could not be recorded (${errorText(err)}), so the seed runs on; nothing was changed` };
+  }
   const refused = await sweep();
   // The runner may create the seed container between its boundary check and
   // the spawn; sweep once more for that window, but only while THIS run is

@@ -138,6 +138,8 @@ export interface FleetReplicaSeedRecord {
   cancelRequested?: boolean;
   /** The stale-primary re-seed's safety dump, taken under the write fence and kept with the backups. */
   safetyDump?: string;
+  /** The database env pins a re-seed could not retire after it retired the stale database: Finish retire removes them. */
+  pinsUnretired?: string[];
 }
 
 export type FleetTransferPhase = 'seeding' | 'applying' | 'catching-up' | 'promoting';
@@ -153,6 +155,8 @@ export interface FleetTransferRun {
   retireOldMaster: boolean;
   parked?: boolean;
   lastError?: string;
+  /** Status views only, never stored: the app accepted the promote and the record clear was refused. */
+  clearPending?: boolean;
 }
 
 export type FleetFailbackMode = 'failback' | 'drop-back';
@@ -226,6 +230,8 @@ export interface FleetFailbackRun {
   /** No runner owns it: the consent park, a failure, or a manager restart. */
   parked?: boolean;
   lastError?: string;
+  /** Status views only, never stored: the run finished and the record clear was refused. */
+  finished?: boolean;
 }
 
 // Recovery-channel arm state (PLAN_REPLICATION.md Section 18, RC-2). One
@@ -304,6 +310,8 @@ export interface RecoveryRescueRecord {
   flipStep?: 'start' | 'role';
   /** Swap (RC-4): the highest term the source's database held at quiesce (control row and guild leases); null when it had neither table. The flip raises the copy above it. */
   swapSourceTerm?: number | null;
+  /** Status views only, never stored: the record reads live, but no runner of this process drives it. */
+  runnerStopped?: boolean;
 }
 
 // Daily pg_dump schedule for the managed sidecar. Absent means the defaults

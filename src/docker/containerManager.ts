@@ -1345,18 +1345,31 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     instance.sanitizedName = names.sanitizedName;
     instance.titleName = names.titleName;
   }
+  let storeBefore: envManager.StoredKeys | null = null;
   if (update.envVars) {
     // The single env dual-write funnel, AFTER the rename validation so a
     // refused update persists nothing anywhere: the store takes everything
     // (sensitive values encrypted; throws on a corrupt store before any state
     // changes), the record keeps only the non-sensitive keys.
+    storeBefore = envManager.snapshotStoredKeys(botId, Object.keys(update.envVars));
     envManager.setEnvVars(botId, update.envVars);
     instance.envVars = withoutSensitiveKeys({ ...instance.envVars, ...update.envVars });
   }
   instance.updatedAt = new Date().toISOString();
 
   registry.instances[botId] = instance;
-  saveRegistry(registry);
+  try {
+    saveRegistry(registry);
+  } catch (err) {
+    if (!storeBefore) throw err;
+    const why = err instanceof Error ? err.message : String(err);
+    try {
+      envManager.restoreStoredKeys(botId, storeBefore);
+    } catch (restoreErr) {
+      throw new Error(`The env save is incomplete: the env store took the new values, but the instance record could not be written (${why}), and putting the store back failed too (${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}). The next start may use the new values; save again once the disk can be written`);
+    }
+    throw new Error(`The instance record could not be written (${why}), so nothing was saved; the env store was put back as it was`);
+  }
 
   return instance;
 }
@@ -1418,8 +1431,19 @@ export function removeEnvKeyFromDeployedCompose(botId: string, key: string): str
 export function removeEnvKeyEverywhere(botId: string, key: string): string[] {
   const unedited = removeEnvKeyFromDeployedCompose(botId, key);
   if (unedited.length > 0) return unedited;
+  const storeBefore = envManager.snapshotStoredKeys(botId, [key]);
   envManager.deleteEnvVar(botId, key);
-  removeBotEnvVars(botId, [key]);
+  try {
+    removeBotEnvVars(botId, [key]);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    try {
+      envManager.restoreStoredKeys(botId, storeBefore);
+    } catch (restoreErr) {
+      throw new Error(`${key} is half removed: it is gone from the env store, but the instance record could not be written (${why}) and still lists it, and putting the store back failed too (${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}); retry the removal`);
+    }
+    throw new Error(`The instance record could not be written (${why}), so ${key} was not removed; retry the removal`);
+  }
   if (Object.prototype.hasOwnProperty.call(envManager.getEnvVars(botId), key)) {
     throw new Error(`The env store still holds ${key} after the removal`);
   }

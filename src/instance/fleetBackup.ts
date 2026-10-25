@@ -28,6 +28,10 @@ import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 import { probeErrorTail } from '../config/secretText';
 import { readStandInPosture, StandInRead } from './appLifecycle';
+import * as fleetFailback from './fleetFailback';
+import * as fleetReplica from './fleetReplica';
+import * as fleetTransfer from './fleetTransfer';
+import * as recoveryRescue from './recoveryRescue';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
 const FACTS_TIMEOUT_MS = 10_000;
@@ -173,16 +177,21 @@ export async function waitForInFlightLanes(boundMs: number, pollMs = 1_000): Pro
 
 /**
  * The lane a manager self-update would cut short, named; null when none runs. Parked runs are left out: they
- * wait for the operator and resume after a restart by design.
+ * wait for the operator and resume after a restart by design. A run is read as its card reads it, so one whose
+ * park or clear the registry refused, or that no runner of this process drives, counts as parked.
  */
 export function databaseLaneBlocker(): string | null {
   const inFlight = inFlightLaneBlocker();
   if (inFlight) return inFlight;
   for (const b of containerManager.getAllBots()) {
-    if (b.recoveryRescue && !b.recoveryRescue.parked) return `a database rescue is running on ${b.displayName} (${b.recoveryRescue.phase})`;
-    if (b.fleetFailback && !b.fleetFailback.parked) return `a ${b.fleetFailback.mode} run is running on ${b.displayName} (${b.fleetFailback.phase})`;
-    if (b.fleetTransfer && !b.fleetTransfer.parked) return `a database transfer is running on ${b.displayName} (${b.fleetTransfer.phase})`;
-    if (b.fleetDbReplicaSeed && !b.fleetDbReplicaSeed.parked) return `a standby seed is running on ${b.displayName}`;
+    const rescue = recoveryRescue.getRescueStatus(b);
+    if (rescue && !rescue.parked) return `a database rescue is running on ${b.displayName} (${rescue.phase})`;
+    const failback = fleetFailback.failbackView(b);
+    if (failback && !failback.parked) return `a ${failback.mode} run is running on ${b.displayName} (${failback.phase})`;
+    const transfer = fleetTransfer.transferView(b);
+    if (transfer && !transfer.parked) return `a database transfer is running on ${b.displayName} (${transfer.phase})`;
+    const seed = fleetReplica.seedView(b);
+    if (seed && !seed.parked) return `a standby seed is running on ${b.displayName}`;
   }
   return null;
 }
@@ -1000,7 +1009,8 @@ function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; ste
   if (instance.recoveryChannel) return { refusal: `The recovery channel is armed on this instance (${instance.recoveryChannel.mode}); disarm it before restoring a dump`, step: `disarm the recovery channel (${instance.recoveryChannel.mode})` };
   if (instance.fleetFailback) return { refusal: `A ${instance.fleetFailback.mode} run is recorded on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before restoring a dump`, step: `Continue, Cancel or Dismiss the ${instance.fleetFailback.mode} run on the Database modal` };
   if (instance.fleetTransfer) return { refusal: `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it before restoring a dump`, step: 'let the database transfer finish or cancel it' };
-  if (instance.fleetDbReplicaSeed && instance.fleetDbReplicaSeed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
+  const seed = fleetReplica.seedView(instance);
+  if (seed && seed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
   return null;
 }
 

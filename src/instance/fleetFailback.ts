@@ -54,7 +54,8 @@ const runners = new Map<string, Promise<void>>();
 const closing = new Map<string, number>();
 
 function startRunner(botId: string, startedAt: number): void {
-  const runner: Promise<void> = runFailback(botId, startedAt).finally(() => {
+  // Deferred, so the runner is registered before its first step reads the live-runner set.
+  const runner: Promise<void> = Promise.resolve().then(() => runFailback(botId, startedAt)).finally(() => {
     if (runners.get(botId) === runner) runners.delete(botId);
   });
   runners.set(botId, runner);
@@ -70,7 +71,64 @@ function saveRun(botId: string, patch: Partial<FleetFailbackRun>): void {
   const current = currentRun(botId);
   if (!current) return;
   containerManager.updateInstanceFleetFailback(botId, { ...current, ...patch, updatedAt: Date.now() });
+  heldRuns.delete(botId);
   containerManager.broadcastBotUpdated(botId);
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** A runner's closing write the registry refused, by run: a park, or the clear of a finished run. The health tick writes it again. */
+type HeldRun = { startedAt: number; kind: 'park' | 'finished'; lastError: string; writeError: string };
+const heldRuns = new Map<string, HeldRun>();
+
+function holdRun(botId: string, held: HeldRun): void {
+  heldRuns.set(botId, held);
+  console.warn(`[FleetFailback] ${botId}: the run record could not be written (${held.writeError}); ${held.kind === 'finished' ? 'the run finished, and its record is cleared on the next health tick' : 'the park is held in memory and written again on the next health tick'}`);
+  containerManager.broadcastBotUpdated(botId);
+}
+
+/** The run as its card and its levers read it: a refused park or clear, and a record that reads live with no runner in this process. */
+export function failbackView(instance: InstanceConfig): FleetFailbackRun | null {
+  const run = instance.fleetFailback;
+  if (!run) return null;
+  const held = heldRuns.get(instance.id);
+  if (held && held.startedAt === run.startedAt) {
+    if (held.kind === 'finished') {
+      return { ...run, parked: true, finished: true, lastError: `${held.lastError.charAt(0).toUpperCase()}${held.lastError.slice(1)}, but its run record could not be cleared (${held.writeError}); the manager clears it on its next health tick, and Dismiss clears it now` };
+    }
+    return { ...run, parked: true, lastError: `the run stopped at ${failbackPhaseText(run)}: ${held.lastError}; its record could not be written (${held.writeError})` };
+  }
+  if (!run.parked && !runners.has(instance.id) && !closing.has(instance.id)) {
+    return { ...run, parked: true, lastError: `the run's runner stopped (${failbackPhaseText(run)}); Continue picks up from where it stopped` };
+  }
+  return run;
+}
+
+/** Health tick: write again what a runner could not, once no runner holds the run. */
+export function retryHeldFailbackRecords(): void {
+  for (const [botId, held] of [...heldRuns]) {
+    const run = currentRun(botId);
+    if (!run || run.startedAt !== held.startedAt) { heldRuns.delete(botId); continue; }
+    if (runners.has(botId) || closing.has(botId)) continue;
+    try {
+      if (held.kind === 'finished') clearRun(botId);
+      else saveRun(botId, { parked: true, lastError: held.lastError });
+    } catch (err) {
+      held.writeError = errorText(err);
+    }
+  }
+}
+
+/** The runner's last word on a run it no longer drives; a refusal is held, never thrown. */
+function finishRun(botId: string, startedAt: number, what: string): void {
+  try {
+    clearRun(botId);
+    console.log(`[FleetFailback] ${containerManager.getBot(botId)?.displayName ?? botId}: ${what}`);
+  } catch (err) {
+    holdRun(botId, { startedAt, kind: 'finished', lastError: what, writeError: errorText(err) });
+  }
 }
 
 /** A finished run closes its episode, so the stored posture is replaced by the one just read, or by none. */
@@ -86,6 +144,7 @@ function recordAnsweredPosture(botId: string, read: FactsRead | null): void {
 
 function clearRun(botId: string): void {
   containerManager.updateInstanceFleetFailback(botId, null);
+  heldRuns.delete(botId);
   containerManager.broadcastBotUpdated(botId);
 }
 
@@ -93,6 +152,19 @@ function clearRun(botId: string): void {
 function declineRun(botId: string, run: FleetFailbackRun): void {
   containerManager.updateInstanceFleetFailbackDeclined(botId, { mode: run.mode, at: Date.now(), standInNodeId: run.standInNodeId, episode: typeof run.episode === 'number' ? run.episode : null, phase: run.phase });
   clearRun(botId);
+}
+
+/** declineRun for Cancel and Dismiss: what could not be saved, or null when both writes landed. */
+function closeDeclined(botId: string, run: FleetFailbackRun): string | null {
+  const declinedBefore = containerManager.getBot(botId)?.fleetFailbackDeclined;
+  try {
+    declineRun(botId, run);
+    return null;
+  } catch (err) {
+    const declined = containerManager.getBot(botId)?.fleetFailbackDeclined;
+    const saved = declined && declined !== declinedBefore;
+    return `${saved ? 'its record could not be cleared' : 'the decline and the run record could not be saved'} (${errorText(err)}): the run stays on its card, parked; press Cancel or Dismiss again once the store can be written`;
+  }
 }
 
 /**
@@ -288,6 +360,7 @@ export function consentText(run: FleetFailbackRun): string {
 
 /** What a stopped instance's badge says while a failback run owns it. */
 export function stoppedText(run: FleetFailbackRun): string {
+  if (run.finished) return `Instance is stopped; the ${run.mode} finished, but its run record is not cleared yet: Dismiss it on the Database modal`;
   const head = run.stoppedByRun ? 'Instance is stopped by the failback run' : 'Instance is stopped; a failback run is on record';
   if (run.phase === 'wipe-consent' && !run.consentAt) return `${head}, which is ${failbackPhaseText(run)}: answer it on the Database modal`;
   return `${head} (${failbackPhaseText(run)})${run.parked ? `; the run stopped: ${run.lastError || 'unknown reason'}` : ''}`;
@@ -533,8 +606,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           const applied = await containerManager.applyFleetDbReplicaService(botId);
           if (!applied.success) throw new Error(`the standby's service could not be started from its record: ${applied.error || 'unknown reason'}; Continue retries it`);
           recordAnsweredPosture(botId, null);
-          clearRun(botId);
-          console.log(`[FleetFailback] ${bot.displayName}: the drop-back finished; this copy is a standby of ${shortId(run.standInNodeId)}'s database again`);
+          finishRun(botId, startedAt, `the drop-back finished; this copy is a standby of ${shortId(run.standInNodeId)}'s database again`);
           return;
         }
         throw new Error(`a drop-back run has no phase ${run.phase}`);
@@ -774,7 +846,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
             const host = bot.fleetDb.replication?.publicHost ?? run.serve?.publicHost;
             const port = bot.fleetDb.replication?.hostPort ?? run.serve?.hostPort;
             if (!host) throw new Error('the adopt stopped before enabling replication on this database and this machine\'s endpoint for it is not known; enable replication from the Replication section, then Continue');
-            const enabled = await enableFleetReplication(bot, host, port);
+            const enabled = await enableFleetReplication(bot, host, port, undefined, { dbPassword: await fleetReplica.fleetDbPasswordFallback(bot) });
             if (!enabled.success) throw new Error(`the adopt stopped before enabling replication on this database, and enabling it again failed: ${enabled.error || 'unknown reason'}; Continue retries it (the Replication section shows Enable only while this database carries no replication posture)`);
             saveRun(botId, { adoptedAt: Date.now() });
           }
@@ -808,8 +880,7 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
           }
           if (owns()) {
             recordAnsweredPosture(botId, masterRead);
-            clearRun(botId);
-            console.log(`[FleetFailback] ${bot.displayName}: the failback finished; this node is the master again on its own database`);
+            finishRun(botId, startedAt, 'the failback finished; this node is the master again on its own database');
           }
           return;
         }
@@ -818,7 +889,13 @@ async function runFailback(botId: string, startedAt: number): Promise<void> {
       }
     }
   } catch (err) {
-    if (owns()) saveRun(botId, { parked: true, lastError: String(err instanceof Error ? err.message : err) });
+    if (!owns()) return;
+    const message = errorText(err);
+    try {
+      saveRun(botId, { parked: true, lastError: message });
+    } catch (writeErr) {
+      holdRun(botId, { startedAt, kind: 'park', lastError: message, writeError: errorText(writeErr) });
+    }
   }
 }
 
@@ -828,7 +905,7 @@ async function waitForSeed(botId: string, owns: () => boolean): Promise<void> {
     if (!owns()) return;
     const bot = containerManager.getBot(botId);
     if (!bot) return;
-    const seed = bot.fleetDbReplicaSeed;
+    const seed = fleetReplica.seedView(bot);
     if (!seed || seed.parked) {
       if (bot.fleetDbReplica && !seed) break;
       throw new Error(seed?.parked
@@ -841,16 +918,22 @@ async function waitForSeed(botId: string, owns: () => boolean): Promise<void> {
 
 /** Continue a parked run; at the consent park, the operator's consent is what lets the wipe run (F5). */
 export async function continueFailback(instance: InstanceConfig, opts: { consent?: boolean } = {}): Promise<ActionResult> {
-  const run = currentRun(instance.id);
+  const now = containerManager.getBot(instance.id);
+  const run = now ? failbackView(now) : null;
   if (!run) return { success: false, error: 'No failback run is recorded on this instance' };
   if (closing.has(instance.id)) return { success: false, error: CLOSING_ERROR };
   if (!run.parked) return { success: false, error: `The run is live (${failbackPhaseText(run)}); wait for it` };
   if (runners.has(instance.id)) return { success: false, error: 'The run\'s last step is still finishing; try again in a moment' };
-  if (run.phase === 'wipe-consent' && !run.consentAt) {
-    if (opts.consent !== true) return { success: false, needsConfirm: true, error: consentText(run) };
-    saveRun(instance.id, { consentAt: Date.now(), phase: 'seeding', parked: false, lastError: undefined });
-  } else {
-    saveRun(instance.id, { parked: false, lastError: undefined });
+  if (run.finished) return { success: false, error: `${run.lastError}; there is nothing left to continue` };
+  try {
+    if (run.phase === 'wipe-consent' && !run.consentAt) {
+      if (opts.consent !== true) return { success: false, needsConfirm: true, error: consentText(run) };
+      saveRun(instance.id, { consentAt: Date.now(), phase: 'seeding', parked: false, lastError: undefined });
+    } else {
+      saveRun(instance.id, { parked: false, lastError: undefined });
+    }
+  } catch (err) {
+    return { success: false, error: `The run record could not be written (${errorText(err)}), so the run was not continued; nothing was changed` };
   }
   startRunner(instance.id, run.startedAt);
   return { success: true, started: true, resumed: true };
@@ -891,17 +974,19 @@ const PAST_SEED = new Set<FleetFailbackPhase>(['applying', 'catching-up', 'promo
 
 /** Cancel is possible while nothing was destroyed and no runner is mid-step. */
 export function cancelableFailback(instance: InstanceConfig): boolean {
-  const run = instance.fleetFailback;
-  if (!run) return false;
+  const run = failbackView(instance);
+  if (!run || run.finished) return false;
   if (!run.parked && run.phase !== 'awaiting-block') return false;
   return !destroyedBy(instance, run);
 }
 
 /** Cancel puts the instance back the way the run found it and remembers the decline for this stand-in episode. */
 export async function cancelFailback(instance: InstanceConfig): Promise<ActionResult> {
-  const first = currentRun(instance.id);
+  const firstBot = containerManager.getBot(instance.id);
+  const first = firstBot ? failbackView(firstBot) : null;
   if (!first) return { success: false, error: 'No failback run is recorded on this instance' };
   if (closing.has(instance.id)) return { success: false, error: CLOSING_ERROR };
+  if (first.finished) return { success: false, error: `${first.lastError}; there is nothing left to cancel` };
   const liveRefusal = (r: FleetFailbackRun): ActionResult | null => r.parked || r.phase === 'awaiting-block' ? null : {
     success: false,
     error: r.phase === 'dumping' ? 'The dump is running; Cancel once the run parks for your consent' : `The run is live (${failbackPhaseText(r)}); Cancel once it parks`,
@@ -917,8 +1002,8 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
   }
   // Checked again and claimed in one synchronous step: a Continue during the reads above wins, and none can follow the claim.
   const bot = containerManager.getBot(instance.id);
-  const run = bot?.fleetFailback ?? null;
-  if (!bot || !run || run.startedAt !== first.startedAt) return { success: false, error: 'The run changed while Cancel read the bot; look at its card again' };
+  const run = bot ? failbackView(bot) : null;
+  if (!bot || !run || run.startedAt !== first.startedAt || run.finished) return { success: false, error: 'The run changed while Cancel read the bot; look at its card again' };
   if (closing.has(instance.id)) return { success: false, error: CLOSING_ERROR };
   const late = liveRefusal(run);
   if (late) return late;
@@ -932,7 +1017,12 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
   closing.set(instance.id, run.startedAt);
   try {
     // A live awaiting-block runner stops at its next check; its step in flight lands first.
-    containerManager.updateInstanceFleetFailback(instance.id, { ...run, parked: true, lastError: 'cancelled by the operator', updatedAt: Date.now() });
+    try {
+      containerManager.updateInstanceFleetFailback(instance.id, { ...run, parked: true, lastError: 'cancelled by the operator', updatedAt: Date.now() });
+      heldRuns.delete(instance.id);
+    } catch (err) {
+      return { success: false, error: `The run record could not be written (${errorText(err)}), so the run was not cancelled; nothing was changed` };
+    }
     await runners.get(instance.id);
     const held = currentRun(instance.id);
     const now = containerManager.getBot(instance.id);
@@ -940,17 +1030,21 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
     // The fence goes before the start: the bot must not boot on a database it cannot write.
     const fenceNote = await liftRunFence(now, held);
     const after = currentRun(instance.id) ?? held;
+    let startedAgain = false;
     if (after.stoppedByRun) {
       const fresh = containerManager.getBot(instance.id);
       if (fresh && fresh.status !== 'running') {
         const started = await containerManager.startBot(instance.id);
+        startedAgain = started.success;
         if (!started.success) {
-          declineRun(instance.id, after);
+          const unsaved = closeDeclined(instance.id, after);
+          if (unsaved) return { success: false, error: `The run is stopped with nothing destroyed, but the instance could not be started again (${started.error}) and ${unsaved}${fenceNote}` };
           return { success: true, error: `The run is cancelled with nothing destroyed, but the instance could not be started again: ${started.error}${fenceNote}` };
         }
       }
     }
-    declineRun(instance.id, after);
+    const unsaved = closeDeclined(instance.id, after);
+    if (unsaved) return { success: false, error: `The run is stopped with nothing destroyed${startedAgain ? ' and the instance was started again' : ''}, but ${unsaved}${fenceNote}` };
     return fenceNote ? { success: true, error: `The run is cancelled with nothing destroyed${fenceNote}` } : { success: true };
   } finally {
     closing.delete(instance.id);
@@ -959,10 +1053,20 @@ export async function cancelFailback(instance: InstanceConfig): Promise<ActionRe
 
 /** Dismiss a parked run, lifting its own fence but touching nothing else, and remember the decline; the by-hand routes reopen with it gone. */
 export async function dismissFailback(instance: InstanceConfig): Promise<ActionResult> {
-  const run = currentRun(instance.id);
+  const viewed = containerManager.getBot(instance.id);
+  const run = viewed ? failbackView(viewed) : null;
   if (!run) return { success: false, error: 'No failback run is recorded on this instance' };
   if (closing.has(instance.id)) return { success: false, error: CLOSING_ERROR };
   if (!run.parked) return { success: false, error: `The run is live (${failbackPhaseText(run)}); wait for it` };
+  if (run.finished) {
+    // A finished run declines nothing: its episode is over.
+    try {
+      clearRun(instance.id);
+    } catch (err) {
+      return { success: false, error: `The ${run.mode} finished, but its run record still could not be cleared (${errorText(err)}); the manager retries on its next health tick` };
+    }
+    return { success: true };
+  }
   if (run.phase === 'wipe-consent' && !run.consentAt) return { success: false, error: 'This run is waiting for your answer: Continue consents to the wipe, Cancel restores the instance' };
   closing.set(instance.id, run.startedAt);
   try {
@@ -972,7 +1076,8 @@ export async function dismissFailback(instance: InstanceConfig): Promise<ActionR
     if (!held || !now || held.startedAt !== run.startedAt) return { success: false, error: 'The run record went away while Dismiss waited for its last step; look at the Database modal again' };
     const fenceNote = await liftRunFence(now, held);
     const after = currentRun(instance.id) ?? held;
-    declineRun(instance.id, after);
+    const unsaved = closeDeclined(instance.id, after);
+    if (unsaved) return { success: false, error: `The run was not dismissed: ${unsaved}${fenceNote}` };
     const fresh = containerManager.getBot(instance.id);
     if (after.stoppedByRun && fresh && fresh.status !== 'running') {
       return { success: true, error: `The run is dismissed and stays closed for this stand-in episode. The instance stays stopped, as the run left it: the by-hand re-seed on this modal needs it stopped, and its card starts it again when you are done${fenceNote}` };

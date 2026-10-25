@@ -7,6 +7,12 @@ const st = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
+// A run a row files as live stands for one whose runner runs in this process.
+const fb = vi.hoisted(() => ({ live: false }));
+vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
+  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
+});
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),
   getAllBots: () => st.bots,
@@ -31,8 +37,9 @@ vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
   postureFromRead: () => st.posture,
 }));
 
-import { consentText, openFailbackByHand, parkInterruptedFailbacks, stoppedText } from '../../src/instance/fleetFailback';
+// fleetReplica first, so its fleetFailback binding is the mocked module.
 import { removeFleetReplica } from '../../src/instance/fleetReplica';
+import { consentText, openFailbackByHand, parkInterruptedFailbacks, stoppedText } from '../../src/instance/fleetFailback';
 
 const run = (extra: Record<string, unknown> = {}): any => ({
   mode: 'failback', phase: 'wipe-consent', startedAt: 1, updatedAt: 1, standInNodeId: 'node-abcdef12',
@@ -45,6 +52,7 @@ beforeEach(() => {
   st.bots = [];
   st.read = { success: true, facts: { running: true, initialized: true } };
   st.posture = null;
+  fb.live = false;
 });
 
 describe('R4-J23: the consent and stopped texts follow stoppedByRun', () => {
@@ -81,6 +89,7 @@ describe('R20-J9: the restart park names the exit its state offers', () => {
 
 describe('R40-J11: the run hold names the exits the run offers', () => {
   it('a live run is waited on, with no button promised', async () => {
+    fb.live = true;
     const r = await removeFleetReplica(bot({ fleetFailback: run({ phase: 'seeding', parked: false, consentAt: 2 }) }));
     expect(r.error).toMatch(/failback run is on this instance/);
     expect(r.error).toMatch(/wait for it to park or finish/);

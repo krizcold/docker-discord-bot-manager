@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -100,6 +100,12 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
   getDeploymentMode: async () => 'docker',
 }));
+// A run these rows file as live stands for one whose runner runs in this process.
+const fb = vi.hoisted(() => ({ live: false }));
+vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
+  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
+});
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import * as fs from 'fs';
@@ -444,6 +450,8 @@ describe('Remove replica', () => {
 describe('a failback seed retried over the replica volume its first seed made', () => {
   const master = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'master' } };
   const run = (consentAt: number | null) => ({ mode: 'failback', phase: 'seeding', startedAt: 7, updatedAt: 7, consentAt, dump: null, block: null });
+  beforeEach(() => { fb.live = true; });
+  afterEach(() => { fb.live = false; });
 
   it('clears it without a confirm once the run holds the wipe consent', async () => {
     writeRegistry({ ...master, fleetFailback: run(8) });

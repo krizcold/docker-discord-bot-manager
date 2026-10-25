@@ -37,7 +37,63 @@ function saveRun(botId: string, patch: Partial<FleetTransferRun>): void {
   const current = currentRun(botId);
   if (!current) return;
   containerManager.updateInstanceFleetTransfer(botId, { ...current, ...patch, updatedAt: Date.now() });
+  heldTransfers.delete(botId);
   containerManager.broadcastBotUpdated(botId);
+}
+
+function clearRun(botId: string): void {
+  containerManager.updateInstanceFleetTransfer(botId, null);
+  heldTransfers.delete(botId);
+  containerManager.broadcastBotUpdated(botId);
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Runners of this process, by instance and run: a record that reads live without one has lost its runner. */
+const runners = new Map<string, number>();
+
+/** A closing write the registry refused, by run: a park, or the clear after the app accepted the promote. The health tick writes it again. */
+type HeldTransfer = { startedAt: number; kind: 'park' | 'handed'; lastError: string; at: number; writeError: string };
+const heldTransfers = new Map<string, HeldTransfer>();
+
+function holdTransfer(botId: string, held: HeldTransfer): void {
+  heldTransfers.set(botId, held);
+  console.warn(`[FleetTransfer] ${botId}: the transfer record could not be written (${held.writeError}); ${held.kind === 'handed' ? 'the app accepted the promote, and the record is cleared on the next health tick' : 'the park is held in memory and written again on the next health tick'}`);
+  containerManager.broadcastBotUpdated(botId);
+}
+
+/** The run as the panel and Transfer read it: a refused park or clear, and a record that reads live with no runner. */
+export function transferView(instance: InstanceConfig): FleetTransferRun | null {
+  const run = instance.fleetTransfer;
+  if (!run) return null;
+  const held = heldTransfers.get(instance.id);
+  if (held && held.startedAt === run.startedAt) {
+    if (held.kind === 'handed') {
+      return { ...run, parked: true, clearPending: true, lastError: `Handed to the app at ${new Date(held.at).toISOString()}: the app accepted the promote, but the transfer record could not be cleared (${held.writeError}); the manager clears it on its next health tick, and Dismiss clears it now` };
+    }
+    return { ...run, parked: true, lastError: `the run stopped at ${run.phase}: ${held.lastError}; its record could not be written (${held.writeError})` };
+  }
+  if (!run.parked && runners.get(instance.id) !== run.startedAt) {
+    return { ...run, parked: true, lastError: `the transfer's runner stopped (phase ${run.phase}); use Continue transfer on the standby panel` };
+  }
+  return run;
+}
+
+/** Health tick: write again what a runner could not. */
+export function retryHeldTransferRecords(): void {
+  for (const [botId, held] of [...heldTransfers]) {
+    const run = currentRun(botId);
+    if (!run || run.startedAt !== held.startedAt) { heldTransfers.delete(botId); continue; }
+    if (runners.get(botId) === held.startedAt) continue;
+    try {
+      if (held.kind === 'handed') clearRun(botId);
+      else saveRun(botId, { parked: true, lastError: held.lastError });
+    } catch (err) {
+      held.writeError = errorText(err);
+    }
+  }
 }
 
 function openRun(botId: string, phase: FleetTransferRun['phase'], retireOldMaster: boolean): number {
@@ -66,10 +122,11 @@ export interface TransferOptions {
  * once and followed through the instance record.
  */
 export async function transferSide(instance: InstanceConfig, opts: TransferOptions): Promise<ActionResult> {
-  const active = instance.fleetTransfer;
+  const active = transferView(containerManager.getBot(instance.id) ?? instance);
   if (active && !active.parked) {
     return { success: false, error: `a transfer is already running on this instance (${active.phase}); wait for it to finish` };
   }
+  if (active?.clearPending) return { success: false, error: `${active.lastError}. The bot's Fleet view shows the promote` };
   if (instance.fleetDbReplica) {
     // A run parked at the promote itself (the app asked for the lag to be
     // acknowledged, or refused) is answered by the app's promote directly, so
@@ -78,15 +135,24 @@ export async function transferSide(instance: InstanceConfig, opts: TransferOptio
     if (!active || active.phase === 'promoting' || opts.confirmLag === true || opts.confirmLineage === true || opts.confirmReachability === true) {
       const result = await fleetReplica.whilePromoting(instance.id, () => promoteSide(instance, { confirmLag: opts.confirmLag, confirmLineage: opts.confirmLineage, confirmReachability: opts.confirmReachability, retireOldMaster: opts.retireOldMaster }));
       if (result.success && active) {
-        containerManager.updateInstanceFleetTransfer(instance.id, null);
-        containerManager.broadcastBotUpdated(instance.id);
+        try {
+          clearRun(instance.id);
+        } catch (err) {
+          holdTransfer(instance.id, { startedAt: active.startedAt, kind: 'handed', lastError: 'the app accepted the promote', at: Date.now(), writeError: errorText(err) });
+          return { ...result, warning: `The app accepted the promote, but the transfer record could not be cleared (${errorText(err)}); the manager clears it on its next health tick` };
+        }
       }
       return result;
     }
     // Parked earlier: the standby exists, so the seed is behind us; the
     // pipeline re-checks the apply and the catch-up from the app's own facts.
     if (!hasAppHooks(instance)) return { success: false, error: 'this app declares no lifecycle hooks' };
-    const startedAt = openRun(instance.id, 'applying', opts.retireOldMaster === true);
+    let startedAt: number;
+    try {
+      startedAt = openRun(instance.id, 'applying', opts.retireOldMaster === true);
+    } catch (err) {
+      return { success: false, error: `The transfer record could not be written (${errorText(err)}), so the transfer was not continued; nothing was changed` };
+    }
     void runSeedFirst(instance.id, startedAt);
     return { success: true, started: true, resumed: true };
   }
@@ -109,7 +175,12 @@ export async function transferSide(instance: InstanceConfig, opts: TransferOptio
     return { success: false, error: `${started.error}. This one-action transfer promotes without waiting for you, so seed the standby first with Provision from the block, check it reports streaming, then Transfer` };
   }
   if (!started.success) return { success: false, error: started.error };
-  const startedAt = openRun(instance.id, 'seeding', opts.retireOldMaster === true);
+  let startedAt: number;
+  try {
+    startedAt = openRun(instance.id, 'seeding', opts.retireOldMaster === true);
+  } catch (err) {
+    return { success: false, error: `The standby seed started, but the transfer record could not be written (${errorText(err)}), so no transfer follows it: once the seed finishes, press Transfer to promote this side` };
+  }
   void runSeedFirst(instance.id, startedAt);
   return { success: true, started: true, seedFirst: true };
 }
@@ -119,6 +190,7 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
     const run = currentRun(botId);
     return !!run && run.startedAt === startedAt && run.parked !== true;
   };
+  runners.set(botId, startedAt);
   try {
     // The seed reports through its own record and its own timeouts (every
     // step of it is bounded), so this waits on that record alone.
@@ -126,7 +198,7 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
       if (!owns()) return;
       const bot = containerManager.getBot(botId);
       if (!bot) return;
-      const seed = bot.fleetDbReplicaSeed;
+      const seed = fleetReplica.seedView(bot);
       // Only a LIVE seed is waited on: with a standby on record, an old parked
       // seed is history, not this run's outcome.
       if (!seed || seed.parked) {
@@ -213,20 +285,35 @@ async function runSeedFirst(botId: string, startedAt: number): Promise<void> {
         : (result.error || 'the app refused the promote'));
     }
     if (owns()) {
-      containerManager.updateInstanceFleetTransfer(botId, null);
-      containerManager.broadcastBotUpdated(botId);
+      try {
+        clearRun(botId);
+      } catch (err) {
+        holdTransfer(botId, { startedAt, kind: 'handed', lastError: 'the app accepted the promote', at: Date.now(), writeError: errorText(err) });
+      }
     }
   } catch (err) {
-    if (owns()) saveRun(botId, { parked: true, lastError: String(err instanceof Error ? err.message : err) });
+    if (!owns()) return;
+    const message = errorText(err);
+    try {
+      saveRun(botId, { parked: true, lastError: message });
+    } catch (writeErr) {
+      holdTransfer(botId, { startedAt, kind: 'park', lastError: message, at: Date.now(), writeError: errorText(writeErr) });
+    }
+  } finally {
+    if (runners.get(botId) === startedAt) runners.delete(botId);
   }
 }
 
 /** Dismiss a parked run; a live one is followed through, never dismissed. */
 export function dismissTransfer(instance: InstanceConfig): { success: boolean; error?: string } {
-  const run = instance.fleetTransfer;
+  const run = transferView(containerManager.getBot(instance.id) ?? instance);
   if (!run) return { success: false, error: 'No transfer is recorded on this instance' };
   if (!run.parked) return { success: false, error: `The transfer is running (${run.phase}); wait for it to finish` };
-  containerManager.updateInstanceFleetTransfer(instance.id, null);
+  try {
+    clearRun(instance.id);
+  } catch (err) {
+    return { success: false, error: `The transfer record could not be cleared (${errorText(err)}), so it was not dismissed` };
+  }
   return { success: true };
 }
 

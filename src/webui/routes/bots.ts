@@ -1203,7 +1203,16 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       // updateBot is the dual-write funnel: the store takes everything
       // (sensitive values encrypted), the record keeps the non-sensitive keys.
       await containerManager.updateBot(req.params.id, { envVars: { ...vars } });
-      const removal = containerManager.removeStoredEnvKeys(req.params.id, toRemove);
+      let removal: ReturnType<typeof containerManager.removeStoredEnvKeys>;
+      try {
+        removal = containerManager.removeStoredEnvKeys(req.params.id, toRemove);
+      } catch (err) {
+        const stored = envManager.getEnvVars(req.params.id);
+        const still = toRemove.filter(k => Object.prototype.hasOwnProperty.call(stored, k));
+        broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+        res.status(500).json({ success: false, stillStored: still, error: `Saved, but the removal of the deleted keys stopped (${err instanceof Error ? err.message : String(err)})${still.length ? `: ${still.join(', ')} ${still.length === 1 ? 'is' : 'are'} still stored` : ''}; save again to retry the removal` });
+        return;
+      }
       // A running bot keeps the env it was deployed with until Apply or Restart applies the save.
       let pendingUnrecorded = '';
       try {
@@ -1790,10 +1799,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const standIn = standRead.read === 'ok' ? standRead.posture : getReplicationHealth(bot.id)?.standIn ?? null;
       if (status.enabled && req.query.include === 'block') {
         const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, standIn, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+        res.json({ success: true, replication: status, standIn, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
         return;
       }
-      res.json({ success: true, replication: status, standIn, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+      res.json({ success: true, replication: status, standIn, failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1837,7 +1846,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
           return;
         }
-        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb, { admit });
+        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb, { admit, dbPassword: await fleetReplica.fleetDbPasswordFallback(bot) });
         // Replication is enabled either way, so a missed delivery is a note on
         // the reply, never a failure of the operator's action.
         const fresh = result.success ? containerManager.getBot(req.params.id) : null;
@@ -1888,7 +1897,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         if (built.success && built.dsn && built.cert) block = { dsn: built.dsn, cert: built.cert };
         else blockError = built.error ?? 'block unavailable';
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: bot.fleetTransfer ?? null, failback: bot.fleetFailback ?? null, failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: fleetTransfer.transferView(bot), failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2195,6 +2204,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         confirm: body.confirm === true,
       });
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-replica/finish-retire - remove the env pins a stale-primary re-seed could not. */
+  router.post('/:id/fleet-replica/finish-retire', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = await fleetReplica.finishPinsRetire(bot);
+      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

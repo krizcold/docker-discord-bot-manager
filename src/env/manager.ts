@@ -372,6 +372,32 @@ export function deleteEnvVar(botId: string, key: string): void {
   saveEnvStorage(botId, storage);
 }
 
+/** The stored form of some keys, ciphertext included, so a refused follow-up write can put them back exactly. */
+export type StoredKeys = { keys: string[]; vars: Record<string, string>; encrypted: Record<string, string> };
+
+export function snapshotStoredKeys(botId: string, keys: string[]): StoredKeys {
+  const { storage } = loadEnvStorage(botId);
+  const snap: StoredKeys = { keys: [...keys], vars: {}, encrypted: {} };
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(storage.vars, key)) snap.vars[key] = storage.vars[key];
+    if (Object.prototype.hasOwnProperty.call(storage.encrypted, key)) snap.encrypted[key] = storage.encrypted[key];
+  }
+  return snap;
+}
+
+/** Puts the snapshot's keys back as they were stored, absent ones removed; the other keys are left as they are. */
+export function restoreStoredKeys(botId: string, snap: StoredKeys): void {
+  const { storage, corrupt } = loadEnvStorage(botId);
+  refuseCorrupt(botId, corrupt);
+  for (const key of snap.keys) {
+    delete storage.vars[key];
+    delete storage.encrypted[key];
+    if (Object.prototype.hasOwnProperty.call(snap.vars, key)) storage.vars[key] = snap.vars[key];
+    if (Object.prototype.hasOwnProperty.call(snap.encrypted, key)) storage.encrypted[key] = snap.encrypted[key];
+  }
+  saveEnvStorage(botId, storage);
+}
+
 /**
  * Check whether the bot's required env (its token var) is set. The token var name
  * is detected per-bot (tokenVarName); when unknown (e.g. a prebuilt-image bot) we

@@ -27,7 +27,7 @@ const runPage = (names: string[], globals: Record<string, unknown>): any => {
 const fns = (...names: string[]) => names.filter((n) => pageHtml.includes(`function ${n}(`));
 
 const lost = async () => { throw Object.assign(new Error('No answer from the manager'), { noAnswer: true }); };
-const hedged = (m: string[] | undefined) => !!m && m[0] === 'error' && /No answer from the manager; the .* may still be running/.test(m[1]);
+const hedged = (m: string[] | undefined) => !!m && m[0] === 'error' && /No answer from the manager(; the .* may still be running|, so the .* can't be confirmed)/.test(m[1]);
 
 describe('api() with a lost answer', () => {
   it('throws a no-answer error when fetch rejects or the body is not JSON', async () => {

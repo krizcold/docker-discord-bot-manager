@@ -419,6 +419,10 @@
       background: var(--success-bg); border: 1px solid var(--success); color: var(--success);
       padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
     }
+    .warning-message {
+      background: var(--warning-bg); border: 1px solid var(--warning); color: var(--warning);
+      padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
+    }
     .info-message {
       background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-secondary);
       padding: 10px 14px; border-radius: var(--radius); margin-bottom: 16px; font-size: 0.85rem;
@@ -1329,8 +1333,10 @@
     }
 
     // A write whose answer was lost may still have run; the caller re-reads its view after this.
-    function showNoAnswer(op) {
-      showMessage('error', `No answer from the manager; the ${op} may still be running. Check its state before trying again.`);
+    function showNoAnswer(op, instant) {
+      showMessage('error', instant
+        ? `No answer from the manager, so the ${op} can't be confirmed. Check whether it took effect before trying again.`
+        : `No answer from the manager; the ${op} may still be running. Check its state before trying again.`);
     }
 
     function wsSend(obj) {
@@ -1339,7 +1345,7 @@
 
     function showMessage(type, text) {
       const el = document.getElementById('message');
-      el.className = type === 'error' ? 'error-message' : type === 'info' ? 'info-message' : 'success-message';
+      el.className = type === 'error' ? 'error-message' : type === 'info' ? 'info-message' : type === 'warning' ? 'warning-message' : 'success-message';
       el.textContent = text;
       setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000);
     }
@@ -1852,7 +1858,7 @@
         if (!res.success) showMessage('error', res.error || 'Failed to toggle auto-update');
         else if (res.message) showMessage('warning', res.message);
       } catch (err) {
-        showNoAnswer('auto-update change');
+        showNoAnswer('auto-update change', true);
       }
       loadBots();
     }
@@ -1864,7 +1870,7 @@
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, interval });
         if (!res.success) showMessage('error', res.error || 'Failed to set interval');
       } catch (err) {
-        showNoAnswer('auto-update change');
+        showNoAnswer('auto-update change', true);
       }
       loadBots();
     }
@@ -1876,7 +1882,7 @@
         const res = await api('PUT', `/bots/${id}/auto-update`, { enabled, hour });
         if (!res.success) { showMessage('error', res.error || 'Failed to set hour'); loadBots(); }
       } catch (err) {
-        showNoAnswer('auto-update change');
+        showNoAnswer('auto-update change', true);
         loadBots();
       }
     }
@@ -1887,7 +1893,7 @@
         if (!res.success) showMessage('error', res.error || 'Failed to set web auth mode');
         else showMessage('success', 'Web auth mode saved: applies on the next Update or Build');
       } catch (err) {
-        showNoAnswer('web auth change');
+        showNoAnswer('web auth change', true);
       }
       loadBots();
     }
@@ -1928,7 +1934,7 @@
           showMessage('error', res.error || 'Failed to toggle auto-update');
         }
       } catch (err) {
-        showNoAnswer('auto-update change');
+        showNoAnswer('auto-update change', true);
       }
       loadBots();
     }
@@ -2633,6 +2639,7 @@
       rows.forEach(row => {
         const keyInput = row.querySelector('.env-key');
         const key = keyInput.value.trim();
+        if (row.classList.contains('env-autowired')) { rowOrigins.push({ key, originalKey: key }); return; }
         if (key) rowKeys.push(key);
         const originalKey = keyInput.dataset.originalKey || '';
         rowOrigins.push({ key, originalKey });
@@ -2832,7 +2839,7 @@
         if (!res.success) showMessage('error', res.error || 'The swap record could not be cleared');
         else showMessage('success', 'Swap record cleared');
       } catch (err) {
-        showNoAnswer('clear');
+        showNoAnswer('clear', true);
       } finally {
         await loadBots();
         if (fleetBackupBotId === botId) showFleetBackups(botId);
@@ -2844,7 +2851,7 @@
         const res = await api('DELETE', `/bots/${botId}/fleet-backups/restore-error`);
         if (!res.success) showMessage('error', res.error || 'Could not dismiss the restore notice');
       } catch (err) {
-        showNoAnswer('dismiss');
+        showNoAnswer('dismiss', true);
       } finally {
         await loadBots();
         if (fleetBackupBotId === botId) showFleetBackups(botId);
@@ -4113,7 +4120,7 @@
         const res = await api('DELETE', `/bots/${botId}/app-transfer`);
         if (!res.success) showMessage('error', res.error || 'Failed to dismiss the transfer');
       } catch (err) {
-        showNoAnswer('transfer dismissal');
+        showNoAnswer('transfer dismissal', true);
       }
       renderFleetReplica(botId);
       loadBots();
@@ -4292,7 +4299,7 @@
         if (!res.success) { showMessage('error', res.error || 'Failed to dismiss the run'); return; }
         showMessage(res.error ? 'error' : 'success', res.error || 'Run dismissed');
       } catch (err) {
-        showNoAnswer('run dismissal');
+        showNoAnswer('run dismissal', true);
       }
       renderFleetReplica(botId);
       renderFleetReplication(botId);
@@ -4466,7 +4473,7 @@
           showMessage('error', res.error || 'Failed to save backup settings');
         }
       } catch (err) {
-        showNoAnswer('backup settings change');
+        showNoAnswer('backup settings change', true);
       }
       showFleetBackupControls(fleetBackupStored);
       loadBots();
@@ -5205,7 +5212,7 @@
     async function toggleSourceAutoUpdate(id, enabled) {
       try {
         await api('PUT', `/sources/${id}`, { autoUpdate: enabled });
-      } catch (err) { showNoAnswer('auto-update change'); loadSources(); }
+      } catch (err) { showNoAnswer('auto-update change', true); loadSources(); }
     }
 
     // ─── Edit Source Modal ───
@@ -6597,6 +6604,10 @@
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
+          if (Object.keys(body).length === 0) {
+            showMessage('info', 'The key is unchanged and the value is empty, so nothing was saved.');
+            return;
+          }
           const res = await api('PUT', `/vault/deleted/${encodeURIComponent(originalKey)}?groupId=${encodeURIComponent(groupId)}`, body);
           if (!res.success) {
             showMessage('error', res.error || 'Failed to save');
@@ -6606,6 +6617,10 @@
           const body = {};
           if (newKey !== originalKey) body.newKey = newKey;
           if (newValue) body.value = newValue;
+          if (Object.keys(body).length === 0) {
+            showMessage('info', 'The key is unchanged and the value is empty, so nothing was saved.');
+            return;
+          }
           const res = await api('PUT', `/vault/standalone/${encodeURIComponent(originalKey)}`, body);
           if (!res.success) {
             showMessage('error', res.error || 'Failed to save');
@@ -6637,7 +6652,7 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showNoAnswer('save');
+        showNoAnswer('save', true);
         vaultValuesCache = null;
         loadVault();
       } finally {
@@ -6655,7 +6670,7 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showNoAnswer('delete');
+        showNoAnswer('delete', true);
         vaultValuesCache = null;
         loadVault();
       } finally {
@@ -6671,7 +6686,7 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showNoAnswer('delete');
+        showNoAnswer('delete', true);
         vaultValuesCache = null;
         loadVault();
       } finally {
@@ -6688,7 +6703,7 @@
         vaultValuesCache = null;
         loadVault();
       } catch (err) {
-        showNoAnswer('category removal');
+        showNoAnswer('category removal', true);
         vaultValuesCache = null;
         loadVault();
       } finally {
@@ -6718,7 +6733,7 @@
         document.getElementById('vault-new-value').value = '';
         loadVault();
       } catch (err) {
-        showNoAnswer('vault entry add');
+        showNoAnswer('vault entry add', true);
         loadVault();
       }
     }

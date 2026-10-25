@@ -26,6 +26,7 @@ import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fl
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
 import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyBlock, readStandInPosture, unansweredRemedy } from './appLifecycle';
 import { hasAppHooks } from './appHookClient';
+import { rescueRunnerLive } from './recoveryRescue';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
 import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
@@ -1089,6 +1090,35 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
 }
 
 /**
+ * A rescue keeps the app file's database service in the bot folder while it copies into the volume. After a Cancel,
+ * the mark on the record is what keeps a kept volume holding a partial copy or a standby from being started.
+ */
+function rescueRemovalRefusal(instance: InstanceConfig, keepData: boolean): string | null {
+  const rescue = instance.recoveryRescue;
+  if (rescue) {
+    if (['promote', 'teardown', 'flip'].includes(rescue.phase)) {
+      if (!rescue.parked) {
+        return `A database rescue on this instance is finishing the swap (phase ${rescue.phase}); wait for it to end, then try Remove again. Nothing was removed`;
+      }
+      return `A database rescue on this instance is past promotion (phase ${rescue.phase}) and has to finish the swap, which needs the bot folder. Finish it with Continue on the rescue block. Nothing was removed`;
+    }
+    const doing = rescue.parked ? `is parked at phase ${rescue.phase}` : `is running (phase ${rescue.phase}) and may be copying into the database volume`;
+    return `A database rescue on this instance ${doing}. Removing the instance would delete its bot folder, which holds the copy of the app file the rescue puts the database back from. Cancel the rescue on its rescue block first. Nothing was removed`;
+  }
+  if (rescueRunnerLive(instance.id)) {
+    return 'The rescue cancelled on this instance is still stopping its last step; try again in a moment. Nothing was removed';
+  }
+  const left = instance.recoveryRescueLeft;
+  if (left && keepData) {
+    const day = new Date(left.at).toISOString().slice(0, 10);
+    const what = left.state === 'partial' ? "a partial copy of the sender's database" : "this instance's database as a standby of the sender";
+    const volume = instance.fleetDb ? ` ${instance.fleetDb.volume}` : '';
+    return `A rescue cancelled on ${day} left ${what} on the database volume${volume}. Removing the instance and keeping its data would drop the record of that, and the kept volume could later be started as if it held a whole database. Start a rescue again to finish the copy, or decommission this database on its Database modal first. Nothing was removed`;
+  }
+  return null;
+}
+
+/**
  * Why Remove must not run on this instance now; null when it may. A delete
  * that also deletes data reaches the fleet database only through decommission
  * (its safety dump is the ruled permit), a standby copy only through Remove
@@ -1102,6 +1132,8 @@ export async function instanceRemovalRefusal(
 ): Promise<{ error: string; needsConfirm?: true; confirmFlag?: 'confirmFleetData' | 'confirmPromoted' } | null> {
   const held = runHold(instance);
   if (held) return { error: held };
+  const rescue = rescueRemovalRefusal(instance, keepData);
+  if (rescue) return { error: rescue };
   if (instance.fleetDbReplica) {
     const promoting = promoteHold(instance);
     if (promoting) return { error: `${promoting}. Nothing was removed` };

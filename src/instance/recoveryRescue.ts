@@ -443,6 +443,11 @@ export async function cancelRescue(instance: InstanceConfig): Promise<{ success:
   return { success: true, note };
 }
 
+/** A runner can outlive its record by one docker call after a Cancel. */
+export function rescueRunnerLive(botId: string): boolean {
+  return running.has(botId);
+}
+
 export function getRescueStatus(instance: InstanceConfig): RecoveryRescueRecord | null {
   return instance.recoveryRescue ?? null;
 }

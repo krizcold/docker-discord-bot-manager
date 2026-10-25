@@ -20,7 +20,7 @@ const pageFunction = (name: string): string => {
   }
 };
 const optional = (names: string[]) => names.filter((n) => pageHtml.includes(`function ${n}(`));
-const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml', 'transferPhaseText', 'failbackRunHtml', 'seedAfterRetire', 'failbackPhaseText']
+const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml', 'transferPhaseText', 'failbackRunHtml', 'failbackPhaseText']
   .concat(optional(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText', 'panelHasEntry', 'copyDumpHtml', 'copyDumpLineHtml']));
 
 const record = { primaryHost: 'p.example', primaryPort: 15432, publicHost: 'h.example', hostPort: 15433 };

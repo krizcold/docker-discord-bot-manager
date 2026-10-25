@@ -382,23 +382,7 @@ export async function getContainerLogs(
 
     if (!output) return [];
 
-    return output.split('\n').filter(line => line.trim()).map(line => {
-      const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s(.*)$/);
-
-      if (timestampMatch) {
-        return {
-          timestamp: timestampMatch[1],
-          message: timestampMatch[2],
-          stream: 'stdout' as const
-        };
-      }
-
-      return {
-        timestamp: new Date().toISOString(),
-        message: line,
-        stream: 'stdout' as const
-      };
-    });
+    return output.split('\n').filter(line => line.trim()).map(line => ({ ...parseDockerLogLine(line), stream: 'stdout' as const }));
   } catch (error) {
     return dockerReadFailure(error);
   }
@@ -417,12 +401,7 @@ export async function streamContainerLogs(
   const processLog = (data: Buffer, stream: 'stdout' | 'stderr') => {
     const lines = data.toString('utf-8').split('\n').filter(l => l.trim());
     for (const line of lines) {
-      const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s(.*)$/);
-      onLog({
-        timestamp: timestampMatch?.[1] || new Date().toISOString(),
-        message: timestampMatch?.[2] || line,
-        stream
-      });
+      onLog({ ...parseDockerLogLine(line), stream });
     }
   };
 

@@ -100,6 +100,26 @@ function round(seconds: number | null | undefined): number | null {
   return seconds === null || seconds === undefined || !Number.isFinite(seconds) ? null : Math.round(seconds * 10) / 10;
 }
 
+/** The word for a primary stopped while its bot followed another node; a copy in recovery needs no re-seed. */
+export function stoppedCoveredText(covered: StandInPosture): string {
+  const copy = covered.holdReason === 'copy';
+  const state = copy ? "this database is a copy of that node's" : 'this database is the copy that is behind';
+  const reseed = 're-seed it as a standby of that node from the block on its Database modal';
+  const catchUp = copy
+    ? 'start it, then promote it from its Fleet tab once the copy has caught up, or promote that node by hand'
+    : `${reseed}, then start it and promote it from its Fleet tab once the copy has caught up`;
+  if (covered.namesThisNode === false) {
+    return `Instance is stopped; its bot followed ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node that was holding the fleet'}, which no longer stands in for it, so there is no failback to run and ${state}: ${copy ? 'start it' : `${reseed}, then start it`} and demote it from its Fleet tab to stay a co-worker`;
+  }
+  if (covered.namesThisNode === true && covered.followsDelivered === false) {
+    return `Instance is stopped; its bot was registered with the node holding the fleet, but the database it delivered was not installed here, so ${state}: ${copy ? catchUp : reseed}`;
+  }
+  if (covered.namesThisNode === null) {
+    return `Instance is stopped; its bot had not registered with the node holding the fleet yet, so ${state}: ${catchUp}`;
+  }
+  return `Instance is stopped; its bot was following ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node holding the fleet'}, so ${state}: ${catchUp}`;
+}
+
 /** A node id as the fleet's own UI abbreviates it; the manager knows no node names. */
 function shortId(id: string | null): string {
   return id ? id.slice(0, 8) : 'an unknown node';
@@ -499,13 +519,7 @@ async function runTick(): Promise<void> {
         continue;
       }
       cache.set(instance.id, covered?.role === 'covered'
-        ? { role: 'primary', severity: 'warn', message: covered.namesThisNode === false
-          ? `Instance is stopped; its bot followed ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node that was holding the fleet'}, which no longer stands in for it, so there is no failback to run and this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and demote it from its Fleet tab to stay a co-worker`
-          : covered.namesThisNode === true && covered.followsDelivered === false
-          ? `Instance is stopped; its bot was registered with the node holding the fleet, but the database it delivered was not installed here, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal`
-          : covered.namesThisNode === null
-          ? `Instance is stopped; its bot had not registered with the node holding the fleet yet, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`
-          : `Instance is stopped; its bot was following ${covered.standInNodeId ? `its stand-in ${shortId(covered.standInNodeId)}` : 'the node holding the fleet'}, so this database is the copy that is behind: re-seed it as a standby of that node from the block on its Database modal, then start it and promote it from its Fleet tab once the copy has caught up`, lagSeconds: null, checkedAt: Date.now(), standIn: covered }
+        ? { role: 'primary', severity: 'warn', message: stoppedCoveredText(covered), lagSeconds: null, checkedAt: Date.now(), standIn: covered }
         : hasAppHooks(instance) && !newestPosture(instance)
         ? { role: 'primary', severity: 'warn', message: 'Instance is stopped and its bot\'s stand-in posture has not been read since the manager started, so whether this database is behind a stand-in is unknown; start the instance to read it', lagSeconds: null, checkedAt: Date.now() }
         : { role: 'primary', severity: 'ok', message: 'Instance is stopped', lagSeconds: null, checkedAt: Date.now() });

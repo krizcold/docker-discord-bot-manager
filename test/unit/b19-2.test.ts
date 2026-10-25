@@ -399,7 +399,7 @@ describe('the page', () => {
           ? { success: true, facts: { running: true, nodeId: 'n1', copyBlockPresent: true, copyBlockCurrent: current } }
           : { success: true, replica: { present: false }, failback: null, failbackDeclined: null, transfer: null },
         setTimeout: () => {}, panelHasEntry: () => false, failbackRunHtml: () => '', seedPurposeText: () => '',
-        seedAfterRetire: () => false, seedWarningHtml: () => '', seedDumpHtml: () => '', transferPhaseText: () => '',
+        seedWarningHtml: () => '', seedDumpHtml: () => '', transferPhaseText: () => '',
         failbackPhaseText: () => '', replicaPromiseText: () => '',
         escapeHtml: (s: unknown) => String(s), jsArg: (s: unknown) => JSON.stringify(s),
       });

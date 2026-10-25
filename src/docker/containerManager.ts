@@ -3353,12 +3353,6 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
 
 // ─── Start ───
 
-/**
- * True when the instance's APP service container is running. Sidecars (redis,
- * a fronting gateway) outlive a killed app container, so a project-wide check
- * would refuse Start in exactly the crashed case this reconcile exists for.
- * Falls back to any-project-container when the app service cannot be resolved.
- */
 /** The instance's running compose containers other than its own fleet sidecar, for an instance with or without one; null when docker did not answer. */
 export async function runningInstanceContainers(botId: string): Promise<string[] | null> {
   if (getBot(botId)?.fleetDb) return runningNonSidecarContainers(botId);
@@ -5087,7 +5081,7 @@ export async function getBotLogs(botId: string, tail = 100): Promise<{ success: 
         if ('error' in logEntries) { unread.push(`${containerName}: ${logEntries.error}`); continue; }
         read++;
         for (const e of logEntries) {
-          allLogs.push(`[${e.timestamp}] [${containerName}] ${e.message}`);
+          allLogs.push(`[${e.timestamp ?? 'time unknown'}] [${containerName}] ${e.message}`);
         }
       } catch (err) {
         console.warn(`[ContainerManager] Failed to get logs from container ${containerId}:`, err);

@@ -202,7 +202,6 @@ function liveFailback(instance: InstanceConfig): FleetFailbackRun | null {
   return (now ? now.fleetFailback : instance.fleetFailback) ?? null;
 }
 
-/** A seed a runner owns right now; a parked one blocks nothing. */
 /**
  * A failback or drop-back run owns this instance's database lanes while it is
  * on record (20.5, B6-i): the by-hand routes would race the very steps it
@@ -227,6 +226,7 @@ function runHold(instance: InstanceConfig, run?: number): string | null {
   return `A ${active.mode} run is on this instance, stopped (${phase}); ${exits} on the Database modal first`;
 }
 
+/** A seed a runner owns right now; a parked one blocks nothing. */
 function seedRunning(botId: string): boolean {
   const bot = containerManager.getBot(botId);
   const seed = bot ? seedView(bot) : null;
@@ -2360,7 +2360,7 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
     ? `${afterRetire ? "This machine's own database was already retired earlier in the failback run. " : ''}The standby service did not start. Dismissing this note clears the standby record that start left; the replica volume stays.`
     : seed.purpose === 'reseed-stale-primary'
       ? (whole
-        ? `This instance's own database has already been retired. The copy from the stand-in is complete. ${tail}`
+        ? `This instance's own database has already been retired. The copy from the node now holding the fleet is complete. ${tail}`
         : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
       : seed.purpose === 'reseed-standby'
         ? (whole
@@ -2369,8 +2369,8 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
         : whole
           ? `${afterRetire ? 'This machine\'s own database was already retired earlier in the failback run. ' : ''}The copy is complete and kept on record. ${tail}`
           : afterRetire
-            ? 'The partial copy is discarded. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
-            : 'The partial copy is discarded; nothing else on this instance is affected.';
+            ? 'The partial copy stays in the replica volume, unused. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
+            : 'The partial copy stays in the replica volume, unused; nothing else on this instance is affected.';
   const committed = seed.committed === true;
   if (parked) return `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`;
   return `Cancel this seed?\n\nThe copy stops at its next step.\n\n${committed ? gone : 'Nothing has been deleted by this run yet.'}`;

@@ -19,7 +19,7 @@ const pageFunction = (name: string): string => {
     else if (pageHtml[i] === '}' && --depth === 0) return pageHtml.slice(start, i + 1);
   }
 };
-const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml', 'transferPhaseText', 'failbackRunHtml', 'seedAfterRetire']
+const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml', 'transferPhaseText', 'failbackRunHtml']
   .concat(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText', 'copyDumpHtml', 'copyDumpLineHtml'].filter((n) => pageHtml.includes(`function ${n}(`)));
 
 const record = { primaryHost: 'p.example', primaryPort: 15432, publicHost: 'h.example', hostPort: 15433 };

@@ -546,7 +546,7 @@ export interface PortBinding {
 }
 
 export interface LogEntry {
-  timestamp: string;
+  timestamp: string | null;
   message: string;
   stream: 'stdout' | 'stderr';
 }

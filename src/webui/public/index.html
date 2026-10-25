@@ -4405,15 +4405,6 @@
       loadBots();
     }
 
-    // A failback run past its wipe consent, or a decline recorded at seeding or
-    // later, means this machine's own database was retired earlier in that run:
-    // a plain provision here is the run's retry seed, not a first standby.
-    function seedAfterRetire(failback, declined) {
-      if (failback) return failback.mode === 'failback' && failback.consentAt != null;
-      if (declined) return declined.mode === 'failback' && ['seeding', 'applying', 'catching-up', 'promoting', 'adopting', 'restarting'].includes(declined.phase);
-      return false;
-    }
-
     // The press names the run it was rendered for; the server words the
     // question from its own record and refuses a run or state that differs.
     async function cancelReplicaSeed(botId, startedAt, parked) {

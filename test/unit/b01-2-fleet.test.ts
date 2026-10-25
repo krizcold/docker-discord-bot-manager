@@ -51,7 +51,11 @@ vi.mock('child_process', async (importOriginal) => {
     }, 1);
     return child;
   };
-  return { ...real, execFile, exec, spawn, default: { ...real, execFile, exec, spawn } };
+  const execFileSync = (cmd: string, args: string[], opts: any) => {
+    if (cmd === 'docker' && args[0] === 'volume' && args[1] === 'inspect' && args[args.length - 1].endsWith('-fleet-postgres-replica-data')) throw new Error('Error: No such volume');
+    return real.execFileSync(cmd, args, opts);
+  };
+  return { ...real, execFile, execFileSync, exec, spawn, default: { ...real, execFile, execFileSync, exec, spawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),

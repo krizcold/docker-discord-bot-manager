@@ -2137,12 +2137,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort, confirm } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean };
+      const { primaryDsn, cert, publicHost, hostPort, confirm, confirmVolume } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
       if (!primaryDsn || !cert || !publicHost) {
         res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
         return;
       }
-      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort, confirm === true));
+      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

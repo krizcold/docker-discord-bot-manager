@@ -864,13 +864,16 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // Past this point cancelling cannot put it back.
   throwIfCancelled(instance.id);
   assertVolumeOwnedHere(instance.id, record.volume);
-  if (purpose === 'provision') {
+  if (purpose !== 'reseed-standby') {
     // Asked again here: the request's check was minutes ago, and a volume made
     // since then was never part of what the operator confirmed.
+    const stopped = purpose === 'provision' ? 'the seed stopped before clearing anything'
+      : 'the seed stopped before clearing the replica volume (this machine\'s stale database was already retired)';
     const state = await dockerVolumeState(record.volume);
-    if (state === 'unknown') throw new Error(`the seed stopped before clearing anything: docker did not say whether the replica volume ${record.volume} exists`);
+    if (state === 'unknown') throw new Error(`${stopped}: docker did not say whether the replica volume ${record.volume} exists`);
     if (state === 'exists' && confirmVolume !== record.volume) {
-      throw new Error(`the seed stopped before clearing anything: ${keptVolumeQuestion(containerManager.getBot(instance.id) ?? instance, record.volume)}. Provision again and confirm to clear it`);
+      const remedy = purpose === 'provision' ? 'Provision again and confirm to clear it' : 'Provisioning the standby asks again before it clears the volume';
+      throw new Error(`${stopped}: ${keptVolumeQuestion(containerManager.getBot(instance.id) ?? instance, record.volume)}. ${remedy}`);
     }
   }
   saveSeed(instance.id, { committed: true });
@@ -1214,8 +1217,8 @@ export function reseedStalePrimary(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
-  opts: { dumpDone?: boolean; run?: number } = {},
-): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean } {
+  opts: { dumpDone?: boolean; run?: number; confirmVolume?: string } = {},
+): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
   const held = runHold(instance, opts.run);
   if (held) return { success: false, error: held };
   if (!instance.fleetDb) {
@@ -1270,9 +1273,24 @@ export function reseedStalePrimary(
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
   }
 
+  const record = replicaRecordFor(instance, validated.intake);
+  // The same rule as provisionFleetReplica: the failback run's wipe consent
+  // covers the replica volume, and every other caller confirms it by name.
+  const inRun = typeof opts.run === 'number' && instance.fleetFailback?.startedAt === opts.run;
+  const confirmVolume = inRun && typeof instance.fleetFailback?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
+  if (volumeRefusal) return { success: false, ...volumeRefusal };
+
   const preflight = async () => {
     throwIfCancelled(instance.id);
     const fleetDb = instance.fleetDb!;
+    // Asked again ahead of the dump and the retire: a volume made since the
+    // request was never part of what the operator confirmed.
+    const replicaState = await dockerVolumeState(record.volume);
+    if (replicaState === 'unknown') throw new Error(`docker did not say whether the replica volume ${record.volume} exists, so nothing was destroyed; retry`);
+    if (replicaState === 'exists' && confirmVolume !== record.volume) {
+      throw new Error(`nothing was destroyed: ${keptVolumeQuestion(containerManager.getBot(instance.id) ?? instance, record.volume)}. Re-seed again and confirm to clear it`);
+    }
     // The dump is the permit, as for decommission: the database is destroyed
     // only after a dump taken under the write fence succeeded. Stopping the
     // instance took its whole compose project down, so the database comes
@@ -1347,7 +1365,7 @@ export function reseedStalePrimary(
   }
   let started: { success: boolean; error?: string };
   try {
-    started = startProvisioning(instance, replicaRecordFor(instance, validated.intake), validated.intake, 'reseed-stale-primary', preflight, () => fleetBackup.releaseFleetBackupBusy(instance.id));
+    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', preflight, () => fleetBackup.releaseFleetBackupBusy(instance.id), confirmVolume);
   } catch (err) {
     fleetBackup.releaseFleetBackupBusy(instance.id);
     throw err;

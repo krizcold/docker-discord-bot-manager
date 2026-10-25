@@ -4110,15 +4110,15 @@
 
     // Each confirm the server asks for is answered on its own: a volume to clear
     // is named in confirmVolume, any other question takes confirm.
-    async function postProvision(url, payload) {
+    async function postProvision(url, payload, verb = 'provision') {
       let body = payload;
       let res = await api('POST', url, body);
       for (let round = 0; round < 3 && !res.success && res.needsConfirm; round++) {
         if (res.confirmVolume) {
-          if (!window.confirm(`${res.error}\n\nClear ${res.confirmVolume} and provision?`)) return null;
+          if (!window.confirm(`${res.error}\n\nClear ${res.confirmVolume} and ${verb}?`)) return null;
           body = { ...body, confirmVolume: res.confirmVolume };
         } else {
-          if (!window.confirm(`${res.error}\n\nProvision it here anyway?`)) return null;
+          if (!window.confirm(`${res.error}\n\n${verb.charAt(0).toUpperCase()}${verb.slice(1)} it here anyway?`)) return null;
           body = { ...body, confirm: true };
         }
         res = await api('POST', url, body);
@@ -4277,11 +4277,8 @@
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
-        let res = await api('POST', `/bots/${botId}/fleet-reseed`, payload);
-        if (!res.success && res.needsConfirm) {
-          if (!window.confirm(`${res.error}\n\nRe-seed it here anyway?`)) return;
-          res = await api('POST', `/bots/${botId}/fleet-reseed`, { ...payload, confirm: true });
-        }
+        const res = await postProvision(`/bots/${botId}/fleet-reseed`, payload, 're-seed');
+        if (!res) return;
         // Failure keeps the form (and everything pasted into it) intact.
         if (!res.success) { showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to start re-seeding'}`); return; }
         showMessage('success', `${botLabel(botId)}: re-seeding started`);

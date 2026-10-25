@@ -18,6 +18,10 @@ vi.mock('child_process', async (importOriginal) => {
   const spawn = () => { throw new Error('spawn called'); };
   return { ...real, exec, execFile, spawn, default: { ...real, exec, execFile, spawn } };
 });
+vi.mock('../../src/docker/dockerClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/docker/dockerClient')>()),
+  volumeState: () => 'absent',
+}));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),

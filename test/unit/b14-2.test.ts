@@ -98,6 +98,7 @@ vi.mock('child_process', async (importOriginal) => {
     const sql = args.join(' ');
     if (args[0] === 'inspect') return cb(null, 'true\n', '');
     if (args[0] === 'volume' && args[1] === 'inspect') {
+      if (args[args.length - 1].endsWith('-fleet-postgres-replica-data')) return cb(new Error('fail'), '', 'Error: No such volume');
       return pg.volume === 'exists' ? cb(null, '[]', '') : cb(new Error('fail'), '', 'Error: No such volume');
     }
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) {
@@ -135,7 +136,11 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  return { ...real, execFile, exec, spawn, default: { ...real, execFile, exec, spawn } };
+  const execFileSync = (cmd: string, args: string[], opts: any) => {
+    if (cmd === 'docker' && args[0] === 'volume' && args[1] === 'inspect' && args[args.length - 1].endsWith('-fleet-postgres-replica-data')) throw new Error('Error: No such volume');
+    return real.execFileSync(cmd, args, opts);
+  };
+  return { ...real, execFile, execFileSync, exec, spawn, default: { ...real, execFile, execFileSync, exec, spawn } };
 });
 
 import * as fs from 'fs';

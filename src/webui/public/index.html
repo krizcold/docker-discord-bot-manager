@@ -1150,6 +1150,7 @@
           // Real-time status transitions during operations - in-memory patch only
           case 'bot:status':
             setBotStatus(payload.id, payload.status, payload.activeOp);
+            if (payload.activeOp || payload.cutOp !== undefined) mergeBotState({ id: payload.id, cutOp: payload.cutOp || null });
             redraw();
             break;
           case 'bots:checked':
@@ -1529,6 +1530,10 @@
                 : lane.interrupted
                   ? `<span class="update-badge danger" title="${escapeHtml(`The last ${laneVerb} (started ${lane.startedAt}) did not finish before the manager last restarted.${lane.wasRunning && bot.status !== 'running' ? ' The bot was running before it; Update or Start brings it back.' : ''}`)}">${laneVerb} unfinished</span>`
                   : '';
+            // An interrupted lane's badge already names a cut update, restart or build.
+            const cut = bot.cutOp;
+            const cutBadge = !cut || bot.activeOp || (lane && lane.interrupted && lane.op === cut.op) ? ''
+              : `<span class="update-badge danger" style="cursor:pointer;" onclick="viewBuildLogs('${bot.id}', ${jsArg(botName)})" title="${escapeHtml(`${cutOpText(cut)} Open Build Logs to dismiss this note; starting a new operation on the bot also clears it.`)}">${cut.unknown ? 'Last operation unknown' : `${escapeHtml(cut.op.charAt(0).toUpperCase() + cut.op.slice(1))} cut by restart`}</span>`;
 
             // Fleet DB backup warning (failed or stale sidecar dump)
             const fb = bot.fleetBackup;
@@ -1627,7 +1632,7 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${laneBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${replWarnBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${laneBadge}${cutBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${replWarnBadge}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
@@ -4684,7 +4689,8 @@
             case 'idle':
               terminalFinished = true;
               if (terminalTickTimer) { clearInterval(terminalTickTimer); terminalTickTimer = null; }
-              setTerminalStatus(data.status && data.status !== 'unknown' ? `Idle - bot is ${data.status}` : 'Idle', 'dot-done', '');
+              if (data.cutOp) showTerminalCutOp(botId, data.cutOp, data.status);
+              else setTerminalStatus(data.status && data.status !== 'unknown' ? `Idle - bot is ${data.status}` : 'Idle', 'dot-done', '');
               if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
               break;
             default:
@@ -4739,6 +4745,44 @@
       addTerminalLog(success ? '--- Process completed successfully ---' : '--- Process failed ---', success ? 'success' : 'error');
       setTerminalStatus(success ? 'Complete' : 'Failed', 'dot-done', success ? 'var(--success)' : 'var(--danger)');
       if (terminalEventSource) { terminalEventSource.close(); terminalEventSource = null; }
+    }
+
+    function cutOpText(cutOp) {
+      if (cutOp.unknown) return 'The manager could not read its record of running operations, so whether a manager restart cut an operation on this bot can\'t be confirmed. Check the bot\'s state and its logs.';
+      return `A ${cutOp.op} started ${new Date(cutOp.startedAt).toLocaleString()} was running when the manager restarted, so its outcome can't be confirmed. Check the bot's state and its logs.`;
+    }
+
+    function showTerminalCutOp(botId, cutOp, status) {
+      addTerminalLog(cutOpText(cutOp), 'error');
+      const now = status && status !== 'unknown' ? ` - bot is ${status}` : '';
+      setTerminalStatus(cutOp.unknown ? `Last operation unknown${now}` : `${cutOp.op} cut by a restart${now}`, 'dot-done', 'var(--warning)');
+      const footer = document.querySelector('#terminal-popup .terminal-footer');
+      if (!footer || footer.querySelector('.terminal-dismiss-cut')) return;
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary btn-small terminal-dismiss-cut';
+      btn.textContent = 'Dismiss note';
+      btn.onclick = () => dismissCutOp(botId, btn);
+      footer.insertBefore(btn, footer.lastElementChild);
+    }
+
+    async function dismissCutOp(botId, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api('DELETE', `/bots/${botId}/cut-op`);
+        if (!res.success) {
+          showMessage('error', res.error || 'The note was not cleared');
+          if (btn) btn.disabled = false;
+          return;
+        }
+        if (res.warning) showMessage('error', res.warning);
+        mergeBotState({ id: botId, cutOp: null });
+        if (btn) btn.remove();
+        if (terminalBotId === botId) setTerminalStatus('Note dismissed', 'dot-done', '');
+        redraw();
+      } catch (err) {
+        showNoAnswer('dismiss', true);
+        if (btn) btn.disabled = false;
+      }
     }
 
     // ─── Service Logs Popup (matches Dev Kit pattern) ───

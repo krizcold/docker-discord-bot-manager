@@ -8,7 +8,7 @@
 import { execSync } from 'child_process';
 import { startServer } from './webui/server';
 import { checkDockerConnection } from './docker/dockerClient';
-import { syncContainerStates, resetTransientStatuses, beginShutdown } from './docker/containerManager';
+import { syncContainerStates, resetTransientStatuses, beginShutdown, loadOpRecords } from './docker/containerManager';
 import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
@@ -108,6 +108,7 @@ async function main(): Promise<void> {
   const bootPass = async (name: string, pass: () => unknown): Promise<void> => {
     try { await pass(); } catch (err: any) { console.warn(`[Init] ${name} did not complete: ${err?.message || err}`); }
   };
+  await bootPass('Operation record read', loadOpRecords);
   await bootPass('Transient status reset', resetTransientStatuses);
   await bootPass('Container state sync', syncContainerStates);
   await bootPass('Replica seed park', parkInterruptedReplicaSeeds);

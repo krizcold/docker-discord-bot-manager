@@ -896,7 +896,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       if (collector) {
         for (const log of collector.getLogs()) writeFrame(log);
       }
-      writeFrame({ type: 'idle', status: currentStatus(), timestamp: Date.now() });
+      const cutOp = containerManager.cutOpOf(botId);
+      writeFrame({ type: 'idle', status: currentStatus(), ...(cutOp ? { cutOp } : {}), timestamp: Date.now() });
       res.end();
       return;
     }
@@ -952,6 +953,21 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       cleanup();
       res.end();
     });
+  });
+
+  /** DELETE /api/bots/:id/cut-op - Dismiss the note that a manager restart cut an operation on this bot. */
+  router.delete('/:id/cut-op', (req: Request, res: Response) => {
+    try {
+      if (!containerManager.getBot(req.params.id)) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const result = containerManager.dismissCutOp(req.params.id);
+      if (result.success && result.dismissed) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.status(result.success ? 200 : 500).json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
   });
 
   /**

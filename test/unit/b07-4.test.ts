@@ -72,19 +72,19 @@ describe('B07-4: every tab is told when an op lock is released', () => {
       throw new Error('docker stop failed');
     })).rejects.toThrow('docker stop failed');
     expect(containerManager.isBotBusy('b1')).toBeNull();
-    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null } });
+    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null, cutOp: null } });
   });
 
   it('an op that returns ends with the same closing push', async () => {
     await containerManager.withExternalBotOp('b1', 'delete', async () => ({ success: false }));
-    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null } });
+    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null, cutOp: null } });
   });
 
   it('an unreadable registry still clears the lock in every tab without naming a status', async () => {
     await containerManager.withExternalBotOp('b1', 'stop', async () => {
       fs.writeFileSync(registryPath, '{not json');
     }).catch(() => {});
-    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', activeOp: null } });
+    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', activeOp: null, cutOp: null } });
   });
 
   it('a bot removed by the op gets no closing push', async () => {
@@ -101,7 +101,7 @@ describe('B07-4: every tab is told when an op lock is released', () => {
     const result = await containerManager.startBot('b1');
     expect(result.success).toBe(false);
     expect(containerManager.isBotBusy('b1')).toBeNull();
-    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null } });
+    expect(last()).toEqual({ type: 'bot:status', payload: { id: 'b1', status: 'running', activeOp: null, cutOp: null } });
   });
 
   it('the UI keeps the card status when a push carries none', () => {

@@ -298,9 +298,9 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
  * removed: the browser has no use for them. (The recovery arm block carries
  * its own copy-paste credential through its dedicated surface.)
  */
-export function withoutRecordSecrets(inst: InstanceConfig | null): InstanceConfig | null {
+export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConfig & { cutOp: CutOp | null }) | null {
   if (!inst) return inst;
-  const out: InstanceConfig = { ...inst };
+  const out: InstanceConfig & { cutOp: CutOp | null } = { ...inst, cutOp: cutOpOf(inst.id) };
   delete out.updateToken;
   // Explicit either way: the browser merges pushed records over what it holds,
   // and an absent key cannot clear a flag it already shows.
@@ -1646,11 +1646,134 @@ function broadcastOpReleased(botId: string): void {
   if (!broadcastFn) return;
   const registry = loadRegistry();
   if (brokenRegistryLoads.has(registry)) {
-    broadcastFn('bot:status', { id: botId, activeOp: null });
+    broadcastFn('bot:status', { id: botId, activeOp: null, cutOp: cutOpOf(botId) });
     return;
   }
   const inst = registry.instances[botId];
-  if (inst) broadcastFn('bot:status', { id: botId, status: servedStatus(inst).status, activeOp: null });
+  if (inst) broadcastFn('bot:status', { id: botId, status: servedStatus(inst).status, activeOp: null, cutOp: cutOpOf(botId) });
+}
+
+// ─── Operation records ───
+
+// Each held op lock is mirrored in OP_RECORD_FILE, so a record left there at
+// boot names an op a manager restart cut short. The note stays until a new op
+// starts on that bot or the operator dismisses it.
+const OP_RECORD_FILE = path.join(DATA_DIR, 'active-ops.json');
+
+interface OpRecord { op: string; startedAt: string }
+export type CutOp = { op: string; startedAt: string } | { unknown: true };
+
+const runningOpRecords = new Map<string, OpRecord>();
+const cutOps = new Map<string, CutOp>();
+// Entries that could not be read are written back as they were, so their note outlives the next restart too.
+const unreadableOpRecords = new Map<string, unknown>();
+// Set when the file at boot could not be read: it is never written over, and
+// every bot's cut op is unknown until the operator clears it on that bot.
+let opRecordFault: string | null = null;
+const faultClearedBots = new Set<string>();
+let opRecordsLoaded = false;
+
+function ensureOpRecordsLoaded(): void {
+  if (!opRecordsLoaded) loadOpRecords();
+}
+
+function isOpRecord(v: any): v is OpRecord {
+  return !!v && typeof v === 'object' && typeof v.op === 'string' && v.op !== '' && typeof v.startedAt === 'string' && v.startedAt !== '';
+}
+
+/** Boot pass: every record left in the file is an op the restart cut. */
+export function loadOpRecords(): void {
+  runningOpRecords.clear();
+  cutOps.clear();
+  unreadableOpRecords.clear();
+  faultClearedBots.clear();
+  opRecordFault = null;
+  opRecordsLoaded = true;
+  const state = storeFileState(OP_RECORD_FILE);
+  if (state.kind === 'absent') return;
+  let parsed: any;
+  try {
+    if (state.kind === 'broken') throw new Error(state.error);
+    parsed = JSON.parse(fs.readFileSync(OP_RECORD_FILE, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('it does not hold a JSON object');
+  } catch (err) {
+    opRecordFault = err instanceof Error ? err.message : String(err);
+    console.error(`[Error] ${path.basename(OP_RECORD_FILE)} could not be read, so whether a restart cut an operation can't be confirmed for any bot: ${opRecordFault}`);
+    return;
+  }
+  for (const [botId, rec] of Object.entries(parsed)) {
+    if (isOpRecord(rec)) {
+      cutOps.set(botId, { op: rec.op, startedAt: rec.startedAt });
+      console.warn(`[Init] ${botId}: its ${rec.op} (started ${rec.startedAt}) was running when the manager stopped; its outcome can't be confirmed`);
+    } else {
+      cutOps.set(botId, { unknown: true });
+      unreadableOpRecords.set(botId, rec);
+      console.error(`[Error] ${botId}: its operation record could not be read, so whether a restart cut an operation can't be confirmed`);
+    }
+  }
+}
+
+/** The op a manager restart cut on this bot, unknown when its record could not be read, null when none. */
+export function cutOpOf(botId: string): CutOp | null {
+  ensureOpRecordsLoaded();
+  const cut = cutOps.get(botId);
+  if (cut) return cut;
+  if (opRecordFault && !faultClearedBots.has(botId)) return { unknown: true };
+  return null;
+}
+
+/** Throws when the file cannot be written. */
+function writeOpRecords(): void {
+  if (opRecordFault) throw new Error(`${path.basename(OP_RECORD_FILE)} could not be read at boot, so it is not written over (${opRecordFault})`);
+  const out: Record<string, unknown> = Object.fromEntries(unreadableOpRecords);
+  for (const [botId, cut] of cutOps) {
+    if ('op' in cut) out[botId] = cut;
+  }
+  for (const [botId, rec] of runningOpRecords) out[botId] = rec;
+  writeFileAtomic(OP_RECORD_FILE, JSON.stringify(out, null, 2));
+}
+
+function recordOpBegin(botId: string, op: string): void {
+  ensureOpRecordsLoaded();
+  cutOps.delete(botId);
+  unreadableOpRecords.delete(botId);
+  if (opRecordFault) faultClearedBots.add(botId);
+  runningOpRecords.set(botId, { op, startedAt: new Date().toISOString() });
+  try {
+    writeOpRecords();
+  } catch (err) {
+    console.error(`[Error] ${botId}: the ${op} was not recorded, so a manager restart during it will not be reported: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+function recordOpEnd(botId: string, op: string): void {
+  runningOpRecords.delete(botId);
+  try {
+    writeOpRecords();
+  } catch (err) {
+    console.error(`[Error] ${botId}: the record of the finished ${op} could not be removed, so the next manager start may report it as cut short: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** Clears the cut-op note on a bot; fails, keeping the note, when its removal cannot be written. */
+export function dismissCutOp(botId: string): { success: true; dismissed: boolean; warning?: string } | { success: false; error: string } {
+  const cut = cutOpOf(botId);
+  if (!cut) return { success: true, dismissed: false };
+  if (!cutOps.has(botId)) {
+    faultClearedBots.add(botId);
+    return { success: true, dismissed: true, warning: `${path.basename(OP_RECORD_FILE)} could not be read at boot, so this note comes back after the next manager restart` };
+  }
+  const unreadable = unreadableOpRecords.get(botId);
+  cutOps.delete(botId);
+  unreadableOpRecords.delete(botId);
+  try {
+    writeOpRecords();
+  } catch (err) {
+    cutOps.set(botId, cut);
+    if (unreadable !== undefined) unreadableOpRecords.set(botId, unreadable);
+    return { success: false, error: `The note was not cleared: its record could not be removed (${err instanceof Error ? err.message : String(err)})` };
+  }
+  return { success: true, dismissed: true };
 }
 
 async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Promise<T> {
@@ -1659,10 +1782,12 @@ async function withBotOp<T>(botId: string, op: string, fn: () => Promise<T>): Pr
     throw new Error(`Operation '${current}' is already in progress for this bot`);
   }
   activeOps.set(botId, op);
+  recordOpBegin(botId, op);
   try {
     return await fn();
   } finally {
     activeOps.delete(botId);
+    recordOpEnd(botId, op);
     broadcastOpReleased(botId);
   }
 }
@@ -1732,6 +1857,7 @@ async function withLoggedBotOp(
     throw new Error(`Operation '${current}' is already in progress for this bot`);
   }
   activeOps.set(botId, op);
+  recordOpBegin(botId, op);
   const log = logCollectors.get(botId);
   log.beginOp(op);
   const endStatus = () => { try { return getBot(botId)?.status; } catch { return undefined; } };
@@ -1745,6 +1871,7 @@ async function withLoggedBotOp(
     throw err;
   } finally {
     activeOps.delete(botId);
+    recordOpEnd(botId, op);
     broadcastOpReleased(botId);
   }
 }

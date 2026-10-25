@@ -389,35 +389,6 @@ export async function getContainerLogs(
 }
 
 /**
- * Stream container logs via callback
- */
-export async function streamContainerLogs(
-  containerId: string,
-  onLog: (entry: LogEntry) => void,
-  onError?: (error: Error) => void
-): Promise<() => void> {
-  const child = spawn('docker', ['logs', '-f', '--timestamps', containerId]);
-
-  const processLog = (data: Buffer, stream: 'stdout' | 'stderr') => {
-    const lines = data.toString('utf-8').split('\n').filter(l => l.trim());
-    for (const line of lines) {
-      onLog({ ...parseDockerLogLine(line), stream });
-    }
-  };
-
-  child.stdout.on('data', (data) => processLog(data, 'stdout'));
-  child.stderr.on('data', (data) => processLog(data, 'stderr'));
-
-  if (onError) {
-    child.on('error', onError);
-  }
-
-  return () => {
-    child.kill();
-  };
-}
-
-/**
  * Check if a Docker image exists locally
  */
 export async function imageExists(imageName: string): Promise<boolean> {

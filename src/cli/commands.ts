@@ -160,9 +160,10 @@ export async function managerUpdate(ctx: Ctx, pollMs = 3000): Promise<void> {
 
 /**
  * Stream an SSE route. A build-log stream ends on its own terminal frame: done or
- * idle exits 0, failed exits 1, and a stream that ends or times out without one exits
- * EXIT_TIMEOUT. A container-log stream ends on an end frame when docker logs exits:
- * exit code 0 exits 0, any other EXIT_ERR. Its own --timeout ending it exits 0, and
+ * idle exits 0, failed exits 1, and an idle frame with cutOp (a manager restart cut
+ * the last operation, outcome unknown) or a stream that ends or times out without a
+ * terminal frame exits EXIT_TIMEOUT. A container-log stream ends on an end frame
+ * when docker logs exits: exit code 0 exits 0, any other EXIT_ERR. Its own --timeout ending it exits 0, and
  * the server ending it without an end frame exits EXIT_TIMEOUT.
  */
 async function streamSse(ctx: Ctx, path: string, terminal: boolean): Promise<void> {
@@ -180,6 +181,7 @@ async function streamSse(ctx: Ctx, path: string, terminal: boolean): Promise<voi
   const lastFrame = last as { event: string; data: unknown } | null;
   if (terminal) {
     const type = (lastFrame?.data as { type?: string } | null)?.type;
+    if (type === 'idle' && (lastFrame?.data as { cutOp?: unknown } | null)?.cutOp) fail("a manager restart cut the bot's last operation, so its outcome can't be confirmed", EXIT_TIMEOUT);
     if (type === 'done' || type === 'idle') process.exit(EXIT_OK);
     if (type === 'failed') process.exit(EXIT_ERR);
     fail(how === 'timeout' ? 'stream timed out before the operation finished' : 'stream ended before the operation finished', EXIT_TIMEOUT);

@@ -259,13 +259,13 @@ export function recordSecrets(inst: InstanceConfig): string[] {
 
 /**
  * A stored error can quote a command or a statement that carried a
- * credential, so every lastError is written with the record's secrets
- * replaced by ***.
+ * credential, so every lastError and the restore notice are written with
+ * the record's secrets replaced by ***.
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const has = [inst.fleetDbReplicaSeed, inst.fleetDbReplica?.autoReseed, inst.fleetTransfer, inst.fleetFailback, inst.recoveryRescue]
     .some(r => typeof r?.lastError === 'string' && r.lastError !== '');
-  if (!has) return inst;
+  if (!has && !inst.fleetRestoreError) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
@@ -275,6 +275,7 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   if (out.fleetTransfer) out.fleetTransfer = scrub(out.fleetTransfer);
   if (out.fleetFailback) out.fleetFailback = scrub(out.fleetFailback);
   if (out.recoveryRescue) out.recoveryRescue = scrub(out.recoveryRescue);
+  if (out.fleetRestoreError) out.fleetRestoreError = { ...out.fleetRestoreError, text: redactSecrets(out.fleetRestoreError.text, secrets) };
   return out;
 }
 

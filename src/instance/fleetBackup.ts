@@ -69,7 +69,7 @@ function scrubbed(botId: string, text: string): string {
 const fenceStuck: Map<string, Map<string, { text: string; db: RestoreFleetDb }>> = new Map();
 function setStuck(botId: string, db: RestoreFleetDb, text: string): void {
   const entries = fenceStuck.get(botId) ?? new Map();
-  entries.set(db.containerName, { text, db });
+  entries.set(db.containerName, { text: scrubbed(botId, text), db });
   fenceStuck.set(botId, entries);
 }
 function clearStuck(botId: string, containerName: string): void {
@@ -127,7 +127,7 @@ function restoreNotice(botId: string): { file: string; text: string } | null {
 }
 
 function setRestoreError(botId: string, file: string, reason: string, consequence: string): void {
-  const text = `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`;
+  const text = scrubbed(botId, `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`);
   try {
     containerManager.updateInstanceFleetRestoreError(botId, { file, text });
     unsavedRestoreErrors.delete(botId);

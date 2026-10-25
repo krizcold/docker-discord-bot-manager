@@ -386,6 +386,16 @@ function addLavalink(compose: ComposeFile, botService: ComposeService, botId: st
   });
 }
 
+/** A double-quoted YAML scalar that parses back to exactly `value`. */
+function yamlString(value: unknown): string {
+  return JSON.stringify(value == null ? '' : String(value))
+    .replace(/[\u007f-\u009f\u2028\u2029\ufeff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+function yamlKey(key: string): string {
+  return /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(key) ? key : yamlString(key);
+}
+
 /**
  * Format compose object to YAML
  */
@@ -400,19 +410,19 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push(`  ${serviceName}:`);
 
     if (service.image) {
-      lines.push(`    image: ${service.image}`);
+      lines.push(`    image: ${yamlString(service.image)}`);
     }
 
     if (service.build) {
       lines.push('    build:');
-      lines.push(`      context: ${service.build.context}`);
-      lines.push(`      dockerfile: ${service.build.dockerfile}`);
+      lines.push(`      context: ${yamlString(service.build.context)}`);
+      lines.push(`      dockerfile: ${yamlString(service.build.dockerfile)}`);
     }
 
-    lines.push(`    container_name: ${service.container_name}`);
+    lines.push(`    container_name: ${yamlString(service.container_name)}`);
     lines.push(`    restart: ${service.restart}`);
     if (service.command?.length) {
-      lines.push(`    command: [${service.command.map(c => JSON.stringify(c)).join(', ')}]`);
+      lines.push(`    command: [${service.command.map(yamlString).join(', ')}]`);
     }
     lines.push('    logging:');
     lines.push('      driver: json-file');
@@ -434,23 +444,21 @@ function formatComposeYaml(compose: ComposeFile): string {
     if (service.environment && Object.keys(service.environment).length > 0) {
       lines.push('    environment:');
       for (const [key, value] of Object.entries(service.environment)) {
-        const needsQuotes = /[:\s#{}[\],&*!|>'"%@`]/.test(value) || value === '';
-        const formatted = needsQuotes ? `"${value.replace(/"/g, '\\"')}"` : value;
-        lines.push(`      ${key}: ${formatted}`);
+        lines.push(`      ${yamlKey(key)}: ${yamlString(value)}`);
       }
     }
 
     if (service.expose?.length) {
       lines.push('    expose:');
       for (const port of service.expose) {
-        lines.push(`      - "${port}"`);
+        lines.push(`      - ${yamlString(port)}`);
       }
     }
 
     if (service.healthcheck) {
       const hc = service.healthcheck;
       lines.push('    healthcheck:');
-      lines.push(`      test: [${hc.test.map(t => JSON.stringify(t)).join(', ')}]`);
+      lines.push(`      test: [${hc.test.map(yamlString).join(', ')}]`);
       if (hc.interval) lines.push(`      interval: ${hc.interval}`);
       if (hc.timeout) lines.push(`      timeout: ${hc.timeout}`);
       if (hc.retries !== undefined) lines.push(`      retries: ${hc.retries}`);
@@ -461,8 +469,8 @@ function formatComposeYaml(compose: ComposeFile): string {
       lines.push('    volumes:');
       for (const vol of service.volumes) {
         lines.push(`      - type: ${vol.type}`);
-        lines.push(`        source: ${vol.source}`);
-        lines.push(`        target: ${vol.target}`);
+        lines.push(`        source: ${yamlString(vol.source)}`);
+        lines.push(`        target: ${yamlString(vol.target)}`);
       }
     }
 
@@ -476,7 +484,7 @@ function formatComposeYaml(compose: ComposeFile): string {
     if (service.labels) {
       lines.push('    labels:');
       for (const [key, value] of Object.entries(service.labels)) {
-        lines.push(`      ${key}: "${value}"`);
+        lines.push(`      ${yamlKey(key)}: ${yamlString(value)}`);
       }
     }
 
@@ -485,9 +493,9 @@ function formatComposeYaml(compose: ComposeFile): string {
       if (service['x-casaos'].volumes) {
         lines.push('      volumes:');
         for (const vol of service['x-casaos'].volumes) {
-          lines.push(`        - container: ${vol.container}`);
+          lines.push(`        - container: ${yamlString(vol.container)}`);
           lines.push('          description:');
-          lines.push(`            en_us: ${vol.description.en_us}`);
+          lines.push(`            en_us: ${yamlString(vol.description.en_us)}`);
         }
       }
     }
@@ -534,12 +542,12 @@ function formatComposeYaml(compose: ComposeFile): string {
     lines.push(`  author: ${casaos.author}`);
     lines.push(`  developer: ${casaos.developer}`);
     lines.push('  tagline:');
-    lines.push(`    en_us: "${casaos.tagline.en_us}"`);
+    lines.push(`    en_us: ${yamlString(casaos.tagline.en_us)}`);
     lines.push(`  category: ${casaos.category}`);
     lines.push('  description:');
-    lines.push(`    en_us: "${casaos.description.en_us}"`);
+    lines.push(`    en_us: ${yamlString(casaos.description.en_us)}`);
     lines.push('  title:');
-    lines.push(`    en_us: "${casaos.title.en_us}"`);
+    lines.push(`    en_us: ${yamlString(casaos.title.en_us)}`);
     if (casaos.is_uncontrolled !== undefined) {
       lines.push(`  is_uncontrolled: ${casaos.is_uncontrolled}`);
     }

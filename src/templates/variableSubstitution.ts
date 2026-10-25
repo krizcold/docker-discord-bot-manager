@@ -91,21 +91,13 @@ export function buildSubstitutionVariables(bot: BotConfig): SubstitutionVariable
 export function applyVariableSubstitution(compose: string, bot: BotConfig): string {
   const vars = buildSubstitutionVariables(bot);
 
-  let result = compose;
-
-  // Replace both $VAR and ${VAR} formats
-  for (const [key, raw] of Object.entries(vars)) {
+  // One pass, so '$$' (compose's escape for '$') never starts a name and an inserted value is never scanned again
+  return compose.replace(/\$\$|\$\{([^{}$]*)\}|\$([A-Za-z0-9_]+)/g, (match, braced, bare) => {
+    const key: string | undefined = braced ?? bare;
+    if (key === undefined || !Object.prototype.hasOwnProperty.call(vars, key)) return match;
     // compose interpolates every string in the file, so a literal '$' is written '$$'
-    const value = String(raw ?? '').replace(/\$/g, '$$$$');
-    // Replace ${VAR} format first (more specific)
-    result = result.split(`\${${key}}`).join(value);
-    // Replace $VAR format (at word boundary to avoid partial matches)
-    // Use regex for word boundary matching
-    const dollarPattern = new RegExp(`\\$${key}(?![A-Za-z0-9_])`, 'g');
-    result = result.replace(dollarPattern, () => value);
-  }
-
-  return result;
+    return String(vars[key] ?? '').replace(/\$/g, '$$$$');
+  });
 }
 
 /**

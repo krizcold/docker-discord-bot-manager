@@ -75,6 +75,8 @@ import * as path from 'path';
 import * as vm from 'vm';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
+// Loaded before the mocked appLifecycle so the import cycle appLifecycle -> fleetReplication -> fleetBackup closes on a real module, not a pending mock factory.
+import '../../src/instance/fleetBackup';
 import { resumeRecoveryRescues, startRescue } from '../../src/instance/recoveryRescue';
 
 const botDir = path.join(h.dir, 'bots', 'b1');

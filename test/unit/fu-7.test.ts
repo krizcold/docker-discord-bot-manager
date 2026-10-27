@@ -11,7 +11,6 @@ const h = vi.hoisted(() => {
     bots: [] as any[],
     fault: null as string | null,
     calls: [] as string[][],
-    channelWrites: [] as any[],
     lstatFaults: new Set<string>(),
   };
 });
@@ -70,12 +69,6 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   isBotBusy: () => null,
   isShuttingDown: () => false,
   sharedVolumeReason: () => null,
-  updateInstanceRecoveryChannel: (id: string, rec: any) => {
-    h.channelWrites.push(rec);
-    const b = h.bots.find(x => x.id === id);
-    if (b) b.recoveryChannel = rec ?? undefined;
-    return true;
-  },
 }));
 vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
@@ -94,7 +87,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { validateName, makeUniqueName, checkFolderReuse } from '../../src/naming';
 import { provisionFleetReplica, reseedStalePrimary } from '../../src/instance/fleetReplica';
-import { armReceiver, armSource } from '../../src/instance/recoveryChannel';
 
 const FAULT = 'The instance registry (instances.json) cannot be read, so the bot list is unknown and every change is refused. Repair or replace instances.json (no copy).';
 const FLEET_URL = 'https://example.invalid/fake/super-modular-discord-bot';
@@ -209,7 +201,6 @@ describe('B04-2n: the host-port collision checks refuse while the registry canno
     h.bots = [];
     h.fault = null;
     h.calls = [];
-    h.channelWrites = [];
   });
 
   it('provision refuses with a can\'t-confirm answer and calls no docker', () => {
@@ -236,35 +227,6 @@ describe('B04-2n: the host-port collision checks refuse while the registry canno
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/Host port 5440 cannot be confirmed free/);
     expect(res.error).toContain('instances.json');
-    expect(h.calls).toEqual([]);
-  });
-
-  it('arming a receiver refuses with a can\'t-confirm answer and writes no record', async () => {
-    h.bots = [worker({ fleetDb: FLEET_DB })];
-    h.fault = FAULT;
-    const res = await armReceiver(h.bots[0], 'receiver.invalid', 15433);
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/Host port 15433 cannot be confirmed free/);
-    expect(res.error).toContain('instances.json');
-    expect(h.channelWrites).toEqual([]);
-    expect(h.calls).toEqual([]);
-  });
-
-  it('arming a receiver still names the bot that uses the port when the registry reads', async () => {
-    h.bots = [worker({ fleetDb: FLEET_DB }), other({ fleetDbReplica: { hostPort: 15433 } })];
-    const res = await armReceiver(h.bots[0], 'receiver.invalid', 15433);
-    expect(res.error).toMatch(/Host port 15433 is already used by "Bot 2"/);
-    expect(h.channelWrites).toEqual([]);
-  });
-
-  it('arming a source refuses while the registry cannot say whether the receiver is on this machine', async () => {
-    h.bots = [worker({ fleetDb: FLEET_DB })];
-    h.fault = FAULT;
-    const res = await armSource(h.bots[0], { host: 'peer.invalid', port: 15433, cert: PEM, token: 't' });
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/cannot be confirmed/);
-    expect(res.error).toContain('instances.json');
-    expect(h.channelWrites).toEqual([]);
     expect(h.calls).toEqual([]);
   });
 });

@@ -156,7 +156,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import * as fleetBackup from '../../src/instance/fleetBackup';
-import { ownedFenceLayers } from '../../src/instance/fleetFailback';
 import { enableFleetReplication, narrowKeptPlainHba } from '../../src/instance/fleetReplication';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
@@ -408,17 +407,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   });
 });
 
-describe('B14-2Lb: a consent park owns the layers it set', () => {
-  it('owns only the layers that were off, or one an earlier run of its lane left', () => {
-    const state = (readOnly: boolean, hba: boolean, readOnlyOwner: string | null = null, hbaOwner: string | null = null) => ({ readOnly, hba, readOnlyOwner, hbaOwner, ownerFile: readOnlyOwner ?? '' });
-    expect(ownedFenceLayers(state(true, false), 'failback:2')).toEqual({ readOnly: false, hba: true });
-    expect(ownedFenceLayers(state(false, true), 'failback:2')).toEqual({ readOnly: true, hba: false });
-    expect(ownedFenceLayers(state(false, false), 'failback:2')).toEqual({ readOnly: true, hba: true });
-    expect(ownedFenceLayers(state(true, true, 'failback:1', 'failback:1'), 'failback:2')).toEqual({ readOnly: true, hba: true });
-    expect(ownedFenceLayers(state(true, true, 'restore:1', 'failback:1'), 'failback:2')).toEqual({ readOnly: false, hba: true });
-    expect(ownedFenceLayers(state(true, true, 'dropback:1', 'dropback:1'), 'failback:2')).toEqual({ readOnly: false, hba: false });
-  });
-
+describe('B14-2Lb: a consent park lifts the layers it owns', () => {
   it('lifting only the pg_hba layer leaves the read-only default another lane set', async () => {
     expect(await fleetBackup.liftConsentFence('a', primary, OWNER, 'x', { readOnly: false, hba: true })).toBe('lifted');
     expect(pg.events).toEqual(['hba-strip', 'reload']);

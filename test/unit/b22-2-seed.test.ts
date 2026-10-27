@@ -72,10 +72,9 @@ vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   hasAppHooks: () => false,
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
-  readStandInPosture: async () => ({ read: 'none' }),
 }));
 vi.mock('../../src/instance/fleetReplication', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/instance/fleetReplication')>();
@@ -102,7 +101,6 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import * as fleetBackup from '../../src/instance/fleetBackup';
-import { startRescue } from '../../src/instance/recoveryRescue';
 const { cancelReplicaSeed, getFleetReplicaStatus, provisionFleetReplica, removeFleetReplica } = fleetReplica;
 const retryHeldSeedRecords = (): void => (fleetReplica as any).retryHeldSeedRecords?.();
 
@@ -142,7 +140,7 @@ afterAll(() => {
 });
 
 describe('R40-J3: a seed whose success clear is refused reads finished', () => {
-  it('names the pending clear, frees the remove guard, and the health tick clears it', async () => {
+  it('names the pending clear, frees the remove guard, and the minute retry clears it', async () => {
     h.refuseClear = true;
     const started = provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
     expect(started.success).toBe(true);
@@ -217,19 +215,11 @@ describe('R43-J1: a provision whose Apply mark and success clear are both refuse
 });
 
 describe('R40-J3: other lanes read a seed held done as finished', () => {
-  it('neither the self-update nor a fresh rescue names a running seed', async () => {
+  it('the self-update does not name a running seed', async () => {
     h.refuseClear = true;
     provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplicaSeed).toBeDefined();
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
-    const file = path.join(h.dir, 'instances.json');
-    const reg = JSON.parse(fs.readFileSync(file, 'utf8'));
-    reg.instances.b1.fleetDb = { containerName: 'b1-db', user: 'u', db: 'd', volume: 'b1-vol' };
-    reg.instances.b1.recoveryChannel = { mode: 'receiver', containerName: 'b1-relay', token: 't', createdAt: 1, tunnelPort: 15433, publicHost: 'h', tlsKey: 'k', tlsCert: 'c' };
-    fs.writeFileSync(file, JSON.stringify(reg));
-    expect(bot().recoveryChannel?.mode).toBe('receiver');
-    const res = await startRescue(bot(), false);
-    expect(res.error ?? '').not.toMatch(/Provisioning of a standby is running/);
   });
 });

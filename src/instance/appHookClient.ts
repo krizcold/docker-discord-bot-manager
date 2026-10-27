@@ -1,8 +1,7 @@
 /**
  * Typed client for an app's manager-facing lifecycle hooks (PLAN_REPLICATION
- * 20.16). The manager dials the app container by name over the shared network,
- * the same route recoveryRescue uses for the relay, and authenticates with the
- * per-instance token it already mints and injects.
+ * 20.16). The manager dials the app container by name over the shared network
+ * and authenticates with the per-instance token it already mints and injects.
  *
  * The app's browser API is authenticated at the deployment boundary and is
  * deliberately open inside the container, so it is never what this drives: the
@@ -124,4 +123,99 @@ export async function callAppHook<T = any>(
 /** Whether this instance's app declares the lifecycle hook contract at all. */
 export function hasAppHooks(instance: InstanceConfig): boolean {
   return !!findAppCapabilities(instance.sourceUrl)?.hooks;
+}
+
+export interface AppFacts {
+  running: boolean;
+  initialized: boolean;
+  role: string | null;
+  nodeId: string | null;
+  nodeName: string | null;
+  term: number | null;
+  standalone: boolean;
+  backupMaster: boolean;
+  /** The running bot's consent to active backup mode, as it booted; the saved env may differ until the container is recreated. */
+  activeCapable?: boolean;
+  /** The app's own verdict that this node is where the copy block belongs. */
+  copyBlockTarget: boolean;
+  superseded: { byNodeId: string; byNodeName: string; term: number; retireRequested: boolean; at: number; source: string; steppedDown: boolean } | null;
+  promote: any;
+  emptyStoreHold: any;
+  takeoverHold: any;
+  staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number } | null;
+  copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
+  /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
+  copyBlockCurrent?: boolean | null;
+  /** The app's own verdict that the block names the database it FOLLOWS while holding or after a step-down (B6 map F32): the source the failback re-seeds from. */
+  copyBlockFollowed?: boolean | null;
+  /** The app's container carries a standby endpoint (it learned its standby); null while the bot is down. */
+  dbReplica?: boolean | null;
+  /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
+  standbySlot: {
+    slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;
+    observedAt: number; receivedAt: number; fromNodeId: string; fromTerm: number; sourceIsCurrentMaster: boolean | null;
+    sourceAt: number;
+  } | null;
+  /** The app's own verdict: the fact is fresh, the slot is lost, and it is on the master this copy follows. */
+  standbySlotLost: boolean;
+}
+
+export interface ActionResult {
+  success: boolean;
+  error?: string;
+  /** The app asked for an explicit confirmation before it will act. */
+  needsConfirm?: boolean;
+  /** role-reset: whether the app also dropped the store forms it had persisted (false where its environment pins none). */
+  formsCleared?: boolean;
+  /** The request went out and no answer came back in time: the app may have acted. */
+  unknown?: boolean;
+  /** The app wants the RPO acknowledged before promoting. */
+  needsLagConfirm?: boolean;
+  /** The app says another designated backup received further than this copy (20.19 F14). */
+  needsLineageConfirm?: boolean;
+  /** The app wants it acknowledged that other instances cannot reach this one once it is the primary side. */
+  needsReachabilityConfirm?: boolean;
+  lagMs?: number | null;
+  restartRequired?: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * An instance hosting a companion database whose app declares no capability
+ * record is a configuration hole, not a plain app: the manager would silently
+ * treat it as having no companion and skip provisioning and retirement for a
+ * database that really exists. Refuse loudly instead (PLAN_REPLICATION 20.16
+ * carried-forward guard).
+ */
+export function capabilityRefusal(instance: InstanceConfig): string | null {
+  const hasCompanion = !!instance.fleetDb || !!instance.fleetDbReplica;
+  if (!hasCompanion) return null;
+  if (findAppCapabilities(instance.sourceUrl)?.companionDb) return null;
+  return 'This instance runs a managed database but its app declares no capability record, so the manager cannot tell how to provision or retire it. Add a record for this source before using the database lifecycle here.';
+}
+
+/** The app's recorded facts, or a named reason they could not be read. */
+export async function getAppFacts(instance: InstanceConfig, timeoutMs?: number): Promise<{ success: boolean; facts?: AppFacts; error?: string }> {
+  if (!hasAppHooks(instance)) return { success: false, error: 'this app declares no lifecycle hooks' };
+  const result = await callAppHook<AppFacts & { success: boolean }>(instance, 'facts', 'GET', undefined, timeoutMs);
+  if (!result.ok) return { success: false, error: result.error };
+  return { success: true, facts: result.body as AppFacts };
+}
+
+/**
+ * A container that just started serves its hooks only once its web server
+ * listens; callers that start it and then need it wait here, bounded.
+ */
+export async function waitForAppHook(instance: InstanceConfig, deadlineMs: number): Promise<ActionResult> {
+  const deadline = Date.now() + deadlineMs;
+  let last = 'no answer yet';
+  for (;;) {
+    const facts = await getAppFacts(instance, 5_000);
+    if (facts.success) return { success: true };
+    last = facts.error || last;
+    if (Date.now() >= deadline) {
+      return { success: false, error: `the app did not answer its hooks within ${Math.round(deadlineMs / 1000)} s (${last})` };
+    }
+    await new Promise(resolve => setTimeout(resolve, 2_000));
+  }
 }

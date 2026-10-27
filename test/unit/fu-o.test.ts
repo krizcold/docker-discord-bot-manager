@@ -103,7 +103,6 @@ vi.mock('child_process', async (importOriginal) => {
 import * as fs from 'fs';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
-import { ownedFenceLayers, runFenceOwner } from '../../src/instance/fleetFailback';
 import { runOnDataDir, MANAGED_HBA } from './fence-fake';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
@@ -168,116 +167,6 @@ describe('FU-O row 1: each fence layer names its owner', () => {
   });
 });
 
-describe('FU-O row 2: a promote\'s read-only layer is not a failback run\'s', () => {
-  it('a re-armed park over a read-only layer with no owner file owns only the pg_hba layer, and its Cancel sends no read-only reset', async () => {
-    // The failback record outlived its fence; after a restart the promote fenced the old primary read-only from the app.
-    seedRegistry({ fleetConsentFenceLeft: [{ containerName: primary.containerName, owner: 'failback:1' }] });
-    state().readOnly = true;
-    const fb = await restartedManager();
-    const prior = await fb.fenceLayers(primary);
-    const owned = ownedFenceLayers(prior!, runFenceOwner({ mode: 'failback', startedAt: 2 }));
-    expect(owned).toEqual({ readOnly: false, hba: true });
-    await fb.fenceForConsent(primary, 'failback:2');
-    pg.events = [];
-    expect(await fb.liftConsentFence('a', primary, 'failback:2', 'x', owned)).toBe('lifted');
-    expect(pg.events).not.toContain('reset');
-    expect(pg.events).not.toContain('owner-read');
-    expect(state()).toEqual({ readOnly: true, ownerFile: null, lines: [] });
-  });
-});
-
-describe('FU-O row 3: the seeded warning names the owner the layers name, not the record', () => {
-  it('a failback record still on disk over a promote\'s fence does not name the failback run', async () => {
-    const run = { mode: 'failback', phase: 'wipe-consent', startedAt: 1, updatedAt: 1, standInNodeId: null, episode: null, lineage: null, dump: null, block: null, serve: null, stoppedByRun: false, parked: true, consentAt: null };
-    seedRegistry({ fleetFailback: run, fleetConsentFenceLeft: [{ containerName: primary.containerName, owner: 'failback:1' }] });
-    // Within one tick the failback's fence went off and the promote fenced the database read-only, with no owner.
-    state().readOnly = true;
-    const fb = await restartedManager();
-    await startedWithTick(fb);
-    await vi.waitFor(() => expect(fb.getFleetFenceStuck('a')).not.toBeNull());
-    const text = fb.getFleetFenceStuck('a')!;
-    expect(text).not.toMatch(/failback run on this instance owns it/);
-    expect(text).toMatch(/no lane of this manager/);
-  });
-});
-
-describe('FU-O row 4: a restore that takes over a park\'s fence owns it', () => {
-  it('the failback Cancel lifts nothing and names the restore', async () => {
-    await fleetBackup.applyWriteFence(primary, 'failback:5', 'lane');
-    await fleetBackup.applyWriteFence(primary, 'restore:1729900000000', 'any');
-    expect(state()).toEqual({ readOnly: true, ownerFile: 'restore:1729900000000', lines: ['restore:1729900000000', 'restore:1729900000000'] });
-    pg.events = [];
-    const held: fleetBackup.FenceHeld = { readOnly: false, hba: false, holder: null };
-    expect(await fleetBackup.liftConsentFence('a', primary, 'failback:5', 'x', both, held)).toBe('held');
-    expect(pg.events).not.toContain('reset');
-    expect(state().readOnly).toBe(true);
-    expect(state().lines).toHaveLength(2);
-    expect(held).toMatchObject({ readOnly: true, hba: true, holder: 'restore:1729900000000' });
-    expect(fleetBackup.heldText(held, 'the run')).toMatch(/belong to a restore \(started 2024-10-25 23:46 UTC\)/);
-    expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/a restore \(started/);
-  });
-
-  it('the park takes over only a layer its own lane left', async () => {
-    await fleetBackup.applyWriteFence(primary, 'failback:5', 'lane');
-    await fleetBackup.applyWriteFence(primary, 'failback:6', 'lane');
-    expect(state().ownerFile).toBe('failback:6');
-    pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: null, lines: [] });
-    await fleetBackup.applyWriteFence(primary, 'swap:7', 'lane');
-    expect(state()).toEqual({ readOnly: true, ownerFile: null, lines: ['swap:7', 'swap:7'] });
-  });
-
-  it('the swap quiesce takes over a failback, drop-back or swap layer, never a restore, re-seed, decommission or no-owner one', async () => {
-    for (const prior of ['failback:5', 'dropback:5', 'swap:5']) {
-      pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: prior, lines: [prior, prior] });
-      await fleetBackup.applyWriteFence(primary, 'swap:9', 'run');
-      expect(state()).toEqual({ readOnly: true, ownerFile: 'swap:9', lines: ['swap:9', 'swap:9'] });
-    }
-    for (const prior of ['restore:5', 'reseed:5', 'decommission:5', '']) {
-      pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: prior || null, lines: [prior, prior] });
-      await fleetBackup.applyWriteFence(primary, 'swap:9', 'run');
-      expect(state()).toEqual({ readOnly: true, ownerFile: prior || null, lines: [prior, prior] });
-    }
-  });
-});
-
-describe('FU-O row 5: the disarm lifts only a swap\'s layers', () => {
-  const channel = { mode: 'source', containerName: 'bot-a-recovery-relay', token: 't', createdAt: 1, endpointHost: 'h', endpointPort: 15433, pinCert: 'c' };
-
-  async function disarm(): Promise<{ success: boolean; error?: string; warning?: string }> {
-    seedRegistry({ recoveryChannel: channel, sanitizedName: 'bot-a' });
-    vi.resetModules();
-    const cm = await import('../../src/docker/containerManager');
-    const rc = await import('../../src/instance/recoveryChannel');
-    return rc.disarmRecoveryChannel(cm.getBot('a')!);
-  }
-
-  it('a read-only layer a restore owns stays on and the answer names it', async () => {
-    pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: 'restore:1729900000000', lines: ['swap:2', 'swap:2'] });
-    const res = await disarm();
-    expect(res.success).toBe(true);
-    expect(pg.events).not.toContain('reset');
-    expect(state()).toEqual({ readOnly: true, ownerFile: 'restore:1729900000000', lines: [] });
-    expect(res.warning).toMatch(/read-only layer of the write fence belongs to a restore \(started 2024-10-25 23:46 UTC\)/);
-    expect(onDisk().recoveryChannel).toBeUndefined();
-  });
-
-  it('a read-only layer no lane owns stays on and the answer says so', async () => {
-    pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: null, lines: [] });
-    const res = await disarm();
-    expect(res.success).toBe(true);
-    expect(pg.events).not.toContain('reset');
-    expect(state().readOnly).toBe(true);
-    expect(res.warning).toMatch(/belongs to no lane of this manager/);
-  });
-
-  it('a swap\'s layers are lifted, whichever swap set them', async () => {
-    pg.dbs.set(primary.containerName, { readOnly: true, ownerFile: 'swap:3', lines: ['swap:3', 'swap:3'] });
-    const res = await disarm();
-    expect(res).toEqual({ success: true });
-    expect(state()).toEqual({ readOnly: false, ownerFile: null, lines: [] });
-  });
-});
-
 describe('FU-O row 6: half lifts leave an owner that the next step clears', () => {
   it('a reset that lands with a failed file removal leaves a stale owner the reprobe removes', async () => {
     const fb = await restartedManager();
@@ -316,14 +205,11 @@ describe('FU-O row 7: the copy strips remove the owner file', () => {
     expect(ran.files['smdb-fence-owner']).toBeUndefined();
   });
 
-  it('the re-seed copy, the rescue standby, the adopt and the flip strip the owner file', () => {
+  it('the re-seed copy and the adopt strip the owner file', () => {
     const src = (file: string) => fs.readFileSync(path.resolve(__dirname, '../../src/instance', file), 'utf8');
     const replica = src('fleetReplica.ts');
     expect(replica).toMatch(/default_transaction_read_only\/d' \$\{PGDATA\}\/postgresql\.auto\.conf && \$\{fleetBackup\.stripCopiedFenceScript\(PGDATA\)\}/);
     expect(replica).toMatch(/'exec', '-u', 'root', rec\.containerName, 'sh', '-c', fleetBackup\.stripCopiedFenceScript\(PGDATA\)/);
-    const rescue = src('recoveryRescue.ts');
-    expect(rescue).toMatch(/postgresql\.auto\.conf && \$\{stripCopiedFenceScript\(PGDATA\)\}/);
-    expect(rescue).toMatch(/primary_slot_name\/d' \$\{PGDATA\}\/postgresql\.auto\.conf && rm -f \$\{PGDATA\}\/\$\{FENCE_OWNER_FILE\}/);
   });
 });
 
@@ -341,12 +227,12 @@ describe('FU-O row 8: the volume fallback lifts only this lane\'s read-only line
   });
 
   it('keeps the read-only line and the owner file when another lane owns them', async () => {
-    const ran = await runOnDataDir(await volumeScript('restore:1'), '/pgdata', files('swap:2'));
+    const ran = await runOnDataDir(await volumeScript('restore:1'), '/pgdata', files('reseed:2'));
     expect(ran.files['postgresql.auto.conf']).toContain('default_transaction_read_only');
-    expect(ran.files['smdb-fence-owner']).toBe('swap:2');
-    expect(ran.files['pg_hba.conf']).toContain('smdb-fence-owner=swap:2');
-    expect(ran.out).toMatch(/held-ro swap:2/);
-    expect(ran.out).toMatch(/held-hba swap:2/);
+    expect(ran.files['smdb-fence-owner']).toBe('reseed:2');
+    expect(ran.files['pg_hba.conf']).toContain('smdb-fence-owner=reseed:2');
+    expect(ran.out).toMatch(/held-ro reseed:2/);
+    expect(ran.out).toMatch(/held-hba reseed:2/);
   });
 
   it('removes the line, the owner file and the fence lines when this lane owns them', async () => {
@@ -354,19 +240,6 @@ describe('FU-O row 8: the volume fallback lifts only this lane\'s read-only line
     expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\n");
     expect(ran.files['smdb-fence-owner']).toBeUndefined();
     expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
-  });
-});
-
-describe('FU-O row 10: the sender keeps the receiver\'s cancel with its swap record', () => {
-  it('saves the cancelled swap and clears it with the swap record', async () => {
-    vi.resetModules();
-    const cm = await import('../../src/docker/containerManager');
-    cm.updateInstanceRecoverySwappedAway('a', { at: 5 });
-    cm.updateInstanceRecoverySwapAbandoned('a', { at: 6, phase: 'catchup', cleared: false, left: null });
-    expect(onDisk().recoverySwapAbandoned).toEqual({ at: 6, phase: 'catchup', cleared: false, left: null });
-    cm.updateInstanceRecoverySwappedAway('a', null);
-    expect(onDisk().recoverySwappedAway).toBeUndefined();
-    expect(onDisk().recoverySwapAbandoned).toBeUndefined();
   });
 });
 

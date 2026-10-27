@@ -54,12 +54,6 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     },
   };
 });
-// An unparked run a row files stands for one whose runner runs in this process.
-const fb = vi.hoisted(() => ({ live: false }));
-vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
-  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
-});
 
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
@@ -345,26 +339,6 @@ describe('R7-J4 and R10-J1: who the restore stops comes from docker and the pars
   });
 });
 
-describe('R8-J1 and R9-J3: the restore refuses while another lane holds the database', () => {
-  const cases: Array<[string, Record<string, unknown>, RegExp]> = [
-    ['a recorded rescue', { recoveryRescue: { phase: 'streaming', startedAt: 1, updatedAt: 1, parked: true } }, /rescue is recorded/],
-    ['an armed receiver channel', { recoveryChannel: { mode: 'receiver' } }, /recovery channel is armed on this instance \(receiver\)/],
-    ['an armed source channel', { recoveryChannel: { mode: 'source' } }, /recovery channel is armed on this instance \(source\)/],
-    ['a parked failback run', { fleetFailback: { mode: 'failback', phase: 'wipe-consent', parked: true } }, /failback run is recorded/],
-    ['a transfer run', { fleetTransfer: { phase: 'seeding', startedAt: 1, updatedAt: 1, retireOldMaster: false } }, /transfer is recorded/],
-  ];
-  for (const [name, extra, text] of cases) {
-    it(`refuses on ${name} with nothing changed`, async () => {
-      writeRegistry(extra);
-      const r = await restore();
-      expect(r.success).toBe(false);
-      expect(r.error).toMatch(text);
-      expect(r.error).toMatch(/nothing was changed/);
-      expect(pg.events).toEqual([]);
-    });
-  }
-});
-
 describe('R9-J3: Start, Restart, Update and Build refuse on an instance the restore holds', () => {
   it('refuses while the restore runs and admits once it ends', async () => {
     let open: () => void = () => {};
@@ -381,33 +355,8 @@ describe('R9-J3: Start, Restart, Update and Build refuse on an instance the rest
   });
 });
 
-describe('R8-J1 and R9-J3: the database lanes refuse while a run is recorded', () => {
-  it('the sidecar start refuses during a rescue unless the rescue asks', async () => {
-    writeRegistry({ recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1 } });
-    const real = await vi.importActual<typeof import('../../src/docker/containerManager')>('../../src/docker/containerManager');
-    const refused = await real.startFleetDbSidecar('a');
-    expect(refused.success).toBe(false);
-    expect(refused.error).toMatch(/rescue is recorded/);
-    const asked = await real.startFleetDbSidecar('a', { forRescue: true });
-    expect(asked.error ?? '').not.toMatch(/rescue/);
-  });
-
-  const runs: Array<[string, Record<string, unknown>, RegExp]> = [
-    ['a rescue', { recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1 } }, /rescue is recorded/],
-    ['a failback run', { fleetFailback: { mode: 'drop-back', phase: 'seeding' } }, /drop-back run is recorded/],
-    ['a transfer run', { fleetTransfer: { phase: 'promoting', startedAt: 1, updatedAt: 1, retireOldMaster: false } }, /transfer is recorded/],
-  ];
-  for (const [name, extra, text] of runs) {
-    it(`Build and Update refuse on ${name}`, () => {
-      writeRegistry(extra);
-      expect(containerManager.buildPreflightRefusal('a')?.error).toMatch(text);
-      expect(containerManager.updatePreflightRefusal('a')?.error).toMatch(text);
-    });
-  }
-});
-
 describe('R13-J15: a manager self-update waits for a running lane', () => {
-  it('names a running restore, an op lock and an unparked run, and nothing when all is quiet', async () => {
+  it('names a running restore and an op lock, and nothing when all is quiet', async () => {
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
     expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/dump, restore or replication change is running on a/);
@@ -417,12 +366,6 @@ describe('R13-J15: a manager self-update waits for a running lane', () => {
     expect(fleetBackup.databaseLaneBlocker()).toMatch(/operation 'build' is running on w/);
     release();
     await held;
-    writeRegistry({ fleetFailback: { mode: 'failback', phase: 'seeding' } });
-    fb.live = true;
-    expect(fleetBackup.databaseLaneBlocker()).toMatch(/failback run is running on a/);
-    fb.live = false;
-    expect(fleetBackup.databaseLaneBlocker()).toBeNull();
-    writeRegistry({ fleetFailback: { mode: 'failback', phase: 'wipe-consent', parked: true } });
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
   });
 
@@ -450,16 +393,6 @@ describe('R13-J15: a manager self-update waits for a running lane', () => {
   });
 });
 
-describe('R9-J3: a sender a swap moved away from refuses a later start', () => {
-  it('Start, Restart and Update refuse while the swap record stands, and admit once it is cleared', () => {
-    writeRegistry({ recoverySwappedAway: { at: Date.UTC(2026, 9, 24) } });
-    expect(containerManager.startPreflightRefusal('a')?.error).toMatch(/recovery swap on 2026-10-24 handed this instance's database to another machine/);
-    expect(containerManager.updatePreflightRefusal('a')?.error).toMatch(/recovery swap on 2026-10-24/);
-    (containerManager as any).updateInstanceRecoverySwappedAway('a', null);
-    expect(containerManager.startPreflightRefusal('a')).toBeNull();
-  });
-});
-
 describe('R13-J15: the update scripts and a shutdown wait for a running lane', () => {
   it('a shutdown waits for the backup slot to clear, bounded', async () => {
     expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(true);
@@ -470,11 +403,6 @@ describe('R13-J15: the update scripts and a shutdown wait for a running lane', (
     const bounded = await (fleetBackup as any).waitForInFlightLanes(50, 10);
     fleetBackupGuards.releaseFleetBackupBusy('a');
     expect(bounded).toMatch(/dump, restore or replication change is running on a/);
-  });
-
-  it('a shutdown does not wait on a recorded run that resumes after a restart', async () => {
-    writeRegistry({ fleetFailback: { mode: 'failback', phase: 'seeding' } });
-    expect(await (fleetBackup as any).waitForInFlightLanes(5_000, 10)).toBeNull();
   });
 
   it('the lanes route answers what a recreate would cut short', async () => {

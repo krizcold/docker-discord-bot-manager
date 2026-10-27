@@ -127,14 +127,3 @@ describe('a restore whose fence was stripped once keeps saying a restart clears 
     expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/restart the instance to clear it/);
   });
 });
-
-describe('the named remedy for a fence on a receiver is a step the restore takes', () => {
-  it('a restore on a receiver is refused with the same disarm step the warning names', async () => {
-    const reg = JSON.parse(fs.readFileSync(path.join(tmp.dir, 'instances.json'), 'utf-8'));
-    reg.instances.a.recoveryChannel = { mode: 'receiver' };
-    fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify(reg));
-    const r = await restore();
-    expect(r.success).toBe(false);
-    expect(r.error).toMatch(/The recovery channel is armed on this instance \(receiver\); disarm it before restoring a dump/);
-  });
-});

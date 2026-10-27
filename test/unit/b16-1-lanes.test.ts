@@ -28,8 +28,8 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   runningNonSidecarContainers: async () => [],
   deployedComposeExists: () => true,
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
 }));
 

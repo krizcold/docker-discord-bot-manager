@@ -11,7 +11,7 @@ const cm = vi.hoisted(() => {
   process.env.DATA_DIR = dir;
   process.env.DATA_ROOT = nodePath.join(dir, 'DATA');
   nodeFs.writeFileSync(nodePath.join(dir, 'instances.json'), JSON.stringify({ instances: {
-    'b10-3-op': { id: 'b10-3-op', name: 'b10-3-op', sanitizedName: 'b10-3-op', status: 'stopped', recoveryRescue: true },
+    'b10-3-op': { id: 'b10-3-op', name: 'b10-3-op', sanitizedName: 'b10-3-op', status: 'stopped', fleetDb: { containerName: 'pg', user: 'u', db: 'd', volume: 'v', retiringAt: '2026-10-22T00:00:00.000Z' } },
   } }));
   return { status: 'running' };
 });

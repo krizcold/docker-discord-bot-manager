@@ -20,16 +20,13 @@ import * as dockerClient from '../docker/dockerClient';
 import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import * as fleetBackupGuards from './fleetBackupGuards';
-import * as fleetFailback from './fleetFailback';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
 import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
-import { AppFacts, capabilityRefusal, getAppFacts, postureFromRead, publishCopyBlock, readStandInPosture, unansweredRemedy } from './appLifecycle';
-import { hasAppHooks } from './appHookClient';
-import { rescueRunnerLive } from './recoveryRescue';
+import { AppFacts, capabilityRefusal, getAppFacts, hasAppHooks } from './appHookClient';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
-import { InstanceConfig, FleetDbReplicaRecord, FleetFailbackPhase, FleetFailbackRun, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
+import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
@@ -62,7 +59,7 @@ const READ_TIMEOUT_MS = 30_000;
 
 /** Attempts the automatic re-seed makes before it stops and asks (20.14). */
 export const AUTO_RESEED_MAX_ATTEMPTS = 3;
-/** Minimum spacing between automatic attempts, so a failing re-seed never re-fires on every health tick. */
+/** Minimum spacing between automatic attempts, so a failing re-seed does not start again at once. */
 const AUTO_RESEED_SPACING_MS = 30 * 60_000;
 /** A facts read on the re-seed's entry must not hang it; the hook's default timeout is sized for a promote. */
 const FACTS_TIMEOUT_MS = 10_000;
@@ -103,13 +100,13 @@ function errorText(err: unknown): string {
 /**
  * A seed write the registry refused, by seed: a patch the record still lacks
  * (a commit mark, a park), or the clear of a finished seed. Read into every
- * view of the seed and written again on the next health tick.
+ * view of the seed; the manager tries the write again every minute.
  */
 type HeldSeed = { startedAt: number; patch: Partial<FleetReplicaSeedRecord>; done: boolean; writeError: string };
 const heldSeeds = new Map<string, HeldSeed>();
 /** What a finished seed left for the operator to do, by seed: shown on the standby panel until dismissed or a new seed starts. */
 const seedNotes = new Map<string, { startedAt: number; text: string }>();
-/** The standby record a failed first provision built and could not clear, by seed: cleared on the next health tick or the seed's Dismiss. */
+/** The standby record a failed first provision built and could not clear, by seed: the manager tries the clear again every minute, and the seed's Dismiss clears it now. */
 const heldReplicaClears = new Map<string, { startedAt: number; containerName: string; writeError: string }>();
 
 function replicaClearHeld(botId: string, startedAt: number): boolean {
@@ -139,7 +136,7 @@ function holdSeed(botId: string, startedAt: number, patch: Partial<FleetReplicaS
   const prior = heldSeeds.get(botId);
   const merged = prior && prior.startedAt === startedAt && !prior.done ? { ...prior.patch, ...patch } : patch;
   heldSeeds.set(botId, { startedAt, patch: merged, done, writeError: errorText(err) });
-  console.warn(`[FleetReplica] ${botId}: the seed record could not be written (${errorText(err)}); ${done ? 'the seed finished, and its record is cleared on the next health tick' : 'the change is held in memory and written again on the next health tick'}`);
+  console.warn(`[FleetReplica] ${botId}: the seed record could not be written (${errorText(err)}); ${done ? 'the seed finished, and the manager tries to clear its record again every minute' : 'the change is held in memory, and the manager tries the write again every minute'}`);
 }
 
 /** saveSeed for a mark that must not be lost: a refusal is held, never thrown. */
@@ -171,12 +168,12 @@ export function seedView(instance: InstanceConfig): FleetReplicaSeedRecord | nul
   const view = held && held.startedAt === seed.startedAt ? { ...seed, ...held.patch } : { ...seed };
   if (held && held.startedAt === seed.startedAt && held.patch.parked) view.lastError = `${held.patch.lastError || 'the seed stopped'}; its record could not be written (${held.writeError})`;
   if (view.parked && clear && cleared) {
-    view.lastError = `${view.lastError || 'the seed stopped'}; the standby record could not be cleared (${clear.writeError}), so the manager clears it on its next health tick, and Dismiss clears it now`;
+    view.lastError = `${view.lastError || 'the seed stopped'}; the standby record could not be cleared (${clear.writeError}), so the manager tries the clear again every minute, and Dismiss clears it now`;
   }
   return view;
 }
 
-/** Health tick: write again what a seed could not. */
+/** Run every minute by the fleet backup scheduler: write again what a seed could not. */
 export function retryHeldSeedRecords(): void {
   for (const [botId, held] of [...heldSeeds]) {
     const seed = seedRecord(botId);
@@ -197,36 +194,6 @@ export function retryHeldSeedRecords(): void {
   }
 }
 
-/** The run on record now: a caller's snapshot can predate a Cancel or a Dismiss. */
-function liveFailback(instance: InstanceConfig): FleetFailbackRun | null {
-  const now = containerManager.getBot(instance.id);
-  return (now ? now.fleetFailback : instance.fleetFailback) ?? null;
-}
-
-/**
- * A failback or drop-back run owns this instance's database lanes while it is
- * on record (20.5, B6-i): the by-hand routes would race the very steps it
- * sequences. Only the run itself (its startedAt token) passes.
- */
-function runHold(instance: InstanceConfig, run?: number): string | null {
-  const active = fleetFailback.failbackView(containerManager.getBot(instance.id) ?? instance);
-  if (typeof run === 'number') {
-    if (!active) return 'The failback run that asked is no longer on record (it was cancelled or dismissed); nothing was changed';
-    if (active.startedAt === run) {
-      return active.parked ? `The failback run that asked was stopped (${active.lastError || 'parked'}); nothing was changed` : null;
-    }
-  }
-  if (!active) return null;
-  const phase = fleetFailback.failbackPhaseText(active);
-  if (active.finished) return `A ${active.mode} run finished on this instance, but its record is not cleared yet; Dismiss it on the Database modal first`;
-  if (!active.parked) return `A ${active.mode} run is on this instance (${phase}); wait for it to park or finish (its card on the Database modal then shows its exits)`;
-  if (active.phase === 'wipe-consent' && !active.consentAt) {
-    return `A ${active.mode} run is on this instance (${phase}); answer it on the Database modal first (${active.mode === 'drop-back' ? 'Re-seed this copy' : 'Wipe and re-seed'}, or Cancel)`;
-  }
-  const exits = fleetFailback.cancelableFailback(instance) ? 'Continue, Cancel or Dismiss it' : 'Continue or Dismiss it';
-  return `A ${active.mode} run is on this instance, stopped (${phase}); ${exits} on the Database modal first`;
-}
-
 /** A seed a runner owns right now; a parked one blocks nothing. */
 function seedRunning(botId: string): boolean {
   const bot = containerManager.getBot(botId);
@@ -239,46 +206,15 @@ export function seedBuiltRecord(rec: FleetDbReplicaRecord | null | undefined, se
   return !!rec && !!seed && rec.copyCleared !== true && typeof rec.seededBy === 'number' && rec.seededBy === seed.startedAt;
 }
 
-/**
- * Transfers asking the app to promote this instance's copy right now. The
- * request leaves no record while it waits, and removing the copy mid-promote
- * takes the fleet's next database away.
- */
-const promotesInFlight = new Map<string, number>();
-
-export async function whilePromoting<T>(botId: string, fn: () => Promise<T>): Promise<T> {
-  promotesInFlight.set(botId, (promotesInFlight.get(botId) ?? 0) + 1);
-  try {
-    return await fn();
-  } finally {
-    const left = (promotesInFlight.get(botId) ?? 1) - 1;
-    if (left > 0) promotesInFlight.set(botId, left);
-    else promotesInFlight.delete(botId);
-  }
-}
-
 /** Why a Remove replica must not run now, from the live record; null when nothing is in flight. */
 function removalHold(botId: string, containerName: string): string | null {
   const now = containerManager.getBot(botId);
   if (!now?.fleetDbReplica || now.fleetDbReplica.containerName !== containerName) {
     return 'The standby record changed while the removal was being checked; look again';
   }
-  const held = runHold(now);
-  if (held) return held;
   if (seedRunning(botId)) return 'A seed is running on this standby; wait for it to finish';
   const busyOp = containerManager.isBotBusy(botId);
   if (busyOp) return `Operation '${busyOp}' is running on this instance; wait for it to finish`;
-  return promoteHold(now);
-}
-
-/** A transfer that is promoting, or may be promoting, this instance's copy. */
-function promoteHold(instance: InstanceConfig): string | null {
-  const run = instance.fleetTransfer;
-  if (run && !run.parked) return `A transfer is running on this instance (${run.phase}); wait for it to finish`;
-  if (run?.phase === 'promoting') {
-    return 'A transfer stopped while the app was promoting this copy, and the app may still be promoting it; check its Fleet view, then Continue or Dismiss the transfer first';
-  }
-  if (promotesInFlight.has(instance.id)) return 'A Transfer is asking the app to promote this copy right now; wait for its answer';
   return null;
 }
 
@@ -424,7 +360,6 @@ export function autoReseedOutlook(instance: InstanceConfig, now: number = Date.n
   const attempts = ledger?.attempts ?? 0;
   if (attempts >= AUTO_RESEED_MAX_ATTEMPTS) return { remaining: 0, nextAt: null, none: `it stopped after ${attempts} attempts; fix the cause, then use Re-seed now` };
   if (instance.fleetDbReplicaSeed?.cancelled === true) return { remaining: 0, nextAt: null, none: 'the last re-seed was cancelled, so nothing retries it; use Re-seed now when you want it' };
-  if (instance.fleetFailback) return { remaining: 0, nextAt: null, none: `a ${instance.fleetFailback.mode} run holds this copy, so the automatic re-seed does not run until that run ends` };
   return { remaining: AUTO_RESEED_MAX_ATTEMPTS - attempts, nextAt: ledger ? Math.max(now, ledger.lastAttemptAt + AUTO_RESEED_SPACING_MS) : now, none: null };
 }
 
@@ -592,7 +527,7 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
   const held = heldSeeds.get(instance.id);
   const note = seedNotes.get(instance.id);
   if (seedDone(instance) && held) {
-    status.seedNote = `The standby was provisioned; its seed record could not be cleared (${held.writeError}). The manager clears it on its next health tick, and Dismiss clears it now`;
+    status.seedNote = `The standby was provisioned; its seed record could not be cleared (${held.writeError}). The manager tries the clear again every minute, and Dismiss clears it now`;
     status.seedNoteStartedAt = held.startedAt;
   } else if (note && !seed) {
     status.seedNote = note.text;
@@ -839,8 +774,6 @@ function startProvisioning(
  * database on this manager, and asks before clearing a replica volume that
  * already exists.
  */
-const FAILBACK_PAST_WIPE: ReadonlySet<FleetFailbackPhase> = new Set(['seeding', 'applying', 'catching-up', 'promoting', 'adopting', 'restarting']);
-
 export function provisionFleetReplica(
   instance: InstanceConfig,
   primaryDsn: string,
@@ -848,10 +781,8 @@ export function provisionFleetReplica(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
-  opts: { run?: number; confirmVolume?: string } = {},
+  opts: { confirmVolume?: string } = {},
 ): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
-  const held = runHold(instance, opts.run);
-  if (held) return { success: false, error: held };
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
@@ -871,19 +802,10 @@ export function provisionFleetReplica(
     return { success: false, error: 'This app declares no fleet control plane - a standby belongs beside a fleet worker' };
   }
   const folded = foldedRoleValue(controlPlane.roleEnv, instance.envVars?.[controlPlane.roleEnv.key]);
-  // The failback run's own seed is exempt: a returning master keeps its master
-  // role by design and mid-failback follows another node's database by
-  // posture, which is what this gate asserts. Keyed on the record, not the
-  // bare token, so only the run on this instance holds it.
-  const inRun = typeof opts.run === 'number' && liveFailback(instance)?.startedAt === opts.run;
-  // So is the state a dismissed failback leaves once its seed retired this
-  // machine's own database (a decline recorded at seeding or later): the node
-  // still follows another node's database by posture, and this lane is the
-  // by-hand exit the run's park text names. The settle clears the decline.
-  // A re-seed as a stale primary that retired this machine's own database leaves the same posture, run or no run.
-  const afterRetire = (instance.fleetFailbackDeclined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(instance.fleetFailbackDeclined.phase))
-    || (!!instance.fleetOwnDbRetiredAt && !instance.fleetDb);
-  if (!inRun && !afterRetire && !controlPlane.roleEnv.dialsOut.includes(folded)) {
+  // A re-seed as a stale primary that retired this machine's own database leaves
+  // the node following another node's database while it keeps its master role.
+  const afterRetire = !!instance.fleetOwnDbRetiredAt && !instance.fleetDb;
+  if (!afterRetire && !controlPlane.roleEnv.dialsOut.includes(folded)) {
     return { success: false, error: `A replica belongs beside a fleet worker (set ${controlPlane.roleEnv.key} to ${controlPlane.roleEnv.dialsOut.join(' or ')} first)` };
   }
   if (!containerManager.deployedComposeExists(instance.id)) {
@@ -897,8 +819,7 @@ export function provisionFleetReplica(
   if (registryUnread) return { success: false, error: registryUnread };
   const collision = containerManager.getAllBots().find(other =>
     other.fleetDb?.replication?.hostPort === port
-    || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port)
-    || other.recoveryChannel?.tunnelPort === port);
+    || (other.id !== instance.id && other.fleetDbReplica?.hostPort === port));
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
@@ -914,10 +835,7 @@ export function provisionFleetReplica(
   }
 
   const record = replicaRecordFor(instance, validated.intake);
-  // The failback's wipe consent covers this volume: its stale-primary seed
-  // clears the same volume unasked, and a retry after that seed parked
-  // finds the volume it made.
-  const confirmVolume = inRun && typeof liveFailback(instance)?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const confirmVolume = opts.confirmVolume;
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
 
@@ -926,40 +844,6 @@ export function provisionFleetReplica(
   const started = startProvisioning(instance, record, validated.intake, 'provision', undefined, undefined, confirmVolume);
   if (!started.success) return started;
   return { success: true, started: true };
-}
-
-/**
- * Provision the first standby from the copy block the bot itself holds (a
- * designated backup receives it on register, 20.14), so a joined machine
- * needs no paste. Every guard is provisionFleetReplica's; only where the
- * intake comes from differs.
- */
-export async function provisionFleetReplicaFromFacts(
-  instance: InstanceConfig,
-  publicHost: string,
-  hostPort?: number,
-  confirm?: boolean,
-  confirmVolume?: string,
-): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string }> {
-  const held = runHold(instance);
-  if (held) return { success: false, error: held };
-  if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
-  if (!hasAppHooks(instance)) return { success: false, error: 'This app declares no lifecycle hooks, so the manager cannot read the copy block from it; paste the block instead' };
-  const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
-  if (!facts.success) return { success: false, error: `Could not read the copy block from the app: ${facts.error}` };
-  const block = facts.facts?.copyBlock;
-  if (!block?.dsn || !block.cert) {
-    return { success: false, error: 'The bot holds no copy block (only a designated backup receives one from the master); paste the block from the primary machine instead' };
-  }
-  // The app's own verdict: a block inherited from a former master names a
-  // fenced database, and a standby seeded from it would follow the wrong side.
-  if (facts.facts?.copyBlockCurrent === false) {
-    return { success: false, error: 'The block this node holds names a database that is not the one the fleet follows now (it came from a former master). The current primary\'s block reaches this node only at its next registration with that primary, once that primary\'s manager has published it (opening its Replication section does): restart this bot after that, or paste that block instead' };
-  }
-  if (facts.facts?.copyBlockCurrent !== true) {
-    return { success: false, error: 'The app did not say whether its block is current; paste the block from the primary machine instead' };
-  }
-  return provisionFleetReplica(instance, block.dsn, block.cert, publicHost, hostPort, confirm, { confirmVolume });
 }
 
 /**
@@ -1220,7 +1104,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
       } catch (err) {
         if (typeof builtBy !== 'number') throw new Error(`standby service start failed: ${apply.error}; the standby record could not be cleared (${errorText(err)}), so Remove replica clears it`);
         heldReplicaClears.set(instance.id, { startedAt: builtBy, containerName: record.containerName, writeError: errorText(err) });
-        console.warn(`[FleetReplica] ${instance.id}: the standby record could not be cleared after its service failed to start (${errorText(err)}); it is cleared on the next health tick`);
+        console.warn(`[FleetReplica] ${instance.id}: the standby record could not be cleared after its service failed to start (${errorText(err)}); the manager tries the clear again every minute`);
       }
     }
     throw new Error(`standby service start failed: ${apply.error}`);
@@ -1286,26 +1170,14 @@ function unreadCopyRefusal(instance: InstanceConfig, rec: FleetDbReplicaRecord, 
  * orphaned and retains WAL: the caller must surface that loudly.
  */
 export async function removeFleetReplica(instance: InstanceConfig, opts: { confirmPromoted?: boolean } = {}): Promise<{ success: boolean; error?: string; needsConfirm?: boolean }> {
-  const held = runHold(instance);
-  if (held) return { success: false, error: held };
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'No replica on this instance' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
   const hold = removalHold(instance.id, rec.containerName);
   if (hold) return { success: false, error: hold };
-  // A stand-in's copy IS the fleet's database (20.5): removing it takes the
-  // fleet down. Judged from the app's fact alone (B6 map F34); a silent app
-  // or an ended lane is not refused here. The copy's own database is read
-  // next, and a running copy that does not answer refuses: the exit then is
-  // stopping its container, after which this removal keeps the volume and
-  // records what it held as unknown.
-  const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
-  const standing = posture.read === 'ok' ? posture.posture : null;
-  if (standing?.role === 'stand-in' && standing.live) {
-    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing it would take the fleet's database down. It returns to standby duty through the failback, or by hand after a manual promote or demote` };
-  }
-  // A copy promoted by hand reads no posture at all, and the app may be
-  // serving the fleet from it until it is adopted.
+  // A running copy that does not answer refuses: the exit then is stopping its
+  // container, after which this removal keeps the volume and records what it
+  // held as unknown. A promoted copy may be serving the fleet until it is adopted.
   const copyState = await copyHeld(rec);
   if (copyState === 'unanswered' || copyState === 'no-identity') {
     const after = `Remove replica keeps the volume and records what it held as unknown${copyState === 'no-identity' ? '; a Provision after that stamps the identity' : ''}`;
@@ -1314,8 +1186,8 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
   if (copyState === 'promoted' && !opts.confirmPromoted) {
     return { success: false, needsConfirm: true, error: "This copy no longer follows a primary: it was promoted, so the fleet may be serving from it now, and it may hold writes no other database has. Adopt it below to keep it as this machine's database. Removing it takes its container down at once; the volume is kept, and a later Provision here asks before clearing it" };
   }
-  // The posture read can take seconds; a seed, a build or a transfer that
-  // started meanwhile would write back or wipe what this removal leaves.
+  // The copy read can take seconds; a seed or a build that started
+  // meanwhile would write back or wipe what this removal leaves.
   const holdAfterRead = removalHold(instance.id, rec.containerName);
   if (holdAfterRead) return { success: false, error: holdAfterRead };
   // Claimed in the same synchronous segment as the check above: a seed, build
@@ -1340,35 +1212,6 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
 }
 
 /**
- * A rescue keeps the app file's database service in the bot folder while it copies into the volume. After a Cancel,
- * the mark on the record is what keeps a kept volume holding a partial copy or a standby from being started.
- */
-function rescueRemovalRefusal(instance: InstanceConfig, keepData: boolean): string | null {
-  const rescue = instance.recoveryRescue;
-  if (rescue) {
-    if (['promote', 'teardown', 'flip'].includes(rescue.phase)) {
-      if (!rescue.parked) {
-        return `A database rescue on this instance is finishing the swap (phase ${rescue.phase}); wait for it to end, then try Remove again. Nothing was removed`;
-      }
-      return `A database rescue on this instance is past promotion (phase ${rescue.phase}) and has to finish the swap, which needs the bot folder. Finish it with Continue on the rescue block. Nothing was removed`;
-    }
-    const doing = rescue.parked ? `is parked at phase ${rescue.phase}` : `is running (phase ${rescue.phase}) and may be copying into the database volume`;
-    return `A database rescue on this instance ${doing}. Removing the instance would delete its bot folder, which holds the copy of the app file the rescue puts the database back from. Cancel the rescue on its rescue block first. Nothing was removed`;
-  }
-  if (rescueRunnerLive(instance.id)) {
-    return 'The rescue cancelled on this instance is still stopping its last step; try again in a moment. Nothing was removed';
-  }
-  const left = instance.recoveryRescueLeft;
-  if (left && keepData) {
-    const day = new Date(left.at).toISOString().slice(0, 10);
-    const what = left.state === 'partial' ? "a partial copy of the sender's database" : "this instance's database as a standby of the sender";
-    const volume = instance.fleetDb ? ` ${instance.fleetDb.volume}` : '';
-    return `A rescue cancelled on ${day} left ${what} on the database volume${volume}. Removing the instance and keeping its data would drop the record of that, and the kept volume could later be started as if it held a whole database. Start a rescue again to finish the copy, or decommission this database on its Database modal first. Nothing was removed`;
-  }
-  return null;
-}
-
-/**
  * Why Remove must not run on this instance now; null when it may. A delete
  * that also deletes data reaches the fleet database only through decommission
  * (its safety dump is the ruled permit), a standby copy only through Remove
@@ -1380,18 +1223,7 @@ export async function instanceRemovalRefusal(
   confirmFleetData: boolean,
   confirmPromoted = false,
 ): Promise<{ error: string; needsConfirm?: true; confirmFlag?: 'confirmFleetData' | 'confirmPromoted' } | null> {
-  const held = runHold(instance);
-  if (held) return { error: held };
-  const rescue = rescueRemovalRefusal(instance, keepData);
-  if (rescue) return { error: rescue };
   if (instance.fleetDbReplica) {
-    const promoting = promoteHold(instance);
-    if (promoting) return { error: `${promoting}. Nothing was removed` };
-    const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
-    const standing = posture.read === 'ok' ? posture.posture : null;
-    if (standing?.role === 'stand-in' && standing.live) {
-      return { error: `This instance's database copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; removing the instance would take the fleet's database down. Nothing was removed` };
-    }
     // Remove takes the copy's container down whether or not it keeps the data.
     const copyState = await copyHeld(instance.fleetDbReplica);
     if (copyState === 'unanswered' || copyState === 'no-identity') {
@@ -1528,7 +1360,7 @@ function companionEnvKeys(botId: string): string[] {
  * serve the fleet database comes back after the pair failed over to the other
  * one, and its copy is a fork nobody may ever read again. This turns it into an
  * ordinary standby of the new primary, so the whole fleet is back to one
- * database with one copy and failback is the normal planned handover.
+ * database with one copy.
  *
  * Re-seed rather than pg_rewind: enable turns wal_log_hints on, so a rewind
  * is possible on any cluster that has run enable, but no code calls pg_rewind
@@ -1544,16 +1376,12 @@ export function reseedStalePrimary(
   publicHost: string,
   hostPort?: number,
   confirm?: boolean,
-  opts: { dumpDone?: boolean; run?: number; confirmVolume?: string } = {},
+  opts: { dumpDone?: boolean; confirmVolume?: string } = {},
 ): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
-  const held = runHold(instance, opts.run);
-  if (held) return { success: false, error: held };
   if (!instance.fleetDb) {
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
   }
   if (instance.fleetDbReplica) return { success: false, error: 'A replica already exists on this instance - remove it first' };
-  if (instance.recoveryChannel) return { success: false, error: 'A recovery channel is armed on this database - disarm it first' };
-  if (instance.recoveryRescue) return { success: false, error: 'A database rescue is in progress on this instance - finish or cancel it first' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
@@ -1584,8 +1412,7 @@ export function reseedStalePrimary(
   // the retire below runs, and reusing it is the normal outcome.
   const collision = containerManager.getAllBots().find(other =>
     (other.id !== instance.id
-      && (other.fleetDb?.replication?.hostPort === port || other.fleetDbReplica?.hostPort === port))
-    || other.recoveryChannel?.tunnelPort === port);
+      && (other.fleetDb?.replication?.hostPort === port || other.fleetDbReplica?.hostPort === port)));
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
@@ -1603,10 +1430,7 @@ export function reseedStalePrimary(
   }
 
   const record = replicaRecordFor(instance, validated.intake);
-  // The same rule as provisionFleetReplica: the failback run's wipe consent
-  // covers the replica volume, and every other caller confirms it by name.
-  const inRun = typeof opts.run === 'number' && liveFailback(instance)?.startedAt === opts.run;
-  const confirmVolume = inRun && typeof liveFailback(instance)?.consentAt === 'number' ? record.volume : opts.confirmVolume;
+  const confirmVolume = opts.confirmVolume;
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
 
@@ -1629,9 +1453,7 @@ export function reseedStalePrimary(
     // instance took its whole compose project down, so the database comes
     // back up alone to be dumped. A volume PROVEN absent has nothing to
     // protect, and starting the sidecar would mint an empty database whose
-    // dump would pose as the safety copy. The failback run dumps under its
-    // own fence before it parks for consent (F5), and that consent names the
-    // dump's outcome, so it arrives here with the dump done.
+    // dump would pose as the safety copy.
     let fenced = false;
     const fenceOwner = fleetBackup.newFenceOwner('reseed');
     try {
@@ -1782,13 +1604,9 @@ export async function decommissionFleetDb(
     return await containerManager.withExternalBotOp(botId, 'decommission', async () => {
       const instance = containerManager.getBot(botId);
       if (!instance?.fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
-      const held = runHold(instance);
-      if (held) return { success: false, error: held };
       const refusal = capabilityRefusal(instance);
       if (refusal) return { success: false, error: refusal };
       if (instance.fleetDbReplica) return { success: false, error: 'This instance also holds a standby copy - remove or adopt it before decommissioning the primary database' };
-      if (instance.recoveryChannel) return { success: false, error: 'A recovery channel is armed on this database - disarm it first' };
-      if (instance.recoveryRescue) return { success: false, error: 'A database rescue is in progress on this instance - finish or cancel it first' };
       if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running on this instance' };
       if (instance.status === 'running') {
         return { success: false, error: 'Stop the instance first: decommission destroys the database it is running on' };
@@ -1972,10 +1790,7 @@ function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string |
  */
 export async function adoptPromotedReplica(
   instance: InstanceConfig,
-  opts: { run?: number } = {},
 ): Promise<{ success: boolean; error?: string; restartRequired?: boolean }> {
-  const held = runHold(instance, opts.run);
-  if (held) return { success: false, error: held };
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to adopt' };
   if (instance.fleetDb) return { success: false, error: 'This instance already hosts a fleet database' };
@@ -1999,20 +1814,6 @@ export async function adoptPromotedReplica(
   // primary and invite a second Enable to fork the pair.
   if (status.live.inRecovery !== false) {
     return { success: false, error: 'This copy is still following a primary, so it is not this machine\'s database yet. Promote this node first (its own web UI), then adopt' };
-  }
-  // Out of recovery says nothing about WHY (B6 map F34): a stand-in's copy is
-  // promoted too, and filing it would make a temporary copy this machine's
-  // own for good. Only the app's fact tells the two apart, so no fact, no adopt.
-  const posture = await readStandInPosture(instance, FACTS_TIMEOUT_MS);
-  if (posture.read === 'unanswered') {
-    return { success: false, error: `The app on this instance is not answering (${posture.error}), so the manager cannot tell whether this copy stands in for a dead master or was promoted for good; ${unansweredRemedy(posture.error)} before adopting` };
-  }
-  const standing = posture.read === 'ok' ? posture.posture : null;
-  if (standing?.role === 'stand-in' && standing.live) {
-    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)} (20.5): it is the fleet's database only until the failback, and adopting it would file a temporary copy as this machine's own. Promote this node by hand first if it should become the true master, then adopt` };
-  }
-  if (standing?.role === 'stand-in') {
-    return { success: false, error: `This copy took the fleet's writes as a stand-in for ${shortId(standing.coveringNodeId)} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}) with those writes still only here; adopting would file them under a node that no longer serves the fleet. Promote this node by hand first (its own web UI), then adopt` };
   }
 
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
@@ -2193,27 +1994,6 @@ async function readCopyCredential(rec: FleetDbReplicaRecord): Promise<{ user: st
 }
 
 /**
- * The stand-in's manager gives its bot the block for the PROMOTED copy it
- * serves from, so the bot relays it to the node it stands in for on register
- * (B6 map F32): the source the failback re-seeds the returning master from.
- * Only when the bot says it is the block's target, and only until it holds a
- * block naming this copy. Nothing is filed (F33).
- */
-export async function publishStandInCopyBlock(instance: InstanceConfig, facts: AppFacts): Promise<void> {
-  const rec = instance.fleetDbReplica;
-  if (!rec || facts.copyBlockTarget !== true || containerManager.isBotBusy(instance.id)) return;
-  const held = facts.copyBlock?.dsn ? (() => { try { return new URL(facts.copyBlock!.dsn); } catch { return null; } })() : null;
-  if (held && held.hostname === rec.publicHost && (Number(held.port) || 5432) === rec.hostPort) return;
-  const block = await getStandInCopyBlock(instance);
-  if (!block.success || !block.dsn || !block.cert) {
-    console.warn(`[FleetReplica] ${instance.displayName}: the stand-in's copy block could not be produced for its bot: ${block.error}`);
-    return;
-  }
-  const published = await publishCopyBlock(instance, { dsn: block.dsn, cert: block.cert });
-  if (!published.success) console.warn(`[FleetReplica] ${instance.displayName}: the stand-in's copy block was not published to its bot: ${published.error}`);
-}
-
-/**
  * Cancel the seed a runner owns (preparing or seeding: the seed container is
  * removed by name, which ends pg_basebackup and releases the op lock, and the
  * runner clears the record at its next boundary check), or dismiss a parked
@@ -2247,7 +2027,7 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
     try {
       clearSeed(instance.id);
     } catch (err) {
-      return { success: false, error: `The standby was provisioned, but its seed record still could not be cleared (${errorText(err)}); the manager retries on its next health tick` };
+      return { success: false, error: `The standby was provisioned, but its seed record still could not be cleared (${errorText(err)}); the manager tries the clear again every minute` };
     }
     // A note the same seed left (the Restart note) shows next, with its own Dismiss.
     return { success: true, dismissed: true };
@@ -2305,7 +2085,7 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
       try {
         clearHeldReplica(instance.id);
       } catch (err) {
-        return { success: false, error: `The standby record this seed built still could not be cleared (${errorText(err)}), so the stopped seed was not dismissed; the manager retries on its next health tick` };
+        return { success: false, error: `The standby record this seed built still could not be cleared (${errorText(err)}), so the stopped seed was not dismissed; the manager tries the clear again every minute` };
       }
     }
     try {
@@ -2333,25 +2113,16 @@ export async function cancelReplicaSeed(instance: InstanceConfig, request: SeedC
   return { success: true };
 }
 
-/** A failback run past its wipe consent, or a decline at seeding or later, retired this machine's own database earlier. */
-function seedAfterRetire(instance: InstanceConfig): boolean {
-  const run = instance.fleetFailback;
-  if (run) return run.mode === 'failback' && run.consentAt !== null;
-  const declined = instance.fleetFailbackDeclined;
-  return declined?.mode === 'failback' && FAILBACK_PAST_WIPE.has(declined.phase);
-}
-
 /** The question a Cancel or Dismiss asks, worded from the record and, for a whole copy, from its container's state now. */
 async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): Promise<string> {
   const instance = containerManager.getBot(botId);
   const rec = instance?.fleetDbReplica;
   const parked = seed.parked === true;
-  const afterRetire = !!instance && seedAfterRetire(instance);
   const clearHeld = parked && replicaClearHeld(botId, seed.startedAt);
   const whole = parked && seedBuiltRecord(rec, seed) && !clearHeld;
   let tail = '';
   if (whole && rec) {
-    const next = instance?.fleetFailback ? 'Continue on the run card starts its container' : 'pressing Build on its card, then Apply (or Start if the instance is stopped), starts its container';
+    const next = 'pressing Build on its card, then Apply (or Start if the instance is stopped), starts its container';
     const running = await containerRunning(rec.containerName);
     tail = running === true
       ? 'Its standby container is running. Dismissing this note keeps the copy.'
@@ -2360,7 +2131,7 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
         : `The manager can't confirm whether its standby container is running (docker did not answer). Dismissing this note keeps the copy; if the container is not running, ${next}.`;
   }
   const gone = clearHeld
-    ? `${afterRetire ? "This machine's own database was already retired earlier in the failback run. " : ''}The standby service did not start. Dismissing this note clears the standby record that start left; the replica volume stays.`
+    ? `The standby service did not start. Dismissing this note clears the standby record that start left; the replica volume stays.`
     : seed.purpose === 'reseed-stale-primary'
       ? (whole
         ? `This instance's own database has already been retired. The copy from the node now holding the fleet is complete. ${tail}`
@@ -2370,10 +2141,8 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
           ? `The copy is complete. ${tail}`
           : 'The old copy has already been cleared, so this standby holds nothing usable until it is re-seeded or removed.')
         : whole
-          ? `${afterRetire ? 'This machine\'s own database was already retired earlier in the failback run. ' : ''}The copy is complete and kept on record. ${tail}`
-          : afterRetire
-            ? 'The partial copy stays in the replica volume, unused. This machine\'s own database was already retired earlier in the failback run, so this node is an ordinary worker without a standby until it is re-seeded.'
-            : 'The partial copy stays in the replica volume, unused; nothing else on this instance is affected.';
+          ? `The copy is complete and kept on record. ${tail}`
+          : 'The partial copy stays in the replica volume, unused; nothing else on this instance is affected.';
   const committed = seed.committed === true;
   if (parked) return `Dismiss this stopped seed?${committed ? `\n\n${gone}` : ''}`;
   return `Cancel this seed?\n\nThe copy stops at its next step.\n\n${committed ? gone : 'Nothing has been deleted by this run yet.'}`;
@@ -2448,13 +2217,7 @@ export function coveredOverRefusal(facts: Pick<AppFacts, 'backupMaster' | 'copyB
  * recovery is refused whoever asks; the copy must also be up, unless the
  * manager itself already cleared it, when there is nothing left to protect.
  */
-export async function reseedStandby(instance: InstanceConfig, trigger: 'automatic' | 'operator', opts: { consentedRun?: number } = {}): Promise<{ success: boolean; error?: string; started?: boolean }> {
-  const held = runHold(instance, opts.consentedRun);
-  if (held) return { success: false, error: held };
-  // The drop-back run's consent (F32 under F5) is what re-seeds a promoted copy
-  // that took the fleet's writes as a stand-in: the operator saw the verdict.
-  const consenting = liveFailback(instance);
-  const consented = opts.consentedRun !== undefined && consenting?.startedAt === opts.consentedRun && consenting.consentAt !== null;
+export async function reseedStandby(instance: InstanceConfig, trigger: 'automatic' | 'operator'): Promise<{ success: boolean; error?: string; started?: boolean }> {
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to re-seed' };
   if (seedRunning(instance.id)) return { success: false, error: 'A seed is already running on this instance' };
@@ -2464,29 +2227,6 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   const capability = capabilityRefusal(instance);
   if (capability) return { success: false, error: capability };
   const status = await getFleetReplicaStatus(instance);
-  // The app's explicit stand-in posture outranks the recovery reading (20.5,
-  // B6 map F34/F35): a serving copy IS the fleet's database, and a peer's copy
-  // keeps its place for the failback. Judged BEFORE the ledger: a freeze can
-  // last hours, and counting it as attempts would latch the automatic re-seed
-  // off for good. One facts read serves this and the copy block below.
-  const factsRead = hasAppHooks(instance) ? await getAppFacts(instance, FACTS_TIMEOUT_MS) : null;
-  const posture = postureFromRead(instance, factsRead);
-  const standing = posture.read === 'ok' ? posture.posture : null;
-  const promotedCopy = status.live?.running === true && status.live.inRecovery === false;
-  if (standing?.role === 'stand-in' && standing.live) {
-    return { success: false, error: `This copy is standing in for ${shortId(standing.coveringNodeId)}${standing.holdsWrites ? ' and holds the fleet\'s writes' : ''}; re-seeding it would destroy the database the fleet is on. It returns to standby duty through the failback, or by hand after a manual promote` };
-  }
-  if (standing?.role === 'stand-in' && promotedCopy && !consented) {
-    return { success: false, error: `This copy took the fleet's writes as a stand-in for ${shortId(standing.coveringNodeId)} and the lane ended (${standing.disarmReason ?? 'no reason recorded'}); re-seeding would discard writes that may exist only here. Promote this node by hand to keep them, or remove the replica and provision it again to discard them` };
-  }
-  if (standing?.role === 'peer') {
-    return { success: false, error: `The fleet is being served by a stand-in for ${shortId(standing.coveringNodeId)}, whose database this copy follows; it keeps its place for the failback and is not re-seeded until that settles` };
-  }
-  if (standing?.role === 'covered') {
-    return { success: false, error: standing.namesThisNode === false
-      ? coveredOverRefusal(factsRead?.facts ?? null)
-      : `This copy is the returning master's, held for the failback from ${standing.standInNodeId ? `its stand-in ${shortId(standing.standInNodeId)}` : 'the node holding the fleet'}; it is the copy the failback promotes, so it is not re-seeded from here` };
-  }
   if (trigger === 'operator') patchLedger(instance.id, () => undefined);
   ledgerAttempt(instance.id, trigger);
   const refuse = (error: string): { success: false; error: string } => {
@@ -2494,14 +2234,9 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     return { success: false, error };
   };
 
-  // An unanswered app is a failure the ledger exists to latch (the attempt
-  // cap stops the automatic retry), unlike the freezes above.
-  if (posture.read === 'unanswered') {
-    return refuse(`The app on this instance is not answering (${posture.error}), so the manager cannot tell whether this copy is standing in for a dead master; ${unansweredRemedy(posture.error)} before re-seeding it`);
-  }
   // Never re-seeded over, whoever asks and whatever a stopped run left behind:
   // a promoted copy is the database its fleet now serves.
-  if (status.live?.running && status.live.inRecovery !== true && !consented) {
+  if (status.live?.running && status.live.inRecovery !== true) {
     return refuse('This copy has been promoted and no longer follows a primary; adopt it or remove it instead of re-seeding');
   }
   // The copy must be up to be proven unpromoted, unless the manager itself
@@ -2516,7 +2251,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
     return refuse('The standby container is not running, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and press Build on its card, then Apply (or Start if the instance is stopped), if a stopped re-seed took the standby service out of its compose');
   }
   if (!hasAppHooks(instance)) return refuse('This app declares no lifecycle hooks, so the manager cannot obtain the copy block; remove the replica and provision it again by hand');
-  const facts = factsRead ?? await getAppFacts(instance, FACTS_TIMEOUT_MS);
+  const facts = await getAppFacts(instance, FACTS_TIMEOUT_MS);
   if (!facts.success) return refuse(`Could not read the copy block from the app: ${facts.error}`);
   const block = facts.facts?.copyBlock;
   if (!block?.dsn || !block.cert) {

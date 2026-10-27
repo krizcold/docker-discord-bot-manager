@@ -42,12 +42,7 @@ describe('api() with a lost answer', () => {
 describe('write catches say the op may still be running and re-read', () => {
   const cases: [string, unknown[], string][] = [
     ['decommissionFleetDb', ['b1'], 'loadBots'],
-    ['appDemote', ['b1'], 'loadBots'],
     ['restoreFleetBackupFile', ['b1', 'x.dump'], 'loadBots'],
-    ['startRecoveryRescue', ['b1'], 'renderRecoveryChannel'],
-    ['startRecoverySwap', ['b1'], 'renderRecoveryChannel'],
-    ['cancelFailback', ['b1'], 'renderFleetReplica'],
-    ['openFailback', ['b1'], 'renderFleetReplica'],
     ['adoptPromotedReplica', ['b1'], 'loadBots'],
     ['enableFleetReplication', ['b1'], 'renderFleetReplication'],
     ['fetchSource', ['s1'], 'loadSources'],
@@ -66,29 +61,13 @@ describe('write catches say the op may still be running and re-read', () => {
         refuseBadNumbers: () => false, botLabel: (id: string) => id, isTransientStatus: () => false,
         hideFleetBackups: () => {}, showFleetBackups: () => {}, hideAddSourceModal: () => {}, renderBots: () => {},
       };
-      for (const r of ['loadBots', 'loadSources', 'renderRecoveryChannel', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
+      for (const r of ['loadBots', 'loadSources', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
       const ctx = runPage([fn, ...fns('showNoAnswer', 'waitForSourceUrl', 'restoreSharersText')], g);
       await ctx[fn](...args);
       expect(messages.some(hedged)).toBe(true);
       expect(calls).toContain(reread);
     });
   }
-});
-
-describe('the recovery channel section', () => {
-  it('does not offer a fresh start when the rescue read fails, and polls again', async () => {
-    const body: any = { innerHTML: '', isConnected: true };
-    const timers: unknown[] = [];
-    const ctx = runPage(fns('readRecoveryRescue', 'pollRecoveryChannel').concat(['renderRecoveryChannel', 'renderRescueBlock', 'escapeHtml']), {
-      document: { getElementById: () => body }, fleetBackupBotId: 'b1', setTimeout: (f: unknown) => timers.push(f),
-      loadBots: () => {},
-      api: async (_m: string, ep: string) => ep.endsWith('recovery-channel') ? { success: true, channel: { armed: false } } : { success: false, error: 'busy' },
-    });
-    vm.runInContext('var recoveryChannelSeq = 0; var recoveryLastPhase = {}; var SWAP_PHASES = ["quiesce","catchup","promote","teardown","flip"];', ctx);
-    await ctx.renderRecoveryChannel('b1');
-    expect(body.innerHTML).not.toContain('Arm receiver');
-    expect(timers.length).toBe(1);
-  });
 });
 
 describe('the remaining write catches say the op may still be running and re-read', () => {
@@ -98,9 +77,6 @@ describe('the remaining write catches say the op may still be running and re-rea
     ['setBotWebAuth', ['b1', 'off'], 'loadBots'],
     ['dropFleetSlot', ['b1', 'slot1'], 'renderFleetReplication'],
     ['disableFleetReplication', ['b1'], 'renderFleetReplication'],
-    ['armRecoveryReceiver', ['b1'], 'renderRecoveryChannel'],
-    ['disarmRecoveryChannel', ['b1'], 'renderRecoveryChannel'],
-    ['dismissTransfer', ['b1'], 'renderFleetReplica'],
     ['removeFleetReplica', ['b1', false, false], 'renderFleetReplica'],
     ['cancelReplicaSeed', ['b1', false, false, 'seed', ''], 'loadBots'],
     ['deleteSource', ['s1'], 'loadSources'],
@@ -123,7 +99,7 @@ describe('the remaining write catches say the op may still be running and re-rea
         showMessage: (t: string, m: string) => messages.push([t, m]), lockBtns: () => () => {},
         refuseBadNumbers: () => false, botLabel: (id: string) => id, renderSeedBanner: async () => {}, hideEditSourceModal: () => {},
       };
-      for (const r of ['loadBots', 'loadSources', 'loadVault', 'renderRecoveryChannel', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
+      for (const r of ['loadBots', 'loadSources', 'loadVault', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
       const ctx = runPage([fn, ...fns('showNoAnswer')], g);
       await ctx[fn](...args);
       expect(messages.some(hedged)).toBe(true);
@@ -133,7 +109,7 @@ describe('the remaining write catches say the op may still be running and re-rea
 });
 
 describe('a provisioning request whose answer was lost', () => {
-  for (const [fn, ep] of [['provisionFleetReplicaFromFacts', 'from-facts'], ['provisionFleetReplica', 'fleet-replica'], ['reseedStalePrimary', 'fleet-reseed']]) {
+  for (const [fn, ep] of [['provisionFleetReplica', 'fleet-replica'], ['reseedStalePrimary', 'fleet-reseed']]) {
     it(`${fn} re-reads the instance and refuses a second press while it checks`, async () => {
       const messages: string[][] = [];
       const calls: string[] = [];
@@ -171,87 +147,7 @@ describe('a provisioning request whose answer was lost', () => {
 });
 
 describe('the env editor database check', () => {
-  it('armRecoverySource hedges a lost answer and re-reads (its brace literal defeats the function scanner)', () => {
-    const at = pageHtml.indexOf('async function armRecoverySource(');
-    const body = pageHtml.slice(at, pageHtml.indexOf('async function disarmRecoveryChannel(', at));
-    expect(body).toMatch(/catch \(err\) \{\s*showNoAnswer\('sender arming'\);\s*\}\s*renderRecoveryChannel\(botId\)/);
-  });
   it('says the test got no answer when the request throws', () => {
     expect(pageFunction('saveEnvEditor')).toMatch(/connection test got no answer/);
-  });
-});
-
-describe('a swap whose record closed', () => {
-  const swap = { startedAt: 111, completedAt: 222 };
-  let timers: unknown[] = [];
-  const run = async (bot: unknown) => {
-    const body: any = { innerHTML: '', isConnected: true };
-    timers = [];
-    const ctx = runPage(fns('readRecoveryRescue', 'pollRecoveryChannel').concat(['renderRecoveryChannel', 'renderRescueBlock', 'escapeHtml']), {
-      document: { getElementById: () => body }, fleetBackupBotId: 'b1', setTimeout: (t: unknown) => timers.push(t), loadBots: () => {},
-      api: async (_m: string, ep: string) => ep.endsWith('recovery-channel') ? { success: true, channel: { armed: false } }
-        : ep.endsWith('recovery-rescue') ? { success: true, rescue: null }
-          : bot ? { success: true, bot } : { success: false, error: 'busy' },
-    });
-    vm.runInContext('var recoveryChannelSeq = 0; var recoveryLastPhase = { b1: { phase: "flip", startedAt: 111, waits: 0 } }; var SWAP_PHASES = ["quiesce","catchup","promote","teardown","flip"];', ctx);
-    await ctx.renderRecoveryChannel('b1');
-    return body.innerHTML as string;
-  };
-  it('says the fleet is starting and keeps polling while the start runs', async () => {
-    for (const fields of [{ status: 'building' }, { status: 'starting' }, { status: 'stopped', activeOp: 'start' }]) {
-      const html = await run({ id: 'b1', ...fields, recoveryLastSwap: swap, fleetDb: { replication: { publicHost: 'h' } } });
-      expect(html).toMatch(/fleet is starting/);
-      expect(html).not.toMatch(/Start it from the bot list/);
-      expect(timers.length).toBe(1);
-    }
-  });
-  it('does not claim a start it has not read, and keeps polling', async () => {
-    const html = await run({ id: 'b1', status: 'stopped', activeOp: null, recoveryLastSwap: swap, fleetDb: { replication: { publicHost: 'h' } } });
-    expect(html).toMatch(/this machine now holds the primary/);
-    expect(html).not.toMatch(/fleet is starting/);
-    expect(html).toMatch(/has not shown yet/);
-    expect(timers.length).toBe(1);
-  });
-  it('does not claim the swap finished when the flip did not stamp it', async () => {
-    const html = await run({ id: 'b1', status: 'running', fleetDb: { replication: { publicHost: 'h' } } });
-    expect(html).not.toMatch(/swap finished/);
-    expect(html).toMatch(/can't confirm/);
-  });
-  it('does not claim the swap finished on a stamp from an earlier swap', async () => {
-    const html = await run({ id: 'b1', status: 'running', recoveryLastSwap: { startedAt: 5, completedAt: 6 }, fleetDb: { replication: { publicHost: 'h' } } });
-    expect(html).not.toMatch(/swap finished/);
-  });
-  it('states that this machine holds the primary and the fleet runs', async () => {
-    const html = await run({ id: 'b1', status: 'running', recoveryLastSwap: swap, fleetDb: { replication: { publicHost: 'h' } } });
-    expect(html).toMatch(/this machine now holds the primary/);
-    expect(html).toMatch(/fleet is running/);
-  });
-  it('states that the fleet did not start', async () => {
-    const html = await run({ id: 'b1', status: 'error', recoveryLastSwap: swap, fleetDb: { replication: { publicHost: 'h' } } });
-    expect(html).toMatch(/this machine now holds the primary/);
-    expect(html).toMatch(/did not start/);
-    expect(timers.length).toBe(0);
-  });
-  it('states that the swap did not make this machine the primary', async () => {
-    const html = await run({ id: 'b1', status: 'stopped', fleetDbReplica: { slot: 's' } });
-    expect(html).toMatch(/did not make this machine the primary/);
-  });
-  it('hedges only when the instance cannot be read', async () => {
-    const html = await run(null);
-    expect(html).toMatch(/can't confirm/);
-  });
-});
-
-describe('the armed receiver with no rescue record', () => {
-  it('forgets the last swap phase so a later disarm reports no swap outcome', async () => {
-    const body: any = { innerHTML: '', isConnected: true };
-    const ctx = runPage(fns('readRecoveryRescue', 'pollRecoveryChannel').concat(['renderRecoveryChannel', 'renderRescueBlock', 'escapeHtml']), {
-      document: { getElementById: () => body }, fleetBackupBotId: 'b1', setTimeout: () => {}, loadBots: () => {},
-      api: async (_m: string, ep: string) => ep.endsWith('recovery-channel') ? { success: true, channel: { armed: true, mode: 'receiver', publicHost: 'h', tunnelPort: 1 } }
-        : { success: true, rescue: null },
-    });
-    vm.runInContext('var recoveryChannelSeq = 0; var recoveryLastPhase = { b1: { phase: "catchup", startedAt: 1, waits: 0 } }; var SWAP_PHASES = ["quiesce","catchup","promote","teardown","flip"];', ctx);
-    await ctx.renderRecoveryChannel('b1');
-    expect(vm.runInContext('recoveryLastPhase.b1', ctx)).toBeUndefined();
   });
 });

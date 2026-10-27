@@ -49,8 +49,8 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     applyFleetDbReplicaService: async () => ({ success: false, error: 'fake apply failure' }),
   };
 });
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
 }));
 

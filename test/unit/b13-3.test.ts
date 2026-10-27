@@ -57,7 +57,7 @@ describe('every built card renders a Build control', () => {
 });
 
 describe('remedies name the Build control', () => {
-  const texts = [src('instance/fleetReplica.ts'), src('instance/fleetFailback.ts'), src('docker/containerManager.ts'), pageHtml];
+  const texts = [src('instance/fleetReplica.ts'), src('docker/containerManager.ts'), pageHtml];
   it('no remedy tells the operator to press Update or to rebuild the instance', () => {
     for (const t of texts) {
       expect(t).not.toMatch(/press Update|Press Update|Press Start \(or Update\)/);
@@ -66,6 +66,5 @@ describe('remedies name the Build control', () => {
   });
   it('the stopped re-seed remedy names Build', () => {
     expect(src('instance/fleetReplica.ts')).toContain('press Build on its card');
-    expect(src('instance/fleetFailback.ts')).toContain('press Build on its card');
   });
 });

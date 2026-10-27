@@ -59,8 +59,7 @@ const sourceDb = { containerName: 'bot-s-postgres', user: 'app', db: 'app', volu
 function seedRegistry(extra: Record<string, unknown> = {}): void {
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: {
     a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'stopped', fleetDb, fleetBackup: { enabled: false, hour: 4, keep: 7 }, ...extra },
-    s: { id: 's', displayName: 's', sanitizedName: 'bot-s', status: 'stopped', fleetDb: sourceDb, fleetBackup: { enabled: false, hour: 4, keep: 7 },
-      recoveryChannel: { mode: 'source', containerName: 'bot-s-recovery', token: 't', createdAt: 1 }, recoverySwappedAway: { at: 1 } },
+    s: { id: 's', displayName: 's', sanitizedName: 'bot-s', status: 'stopped', fleetDb: sourceDb, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
   } }, null, 2));
 }
 
@@ -119,9 +118,9 @@ describe('B20-1t, B11-2t: fleetBackup reads have a bound, its writes do not', ()
 
   it('the fence lift (a write) gets no timeout', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    // The read-only layer names the failback run that lifts it.
-    h.answer = (args) => args.join(' ').includes("pg_read_file('smdb-fence-owner', true)") ? { stdout: 'on|failback:1\n' } : { stdout: '' };
-    expect(await fb.liftConsentFence('a', fleetDb, 'failback:1', 'x')).toBe('lifted');
+    // The read-only layer names the restore that lifts it.
+    h.answer = (args) => args.join(' ').includes("pg_read_file('smdb-fence-owner', true)") ? { stdout: 'on|restore:1\n' } : { stdout: '' };
+    expect(await fb.liftLaneFence('a', fleetDb, 'restore:1', 'a restore', 'x')).toBe('');
     const lift = h.calls.find(c => c.args.join(' ').includes('ALTER SYSTEM RESET'));
     expect(lift).toBeDefined();
     expect(lift!.opts?.timeout).toBeUndefined();
@@ -143,15 +142,17 @@ describe('B11-2t: fleetReplication reads the container state with a bound', () =
 
 describe('B20-1t: the backup tick skips while its previous run is in flight', () => {
   it('a second tick during a hung first one starts nothing', async () => {
-    seedRegistry({ fleetConsentFenceLeft: [{ containerName: fleetDb.containerName, owner: 'failback:1' }] });
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    h.answer = (args) => args[0] === 'inspect' ? 'hang' : { stdout: '' };
+    // The start finds a restore's fence left on, so every tick re-probes that database.
+    h.answer = (args) => args[0] === 'inspect' ? { stdout: 'true\n' } : args.join(' ').includes('pg_read_file') ? { stdout: 'on|0|restore:1|\n' } : { stdout: '' };
     let tick: () => void = () => {};
     const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((fn: () => void) => { tick = fn; return 0; }) as unknown as typeof setInterval);
     fb.startFleetBackupScheduler();
     spy.mockRestore();
     try {
       await settle();
+      expect(fb.getFleetFenceStuck('a')).not.toBeNull();
+      h.answer = (args) => args[0] === 'inspect' ? 'hang' : { stdout: '' };
       const afterSeed = h.calls.length;
       tick();
       await settle();
@@ -166,22 +167,8 @@ describe('B20-1t: the backup tick skips while its previous run is in flight', ()
   });
 });
 
-describe('B16-1w: a manager stop does not wait on the slot a quiesced recovery source holds', () => {
-  it('the shutdown wait passes a quiesced source slot at once, and a self-update still refuses on it', async () => {
-    const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    const guards = await import('../../src/instance/fleetBackupGuards');
-    expect(guards.claimFleetBackupBusy('s')).toBe(true);
-    try {
-      const began = Date.now();
-      expect(await fb.waitForInFlightLanes(2_000, 10)).toBeNull();
-      expect(Date.now() - began).toBeLessThan(1_000);
-      expect(fb.databaseLaneBlocker()).toMatch(/running on s$/);
-    } finally {
-      guards.releaseFleetBackupBusy('s');
-    }
-  });
-
-  it('a slot held on any other instance is still waited on', async () => {
+describe('B16-1w: a manager stop waits on a held backup slot', () => {
+  it('a slot held on an instance is waited on', async () => {
     const fb = await fresh(() => import('../../src/instance/fleetBackup'));
     const guards = await import('../../src/instance/fleetBackupGuards');
     expect(guards.claimFleetBackupBusy('a')).toBe(true);
@@ -189,22 +176,6 @@ describe('B16-1w: a manager stop does not wait on the slot a quiesced recovery s
       expect(await fb.waitForInFlightLanes(50, 10)).toMatch(/running on a$/);
     } finally {
       guards.releaseFleetBackupBusy('a');
-    }
-  });
-
-  it('a quiesced source whose op lock is held is still waited on', async () => {
-    const fb = await fresh(() => import('../../src/instance/fleetBackup'));
-    const guards = await import('../../src/instance/fleetBackupGuards');
-    const cm = await import('../../src/docker/containerManager');
-    expect(guards.claimFleetBackupBusy('s')).toBe(true);
-    let release: () => void = () => {};
-    const op = cm.withExternalBotOp('s', 'quiesce', () => new Promise<void>((r) => { release = r; }));
-    try {
-      expect(await fb.waitForInFlightLanes(50, 10)).toMatch(/running on s$/);
-    } finally {
-      release();
-      await op;
-      guards.releaseFleetBackupBusy('s');
     }
   });
 });

@@ -109,7 +109,7 @@ const writeRegistry = (extra: Record<string, unknown> = {}): void => {
 };
 
 const bot = () => containerManager.getBot('b1')!;
-const enable = (opts?: { rotateCert?: boolean }) => enableFleetReplication(bot(), 'primary.invalid', 15432, undefined, opts);
+const enable = () => enableFleetReplication(bot(), 'primary.invalid', 15432);
 const ran = (re: RegExp) => h.calls.filter(c => re.test(`${c.args.join(' ')}\n${c.stdin}`));
 const hbaWrites = () => h.calls.filter(c => c.args.join(' ').includes('pg_hba.conf'));
 
@@ -175,25 +175,6 @@ describe('the replication lane is serialized per instance', () => {
   });
 });
 
-describe('the recovery lanes keep their replication login', () => {
-  it('refuses an Enable that would mint a credential while a recovery channel is armed', async () => {
-    writeRegistry({ recoveryChannel: { mode: 'source', containerName: 'bot1-recovery', token: 't', createdAt: 1 } });
-    const res = await enable();
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/recovery channel is armed/);
-    expect(ran(/ROLE replicator/)).toEqual([]);
-  });
-
-  it('refuses Disable while a rescue record exists', async () => {
-    writeRegistry({ fleetDb: { ...fleetDb, replication }, recoveryRescue: { phase: 'catchup', startedAt: 1 } });
-    const res = await disableFleetReplication(bot());
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/recovery rescue is recorded/);
-    expect(ran(/NOLOGIN/)).toEqual([]);
-    expect(bot().fleetDb!.replication).toBeDefined();
-  });
-});
-
 describe('Disable counts every walsender of the replication role', () => {
   it('refuses while a replication connection holds no active slot', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
@@ -209,7 +190,7 @@ describe('Disable counts every walsender of the replication role', () => {
 
 describe('the server certificate pair', () => {
   it('writes both files under .new names and renames them only once both are written', async () => {
-    const res = await enable({ rotateCert: true });
+    const res = await enable();
     expect(res.success).toBe(true);
     const writes = ran(/cat > \S*server\.(key|crt)/);
     expect(writes.map(c => /cat > (\S+)/.exec(c.args.join(' '))![1])).toEqual([
@@ -220,7 +201,7 @@ describe('the server certificate pair', () => {
 
   it('leaves the installed pair alone and runs no reload when the certificate write fails', async () => {
     h.failWhen = /server\.crt\.new/;
-    const res = await enable({ rotateCert: true });
+    const res = await enable();
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/installed pair was not changed/);
     expect(ran(/mv -f/)).toEqual([]);
@@ -242,12 +223,6 @@ describe('certRotated says whether a pair was installed over an existing one', (
   it('is true on a re-enable after a Disable, where the old cert stays on disk', async () => {
     const res = await enable();
     expect(res.success).toBe(true);
-    expect(res.certRotated).toBe(true);
-  });
-
-  it('is true on rotateCert with an unchanged host', async () => {
-    writeRegistry({ fleetDb: { ...fleetDb, replication } });
-    const res = await enable({ rotateCert: true });
     expect(res.certRotated).toBe(true);
   });
 

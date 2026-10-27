@@ -202,10 +202,10 @@ describe('B09-2 review: an unreadable store is not a missing value', () => {
       fleetBackupBotId: null, fleetBackupStoredKeep: null,
       document: { getElementById: (id: string) => id === 'fleet-backup-content' ? content : { classList: { remove: () => {} } } },
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
-      renderSeedBanner: () => {}, renderFleetReplication: () => {}, renderRecoveryChannel: () => {},
+      renderSeedBanner: () => {}, renderFleetReplication: () => {},
       api: async () => ({ success: true, backups: [] }),
     });
-    for (const fn of ['showFleetBackups', 'fleetBackupListHtml', 'fleetBackupErrorHtml', 'swappedAwayHtml']) vm.runInContext(pageFunction(fn), ctx);
+    for (const fn of ['showFleetBackups', 'fleetBackupListHtml', 'fleetBackupErrorHtml']) vm.runInContext(pageFunction(fn), ctx);
     await ctx.showFleetBackups('b1');
     return content.innerHTML as string;
   };

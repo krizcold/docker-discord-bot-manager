@@ -24,15 +24,13 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
-import * as recoveryRescue from '../../src/instance/recoveryRescue';
 import { createBotRoutes } from '../../src/webui/routes/bots';
 
 afterAll(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
 
 const fleetDb = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
 fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances: {
-  a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb,
-    recoveryChannel: { mode: 'receiver', containerName: 'bot-a-recovery', token: 't', createdAt: 1 } },
+  a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb },
 } }, null, 2));
 
 const router: any = createBotRoutes({ clients: new Set() } as any);
@@ -54,17 +52,14 @@ describe('R13-J15: a shutting-down manager admits no new lane', () => {
     fleetBackupGuards.releaseFleetBackupBusy('a');
   });
 
-  it('after SIGTERM the backup slot, a restore, a rescue and the bot routes refuse, and nothing runs', async () => {
+  it('after SIGTERM the backup slot, a restore and the bot routes refuse, and nothing runs', async () => {
     containerManager.beginShutdown();
     tmp.docker.length = 0;
     expect(fleetBackupGuards.claimFleetBackupBusy('a')).toBe(false);
     const restore = await fleetBackup.restoreFleetBackup('a', 'fleet-2026-10-24.dump');
     expect(restore.success).toBe(false);
     expect(restore.error).toMatch(/^The manager is shutting down/);
-    const rescue = await recoveryRescue.startRescue(containerManager.getBot('a')!, true);
-    expect(rescue.success).toBe(false);
-    expect(rescue.error).toMatch(/^The manager is shutting down/);
-    for (const url of ['/a/start', '/a/update', '/a/restart', '/a/fleet-backups/restore', '/a/recovery-rescue', '/a/request-update', '/a']) {
+    for (const url of ['/a/start', '/a/update', '/a/restart', '/a/fleet-backups/restore', '/a/request-update', '/a']) {
       const r = await gate(url === '/a' ? 'DELETE' : 'POST', url);
       expect(r.passed).toBe(false);
       expect(r.status).toBe(503);
@@ -72,6 +67,5 @@ describe('R13-J15: a shutting-down manager admits no new lane', () => {
     }
     expect((await gate('GET', '/a/fleet-backups')).passed).toBe(true);
     expect(tmp.docker).toEqual([]);
-    expect(containerManager.getBot('a')?.recoveryRescue).toBeUndefined();
   });
 });

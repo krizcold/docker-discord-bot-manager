@@ -96,7 +96,7 @@ describe('B07-4: every tab is told when an op lock is released', () => {
 
   it('a logged op that fails ends with the same closing push', async () => {
     const reg = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
-    reg.instances.b1.recoveryRescue = { startedAt: '2026-10-22T00:00:00.000Z' };
+    reg.instances.b1.fleetDb = { containerName: 'pg', user: 'u', db: 'd', volume: 'v', retiringAt: '2026-10-22T00:00:00.000Z' };
     fs.writeFileSync(registryPath, JSON.stringify(reg));
     const result = await containerManager.startBot('b1');
     expect(result.success).toBe(false);

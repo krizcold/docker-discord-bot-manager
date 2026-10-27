@@ -35,8 +35,8 @@ vi.mock('../../src/config/appCapabilities', async (importOriginal) => ({
     },
   }),
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   getAppFacts: async (bot: { id: string }) => {
     const f = tmp.facts[bot.id];
     return f ? { success: true, facts: f } : { success: false, error: 'no answer' };
@@ -50,8 +50,8 @@ import YAML from 'yaml';
 import * as envManager from '../../src/env/manager';
 import { createBotRoutes } from '../../src/webui/routes/bots';
 
-const ids = ['b1', 'b2', 'b3', 'b4', 'b5'];
-const live = { running: true, initialized: true, role: 'master', superseded: null, followerHold: null };
+const ids = ['b1', 'b2', 'b3', 'b4'];
+const live = { running: true, initialized: true, role: 'master', superseded: null };
 
 beforeEach(() => {
   delete process.env.APP_DOMAIN;
@@ -76,7 +76,6 @@ beforeEach(() => {
     b1: live,
     b2: { ...live, initialized: false },
     b3: { ...live, superseded: { byNodeId: 'x', byNodeName: 'x', term: 2, retireRequested: false, at: 1, source: 'peer', steppedDown: true } },
-    b5: { ...live, followerHold: { reason: 'behind', standInNodeId: 'x', standInName: 'x', observedTerm: 2, localTerm: 1, seenVia: 'peer', since: 1, following: 'x', namesThisNode: true } },
   };
 });
 
@@ -106,10 +105,6 @@ describe('the wizard master list asks each app whether it is a live master', () 
     const got = (await masters()).masters.map((x: any) => x.id);
     expect(got).not.toContain('b2');
     expect(got).not.toContain('b3');
-  });
-
-  it('leaves out a master that follows a stand-in under a follower hold', async () => {
-    expect((await masters()).masters.map((x: any) => x.id)).not.toContain('b5');
   });
 
   it('leaves out a node whose app reports a role other than master', async () => {

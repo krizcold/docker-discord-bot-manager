@@ -37,8 +37,7 @@ export const REPLICATION_ROLE = 'replicator';
 const FLEET_SLOT_PREFIX = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;
 // Bounded slot retention (PLAN_REPLICATION.md RC-1): an absent standby must
-// fill the bound, not the disk - in the rescue direction the source is a
-// personal computer. Invalidation falls back to a fresh seed by design.
+// fill the bound, not the disk. Invalidation falls back to a fresh seed by design.
 const DEFAULT_SLOT_WAL_KEEP_MB = 4096;
 const PGDATA = '/var/lib/postgresql/data';
 const EXEC_TIMEOUT_MS = 30_000;
@@ -263,7 +262,7 @@ export function enableFleetReplication(
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
-  opts: { rotateCert?: boolean; fromRescue?: boolean; admit?: Admission; dbPassword?: string } = {},
+  opts: { admit?: Admission; dbPassword?: string } = {},
 ): Promise<EnableResult> {
   return inReplicationLane<EnableResult>(instance.id, 'Enable', async () => {
     const fresh = containerManager.getBot(instance.id);
@@ -280,9 +279,8 @@ type Admission = (instance: InstanceConfig) => Promise<string | null>;
 type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number };
 
 /**
- * One replication lane per instance: Enable, Disable and the internal
- * enablers (adopt, failback adopt, rescue flip) take the instance's op lock,
- * so a start, rebuild, seed or decommission and a second Enable or Disable
+ * One replication lane per instance: Enable, Disable and the adopt take the
+ * instance's op lock, so a start, rebuild, seed or decommission and a second Enable or Disable
  * refuse while one runs, and the backup slot, so no dump or restore runs
  * beside it.
  */
@@ -301,19 +299,12 @@ async function inReplicationLane<T extends { success: boolean; error?: string }>
   }
 }
 
-/** The recovery lanes log in as the replication role: a new credential or a revoked login would cut them off. */
-function recoveryRefusal(instance: InstanceConfig, action: string): string | null {
-  if (instance.recoveryChannel) return `A recovery channel is armed on this instance and logs in as the replication role; disarm it before you ${action} (nothing was changed)`;
-  if (instance.recoveryRescue) return `A recovery rescue is recorded on this instance and its channel logs in as the replication role; finish or cancel it before you ${action} (nothing was changed)`;
-  return null;
-}
-
 async function enableInLane(
   instance: InstanceConfig,
   publicHost: string,
   hostPort: number | undefined,
   slotWalKeepMb: number | undefined,
-  opts: { rotateCert?: boolean; fromRescue?: boolean; dbPassword?: string },
+  opts: { dbPassword?: string },
 ): Promise<EnableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
@@ -336,8 +327,7 @@ async function enableInLane(
   }
   const collision = containerManager.getAllBots().find(other =>
     (other.id !== instance.id && other.fleetDb?.replication?.hostPort === port)
-    || other.fleetDbReplica?.hostPort === port
-    || other.recoveryChannel?.tunnelPort === port);
+    || other.fleetDbReplica?.hostPort === port);
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
@@ -357,12 +347,6 @@ async function enableInLane(
   if (fleetDb.replication && !fleetDb.replication.password) {
     return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable replication and re-enable it to mint a fresh credential (existing standbys must then be re-seeded).' };
   }
-  // The rescue flip runs while its own record exists, and its channel is
-  // disarmed by then.
-  if (!fleetDb.replication && !opts.fromRescue) {
-    const recovery = recoveryRefusal(instance, 'enable replication');
-    if (recovery) return { success: false, error: recovery };
-  }
   const recordAtStart = JSON.stringify(fleetDb);
 
   const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
@@ -378,10 +362,7 @@ async function enableInLane(
   const plain = { addrs: [...new Set([...live.addrs, ...(fleetDb.replication?.keptPlain ?? fleetDb.keptPlain ?? []), ...own])].sort() };
 
   const previousCertHost = fleetDb.replication?.certHost;
-  // rotateCert: the caller knows PGDATA was replaced wholesale (the RC-4
-  // rescue rsyncs the SOURCE's pair in), so the certHost shortcut would keep
-  // a cert naming the other machine and the copy block could never verify.
-  const cert = await ensureServerCert(fleetDb.containerName, host, opts.rotateCert ? undefined : previousCertHost);
+  const cert = await ensureServerCert(fleetDb.containerName, host, previousCertHost);
   if (cert.error) return { success: false, error: cert.error };
   const certRotated = cert.rotated;
   const failed = (error: string): EnableResult => ({
@@ -484,8 +465,6 @@ async function disableInLane(
 ): Promise<DisableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
-  const recovery = recoveryRefusal(instance, 'disable replication');
-  if (recovery) return { success: false, error: recovery };
   const disableRecordAtStart = JSON.stringify(fleetDb);
   const dbPassword = storedDbPassword(instance);
   if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
@@ -529,8 +508,6 @@ async function disableInLane(
   // database, so the record says a Disable is under way until it finishes:
   // an interrupted one is then shown, and pressing Disable again finishes it.
   const before = containerManager.getBot(instance.id);
-  const lateRecovery = before ? recoveryRefusal(before, 'disable replication') : null;
-  if (lateRecovery) return { success: false, error: lateRecovery };
   if (JSON.stringify(before?.fleetDb) !== disableRecordAtStart) {
     return { success: false, error: "The instance's database record changed while this Disable ran its checks (nothing was disabled); check the Replication section, then press Disable replication again" };
   }
@@ -659,7 +636,7 @@ export interface FleetReplicationStatus {
      * Every physical slot on this primary, joined to the link streaming on it
      * (active_pid to pg_stat_replication.pid); an invalidated one means its
      * standby must re-seed. fleet marks the standby slots this manager family
-     * mints; the recovery channel's slot is not one.
+     * mints.
      */
     slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null }>;
     /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */

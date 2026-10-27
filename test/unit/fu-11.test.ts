@@ -12,8 +12,6 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import * as dockerClient from '../../src/docker/dockerClient';
-import * as health from '../../src/instance/fleetReplicationHealth';
-import type { StandInPosture } from '../../src/instance/appLifecycle';
 
 const src = (p: string): string => fs.readFileSync(path.join(__dirname, '../../src', p), 'utf8');
 
@@ -25,33 +23,6 @@ describe('FU-11 B10-1t a log line docker did not stamp carries no time', () => {
       { timestamp: '2026-10-22T00:00:00.000000000Z', message: 'hello', stream: 'stdout' },
       { timestamp: null, message: 'a continued line', stream: 'stdout' },
     ]);
-  });
-});
-
-describe('FU-11 B11-3t the stopped covered-primary text follows holdReason', () => {
-  const posture = (over: Partial<StandInPosture>): StandInPosture => ({
-    role: 'covered', live: true, standInNodeId: 'abcdef123456', coveringNodeId: null, holdsWrites: true, since: null,
-    gate: null, disarmReason: null, holdReason: 'behind', namesThisNode: true, followsDelivered: true, ...over,
-  } as StandInPosture);
-  const cases: Partial<StandInPosture>[] = [
-    { namesThisNode: false },
-    { namesThisNode: true, followsDelivered: false },
-    { namesThisNode: null },
-    { namesThisNode: true, followsDelivered: true },
-  ];
-
-  it.each(cases)('a copy in recovery is never called the copy that is behind (%o)', (over) => {
-    const text = health.stoppedCoveredText(posture({ ...over, holdReason: 'copy' }));
-    expect(text).toMatch(/^Instance is stopped/);
-    expect(text).toContain("this database is a copy of that node's");
-    expect(text).not.toContain('the copy that is behind');
-    expect(text).not.toContain('re-seed');
-  });
-
-  it.each(cases)('a database that is behind still says so and asks for the re-seed (%o)', (over) => {
-    const text = health.stoppedCoveredText(posture({ ...over, holdReason: 'behind' }));
-    expect(text).toContain('this database is the copy that is behind');
-    expect(text).toContain('re-seed it as a standby of that node');
   });
 });
 

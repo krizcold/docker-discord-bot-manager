@@ -13,14 +13,7 @@ import { seedDefaultSources } from './source/sourceManager';
 import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startFleetBackupScheduler, stopFleetBackupScheduler, waitForInFlightLanes } from './instance/fleetBackup';
-import { startFleetReplicationHealth, stopFleetReplicationHealth } from './instance/fleetReplicationHealth';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
-import { parkInterruptedTransfers } from './instance/fleetTransfer';
-import { parkInterruptedFailbacks } from './instance/fleetFailback';
-import { startFleetReplicaAuto, stopFleetReplicaAuto } from './instance/fleetReplicaAuto';
-import { startRecoveryChannelReconciler, stopRecoveryChannelReconciler } from './instance/recoveryChannel';
-import { startRecoveryControlServer, stopRecoveryControlServer } from './instance/recoveryControl';
-import { resumeRecoveryRescues } from './instance/recoveryRescue';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 import { warnOnOpenDataRoot } from './config/fileModes';
@@ -112,8 +105,6 @@ async function main(): Promise<void> {
   await bootPass('Transient status reset', resetTransientStatuses);
   await bootPass('Container state sync', syncContainerStates);
   await bootPass('Replica seed park', parkInterruptedReplicaSeeds);
-  await bootPass('Transfer park', parkInterruptedTransfers);
-  await bootPass('Failback park', parkInterruptedFailbacks);
 
   // Start web server
   console.log('[Init] Starting web server...');
@@ -128,19 +119,6 @@ async function main(): Promise<void> {
   // Start fleet Postgres sidecar backup scheduler
   startFleetBackupScheduler();
 
-  // Start the replication health sampler (feeds the instance list's badges)
-  startFleetReplicationHealth();
-
-  // Automatic re-seed of a standby whose slot the primary reports lost (20.14)
-  startFleetReplicaAuto();
-
-  // Keep armed recovery-channel relays alive (the record survives; the helper must too)
-  startRecoveryChannelReconciler();
-
-  // Recovery-channel source control plane + resumable receiver rescues (RC-3)
-  startRecoveryControlServer();
-  resumeRecoveryRescues();
-
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
   startStateReconciler(() => wss.clients.size);
 }
@@ -150,33 +128,23 @@ const SHUTDOWN_LANE_WAIT_MS = 120_000;
 
 // Handle graceful shutdown
 let shuttingDown = false;
-process.on('SIGTERM', () => {
+function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   beginShutdown();
-  console.log('[Shutdown] Received SIGTERM, shutting down...');
+  console.log(`[Shutdown] Received ${signal}, shutting down...`);
   stopSourceUpdater();
   stopInstanceUpdater();
   stopFleetBackupScheduler();
-  stopFleetReplicationHealth();
-  stopFleetReplicaAuto();
-  stopRecoveryChannelReconciler();
   void waitForInFlightLanes(SHUTDOWN_LANE_WAIT_MS).then(lane => {
     if (lane) console.error(`[Shutdown] Exiting with a lane still running, which is cut short: ${lane}`);
-    stopRecoveryControlServer();
     stopStateReconciler();
     process.exit(0);
   });
-});
+}
 
-process.on('SIGINT', () => {
-  console.log('[Shutdown] Received SIGINT, shutting down...');
-  stopSourceUpdater();
-  stopInstanceUpdater();
-  stopFleetBackupScheduler();
-  stopStateReconciler();
-  process.exit(0);
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Handle uncaught errors
 process.on('uncaughtException', (error) => {

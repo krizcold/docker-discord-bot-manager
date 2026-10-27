@@ -22,7 +22,6 @@ vi.mock('child_process', async (importOriginal) => {
   return { ...real, execFile };
 });
 import { LOG_CAP_RUN_ARGS } from '../../src/templates/logCaps';
-import { ensureRsyncDaemon } from '../../src/instance/recoveryControl';
 import { generateImageCompose } from '../../src/templates/compose';
 import { addFleetPostgresReplicaService, addFleetPostgresService, processComposeForCasaOS } from '../../src/templates/pcsProcessing';
 
@@ -99,20 +98,8 @@ describe('every compose the manager writes caps its container logs', () => {
     expect(opts.some(o => /^max-file=\d+$/.test(o))).toBe(true);
   });
 
-  it('the rsync daemon run passes the log cap as docker options, before the image', async () => {
-    calls.length = 0;
-    await ensureRsyncDaemon({ id: 'i1', fleetDb: { volume: 'v1' } } as any, 'example/rsync:1', 'net1');
-    const run = calls.find(c => c[0] === 'run');
-    expect(run).toBeTruthy();
-    const image = run!.indexOf('example/rsync:1');
-    const size = run!.findIndex((v, i) => run![i - 1] === '--log-opt' && v.startsWith('max-size='));
-    expect(size).toBeGreaterThan(0);
-    expect(size).toBeLessThan(image);
-    expect(run![run!.indexOf('--log-driver') + 1]).toBe('json-file');
-  });
-
   it('every long-lived docker run the manager starts spreads the log cap', () => {
-    for (const file of ['instance/recoveryChannel.ts', 'instance/recoveryControl.ts', 'instance/recoveryRescue.ts', 'manager/selfUpdate.ts']) {
+    for (const file of ['manager/selfUpdate.ts']) {
       const src = fs.readFileSync(path.join(__dirname, '../../src', file), 'utf8');
       const runs = src.match(/'run',\s*'-d'[\s\S]*?\]/g) ?? [];
       expect(runs.length, file).toBeGreaterThan(0);

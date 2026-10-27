@@ -61,10 +61,6 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     },
   };
 });
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
-  readStandInPosture: async () => ({ read: 'none' }),
-}));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
   getDeploymentMode: async () => 'docker',

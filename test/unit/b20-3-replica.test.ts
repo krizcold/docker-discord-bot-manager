@@ -70,11 +70,6 @@ describe('the automatic re-seed outlook names the attempts left and when none re
     expect(out.none).toMatch(/cancelled/);
   });
 
-  it('says nothing retries while a failback run holds the lane', () => {
-    writeRegistry();
-    const out = fleetReplica.autoReseedOutlook(at(undefined, { fleetFailback: { mode: 'failback', startedAt: 1, phase: 'seeding', parked: true } }), now);
-    expect(out.none).toMatch(/failback run holds this copy/);
-  });
 });
 
 describe('Provision after a re-seed retired this node\'s own database', () => {

@@ -20,9 +20,6 @@ import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
-import * as recoveryChannel from '../../instance/recoveryChannel';
-import * as recoveryRescue from '../../instance/recoveryRescue';
-import { getReplicationHealth } from '../../instance/fleetReplicationHealth';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -36,12 +33,9 @@ import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContaine
 import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
-import { hasAppHooks } from '../../instance/appHookClient';
+import { getAppFacts, hasAppHooks } from '../../instance/appHookClient';
 import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
-import * as appLifecycle from '../../instance/appLifecycle';
 import { isAutoRebuilding } from '../../instance/instanceUpdater';
-import * as fleetTransfer from '../../instance/fleetTransfer';
-import * as fleetFailback from '../../instance/fleetFailback';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
 
@@ -58,7 +52,7 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 
 // The computed health keys every bot record carries to the page, so a push
 // never replaces them with the raw record's fleetBackup config.
-function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null; replicationHealth: ReturnType<typeof getReplicationHealth> } {
+function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null } {
   return {
     fleetBackup: bot.fleetDb ? {
       lastAt: bot.lastFleetBackupAt || null,
@@ -69,7 +63,6 @@ function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> 
       ...fleetBackup.effectiveFleetBackup(bot),
     } : null,
     fenceStuck: fleetBackup.getFleetFenceStuck(bot.id),
-    replicationHealth: getReplicationHealth(bot.id),
   };
 }
 
@@ -88,8 +81,7 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
     live.add(bot.id);
     let health: ReturnType<typeof botHealth>;
     try { health = botHealth(bot); } catch { continue; }
-    const rh = health.replicationHealth;
-    const key = JSON.stringify([health.fleetBackup, health.fenceStuck, rh ? { ...rh, checkedAt: undefined } : null]);
+    const key = JSON.stringify([health.fleetBackup, health.fenceStuck]);
     if (seen.get(bot.id) === key) continue;
     seen.set(bot.id, key);
     changed.push({ id: bot.id, ...health });
@@ -416,10 +408,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
             slots.push(Promise.resolve(unanswered()));
             continue;
           }
-          slots.push(appLifecycle.getAppFacts(bot, FLEET_MASTER_FACTS_TIMEOUT_MS).then(read => {
+          slots.push(getAppFacts(bot, FLEET_MASTER_FACTS_TIMEOUT_MS).then(read => {
             const f = read.success ? read.facts : undefined;
             if (!f) return unanswered();
-            return f.running && f.initialized && f.role === 'master' && !f.superseded && !f.followerHold ? entry : null;
+            return f.running && f.initialized && f.role === 'master' && !f.superseded ? entry : null;
           }, unanswered));
         } catch {
           // an unreadable instance must not break the list
@@ -1837,10 +1829,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const repl = bot.fleetDb?.replication;
-      const result: Awaited<ReturnType<typeof fleetReplica.decommissionFleetDb>> & { copyBlockNote?: string } = await fleetReplica.decommissionFleetDb(bot.id);
-      if (result.success && repl) result.copyBlockNote = await appLifecycle.retractCopyBlockOf(bot.id, { host: repl.publicHost, port: repl.hostPort });
-      res.json(result);
+      res.json(await fleetReplica.decommissionFleetDb(bot.id));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1859,34 +1848,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const status = await fleetReplication.getFleetReplicationStatus(bot);
-      if (bot.copyBlockRetract) void appLifecycle.settleCopyBlockRetract(bot.id).catch(() => undefined);
-      // The Database modal hits this on every open, so a master that missed
-      // the publish at Enable, adopt or a rescue gets the current block here.
-      // Deliberately NOT awaited - the hook budget is promote-sized, and the
-      // operator asked for a status, not a publish. The next open reconciles.
-      if (status.enabled && bot.fleetDb?.replication && !containerManager.isBotBusy(bot.id)) {
-        void (async () => {
-          try {
-            const facts = await appLifecycle.getAppFacts(bot);
-            // Only the node the app itself marks as the copy-block target
-            // relays the block onward: publishing onto a backup would overwrite
-            // the block its master relayed, and publishing during a lifecycle
-            // op could re-add one a decommission just retracted.
-            if (!facts.success || facts.facts?.copyBlockTarget !== true) return;
-            if (containerManager.isBotBusy(bot.id)) return;
-            const published = await appLifecycle.ensureCopyBlockCurrent(bot, facts.facts?.copyBlock ?? null);
-            if (!published.success) console.warn(`[Bots] Copy block not published to ${bot.sanitizedName}: ${published.error}`);
-          } catch { /* opportunistic; never surfaces */ }
-        })();
-      }
-      const standRead = await appLifecycle.readStandInPosture(bot, 10_000);
-      const standIn = standRead.read === 'ok' ? standRead.posture : getReplicationHealth(bot.id)?.standIn ?? null;
       if (status.enabled && req.query.include === 'block') {
         const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, standIn, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error, failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+        res.json({ success: true, replication: status, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
         return;
       }
-      res.json({ success: true, replication: status, standIn, failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot) });
+      res.json({ success: true, replication: status });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1923,30 +1890,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
       }
-      let result: { success: boolean; error?: string; copyBlockNote?: string; copyBlockError?: string };
-      const admit = (fresh: InstanceConfig) => appLifecycle.followerHoldRefusal(fresh, enabled ? 'Enable' : 'Disable');
+      let result: { success: boolean; error?: string };
       if (enabled) {
         if (!publicHost || typeof publicHost !== 'string') {
           res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
           return;
         }
-        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb, { admit, dbPassword: await fleetReplica.fleetDbPasswordFallback(bot) });
-        // Replication is enabled either way, so a missed delivery is a note on
-        // the reply, never a failure of the operator's action.
-        const fresh = result.success ? containerManager.getBot(req.params.id) : null;
-        if (fresh) {
-          const copy = await appLifecycle.deliverCopyBlockToTarget(fresh);
-          if (copy.error) {
-            console.warn(`[Bots] Copy block not delivered to ${fresh.sanitizedName}: ${copy.error}`);
-            result.copyBlockError = copy.error;
-          } else {
-            result.copyBlockNote = copy.note;
-          }
-        }
+        result = await fleetReplication.enableFleetReplication(bot, publicHost, hostPort, slotWalKeepMb, { dbPassword: await fleetReplica.fleetDbPasswordFallback(bot) });
       } else {
-        const repl = bot.fleetDb?.replication;
-        result = await fleetReplication.disableFleetReplication(bot, { admit });
-        if (result.success && repl) result.copyBlockNote = await appLifecycle.retractCopyBlockOf(bot.id, { host: repl.publicHost, port: repl.hostPort });
+        result = await fleetReplication.disableFleetReplication(bot);
       }
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
@@ -1966,22 +1918,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      // The primary's word on this standby's slot rides the cached health
-      // verdict (20.17); the live probe below cannot see it from this machine.
-      // The stand-in posture is read LIVE (B6 map F34): the modal offers adopt
-      // and re-seed on it, and a minute-old cache could offer a lane the app
-      // has just refused. Skipped while a seed runs: there is no copy to ask about.
-      const seeding = !!bot.fleetDbReplicaSeed && !bot.fleetDbReplicaSeed.parked;
-      const standIn = bot.fleetDbReplica && !seeding ? await appLifecycle.readStandInPosture(bot, 10_000) : null;
-      const standing = standIn?.read === 'ok' ? standIn.posture : null;
-      let block: { dsn: string; cert: string } | null = null;
-      let blockError: string | null = null;
-      if (req.query.include === 'block' && standing?.role === 'stand-in' && standing.live && standing.holdsWrites) {
-        const built = await fleetReplica.getStandInCopyBlock(bot);
-        if (built.success && built.dsn && built.cert) block = { dsn: built.dsn, cert: built.cert };
-        else blockError = built.error ?? 'block unavailable';
-      }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), slot: getReplicationHealth(bot.id)?.slot ?? null, standIn, block, blockError, transfer: fleetTransfer.transferView(bot), failback: fleetFailback.failbackView(bot), failbackDeclined: bot.fleetFailbackDeclined ?? null, failbackCancelable: fleetFailback.cancelableFailback(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2011,193 +1948,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/fleet-replica/from-facts - Provision a standby from the
-   * copy block the bot itself holds ({publicHost, hostPort?}); no paste.
-   * Async: poll the GET for the phase.
-   */
-  router.post('/:id/fleet-replica/from-facts', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const { publicHost, hostPort, confirm, confirmVolume } = req.body as { publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
-      if (!publicHost) {
-        res.status(400).json({ success: false, error: 'publicHost is required' });
-        return;
-      }
-      res.json(await fleetReplica.provisionFleetReplicaFromFacts(bot, publicHost, hostPort, confirm === true, typeof confirmVolume === 'string' ? confirmVolume : undefined));
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * GET/POST/DELETE /api/bots/:id/recovery-channel - The cross-host recovery
-   * channel (PLAN_REPLICATION Section 18, RC-2). POST body picks the side:
-   * {mode:'receiver', publicHost, tunnelPort?} arms the listener and returns
-   * the arm block; {mode:'source', host, port, cert, token} arms the dialer
-   * with a block from the other machine. Arming is manual on BOTH ends by
-   * design: a channel that overwrites a database needs consent on each side.
-   */
-  router.get('/:id/recovery-channel', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      res.json({ success: true, channel: await recoveryChannel.getRecoveryChannelStatus(bot) });
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  router.post('/:id/recovery-channel', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const { mode, publicHost, tunnelPort, host, port, cert, token } = req.body as {
-        mode?: string; publicHost?: string; tunnelPort?: number;
-        host?: string; port?: number; cert?: string; token?: string;
-      };
-      let result;
-      if (mode === 'receiver') {
-        if (!publicHost || typeof publicHost !== 'string') {
-          res.status(400).json({ success: false, error: 'publicHost is required to arm the receiver' });
-          return;
-        }
-        result = await recoveryChannel.armReceiver(bot, publicHost, tunnelPort);
-      } else if (mode === 'source') {
-        result = await recoveryChannel.armSource(bot, { host, port, cert, token });
-      } else {
-        res.status(400).json({ success: false, error: "mode must be 'receiver' or 'source'" });
-        return;
-      }
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  router.delete('/:id/recovery-channel', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await recoveryChannel.disarmRecoveryChannel(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** DELETE /api/bots/:id/recovery-swapped-away - Clear the record that a swap handed this database away, so Start and Update run again. */
-  router.delete('/:id/recovery-swapped-away', (req: Request, res: Response) => {
-    try {
-      if (!containerManager.getBot(req.params.id)) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      containerManager.updateInstanceRecoverySwappedAway(req.params.id, null);
-      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, error: `The swap record could not be cleared: ${String(error)}` });
-    }
-  });
-
-  /** DELETE /api/bots/:id/recovery-swap-abandoned - Dismiss a cancelled swap's notice; the swap record, if one stands, stays. */
-  router.delete('/:id/recovery-swap-abandoned', (req: Request, res: Response) => {
-    try {
-      if (!containerManager.getBot(req.params.id)) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      containerManager.updateInstanceRecoverySwapAbandoned(req.params.id, null);
-      broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, error: `The cancelled swap notice could not be dismissed: ${String(error)}` });
-    }
-  });
-
-  /**
-   * GET/POST/DELETE /api/bots/:id/recovery-rescue - The receiver-side rescue
-   * (RC-3). POST {confirm?, acknowledge?, withoutDump?} starts or continues
-   * it; without confirm (or with a warning not acknowledged) it answers
-   * needsConfirm + fresh/outdated/partial + both identities + the warnings so
-   * the UI can show the right sentences. DELETE cancels (the volume stays as-is).
-   */
-  router.get('/:id/recovery-rescue', (req: Request, res: Response) => {
-    const bot = containerManager.getBot(req.params.id);
-    if (!bot) {
-      res.status(404).json({ success: false, error: 'Bot not found' });
-      return;
-    }
-    res.json({ success: true, rescue: recoveryRescue.getRescueStatus(bot), leftover: bot.recoveryRescueLeft?.state ?? null });
-  });
-
-  router.post('/:id/recovery-rescue', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const acknowledge = Array.isArray(req.body?.acknowledge) ? req.body.acknowledge.filter((k: unknown): k is string => typeof k === 'string') : [];
-      const result = await recoveryRescue.startRescue(bot, req.body?.confirm === true, { acknowledge, withoutDump: req.body?.withoutDump === true });
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  router.delete('/:id/recovery-rescue', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await recoveryRescue.cancelRescue(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * POST /api/bots/:id/recovery-rescue/swap - The RC-4 swap, from a caught-up
-   * streaming rescue. Without {confirm:true} it answers needsConfirm so the
-   * UI can show the downtime sentence.
-   */
-  router.post('/:id/recovery-rescue/swap', (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = recoveryRescue.startSwap(bot, req.body?.confirm === true);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
    * POST /api/bots/:id/fleet-adopt-primary - File a promoted standby as this
    * machine's fleet database and enable replication on it, so the machine that
    * just took over can hand out the copy block the old one re-seeds from.
@@ -2209,21 +1959,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result: Awaited<ReturnType<typeof fleetReplica.adoptPromotedReplica>> & { copyBlockNote?: string; copyBlockError?: string } = await fleetReplica.adoptPromotedReplica(bot);
+      const result = await fleetReplica.adoptPromotedReplica(bot);
       if (result.success) {
-        // This machine now mints its own block; without republishing, its app
-        // would keep relaying the OLD master's, and backups would re-seed from
-        // a database that no longer leads the fleet.
-        const fresh = containerManager.getBot(req.params.id);
-        if (fresh?.fleetDb?.replication) {
-          const copy = await appLifecycle.deliverCopyBlockToTarget(fresh);
-          if (copy.error) {
-            console.warn(`[Bots] Copy block not republished after adopt on ${fresh.sanitizedName}: ${copy.error}`);
-            result.copyBlockError = copy.error;
-          } else {
-            result.copyBlockNote = copy.note;
-          }
-        }
         broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       }
       res.json(result);
@@ -2366,171 +2103,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const updated = containerManager.updateInstanceWebAuth(req.params.id, mode);
       broadcastToClients(wss, 'bot:updated', publicBot(updated));
       res.json({ success: true, bot: publicBot(updated) });
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  // ─── App lifecycle (PLAN_REPLICATION 20.13, stage B4m-2a) ───
-  // The app decides; the manager relays the click and does the infrastructure
-  // work its recorded facts imply. Every refusal here is the app's own words.
-
-  /**
-   * GET /:id/app-facts - what this instance's app concluded (superseded, retire
-   * instruction, promote phase, copy block). Sends a recorded copy-block
-   * retraction first, then republishes the block when the app is its target and
-   * holds anything other than the whole current block.
-   */
-  router.get('/:id/app-facts', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      if (bot.copyBlockRetract) await appLifecycle.settleCopyBlockRetract(bot.id);
-      const result = await appLifecycle.getAppFacts(bot);
-      if (result.success && result.facts?.copyBlockTarget === true
-          && bot.fleetDb?.replication && !containerManager.isBotBusy(bot.id)) {
-        const delivered = await appLifecycle.ensureCopyBlockCurrent(bot, result.facts.copyBlock);
-        // Re-read only when something was actually published, so what the UI
-        // sees is what the app holds without a second round trip on the no-op.
-        if (delivered.success && delivered.delivered) {
-          const refreshed = await appLifecycle.getAppFacts(bot);
-          if (refreshed.success && refreshed.facts) result.facts = refreshed.facts;
-        }
-      }
-      // The block carries the replicator password. The UI only needs to know one
-      // EXISTS, and the manager's own copy-block route keeps it behind an
-      // explicit ?include=block, so do not widen that here.
-      if (result.facts) {
-        const { copyBlock, ...rest } = result.facts;
-        res.json({ ...result, facts: { ...rest, copyBlockPresent: !!copyBlock } });
-        return;
-      }
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * POST /:id/app-transfer { confirmLag?, confirmLineage?, confirmReachability?, retireOldMaster? } - make this whole
-   * side the master side. [Transfer] and [Transfer and retire] are the same call.
-   */
-  router.post('/:id/app-transfer', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetTransfer.transferSide(bot, {
-        confirmLag: req.body?.confirmLag === true,
-        confirmLineage: req.body?.confirmLineage === true,
-        confirmReachability: req.body?.confirmReachability === true,
-        retireOldMaster: req.body?.retireOldMaster === true,
-        publicHost: typeof req.body?.publicHost === 'string' ? req.body.publicHost : undefined,
-        hostPort: typeof req.body?.hostPort === 'number' ? req.body.hostPort : undefined,
-      });
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** DELETE /:id/app-transfer - dismiss a parked seed-first transfer. */
-  router.delete('/:id/app-transfer', (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = fleetTransfer.dismissTransfer(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** POST /:id/fleet-failback - open the failback run by hand on a returning master (it opens itself on the health tick otherwise). */
-  router.post('/:id/fleet-failback', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetFailback.openFailbackByHand(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** POST /:id/fleet-failback/continue { consent? } - resume a parked run; at the consent park, consent:true is the operator's answer (F5). */
-  router.post('/:id/fleet-failback/continue', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetFailback.continueFailback(bot, { consent: req.body?.consent === true });
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** POST /:id/fleet-failback/cancel - cancel a run before its wipe; the instance is started again if the run stopped it. */
-  router.post('/:id/fleet-failback/cancel', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetFailback.cancelFailback(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** DELETE /:id/fleet-failback - dismiss a parked run, lifting its own write fence and touching nothing else. */
-  router.delete('/:id/fleet-failback', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetFailback.dismissFailback(bot);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /** POST /:id/app-demote { confirm? } - stop being the master side. */
-  router.post('/:id/app-demote', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await appLifecycle.demote(bot, req.body?.confirm === true);
-      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(bot.id)));
-      res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

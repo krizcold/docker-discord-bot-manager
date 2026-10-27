@@ -34,11 +34,3 @@ describe('B13-2 covered-copy refusal names a remedy the demoted node can finish'
     for (const f of [null, { backupMaster: true, copyBlockCurrent: null }, { backupMaster: false, copyBlockCurrent: true }]) expect(coveredOverRefusal(f)).not.toMatch(/[\u2013\u2014]/);
   });
 });
-
-describe('B13-2 page note for a returning copy that follows a stale primary', () => {
-  it('tells a co-worker to remove and provision again, and keeps demote then Re-seed now for a backup or a current block', () => {
-    expect(pageHtml).not.toContain('demote the node from its Fleet tab to stay a co-worker, then Re-seed now repoints this copy at the current primary');
-    expect(pageHtml).toContain("(facts && facts.copyBlockCurrent === true) || (facts && facts.backupMaster === true) ? `Demote the node from its Fleet tab to release the copy, then Re-seed now repoints it at the current primary");
-    expect(pageHtml).toContain("so Re-seed now would have nothing to follow. Remove the replica and provision it again from the copy block on the current primary's Database modal, or set BOT_NODE_ROLE=backup-master on this node and restart it first, then demote it from its Fleet tab and Re-seed now once the block reaches it.`}");
-  });
-});

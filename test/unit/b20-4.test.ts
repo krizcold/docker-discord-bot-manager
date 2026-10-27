@@ -84,9 +84,6 @@ vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
-import { cancelableFailback } from '../../src/instance/fleetFailback';
-import { disarmRecoveryChannel, getRecoveryChannelStatus, reconcileRecoveryChannels } from '../../src/instance/recoveryChannel';
-import { startRescue } from '../../src/instance/recoveryRescue';
 
 const DB = 'bot1-fleet-postgres-data';
 const registryPath = path.join(h.dir, 'instances.json');
@@ -228,14 +225,6 @@ describe('R18-J4 and R7-J27: the fleet database retire', () => {
   });
 });
 
-describe('R18-J4: a failback whose database retire began is past cancellation', () => {
-  it('reads a retiring mark as destroyed', () => {
-    const run = { mode: 'failback', phase: 'seeding', parked: true, consentAt: 1, startedAt: 1, updatedAt: 1, standInNodeId: null, episode: null, lineage: null, dump: null, block: null, serve: null, stoppedByRun: false };
-    expect(cancelableFailback(record({ fleetDb, fleetFailback: run }))).toBe(true);
-    expect(cancelableFailback(record({ fleetDb: { ...fleetDb, retiringAt: '2026-10-24T10:00:00.000Z' }, fleetFailback: run }))).toBe(false);
-  });
-});
-
 describe('R1-J38 and R7-J27: the standby service removal', () => {
   // Linux answers ENOTDIR here; Windows answers ENOENT, which is a compose never deployed.
   it.skipIf(process.platform === 'win32')('fails, and keeps the container, when the deployed compose cannot be read', async () => {
@@ -266,127 +255,5 @@ describe('R1-J38 and R7-J27: the standby service removal', () => {
     h.execFails = [[/^docker rm/, 'Error: No such container: bot1-fleet-postgres-replica']];
     const res = await containerManager.removeFleetDbReplicaService('b1', 'bot1-fleet-postgres-replica');
     expect(res.success).toBe(true);
-  });
-});
-
-describe('R1-J38: the recovery channel disarm reports what remains', () => {
-  const channel = { mode: 'source', containerName: 'bot1-recovery-relay', token: 't', createdAt: 1, endpointHost: 'h', endpointPort: 15433, pinCert: 'c' };
-  const sourceBot = () => { writeRegistry(record({ fleetDb, recoveryChannel: channel })); return containerManager.getBot('b1')!; };
-  const isExec = (sql: string) => (a: string[]) => a[0] === 'exec' && a.join(' ').includes(sql);
-  const isStrip = (a: string[]) => a[0] === 'run' && a.join(' ').includes('default_transaction_read_only');
-  const isDbInspect = (a: string[]) => a[0] === 'inspect' && a[a.length - 1] === fleetDb.containerName;
-
-  it('keeps the record and answers an error when the fence was stripped from the files but the database runs on', async () => {
-    h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'psql: error: connection refused']);
-    h.rules.push([isStrip, true, 'stripped-ro\n', '']);
-    h.rules.push([isDbInspect, true, 'true\n', '']);
-    const res = await disarmRecoveryChannel(sourceBot());
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/may stay READ-ONLY or refusing every connection but the manager's until its container restarts/);
-    expect(stored().recoveryChannel).toMatchObject({ containerName: 'bot1-recovery-relay' });
-    expect(typeof stored().recoveryChannel.disarmingAt).toBe('number');
-    expect(stored().recoveryChannel.disarmLeft).toMatch(/READ-ONLY/);
-  });
-
-  it('keeps the record and says the slot is not checked when the database is not running', async () => {
-    h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'Error response from daemon: No such container: bot1-fleet-postgres']);
-    h.rules.push([isStrip, true, '', '']);
-    h.rules.push([isDbInspect, false, '', 'Error: No such object: bot1-fleet-postgres']);
-    const res = await disarmRecoveryChannel(sourceBot());
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/could not be checked or dropped because the database is not running; a stopped database holds no WAL for it, and Disarm drops the slot once the database runs again/);
-    expect(res.error).not.toMatch(/start the instance/i);
-    expect(res.error).not.toMatch(/keeps holding WAL/);
-    expect(h.calls.filter((c) => c.includes('pg_drop_replication_slot'))).toEqual([]);
-    expect(stored().recoveryChannel?.disarmLeft).toMatch(/not running/);
-  });
-
-  it('keeps the record when the slot could not be dropped', async () => {
-    h.rules.push([isDbInspect, true, 'true\n', '']);
-    h.rules.push([isExec('pg_drop_replication_slot'), false, '', 'ERROR: replication slot "recovery_channel" is active']);
-    const res = await disarmRecoveryChannel(sourceBot());
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/recovery_channel could not be dropped \(ERROR: replication slot "recovery_channel" is active\), so it keeps holding WAL/);
-    expect(stored().recoveryChannel?.disarmLeft).toMatch(/slot/);
-    const status = await getRecoveryChannelStatus(containerManager.getBot('b1')!);
-    expect(status.disarming?.left).toMatch(/slot/);
-  }, 15_000);
-
-  it('clears the record when the fence file held no fence and the slot dropped', async () => {
-    h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'container not running']);
-    h.rules.push([isStrip, true, '', '']);
-    const res = await disarmRecoveryChannel(sourceBot());
-    expect(res).toEqual({ success: true });
-    expect(stored().recoveryChannel).toBeUndefined();
-  });
-
-  it('B14-2Lb: strips the fence lines from pg_hba.conf before the read-only reset', async () => {
-    const { fenceOwners } = await import('./fence-fake');
-    fenceOwners.set(fleetDb.containerName, 'swap:5');
-    h.rules.push([isExec('SHOW default_transaction_read_only'), true, 'on\n', '']);
-    const res = await disarmRecoveryChannel(sourceBot());
-    expect(res).toEqual({ success: true });
-    const hba = h.calls.findIndex(c => c.startsWith('exec -u root bot1-fleet-postgres sh -c') && c.includes("sed -i '/# smdb-write-fence$/d'"));
-    const reset = h.calls.findIndex(c => c.includes('ALTER SYSTEM RESET default_transaction_read_only'));
-    expect(hba).toBeGreaterThanOrEqual(0);
-    expect(reset).toBeGreaterThan(hba);
-    expect(h.calls[hba]).toContain('f=/var/lib/postgresql/data/pg_hba.conf;');
-  });
-
-  it('B14-2Lb: with the database down, the volume strip removes both layers and keeps pg_hba.conf postgres-owned', async () => {
-    h.rootFails = true;
-    h.rules.push([isExec('ALTER SYSTEM RESET'), false, '', 'Error response from daemon: container is not running']);
-    h.rules.push([isStrip, true, 'stripped-ro\n', '']);
-    h.rules.push([isDbInspect, false, '', 'Error: No such object: bot1-fleet-postgres']);
-    await disarmRecoveryChannel(sourceBot());
-    const run = h.runs.find(isStrip)!;
-    expect(run.slice(0, 6)).toEqual(['run', '--rm', '-v', `${DB}:/pgdata`, '--entrypoint', 'sh']);
-    const script = run[run.length - 1];
-    expect(script).toContain("sed -i '/^default_transaction_read_only/d' /pgdata/postgresql.auto.conf");
-    expect(script).toContain('f=/pgdata/pg_hba.conf;');
-    expect(script).toMatch(/sed -i '\/# smdb-write-fence\$\/d' "\$f" && chown postgres:postgres "\$f" && chmod 600 "\$f"/);
-
-    const { ownedFencedHba, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
-    const ran = await runOnDataDir(script, '/pgdata', {
-      'pg_hba.conf': ownedFencedHba('swap:5') + MANAGED_HBA,
-      'postgresql.auto.conf': "wal_log_hints = 'on'\ndefault_transaction_read_only = 'on'\n",
-      'smdb-fence-owner': 'swap:5',
-    });
-    expect(ran.out.trim().split('\n')).toEqual(['stripped-ro', 'stripped-hba']);
-    expect(ran.files['smdb-fence-owner']).toBeUndefined();
-    expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
-    expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\n");
-    expect(ran.chowns).toEqual(['postgres:postgres /pgdata/pg_hba.conf']);
-  });
-
-  it('the reconciler leaves a channel that is being disarmed alone', async () => {
-    writeRegistry(record({ fleetDb, recoveryChannel: { ...channel, disarmingAt: 5, disarmLeft: 'x' } }));
-    h.rules.push([(a) => a[0] === 'inspect', false, '', 'Error: No such object: bot1-recovery-relay']);
-    process.env.RECOVERY_RELAY_IMAGE = 'img';
-    try {
-      await reconcileRecoveryChannels();
-    } finally {
-      delete process.env.RECOVERY_RELAY_IMAGE;
-    }
-    expect(h.calls.filter((c) => !c.endsWith('bot1-recovery-relay'))).toEqual([]);
-    expect(h.calls.filter((c) => c.startsWith('run') || c.startsWith('start') || c.startsWith('rm'))).toEqual([]);
-  });
-});
-
-describe('R18-J4: a rescue does not start over an unfinished retire', () => {
-  it('refuses a fresh rescue while the retiring mark is set, before asking the relay', async () => {
-    const fetchCalls: string[] = [];
-    vi.stubGlobal('fetch', async (url: string) => { fetchCalls.push(String(url)); throw new Error('no relay in the test'); });
-    try {
-      const channel = { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 't', createdAt: 1 };
-      writeRegistry(record({ fleetDb: { ...fleetDb, retiringAt: '2026-10-24T01:00:00.000Z' }, recoveryChannel: channel }));
-      const res = await startRescue(containerManager.getBot('b1')!, true);
-      expect(res.success).toBe(false);
-      expect(res.error).toMatch(/was being removed \(since 2026-10-24T01:00:00.000Z\) and the removal did not finish/);
-      expect(fetchCalls).toEqual([]);
-      expect(stored().recoveryRescue).toBeUndefined();
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 });

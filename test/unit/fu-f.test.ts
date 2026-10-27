@@ -56,12 +56,10 @@ vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   hasAppHooks: () => h.hooks,
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
   getAppFacts: async () => ({ success: true, facts: h.facts }),
-  postureFromRead: () => ({ read: 'ok', posture: null }),
-  readStandInPosture: async () => ({ read: 'none' }),
 }));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
@@ -74,7 +72,6 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
-import { getReplicationHealth, startFleetReplicationHealth, stopFleetReplicationHealth } from '../../src/instance/fleetReplicationHealth';
 
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
 const REPLICA = {
@@ -165,24 +162,6 @@ describe('FU-7c: the replay lag across two clocks', () => {
     h.probe = 't|streaming|f|12.5\n';
     expect((await fleetReplica.getFleetReplicaStatus(bot())).live!.replayLagSeconds).toBe(12.5);
   });
-
-  const verdict = async () => {
-    startFleetReplicationHealth();
-    stopFleetReplicationHealth();
-    let v: ReturnType<typeof getReplicationHealth> = null;
-    await vi.waitFor(() => { v = getReplicationHealth('b1'); expect(v?.role).toBe('replica'); expect(v?.message).not.toBe(''); });
-    return v!;
-  };
-
-  it('the health text says the lag cannot be read, never a negative lag', async () => {
-    h.probe = 't|streaming|f|-400\n';
-    const v = await verdict();
-    expect(v.message).not.toMatch(/-\d+s behind/);
-    expect(v.message).toMatch(/clock/);
-    expect(v.message).toMatch(/400s/);
-    expect(v.severity).toBe('warn');
-    expect(v.lagSeconds).toBeNull();
-  });
 });
 
 describe('FU-7c: a slot fact received in the future is not fresh', () => {
@@ -196,37 +175,12 @@ describe('FU-7c: a slot fact received in the future is not fresh', () => {
   });
 });
 
-describe('FU-7c: both freshness sites ignore a slot fact received in the future', () => {
+describe('FU-7c: the re-seed ignores a slot fact received in the future', () => {
   const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
   const leftBehindFact = (receivedAt: number) => ({
     running: true,
     standbySlot: { slotName: REPLICA.slot, walStatus: 'reserved', observedAt: Date.now(), receivedAt, sourceAt: Date.now(), fromNodeId: 'n2', fromTerm: 2, sourceIsCurrentMaster: false },
   });
-  const health = async () => {
-    const since = Date.now();
-    startFleetReplicationHealth();
-    stopFleetReplicationHealth();
-    let v: ReturnType<typeof getReplicationHealth> = null;
-    await vi.waitFor(() => { v = getReplicationHealth('b1'); expect(v?.role).toBe('replica'); expect(v!.checkedAt).toBeGreaterThanOrEqual(since); });
-    return v!;
-  };
-
-  it('the health tick carries the former-master verdict from a fresh fact', async () => {
-    h.hooks = true;
-    h.probe = 't|streaming|f|1\n';
-    h.facts = leftBehindFact(Date.now() - 1000);
-    expect((await health()).message).toMatch(/no longer the fleet's master/);
-  });
-
-  it('the health tick carries no former-master verdict from a future-dated fact', async () => {
-    h.hooks = true;
-    h.probe = 't|streaming|f|1\n';
-    h.facts = leftBehindFact(Date.now() + 60_000);
-    const v = await health();
-    expect(v.message).not.toMatch(/no longer the fleet's master/);
-    expect(v.message).not.toMatch(/lost|absent/);
-  });
-
   it('the re-seed refuses a repoint on a future-dated former-master fact', async () => {
     h.hooks = true;
     h.probe = 't|streaming|f|1\n';

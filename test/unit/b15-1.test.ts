@@ -13,7 +13,6 @@ const h = vi.hoisted(() => {
     removedVolumes: [] as string[],
     inRecovery: 't' as 't' | 'f' | 'error',
     running: 'true' as 'true' | 'false',
-    posture: { read: 'none' } as unknown,
     replicaRemoved: [] as string[],
     spawns: [] as string[][],
   };
@@ -83,10 +82,6 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   markPendingApplyIfRunning: async () => {},
   removeFleetDbReplicaService: async (_id: string, name: string) => { h.replicaRemoved.push(name); return { success: true }; },
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
-  readStandInPosture: async () => h.posture,
-}));
 vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
   generateCertPair: async (dir: string) => {
@@ -100,12 +95,6 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
   getDeploymentMode: async () => 'docker',
 }));
-// A run these rows file as live stands for one whose runner runs in this process.
-const fb = vi.hoisted(() => ({ live: false }));
-vi.mock('../../src/instance/fleetFailback', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../src/instance/fleetFailback')>();
-  return { ...real, failbackView: (i: any) => (fb.live ? i.fleetFailback ?? null : real.failbackView(i)) };
-});
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import * as fs from 'fs';
@@ -167,7 +156,6 @@ beforeEach(async () => {
   h.removedVolumes = [];
   h.inRecovery = 't';
   h.running = 'true';
-  h.posture = { read: 'none' };
   h.replicaRemoved = [];
   h.spawns = [];
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
@@ -235,21 +223,6 @@ describe('a data-deleting Remove of an instance holding the fleet database', () 
     expect(res.body).toMatchObject({ success: true });
     expect(h.removedVolumes).toEqual([]);
     expect(h.volumes.get(DB)).toBe('exists');
-  });
-});
-
-describe('any Remove while a database lane owns the instance', () => {
-  it('refuses a keep-data Remove while a failback run is on record', async () => {
-    writeRegistry({ fleetDb, fleetFailback: { mode: 'failback', phase: 'seeding', startedAt: 1 } });
-    await expect(containerManager.deleteBot('b1', true, true)).rejects.toThrow(/failback run is on this instance/);
-    expect(registered()).toBe(true);
-  });
-
-  it('refuses a keep-data Remove while the copy stands in for the master', async () => {
-    writeRegistry({ fleetDbReplica: REPLICA });
-    h.posture = { read: 'ok', posture: { role: 'stand-in', live: true, coveringNodeId: 'node-master-1', standInNodeId: null, holdsWrites: true } };
-    await expect(containerManager.deleteBot('b1', true, true)).rejects.toThrow(/standing in for/);
-    expect(registered()).toBe(true);
   });
 });
 
@@ -447,30 +420,6 @@ describe('Remove replica', () => {
   });
 });
 
-describe('a failback seed retried over the replica volume its first seed made', () => {
-  const master = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'master' } };
-  const run = (consentAt: number | null) => ({ mode: 'failback', phase: 'seeding', startedAt: 7, updatedAt: 7, consentAt, dump: null, block: null });
-  beforeEach(() => { fb.live = true; });
-  afterEach(() => { fb.live = false; });
-
-  it('clears it without a confirm once the run holds the wipe consent', async () => {
-    writeRegistry({ ...master, fleetFailback: run(8) });
-    h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, false, { run: 7 });
-    expect(res).toMatchObject({ success: true, started: true });
-    await waitFor(() => !bot().fleetDbReplicaSeed || bot().fleetDbReplicaSeed?.parked === true);
-    expect(bot().fleetDbReplicaSeed?.lastError).toBeUndefined();
-    expect(wiped()).toBe(true);
-  });
-
-  it('still asks for a run that holds no consent', () => {
-    writeRegistry({ ...master, fleetFailback: run(null) });
-    h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, false, { run: 7 });
-    expect(res).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
-  });
-});
-
 describe('database dumps after the record is removed', () => {
   it('the dump listing and the removed-instance listing still answer after deleteBot', async () => {
     writeRegistry();
@@ -509,27 +458,8 @@ describe('database dumps after the record is removed', () => {
   });
 });
 
-describe('a keep-data Remove of an instance whose copy a transfer or a promote holds', () => {
+describe('a keep-data Remove of an instance whose copy was promoted', () => {
   const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'co-worker' }, fleetDbReplica: REPLICA };
-
-  it('refuses while a transfer is parked at promoting', async () => {
-    writeRegistry({ ...worker, fleetTransfer: { phase: 'promoting', startedAt: 1, updatedAt: 1, retireOldMaster: false, parked: true } });
-    await expect(containerManager.deleteBot('b1', true, true)).rejects.toThrow(/app was promoting this copy/);
-    expect(registered()).toBe(true);
-  });
-
-  it('refuses while a transfer is asking the app to promote the copy', async () => {
-    writeRegistry(worker);
-    let release!: () => void;
-    const promoting = fleetReplica.whilePromoting('b1', () => new Promise<void>((r) => { release = r; }));
-    try {
-      await expect(containerManager.deleteBot('b1', true, true)).rejects.toThrow(/asking the app to promote this copy/);
-      expect(registered()).toBe(true);
-    } finally {
-      release();
-      await promoting;
-    }
-  });
 
   it('asks before removing over a promoted copy, and goes on once confirmed', async () => {
     writeRegistry(worker);

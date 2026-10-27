@@ -23,10 +23,7 @@ const helpers = ['isBadNumber', 'refuseBadNumbers'];
 const numInput = (value: string, bad = false) => ({ value, validity: { badInput: bad }, dataset: {} as any, defaultValue: value });
 
 const common = (sent: any[], messages: string[][], els: Record<string, any>) => ({
-  document: {
-    getElementById: (id: string) => els[id] || null,
-    querySelectorAll: (s: string) => els[s] || [],
-    querySelector: () => ({ disabled: false, textContent: '', isConnected: true }),
+  document: {getElementById: (id: string) => els[id] || null,querySelectorAll: (s: string) => els[s] || [],querySelector: () => ({ disabled: false, textContent: '', isConnected: true }),
   },
   api: async (method: string, url: string, body: any) => { sent.push({ method, url, body }); return { success: true, removed: [], fleetBackup: body }; },
   showMessage: (type: string, text: string) => { messages.push([type, text]); },
@@ -124,9 +121,6 @@ describe('port and WAL fields the browser cannot parse are refused', () => {
   const cases: [string, string, Record<string, any>][] = [
     ['enableFleetReplication', 'fleet-repl-port', { 'fleet-repl-host': { value: 'h' } }],
     ['enableFleetReplication', 'fleet-repl-keep', { 'fleet-repl-host': { value: 'h' } }],
-    ['armRecoveryReceiver', 'rc-recv-port', { 'rc-recv-host': { value: 'h' } }],
-    ['armRecoverySource', 'rc-src-port', { 'rc-src-host': { value: 'h' }, 'rc-src-cert': { value: 'c' }, 'rc-src-token': { value: 't' } }],
-    ['provisionFleetReplicaFromFacts', 'replica-port', { 'replica-host': { value: 'h' } }],
     ['provisionFleetReplica', 'replica-port', { 'replica-host': { value: 'h' }, 'replica-dsn': { value: 'd' }, 'replica-cert': { value: 'c' } }],
     ['reseedStalePrimary', 'reseed-port', { 'reseed-host': { value: 'h' }, 'reseed-dsn': { value: 'd' }, 'reseed-cert': { value: 'c' } }],
   ];
@@ -139,14 +133,6 @@ describe('port and WAL fields the browser cannot parse are refused', () => {
       expect(messages[0]?.[0]).toBe('error');
     });
   }
-
-  it('appTransfer seeding first refuses an unparsable replica-port', async () => {
-    const sent: any[] = []; const messages: string[][] = [];
-    const ctx = runPage([...helpers, 'appTransfer'], common(sent, messages, { 'replica-host': { value: 'h' }, 'replica-port': numInput('', true) }));
-    await ctx.appTransfer('b1', false, true, false);
-    expect(sent).toHaveLength(0);
-    expect(messages[0]?.[0]).toBe('error');
-  });
 });
 
 describe('the guided form coerce honours badInput', () => {

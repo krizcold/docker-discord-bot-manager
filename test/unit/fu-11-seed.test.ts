@@ -76,13 +76,6 @@ describe('FU-11 B22-1x each parked committed seed gets its own Dismiss question'
     expect(text).not.toContain('already retired');
   });
 
-  it('a partial provision after a failback retire names the retire and the missing standby', async () => {
-    writeRegistry({ fleetDbReplicaSeed: seed('provision'), fleetFailbackDeclined: { mode: 'failback', phase: 'seeding' } });
-    const text = await ask();
-    expect(text).toContain('The partial copy stays in the replica volume, unused. This machine\'s own database was already retired earlier in the failback run');
-    expect(text).not.toContain('nothing else on this instance is affected');
-  });
-
   it('a whole stale-primary re-seed names the node now holding the fleet and the container state', async () => {
     writeRegistry({ fleetDbReplicaSeed: seed('reseed-stale-primary'), fleetDbReplica: replica });
     const text = await ask();

@@ -89,14 +89,8 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
 vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   hasAppHooks: () => h.hooks,
-}));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
   capabilityRefusal: () => null,
   getAppFacts: async () => ({ success: true, facts: { running: true, copyBlockCurrent: true, copyBlock: { dsn: 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', cert: PEM } } }),
-  postureFromRead: () => ({ read: 'ok', posture: null }),
-  readStandInPosture: async () => (h.posture ? h.posture() : { read: 'none' }),
-  transfer: async () => (h.promote ? h.promote() : { success: true }),
 }));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
@@ -110,7 +104,6 @@ import * as path from 'path';
 import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
 import { cancelReplicaSeed, parkInterruptedReplicaSeeds, provisionFleetReplica, removeFleetReplica, reseedStandby } from '../../src/instance/fleetReplica';
-import { transferSide } from '../../src/instance/fleetTransfer';
 
 const cancel = cancelReplicaSeed as unknown as (instance: any, expect?: Record<string, unknown>) => Promise<any>;
 
@@ -316,37 +309,6 @@ describe('R9-23, R9-25, R9-26: Remove replica refuses what is in flight', () => 
       release();
       await held;
     }
-  });
-
-  it('refuses while a transfer run is live', async () => {
-    writeRegistry({ fleetDbReplica: { ...REPLICA }, fleetTransfer: { phase: 'promoting', startedAt: 1, updatedAt: 1, retireOldMaster: false } });
-    const res = await removeFleetReplica(bot());
-    expect(res.success).toBe(false);
-    expect(bot().fleetDbReplica?.containerName).toBe(REPLICA.containerName);
-  });
-
-  it('refuses while a Transfer promotes this copy in the same request', async () => {
-    h.hooks = true;
-    writeRegistry({ fleetDbReplica: { ...REPLICA } });
-    let during: any = null;
-    h.promote = async () => { during = await removeFleetReplica(bot()); return { success: true }; };
-    h.posture = async () => ({ read: 'ok', posture: null });
-    await transferSide(bot(), {});
-    expect(during?.success).toBe(false);
-    expect(bot().fleetDbReplica?.containerName).toBe(REPLICA.containerName);
-  });
-
-  it('refuses a seed that started while it read the posture, and keeps both records', async () => {
-    h.hooks = true;
-    writeRegistry({ fleetDbReplica: { ...REPLICA } });
-    h.posture = async () => {
-      containerManager.updateInstanceFleetDbReplicaSeed('b1', seedOf(9000, { phase: 'preparing' }) as any);
-      return { read: 'ok', posture: null };
-    };
-    const res = await removeFleetReplica(bot());
-    expect(res.success).toBe(false);
-    expect(bot().fleetDbReplica?.containerName).toBe(REPLICA.containerName);
-    expect(bot().fleetDbReplicaSeed?.startedAt).toBe(9000);
   });
 });
 

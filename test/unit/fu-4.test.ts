@@ -77,12 +77,10 @@ vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   hasAppHooks: () => h.hooks,
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
   getAppFacts: async () => ({ success: true, facts: { running: true, copyBlockCurrent: true, copyBlock: { dsn: 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', cert: PEM } } }),
-  postureFromRead: () => ({ read: 'ok', posture: null }),
-  readStandInPosture: async () => ({ read: 'none' }),
 }));
 vi.mock('../../src/instance/fleetReplication', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/instance/fleetReplication')>();
@@ -163,7 +161,7 @@ describe('B22-2a: a provision whose service start fails and whose record clear i
     await waitFor(() => containerManager.isBotBusy('b1') === null);
   };
 
-  it('parks with the start failure and the held clear named, drops the slot, and the health tick clears the record', async () => {
+  it('parks with the start failure and the held clear named, drops the slot, and the minute retry clears the record', async () => {
     await failed();
     expect(bot().fleetDbReplica).toBeDefined();
     const status = await getFleetReplicaStatus(bot());

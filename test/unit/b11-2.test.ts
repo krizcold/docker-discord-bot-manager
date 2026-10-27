@@ -55,7 +55,6 @@ import * as envManager from '../../src/env/manager';
 import { dropFleetSlot, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 import { adoptPromotedReplica, getFleetReplicaStatus, standbyDownText } from '../../src/instance/fleetReplica';
 import { getFleetBackupError, getFleetFenceStuck, runFleetDump } from '../../src/instance/fleetBackup';
-import { getReplicationHealth, startFleetReplicationHealth, stopFleetReplicationHealth } from '../../src/instance/fleetReplicationHealth';
 
 const fakeUrl = 'postgresql://smdb:fake-pass@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
 const replication = { role: 'replicator', password: 'fake', hostPort: 5433, publicHost: 'h', certHost: 'h' };
@@ -154,33 +153,6 @@ describe('the primary probe and refusals', () => {
     const res = await runFleetDump(bot());
     expect(res.success).toBe(false);
     expect(res.error).toContain('Could not probe the database container');
-  });
-});
-
-describe('the health verdict when docker could not be asked', () => {
-  const verdict = async (role: 'primary' | 'replica'): Promise<string> => {
-    startFleetReplicationHealth();
-    stopFleetReplicationHealth();
-    let msg = '';
-    await vi.waitFor(() => { const v = getReplicationHealth('b1'); msg = v?.message ?? ''; expect(v?.role).toBe(role); });
-    return msg;
-  };
-
-  it('says the primary could not be read, not that it is not running', async () => {
-    h.inspect = 'daemon';
-    h.execOk = false;
-    const msg = await verdict('primary');
-    expect(msg).toContain('Could not read the database');
-    expect(msg).not.toContain('not running');
-  });
-
-  it('says the standby could not be read', async () => {
-    writeRegistry({ fleetDbReplica: replica });
-    h.inspect = 'daemon';
-    h.execOk = false;
-    const msg = await verdict('replica');
-    expect(msg).toContain('Could not read the standby (');
-    expect(msg).not.toContain('not running');
   });
 });
 

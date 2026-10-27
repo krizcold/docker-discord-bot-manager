@@ -18,8 +18,8 @@ const execAsync = promisify(exec);
 import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
-  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord, RecoveryChannelRecord, RecoveryRescueRecord, RecoveryRescueLeft, RecoverySwapAbandoned,
-  ContainerInfo, FleetFailbackDecline, FleetFailbackRun, FleetTransferRun, FleetBackupConfig, InstanceLane,
+  DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
+  ContainerInfo, FleetBackupConfig, InstanceLane,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -184,8 +184,8 @@ function withoutSensitiveKeys(envVars: Record<string, string> | undefined): Reco
   return out;
 }
 
-// The four registry-held structured secrets (updateToken, the replication
-// password, the recovery channel's token and TLS key) persist encrypted, the
+// The registry-held structured secrets (updateToken and the replication
+// password) persist encrypted, the
 // sibling of the env two-store strip for values that are not env vars and so
 // have no env-store home. In-memory records always carry plaintext; these
 // helpers run only at the load/save boundary. A pre-encryption plaintext value
@@ -223,17 +223,12 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   if (inst.fleetDb?.replication) {
     inst.fleetDb.replication.password = decryptRecordSecret(inst.id, 'fleetDb.replication.password', inst.fleetDb.replication.password) ?? '';
   }
-  if (inst.recoveryChannel) {
-    inst.recoveryChannel.token = decryptRecordSecret(inst.id, 'recoveryChannel.token', inst.recoveryChannel.token) ?? '';
-    inst.recoveryChannel.tlsKey = decryptRecordSecret(inst.id, 'recoveryChannel.tlsKey', inst.recoveryChannel.tlsKey);
-  }
 }
 
 function encryptedOrStashed(instId: string, field: string, plain: string | undefined): string | undefined {
   if (plain) return envManager.encrypt(plain);
   // Only the '' scrub marker consults the stash: an ABSENT field means the
-  // operator re-provisioned the structure away (e.g. a receiver re-armed as
-  // source), and resurrecting the stale blob into it would mint a phantom
+  // operator re-provisioned the structure away, and resurrecting the stale blob into it would mint a phantom
   // key-loss forever.
   if (plain === undefined) return undefined;
   // '' with a stashed blob is a key-loss read: write the original ciphertext
@@ -243,7 +238,7 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
-  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.recoveryChannel?.token, inst.recoveryChannel?.tlsKey];
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password];
   try {
     for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
       if (!value) continue;
@@ -263,7 +258,7 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  * the record's secrets replaced by ***.
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
-  const has = [inst.fleetDbReplicaSeed, inst.fleetDbReplica?.autoReseed, inst.fleetTransfer, inst.fleetFailback, inst.recoveryRescue]
+  const has = [inst.fleetDbReplicaSeed, inst.fleetDbReplica?.autoReseed]
     .some(r => typeof r?.lastError === 'string' && r.lastError !== '');
   if (!has && !inst.fleetRestoreError) return inst;
   const secrets = recordSecrets(inst);
@@ -272,9 +267,6 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const out: InstanceConfig = { ...inst };
   if (out.fleetDbReplicaSeed) out.fleetDbReplicaSeed = scrub(out.fleetDbReplicaSeed);
   if (out.fleetDbReplica?.autoReseed) out.fleetDbReplica = { ...out.fleetDbReplica, autoReseed: scrub(out.fleetDbReplica.autoReseed) };
-  if (out.fleetTransfer) out.fleetTransfer = scrub(out.fleetTransfer);
-  if (out.fleetFailback) out.fleetFailback = scrub(out.fleetFailback);
-  if (out.recoveryRescue) out.recoveryRescue = scrub(out.recoveryRescue);
   if (out.fleetRestoreError) out.fleetRestoreError = { ...out.fleetRestoreError, text: redactSecrets(out.fleetRestoreError.text, secrets) };
   return out;
 }
@@ -285,19 +277,12 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: encryptedOrStashed(inst.id, 'fleetDb.replication.password', out.fleetDb.replication.password) ?? '' } };
   }
-  if (out.recoveryChannel) {
-    const rc = { ...out.recoveryChannel };
-    rc.token = encryptedOrStashed(inst.id, 'recoveryChannel.token', rc.token) ?? '';
-    rc.tlsKey = encryptedOrStashed(inst.id, 'recoveryChannel.tlsKey', rc.tlsKey);
-    out.recoveryChannel = rc;
-  }
   return out;
 }
 
 /**
- * Response-boundary copy of a record with the four registry-held secrets
- * removed: the browser has no use for them. (The recovery arm block carries
- * its own copy-paste credential through its dedicated surface.)
+ * Response-boundary copy of a record with the registry-held secrets
+ * removed: the browser has no use for them.
  */
 export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConfig & { cutOp: CutOp | null }) | null {
   if (!inst) return inst;
@@ -309,10 +294,6 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.lane = inst.lane ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
-  }
-  if (out.recoveryChannel) {
-    out.recoveryChannel = { ...out.recoveryChannel, token: '' };
-    delete out.recoveryChannel.tlsKey;
   }
   return out;
 }
@@ -707,72 +688,6 @@ export function updateInstanceFleetDbReplicaKept(botId: string, kept: InstanceCo
   saveRegistry(registry);
 }
 
-export function updateInstanceRecoveryChannel(botId: string, channel: RecoveryChannelRecord | null): InstanceConfig | null {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return null;
-  if (channel) instance.recoveryChannel = channel;
-  else delete instance.recoveryChannel;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-  return instance;
-}
-
-/** What an earlier cancelled rescue left stays marked while a new one runs; a cancel's left replaces it, and a finished swap clears it. */
-export function updateInstanceRecoveryRescue(botId: string, rescue: RecoveryRescueRecord | null, lastSwap?: { startedAt: number; completedAt: number }, left?: RecoveryRescueLeft): InstanceConfig | null {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return null;
-  if (rescue) {
-    instance.recoveryRescue = rescue;
-  } else {
-    delete instance.recoveryRescue;
-    if (left) instance.recoveryRescueLeft = left;
-  }
-  if (lastSwap) {
-    instance.recoveryLastSwap = lastSwap;
-    delete instance.recoveryRescueLeft;
-  }
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-  return instance;
-}
-
-/** Throws when the registry cannot be saved. */
-export function updateInstanceRecoverySwappedAway(botId: string, record: { at: number } | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (!record && !instance.recoverySwappedAway && !instance.recoverySwapAbandoned) return;
-  if (record) instance.recoverySwappedAway = record;
-  else { delete instance.recoverySwappedAway; delete instance.recoverySwapAbandoned; }
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-/** The receiver cancelled the swap this source's record names (null clears it). Throws when the registry cannot be saved. */
-export function updateInstanceRecoverySwapAbandoned(botId: string, record: RecoverySwapAbandoned | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (!record && !instance.recoverySwapAbandoned) return;
-  if (record) instance.recoverySwapAbandoned = record;
-  else delete instance.recoverySwapAbandoned;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-/** The cancel's outcome in one save: its notice, and the swap record cleared when record.cleared. Throws when the registry cannot be saved. */
-export function recordRecoverySwapCancel(botId: string, record: RecoverySwapAbandoned): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  instance.recoverySwapAbandoned = record;
-  if (record.cleared) delete instance.recoverySwappedAway;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
 export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetReplicaSeedRecord | null): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -835,47 +750,6 @@ export function deployedComposeEnvValues(botId: string, keys: string[], activeOn
   return copies > 0 ? found : null;
 }
 
-export function updateInstanceFleetTransfer(botId: string, run: FleetTransferRun | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (run) instance.fleetTransfer = run;
-  else delete instance.fleetTransfer;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-export function updateInstanceFleetFailback(botId: string, run: FleetFailbackRun | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (run) instance.fleetFailback = run;
-  else delete instance.fleetFailback;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-/** Set or clear the copy-block retraction a bot has not confirmed yet. Throws when the registry cannot be saved. */
-export function updateInstanceCopyBlockRetract(botId: string, pending: InstanceConfig['copyBlockRetract'] | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (pending) instance.copyBlockRetract = pending;
-  else delete instance.copyBlockRetract;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-export function updateInstanceFleetFailbackDeclined(botId: string, decline: FleetFailbackDecline | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (decline) instance.fleetFailbackDeclined = decline;
-  else delete instance.fleetFailbackDeclined;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
 /** Set or clear a failed restore's notice. Throws when the registry cannot be saved. */
 export function updateInstanceFleetRestoreError(botId: string, notice: { file: string; text: string } | null): void {
   const registry = loadRegistry();
@@ -893,32 +767,6 @@ export function updateInstanceFleetOwnDbRetired(botId: string, at: string): void
   const instance = registry.instances[botId];
   if (!instance) return;
   instance.fleetOwnDbRetiredAt = at;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-export function updateInstanceFleetLastPosture(botId: string, record: InstanceConfig['fleetLastPosture'] | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  if (record) instance.fleetLastPosture = record;
-  else delete instance.fleetLastPosture;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
-/** Record (with the owner its layers name) or clear (owner null) that a failback or drop-back run left its write fence on this database. Throws when the registry cannot be saved. */
-export function updateInstanceFleetConsentFenceLeft(botId: string, containerName: string, owner: string | null): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  const now = instance.fleetConsentFenceLeft ?? [];
-  const at = now.find(e => e.containerName === containerName);
-  if (owner ? at?.owner === owner : !at) return;
-  const rest = now.filter(e => e.containerName !== containerName);
-  const next = owner ? [...rest, { containerName, owner }] : rest;
-  if (next.length) instance.fleetConsentFenceLeft = next;
-  else delete instance.fleetConsentFenceLeft;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
 }
@@ -1016,9 +864,8 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   // already carries (B6 map F30): enable then keeps it instead of minting.
   stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume, ...(replication ? { replication } : {}) };
   delete stored.fleetDbReplica;
-  // The seed record and any transfer run are about the standby this adopt just consumed.
+  // The seed record is about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
-  delete stored.fleetTransfer;
   delete stored.fleetOwnDbRetiredAt;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
@@ -1027,7 +874,6 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     live.fleetDb = { ...stored.fleetDb };
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
-    delete live.fleetTransfer;
     delete live.fleetOwnDbRetiredAt;
   }
   // A standby deployed before the app depended on it: order compose down now,
@@ -1061,14 +907,11 @@ export function unfinishedRetireRefusal(retiringAt: string): string {
  * dump until this runs; the app service is deliberately left down.
  * retireRetry: the caller proved the volume predates the retiring mark.
  */
-export async function startFleetDbSidecar(botId: string, opts: { forRescue?: boolean; retireRetry?: boolean } = {}): Promise<LaneResult> {
+export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: boolean } = {}): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
   if (fleetDb.retiringAt && !opts.retireRetry) return { success: false, error: unfinishedRetireRefusal(fleetDb.retiringAt) };
-  if (instance.recoveryRescue && !opts.forRescue) {
-    return { success: false, error: 'A database rescue is recorded on this instance and rewrites its volume; the database was not started' };
-  }
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
@@ -1166,12 +1009,8 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     if (stripped.content !== null) rewriteComposeFile(composePath, stripped.content);
     const registry = loadRegistry();
     const stored = registry.instances[botId];
-    // With the old copy gone, a swap that handed it away can no longer leave a second primary behind.
     if (stored) {
       delete stored.fleetDb;
-      delete stored.recoverySwappedAway;
-      delete stored.recoverySwapAbandoned;
-      delete stored.recoveryRescueLeft;
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
     }
@@ -1179,9 +1018,6 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     return { success: false, volumeRemoved: true, error: `the database volume ${fleetDb.volume} was removed, but its compose or record could not be updated: ${errorText(err)}` };
   }
   delete instance.fleetDb;
-  delete instance.recoverySwappedAway;
-  delete instance.recoverySwapAbandoned;
-  delete instance.recoveryRescueLeft;
   return { success: true, volumeRemoved: true };
 }
 
@@ -1646,26 +1482,9 @@ export function releaseDatabaseLane(botIds: string[]): void {
   for (const id of botIds) databaseHolds.delete(id);
 }
 
-function swappedAwayRefusal(botId: string, action: string): { success: false; error: string } | null {
-  const swapped = getBot(botId)?.recoverySwappedAway;
-  if (!swapped) return null;
-  const day = new Date(swapped.at).toISOString().slice(0, 10);
-  return { success: false, error: `A recovery swap on ${day} handed this instance's database to another machine, so ${action} would run a second primary on the old copy; re-seed it as a standby of the new primary, or, if that swap never promoted the copy there, clear the swap record on its Database modal first` };
-}
-
 function databaseHoldRefusal(botId: string, action: string): { success: false; error: string } | null {
   const lane = databaseHolds.get(botId);
   return lane ? { success: false, error: `${lane} is running on this instance's database; ${action} is refused until it ends` } : null;
-}
-
-/** The recorded database runs a build or update must not run under; null when none is recorded. */
-function databaseRunRefusal(botId: string, action: string): { success: false; error: string } | null {
-  const inst = getBot(botId);
-  if (!inst) return null;
-  if (inst.recoveryRescue) return { success: false, error: `A database rescue is recorded on this instance; finish or cancel it before ${action} (nothing was changed)` };
-  if (inst.fleetFailback) return { success: false, error: `A ${inst.fleetFailback.mode} run is recorded on this instance (${inst.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before ${action} (nothing was changed)` };
-  if (inst.fleetTransfer) return { success: false, error: `A database transfer is recorded on this instance (${inst.fleetTransfer.phase}); let it finish or cancel it before ${action} (nothing was changed)` };
-  return null;
 }
 
 // Status pushes sent inside an op carry its activeOp; once the lock is gone
@@ -2107,12 +1926,9 @@ async function listDeleteRemnants(
     // Cannot see containers at all: do not deregister on blind faith.
     remnants.push('unverified containers (docker unreachable)');
   }
-  // The recovery and seed helpers are docker-run without labels, so the label
-  // scan cannot see them; their names are exactly enumerable, probed one by one.
+  // The seed helpers are docker-run without labels, so the label scan cannot
+  // see them; their names are exactly enumerable, probed one by one.
   for (const name of [
-    instance.recoveryChannel?.containerName,
-    `${instance.sanitizedName}-recovery-rsyncd`,
-    `${instance.sanitizedName}-recovery-rsync`,
     `${instance.sanitizedName}-fleet-replica-seed`,
     `${instance.sanitizedName}-fleet-replica-seed-slot`,
     `${instance.sanitizedName}-fleet-replica-seed-slot-drop`,
@@ -2369,15 +2185,8 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
     console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps replication slot ${instance.fleetDbReplica.slot}, which retains WAL until it is dropped there (its Database modal lists the slot with a Drop action once nothing streams on it)`);
   }
 
-  // 3c. Recovery-channel relay: never compose-managed, so nothing else
-  // removes it. The peer machine keeps redialing until disarmed there.
-  if (instance.recoveryChannel) {
-    await rmContainerTolerant(instance.recoveryChannel.containerName, failures);
-  }
-
-  // 3d. Derived-name helpers run UNCONDITIONALLY: a helper can outlive its
-  // record (a disarm whose rm failed after the record cleared, a seed whose
-  // --rm was defeated by a daemon crash), and the remnants gate probes these
+  // 3c. Derived-name helpers run UNCONDITIONALLY: a helper can outlive its
+  // record (a seed whose --rm was defeated by a daemon crash), and the remnants gate probes these
   // same names unconditionally - a remnant the delete never retries removing
   // would wedge the delete in error forever.
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed`, failures);
@@ -2385,8 +2194,6 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-slot-drop`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-replica-seed-probe`, failures);
   await rmContainerTolerant(`${instance.sanitizedName}-fleet-postgres-replica-data-helper`, failures);
-  await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsyncd`, failures);
-  await rmContainerTolerant(`${instance.sanitizedName}-recovery-rsync`, failures);
 
   // 4. Remove instance directory
   if (!keepData) {
@@ -3519,9 +3326,7 @@ export async function runningInstanceContainers(botId: string): Promise<string[]
 
 /**
  * Names of this instance's RUNNING compose containers other than the fleet
- * sidecar. The recovery swap's quiesce (RC-4) works from container truth,
- * not the registry status: the end-of-WAL it captures is only a fence if
- * nothing can write to the database anymore. Null = docker query failed,
+ * sidecar, read from container truth rather than the registry status. Null = docker query failed,
  * so the caller must refuse rather than assume quiet.
  */
 export async function runningNonSidecarContainers(botId: string): Promise<string[] | null> {
@@ -3615,90 +3420,16 @@ export async function startBot(botId: string): Promise<LaneResult> {
 
 /** The synchronous refusal a start or restart answers before touching anything; null when it may proceed. */
 export function startPreflightRefusal(botId: string): { success: false; error: string } | null {
-  const rescue = getBot(botId)?.recoveryRescue;
-  // The flip's sub-steps run after the copy is filed as the primary: the volume is no longer being rewritten.
-  if (rescue && !(rescue.phase === 'flip' && rescue.flipStep)) {
-    return { success: false, error: 'A database rescue is rewriting this instance\'s volume; cancel the rescue (or finish the swap) before starting it' };
-  }
   const retiringAt = getBot(botId)?.fleetDb?.retiringAt;
   if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
-  return swappedAwayRefusal(botId, 'a start') ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
-}
-
-/**
- * A cancelled rescue that left a partial copy or a standby of the sender refuses a start: Postgres would run on files
- * that are not a consistent database, or as a read-only follower of a channel that may be gone. The volume is asked
- * each time, so a volume put right by hand (or by a finished rescue) starts again and the mark is cleared.
- */
-export async function rescueLeftoverRefusal(botId: string): Promise<{ success: false; error: string } | null> {
-  const instance = getBot(botId);
-  const left = instance?.recoveryRescueLeft;
-  if (!instance || !left) return null;
-  const volume = instance.fleetDb?.volume;
-  const day = new Date(left.at).toISOString().slice(0, 10);
-  // The probe's docker run would mint an absent volume and read it as clean.
-  const volState = volume ? await (await import('../instance/fleetReplica')).dockerVolumeState(volume) : 'exists';
-  if (volState === 'absent') {
-    return { success: false, error: `A rescue cancelled on ${day} left a mark on this instance, and its database volume ${volume} is gone, so it was not started and the mark is kept: a start would create an empty volume under that name. Decommission this database on its Database modal and provision a new one` };
-  }
-  if (volState === 'unknown') {
-    return { success: false, error: `A rescue cancelled on ${day} left a mark on this instance, and this manager can't confirm whether its database volume ${volume} exists (docker did not answer), so the instance was not started; retry in a moment` };
-  }
-  const probe = !volume ? { ok: true, out: 'clean' } : await new Promise<{ ok: boolean; out: string }>(resolve => {
-    execFile('docker', ['run', '--rm', '-v', `${volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
-      'if test -f /pgdata/rescue.inprogress; then echo partial; elif test -f /pgdata/standby.signal; then echo standby; else echo clean; fi'],
-      { timeout: 60_000 }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message).trim().split('\n').pop() || 'no answer' : String(stdout).trim() }));
-  });
-  if (probe.ok && probe.out === 'clean') {
-    try {
-      const registry = loadRegistry();
-      const stored = registry.instances[botId];
-      if (stored) {
-        delete stored.recoveryRescueLeft;
-        saveRegistry(registry);
-      }
-      delete instance.recoveryRescueLeft;
-    } catch (err) {
-      return { success: false, error: `The volume a rescue cancelled on ${day} left behind is clean again, but that could not be recorded (${errorText(err)}), so the instance was not started; retry` };
-    }
-    return null;
-  }
-  const remedy = 'Start a rescue again to finish the copy, or decommission this database on its Database modal and provision a new one';
-  if (probe.ok && probe.out === 'partial') {
-    return { success: false, error: `A rescue cancelled on ${day} left a partial copy of the sender's database on this instance's volume, so it was not started: Postgres would run on files that are not a consistent database. ${remedy}` };
-  }
-  if (probe.ok && probe.out === 'standby') {
-    return { success: false, error: `A rescue cancelled on ${day} left this instance's database as a standby of the sender (read-only, following a channel that may be gone), so it was not started. ${remedy}` };
-  }
-  return { success: false, error: `A rescue cancelled on ${day} may have left a partial copy on this instance's volume, and docker could not check it (${probe.ok ? `it answered '${probe.out}'` : probe.out}), so the instance was not started; retry in a moment` };
-}
-
-const COPY_BLOCK_RETRACT_LOCK_WAIT_MS = 30 * 60_000;
-
-/** A recorded copy-block retraction reaches the app once its hooks answer after a start; a miss stays recorded. */
-async function sendCopyBlockRetract(botId: string): Promise<void> {
-  try {
-    // Imported here: appLifecycle imports this module.
-    const lifecycle = await import('../instance/appLifecycle');
-    const instance = getBot(botId);
-    if (!instance) return;
-    const up = await lifecycle.waitForAppHook(instance, 90_000);
-    if (!up.success) return;
-    // The lane that started the bot, or one that took the lock after it, may still hold it.
-    const until = Date.now() + COPY_BLOCK_RETRACT_LOCK_WAIT_MS;
-    while (isBotBusy(botId) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 1000).unref());
-    const settled = await lifecycle.settleCopyBlockRetract(botId);
-    if (settled.pending) console.warn(`[Start] ${instance.displayName}: the copy-block retraction is still pending (${settled.reason}); the next start or opening its Database modal sends it again`);
-  } catch (err) {
-    console.warn(`[Start] the copy-block retraction for ${botId} could not be sent: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  return databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
 async function startBotImpl(botId: string): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  const rescueRefusal = startPreflightRefusal(botId) ?? await rescueLeftoverRefusal(botId);
-  if (rescueRefusal) return rescueRefusal;
+  const preflight = startPreflightRefusal(botId);
+  if (preflight) return preflight;
   let statusBefore = instance.status;
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
   if (instance.status === 'running') {
@@ -3761,7 +3492,6 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
         result.warning = result.warning ? `${result.warning}; ${fenced}` : fenced;
       }
     }
-    if (getBot(botId)?.copyBlockRetract) void sendCopyBlockRetract(botId);
   }
   if (!applyInPlace) return result;
 
@@ -4253,8 +3983,8 @@ async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
 
 export async function restartBot(botId: string): Promise<LaneResult> {
   return withLoggedBotOp(botId, 'restart', async () => {
-    const rescueRefusal = startPreflightRefusal(botId) ?? await rescueLeftoverRefusal(botId);
-    if (rescueRefusal) return rescueRefusal;
+    const preflight = startPreflightRefusal(botId);
+    if (preflight) return preflight;
     try {
       writeLane(botId, newLane('restart', true));
     } catch (err) {
@@ -4316,7 +4046,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  return swappedAwayRefusal(botId, 'an update') ?? databaseHoldRefusal(botId, 'Update') ?? databaseRunRefusal(botId, 'updating') ?? deleteLaneRefusal(botId, 'Update');
+  return databaseHoldRefusal(botId, 'Update') ?? deleteLaneRefusal(botId, 'Update');
 }
 
 /** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
@@ -4487,7 +4217,7 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
 
 /** The synchronous refusal a Build answers before touching anything; null when it may proceed. */
 export function buildPreflightRefusal(botId: string): { success: false; error: string } | null {
-  return databaseHoldRefusal(botId, 'Build') ?? databaseRunRefusal(botId, 'building') ?? deleteLaneRefusal(botId, 'Build');
+  return databaseHoldRefusal(botId, 'Build') ?? deleteLaneRefusal(botId, 'Build');
 }
 
 export async function buildBot(botId: string): Promise<LaneResult> {
@@ -5353,16 +5083,12 @@ export async function syncContainerStates(): Promise<void> {
     const appName = resolveAppName(instance.id);
     // Same matching as getContainerIdsForBot (ownedBotContainers).
     // Standalone-capable service containers are excluded by exact name: the
-    // fleet sidecar, a replica, or a recovery helper routinely runs ALONE
-    // (dumps, re-seeds, rescues), and counting one as "the bot" flips the
-    // registry to running - which a later stop turns into a compose down that
-    // kills the very standby a rescue is streaming into.
+    // fleet sidecar or a replica routinely runs ALONE (dumps, re-seeds), and
+    // counting one as "the bot" flips the registry to running - which a later
+    // stop turns into a compose down that kills the standby a seed fills.
     const standalone = new Set<string>([
       instance.fleetDb?.containerName || '',
       instance.fleetDbReplica?.containerName || '',
-      `${instance.sanitizedName}-recovery-relay`,
-      `${instance.sanitizedName}-recovery-rsyncd`,
-      `${instance.sanitizedName}-recovery-rsync`,
     ]);
     const botContainers = ownedBotContainers(containers, instance.id, appName)
       .filter(c => !standalone.has(c.name));

@@ -23,8 +23,6 @@ const h = vi.hoisted(() => {
     refusePending: false,
     events: [] as string[],
     installs: [] as string[],
-    settles: [] as Array<string | null>,
-    hookGate: null as null | Promise<void>,
     downGate: null as null | Promise<void>,
   };
 });
@@ -110,21 +108,11 @@ vi.mock('../../src/config/configFileManager', async (importOriginal) => ({
   getConfigFilesWithStatus: () => ({ files: [], undecryptable: [], corrupt: h.cfgCorrupt }),
   getBuiltMounts: () => [],
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
-  waitForAppHook: async () => { if (h.hookGate) await h.hookGate; return { success: true }; },
-  settleCopyBlockRetract: async (botId: string) => {
-    const cm = await import('../../src/docker/containerManager');
-    h.settles.push(cm.isBotBusy(botId));
-    return { pending: false };
-  },
-}));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
-import '../../src/instance/appLifecycle';
 
 const botDir = path.join(h.dir, 'bots', 'b1');
 const composePath = path.join(botDir, 'docker-compose.yml');
@@ -153,8 +141,6 @@ beforeEach(() => {
   h.refusePending = false;
   h.events.length = 0;
   h.installs.length = 0;
-  h.settles.length = 0;
-  h.hookGate = null;
   h.downGate = null;
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
@@ -251,26 +237,4 @@ describe('B04-3c the post-install command runs once per install', () => {
     expect(second.success).toBe(true);
     expect(h.installs).toEqual(['post']);
   }, 30_000);
-});
-
-describe('B19-2s the copy-block retraction waits for the op lock', () => {
-  it('a retraction whose hooks answer while another lane holds the lock is sent once the lock is free', async () => {
-    seed('stopped', { copyBlockRetract: { host: 'primary.invalid', port: 15432, since: '2026-10-24T00:00:00.000Z' } });
-    const hook = h.deferred();
-    const down = h.deferred();
-    h.hookGate = hook.promise;
-    h.downGate = down.promise;
-    const res = await containerManager.startBot('b1');
-    expect(res.success).toBe(true);
-    const stop = containerManager.stopBot('b1');
-    await new Promise(r => setTimeout(r, 20));
-    expect(containerManager.isBotBusy('b1')).toBe('stop');
-    hook.resolve();
-    await new Promise(r => setTimeout(r, 100));
-    expect(h.settles).toEqual([]);
-    down.resolve();
-    await stop;
-    for (let i = 0; i < 300 && h.settles.length === 0; i++) await new Promise(r => setTimeout(r, 10));
-    expect(h.settles).toEqual([null]);
-  }, 20_000);
 });

@@ -87,21 +87,6 @@ describe('the stuck-fence warning seeded at start names a remedy that works', ()
     expect(text).not.toMatch(/restart the instance to clear it/);
   });
 
-  it('an armed recovery channel names its disarm as the remedy', async () => {
-    pg.saved = '1';
-    seedRegistry({ recoveryChannel: { mode: 'source' } });
-    fenceOwners.set(primary.containerName, 'swap:1729900000000');
-    expect(await seededWarning()).toMatch(/disarming the recovery channel/);
-  });
-
-  it('a recovery channel receiver is not sent to a disarm that leaves the fence', async () => {
-    pg.saved = '1';
-    seedRegistry({ recoveryChannel: { mode: 'receiver' } });
-    const text = await seededWarning();
-    expect(text).not.toMatch(/disarming the recovery channel on its Database modal lifts it/);
-    expect(text).toMatch(/disarm the recovery channel \(receiver\), then run a restore again to retry the lift/);
-  });
-
   it('a promoted copy is not sent to a re-seed the modal refuses', async () => {
     pg.fenced = new Map([[copy.containerName, true]]);
     pg.inRecovery = 'f';

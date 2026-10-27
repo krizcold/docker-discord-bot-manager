@@ -43,19 +43,6 @@ describe('the restore request toast', () => {
   });
 });
 
-describe('dismissing a failback run', () => {
-  it('styles an error carried on a successful answer as an error', async () => {
-    const messages: string[][] = [];
-    const ctx = runPage(['dismissFailback'], {
-      api: async () => ({ success: true, error: 'run dismissed, but the instance did not start' }),
-      showMessage: (t: string, m: string) => messages.push([t, m]),
-      renderFleetReplica: () => {}, renderFleetReplication: () => {}, loadBots: () => {},
-    });
-    await ctx.dismissFailback('b1');
-    expect(messages[0][0]).toBe('error');
-  });
-});
-
 describe('copy buttons', () => {
   const page = (writeText: (t: string) => Promise<void>) => {
     const messages: string[][] = [];

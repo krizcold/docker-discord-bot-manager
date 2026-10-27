@@ -28,16 +28,11 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
-import { readStandInPosture, StandInRead } from './appLifecycle';
-import * as fleetFailback from './fleetFailback';
 import * as fleetReplica from './fleetReplica';
-import * as fleetTransfer from './fleetTransfer';
-import * as recoveryRescue from './recoveryRescue';
 import { REPLICATION_ROLE } from './fleetReplication';
-import { busy, externalClaims, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
+import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
-const FACTS_TIMEOUT_MS = 10_000;
 const REFIRE_GUARD_MS = 23 * 60 * 60 * 1000; // prevents double-fire within the hour window
 const DUMP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** A docker read (inspect, a SELECT or SHOW): a hung CLI must not hold its lane; a timed-out read is unknown. */
@@ -53,7 +48,7 @@ let tickRunning = false;
 const lastAttempts: Map<string, number> = new Map();
 // Last dump error per instance (in-memory, surfaced on the bot card)
 const lastErrors: Map<string, string> = new Map();
-// A standby copy that has left recovery, or stands in (read-only too), is dumped under this prefix.
+// A standby copy is dumped under this prefix, whether or not it is in recovery.
 const COPY_PREFIX = 'standin-';
 const lastCopyAttempts: Map<string, number> = new Map();
 const copyErrors: Map<string, string> = new Map();
@@ -65,7 +60,7 @@ function scrubbed(botId: string, text: string): string {
 // A stuck restore write fence, tracked apart from lastErrors: a read-only
 // database still DUMPS successfully, so the nightly dump's success would wipe
 // a warning parked in the shared slot while the fence still stands.
-// One warning per database (the primary and a drop-back's copy are fenced apart), keyed by container name.
+// One warning per database (the primary and its copy are fenced apart), keyed by container name.
 const fenceStuck: Map<string, Map<string, { text: string; db: RestoreFleetDb }>> = new Map();
 function setStuck(botId: string, db: RestoreFleetDb, text: string): void {
   const entries = fenceStuck.get(botId) ?? new Map();
@@ -79,29 +74,6 @@ function clearStuck(botId: string, containerName: string): void {
   if (entries.size === 0) fenceStuck.delete(botId);
 }
 const isStuck = (botId: string, containerName: string) => fenceStuck.get(botId)?.has(containerName) === true;
-// The databases whose fence a failback or drop-back run left on, with the owner its layers name. It only points at
-// the fence: the layers' owners decide who lifts it. Persisted on the instance (fleetConsentFenceLeft) so a manager
-// restart keeps it. This process's word overrides the disk while a save is refused: one it recorded is held here,
-// one it cleared waits here for its clear to land.
-type FenceKey = { botId: string; containerName: string };
-const fenceKey = (botId: string, containerName: string) => JSON.stringify([botId, containerName]);
-const stuckByFailback: Map<string, string> = new Map();
-const clearPending: Map<string, FenceKey> = new Map();
-
-/** Save the record (owner null clears it); false when the save was refused. */
-function recordFailbackFence(botId: string, containerName: string, owner: string | null): boolean {
-  const key = fenceKey(botId, containerName);
-  if (owner) { stuckByFailback.set(key, owner); clearPending.delete(key); }
-  else { stuckByFailback.delete(key); clearPending.set(key, { botId, containerName }); }
-  try {
-    containerManager.updateInstanceFleetConsentFenceLeft(botId, containerName, owner);
-    clearPending.delete(key);
-    return true;
-  } catch (err) {
-    console.error(`[FleetBackup] Could not save the failback fence record for ${botId} (${containerName}):`, err);
-    return false;
-  }
-}
 export function getFleetBackupError(botId: string): string | null {
   return lastErrors.get(botId) || null;
 }
@@ -137,28 +109,15 @@ function setRestoreError(botId: string, file: string, reason: string, consequenc
   }
 }
 
-/** The write fences a restore, drop-back or failback left on, one text per database; null when none. */
+/** The write fences a lane left on, one text per database; null when none. */
 export function getFleetFenceStuck(botId: string): string | null {
   return Array.from(fenceStuck.get(botId)?.values() ?? [], e => e.text).join('; ') || null;
 }
 
-/**
- * A slot a recovery source's quiesce left held: the source is swapped away and nothing runs on it under its op
- * lock. The slot only waits for the receiver's teardown, so a shutdown waiting on it would wait out its whole bound.
- */
-function quiescedSourceSlot(botId: string): boolean {
-  const instance = containerManager.getBot(botId);
-  return !!instance?.recoverySwappedAway && instance.recoveryChannel?.mode === 'source' && externalClaims.has(botId)
-    && !containerManager.activeBotOps().some(([id]) => id === botId);
-}
-
-/**
- * A held backup slot or op lock, named; null when neither is held. A shutdown waits on these, bounded, and passes
- * over a quiesced source's slot (passQuiesced); a self-update does not, since the recreate would drop that slot.
- */
-export function inFlightLaneBlocker(opts: { passQuiesced?: boolean } = {}): string | null {
+/** A held backup slot or op lock, named; null when neither is held. A shutdown and a self-update wait on these, bounded. */
+export function inFlightLaneBlocker(): string | null {
   const name = (id: string) => containerManager.getBot(id)?.displayName || id;
-  const slot = Array.from(busy).find(id => !opts.passQuiesced || !quiescedSourceSlot(id));
+  const slot = Array.from(busy)[0];
   if (slot) return `a database dump, restore or replication change is running on ${name(slot)}`;
   const op = containerManager.activeBotOps()[0];
   if (op) return `operation '${op[1]}' is running on ${name(op[0])}`;
@@ -168,14 +127,11 @@ export function inFlightLaneBlocker(opts: { passQuiesced?: boolean } = {}): stri
 /** Waits, bounded, until inFlightLaneBlocker answers null; the lane still running at the bound, or null. */
 export async function waitForInFlightLanes(boundMs: number, pollMs = 1_000): Promise<string | null> {
   const deadline = Date.now() + boundMs;
-  for (const id of busy) {
-    if (quiescedSourceSlot(id)) console.log(`[Shutdown] Not waiting on ${containerManager.getBot(id)?.displayName || id}: the backup slot is held for the swap's quiesce, which nothing runs under now; the receiver's teardown or a disarm releases it`);
-  }
-  let lane = inFlightLaneBlocker({ passQuiesced: true });
+  let lane = inFlightLaneBlocker();
   if (lane) console.log(`[Shutdown] Waiting up to ${Math.round(boundMs / 1000)} s: ${lane}`);
   while (lane && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pollMs));
-    lane = inFlightLaneBlocker({ passQuiesced: true });
+    lane = inFlightLaneBlocker();
   }
   return lane;
 }
@@ -189,12 +145,6 @@ export function databaseLaneBlocker(): string | null {
   const inFlight = inFlightLaneBlocker();
   if (inFlight) return inFlight;
   for (const b of containerManager.getAllBots()) {
-    const rescue = recoveryRescue.getRescueStatus(b);
-    if (rescue && !rescue.parked) return `a database rescue is running on ${b.displayName} (${rescue.phase})`;
-    const failback = fleetFailback.failbackView(b);
-    if (failback && !failback.parked) return `a ${failback.mode} run is running on ${b.displayName} (${failback.phase})`;
-    const transfer = fleetTransfer.transferView(b);
-    if (transfer && !transfer.parked) return `a database transfer is running on ${b.displayName} (${transfer.phase})`;
     const seed = fleetReplica.seedView(b);
     if (seed && !seed.parked) return `a standby seed is running on ${b.displayName}`;
   }
@@ -406,12 +356,9 @@ export type FenceState = FenceLayers & { readOnlyOwner: string | null; hbaOwner:
 
 /**
  * Which layer an earlier fence left on a fence may take over: 'any' for the lanes that replace or destroy the data
- * (restore, re-seed, decommission), 'lane' for the consent park, which takes over only a layer its own lane left, and
- * 'run' for the recovery quiesce, which takes over a layer a failback, drop-back or swap run left (the swap moves the
- * primary away, so that run must not lift the layer under it), never a restore's, re-seed's, decommission's or no lane's.
+ * (restore, re-seed, decommission), 'lane' for a fence that takes over only a layer its own lane left.
  */
-export type FenceTakeOver = 'any' | 'lane' | 'run';
-const RUN_LANES: ReadonlyArray<FenceLane | null> = ['failback', 'dropback', 'swap'];
+export type FenceTakeOver = 'any' | 'lane';
 
 /**
  * The layers a lift left on because another lane, or no lane, owns them; holder is that owner (null: no lane).
@@ -419,7 +366,7 @@ const RUN_LANES: ReadonlyArray<FenceLane | null> = ['failback', 'dropback', 'swa
  */
 export type FenceHeld = { readOnly: boolean; hba: boolean; holder: string | null; fromFiles?: boolean; detail?: string };
 
-/** owner is lane:<ms>; 'swap:*' stands for any swap, as the disarm lifts the layers of whichever swap set them. */
+/** owner is lane:<ms>; '<lane>:*' stands for any run of that lane. */
 export function newFenceOwner(lane: FenceLane, at: number = Date.now()): string {
   return `${lane}:${at}`;
 }
@@ -574,8 +521,6 @@ const capitalized = (text: string) => text.charAt(0).toUpperCase() + text.slice(
 function holderRemedy(owner: string | null): string {
   const lane = fenceOwnerLane(owner);
   if (!lane) return `if nothing should hold it, lift it by hand (ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf(); remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf)`;
-  if (lane === 'swap') return 'disarming the recovery channel on its Database modal lifts it';
-  if (lane === 'failback' || lane === 'dropback') return 'that run\'s exits on its Database modal lift it, and a new run of that lane takes it over';
   return 'running that lane again lifts it';
 }
 
@@ -610,20 +555,15 @@ function stuckLiftText(result: FenceLift, lane: string, volume: string, failedRe
  * clears a STRIPPED fence; a 'failed', 'unreloaded' or 'locked' one survives in the volume's
  * files and would be re-applied by the restart, so its remedy is a retried lift instead. */
 async function liftAndTrack(botId: string, fleetDb: RestoreFleetDb, owner: string, lane = 'a restore', failedRemedy = 'running the restore again retries the lift', layers: FenceLayers = BOTH_LAYERS, held: FenceHeld = noneHeld()): Promise<FenceLift> {
-  const failback = lane === 'a failback';
   const result = await liftOwnedFence(fleetDb, owner, layers, held);
   if (result === 'lifted' || result === 'gone') {
     clearStuck(botId, fleetDb.containerName);
-    recordFailbackFence(botId, fleetDb.containerName, null);
     return result;
   }
   if (result === 'held') {
-    recordFailbackFence(botId, fleetDb.containerName, null);
     setStuck(botId, fleetDb, capitalized(heldText(held, lane)));
     return result;
   }
-  // A run stopped mid-lift is covered by its own run record (fence.owned), so this is saved only once the lift did not land.
-  recordFailbackFence(botId, fleetDb.containerName, failback ? owner : null);
   const heldNote = held.readOnly || held.hba ? `; and ${heldText(held, lane)}` : '';
   setStuck(botId, fleetDb, stuckLiftText(result, lane, fleetDb.volume, failedRemedy) + heldNote);
   return result;
@@ -655,7 +595,7 @@ async function sweepSessions(db: RestoreFleetDb): Promise<string | null> {
 }
 
 /**
- * The write fence every lane that dumps before a destroy uses, the consent park and the recovery quiesce too: the
+ * The write fence every lane that dumps before a destroy uses, and the consent park: the
  * read-only default, then pg_hba lines that refuse every TCP connection but the managed role's replication, then
  * every other session ended, and once more after authentication_timeout (a login accepted before the reload can
  * finish under the old rules). A session that sets READ WRITE itself passes the default; it cannot pass the lines.
@@ -680,8 +620,7 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
   if (hbaFile !== FENCE_HBA_FILE) return refusedBefore(`the database reads its pg_hba from ${hbaFile || 'an unnamed file'}, not ${FENCE_HBA_FILE}, so the fence could not refuse outside connections`);
   if (Number(subscriptions) > 0) return refusedBefore(`the database has ${subscriptions} enabled subscription(s), whose workers write past the fence; disable them (ALTER SUBSCRIPTION ... DISABLE) and retry`);
   const mayTake = (found: string | null): boolean => takeOver === 'any'
-    || (found !== null && (found === owner || fenceOwnerLane(found) === fenceOwnerLane(owner)
-      || (takeOver === 'run' && RUN_LANES.includes(fenceOwnerLane(found)))));
+    || (found !== null && (found === owner || fenceOwnerLane(found) === fenceOwnerLane(owner)));
   const setReadOnly = readOnlyNow === 'off' || mayTake(parseFenceOwner(fileOwner));
   const setHba = hbaCount === '0' || mayTake(parseFenceOwner(hbaOwners));
   if (setReadOnly) {
@@ -751,7 +690,6 @@ export async function fencedSafetyDump(instance: InstanceConfig, prefix: string,
   if (!fleetDb) return { success: false, error: 'No fleet database record' };
   const fence = await applyWriteFence(fleetDb, owner, 'any');
   if (!fence.changed) return { success: false, error: `the write fence could not be applied (${lastLine(fence.stderr)}), so no dump was taken` };
-  foreignFenceSet(instance.id, fleetDb.containerName);
   if (!fence.ok) {
     const held = noneHeld();
     const lifted = await liftAndTrack(instance.id, fleetDb, owner, lane, remedy, BOTH_LAYERS, held);
@@ -768,27 +706,6 @@ export async function fencedSafetyDump(instance: InstanceConfig, prefix: string,
 export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, owner: string, lane: string, remedy: string): Promise<string> {
   const held = noneHeld();
   return liftNote(await liftAndTrack(botId, fleetDb, owner, lane, remedy, BOTH_LAYERS, held), fleetDb.volume, remedy, held, lane);
-}
-
-/** The owner a failback or drop-back run on this instance left its fence under on this database (the persisted record, or this process's when its save was refused); null when none. */
-export function failbackFenceOwner(botId: string, containerName: string): string | null {
-  const key = fenceKey(botId, containerName);
-  const held = stuckByFailback.get(key);
-  if (held) return held;
-  if (clearPending.has(key)) return null;
-  return (containerManager.getBot(botId)?.fleetConsentFenceLeft ?? []).find(e => e.containerName === containerName)?.owner ?? null;
-}
-
-export function failbackFenceLeft(botId: string, containerName: string): boolean {
-  return failbackFenceOwner(botId, containerName) !== null;
-}
-
-/**
- * A lane that takes over any layer set its write fence on this database, so a failback's stuck one under it is now
- * that lane's to lift: the record goes, and a refused save is held here until its clear lands.
- */
-export function foreignFenceSet(botId: string, containerName: string): void {
-  if (failbackFenceLeft(botId, containerName)) recordFailbackFence(botId, containerName, null);
 }
 
 /** Which layers of the write fence the database holds now and whose they are; null when it cannot be asked. */
@@ -828,14 +745,10 @@ export async function fenceStartWarning(botId: string): Promise<string | null> {
  */
 async function seedStuckFences(): Promise<void> {
   for (const instance of containerManager.getAllBots()) {
-    // A failback record whose fence no layer names any more is stale, and must not claim a later lane's fence.
-    for (const { containerName } of instance.fleetConsentFenceLeft ?? []) await checkFailbackRecord(instance.id, containerName);
-    // A parked failback's fence is the run's own, named by its consent; it sits on the run's database only.
-    const parked = instance.fleetFailback?.fence?.ok === true ? instance.fleetFailback.mode : null;
     // A copy carries no fence of its own (its seed strips the setting), so one
-    // reading 'on' is a drop-back's, a promote's or a swap's that was never lifted.
+    // reading 'on' is a promote's that was never lifted.
     const copy = instance.fleetDbReplica;
-    if (parked !== 'drop-back' && copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
+    if (copy?.user && !isStuck(instance.id, copy.containerName) && await isContainerRunning(copy.containerName)) {
       const copyDb = { containerName: copy.containerName, user: copy.user, db: copy.db ?? 'postgres', volume: copy.volume };
       const onCopy = await fenceLayers(copyDb);
       await dropStaleOwner(instance.id, copyDb, onCopy);
@@ -843,13 +756,13 @@ async function seedStuckFences(): Promise<void> {
         const recovery = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
         const inRecovery = recovery.ok ? recovery.stdout.trim() : '';
         const remedy = inRecovery === 't' ? 're-seeding this copy on its Database modal clears it'
-          : inRecovery === 'f' ? `this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf, ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf(), and remove the file ${FENCE_OWNER_FILE} from the data directory) or let a drop-back run re-seed it`
+          : inRecovery === 'f' ? `this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf, ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf(), and remove the file ${FENCE_OWNER_FILE} from the data directory)`
             : 'whether this copy is still a standby could not be read: re-seeding on its Database modal clears a standby, and a promoted copy is lifted only by hand';
         setStuck(instance.id, copyDb, `${fencedState(onCopy, 'The copy')}: a write fence is on (${ownersText(onCopy)}); ${remedy}`);
       }
     }
     const db = instance.fleetDb;
-    if (parked === 'failback' || !db || isStuck(instance.id, db.containerName)) continue;
+    if (!db || isStuck(instance.id, db.containerName)) continue;
     if (!await isContainerRunning(db.containerName)) continue;
     const layers = await fenceLayers(db);
     await dropStaleOwner(instance.id, db, layers);
@@ -871,9 +784,6 @@ async function seededFenceRemedy(instance: InstanceConfig, db: RestoreFleetDb, l
     const lane = fenceOwnerLane(owner);
     // A restore takes over any layer, so it also lifts one no lane owns.
     if (lane === 'restore' || !lane) return restoreRetryRemedy(instance);
-    if ((lane === 'failback' || lane === 'dropback') && instance.fleetFailback && newFenceOwner(lane, instance.fleetFailback.startedAt) === owner) {
-      return `the ${instance.fleetFailback.mode} run on this instance owns it, and the run's exits on its Database modal lift it`;
-    }
     return holderRemedy(owner);
   })));
   const lane = `${ownersText(layers)}, and ${remedies.join('; ')}`;
@@ -886,7 +796,7 @@ async function seededFenceRemedy(instance: InstanceConfig, db: RestoreFleetDb, l
 
 /** A lane may be between writing an owner file and setting its layer on this instance's databases. */
 function laneMayBeFencing(botId: string): boolean {
-  return busy.has(botId) || containerManager.isBotBusy(botId) !== null || !!containerManager.getBot(botId)?.fleetFailback;
+  return busy.has(botId) || containerManager.isBotBusy(botId) !== null;
 }
 
 /** An owner file over a database that reads not read-only is stale: it goes, unless a lane may be fencing right now. */
@@ -897,37 +807,12 @@ async function dropStaleOwner(botId: string, db: RestoreFleetDb, layers: FenceSt
   else if (!layers.ownerFile) staleOwnerFiles.delete(db.containerName);
 }
 
-/** Clear a failback record whose database is gone, or whose layers no longer name its owner; one that cannot be asked is kept for the next check. */
-async function checkFailbackRecord(botId: string, containerName: string): Promise<void> {
-  const instance = containerManager.getBot(botId);
-  const db = instance ? [instance.fleetDb, instance.fleetDbReplica].find(d => d?.containerName === containerName) : undefined;
-  if (!db?.user) { recordFailbackFence(botId, containerName, null); return; }
-  const target = { containerName, user: db.user, db: db.db ?? 'postgres', volume: db.volume };
-  const layers = await isContainerRunning(containerName) ? await fenceLayers(target) : null;
-  if (!layers) return;
-  const owner = failbackFenceOwner(botId, containerName);
-  if (layers.readOnlyOwner !== owner && layers.hbaOwner !== owner) recordFailbackFence(botId, containerName, null);
-}
-
 /**
  * Self-heal the stuck-fence warning: once the operator restarts the container
  * (the stripped auto.conf comes up clean) the live state is writable again and
  * the warning must go. Cheap - runs only while an entry exists.
  */
 async function reprobeStuckFences(): Promise<void> {
-  for (const { botId, containerName } of Array.from(clearPending.values())) recordFailbackFence(botId, containerName, null);
-  // Every record, not only the database the instance's one warning names: a stale one must not claim a later lane's fence.
-  const records = new Set(stuckByFailback.keys());
-  for (const instance of containerManager.getAllBots()) {
-    for (const { containerName } of instance.fleetConsentFenceLeft ?? []) {
-      const key = fenceKey(instance.id, containerName);
-      if (!clearPending.has(key)) records.add(key);
-    }
-  }
-  for (const key of records) {
-    const [botId, containerName] = JSON.parse(key) as [string, string];
-    await checkFailbackRecord(botId, containerName);
-  }
   for (const [containerName, { db }] of Array.from(staleOwnerFiles.entries())) {
     const instance = containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName || b.fleetDbReplica?.containerName === containerName);
     if (!instance) { staleOwnerFiles.delete(containerName); continue; }
@@ -946,7 +831,7 @@ async function reprobeStuckFences(): Promise<void> {
       if (!await isContainerRunning(db.containerName)) continue;
       const layers = await fenceLayers(db);
       await dropStaleOwner(id, db, layers);
-      if (noLayer(layers)) { clearStuck(id, db.containerName); recordFailbackFence(id, db.containerName, null); }
+      if (noLayer(layers)) clearStuck(id, db.containerName);
     }
   }
 }
@@ -1173,11 +1058,11 @@ function lastCopyDump(botId: string): { file: string; mtime: number } | null {
   return listFleetBackups(botId).find(f => f.file.startsWith(COPY_PREFIX)) ?? null;
 }
 
-/** The copy's scheduled-dump state for its banner; null for an instance without a standby copy. */
+/** The copy's scheduled-dump state for its banner; null without a standby copy or for a cleared one, which is never dumped. */
 export function copyBackupInfo(instance: InstanceConfig): {
   enabled: boolean; hour: number; keep: number; lastAt: number | null; lastFile: string | null; stale: boolean; lastError: string | null; listError: string | null;
 } | null {
-  if (!instance.fleetDbReplica) return null;
+  if (!instance.fleetDbReplica || instance.fleetDbReplica.copyCleared) return null;
   const config = effectiveFleetBackup(instance);
   let last: { file: string; mtime: number } | null = null;
   let listError: string | null = null;
@@ -1198,50 +1083,22 @@ export function copyBackupInfo(instance: InstanceConfig): {
   };
 }
 
-/** true when the copy takes writes (out of recovery), false while it follows a primary; an error when it cannot be read. */
-async function copyTakesWrites(rec: { containerName: string; user: string; db: string }): Promise<{ writes: boolean } | { error: string }> {
-  const probe = await readDocker(['exec', rec.containerName, 'psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery()']);
-  const answer = probe.stdout.trim();
-  if (probe.ok && (answer === 't' || answer === 'f')) return { writes: answer === 'f' };
-  return { error: probe.ok ? 'unexpected answer from the copy' : probeErrorTail(probe.stderr) || 'no answer from the copy' };
-}
-
-/**
- * A copy still in recovery is dumped while it stands in live (its primary is gone, so it may be the only copy left)
- * and while the app does not answer, since a stand-in cannot then be ruled out.
- */
-function copyMayBeAlone(read: StandInRead): boolean {
-  if (read.read === 'unanswered') return true;
-  return read.read === 'ok' && read.posture?.role === 'stand-in' && read.posture.live === true;
-}
-
 async function runScheduledCopyDump(instance: InstanceConfig): Promise<void> {
   const rec = instance.fleetDbReplica;
   if (!rec || rec.copyCleared) return;
-  if (instance.fleetDbReplicaSeed && !instance.fleetDbReplicaSeed.parked) return;
+  const seed = fleetReplica.seedView(instance);
+  if (seed && seed.parked !== true) return;
   let last = 0;
   try { last = lastCopyDump(instance.id)?.mtime ?? 0; } catch { /* an unreadable folder fails the dump below, which reports it */ }
   if (Date.now() - Math.max(lastCopyAttempts.get(instance.id) || 0, last) < REFIRE_GUARD_MS) return;
   lastCopyAttempts.set(instance.id, Date.now());
   if (!rec.user || !rec.db) {
-    copyErrors.set(instance.id, 'the standby record has no database identity, so whether this copy takes writes could not be read and no scheduled dump of it ran');
+    copyErrors.set(instance.id, 'the standby record has no database identity, so no scheduled dump of this copy ran');
     return;
   }
   const target = { containerName: rec.containerName, user: rec.user, db: rec.db };
   busy.add(instance.id);
   try {
-    const role = await copyTakesWrites(target);
-    if ('error' in role) {
-      const why = scrubbed(instance.id, role.error);
-      copyErrors.set(instance.id, `could not read whether this copy takes writes (${why}), so no scheduled dump of it ran`);
-      console.error(`[FleetBackup] Could not read the role of the copy for ${instance.displayName} (${instance.id}): ${why}`);
-      return;
-    }
-    if (!role.writes && !copyMayBeAlone(await readStandInPosture(instance, FACTS_TIMEOUT_MS))) {
-      copyErrors.delete(instance.id);
-      lastCopyAttempts.delete(instance.id);
-      return;
-    }
     const result = await dumpDatabase(instance.id, target, COPY_PREFIX);
     if (result.success) {
       copyErrors.delete(instance.id);
@@ -1352,10 +1209,6 @@ export async function previewFleetRestore(botId: string): Promise<{ success: tru
 
 /** The lane that holds this instance's database against a restore: the refusal, and the step that clears it; null when none does. */
 function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string } | null {
-  if (instance.recoveryRescue) return { refusal: 'A database rescue is recorded on this instance; finish or cancel it before restoring a dump', step: 'finish or cancel the database rescue' };
-  if (instance.recoveryChannel) return { refusal: `The recovery channel is armed on this instance (${instance.recoveryChannel.mode}); disarm it before restoring a dump`, step: `disarm the recovery channel (${instance.recoveryChannel.mode})` };
-  if (instance.fleetFailback) return { refusal: `A ${instance.fleetFailback.mode} run is recorded on this instance (${instance.fleetFailback.phase}); Continue, Cancel or Dismiss it on the Database modal before restoring a dump`, step: `Continue, Cancel or Dismiss the ${instance.fleetFailback.mode} run on the Database modal` };
-  if (instance.fleetTransfer) return { refusal: `A database transfer is recorded on this instance (${instance.fleetTransfer.phase}); let it finish or cancel it before restoring a dump`, step: 'let the database transfer finish or cancel it' };
   const seed = fleetReplica.seedView(instance);
   if (seed && seed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
   return null;
@@ -1436,8 +1289,8 @@ async function sharersRunning(sharing: InstanceConfig[]): Promise<{ ids: string[
 }
 
 /**
- * Restore a dump into the instance's sidecar. Refused while another lane holds the database (a rescue, an armed
- * recovery channel, a failback, transfer or seed run, an op lock on an instance that shares it). In order: the
+ * Restore a dump into the instance's sidecar. Refused while another lane holds the database (a seed run, an op lock
+ * on an instance that shares it). In order: the
  * instances that share the database are held (Start, Restart, Update and Build refuse) and the ones docker shows
  * running are stopped, the sidecar is brought back alone, write fence, pre-restore safety dump under the fence
  * (refusing the restore if it fails), the live term kept on disk (refusing when it cannot be), the restore
@@ -1631,7 +1484,7 @@ async function runFleetRestore(
       sidecarStartedAlone = true;
     }
 
-    // 3. Write fence, the same one the recovery quiesce uses: writes off
+    // 3. Write fence: writes off
     // cluster-wide and every other session terminated, so a consumer the
     // sweep could not see cannot write under the restore.
     // ON_ERROR_STOP so a failed ALTER SYSTEM under a succeeding terminate
@@ -1644,7 +1497,6 @@ async function runFleetRestore(
       const note = await undo();
       return { success: false, error: `Could not fence the database for the restore: ${lastLine(fence.stderr)}${note}`, steps };
     }
-    foreignFenceSet(botId, fleetDb.containerName);
     if (!fence.ok) {
       // A half-applied fence must not survive the refusal. Only a LIVE lift
       // clears it; 'stripped' cleans the persisted copy alone, so the operator
@@ -1902,6 +1754,9 @@ export function startFleetBackupScheduler(): void {
   });
 
   intervalHandle = setInterval(() => {
+    if (!containerManager.registryFault()) {
+      try { fleetReplica.retryHeldSeedRecords(); } catch (err) { console.error('[FleetBackup] Held seed record retry error:', err); }
+    }
     if (tickRunning) return;
     tickRunning = true;
     runFleetBackupTick().catch(err => {

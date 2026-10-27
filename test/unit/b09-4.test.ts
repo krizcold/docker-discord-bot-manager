@@ -7,7 +7,6 @@ const st = vi.hoisted(() => ({
   broadcasts: [] as Array<{ type: string; data: any }>,
   lastError: null as string | null,
   fence: null as string | null,
-  health: null as any,
   bots: [] as any[],
 }));
 
@@ -30,7 +29,6 @@ vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   fleetBackupScopeState: () => true,
   listFleetBackups: () => [],
 }));
-vi.mock('../../src/instance/fleetReplicationHealth', () => ({ getReplicationHealth: () => st.health }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: (_w: unknown, type: string, data: any) => { st.broadcasts.push({ type, data }); } }));
 
 import * as routes from '../../src/webui/routes/bots';
@@ -50,17 +48,15 @@ beforeEach(() => {
   st.broadcasts = [];
   st.lastError = 'disk full';
   st.fence = null;
-  st.health = { role: 'primary', severity: 'error', message: 'standby gone', lagSeconds: null, checkedAt: 1 };
   st.bots = [{ id: 'b1', status: 'running', sourceType: 'git', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4, keep: 7 } }];
 });
 
 describe('B09-4 lifecycle pushes carry the enriched health keys', () => {
   for (const [route, type] of [['/:id/start', 'bot:started'], ['/:id/stop', 'bot:stopped'], ['/:id/restart', 'bot:restarted']]) {
-    it(`${type} carries the backup error and the replication verdict`, async () => {
+    it(`${type} carries the backup error`, async () => {
       await call(route);
       const push = st.broadcasts.find(b => b.type === type);
       expect(push?.data.fleetBackup?.lastError).toBe('disk full');
-      expect(push?.data.replicationHealth?.message).toBe('standby gone');
     });
   }
 });
@@ -74,19 +70,16 @@ describe('B09-4 health changes are pushed', () => {
     expect(pushed[0].fleetBackup).toBeNull();
   });
 
-  it('reports a bot once, then only when its verdict or backup status changes', () => {
+  it('reports a bot once, then only when its backup status changes', () => {
     const fn = (routes as any).collectHealthChanges;
     expect(typeof fn).toBe('function');
     const seen = new Map<string, string>();
     expect(fn(seen).map((p: any) => p.id)).toEqual(['b1']);
-    st.health = { ...st.health, checkedAt: 2 };
     expect(fn(seen)).toEqual([]);
     st.lastError = null;
     const changed = fn(seen);
     expect(changed).toHaveLength(1);
     expect(changed[0].fleetBackup.lastError).toBeNull();
-    st.health = { ...st.health, severity: 'ok', message: 'streaming' };
-    expect(fn(seen)[0].replicationHealth.message).toBe('streaming');
   });
 
   const pageHtml = fs.readFileSync(path.join(__dirname, '../../src/webui/public/index.html'), 'utf8');
@@ -116,9 +109,9 @@ describe('B09-4 health changes are pushed', () => {
       fleetBackupBotId: 'b1', fleetBackupStored: null, fleetBackupRefreshSeq: 0,
       document: { getElementById: (id: string) => boxes[id] ?? null },
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
-      renderSeedBanner: () => {}, renderFleetReplication: () => {}, renderRecoveryChannel: () => {}, api,
+      renderSeedBanner: () => {}, renderFleetReplication: () => {}, api,
     });
-    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml', 'swappedAwayHtml']) vm.runInContext(pageFunction(fn), ctx);
+    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml']) vm.runInContext(pageFunction(fn), ctx);
     return { ctx, boxes };
   };
   const listed = async () => ({ success: true, backups: [{ file: 'new.dump', size: 1, mtime: 1 }] });

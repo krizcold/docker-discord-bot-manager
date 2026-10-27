@@ -75,8 +75,8 @@ vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   clearTermFloor: () => {},
   runFleetDump: async () => ({ success: true, file: 'fake.dump' }),
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
 }));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({

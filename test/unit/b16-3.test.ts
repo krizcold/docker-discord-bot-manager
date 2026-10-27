@@ -65,10 +65,6 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
       st.calls.push(['startFleetDbSidecar']);
       return { success: true };
     },
-    updateInstanceRecoveryRescue: (id: string, rec: any) => {
-      const b = st.bots.find(x => x.id === id);
-      if (b) b.recoveryRescue = rec ?? undefined;
-    },
   };
 });
 
@@ -76,8 +72,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
-import * as rescue from '../../src/instance/recoveryRescue';
-import { isFleetBackupBusy } from '../../src/instance/fleetBackupGuards';
 import { putServiceBack, takeServiceOut } from '../../src/templates/pcsProcessing';
 
 const composePath = (id: string) => path.join(tmp.dir, 'DATA', 'AppData', 'casaos', 'apps', id, 'docker-compose.yml');
@@ -96,15 +90,6 @@ const ORIGINAL = YAML.stringify({
 });
 const fleetDb = { containerName: 'bot1-db', user: 'u', db: 'd', volume: 'bot1-vol' };
 
-function receiver(id: string, phase: string, extra: Record<string, unknown> = {}): any {
-  return {
-    id, sanitizedName: id, displayName: 'Bot 1', status: 'stopped', sourceUrl: 'x', fleetDb,
-    recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 't', createdAt: 1, tunnelPort: 15433, publicHost: 'h', tlsKey: 'k', tlsCert: 'c' },
-    recoveryRescue: { phase, startedAt: 1, updatedAt: 1, dumpDone: true },
-    ...extra,
-  };
-}
-
 beforeEach(() => {
   st.calls.length = 0;
   st.mounts = '';
@@ -122,22 +107,10 @@ beforeEach(() => {
     instances[id] = { id, displayName: 'Bot 1', sanitizedName: id, status: 'stopped', sourceUrl: 'x', fleetDb };
   }
   fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances }));
-  vi.stubGlobal('fetch', async (url: string) => {
-    if (String(url).endsWith('/backup-stop')) return new Response(JSON.stringify({ success: true, result: { labelfile: 'START WAL LOCATION: 0/2000028\n' } }), { status: 200 });
-    if (String(url).endsWith('/prepare')) return new Response(JSON.stringify({ success: true, slot: 'recovery_channel', replicator: { user: 'r', password: 'p' } }), { status: 200 });
-    return new Response(JSON.stringify({ success: true }), { status: 200 });
-  });
 });
 afterAll(() => {
-  vi.unstubAllGlobals();
   fs.rmSync(tmp.dir, { recursive: true, force: true });
 });
-
-async function runUntil(bot: any, done: (r: any) => boolean, timeout = 5000): Promise<void> {
-  st.bots = [bot];
-  rescue.resumeRecoveryRescues();
-  await vi.waitFor(() => expect(done(st.bots[0].recoveryRescue)).toBe(true), { timeout, interval: 50 });
-}
 
 describe('R11-J7: the database service leaves the app file while a lane holds it', () => {
   it('taking a service out and putting it back keeps a change made to another service meanwhile', () => {
@@ -183,91 +156,5 @@ describe('R11-J7: the database service leaves the app file while a lane holds it
     expect(r.success).toBe(false);
     expect(r.error).toContain(held('b1'));
     expect(fs.readFileSync(held('b1'), 'utf-8')).toBe('not json');
-  });
-});
-
-describe('R11-J7: a rescue keeps its database out of CasaOS reach while it rewrites the volume', () => {
-  it('the preflight takes the database out of the app file and removes its container instead of stopping it', async () => {
-    st.mounts = 'bot1-db\n';
-    await runUntil(receiver('r1', 'preflight'), r => r?.phase === 'bulk' && r?.parked === true);
-    expect(compose('r1').services['fleet-postgres']).toBeUndefined();
-    expect(compose('r1').services.app).toBeDefined();
-    expect(ran(a => a[0] === 'rm' && a[1] === '-f' && a[2] === 'bot1-db')).toBe(true);
-    expect(ran(a => a[0] === 'stop')).toBe(false);
-  });
-
-  it('a container that mounts the volume before an rsync pass parks the rescue at bulk and starts no pass', async () => {
-    containerManager.holdFleetDbForLane('r2');
-    st.mounts = 'bot1-db\n';
-    await runUntil(receiver('r2', 'bulk'), r => r?.parked === true);
-    const rec = st.bots[0].recoveryRescue;
-    expect(rec.phase).toBe('bulk');
-    expect(rec.lastError).toMatch(/^the database container was started outside the manager during the copy \(bot1-db mounts the database volume\); the copy is discarded/);
-    expect(ran(a => a[0] === 'run' && a[1] === '-d')).toBe(false);
-  });
-
-  it('a container that mounts the volume when backup_label is due parks at bulk and writes no label', async () => {
-    containerManager.holdFleetDbForLane('r3');
-    let ps = 0;
-    st.onCall = args => { if (args[0] === 'ps' && ++ps === 2) st.mounts = 'intruder\n'; };
-    await runUntil(receiver('r3', 'consistent'), r => r?.parked === true, 18000);
-    expect(st.bots[0].recoveryRescue.phase).toBe('bulk');
-    expect(st.bots[0].recoveryRescue.lastError).toMatch(/intruder mounts the database volume/);
-    expect(ran(a => a.join(' ').includes('rsync -a'))).toBe(true);
-    expect(ran(a => a.join(' ').includes('backup_label'))).toBe(false);
-  }, 20000);
-
-  it('the standby step writes the standby config, then puts the database back, then starts it', async () => {
-    containerManager.holdFleetDbForLane('r4');
-    await runUntil(receiver('r4', 'standby'), r => r?.phase === 'streaming');
-    st.bots[0].recoveryRescue = undefined;
-    expect(YAML.parse(st.composeAtStart!).services['fleet-postgres'].container_name).toBe('bot1-db');
-    const config = st.calls.findIndex(a => a.join(' ').includes('standby.signal'));
-    const start = st.calls.findIndex(a => a[0] === 'startFleetDbSidecar');
-    expect(config).toBeGreaterThanOrEqual(0);
-    expect(start).toBeGreaterThan(config);
-    expect(fs.existsSync(held('r4'))).toBe(false);
-    // B14-2Lb: the rsynced copy carries the source's pg_hba.conf, fence lines and all; the config write strips them.
-    const { FENCED_HBA, MANAGED_HBA, runOnDataDir } = await import('./fence-fake');
-    const script = st.calls[config][st.calls[config].length - 1];
-    const ran = await runOnDataDir(script, '/var/lib/postgresql/data', {
-      'pg_hba.conf': FENCED_HBA + MANAGED_HBA,
-      'postgresql.auto.conf': "default_transaction_read_only = 'on'\nwal_log_hints = 'on'\n",
-      'rescue.inprogress': '',
-    }, "primary_conninfo = 'x'\n");
-    expect(ran.files['pg_hba.conf']).toBe(MANAGED_HBA);
-    expect(ran.files['postgresql.auto.conf']).toBe("wal_log_hints = 'on'\nprimary_conninfo = 'x'\n");
-    expect(ran.files['standby.signal']).toBe('');
-    expect(ran.files['rescue.inprogress']).toBeUndefined();
-    expect(ran.chowns).toContain('postgres:postgres /var/lib/postgresql/data/pg_hba.conf');
-  });
-
-  it('a cancel puts the database back into the app file', async () => {
-    containerManager.holdFleetDbForLane('r5');
-    st.bots = [receiver('r5', 'bulk', { recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1, parked: true } })];
-    const r = await rescue.cancelRescue(st.bots[0]);
-    expect(r).toMatchObject({ success: true });
-    expect(r.warning).toBeUndefined();
-    expect(compose('r5').services['fleet-postgres'].container_name).toBe('bot1-db');
-    expect(fs.existsSync(held('r5'))).toBe(false);
-  });
-
-  it('a cancel during the pre-rescue dump leaves the database in the app file and its container in place', async () => {
-    st.hasDb = true;
-    const bot = receiver('r7', 'preflight', { recoveryRescue: { phase: 'preflight', startedAt: 1, updatedAt: 1 } });
-    st.onDump = async () => { expect((await rescue.cancelRescue(bot)).warning).toBeUndefined(); };
-    await runUntil(bot, () => ran(a => a[0] === 'runFleetDump') && !isFleetBackupBusy('r7'));
-    expect(bot.recoveryRescue).toBeUndefined();
-    expect(compose('r7').services['fleet-postgres'].container_name).toBe('bot1-db');
-    expect(fs.existsSync(held('r7'))).toBe(false);
-    expect(ran(a => a[0] === 'rm' && a[2] === 'bot1-db')).toBe(false);
-  });
-
-  it('a cancel whose release fails says the rescue was cancelled and the database is not back', async () => {
-    fs.writeFileSync(held('r6'), 'not json');
-    st.bots = [receiver('r6', 'bulk', { recoveryRescue: { phase: 'bulk', startedAt: 1, updatedAt: 1, parked: true } })];
-    const r = await rescue.cancelRescue(st.bots[0]);
-    expect(r.success).toBe(true);
-    expect(r.warning).toMatch(/^The rescue was cancelled, but the database service could not be put back into the deployed compose/);
   });
 });

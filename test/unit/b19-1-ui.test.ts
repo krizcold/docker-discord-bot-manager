@@ -55,10 +55,4 @@ describe('the WAL bound toast reports what its Enable changed', () => {
     expect(kind).toBe('success');
     expect(text).toBe('WAL retention bound applied (4096 MB). It takes effect immediately; wal_log_hints applies on the next restart.');
   });
-
-  it('styles a failed copy block hand-off as an error', async () => {
-    const [[kind, text]] = await applyBound({ success: true, certRotated: false, copyBlockError: 'bot not running' });
-    expect(kind).toBe('error');
-    expect(text).toMatch(/copy block could not be handed to the bot \(bot not running\)/);
-  });
 });

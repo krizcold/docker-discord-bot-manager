@@ -106,12 +106,9 @@ vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   clearTermFloor: () => {},
   runFleetDump: async () => ({ success: true, file: 'fake.dump' }),
 }));
-vi.mock('../../src/instance/appLifecycle', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/appLifecycle')>()),
+vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/appHookClient')>()),
   capabilityRefusal: () => null,
-  waitForAppHook: async () => ({ success: true }),
-  deliverCopyBlock: async () => ({ success: true }),
-  resetRole: async () => ({ success: true }),
 }));
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
@@ -125,8 +122,6 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import { enableFleetReplication, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 import { getFleetReplicaStatus, reseedStalePrimary } from '../../src/instance/fleetReplica';
-import { armReceiver } from '../../src/instance/recoveryChannel';
-import { cancelRescue, startRescue } from '../../src/instance/recoveryRescue';
 import { scramSha256Verifier } from '../../src/config/secretText';
 
 const botDir = path.join(h.dir, 'bots', 'b1');
@@ -277,79 +272,10 @@ describe('stored error texts', () => {
       purpose: 'provision', phase: 'seeding', startedAt: now, updatedAt: now, publicHost: 'h', hostPort: 5440,
       primaryHost: 'p', primaryPort: 5433, slot: 's', parked: true, lastError: `psql: could not log in with ${REPL_SECRET}`,
     });
-    containerManager.updateInstanceRecoveryRescue('b1', { phase: 'flip', startedAt: now, updatedAt: now, lastError: `Command failed: psql ALTER ROLE smdb PASSWORD '${DB_SECRET}'` });
     const disk = fs.readFileSync(path.join(h.dir, 'instances.json'), 'utf8');
     expect(disk).not.toContain(REPL_SECRET);
-    expect(disk).not.toContain(DB_SECRET);
     const bot = containerManager.getBot('b1')!;
     expect(bot.fleetDbReplicaSeed?.lastError).toContain('***');
-    expect(bot.recoveryRescue?.lastError).toContain('***');
-  });
-});
-
-describe('the recovery channel relay', () => {
-  it('passes the channel token and TLS key by environment, never in argv', async () => {
-    const res = await armReceiver(containerManager.getBot('b1')!, 'receiver.invalid', 15499);
-    expect(res.success).toBe(true);
-    const token = res.block!.token;
-    const key = containerManager.getBot('b1')!.recoveryChannel!.tlsKey!;
-    expect(key).toContain('FAKE-TLS-KEY-PEM');
-    const run = h.calls.find(c => c.args[0] === 'run' && c.args.includes('/app/dist/recovery/relay.js'))!;
-    expect(run).toBeDefined();
-    expect(argvWith(token)).toEqual([]);
-    expect(argvWith('FAKE-TLS-KEY-PEM')).toEqual([]);
-    expect(run.args).toContain('RELAY_TOKEN');
-    expect(run.args).toContain('RELAY_TLS_KEY');
-    expect(run.env.RELAY_TOKEN).toBe(token);
-    expect(run.env.RELAY_TLS_KEY).toBe(key);
-  });
-});
-
-describe('the rescue flip', () => {
-  it('sets the app role password as a verifier on stdin, never in argv', async () => {
-    const now = Date.now();
-    writeRegistry({
-      fleetDb: { ...fleetDb, replication },
-      recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 'Chan-Token-0123456789', createdAt: now, tunnelPort: 15433, publicHost: 'primary.invalid', tlsKey: 'k', tlsCert: 'c' },
-      recoveryRescue: { phase: 'flip', startedAt: now, updatedAt: now, swapPublicHost: 'primary.invalid', swapSourceTerm: null },
-    });
-    const res = await startRescue(containerManager.getBot('b1')!, true);
-    expect(res.success).toBe(true);
-    await waitFor(() => !containerManager.getBot('b1')?.recoveryRescue || !!containerManager.getBot('b1')?.recoveryRescue?.lastError);
-    expect(containerManager.getBot('b1')?.recoveryRescue?.lastError).toBeUndefined();
-    expect(argvWith(DB_SECRET)).toEqual([]);
-    const alter = h.calls.filter(c => /ALTER ROLE "smdb"/.test(c.stdin));
-    expect(alter.length).toBe(1);
-    expect(alter[0].args).toContain('-i');
-    expect(alter[0].stdin).toMatch(/SET log_min_error_statement = panic;/);
-    expect(alter[0].stdin).toMatch(/PASSWORD 'SCRAM-SHA-256\$4096:/);
-    expect(alter[0].stdin).not.toContain(DB_SECRET);
-  });
-});
-
-describe('the swap outcome record', () => {
-  it('stores the rescue start as the last swap when the flip clears the record', async () => {
-    const startedAt = Date.now() - 5000;
-    writeRegistry({
-      fleetDb: { ...fleetDb, replication },
-      recoveryChannel: { mode: 'receiver', containerName: 'bot1-recovery-relay', token: 'Chan-Token-0123456789', createdAt: startedAt, tunnelPort: 15433, publicHost: 'primary.invalid', tlsKey: 'k', tlsCert: 'c' },
-      recoveryRescue: { phase: 'flip', startedAt, updatedAt: startedAt, swapPublicHost: 'primary.invalid', swapSourceTerm: null },
-    });
-    const res = await startRescue(containerManager.getBot('b1')!, true);
-    expect(res.success).toBe(true);
-    await waitFor(() => !containerManager.getBot('b1')?.recoveryRescue || !!containerManager.getBot('b1')?.recoveryRescue?.lastError);
-    const bot = containerManager.getBot('b1')!;
-    expect(bot.recoveryRescue).toBeUndefined();
-    expect(bot.recoveryLastSwap?.startedAt).toBe(startedAt);
-  });
-  it('leaves the last swap unset when a cancel clears the record', async () => {
-    const startedAt = Date.now() - 5000;
-    writeRegistry({ recoveryRescue: { phase: 'catchup', startedAt, updatedAt: startedAt } });
-    const res = await cancelRescue(containerManager.getBot('b1')!);
-    expect(res.success).toBe(true);
-    const bot = containerManager.getBot('b1')!;
-    expect(bot.recoveryRescue).toBeUndefined();
-    expect(bot.recoveryLastSwap).toBeUndefined();
   });
 });
 

@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
-  ContainerInfo, FleetBackupConfig, InstanceLane,
+  ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -282,6 +282,7 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   // and an absent key cannot clear a flag it already shows.
   out.pendingApply = inst.pendingApply === true;
   out.lane = inst.lane ?? null;
+  out.maintenance = inst.maintenance ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
   }
@@ -678,6 +679,18 @@ export function updateInstanceFleetDbReplicaKept(botId: string, kept: InstanceCo
   saveRegistry(registry);
 }
 
+/** Throws when the registry cannot be written; null removes the record (Running, settled). */
+export function updateInstanceMaintenance(botId: string, record: MaintenanceRecord | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (record) instance.maintenance = record;
+  else delete instance.maintenance;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetReplicaSeedRecord | null): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -913,12 +926,34 @@ export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: b
   for (let attempt = 0; attempt < 30; attempt++) {
     try {
       await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -U "${fleetDb.user}" -d "${fleetDb.db}"`);
-      return { success: true };
     } catch {
       await new Promise(resolve => setTimeout(resolve, 1000));
+      continue;
     }
+    // Imported here: dbLogin reaches this module through fleetReplication.
+    const role = await (await import('../instance/dbLogin')).ensureManagerDbRole({ container: fleetDb.containerName, user: fleetDb.user });
+    if (!role.ok) console.warn(`[ContainerManager] ${botId}: the manager's database role dbm_admin could not be confirmed: ${role.error}`);
+    return { success: true };
   }
   return { success: false, error: 'database did not become ready within 30 seconds' };
+}
+
+export const START_DB_READY = { deadlineMs: 30_000, tryMs: 5_000, pauseMs: 1000 };
+
+/** Whether the database answers pg_isready before START_DB_READY's deadline; each try is cut at tryMs. */
+export async function databaseReady(fleetDb: { containerName: string; user: string; db: string }): Promise<boolean> {
+  const deadline = Date.now() + START_DB_READY.deadlineMs;
+  for (;;) {
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    try {
+      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -U "${fleetDb.user}" -d "${fleetDb.db}"`, { timeout: Math.min(START_DB_READY.tryMs, left) });
+      return true;
+    } catch {
+      if (deadline - Date.now() <= START_DB_READY.pauseMs) return false;
+      await new Promise(resolve => setTimeout(resolve, START_DB_READY.pauseMs));
+    }
+  }
 }
 
 /**
@@ -1461,7 +1496,7 @@ export function releaseDatabaseLane(botIds: string[]): void {
   for (const id of botIds) databaseHolds.delete(id);
 }
 
-function databaseHoldRefusal(botId: string, action: string): { success: false; error: string } | null {
+export function databaseHoldRefusal(botId: string, action: string): { success: false; error: string } | null {
   const lane = databaseHolds.get(botId);
   return lane ? { success: false, error: `${lane} is running on this instance's database; ${action} is refused until it ends` } : null;
 }
@@ -1647,7 +1682,7 @@ function clearFinishedLane(botId: string): string | null {
   }
 }
 
-function deleteLaneRefusal(botId: string, action: string): { success: false; error: string } | null {
+export function deleteLaneRefusal(botId: string, action: string): { success: false; error: string } | null {
   const lane = getBot(botId)?.lane;
   if (lane?.op !== 'delete') return null;
   return { success: false, error: `A Delete of this instance${lane.keepData ? ' (keeping its data)' : ''} did not finish, so its containers, image or compose may already be gone; ${action} is refused until Delete is run again` };
@@ -2219,6 +2254,9 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
     throw new Error(`${removed}, but its record could not be cleared: ${msg} Delete it again once the registry can be written.`);
   }
   logCollectors.remove(botId);
+  // Imported here: dbLogin reaches this module through fleetReplication.
+  const dbLogin = await import('../instance/dbLogin');
+  for (const container of [instance.fleetDb?.containerName, instance.fleetDbReplica?.containerName]) if (container) dbLogin.forgetManagerRole(container);
 
   console.log(`[ContainerManager] Instance ${botId} uninstalled cleanly (keepData: ${keepData}, keepEnv: ${keepEnv})`);
   return true;
@@ -3197,6 +3235,12 @@ export async function withServingStatus(instance: InstanceConfig): Promise<{ ins
   return { instance: typeof appId === 'string' ? { ...instance, status: 'running' } : instance };
 }
 
+/** Whether this bot's app container runs: null when docker could not answer. */
+export async function appContainerRunning(botId: string): Promise<boolean | null> {
+  const id = await runningAppContainerId(botId, resolveAppName(botId));
+  return id === undefined ? null : id !== null;
+}
+
 async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
   // A docker query that failed keeps the conservative refusal.
   return await runningAppContainerId(botId, appName) !== null;
@@ -3234,8 +3278,12 @@ export async function startBot(botId: string): Promise<LaneResult> {
 }
 
 /** The synchronous refusal a start or restart answers before touching anything; null when it may proceed. */
+export const OFF_START_REFUSAL = 'This bot is Off. Choose Running in its State window to start it';
+
 export function startPreflightRefusal(botId: string): { success: false; error: string } | null {
-  const retiringAt = getBot(botId)?.fleetDb?.retiringAt;
+  const instance = getBot(botId);
+  if (instance?.maintenance?.state === 'off') return { success: false, error: OFF_START_REFUSAL };
+  const retiringAt = instance?.fleetDb?.retiringAt;
   if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
   return databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
@@ -3299,7 +3347,19 @@ async function startBotImpl(botId: string): Promise<LaneResult> {
         result.warning = result.warning ? `${result.warning}; ${narrowed}` : narrowed;
       }
     }
-    if (getBot(botId)?.fleetDb) {
+    const startedDb = getBot(botId)?.fleetDb;
+    const dbReady = startedDb ? await databaseReady(startedDb) : false;
+    if (startedDb && dbReady) {
+      // Imported here: dbLogin reaches this module through fleetReplication.
+      const role = await (await import('../instance/dbLogin')).ensureManagerDbRole({ container: startedDb.containerName, user: startedDb.user })
+        .catch(err => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }));
+      if (!role.ok) console.warn(`[ContainerManager] ${botId}: the manager's database role dbm_admin could not be confirmed after the start: ${role.error}`);
+    }
+    if (startedDb && !dbReady) {
+      const noAnswer = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the manager's own database role is created at its first login instead";
+      logCollectors.get(botId).addLog(`[Start] ${noAnswer}`, 'warning');
+      result.warning = result.warning ? `${result.warning}; ${noAnswer}` : noAnswer;
+    } else if (getBot(botId)?.fleetDb) {
       // Imported here: fleetBackup imports this module.
       const fenced = await (await import('../instance/fleetBackup')).fenceStartWarning(botId).catch(() => null);
       if (fenced) {
@@ -3703,6 +3763,12 @@ export async function stopBot(botId: string): Promise<LaneResult> {
     const result = await stopBotImpl(botId);
     return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
   });
+}
+
+/** Start for a caller that already holds this instance's op lock under op (withExternalBotOp); refuses when it does not. */
+export async function startBotInOp(botId: string, op: string): Promise<LaneResult> {
+  if (activeOps.get(botId) !== op) return { success: false, error: `the start must run under the '${op}' operation, which is not held` };
+  return startBotImpl(botId);
 }
 
 /** Stop for a caller that already holds this instance's op lock under op (withExternalBotOp); refuses when it does not. */

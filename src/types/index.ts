@@ -192,6 +192,7 @@ export interface InstanceConfig {
   lastStartAt?: number;                // epoch ms of the last (re)start; drives the Open-button grace fallback
   pendingApply?: boolean;              // a build finished while the project ran; Start (in place) or Restart applies it
   lane?: InstanceLane | null;          // a destructive lane in flight or cut short; null in a browser copy once cleared
+  maintenance?: MaintenanceRecord | null; // the operator's state order; absent = Running, settled; null in a browser copy
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
@@ -204,6 +205,20 @@ export interface InstanceConfig {
   // Metadata
   createdAt: string;
   updatedAt: string;
+}
+
+export type BotRunState = 'running' | 'maintenance' | 'off';
+
+export interface MaintenanceRecord {
+  state: BotRunState;
+  message: string;                    // '' = the bot's default text
+  orderedAt: string;
+  settled: boolean;                   // every step the order needs is confirmed
+  hook: 'confirmed' | 'unconfirmed' | 'missing' | 'none';
+  login: 'blocked' | 'open' | 'unconfirmed' | 'not-managed';
+  savedByBot: 'running' | 'maintenance' | null; // the last state the bot confirmed saving, across orders
+  prior?: { state: BotRunState; message: string };
+  lastError?: string;                 // why the order is not settled, or the warning a settled order carries
 }
 
 /**

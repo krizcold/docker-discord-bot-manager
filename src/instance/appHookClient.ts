@@ -18,6 +18,8 @@ export interface AppHookResult<T = any> {
   error?: string;
   /** The request went out and no answer came back in time: the app may have acted. */
   unknown?: boolean;
+  /** The HTTP status, when a response came. */
+  status?: number;
 }
 
 /** Long enough for a promote's own phases; past it the outcome is unknown, not failed. */
@@ -98,14 +100,14 @@ export async function callAppHook<T = any>(
     });
     const parsed: any = await res.json().catch(() => null);
     if (!res.ok) {
-      return { ok: false, error: String(parsed?.error || `${action} returned ${res.status}`) };
+      return { ok: false, status: res.status, error: String(parsed?.error || `${action} returned ${res.status}`) };
     }
     if (!parsed || parsed.success !== true) {
       // A refusal is a real answer, not a transport failure: the app's named
       // reason (and any needsConfirm) rides the body for the caller to surface.
-      return { ok: false, body: parsed as T, error: String(parsed?.error || `${action} refused`) };
+      return { ok: false, status: res.status, body: parsed as T, error: String(parsed?.error || `${action} refused`) };
     }
-    return { ok: true, body: parsed as T };
+    return { ok: true, status: res.status, body: parsed as T };
   } catch (err) {
     if (err instanceof Error && err.name === 'TimeoutError') {
       if (method !== 'POST') return { ok: false, error: `${action} did not answer within ${Math.round(timeoutMs / 1000)} s` };

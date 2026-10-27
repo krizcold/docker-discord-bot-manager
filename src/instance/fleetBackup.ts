@@ -29,6 +29,8 @@ import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig } from '../types';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
 import * as fleetReplica from './fleetReplica';
+import * as dbLogin from './dbLogin';
+import { MANAGER_DB_ROLE } from './dbLogin';
 import { REPLICATION_ROLE } from './fleetReplication';
 import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
@@ -325,6 +327,18 @@ function readDocker(args: string[]): Promise<{ ok: boolean; stdout: string; stde
   return execDocker(args, READ_TIMEOUT_MS);
 }
 
+type DockerOut = { ok: boolean; stdout: string; stderr: string };
+const missingRole = (r: DockerOut) => !r.ok && dbLogin.isMissingManagerRole(r.stderr);
+
+/** A docker call whose args log in as MANAGER_DB_ROLE: a missing role is made and the call runs once more. */
+function managerExec(db: { containerName: string; user: string }, args: string[], timeout?: number): Promise<DockerOut> {
+  return dbLogin.asManager({ container: db.containerName, user: db.user }, role => execDocker(dbLogin.withRole(args, role), timeout), missingRole);
+}
+
+function managerRead(db: { containerName: string; user: string }, args: string[]): Promise<DockerOut> {
+  return managerExec(db, args, READ_TIMEOUT_MS);
+}
+
 // stopBot/startBot THROW on an op-lock conflict; inside the restore lane a
 // throw would skip the restart obligations and turn a finished restore into
 // a 500, so any rejection from these container ops becomes an ordinary
@@ -440,7 +454,7 @@ function heldFrom(stdout: string, held: FenceHeld): void {
   }
 }
 
-const psqlArgs = (db: RestoreFleetDb, ...commands: string[]) => ['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', ...commands.flatMap(c => ['-c', c])];
+const psqlArgs = (db: RestoreFleetDb, ...commands: string[]) => ['exec', db.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', ...commands.flatMap(c => ['-c', c])];
 const READ_WRITE_SQL = 'SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE';
 const RELOAD_SQL = 'SELECT pg_reload_conf()';
 
@@ -458,15 +472,15 @@ export async function liftOwnedFence(fleetDb: RestoreFleetDb, owner: string, lay
   // the lift must work while the target db is dropped mid-restore.
   const hba = layers.hba ? await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', liftHbaScript(FENCE_PGDATA, owner)]) : null;
   if (hba?.ok) heldFrom(hba.stdout, held);
-  const reload = await execDocker(psqlArgs(fleetDb, RELOAD_SQL));
+  const reload = await managerExec(fleetDb, psqlArgs(fleetDb, RELOAD_SQL));
   let reset: DockerAnswer = reload;
   if (layers.readOnly) {
-    const read = await readDocker(psqlArgs(fleetDb, `SELECT current_setting('default_transaction_read_only') || '|' || ${FENCE_OWNER_FILE_SQL}`));
+    const read = await managerRead(fleetDb, psqlArgs(fleetDb, `SELECT current_setting('default_transaction_read_only') || '|' || ${FENCE_OWNER_FILE_SQL}`));
     const m = read.ok ? /^(on|off)\|([^|\n]*)$/.exec(read.stdout.trim()) : null;
     if (!m) {
       reset = { ok: false, stdout: '', stderr: read.ok ? `the read-only layer and its owner read back as ${read.stdout.trim().slice(0, 100) || 'nothing'}` : read.stderr };
     } else if (ownerMatches(m[2], owner)) {
-      reset = await execDocker(psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM RESET default_transaction_read_only', RELOAD_SQL));
+      reset = await managerExec(fleetDb, psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM RESET default_transaction_read_only', RELOAD_SQL));
       if (reset.ok) await dropOwnerFile(fleetDb, m[2]);
     } else {
       reset = { ok: true, stdout: '', stderr: '' };
@@ -498,7 +512,7 @@ export async function liftOwnedFence(fleetDb: RestoreFleetDb, owner: string, lay
   // Nothing of this lane's was in the files: the layers left are another lane's.
   if ((held.readOnly || held.hba) && !strip.stdout.includes('stripped-') && !live) return 'held';
   // The database answered, so a reload applies the stripped pg_hba file live.
-  if (live && (await execDocker(psqlArgs(fleetDb, RELOAD_SQL))).ok) return settled();
+  if (live && (await managerExec(fleetDb, psqlArgs(fleetDb, RELOAD_SQL))).ok) return settled();
   return 'stripped';
 }
 
@@ -575,7 +589,7 @@ const fenceSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resol
 async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
   const until = Date.now() + fenceTiming.probeDeadlineMs;
   for (;;) {
-    const probe = await readDocker(['exec', db.containerName, 'psql', '-h', '127.0.0.1', '-U', db.user, '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
+    const probe = await readDocker(['exec', db.containerName, 'psql', '-h', '127.0.0.1', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
     if (!probe.ok && probe.stderr.includes('pg_hba.conf rejects connection')) return true;
     if (Date.now() >= until) return false;
     await fenceSleep(fenceTiming.probeGapMs);
@@ -584,12 +598,12 @@ async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
 
 /** Ends every client session and every walsender but the managed role's physical ones; the reason when one did not end, else null. */
 async function sweepSessions(db: RestoreFleetDb): Promise<string | null> {
-  const sweep = await execDocker(psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`));
+  const sweep = await managerExec(db, psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`));
   if (!sweep.ok) return `the open sessions could not be ended (${lastLine(sweep.stderr)})`;
   const kept = sweep.stdout.split('\n').map(l => l.trim().split('|')).filter(([pid, ended]) => /^\d+$/.test(pid) && ended !== 't').map(([pid]) => pid);
   if (kept.length === 0) return null;
   // A session that ended between the listing and its terminate also answers false.
-  const left = await readDocker(psqlArgs(db, `SELECT count(*) FROM pg_stat_activity WHERE pid IN (${kept.join(', ')})`));
+  const left = await managerRead(db, psqlArgs(db, `SELECT count(*) FROM pg_stat_activity WHERE pid IN (${kept.join(', ')})`));
   if (left.ok && left.stdout.trim() === '0') return null;
   return `${kept.length} open session(s) did not end within 5 s of being terminated${left.ok ? '' : ' and whether they ended since could not be read'}`;
 }
@@ -608,7 +622,7 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
   const owned: FenceLayers = { ...NO_LAYERS };
   const refusedBefore = (reason: string) => ({ ok: false, stdout: '', stderr: reason, changed: false, owned });
   const refused = (reason: string) => ({ ok: false, stdout: '', stderr: reason, changed: true, owned });
-  const read = await readDocker(psqlArgs(fleetDb,
+  const read = await managerRead(fleetDb, psqlArgs(fleetDb,
     `SELECT current_setting('hba_file') || '|' || current_setting('ssl') || '|' || (SELECT setting FROM pg_settings WHERE name = 'authentication_timeout') || '|' || (SELECT count(*) FROM pg_subscription WHERE subenabled) || '|' || current_setting('default_transaction_read_only') || '|' || ${FENCE_OWNER_FILE_SQL} || '|' || (${FENCE_HBA_COUNT_SQL}) || '|' || (${FENCE_HBA_OWNER_SQL})`));
   if (!read.ok) return refusedBefore(`the database's settings could not be read before the fence (${lastLine(read.stderr)})`);
   const fields = read.stdout.trim().split('|');
@@ -629,7 +643,7 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
     const file = await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', fenceOwnerFileScript(owner)]);
     if (!file.ok) return refused(`the fence's owner file could not be written (${lastLine(file.stderr)})`);
     // ON_ERROR_STOP so a failed ALTER SYSTEM cannot read as a fence.
-    const readOnly = await execDocker(psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM SET default_transaction_read_only = on', RELOAD_SQL));
+    const readOnly = await managerExec(fleetDb, psqlArgs(fleetDb, READ_WRITE_SQL, 'ALTER SYSTEM SET default_transaction_read_only = on', RELOAD_SQL));
     if (!readOnly.ok) return { ...readOnly, changed: true, owned };
   }
   if (setHba) {
@@ -637,7 +651,7 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
     const hba = await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', fenceHbaScript(ssl === 'on', owner)]);
     if (!hba.ok) return refused(`pg_hba.conf could not be rewritten (${lastLine(hba.stderr)})`);
   }
-  const reload = await execDocker(psqlArgs(fleetDb, RELOAD_SQL));
+  const reload = await managerExec(fleetDb, psqlArgs(fleetDb, RELOAD_SQL));
   if (!reload.ok) return refused(`the rewritten pg_hba.conf could not be reloaded (${lastLine(reload.stderr)})`);
   if (!await rejectInForce(fleetDb)) return refused(`the database still did not refuse a TCP connection ${fenceTiming.probeDeadlineMs / 1000} s after the reload of its rewritten pg_hba.conf`);
   const first = await sweepSessions(fleetDb);
@@ -691,7 +705,7 @@ export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, owne
 
 /** Which layers of the write fence the database holds now and whose they are; null when it cannot be asked. */
 export async function fenceLayers(target: RestoreFleetDb): Promise<FenceState | null> {
-  const probe = await readDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c',
+  const probe = await managerRead(target, ['exec', target.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-c',
     `SELECT current_setting('default_transaction_read_only') || '|' || (${FENCE_HBA_COUNT_SQL}) || '|' || ${FENCE_OWNER_FILE_SQL} || '|' || (${FENCE_HBA_OWNER_SQL})`]);
   const m = probe.ok ? /^(on|off)\|(\d+)\|([^|\n]*)\|([^|\n]*)$/.exec(probe.stdout.trim()) : null;
   if (!m) return null;
@@ -711,11 +725,13 @@ function ownersText(layers: FenceState): string {
   return `it belongs to ${fenceOwnerText(layers.readOnly ? layers.readOnlyOwner : layers.hbaOwner)}`;
 }
 
-/** The Start warning while the fence's pg_hba lines stand on the instance's database; null when they do not or cannot be read. */
+/** The Start warning while the fence's pg_hba lines stand on the instance's database, or when they cannot be read; null when they do not. */
 export async function fenceStartWarning(botId: string): Promise<string | null> {
   const db = containerManager.getBot(botId)?.fleetDb;
-  const layers = db ? await fenceLayers(db) : null;
-  if (!layers?.hba) return null;
+  if (!db) return null;
+  const layers = await fenceLayers(db);
+  if (!layers) return "The manager can't confirm the database has no write fence on it: its fence settings could not be read, and a fence left on refuses the bot's connections";
+  if (!layers.hba) return null;
   return `${fencedState(layers, 'The database')}: the pg_hba lines of a write fence (ending in ${WRITE_FENCE_MARK}) are still on it, and a restart keeps them; ${ownersText(layers)}, and ${holderRemedy(layers.hbaOwner)}`;
 }
 
@@ -734,7 +750,7 @@ async function seedStuckFences(): Promise<void> {
       const onCopy = await fenceLayers(copyDb);
       await dropStaleOwner(instance.id, copyDb, onCopy);
       if (anyLayer(onCopy)) {
-        const recovery = await readDocker(['exec', copy.containerName, 'psql', '-U', copy.user, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
+        const recovery = await managerRead(copyDb, ['exec', copy.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-c', 'SELECT pg_is_in_recovery()']);
         const inRecovery = recovery.ok ? recovery.stdout.trim() : '';
         const remedy = inRecovery === 't' ? 're-seeding this copy on its Database modal clears it'
           : inRecovery === 'f' ? `this copy is promoted and the Database modal does not re-seed a promoted copy, so lift it by hand (remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf, ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf(), and remove the file ${FENCE_OWNER_FILE} from the data directory)`
@@ -753,7 +769,7 @@ async function seedStuckFences(): Promise<void> {
 
 /** Whether the fence setting is saved in postgresql.auto.conf, so a restart re-applies it; null when that cannot be read. */
 async function fencePersisted(db: RestoreFleetDb): Promise<boolean | null> {
-  const read = await readDocker(['exec', db.containerName, 'psql', '-U', db.user, '-d', 'postgres', '-tA', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
+  const read = await managerRead(db, ['exec', db.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
   const text = read.ok ? read.stdout.trim() : '';
   return /^\d+$/.test(text) ? Number(text) > 0 : null;
 }
@@ -955,8 +971,8 @@ async function dumpDatabase(
   const finalPath = path.join(dir, fileName);
   const tmpPath = `${finalPath}.tmp`;
 
-  return new Promise(resolve => {
-    const child = spawn('docker', ['exec', fleetDb.containerName, 'pg_dump', '-U', fleetDb.user, '-Fc', fleetDb.db]);
+  const dumpAs = (role: string) => new Promise<{ success: boolean; file?: string; error?: string }>(resolve => {
+    const child = spawn('docker', dbLogin.withRole(['exec', fleetDb.containerName, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', fleetDb.db], role));
     const out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
     let stderr = '';
     let killed = false;
@@ -1013,6 +1029,7 @@ async function dumpDatabase(
       });
     });
   });
+  return dbLogin.asManager({ container: fleetDb.containerName, user: fleetDb.user }, dumpAs, r => !r.success && dbLogin.isMissingManagerRole(r.error ?? ''));
 }
 
 async function runScheduledDump(instance: InstanceConfig): Promise<void> {
@@ -1211,7 +1228,7 @@ function restoreRetryRemedy(instance: InstanceConfig): string {
  * circulation carries a term at or below it. Null when neither table exists; an error when the probe failed.
  */
 export async function probeLiveTerm(fleetDb: RestoreFleetDb): Promise<{ ok: true; term: number | null } | { ok: false; error: string }> {
-  const psql = (sql: string) => readDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const psql = (sql: string) => managerRead(fleetDb, ['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
   const tables = await psql("SELECT to_regclass('smdb_control.term') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL");
   if (!tables.ok) return { ok: false, error: lastLine(tables.stderr) };
   const [control, guilds] = tables.stdout.trim().split('|');
@@ -1234,8 +1251,8 @@ export async function probeLiveTerm(fleetDb: RestoreFleetDb): Promise<{ ok: true
  * from the restored rows. The guilds raised, empty when the dump has no lease table.
  */
 export async function raiseGuildTerms(fleetDb: RestoreFleetDb, floor: number): Promise<{ ok: true; guilds: string[] } | { ok: false; error: string }> {
-  const psql = (sql: string) => execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
-    'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
+  const psql = (sql: string) => managerExec(fleetDb, ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+    'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql]);
   const table = await psql("SELECT to_regclass('smdb_data.guild_ownership') IS NOT NULL");
   if (!table.ok) return { ok: false, error: lastLine(table.stderr) };
   if (table.stdout.trim() === 'f') return { ok: true, guilds: [] };
@@ -1504,7 +1521,7 @@ async function runFleetRestore(
     // drop below removes. A MISSING database (a prior recreate failure) has
     // no data to protect and dumping it would refuse every retry, so
     // existence is probed first; an unanswerable probe still refuses.
-    const exists = await readDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+    const exists = await managerRead(fleetDb, ['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
       '-c', `SELECT count(*) FROM pg_database WHERE datname = '${fleetDb.db.replace(/'/g, "''")}'`]);
     if (!exists.ok) {
       return await refuse('Could not check the database before the restore, so the restore was refused', lastLine(exists.stderr));
@@ -1568,8 +1585,8 @@ async function runFleetRestore(
     // Physical walsenders are not connected to any database, so a streaming
     // standby just replays the swap.
     const dbIdent = `"${fleetDb.db.replace(/"/g, '""')}"`;
-    const recreate = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
-      'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+    const recreate = await managerExec(fleetDb, ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+      'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
     if (!recreate.ok) {
@@ -1585,11 +1602,11 @@ async function runFleetRestore(
     // into the database after the lift below - the timeout kills the actual
     // process, and the Node timer is only the backstop behind it.
     const inContainerTimeoutSec = Math.floor(DUMP_TIMEOUT_MS / 1000);
-    const restoreStartedAt = Date.now();
-    const restore = await new Promise<{ success: boolean; error?: string }>(resolve => {
-      const child = spawn('docker', ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
+    const restoreAs = (role: string) => new Promise<{ success: boolean; error?: string }>(resolve => {
+      const restoreStartedAt = Date.now();
+      const child = spawn('docker', dbLogin.withRole(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
         'timeout', '-s', 'KILL', String(inContainerTimeoutSec),
-        'pg_restore', '-U', fleetDb.user, '--exit-on-error', '-d', fleetDb.db]);
+        'pg_restore', '-U', MANAGER_DB_ROLE, '--exit-on-error', '-d', fleetDb.db], role));
       const input = fs.createReadStream(dumpPath);
       let stderr = '';
       let killed = false;
@@ -1626,12 +1643,13 @@ async function runFleetRestore(
         finish({ success: true });
       });
     });
+    const restore = await dbLogin.asManager({ container: fleetDb.containerName, user: fleetDb.user }, restoreAs, r => !r.success && dbLogin.isMissingManagerRole(r.error ?? ''));
 
     if (!restore.success) {
       // 7. Terminate any surviving session before returning: a timed-out
       // pg_restore's server-side process is fence-exempt, and left alive it
       // would keep writing into the database.
-      await execDocker(['exec', fleetDb.containerName, 'psql', '-U', fleetDb.user, '-d', 'postgres', '-tA',
+      await managerExec(fleetDb, ['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA',
         '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
       const reason = scrubbed(botId, restore.error || 'unknown error');
       setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`);
@@ -1643,8 +1661,8 @@ async function runFleetRestore(
     if (floor !== null) {
       // RETURNING-counted: a psql exit 0 with zero rows updated (a dump
       // whose term table exists but is empty) must warn, not report success.
-      const bump = await execDocker(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
-        'psql', '-U', fleetDb.user, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
+      const bump = await managerExec(fleetDb, ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+        'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-v', 'ON_ERROR_STOP=1',
         '-c', `WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, ${floor}) RETURNING 1) SELECT count(*) FROM u`]);
       if (bump.ok && Number.parseInt(bump.stdout.trim(), 10) >= 1) {
         steps.termReconciledTo = floor;

@@ -14,6 +14,7 @@ import { startSourceUpdater, stopSourceUpdater } from './source/sourceUpdater';
 import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUpdater';
 import { startFleetBackupScheduler, stopFleetBackupScheduler, waitForInFlightLanes } from './instance/fleetBackup';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
+import { startMaintenanceReconciler, stopMaintenanceReconciler } from './instance/maintenance';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 import { warnOnOpenDataRoot } from './config/fileModes';
@@ -110,6 +111,9 @@ async function main(): Promise<void> {
   console.log('[Init] Starting web server...');
   const { wss } = startServer();
 
+  // Resumes the state orders a restart cut, then keeps the database logins in line with each bot's state.
+  startMaintenanceReconciler();
+
   // Start source auto-update scheduler
   startSourceUpdater();
 
@@ -136,6 +140,7 @@ function shutdown(signal: string): void {
   stopSourceUpdater();
   stopInstanceUpdater();
   stopFleetBackupScheduler();
+  stopMaintenanceReconciler();
   void waitForInFlightLanes(SHUTDOWN_LANE_WAIT_MS).then(lane => {
     if (lane) console.error(`[Shutdown] Exiting with a lane still running, which is cut short: ${lane}`);
     stopStateReconciler();

@@ -85,7 +85,8 @@ export interface AppCapabilityManifest {
 /** The lifecycle actions an app implementing the hook contract must serve. */
 export type AppHookAction =
   | 'facts'
-  | 'confirm-fresh';
+  | 'confirm-fresh'
+  | 'maintenance';
 
 // Shared by the companion declaration and the guided rows below, so a wizard
 // row can never drift from the declared key it edits.

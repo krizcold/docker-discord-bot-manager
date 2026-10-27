@@ -819,6 +819,13 @@
     </div>
   </div>
 
+  <!-- State Modal -->
+  <div id="state-modal" class="modal-overlay hidden">
+    <div class="modal" style="max-width: 560px;">
+      <div id="state-content"></div>
+    </div>
+  </div>
+
   <!-- Config File Editor Modal -->
   <div id="config-modal" class="modal-overlay hidden">
     <div class="modal" style="max-width: 640px;">
@@ -931,6 +938,35 @@
     function clearActiveOp(id) {
       const bot = bots.find(b => b.id === id);
       if (bot) bot.activeOp = null;
+    }
+
+    function stateName(state) {
+      return { running: 'Running', maintenance: 'Maintenance', off: 'Off' }[state] || 'Running';
+    }
+    function stateButtonLabel(bot) {
+      return `State: ${stateName(bot.maintenance?.state)}`;
+    }
+    function startOffRefusal(bot) {
+      return bot.maintenance?.state === 'off' ? 'This bot is Off. Choose Running in its State window to start it' : '';
+    }
+    function maintenanceBadges(bot) {
+      if (bot.activeOp === 'maintenance') return '';
+      const m = bot.maintenance;
+      let html = '';
+      if (m && !m.settled) {
+        html += `<span class="update-badge danger" title="${escapeHtml(m.lastError || '')}">${stateName(m.state)} not confirmed</span>`;
+      } else if (m && m.state === 'maintenance') {
+        const when = new Date(m.orderedAt).toLocaleString();
+        html += `<span class="update-badge" title="${escapeHtml(`In maintenance since ${when}. Message: ${m.message || "the bot's default text"}`)}">Maintenance</span>`;
+      } else if (m && m.state === 'off') {
+        const when = new Date(m.orderedAt).toLocaleString();
+        html += `<span class="update-badge" title="${escapeHtml(`Off since ${when}. Choose Running in State to start it.`)}">Off</span>`;
+      }
+      if (bot.maintenanceDrift) {
+        const label = bot.maintenanceDrift.startsWith('The state is Off') ? 'Off, but running' : 'Database login blocked';
+        html += `<span class="update-badge danger" title="${escapeHtml(bot.maintenanceDrift)}">${label}</span>`;
+      }
+      return html;
     }
     function redraw() {
       renderBots();
@@ -1064,7 +1100,7 @@
     }
 
     function pageHasUnsavedInput() {
-      const editors = ['env-modal', 'config-modal', 'files-modal', 'install-modal', 'fleet-backup-modal', 'source-modal', 'edit-source-modal'];
+      const editors = ['env-modal', 'config-modal', 'files-modal', 'install-modal', 'fleet-backup-modal', 'state-modal', 'source-modal', 'edit-source-modal'];
       if (editors.some(id => { const m = document.getElementById(id); return m && !m.classList.contains('hidden'); })) return true;
       if (document.querySelector('#vault-list .vault-entry.dirty')) return true;
       const newKey = document.getElementById('vault-new-key');
@@ -1205,6 +1241,10 @@
           // Phase signals - no state change, subsequent bot:status drives UI
           case 'bot:pulling':
           case 'bot:update-requested':
+            break;
+
+          case 'bot:maintenance':
+            onBotMaintenance(payload);
             break;
 
           // Backup status and replication verdict, merged by id
@@ -1527,6 +1567,9 @@
             const restoreBadge = fb && fb.restoreError
               ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
               : '';
+            const stateBadges = maintenanceBadges(bot);
+            const offStart = startOffRefusal(bot) ? ` disabled title="${escapeHtml(startOffRefusal(bot))}"` : '';
+            const stateControl = `<button class="btn btn-secondary btn-small" onclick="showStateWindow('${bot.id}')" title="Running, Maintenance or Off, and the maintenance message">${escapeHtml(stateButtonLabel(bot))}</button>`;
             const fenceBadge = (bot.fenceStuck
               ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database fenced</span>`
               : '');
@@ -1609,14 +1652,14 @@
             <div class="bot-card">
               <div class="bot-card-header">
                 <div>
-                  <h3>${escapeHtml(botName)} ${updateBadge}${laneBadge}${cutBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}</h3>
+                  <h3>${escapeHtml(botName)} ${updateBadge}${laneBadge}${cutBadge}${pendingBadge}${fbWarnBadge}${restoreBadge}${fenceBadge}${stateBadges}</h3>
                   ${sourceTag}
                   ${commitInfo}
                 </div>
                 <div style="text-align:right"><span class="status-badge status-${bot.status}">${bot.activeOp ? escapeHtml(bot.activeOp) : (busyBots.has(bot.id) && !isTransientStatus(bot.status) ? 'busy' : bot.status)}</span>
                 ${statusCheckedLine(bot)}</div>
               </div>
-              ${(isGit || webAuthControl || fleetBackupControl) ? `<div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}${fleetBackupControl}</div>` : ''}
+              <div class="bot-card-meta">${autoUpdateToggle}${webAuthControl}${fleetBackupControl}${stateControl}</div>
               <div class="bot-card-actions">
                 ${isRunning ? `
                   ${(bot.publicUrl || bot.webOpenUrl || bot.hostPort) && !bot.webUiReady
@@ -1642,7 +1685,7 @@
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
                     : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
                 ` : (bot.hasBeenStarted || bot.lastStartAt) ? `
-                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Start</button>
+                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')"${offStart}>Start</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="buildBotImage('${bot.id}')" title="Fetch the source (or pull the image) and rebuild the image and compose without restarting the bot">Build</button>
                   ${showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
@@ -1655,7 +1698,7 @@
                   <button class="btn btn-secondary btn-small" onclick="showFiles('${bot.id}', ${jsArg(botName)})" title="Browse and edit the bot's persistent files">Files</button>
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
-                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')">Install &amp; Run</button>
+                  <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')"${offStart}>Install &amp; Run</button>
                   ${buildLogsBtn}
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>
@@ -2438,6 +2481,7 @@
       if (!bot?.fleetDb) {
         content.innerHTML = `
           <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
+          <div id="fleet-state-line"></div>
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
           <div id="fleet-past-backups"></div>
           <div class="modal-actions">
@@ -2445,6 +2489,7 @@
           </div>`;
         renderFleetReplica(botId);
         renderPastFleetBackups(botId);
+        refreshStateLine(botId);
         return;
       }
 
@@ -2461,6 +2506,7 @@
 
       content.innerHTML = `
         <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
+        <div id="fleet-state-line"></div>
         <div id="fleet-seed-banner"></div>
         <div id="fleet-backup-error">${fleetBackupErrorHtml(bots.find(b => b.id === botId)?.fleetBackup || fb)}</div>
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
@@ -3200,6 +3246,109 @@
       }
       renderFleetReplica(botId);
       loadBots();
+    }
+
+    async function refreshStateLine(botId) {
+      if (!document.getElementById('fleet-state-line') || fleetBackupBotId !== botId) return;
+      let res;
+      try { res = await api('GET', `/bots/${botId}/maintenance`); } catch (err) { res = null; }
+      const line = document.getElementById('fleet-state-line');
+      if (!line || fleetBackupBotId !== botId) return;
+      line.textContent = res?.success ? (res.summary || '') : res ? (res.error || '') : "No answer from the manager, so the bot's state can't be shown.";
+    }
+
+    function onBotMaintenance(payload) {
+      mergeBotState(payload);
+      clearActiveOp(payload.id);
+      if (payload.notify !== false) showMessage(payload.settled ? 'success' : 'error', payload.text);
+      redraw();
+      refreshStateLine(payload.id);
+    }
+
+    let stateBotId = null;
+    function stateWindowHtml(bot, info) {
+      const kindNotes = {
+        database: "The manager blocks the bot's database login and closes its open connections, so no process of this bot, on any machine, can write until Running.",
+        copy: 'This machine holds a live copy of the database. Only the manager of the machine with the main database can block the login; here the bot is put into maintenance through its own answer.',
+        external: "The bot's database is not run by this manager, so its login is not blocked; the bot is put into maintenance through its own answer.",
+        json: 'The bot keeps its data in files, so it is put into maintenance through its own answer.',
+        none: 'This app declares no lifecycle hooks, so Maintenance is not available; Off stops the bot.',
+      };
+      const lines = {
+        running: 'The bot runs normally.',
+        maintenance: 'The bot stays online and answers every command with the message below; no module code runs. Members who join get no welcome or auto-role, messages earn no XP, and reminders that fall due fire when maintenance ends.',
+        off: `The bot is stopped.${info.kind === 'database' ? " Its database keeps running for backups and copies, with the bot's login blocked." : ''}`,
+      };
+      const radio = (state) => `
+          <label style="display:block;margin-bottom:8px;">
+            <input type="radio" name="state-choice" value="${state}"${info.state === state ? ' checked' : ''}${state === 'maintenance' && info.kind === 'none' ? ' disabled' : ''}>
+            <strong>${stateName(state)}</strong>
+            <div class="env-tip">${escapeHtml(lines[state])}</div>
+          </label>`;
+      const message = info.message || '';
+      return `
+        <h3>${escapeHtml(`State: ${bot.displayName || bot.id}`)}</h3>
+        ${radio('running')}${radio('maintenance')}${radio('off')}
+        <div class="env-tip" style="margin-bottom:12px;">${escapeHtml(kindNotes[info.kind] || '')}</div>
+        <label for="state-message">Maintenance message</label>
+        <textarea id="state-message" maxlength="1500" rows="4" style="width:100%;" oninput="document.getElementById('state-count').textContent = this.value.length + ' / 1500'">${escapeHtml(message)}</textarea>
+        <div class="env-tip">Blank uses the bot's default maintenance text. Up to 1500 characters. <span id="state-count">${message.length} / 1500</span></div>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="state-apply" onclick="applyState('${bot.id}')">Apply</button>
+          <button class="btn btn-secondary" onclick="hideStateWindow()">Close</button>
+        </div>`;
+    }
+
+    async function showStateWindow(botId) {
+      stateBotId = botId;
+      const bot = bots.find(b => b.id === botId) || { id: botId };
+      const title = `<h3>${escapeHtml(`State: ${bot.displayName || botId}`)}</h3>`;
+      const content = document.getElementById('state-content');
+      document.getElementById('state-modal').classList.remove('hidden');
+      content.innerHTML = `${title}<div class="loading">Loading...</div>`;
+      let res;
+      try { res = await api('GET', `/bots/${botId}/maintenance`); } catch (err) { res = null; }
+      if (stateBotId !== botId) return;
+      if (!res?.success) {
+        content.innerHTML = `${title}
+          <div class="error-message">${escapeHtml(res ? res.error : "No answer from the manager, so the bot's state can't be shown.")}</div>
+          <div class="modal-actions"><button class="btn btn-secondary" onclick="hideStateWindow()">Close</button></div>`;
+        return;
+      }
+      content.innerHTML = stateWindowHtml(bot, res);
+    }
+
+    function hideStateWindow() {
+      document.getElementById('state-modal').classList.add('hidden');
+      stateBotId = null;
+    }
+
+    async function applyState(botId) {
+      const choice = document.querySelector('input[name="state-choice"]:checked');
+      if (!choice) return;
+      const button = document.getElementById('state-apply');
+      button.disabled = true;
+      button.textContent = 'Applying...';
+      const bot = bots.find(b => b.id === botId);
+      let res;
+      try {
+        res = await api('PUT', `/bots/${botId}/maintenance`, { state: choice.value, message: document.getElementById('state-message').value });
+      } catch (err) {
+        hideStateWindow();
+        showNoAnswer('state change', false);
+        loadBots();
+        return;
+      }
+      if (res.success) {
+        hideStateWindow();
+        if (bot) bot.activeOp = 'maintenance';
+        redraw();
+        showMessage('info', `Changing the state of ${bot?.displayName || botId}; the result shows here when it finishes`);
+        return;
+      }
+      button.disabled = false;
+      button.textContent = 'Apply';
+      showMessage('error', res.error);
     }
 
     function hideFleetBackups() {

@@ -20,6 +20,7 @@ import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
+import * as maintenance from '../../instance/maintenance';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -52,7 +53,7 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 
 // The computed health keys every bot record carries to the page, so a push
 // never replaces them with the raw record's fleetBackup config.
-function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null } {
+function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null; maintenanceDrift: string | null } {
   return {
     fleetBackup: bot.fleetDb ? {
       lastAt: bot.lastFleetBackupAt || null,
@@ -63,6 +64,7 @@ function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> 
       ...fleetBackup.effectiveFleetBackup(bot),
     } : null,
     fenceStuck: fleetBackup.getFleetFenceStuck(bot.id),
+    maintenanceDrift: maintenance.getMaintenanceDrift(bot.id),
   };
 }
 
@@ -81,7 +83,7 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
     live.add(bot.id);
     let health: ReturnType<typeof botHealth>;
     try { health = botHealth(bot); } catch { continue; }
-    const key = JSON.stringify([health.fleetBackup, health.fenceStuck]);
+    const key = JSON.stringify([health.fleetBackup, health.fenceStuck, health.maintenanceDrift]);
     if (seen.get(bot.id) === key) continue;
     seen.set(bot.id, key);
     changed.push({ id: bot.id, ...health });
@@ -103,6 +105,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.use(function shutdownGate(req: Request, res: Response, next: NextFunction) {
     if (!containerManager.isShuttingDown() || req.method === 'GET' || req.method === 'HEAD' || /^\/[^/]+\/webui-ready$/.test(req.path)) return next();
     res.status(503).json({ success: false, error: containerManager.SHUTDOWN_REFUSAL });
+  });
+
+  maintenance.setMaintenanceListener((botId, result, notify) => {
+    const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
+    broadcastToClients(wss, 'bot:maintenance', { ...bot, id: botId, opId: null, settled: result.settled, text: result.text, notify });
   });
 
   const healthSeen = new Map<string, string>();
@@ -485,6 +492,44 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ...(dbDumps > 0 ? { dbDumpsKept: { count: dbDumps, folder: `backups/${req.params.id}/fleet-postgres` } } : {}),
         ...(keptReplicaVolume ? { keptReplicaVolume } : {}),
       });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** GET /api/bots/:id/maintenance - The bot's state, its message and the Database window's state line. */
+  router.get('/:id/maintenance', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, ...await maintenance.maintenanceStatus(bot, maintenance.getMaintenanceDrift(bot.id)) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** PUT /api/bots/:id/maintenance - Order Running, Maintenance or Off (non-blocking; the result arrives as bot:maintenance). */
+  router.put('/:id/maintenance', async (req: Request, res: Response) => {
+    try {
+      const { state, message } = (req.body || {}) as { state?: unknown; message?: unknown };
+      if (message !== undefined && typeof message !== 'string') {
+        res.status(400).json({ success: false, error: 'The maintenance message must be text' });
+        return;
+      }
+      const botId = req.params.id;
+      const opId = randomUUID();
+      const admission = await maintenance.orderMaintenance(botId, state as any, message ?? '', (result) => {
+        const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
+        broadcastToClients(wss, 'bot:maintenance', { ...bot, id: botId, opId, settled: result.settled, text: result.text });
+      });
+      if (!admission.accepted) {
+        res.status(admission.status).json({ success: false, error: admission.error });
+        return;
+      }
+      res.json({ success: true, opId });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

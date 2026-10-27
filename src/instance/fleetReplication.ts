@@ -30,6 +30,8 @@ import { InstanceConfig, FleetDbReplication } from '../types';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
 import * as fleetBackupGuards from './fleetBackupGuards';
+import * as dbLogin from './dbLogin';
+import { MANAGER_DB_ROLE } from './dbLogin';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -72,8 +74,8 @@ function admittedWithoutTls(addr: string): boolean {
 }
 
 /** The addresses of live TCP clients without TLS that the narrowed pg_hba would refuse on their next connection. */
-async function plainClientsOutsidePool(containerName: string, user: string, db: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
-  const read = await psql(containerName, user, db,
+async function plainClientsOutsidePool(containerName: string, db: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
+  const read = await psql(containerName, db,
     `SELECT COALESCE(string_agg(DISTINCT host(a.client_addr), ' '), '') FROM pg_stat_activity a JOIN pg_stat_ssl s ON s.pid = a.pid WHERE a.client_addr IS NOT NULL AND NOT s.ssl;`);
   if (!read.ok) return { ok: false, error: read.stderr.trim() };
   const addrs = read.stdout.trim().split(/\s+/).filter(a => a !== '' && /^[0-9A-Fa-f:.]+$/.test(a) && !admittedWithoutTls(a));
@@ -118,17 +120,32 @@ function dbExec(containerName: string, args: string[], stdin?: string): Promise<
   });
 }
 
-function psql(containerName: string, user: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-Atc', sql]);
+/** The bot role of the managed database in this container, from the registry; '' when none names it. */
+function botRoleOf(containerName: string): string {
+  try {
+    return containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName)?.fleetDb?.user ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/** dbExec for args that log in as MANAGER_DB_ROLE: a missing role is made and the call runs once more. */
+function managerDbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return dbLogin.asManager({ container: containerName, user: botRoleOf(containerName) },
+    role => dbExec(containerName, dbLogin.withRole(args, role), stdin), r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
+}
+
+function psql(containerName: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return managerDbExec(containerName, ['psql', '-U', MANAGER_DB_ROLE, '-d', db, '-v', 'ON_ERROR_STOP=1', '-Atc', sql]);
 }
 
 /** Why pg_hba.conf must not be rewritten now: a lane's write fence stands in it, or that could not be read. Null when it may be. */
-export async function fenceLinesRefusal(containerName: string, user: string, db: string): Promise<string | null> {
-  const read = await psql(containerName, user, db, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
+export async function fenceLinesRefusal(containerName: string, db: string): Promise<string | null> {
+  const read = await psql(containerName, db, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
   const count = read.ok ? read.stdout.trim() : '';
   if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
   if (Number(count) === 0) return null;
-  const owners = await psql(containerName, user, db, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
+  const owners = await psql(containerName, db, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
   const owner = owners.ok ? fleetBackupGuards.parseFenceOwner(owners.stdout) : null;
   const whose = !owners.ok ? 'whose lane set it could not be read'
     : owner ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, and that lane lifts it when it finishes`
@@ -137,8 +154,8 @@ export async function fenceLinesRefusal(containerName: string, user: string, db:
 }
 
 /** SQL on stdin, for a statement that must stay out of every command line. */
-function psqlScript(containerName: string, user: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return dbExec(containerName, ['psql', '-U', user, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
+function psqlScript(containerName: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return managerDbExec(containerName, ['psql', '-U', MANAGER_DB_ROLE, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
 }
 
 /** running true or false as docker says it; null with docker's error when docker could not be asked. */
@@ -328,7 +345,7 @@ async function enableInLane(
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
   }
-  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
   if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; nothing was changed, so retry Enable after that` };
   // The caller's password is a fallback for a manager env that holds no database URL (an adopt whose env write was refused).
   const dbPassword = storedDbPassword(instance) || opts.dbPassword || null;
@@ -342,7 +359,7 @@ async function enableInLane(
   }
   const recordAtStart = JSON.stringify(fleetDb);
 
-  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.db);
   if (!live.ok) return { success: false, error: `could not read which clients connect without TLS (nothing was changed): ${live.error}` };
   // With a record, the bot already got the TLS URL at a start since, or its
   // addresses are in keptPlain; only a start may drop a kept line.
@@ -365,32 +382,32 @@ async function enableInLane(
   });
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
-  const exists = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
+  const exists = await psql(fleetDb.containerName, fleetDb.db, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
   if (!exists.ok) return failed(`database setup failed: ${exists.stderr.trim()}`);
   // The verifier, never the password, and outside a DO block: a failing
   // statement inside one is echoed whole in the CONTEXT line, which the
   // quiet session settings do not hold back.
   const verifier = scramSha256Verifier(password);
   const verb = exists.stdout.trim() === '0' ? 'CREATE' : 'ALTER';
-  const setup = await psqlScript(fleetDb.containerName, fleetDb.user, fleetDb.db,
+  const setup = await psqlScript(fleetDb.containerName, fleetDb.db,
     `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`);
   if (!setup.ok) return failed(`database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}`);
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
-  const ssl = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
+  const ssl = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
   if (!ssl.ok) return failed(`enabling ssl failed: ${ssl.stderr.trim()}`);
   // Restart-only setting (no re-initdb): makes pg_rewind possible on every
   // cluster that has ever run enable (reopened ruling R6).
-  const hints = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM SET wal_log_hints = on;');
+  const hints = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM SET wal_log_hints = on;');
   if (!hints.ok) return failed(`enabling wal_log_hints failed: ${hints.stderr.trim()}`);
-  const keep = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
+  const keep = await psql(fleetDb.containerName, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
   if (!keep.ok) return failed(`setting the WAL retention bound failed: ${keep.stderr.trim()}`);
 
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
     `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
-  const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
+  const reload = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
 
   const replication: FleetDbReplication = {
@@ -465,7 +482,7 @@ async function disableInLane(
     return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
   }
 
-  const streaming = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+  const streaming = await psql(fleetDb.containerName, fleetDb.db,
     `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND active;`);
   if (!streaming.ok) {
     return { success: false, error: `could not read the replication slots (nothing was disabled): ${streaming.stderr.trim()}` };
@@ -475,7 +492,7 @@ async function disableInLane(
   }
   // A seed's base backup and a stream without a slot hold no active slot,
   // and revoking the login would cut them off mid-copy.
-  const senders = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+  const senders = await psql(fleetDb.containerName, fleetDb.db,
     `SELECT COALESCE(string_agg(COALESCE(host(client_addr), 'a local socket'), ', ' ORDER BY client_addr), '') FROM pg_stat_replication WHERE usename = '${REPLICATION_ROLE}';`);
   if (!senders.ok) {
     return { success: false, error: `could not read the replication connections (nothing was disabled): ${senders.stderr.trim()}` };
@@ -487,7 +504,7 @@ async function disableInLane(
   // copy, and only that bot may release them, once it has recorded the relax
   // on the witness (B7-F23's full partition); relaxing here would release
   // them with nothing recorded.
-  const posture = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `SELECT current_setting('synchronous_standby_names');`);
+  const posture = await psql(fleetDb.containerName, fleetDb.db, `SELECT current_setting('synchronous_standby_names');`);
   if (!posture.ok) {
     return { success: false, error: `could not read the synchronous posture (nothing was disabled): ${posture.stderr.trim()}` };
   }
@@ -514,15 +531,15 @@ async function disableInLane(
   // next write (B6 map F18). Separate
   // calls, for the reason the enable above records: ALTER SYSTEM refuses to run
   // inside the implicit transaction a multi-statement psql -c wraps its input in.
-  const relax = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
+  const relax = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
   if (!relax.ok) {
     return { success: false, error: `could not relax the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relax.stderr.trim()}` };
   }
-  const relaxed = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
+  const relaxed = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!relaxed.ok) {
     return { success: false, error: `could not reload after relaxing the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relaxed.stderr.trim()}` };
   }
-  const drop = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
+  const drop = await psql(fleetDb.containerName, fleetDb.db, `
     DO $$ DECLARE s record; BEGIN
       FOR s IN SELECT slot_name FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND NOT active LOOP
         PERFORM pg_drop_replication_slot(s.slot_name);
@@ -531,7 +548,7 @@ async function disableInLane(
   if (!drop.ok) {
     return { success: false, error: `slot drop failed, so the Disable did not finish; press Disable replication again to finish it: ${drop.stderr.trim()}` };
   }
-  const left = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+  const left = await psql(fleetDb.containerName, fleetDb.db,
     `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}');`);
   if (!left.ok) {
     return { success: false, error: `could not confirm the replication slots are gone, so the Disable did not finish; press Disable replication again to finish it: ${left.stderr.trim()}` };
@@ -539,7 +556,7 @@ async function disableInLane(
   if (left.stdout.trim() !== '') {
     return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then press Disable replication again to finish it` };
   }
-  const revoke = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
+  const revoke = await psql(fleetDb.containerName, fleetDb.db, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
   if (!revoke.ok) {
     return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
   }
@@ -577,16 +594,16 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const keptPlain = repl ? repl.keptPlain : fleetDb?.keptPlain;
   if (!fleetDb || !keptPlain?.length) return null;
   const notNarrowed = 'the database still admits non-TLS connections from the addresses Enable kept, and the next start tries again';
-  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
   if (fenced) return `pg_hba was not narrowed: ${fenced}; ${notNarrowed}`;
-  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.user, fleetDb.db);
+  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.db);
   if (!live.ok) return `Could not read which clients connect to the database without TLS (${live.error}), so ${notNarrowed}`;
   const plain = { addrs: live.addrs.filter(a => keptPlain.includes(a)) };
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
     `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
-  const reload = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, 'SELECT pg_reload_conf();');
+  const reload = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;
   try {
     if (repl) {
@@ -687,7 +704,7 @@ export async function getFleetReplicationStatus(
   if (dbState.running === null) status.probeError = dbState.error;
   if (dbState.running !== true) return status;
 
-  const probe = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db,
+  const probe = await psql(fleetDb.containerName, fleetDb.db,
     `SELECT current_setting('ssl'),
             (SELECT json_agg(json_build_object(
                'clientAddr', client_addr::text,
@@ -755,7 +772,7 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
   }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) return { success: false, error: dbDownText(dbState, 'Database container is not running') };
-  const result = await psql(fleetDb.containerName, fleetDb.user, fleetDb.db, `
+  const result = await psql(fleetDb.containerName, fleetDb.db, `
     DO $$ DECLARE s record; BEGIN
       SELECT active INTO s FROM pg_replication_slots WHERE slot_name = '${slot}';
       IF NOT FOUND THEN RAISE EXCEPTION 'no slot named ${slot}'; END IF;

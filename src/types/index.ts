@@ -132,12 +132,42 @@ export interface FleetReplicaSeedRecord {
   pinsUnretired?: string[];
 }
 
-// Daily pg_dump schedule for the managed sidecar. Absent means the defaults
-// (enabled, 04:00, keep 7) for instances that have a fleetDb record.
+// Backups of each database the manager holds for the instance. Absent means the defaults (enabled, 04:00):
+// hourly dumps, and the daily dump and its test restore at the hour.
 export interface FleetBackupConfig {
   enabled: boolean;
   hour: number;
-  keep: number;
+}
+
+/** main: the database this machine holds as the main; copy: its live copy of another machine's main. */
+export type BackupFamily = 'main' | 'copy';
+
+export interface FleetBackupTestRecord {
+  file: string;
+  startedAt: number;
+  finishedAt?: number;
+  result: 'running' | 'passed' | 'failed' | 'interrupted';
+  /** How many manager restarts cut this test short; a second one fails it. */
+  cutShort?: number;
+  /** The failure reason, plus a cleanup or not-saved note. */
+  text?: string;
+  tables?: number;
+  rows?: number;
+}
+
+export interface FleetBackupTests {
+  last?: FleetBackupTestRecord;
+  /** The newest dump that passed a test restore; the trim never deletes it. */
+  lastGood?: string;
+}
+
+export interface FleetBackupAlert {
+  kind: 'dumps' | 'test';
+  text: string;
+  since: number;
+  dm: 'pending' | 'sent' | 'failed' | 'unknown' | 'unsupported';
+  dmAt?: number;
+  dmError?: string;
 }
 
 export interface InstanceConfig {
@@ -175,8 +205,10 @@ export interface InstanceConfig {
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
   fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it
-  fleetBackup?: FleetBackupConfig;     // sidecar pg_dump schedule; absent = defaults
-  lastFleetBackupAt?: number;          // epoch ms of the last successful sidecar dump
+  fleetBackup?: FleetBackupConfig;     // backup schedule; absent = defaults
+  fleetBackupTests?: Partial<Record<BackupFamily, FleetBackupTests>>; // the daily test restore of each family
+  fleetBackupAlerts?: Record<string, FleetBackupAlert>; // standing backup alerts by <family>:<dumps|test>
+  fleetBackupStarts?: Partial<Record<BackupFamily, number>>; // when the scheduler first found each family to back up
 
   // Detection (for git source)
   botType?: BotType;

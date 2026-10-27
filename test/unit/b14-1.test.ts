@@ -39,7 +39,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile, spawn: heldSpawn, default: { ...real, execFile, spawn: heldSpawn } };
 });
 
 vi.mock('simple-git', async () => {
@@ -132,17 +133,8 @@ afterAll(() => { fs.rmSync(h.dir, { recursive: true, force: true }); });
 describe('the scheduled trim', () => {
   const hour = () => new Date().getHours();
 
-  it('keeps every dump when Keep is raised while the dump runs', async () => {
-    seed({ enabled: true, hour: hour(), keep: 3 });
-    const old = seedDumps(3, 0);
-    h.duringDump = () => { seed({ enabled: true, hour: hour(), keep: 5 }); h.duringDumpDone = true; };
-    await runOneTick();
-    await vi.waitFor(() => expect(dumpsNow().length).toBe(4), { timeout: 3000 });
-    for (const f of old) expect(dumpsNow()).toContain(f);
-  });
-
   it('never deletes the dump just written after a clock step back', async () => {
-    seed({ enabled: true, hour: hour(), keep: 3 });
+    seed({ enabled: true, hour: hour() });
     const old = seedDumps(3, 10 * 86400000);
     h.duringDump = () => { h.duringDumpDone = true; };
     await runOneTick();
@@ -151,7 +143,7 @@ describe('the scheduled trim', () => {
   });
 
   it('keeps the previous night dump while older dumps carry future mtimes', async () => {
-    seed({ enabled: true, hour: hour(), keep: 3 });
+    seed({ enabled: true, hour: hour() });
     const old = seedDumps(3, 10 * 86400000);
     const post = '2026-02-01T04-00-00-000Z.dump';
     fs.writeFileSync(path.join(DUMPS, post), 'old');
@@ -164,14 +156,6 @@ describe('the scheduled trim', () => {
     for (const f of old) expect(dumpsNow()).toContain(f);
   });
 
-  it('keeps every dump when the stored Keep is not a whole number from 1 to 365', async () => {
-    seed({ enabled: true, hour: hour(), keep: 0 });
-    const old = seedDumps(3, 0);
-    h.duringDump = () => { h.duringDumpDone = true; };
-    await runOneTick();
-    await vi.waitFor(() => expect(dumpsNow().length).toBe(4), { timeout: 3000 });
-    for (const f of old) expect(dumpsNow()).toContain(f);
-  });
 });
 
 describe('PUT /:id/fleet-backup-config', () => {
@@ -185,29 +169,29 @@ describe('PUT /:id/fleet-backup-config', () => {
     return { status: res.statusCode, body: res.body };
   };
 
-  it('refuses a stale tab\'s save and keeps the newer keep', async () => {
-    seed({ enabled: true, hour: 4, keep: 7 });
-    const first = await put({ enabled: true, keep: 10, expected: { enabled: true, keep: 7 } });
+  it('refuses a stale tab\'s save and keeps the newer hour', async () => {
+    seed({ enabled: true, hour: 4 });
+    const first = await put({ enabled: true, hour: 10, expected: { enabled: true, hour: 4 } });
     expect(first.status).toBe(200);
-    const stale = await put({ enabled: true, keep: 3, expected: { enabled: true, keep: 7 } });
+    const stale = await put({ enabled: true, hour: 3, expected: { enabled: true, hour: 4 } });
     expect(stale.status).toBe(409);
-    expect(stale.body.fleetBackup).toEqual({ enabled: true, hour: 4, keep: 10 });
-    expect(stored()).toEqual({ enabled: true, hour: 4, keep: 10 });
+    expect(stale.body.fleetBackup).toEqual({ enabled: true, hour: 10 });
+    expect(stored()).toEqual({ enabled: true, hour: 10 });
   });
 
   it('a changed field saves alone and leaves the others as stored', async () => {
-    seed({ enabled: true, hour: 4, keep: 10 });
+    seed({ enabled: true, hour: 6 });
     const r = await put({ enabled: false, expected: { enabled: true } });
     expect(r.status).toBe(200);
-    expect(stored()).toEqual({ enabled: false, hour: 4, keep: 10 });
+    expect(stored()).toEqual({ enabled: false, hour: 6 });
   });
 
-  for (const bad of [{ keep: 1.5 }, { keep: 0 }, { keep: '9' }, { hour: 25 }, { hour: 2.5 }]) {
+  for (const bad of [{ hour: 25 }, { hour: 2.5 }]) {
     it(`refuses ${JSON.stringify(bad)} and saves nothing`, async () => {
-      seed({ enabled: true, hour: 4, keep: 7 });
-      const r = await put({ enabled: true, ...bad, expected: { enabled: true, hour: 4, keep: 7 } });
+      seed({ enabled: true, hour: 4 });
+      const r = await put({ enabled: true, ...bad, expected: { enabled: true, hour: 4 } });
       expect(r.status).toBe(400);
-      expect(stored()).toEqual({ enabled: true, hour: 4, keep: 7 });
+      expect(stored()).toEqual({ enabled: true, hour: 4 });
     });
   }
 });

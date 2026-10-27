@@ -66,7 +66,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (answer !== undefined && typeof answer !== 'string') throw new Error(answer.stderr);
     return answer ?? '';
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync: () => '', spawn };
+  const mod = { ...real, exec, execFile, execFileSync, execSync: () => '', spawn: (await import('./dump-fake')).withDumpHolder(spawn as any) };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({

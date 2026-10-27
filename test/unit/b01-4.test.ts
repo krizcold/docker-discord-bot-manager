@@ -68,55 +68,6 @@ describe('number env rows the browser cannot parse are refused', () => {
   });
 });
 
-describe('fleet backup Keep', () => {
-  const page = (keep: any, storedKeep = 7, confirmAnswer = true) => {
-    const sent: any[] = []; const messages: string[][] = []; const asked: string[] = [];
-    const ctx = runPage([...helpers, 'saveFleetBackupConfig', 'showFleetBackupControls'], {
-      ...common(sent, messages, {
-        'fleet-backup-enabled': { checked: true },
-        'fleet-backup-hour': { value: '4' },
-        'fleet-backup-keep': keep,
-      }),
-      fleetBackupBotId: 'b1',
-      fleetBackupStored: { enabled: true, hour: 4, keep: storedKeep },
-      confirm: (t: string) => { asked.push(t); return confirmAnswer; },
-    });
-    return { ctx, sent, messages, asked };
-  };
-
-  it('unparsable text is refused, never saved as 7', async () => {
-    const p = page(numInput('', true), 30);
-    await p.ctx.saveFleetBackupConfig();
-    expect(p.sent).toHaveLength(0);
-    expect(p.messages[0][0]).toBe('error');
-  });
-
-  it('0 and a blank are refused, never saved as 7', async () => {
-    for (const v of ['0', '', '2.5']) {
-      const p = page(numInput(v), 30);
-      await p.ctx.saveFleetBackupConfig();
-      expect(p.sent).toHaveLength(0);
-      expect(p.messages[0][0]).toBe('error');
-    }
-  });
-
-  it('lowering Keep asks first; a decline sends nothing and shows the stored value', async () => {
-    const el = numInput('3');
-    const p = page(el, 30, false);
-    await p.ctx.saveFleetBackupConfig();
-    expect(p.asked).toHaveLength(1);
-    expect(p.sent).toHaveLength(0);
-    expect(el.value).toBe('30');
-  });
-
-  it('a valid raise saves the typed number', async () => {
-    const p = page(numInput('40'), 30);
-    await p.ctx.saveFleetBackupConfig();
-    expect(p.asked).toHaveLength(0);
-    expect(p.sent[0].body).toEqual({ keep: 40, expected: { keep: 30 } });
-  });
-});
-
 describe('port and WAL fields the browser cannot parse are refused', () => {
   const cases: [string, string, Record<string, any>][] = [
     ['enableFleetReplication', 'fleet-repl-port', { 'fleet-repl-host': { value: 'h' } }],

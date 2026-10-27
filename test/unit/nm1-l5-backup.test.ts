@@ -151,6 +151,10 @@ const writeInstance = (record: Record<string, unknown>, id = 'b1') => {
   } }));
 };
 const roleChecks = () => h.calls.filter(a => a.some(x => x.includes('rolsuper'))).length;
+// The dump's snapshot holder: a psql session fed on stdin that prints the snapshot, the counts and the end marker.
+const isHolder = (args: string[]) => args[0] === 'exec' && args[1] === '-i' && args.includes('psql') && args.includes('-X');
+const HOLDER = 'snap|00000003-1|f|1000|-1\ncount|"public"."t"|2\nend|\n';
+const holderArgv = ['exec', '-i', 'bot1-fleet-postgres', 'psql', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', 'dbm_admin', '-d', 'smdb'];
 const callWith = (marker: string) => h.calls.filter(a => a.some(x => x.includes(marker)));
 const C = fleetDb.containerName;
 const raw = async <T>(f: () => Promise<T>): Promise<T> => {
@@ -160,10 +164,11 @@ const raw = async <T>(f: () => Promise<T>): Promise<T> => {
 
 describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
   it('runFleetDump spawns pg_dump with the exact argv and checks no role on success', async () => {
-    h.answer = args => (args[0] === 'inspect' ? 'true\n' : args.includes('pg_dump') ? 'dump' : '');
+    h.answer = args => (args[0] === 'inspect' ? 'true\n' : isHolder(args) ? HOLDER : args.includes('pg_dump') ? 'dump' : '');
     const r = await fleetBackup.runFleetDump({ id: 'b1', fleetDb } as any);
     expect(r.success, r.error).toBe(true);
-    expect(callWith('pg_dump')).toEqual([['exec', C, 'pg_dump', '-U', 'dbm_admin', '-Fc', 'smdb']]);
+    expect(h.calls.filter(isHolder)).toEqual([holderArgv]);
+    expect(callWith('pg_dump')).toEqual([['exec', C, 'pg_dump', '-U', 'dbm_admin', '-Fc', '--snapshot=00000003-1', 'smdb']]);
     expect(roleChecks()).toBe(0);
   });
 
@@ -172,17 +177,19 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     h.answer = args => {
       if (args[0] === 'inspect') return 'true\n';
       if (args.some(x => x.includes('rolsuper'))) return 'true\n';
+      if (isHolder(args)) return HOLDER;
       if (args.includes('pg_dump')) return n++ === 0 ? { stderr: MISSING } : 'dump';
       return '';
     };
     const r = await fleetBackup.runFleetDump({ id: 'b1', fleetDb } as any);
     expect(r.success, r.error).toBe(true);
     expect(callWith('pg_dump').length).toBe(2);
+    expect(h.calls.filter(isHolder).length).toBe(2);
     expect(roleChecks()).toBe(1);
   });
 
   it('a pg_dump that fails for another reason is not retried, and its error is the trimmed stderr cut at 500', async () => {
-    h.answer = args => (args[0] === 'inspect' ? 'true\n' : args.includes('pg_dump') ? { stderr: `  ${'x'.repeat(600)}  ` } : '');
+    h.answer = args => (args[0] === 'inspect' ? 'true\n' : isHolder(args) ? HOLDER : args.includes('pg_dump') ? { stderr: `  ${'x'.repeat(600)}  ` } : '');
     const r = await fleetBackup.runFleetDump({ id: 'b1', fleetDb } as any);
     expect(r).toEqual({ success: false, error: `pg_dump exited with code 1: ${'x'.repeat(500)}` });
     expect(callWith('pg_dump').length).toBe(1);
@@ -290,6 +297,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     h.answer = args => {
       const sql = args.join(' ');
       if (args.includes('pg_restore')) return pgRestore();
+      if (isHolder(args)) return HOLDER;
       if (args.includes('pg_dump')) return 'dump';
       if (args[0] === 'inspect') return 'true\n';
       if (sql.includes('rolsuper')) return 'true\n';

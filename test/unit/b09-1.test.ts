@@ -98,11 +98,10 @@ describe('instance auto-update controls', () => {
 });
 
 describe('fleet backup settings', () => {
-  const page = (answer: any, stored = { enabled: true, hour: 4, keep: 7 }) => {
+  const page = (answer: any, stored = { enabled: true, hour: 4 }) => {
     const els: Record<string, any> = {
       'fleet-backup-enabled': { checked: false },
       'fleet-backup-hour': { value: '9' },
-      'fleet-backup-keep': { value: '30' },
     };
     const messages: string[][] = [];
     const ctx = runPage(fns('saveFleetBackupConfig', 'showFleetBackupControls', 'showNoAnswer'), {
@@ -115,23 +114,23 @@ describe('fleet backup settings', () => {
     vm.runInContext(`var fleetBackupStored = ${JSON.stringify(stored)};`, ctx);
     return { ctx, els, messages };
   };
-  const shown = (els: Record<string, any>) => [els['fleet-backup-enabled'].checked, els['fleet-backup-hour'].value, els['fleet-backup-keep'].value];
+  const shown = (els: Record<string, any>) => [els['fleet-backup-enabled'].checked, els['fleet-backup-hour'].value];
 
   it('shows the stored values again when the save is refused', async () => {
     const { ctx, els, messages } = page({ success: false, error: 'locked' });
     await ctx.saveFleetBackupConfig();
-    expect(shown(els)).toEqual([true, '4', '7']);
+    expect(shown(els)).toEqual([true, '4']);
     expect(messages).toEqual([['error', 'locked']]);
   });
   it('shows the stored values again when the request fails', async () => {
     const { ctx, els } = page(new Error('offline'));
     await ctx.saveFleetBackupConfig();
-    expect(shown(els)).toEqual([true, '4', '7']);
+    expect(shown(els)).toEqual([true, '4']);
   });
   it('shows what the server stored on success', async () => {
-    const { ctx, els } = page({ success: true, fleetBackup: { enabled: false, hour: 9, keep: 20 } });
+    const { ctx, els } = page({ success: true, fleetBackup: { enabled: false, hour: 9 } });
     await ctx.saveFleetBackupConfig();
-    expect(shown(els)).toEqual([false, '9', '20']);
+    expect(shown(els)).toEqual([false, '9']);
   });
   it("says it can't confirm when the server answers without the settings", async () => {
     const { ctx, messages } = page({ success: true });

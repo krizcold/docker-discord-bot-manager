@@ -107,7 +107,7 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  const mod = { ...real, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, exec, spawn };
+  const mod = { ...real, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, exec, spawn: (await import('./dump-fake')).withDumpHolder(spawn as any) };
   return { ...mod, default: mod };
 });
 

@@ -39,7 +39,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile, spawn: heldSpawn, default: { ...real, execFile, spawn: heldSpawn } };
 });
 
 const detector = vi.hoisted(() => ({ mode: 'docker' as 'docker' | 'casaos' }));

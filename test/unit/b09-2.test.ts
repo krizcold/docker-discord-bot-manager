@@ -198,11 +198,11 @@ describe('B09-2 review: an unreadable store is not a missing value', () => {
   const popupHtml = async (scoped: boolean | null) => {
     const content: any = { innerHTML: '' };
     const ctx = loaderCtx({
-      bots: [{ id: 'b1', displayName: 'B1', fleetDb: { containerName: 'pg' }, fleetBackup: { enabled: true, hour: 4, keep: 7, scoped } }],
+      bots: [{ id: 'b1', displayName: 'B1', fleetDb: { containerName: 'pg' }, fleetBackup: { enabled: true, hour: 4, scoped, main: null } }],
       fleetBackupBotId: null, fleetBackupStoredKeep: null,
       document: { getElementById: (id: string) => id === 'fleet-backup-content' ? content : { classList: { remove: () => {} } } },
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
-      renderSeedBanner: () => {}, renderFleetReplication: () => {},
+      renderSeedBanner: () => {}, renderFleetReplication: () => {}, backupStatusHtml: () => '',
       api: async () => ({ success: true, backups: [] }),
     });
     for (const fn of ['showFleetBackups', 'fleetBackupListHtml', 'fleetBackupErrorHtml']) vm.runInContext(pageFunction(fn), ctx);

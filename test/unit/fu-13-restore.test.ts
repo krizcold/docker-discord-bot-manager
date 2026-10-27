@@ -94,7 +94,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (pg.sweepFail && args.join(' ').includes('pg_terminate_backend')) return cb(new Error('psql'), '', 'psql: error: the session sweep failed');
     return withFence(cmd, args, optsOrCb, maybeCb);
   };
-  return { ...real, execFile: fencedExecFile, exec, spawn, default: { ...real, execFile: fencedExecFile, exec, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';

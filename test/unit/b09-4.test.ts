@@ -21,14 +21,19 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   stopBot: async () => ({ success: true }),
   restartBot: async () => ({ success: true }),
 }));
-vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
-  getFleetBackupError: () => st.lastError,
-  getFleetFenceStuck: () => st.fence,
-  isFleetBackupStale: () => false,
-  fleetBackupScopeState: () => true,
-  listFleetBackups: () => [],
-}));
+vi.mock('../../src/instance/fleetBackup', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/fleetBackup')>();
+  return {
+    ...real,
+    fleetBackupStatus: (bot: any) => {
+      const status = real.fleetBackupStatus(bot);
+      return { ...status, main: status.main && { ...status.main, lastError: st.lastError } };
+    },
+    getFleetFenceStuck: () => st.fence,
+    fleetBackupScopeState: () => true,
+    listFleetBackups: () => [],
+  };
+});
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: (_w: unknown, type: string, data: any) => { st.broadcasts.push({ type, data }); } }));
 
 import * as routes from '../../src/webui/routes/bots';
@@ -48,7 +53,7 @@ beforeEach(() => {
   st.broadcasts = [];
   st.lastError = 'disk full';
   st.fence = null;
-  st.bots = [{ id: 'b1', status: 'running', sourceType: 'git', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4, keep: 7 } }];
+  st.bots = [{ id: 'b1', status: 'running', sourceType: 'git', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4 } }];
 });
 
 describe('B09-4 lifecycle pushes carry the enriched health keys', () => {
@@ -56,7 +61,7 @@ describe('B09-4 lifecycle pushes carry the enriched health keys', () => {
     it(`${type} carries the backup error`, async () => {
       await call(route);
       const push = st.broadcasts.find(b => b.type === type);
-      expect(push?.data.fleetBackup?.lastError).toBe('disk full');
+      expect(push?.data.fleetBackup?.main?.lastError).toBe('disk full');
     });
   }
 });
@@ -67,7 +72,7 @@ describe('B09-4 health changes are pushed', () => {
     st.fence = 'The copy is READ-ONLY';
     const pushed = (routes as any).collectHealthChanges(new Map());
     expect(pushed[0].fenceStuck).toBe('The copy is READ-ONLY');
-    expect(pushed[0].fleetBackup).toBeNull();
+    expect(pushed[0].fleetBackup?.main).toBeNull();
   });
 
   it('reports a bot once, then only when its backup status changes', () => {
@@ -79,7 +84,7 @@ describe('B09-4 health changes are pushed', () => {
     st.lastError = null;
     const changed = fn(seen);
     expect(changed).toHaveLength(1);
-    expect(changed[0].fleetBackup.lastError).toBeNull();
+    expect(changed[0].fleetBackup.main.lastError).toBeNull();
   });
 
   const pageHtml = fs.readFileSync(path.join(__dirname, '../../src/webui/public/index.html'), 'utf8');
@@ -97,6 +102,7 @@ describe('B09-4 health changes are pushed', () => {
       else if (pageHtml[i] === '}' && --depth === 0) return pageHtml.slice(start, i + 1);
     }
   };
+  const fam = (lastError: string | null) => ({ family: 'main', role: 'main database', enabled: true, hour: 4, paused: false, lastFile: null, lastAt: null, dataAt: null, lastError, failingSince: null, listError: null, test: null, alerts: { dumps: null, test: null } });
   const page = (api: () => Promise<any>) => {
     const boxes: Record<string, any> = {
       'fleet-backup-modal': { classList: { remove: () => {} } },
@@ -105,29 +111,30 @@ describe('B09-4 health changes are pushed', () => {
       'fleet-backup-list': { innerHTML: 'old list', isConnected: true },
     };
     const ctx: any = vm.createContext({
-      bots: [{ id: 'b1', displayName: 'B1', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4, keep: 7, lastError: 'disk full' } }],
+      bots: [{ id: 'b1', displayName: 'B1', fleetDb: { containerName: 'db' }, fleetBackup: { enabled: true, hour: 4, main: fam('disk full') } }],
       fleetBackupBotId: 'b1', fleetBackupStored: null, fleetBackupRefreshSeq: 0,
       document: { getElementById: (id: string) => boxes[id] ?? null },
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
       renderSeedBanner: () => {}, renderFleetReplication: () => {}, api,
     });
-    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml']) vm.runInContext(pageFunction(fn), ctx);
+    for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml', 'backupTime', 'backupTestHtml', 'backupAlertHtml', 'backupStatusHtml']) vm.runInContext(pageFunction(fn), ctx);
     return { ctx, boxes };
   };
   const listed = async () => ({ success: true, backups: [{ file: 'new.dump', size: 1, mtime: 1 }] });
 
   it('a bot:health push for the open bot clears the error line and redraws the list', async () => {
     const { ctx, boxes } = page(listed);
-    ctx.mergeBotState({ id: 'b1', fleetBackup: { enabled: true, hour: 4, keep: 7, lastError: null } });
+    ctx.mergeBotState({ id: 'b1', fleetBackup: { enabled: true, hour: 4, main: fam(null) } });
     await ctx.refreshFleetBackupStatus('b1');
-    expect(boxes['fleet-backup-error'].innerHTML).toBe('');
+    expect(boxes['fleet-backup-error'].innerHTML).not.toContain('disk full');
+    expect(boxes['fleet-backup-error'].innerHTML).toContain('No backup yet');
     expect(boxes['fleet-backup-list'].innerHTML).toContain('new.dump');
   });
 
   it('a bot:health push for another bot leaves the modal unchanged', async () => {
     const { ctx, boxes } = page(listed);
-    ctx.bots.push({ id: 'b2', fleetDb: {}, fleetBackup: { enabled: true, lastError: 'x' } });
-    ctx.mergeBotState({ id: 'b2', fleetBackup: { enabled: true, lastError: null } });
+    ctx.bots.push({ id: 'b2', fleetDb: {}, fleetBackup: { enabled: true, main: fam('x') } });
+    ctx.mergeBotState({ id: 'b2', fleetBackup: { enabled: true, main: fam(null) } });
     await ctx.refreshFleetBackupStatus('b2');
     expect(boxes['fleet-backup-error'].innerHTML).toContain('disk full');
     expect(boxes['fleet-backup-list'].innerHTML).toBe('old list');
@@ -140,10 +147,10 @@ describe('B09-4 health changes are pushed', () => {
     delete boxes['fleet-backup-error'];
     delete boxes['fleet-backup-list'];
     const opening = ctx.showFleetBackups('b1');
-    ctx.mergeBotState({ id: 'b1', fleetBackup: { enabled: true, hour: 4, keep: 7, lastError: null } });
+    ctx.mergeBotState({ id: 'b1', fleetBackup: { enabled: true, hour: 4, main: fam(null) } });
     await ctx.refreshFleetBackupStatus('b1');
     release();
     await opening;
-    expect(boxes['fleet-backup-content'].innerHTML).not.toContain('Last backup failed');
+    expect(boxes['fleet-backup-content'].innerHTML).not.toContain('disk full');
   });
 });

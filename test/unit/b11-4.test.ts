@@ -70,14 +70,22 @@ vi.mock('child_process', async (importOriginal) => {
     return child;
   });
   const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  return { ...real, execFile: fencedExecFile, spawn, default: { ...real, execFile: fencedExecFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
 import * as path from 'path';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
+const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: string): string | null =>
+  fb.fleetBackupStatus(JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'instances.json'), 'utf-8')).instances[id]).main?.lastError ?? null;
+
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
+// Hourly dumps past their 48-hour keep, so the trim deletes each one nothing protects.
+const stampAgo = (h: number) => new Date(Date.now() - h * 3600000).toISOString().replace(/[:.]/g, '-');
+const OLD = `hourly-${stampAgo(60)}.dump`;
+const OTHER = `hourly-${stampAgo(59)}.dump`;
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
 
 async function freshManager(): Promise<typeof import('../../src/instance/fleetBackup')> {
@@ -92,7 +100,7 @@ async function scheduledDump(fb: typeof import('../../src/instance/fleetBackup')
   spy.mockRestore();
   fb.stopFleetBackupScheduler();
   tick();
-  await vi.waitFor(() => expect(fs.readdirSync(DIR).filter(f => f.endsWith('.dump') && f !== 'old.dump' && f !== 'other.dump').length).toBeGreaterThan(0));
+  await vi.waitFor(() => expect(fs.readdirSync(DIR).filter(f => f.endsWith('.dump') && f !== OLD && f !== OTHER).length).toBeGreaterThan(0));
   await new Promise(r => setTimeout(r, 50));
 }
 
@@ -103,11 +111,11 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   const old = Date.now() / 1000 - 3600;
-  fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
-  fs.utimesSync(path.join(DIR, 'old.dump'), old, old);
-  fs.writeFileSync(path.join(DIR, 'other.dump'), 'dump');
-  fs.utimesSync(path.join(DIR, 'other.dump'), old + 60, old + 60);
-  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', fleetDb: primary, fleetBackup: { enabled: true, hour: new Date().getHours(), keep: 1 } } } }, null, 2));
+  fs.writeFileSync(path.join(DIR, OLD), 'dump');
+  fs.utimesSync(path.join(DIR, OLD), old, old);
+  fs.writeFileSync(path.join(DIR, OTHER), 'dump');
+  fs.utimesSync(path.join(DIR, OTHER), old + 60, old + 60);
+  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', fleetDb: primary, fleetBackup: { enabled: true, hour: new Date().getHours() } } } }, null, 2));
 });
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 
@@ -115,27 +123,27 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
   it('a failed pg_restore sets a restore notice naming the dump and the partial database', async () => {
     const fb = await freshManager();
     pg.restoreCode = 1;
-    const r = await fb.restoreFleetBackup('a', 'old.dump');
+    const r = await fb.restoreFleetBackup('a', OLD);
     expect(r.success).toBe(false);
-    expect(fb.getFleetRestoreError('a')).toContain('old.dump');
+    expect(fb.getFleetRestoreError('a')).toContain(OLD);
     expect(fb.getFleetRestoreError('a')).toContain('partial restore');
   });
 
   it('a later successful scheduled dump neither clears the notice nor trims the targeted dump', async () => {
     const fb = await freshManager();
     pg.restoreCode = 1;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     await scheduledDump(fb);
-    expect(fb.getFleetBackupError('a')).toBeNull();
-    expect(fb.getFleetRestoreError('a')).toContain('old.dump');
-    expect(fs.existsSync(path.join(DIR, 'old.dump'))).toBe(true);
-    expect(fs.existsSync(path.join(DIR, 'other.dump'))).toBe(false);
+    expect(backupError(fb, 'a')).toBeNull();
+    expect(fb.getFleetRestoreError('a')).toContain(OLD);
+    expect(fs.existsSync(path.join(DIR, OLD))).toBe(true);
+    expect(fs.existsSync(path.join(DIR, OTHER))).toBe(false);
   });
 
   it('a failed recreate sets the restore notice too', async () => {
     const fb = await freshManager();
     pg.recreateFails = true;
-    const r = await fb.restoreFleetBackup('a', 'old.dump');
+    const r = await fb.restoreFleetBackup('a', OLD);
     expect(r.success).toBe(false);
     expect(fb.getFleetRestoreError('a')).toContain('could not recreate the database');
   });
@@ -143,9 +151,9 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
   it('a successful restore clears the notice', async () => {
     const fb = await freshManager();
     pg.restoreCode = 1;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     pg.restoreCode = 0;
-    const r = await fb.restoreFleetBackup('a', 'other.dump');
+    const r = await fb.restoreFleetBackup('a', OTHER);
     expect(r.success).toBe(true);
     expect(fb.getFleetRestoreError('a')).toBeNull();
   });
@@ -153,23 +161,23 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
   it('a dismiss clears the notice, and the dump trims normally afterwards', async () => {
     const fb = await freshManager();
     pg.restoreCode = 1;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     expect(fb.dismissFleetRestoreError('a')).toBe(true);
     expect(fb.getFleetRestoreError('a')).toBeNull();
     expect(fb.dismissFleetRestoreError('a')).toBe(false);
     await scheduledDump(fb);
-    expect(fs.existsSync(path.join(DIR, 'old.dump'))).toBe(false);
+    expect(fs.existsSync(path.join(DIR, OLD))).toBe(false);
   });
 
   it('the notice and the trim exemption survive a manager restart until dismissed', async () => {
     let fb = await freshManager();
     pg.restoreCode = 1;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     fb = await freshManager();
-    expect(fb.getFleetRestoreError('a')).toContain('old.dump');
+    expect(fb.getFleetRestoreError('a')).toContain(OLD);
     pg.restoreCode = 0;
     await scheduledDump(fb);
-    expect(fs.existsSync(path.join(DIR, 'old.dump'))).toBe(true);
+    expect(fs.existsSync(path.join(DIR, OLD))).toBe(true);
     expect(fb.dismissFleetRestoreError('a')).toBe(true);
     fb = await freshManager();
     expect(fb.getFleetRestoreError('a')).toBeNull();
@@ -178,7 +186,7 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
   it('a failed recreate never claims a partial restore', async () => {
     const fb = await freshManager();
     pg.recreateFails = true;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     const text = fb.getFleetRestoreError('a') || '';
     expect(text).not.toContain('partial restore');
     expect(text).toContain('may be missing, or unchanged if the drop itself failed');
@@ -190,28 +198,28 @@ describe('R28-J9: a restore notice the registry could not save', () => {
     let fb = await freshManager();
     pg.restoreCode = 1;
     pg.saveFails = true;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     expect(fb.getFleetRestoreError('a')).toContain('a manager restart drops it');
-    expect(fb.getFleetBackupError('a')).toBeNull();
+    expect(backupError(fb, 'a')).toBeNull();
     pg.restoreCode = 0;
     await scheduledDump(fb);
-    expect(fb.getFleetRestoreError('a')).toContain('old.dump');
-    expect(fs.existsSync(path.join(DIR, 'old.dump'))).toBe(true);
+    expect(fb.getFleetRestoreError('a')).toContain(OLD);
+    expect(fs.existsSync(path.join(DIR, OLD))).toBe(true);
     expect(fb.dismissFleetRestoreError('a')).toBe(true);
     expect(fb.getFleetRestoreError('a')).toBeNull();
     pg.restoreCode = 1;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     fb = await freshManager();
-    expect(fb.getFleetRestoreError('a')).toMatch(/^Restore of old\.dump has not finished/);
+    expect(fb.getFleetRestoreError('a')?.startsWith(`Restore of ${OLD} has not finished`)).toBe(true);
   });
 
   it('a successful restore clears the unsaved notice', async () => {
     const fb = await freshManager();
     pg.restoreCode = 1;
     pg.saveFails = true;
-    await fb.restoreFleetBackup('a', 'old.dump');
+    await fb.restoreFleetBackup('a', OLD);
     pg.restoreCode = 0;
-    expect((await fb.restoreFleetBackup('a', 'other.dump')).success).toBe(true);
+    expect((await fb.restoreFleetBackup('a', OTHER)).success).toBe(true);
     expect(fb.getFleetRestoreError('a')).toBeNull();
   });
 });

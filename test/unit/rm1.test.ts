@@ -59,7 +59,8 @@ vi.mock('child_process', async (importOriginal) => {
     return child;
   };
   const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  return { ...real, execFile: fencedExecFile, spawn, default: { ...real, execFile: fencedExecFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, spawn: heldSpawn } };
 });
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => ({
@@ -85,6 +86,7 @@ vi.mock('../../src/instance/fleetReplica', async (importOriginal) => {
 import * as fs from 'fs';
 import * as path from 'path';
 import { fenceOwners } from './fence-fake';
+import { resetHolder } from './dump-fake';
 
 const REGISTRY = path.join(h.dir, 'instances.json');
 const DUMPS = path.join(h.dir, 'backups', 'a', 'fleet-postgres');
@@ -138,6 +140,7 @@ beforeEach(() => {
   h.dumpHold = null;
   h.seedView = null;
   fenceOwners.clear();
+  resetHolder();
   fs.rmSync(DUMPS, { recursive: true, force: true });
 });
 afterAll(() => { fs.rmSync(h.dir, { recursive: true, force: true }); });
@@ -145,20 +148,20 @@ afterAll(() => { fs.rmSync(h.dir, { recursive: true, force: true }); });
 describe('RM1 F1: a copy in recovery gets its scheduled dump', () => {
   it('a copy in recovery whose bot is stopped is dumped', async () => {
     h.botRunning = false;
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     const fb = await restartedManager();
-    await tickOnce(await startedWithTick(fb), '[FleetBackup] Dumped the copy');
+    await tickOnce(await startedWithTick(fb), "[FleetBackup] Dumped a's live copy");
     expect(h.dumpedFrom).toEqual(['bot-a-replica']);
-    expect(dumpsNow()).toEqual([expect.stringMatching(/^standin-.*\.dump$/)]);
+    expect(dumpsNow()).toEqual([expect.stringMatching(/^copy-daily-.*\.dump$/)]);
   });
 
   it('a copy in recovery whose app answers is dumped', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     const fb = await restartedManager();
-    await tickOnce(await startedWithTick(fb), '[FleetBackup] Dumped the copy');
+    await tickOnce(await startedWithTick(fb), "[FleetBackup] Dumped a's live copy");
     expect(h.dumpedFrom).toEqual(['bot-a-replica']);
-    const info = fb.copyBackupInfo(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a);
-    expect(info?.lastFile).toMatch(/^standin-/);
+    const info = fb.fleetBackupStatus(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a).copy;
+    expect(info?.lastFile).toMatch(/^copy-daily-/);
     expect(info?.lastError).toBeNull();
   });
 
@@ -167,66 +170,51 @@ describe('RM1 F1: a copy in recovery gets its scheduled dump', () => {
     const start = pageHtml.indexOf(`function ${name}(`);
     return start < 0 ? '' : pageHtml.slice(start, pageHtml.indexOf('\n    }\n', start) + 6);
   };
-  const body = fn('copyDumpHtml');
+  const body = ['backupTime', 'backupTestHtml', 'backupAlertHtml', 'backupStatusHtml', 'copyDumpHtml'].map(fn).join('\n');
   const line = (info: unknown): string =>
     vm.runInNewContext(`${body}\ncopyDumpHtml(info)`, { info, escapeHtml: (s: string) => s });
-  const info = (over: Record<string, unknown> = {}) => ({ enabled: true, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: null, listError: null, ...over });
+  const info = (over: Record<string, unknown> = {}) => ({ family: 'copy', role: 'live copy', enabled: true, hour: 4, paused: false, lastFile: null, lastAt: null, dataAt: null, lastError: null, failingSince: null, listError: null, test: null, alerts: { dumps: null, test: null }, ...over });
 
   it('the modal shows the copy dump line for a copy in recovery', () => {
     expect(pageHtml).toContain('${copyDumpHtml(res.copyBackup)}');
-    expect(body).not.toMatch(/inRecovery|since|mode/);
-    expect(line(info({ lastAt: Date.now() - 3600000, lastFile: 'standin-x.dump' }))).toContain('Last dump of this copy');
-    expect(line(info())).toMatch(/no dump of this copy yet/i);
+    expect(fn('copyDumpHtml')).not.toMatch(/inRecovery|mode/);
+    expect(line(info({ lastAt: Date.now() - 3600000, lastFile: 'copy-hourly-x.dump' }))).toContain('Last backup of this copy');
+    expect(line(info())).toMatch(/No backup yet/);
     expect(line(info({ lastError: 'pg_dump exited with code 1' }))).toContain('pg_dump exited with code 1');
   });
 
-  it('a copy dump that conflicts with recovery records the error and is retried the next night', async () => {
+  it('a copy dump that conflicts with recovery on every attempt records the error and is retried the next hour', async () => {
     h.dumpFail = 'pg_dump: error: ERROR:  canceling statement due to conflict with recovery';
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     const fb = await restartedManager();
     const tick = await startedWithTick(fb);
-    await tickOnce(tick, '[FleetBackup] Dump of the copy failed');
+    await tickOnce(tick, "[FleetBackup] Dump of a's live copy failed");
     expect(dumpsNow()).toEqual([]);
     const regA = () => JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a;
-    const failed = fb.copyBackupInfo(regA())!;
-    expect(failed.lastError).toContain('canceling statement due to conflict with recovery');
-    expect(line(failed)).toContain('canceling statement due to conflict with recovery');
+    const failed = fb.fleetBackupStatus(regA()).copy!;
+    expect(h.dumpedFrom).toEqual(['bot-a-replica', 'bot-a-replica', 'bot-a-replica']);
+    expect(failed.lastError).toBe("the live copy's replay cancelled the dump 3 times in a row (conflict with recovery); the next hourly run tries again");
+    expect(line(failed)).toContain('conflict with recovery');
     h.dumpFail = null;
     const realNow = Date.now.bind(Date);
-    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 24 * 3600000);
-    try { await tickOnce(tick, '[FleetBackup] Dumped the copy'); } finally { spy.mockRestore(); }
-    expect(dumpsNow()).toEqual([expect.stringMatching(/^standin-.*\.dump$/)]);
-    expect(fb.copyBackupInfo(regA())?.lastError).toBeNull();
-  });
-
-  it('dumps off with a kept dump names that dump', () => {
-    const out = line(info({ enabled: false, lastAt: Date.now() - 3600000, lastFile: 'standin-night1.dump' }));
-    expect(out).toContain('standin-night1.dump');
-    expect(out).toMatch(/Last dump of this copy/);
-    expect(out).not.toMatch(/in no dump/);
-    expect(out).not.toMatch(/writes|took/i);
-  });
-
-  it('dumps off with an unreadable backup folder makes no no-dump claim', () => {
-    const listError = 'The backup folder for a could not be read: EACCES';
-    const out = line(info({ enabled: false, listError }));
-    expect(out).toContain(listError);
-    expect(out).toMatch(/Scheduled dumps are off for this instance, so no further dumps run/);
-    expect(out).not.toMatch(/in no dump/);
-    expect(line(info({ enabled: false }))).toMatch(/in no dump this manager keeps/);
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + 3600000);
+    try { await tickOnce(tick, "[FleetBackup] Dumped a's live copy"); } finally { spy.mockRestore(); }
+    expect(dumpsNow()).toEqual([expect.stringMatching(/^copy-daily-.*\.dump$/)]);
+    expect(fb.fleetBackupStatus(regA()).copy?.lastError).toBeNull();
   });
 
   it('a cleared copy shows no scheduled-dump line', async () => {
-    seed({ fleetDbReplica: { ...replica, copyCleared: true }, fleetBackup: { enabled: true, hour: 4, keep: 7 } });
+    seed({ fleetDbReplica: { ...replica, copyCleared: true }, fleetBackup: { enabled: true, hour: 4 } });
     const fb = await restartedManager();
-    const got = fb.copyBackupInfo(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a);
+    const got = fb.fleetBackupStatus(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a).copy;
+    expect(got).toBeNull();
     expect(line(got)).toBe('');
   });
 });
 
 describe('RM1 F2: the scheduler tick writes held seed records again', () => {
   it('each tick calls retryHeldSeedRecords', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: false, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: false, hour: hour() } });
     const fb = await restartedManager();
     const tick = await startedWithTick(fb);
     await tickOnce(tick, null);
@@ -238,7 +226,7 @@ describe('RM1 F2: the scheduler tick writes held seed records again', () => {
   it('the next interval calls the retry while a tick is still running', async () => {
     let release: () => void = () => {};
     h.dumpHold = new Promise<void>(res => { release = res; });
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     const fb = await restartedManager();
     const tick = await startedWithTick(fb);
     await tickOnce(tick, null);
@@ -261,14 +249,14 @@ describe('RM1 F3: the primary and its copy keep separate stuck-fence warnings', 
     h.fenced = new Map([[primary.containerName, true], [copy.containerName, true]]);
     fenceOwners.set(primary.containerName, OWNER);
     fenceOwners.set(copy.containerName, OWNER);
-    seed({ fleetDb: primary, fleetDbReplica: copy, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
+    seed({ fleetDb: primary, fleetDbReplica: copy, fleetBackup: { enabled: false, hour: 4 } });
   });
 
   it('a stuck fence shows on its own reader, never as a backup failure', async () => {
     const fb = await restartedManager();
     expect(await fb.liftLaneFence('a', primary, OWNER, 'a re-seed', 'x')).not.toBe('');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
-    expect(fb.getFleetBackupError('a')).toBeNull();
+    expect(fb.fleetBackupStatus(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a).main?.lastError ?? null).toBeNull();
   });
 
   it('a lift on the copy leaves the primary\'s stuck-fence warning in place', async () => {
@@ -309,23 +297,23 @@ describe('RM1 S1: the scheduled copy dump reads the seed as the modal does', () 
   const rawSeed = { startedAt: Date.now(), phase: 'seeding', purpose: 'seed', updatedAt: Date.now() };
 
   it('a seed whose park write was refused gets its copy dumped', async () => {
-    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: rawSeed, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: rawSeed, fleetBackup: { enabled: true, hour: hour() } });
     h.seedView = (i) => ({ ...i.fleetDbReplicaSeed, parked: true });
     const fb = await restartedManager();
-    await tickOnce(await startedWithTick(fb), '[FleetBackup] Dumped the copy');
+    await tickOnce(await startedWithTick(fb), "[FleetBackup] Dumped a's live copy");
     expect(h.dumpedFrom).toEqual(['bot-a-replica']);
   });
 
   it('a finished seed whose clear was refused gets its copy dumped', async () => {
-    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: rawSeed, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: rawSeed, fleetBackup: { enabled: true, hour: hour() } });
     h.seedView = () => null;
     const fb = await restartedManager();
-    await tickOnce(await startedWithTick(fb), '[FleetBackup] Dumped the copy');
+    await tickOnce(await startedWithTick(fb), "[FleetBackup] Dumped a's live copy");
     expect(h.dumpedFrom).toEqual(['bot-a-replica']);
   });
 
   it('a running seed still holds the copy dump', async () => {
-    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: { ...rawSeed, parked: true }, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetDbReplicaSeed: { ...rawSeed, parked: true }, fleetBackup: { enabled: true, hour: hour() } });
     h.seedView = (i) => ({ ...i.fleetDbReplicaSeed, parked: false });
     const fb = await restartedManager();
     await tickOnce(await startedWithTick(fb), null);

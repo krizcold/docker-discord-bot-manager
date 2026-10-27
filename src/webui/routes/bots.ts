@@ -53,16 +53,9 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 
 // The computed health keys every bot record carries to the page, so a push
 // never replaces them with the raw record's fleetBackup config.
-function botHealth(bot: InstanceConfig): { fleetBackup: Record<string, unknown> | null; fenceStuck: string | null; maintenanceDrift: string | null } {
+function botHealth(bot: InstanceConfig): { fleetBackup: ReturnType<typeof fleetBackup.fleetBackupStatus> | null; fenceStuck: string | null; maintenanceDrift: string | null } {
   return {
-    fleetBackup: bot.fleetDb ? {
-      lastAt: bot.lastFleetBackupAt || null,
-      stale: fleetBackup.isFleetBackupStale(bot),
-      lastError: fleetBackup.getFleetBackupError(bot.id),
-      restoreError: fleetBackup.getFleetRestoreError(bot.id),
-      scoped: fleetBackup.fleetBackupScopeState(bot),
-      ...fleetBackup.effectiveFleetBackup(bot),
-    } : null,
+    fleetBackup: bot.fleetDb || bot.fleetDbReplica ? fleetBackup.fleetBackupStatus(bot) : null,
     fenceStuck: fleetBackup.getFleetFenceStuck(bot.id),
     maintenanceDrift: maintenance.getMaintenanceDrift(bot.id),
   };
@@ -1543,8 +1536,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * PUT /api/bots/:id/fleet-backup-config - Update the sidecar backup schedule
-   * on the INSTANCE. The body carries only the changed fields (enabled / hour /
-   * keep) and, under `expected`, the stored value each one replaces; a field
+   * on the INSTANCE. The body carries only the changed fields (enabled / hour)
+   * and, under `expected`, the stored value each one replaces; a field
    * changed since answers 409 with what is stored, and nothing is saved.
    */
   router.put('/:id/fleet-backup-config', async (req: Request, res: Response) => {
@@ -1555,7 +1548,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
 
-      const body = (req.body || {}) as { enabled?: unknown; hour?: unknown; keep?: unknown; expected?: Record<string, unknown> };
+      const body = (req.body || {}) as { enabled?: unknown; hour?: unknown; expected?: Record<string, unknown> };
       const changes: Partial<FleetBackupConfig> = {};
       if (body.enabled !== undefined) {
         if (typeof body.enabled !== 'boolean') { res.status(400).json({ success: false, error: 'enabled must be true or false. Nothing was saved.' }); return; }
@@ -1566,12 +1559,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           res.status(400).json({ success: false, error: 'hour must be a whole number from 0 to 23. Nothing was saved.' }); return;
         }
         changes.hour = body.hour;
-      }
-      if (body.keep !== undefined) {
-        if (!fleetBackup.isValidFleetBackupKeep(body.keep)) {
-          res.status(400).json({ success: false, error: 'keep must be a whole number from 1 to 365. Nothing was saved.' }); return;
-        }
-        changes.keep = body.keep;
       }
       const fields = Object.keys(changes) as Array<keyof FleetBackupConfig>;
       if (fields.length === 0) {
@@ -1805,7 +1792,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), copyBackup: fleetBackup.copyBackupInfo(bot) });
+      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), copyBackup: fleetBackup.fleetBackupStatus(bot).copy });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

@@ -85,7 +85,8 @@ vi.mock('child_process', async (importOriginal) => {
     return real.execFileSync(cmd, args, opts);
   };
   const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  return { ...real, execFile: fencedExecFile, execFileSync, exec, spawn, default: { ...real, execFile: fencedExecFile, execFileSync, exec, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, execFileSync, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, execFileSync, exec, spawn: heldSpawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),

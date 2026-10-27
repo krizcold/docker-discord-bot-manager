@@ -41,7 +41,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 1);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile, spawn: heldSpawn, default: { ...real, execFile, spawn: heldSpawn } };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
@@ -54,7 +55,11 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import { dropFleetSlot, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 import { adoptPromotedReplica, getFleetReplicaStatus, standbyDownText } from '../../src/instance/fleetReplica';
-import { getFleetBackupError, getFleetFenceStuck, runFleetDump } from '../../src/instance/fleetBackup';
+import * as fleetBackupModule from '../../src/instance/fleetBackup';
+import { getFleetFenceStuck, runFleetDump } from '../../src/instance/fleetBackup';
+const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: string): string | null =>
+  fb.fleetBackupStatus(JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'instances.json'), 'utf-8')).instances[id]).main?.lastError ?? null;
+
 
 const fakeUrl = 'postgresql://smdb:fake-pass@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
 const replication = { role: 'replicator', password: 'fake', hostPort: 5433, publicHost: 'h', certHost: 'h' };
@@ -158,7 +163,7 @@ describe('the primary probe and refusals', () => {
 
 describe('the backup error and the fence', () => {
   it('reports no fence and no dump error by default, each on its own reader', () => {
-    expect(getFleetBackupError('b1')).toBeNull();
+    expect(backupError(fleetBackupModule, 'b1')).toBeNull();
     expect(getFleetFenceStuck('b1')).toBeNull();
   });
 });

@@ -121,13 +121,16 @@ beforeEach(() => {
 
 describe('collectHealthChanges lastAt', () => {
   it('carries the last backup time, or null when there is none', () => {
+    const dumps = path.join(h.dir, 'backups', 'd1', 'fleet-postgres');
+    fs.mkdirSync(dumps, { recursive: true });
+    fs.writeFileSync(path.join(dumps, 'hourly-2026-10-20T10-00-00-000Z.dump'), 'dump');
     writeRegistry({
-      d1: base('d1', { fleetDb, lastFleetBackupAt: '2026-10-20T10:00:00.000Z' }),
+      d1: base('d1', { fleetDb }),
       d2: base('d2', { fleetDb }),
     });
     const pushes = collectHealthChanges(new Map());
-    expect(pushes.find(p => p.id === 'd1')!.fleetBackup!.lastAt).toBe('2026-10-20T10:00:00.000Z');
-    expect(pushes.find(p => p.id === 'd2')!.fleetBackup!.lastAt).toBeNull();
+    expect(pushes.find(p => p.id === 'd1')!.fleetBackup!.main!.lastAt).toBe(Date.parse('2026-10-20T10:00:00.000Z'));
+    expect(pushes.find(p => p.id === 'd2')!.fleetBackup!.main!.lastAt).toBeNull();
   });
 });
 

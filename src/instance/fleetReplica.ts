@@ -1462,6 +1462,7 @@ async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNulla
 }
 
 const RESEED_LIFT_REMEDY = 'retrying the re-seed retries the lift';
+const RESEED_BUSY_REFUSAL = "A dump, restore or replication change is running on this instance's database, so the re-seed was refused and nothing was changed; wait for it to finish, then re-seed again";
 const DECOMMISSION_LIFT_REMEDY = 'running the decommission again retries the lift';
 
 /**
@@ -2124,21 +2125,36 @@ export async function reseedStandby(instance: InstanceConfig): Promise<{ success
     }
     target = { ...rec, primaryHost: dsn.host, primaryPort: dsn.port };
   }
-  const started = startProvisioning(instance, target, validated.intake, 'reseed-standby', async () => {
-    // The permits were read before the lock: a Remove replica that landed
-    // meanwhile must not be undone by this run writing its record back.
-    const fresh = containerManager.getBot(instance.id)?.fleetDbReplica;
-    if (!fresh || fresh.containerName !== rec.containerName || fresh.volume !== rec.volume) {
-      throw new SeedSuperseded('the standby record changed while the re-seed was starting');
-    }
-    const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
-    if (!removed.success) throw new Error(`could not stop the stale standby: ${removed.error}`);
-    // The wipe below runs inside the same volume, so the standby postgres
-    // must be PROVEN gone, unknown included.
-    if (await containerRunning(rec.containerName) !== false) {
-      throw new Error('the standby database container is still present after the stop, so its copy cannot be cleared safely');
-    }
-  });
-  if (!started.success) return refuse(started.error || 'the seed could not be started');
+  // The wipe must not run under a dump of this copy, nor a dump start under the wipe: the backup slot is held from
+  // here to the run's end, claimed in the same synchronous segment as the start.
+  if (!fleetBackupGuards.claimFleetBackupBusy(instance.id)) {
+    return refuse(containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : RESEED_BUSY_REFUSAL);
+  }
+  const release = () => fleetBackupGuards.releaseFleetBackupBusy(instance.id);
+  let started: { success: boolean; error?: string };
+  try {
+    started = startProvisioning(instance, target, validated.intake, 'reseed-standby', async () => {
+      // The permits were read before the lock: a Remove replica that landed
+      // meanwhile must not be undone by this run writing its record back.
+      const fresh = containerManager.getBot(instance.id)?.fleetDbReplica;
+      if (!fresh || fresh.containerName !== rec.containerName || fresh.volume !== rec.volume) {
+        throw new SeedSuperseded('the standby record changed while the re-seed was starting');
+      }
+      const removed = await containerManager.removeFleetDbReplicaService(instance.id, rec.containerName);
+      if (!removed.success) throw new Error(`could not stop the stale standby: ${removed.error}`);
+      // The wipe below runs inside the same volume, so the standby postgres
+      // must be PROVEN gone, unknown included.
+      if (await containerRunning(rec.containerName) !== false) {
+        throw new Error('the standby database container is still present after the stop, so its copy cannot be cleared safely');
+      }
+    }, release);
+  } catch (err) {
+    release();
+    throw err;
+  }
+  if (!started.success) {
+    release();
+    return refuse(started.error || 'the seed could not be started');
+  }
   return { success: true, started: true };
 }

@@ -84,12 +84,16 @@ vi.mock('child_process', async (importOriginal) => {
     return child;
   });
   const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  return { ...real, execFile: fencedExecFile, exec, spawn, default: { ...real, execFile: fencedExecFile, exec, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: string): string | null =>
+  fb.fleetBackupStatus(JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'instances.json'), 'utf-8')).instances[id]).main?.lastError ?? null;
+
 
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
@@ -121,7 +125,7 @@ async function restoreTexts() {
   return {
     r,
     texts: [r.error ?? '', r.warning ?? '', fleetBackup.getFleetRestoreError('a') ?? '', fleetBackup.getFleetFenceStuck('a') ?? '',
-      fleetBackup.getFleetBackupError('a') ?? '', ...logged],
+      backupError(fleetBackup, 'a') ?? '', ...logged],
   };
 }
 

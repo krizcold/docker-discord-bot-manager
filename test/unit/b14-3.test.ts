@@ -46,7 +46,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile, spawn: heldSpawn, default: { ...real, execFile, spawn: heldSpawn } };
 });
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => ({
@@ -75,6 +76,7 @@ const replica = {
   primaryHost: 'primary.example', primaryPort: 5432, publicHost: 'copy.example', hostPort: 15432, certHost: 'copy.example',
 };
 const hour = () => new Date().getHours();
+const stampAgo = (hours: number) => new Date(Date.now() - hours * 3600000).toISOString().replace(/[:.]/g, '-');
 
 function seed(record: Record<string, unknown>): void {
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', sourceUrl: 'x', createdAt: new Date().toISOString(), ...record } } }, null, 2));
@@ -128,78 +130,67 @@ beforeEach(() => {
 afterAll(() => { fs.rmSync(h.dir, { recursive: true, force: true }); });
 
 describe('R9-12: the scheduled dump follows the database\'s live role', () => {
-  it('dumps a promoted copy under a standin- name', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
+  it('dumps a promoted copy under a copy- name', async () => {
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     await runOneTick('[FleetBackup] Dumped');
     expect(h.dumpedFrom).toEqual(['bot-a-replica']);
     const made = dumpsNow();
     expect(made.length).toBe(1);
-    expect(made[0]).toMatch(/^standin-.*\.dump$/);
+    expect(made[0]).toMatch(/^copy-daily-.*\.dump$/);
   });
 
-  it('does not dump a copy twice within the refire window', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 7 } });
-    seedDumps(['standin-2026-01-01T04-00-00-000Z.dump'], 0);
-    fs.utimesSync(path.join(DUMPS, 'standin-2026-01-01T04-00-00-000Z.dump'), new Date(), new Date());
+  it('does not dump a copy twice within the hour slot', async () => {
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
+    seedDumps([`copy-daily-${stampAgo(0)}.dump`], 0);
     await runOneTick(null);
     expect(h.dumpedFrom).toEqual([]);
   });
 
   it('skips a copy whose schedule is off', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: false, hour: hour(), keep: 7 } });
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: false, hour: hour() } });
     await runOneTick(null);
     expect(h.dumpedFrom).toEqual([]);
   });
 });
 
-describe('R9-12: the trim keeps each family under the same keep', () => {
-  it('the copy\'s trim keeps the newest standin- dumps and every primary dump', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour(), keep: 2 } });
-    const plain = ['2026-01-01T04-00-00-000Z.dump', '2026-01-02T04-00-00-000Z.dump', '2026-01-03T04-00-00-000Z.dump'];
-    const copies = ['standin-2026-01-01T04-00-00-000Z.dump', 'standin-2026-01-02T04-00-00-000Z.dump', 'standin-2026-01-03T04-00-00-000Z.dump'];
+describe('R9-12: the trim keeps each family apart', () => {
+  const plain = [`hourly-${stampAgo(60)}.dump`, `hourly-${stampAgo(59)}.dump`, `hourly-${stampAgo(58)}.dump`];
+  const copies = [`copy-hourly-${stampAgo(60)}.dump`, `copy-hourly-${stampAgo(59)}.dump`, `copy-hourly-${stampAgo(58)}.dump`];
+
+  it('the copy\'s trim deletes its own dumps past their keep and every primary dump stays', async () => {
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: hour() } });
     seedDumps([...plain, ...copies], 2);
     await runOneTick('[FleetBackup] Dumped');
-    await vi.waitFor(() => expect(dumpsNow().filter(f => f.startsWith('standin-')).length).toBe(2), { timeout: 3000 });
+    await vi.waitFor(() => expect(dumpsNow().filter(f => f.startsWith('copy-')).length).toBe(1), { timeout: 3000 });
     const now = dumpsNow();
     for (const f of plain) expect(now).toContain(f);
-    expect(now).toContain('standin-2026-01-03T04-00-00-000Z.dump');
+    for (const f of copies) expect(now).not.toContain(f);
   });
 
-  it('the primary\'s trim never deletes a standin- dump', async () => {
-    seed({ fleetDb, fleetBackup: { enabled: true, hour: hour(), keep: 2 } });
-    const plain = ['2026-01-01T04-00-00-000Z.dump', '2026-01-02T04-00-00-000Z.dump', '2026-01-03T04-00-00-000Z.dump'];
-    const copies = ['standin-2026-01-01T04-00-00-000Z.dump', 'standin-2026-01-02T04-00-00-000Z.dump', 'standin-2026-01-03T04-00-00-000Z.dump'];
+  it('the primary\'s trim never deletes a copy- dump', async () => {
+    seed({ fleetDb, fleetBackup: { enabled: true, hour: hour() } });
     seedDumps([...copies, ...plain], 2);
     await runOneTick('[FleetBackup] Dumped');
-    await vi.waitFor(() => expect(dumpsNow().filter(f => !f.startsWith('standin-')).length).toBe(2), { timeout: 3000 });
+    await vi.waitFor(() => expect(dumpsNow().filter(f => !f.startsWith('copy-')).length).toBe(1), { timeout: 3000 });
     for (const f of copies) expect(dumpsNow()).toContain(f);
   });
 });
 
 describe('R9-12: the copy\'s last dump is reported', () => {
-  it('names the newest standin- dump and calls one older than 36 hours stale', async () => {
-    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: 4, keep: 7 } });
-    seedDumps(['standin-2026-01-01T04-00-00-000Z.dump', '2026-01-05T04-00-00-000Z.dump'], 1);
+  it('names the newest copy- dump, never a primary one', async () => {
+    const copyFile = `copy-daily-${stampAgo(30)}.dump`;
+    seed({ fleetDbReplica: replica, fleetBackup: { enabled: true, hour: 4 } });
+    seedDumps([copyFile, `daily-${stampAgo(2)}.dump`], 1);
     const fb = await loadBackup();
-    const info = fb.copyBackupInfo(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a)!;
-    expect(info.lastFile).toBe('standin-2026-01-01T04-00-00-000Z.dump');
-    expect(info.stale).toBe(true);
+    const info = fb.fleetBackupStatus(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a).copy!;
+    expect(info.lastFile).toBe(copyFile);
     expect(info.enabled).toBe(true);
   });
 
-  it('a recent copy dump is not stale', async () => {
-    seed({ fleetDbReplica: replica });
-    seedDumps(['standin-2026-01-01T04-00-00-000Z.dump'], 0);
-    fs.utimesSync(path.join(DUMPS, 'standin-2026-01-01T04-00-00-000Z.dump'), new Date(), new Date());
-    const fb = await loadBackup();
-    const info = fb.copyBackupInfo(JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a)!;
-    expect(info.stale).toBe(false);
-    expect(info.lastAt).not.toBeNull();
-  });
-
   it('GET /:id/fleet-replica carries the copy\'s backup info', async () => {
+    const copyFile = `copy-daily-${stampAgo(30)}.dump`;
     seed({ fleetDbReplica: replica });
-    seedDumps(['standin-2026-01-01T04-00-00-000Z.dump'], 1);
+    seedDumps([copyFile], 1);
     vi.resetModules();
     const { createBotRoutes } = await import('../../src/webui/routes/bots');
     const router = createBotRoutes({ clients: new Set() } as any);
@@ -209,52 +200,46 @@ describe('R9-12: the copy\'s last dump is reported', () => {
     res.json = (b: unknown) => { res.body = b; return res; };
     await layer.route.stack[layer.route.stack.length - 1].handle({ params: { id: 'a' }, query: {}, body: {} }, res);
     expect(res.statusCode).toBe(200);
-    expect(res.body.copyBackup?.lastFile).toBe('standin-2026-01-01T04-00-00-000Z.dump');
+    expect(res.body.copyBackup?.lastFile).toBe(copyFile);
   });
 });
 
-describe('R9-12: the copy banner says when its last dump is stale', () => {
+describe('R9-12: the copy banner names its last dump', () => {
   const pageHtml = fs.readFileSync(path.resolve(__dirname, '../../src/webui/public/index.html'), 'utf8');
-  const start = pageHtml.indexOf('function copyDumpHtml(');
-  const body = start < 0 ? '' : pageHtml.slice(start, pageHtml.indexOf('\n    }\n', start) + 6);
+  const fn = (name: string): string => {
+    const start = pageHtml.indexOf(`function ${name}(`);
+    return start < 0 ? '' : pageHtml.slice(start, pageHtml.indexOf('\n    }\n', start) + 6);
+  };
+  const copyFamilyFns = ['backupTime', 'backupTestHtml', 'backupAlertHtml', 'backupStatusHtml', 'copyDumpHtml'].map(fn).join('\n');
   const run = (info: unknown): string =>
-    vm.runInNewContext(`${body}\ncopyDumpHtml(info)`, { info, escapeHtml: (s: string) => s });
-  const day = 86400000;
-
-  it('calls a stale last dump stale', () => {
-    expect(body).not.toBe('');
-    const out = run({ enabled: true, hour: 4, keep: 7, lastAt: Date.now() - 3 * day, lastFile: 'standin-x.dump', stale: true, lastError: null });
-    expect(out).toContain('error-message');
-    expect(out).toMatch(/last dump of this copy/i);
-    expect(out).toMatch(/more than 36 hours ago/);
-  });
+    vm.runInNewContext(`${copyFamilyFns}\ncopyDumpHtml(info)`, { info, escapeHtml: (s: string) => s });
+  const info = (over: Record<string, unknown> = {}) => ({ family: 'copy', role: 'live copy', enabled: true, hour: 4, paused: false, lastFile: null, lastAt: null, dataAt: null, lastError: null, failingSince: null, listError: null, test: null, alerts: { dumps: null, test: null }, ...over });
 
   it('names a fresh last dump', () => {
-    const out = run({ enabled: true, hour: 4, keep: 7, lastAt: Date.now() - 3600000, lastFile: 'standin-x.dump', stale: false, lastError: null });
-    expect(out).toMatch(/last dump of this copy/i);
+    const out = run(info({ lastAt: Date.now() - 3600000, lastFile: 'copy-hourly-x.dump' }));
+    expect(out).toMatch(/last backup of this copy: copy-hourly-x\.dump/i);
     expect(out).not.toContain('error-message');
   });
 
   it('says no dump exists yet', () => {
-    expect(run({ enabled: true, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: null })).toMatch(/no dump of this copy yet/i);
+    expect(run(info())).toMatch(/no backup yet/i);
   });
 
   it('says scheduled dumps are off', () => {
-    expect(run({ enabled: false, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: null })).toMatch(/off/);
+    expect(run(info({ enabled: false }))).toMatch(/off/);
   });
 
   it('shows the last failure', () => {
-    expect(run({ enabled: true, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: 'pg_dump exited with code 1' })).toContain('pg_dump exited with code 1');
+    expect(run(info({ lastError: 'pg_dump exited with code 1' }))).toContain('pg_dump exited with code 1');
   });
 
   it('shows the last failure and an unreadable backup folder together', () => {
-    const out = run({ enabled: true, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: 'pg_dump exited with code 1', listError: 'The backup folder for a could not be read: EACCES' });
+    const out = run(info({ lastError: 'pg_dump exited with code 1', listError: 'The backup folder for a could not be read: EACCES' }));
     expect(out).toContain('pg_dump exited with code 1');
     expect(out).toContain('EACCES');
-    expect(out).not.toMatch(/no dump of this copy yet/i);
-    expect(out).toContain('The next scheduled dump runs at 04:00.');
-    const old = run({ enabled: true, hour: 4, keep: 7, lastAt: null, lastFile: null, stale: false, lastError: null, listError: 'The backup folder for a could not be read: EIO' });
-    expect(old).not.toMatch(/no dump of this copy yet|in no dump/i);
+    expect(out).not.toMatch(/no backup yet/i);
+    const old = run(info({ listError: 'The backup folder for a could not be read: EIO' }));
+    expect(old).not.toMatch(/no backup yet/i);
     expect(old).toContain('EIO');
   });
 });

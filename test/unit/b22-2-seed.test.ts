@@ -51,7 +51,8 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'volume' && args[1] === 'inspect') throw Object.assign(new Error('fail'), { stderr: 'Error: No such volume' });
     return real.execFileSync(cmd, args, opts);
   };
-  return { ...real, execFile, execFileSync, exec, spawn, default: { ...real, execFile, execFileSync, exec, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile, execFileSync, exec, spawn: heldSpawn, default: { ...real, execFile, execFileSync, exec, spawn: heldSpawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();

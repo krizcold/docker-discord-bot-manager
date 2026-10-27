@@ -60,7 +60,8 @@ vi.mock('child_process', async (importOriginal) => {
     return child;
   };
   const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  return { ...real, execFile: fencedExecFile, spawn, default: { ...real, execFile: fencedExecFile, spawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execFile: fencedExecFile, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
@@ -68,6 +69,9 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: string): string | null =>
+  fb.fleetBackupStatus(JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR as string, 'instances.json'), 'utf-8')).instances[id]).main?.lastError ?? null;
+
 import * as fleetReplication from '../../src/instance/fleetReplication';
 import { publishHostPort } from '../../src/templates/pcsProcessing';
 
@@ -182,7 +186,7 @@ describe('B06-1b: a dump error shown on the card carries no secret', () => {
     spy.mockRestore();
     fleetBackup.stopFleetBackupScheduler();
     tick();
-    await vi.waitFor(() => expect(fleetBackup.getFleetBackupError('b1')).not.toBeNull());
+    await vi.waitFor(() => expect(backupError(fleetBackup, 'b1')).not.toBeNull());
   };
 
   it('hides the database and replication passwords that pg_dump quoted', async () => {
@@ -192,7 +196,7 @@ describe('B06-1b: a dump error shown on the card carries no secret', () => {
     });
     h.dumpStderr = `pg_dump: error: connection to "${dbUrl}" failed; password ${REPL_SECRET} rejected\n`;
     await scheduledDump();
-    const text = fleetBackup.getFleetBackupError('b1')!;
+    const text = backupError(fleetBackup, 'b1')!;
     expect(text).toContain('pg_dump exited with code 1');
     expect(text).not.toContain(DB_SECRET);
     expect(text).not.toContain(REPL_SECRET);

@@ -19,7 +19,7 @@ import {
   InstanceConfig, InstanceRegistry, BotStatus, BotSourceType, DeploymentMode,
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
-  ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord,
+  ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord, BackupFamily, FleetBackupTests, FleetBackupAlert,
 } from '../types';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -251,13 +251,27 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const has = typeof inst.fleetDbReplicaSeed?.lastError === 'string' && inst.fleetDbReplicaSeed.lastError !== '';
-  if (!has && !inst.fleetRestoreError) return inst;
+  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
   const out: InstanceConfig = { ...inst };
   if (out.fleetDbReplicaSeed) out.fleetDbReplicaSeed = scrub(out.fleetDbReplicaSeed);
   if (out.fleetRestoreError) out.fleetRestoreError = { ...out.fleetRestoreError, text: redactSecrets(out.fleetRestoreError.text, secrets) };
+  if (out.fleetBackupTests) {
+    const tests: InstanceConfig['fleetBackupTests'] = {};
+    for (const [family, t] of Object.entries(out.fleetBackupTests) as Array<[BackupFamily, FleetBackupTests]>) {
+      tests[family] = t.last && typeof t.last.text === 'string' ? { ...t, last: { ...t.last, text: redactSecrets(t.last.text, secrets) } } : t;
+    }
+    out.fleetBackupTests = tests;
+  }
+  if (out.fleetBackupAlerts) {
+    const alerts: Record<string, FleetBackupAlert> = {};
+    for (const [key, a] of Object.entries(out.fleetBackupAlerts)) {
+      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}) };
+    }
+    out.fleetBackupAlerts = alerts;
+  }
   return out;
 }
 
@@ -604,7 +618,7 @@ export function updateInstanceAutoUpdate(botId: string, autoUpdate: boolean, aut
 }
 
 /**
- * Update the sidecar backup schedule (enabled / hour / keep).
+ * Update the backup schedule (enabled / hour).
  */
 export function updateInstanceFleetBackup(
   botId: string,
@@ -615,7 +629,7 @@ export function updateInstanceFleetBackup(
   const instance = registry.instances[botId];
   if (!instance) return { instance: null };
 
-  const current = instance.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+  const current = { enabled: instance.fleetBackup?.enabled ?? true, hour: instance.fleetBackup?.hour ?? 4 };
   if (expected) {
     for (const k of Object.keys(expected) as Array<keyof FleetBackupConfig>) {
       if (expected[k] !== undefined && expected[k] !== current[k]) return { instance, conflict: { ...current } };
@@ -624,7 +638,6 @@ export function updateInstanceFleetBackup(
   instance.fleetBackup = {
     enabled: changes.enabled !== undefined ? changes.enabled : current.enabled,
     hour: changes.hour !== undefined ? changes.hour : current.hour,
-    keep: changes.keep !== undefined ? changes.keep : current.keep,
   };
   instance.updatedAt = new Date().toISOString();
   registry.instances[botId] = instance;
@@ -762,6 +775,48 @@ export function updateInstanceFleetRestoreError(botId: string, notice: { file: s
   if (notice) instance.fleetRestoreError = notice;
   else delete instance.fleetRestoreError;
   instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** Set or clear one family's test restore record. Throws when the registry cannot be saved. */
+export function updateInstanceFleetBackupTest(botId: string, family: BackupFamily, tests: FleetBackupTests | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!tests && !instance.fleetBackupTests?.[family]) return;
+  const all = { ...(instance.fleetBackupTests ?? {}) };
+  if (tests) all[family] = tests;
+  else delete all[family];
+  if (Object.keys(all).length > 0) instance.fleetBackupTests = all;
+  else delete instance.fleetBackupTests;
+  saveRegistry(registry);
+}
+
+/** Set or clear when the scheduler first found a family to back up. Throws when the registry cannot be saved. */
+export function updateInstanceFleetBackupStart(botId: string, family: BackupFamily, at: number | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if ((instance.fleetBackupStarts?.[family] ?? null) === at) return;
+  const all = { ...(instance.fleetBackupStarts ?? {}) };
+  if (at !== null) all[family] = at;
+  else delete all[family];
+  if (Object.keys(all).length > 0) instance.fleetBackupStarts = all;
+  else delete instance.fleetBackupStarts;
+  saveRegistry(registry);
+}
+
+/** Set or clear one backup alert, keyed <family>:<dumps|test>. Throws when the registry cannot be saved. */
+export function updateInstanceFleetBackupAlert(botId: string, key: string, alert: FleetBackupAlert | null): void {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!alert && !instance.fleetBackupAlerts?.[key]) return;
+  const all = { ...(instance.fleetBackupAlerts ?? {}) };
+  if (alert) all[key] = alert;
+  else delete all[key];
+  if (Object.keys(all).length > 0) instance.fleetBackupAlerts = all;
+  else delete instance.fleetBackupAlerts;
   saveRegistry(registry);
 }
 
@@ -1142,18 +1197,6 @@ export function releaseFleetDbFromLane(botId: string): LaneResult {
   } catch (err) {
     return { success: false, error: `the database service could not be put back into the deployed compose (the compose as it was is kept at ${heldPath}): ${err instanceof Error ? err.message : String(err)}` };
   }
-}
-
-/**
- * Persist the timestamp of the last successful sidecar dump (survives restarts,
- * drives the stale-backup badge).
- */
-export function setLastFleetBackupAt(botId: string, at: number): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  instance.lastFleetBackupAt = at;
-  saveRegistry(registry);
 }
 
 /**

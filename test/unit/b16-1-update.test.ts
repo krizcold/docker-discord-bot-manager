@@ -70,7 +70,8 @@ vi.mock('child_process', async (importOriginal) => {
     }
     return (real.execFile as any)(cmd, args, opts, cb);
   };
-  return { ...real, execSync, execFile, spawn, spawnSync };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  return { ...real, execSync, execFile, spawn: heldSpawn, spawnSync };
 });
 
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';

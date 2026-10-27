@@ -196,6 +196,7 @@ describe("NM1 L5: reseedStalePrimary's identity read", () => {
   const rest = (args: string[]): Answer => {
     const sql = args.join(' ');
     if (args[0] === 'volume' && args[1] === 'inspect') return String(args[args.length - 1]).endsWith('-replica-data') ? { stderr: 'Error: No such volume' } : '[]';
+    if (args[1] === '-i' && args.includes('psql') && args.includes('-X')) return 'snap|00000003-1|f|1000|-1\nend|\n';
     if (args.includes('pg_dump')) return 'dump';
     if (args.includes('SELECT pg_is_in_recovery()')) return 'f\n';
     if (args.includes('IDENTIFY_SYSTEM')) return '9009|3|0/3000000|\n';

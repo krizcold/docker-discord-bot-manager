@@ -1,13 +1,14 @@
 /**
  * Fleet Postgres Sidecar Backup Scheduler
  *
- * Runs on a 1-minute tick. Daily pg_dump of manager-provisioned fleet Postgres
- * sidecars ONLY: an instance is in scope when it carries a fleetDb record AND
- * its stored database URL (under the capability record's key) still points at
- * that sidecar container. External databases are never dumped.
- *
- * Dumps stream to <DATA_DIR>/backups/<botId>/fleet-postgres/<ISO>.dump with a
- * keep-newest retention trim (pre-*.dump safety files are exempt). Restore
+ * Runs on a 1-minute tick. Hourly pg_dump of every database the manager holds
+ * for a bot: the main's sidecar (in scope while its stored database URL, under
+ * the capability record's key, still points at that sidecar) and the live copy.
+ * External databases are never dumped. Each dump runs in a snapshot whose table
+ * counts are written beside it as <dump>.json; hourly dumps are kept 48 hours
+ * and daily ones 30 days, and the newest dump is test-restored daily
+ * (backupCheck). Dumps live in <DATA_DIR>/backups/<botId>/fleet-postgres/;
+ * pre-*.dump safety files are never trimmed. Restore
  * order: courtesy stop of the managed instances this manager can see on the
  * URL, sidecar brought back alone (it is a service of the instance's own
  * compose project, so stopping the host takes it down too), WRITE FENCE
@@ -26,7 +27,12 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
-import { InstanceConfig, FleetBackupConfig } from '../types';
+import { InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord } from '../types';
+import {
+  ALERT_AFTER_MS, backupDir, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
+  ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
+} from './backupFiles';
+import * as backupCheck from './backupCheck';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
 import * as fleetReplica from './fleetReplica';
 import * as dbLogin from './dbLogin';
@@ -35,25 +41,51 @@ import { REPLICATION_ROLE } from './fleetReplication';
 import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
-const REFIRE_GUARD_MS = 23 * 60 * 60 * 1000; // prevents double-fire within the hour window
 const DUMP_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 /** A docker read (inspect, a SELECT or SHOW): a hung CLI must not hold its lane; a timed-out read is unknown. */
 const READ_TIMEOUT_MS = 30_000;
-const STALE_AFTER_MS = 36 * 60 * 60 * 1000;
+/**
+ * The dump's bounds: its snapshot and counts, pg_dump itself, the snapshot session's exit after COMMIT, and the time
+ * after which a recovery conflict starts no new attempt.
+ */
+export const dumpTiming = { snapshotTimeoutMs: 5 * 60_000, dumpTimeoutMs: DUMP_TIMEOUT_MS, holderExitMs: 10_000, conflictBudgetMs: 10 * 60_000 };
+const CONFLICT_ATTEMPTS = 3;
+const MIN_FREE_BYTES = 512 * 1024 * 1024;
+const GIB = 1024 * 1024 * 1024;
 
 const DATA_DIR = process.env.DATA_DIR || '/data/data';
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
 let tickRunning = false;
+let schedulerStartedAt = 0;
+// Each tick's dump loop starts one bot further on, so a slow bot does not cost the same later bots their slot.
+let dumpRotation = 0;
+// Orphan throwaways from before a restart; the first test waits for their removal.
+let orphansRemoved: Promise<void> = Promise.resolve();
+// The one test restore running, outside the tick; dbBytes sizes the disk it holds.
+let runningTest: { botId: string; family: BackupFamily; file: string; dbBytes: number } | null = null;
 
-// Last dump attempt per instance (in-memory; persisted success lives on the record)
-const lastAttempts: Map<string, number> = new Map();
-// Last dump error per instance (in-memory, surfaced on the bot card)
+export function isTickRunning(): boolean {
+  return tickRunning;
+}
+
+export function isTestRunning(): boolean {
+  return runningTest !== null;
+}
+
+const familyKey = (botId: string, family: BackupFamily) => `${botId}:${family}`;
+// The last dump error of each family (in memory; the dumps alert is the record that survives a restart).
 const lastErrors: Map<string, string> = new Map();
-// A standby copy is dumped under this prefix, whether or not it is in recovery.
-const COPY_PREFIX = 'standin-';
-const lastCopyAttempts: Map<string, number> = new Map();
-const copyErrors: Map<string, string> = new Map();
+// The hour slot each family's scheduled dump was last attempted in.
+const attemptedSlots: Map<string, number> = new Map();
+// When a tick last found the family's database stopped.
+const pausedAt: Map<string, number> = new Map();
+const pausedNow: Set<string> = new Set();
+// Family starts the registry refused, and the hour slot their refusal was last logged in.
+const unsavedStarts: Map<string, number | null> = new Map();
+const startLoggedSlots: Map<string, number> = new Map();
+// dataAt of copy dumps, by file name, read once from their counts files.
+const dataAtCache: Map<string, number | null> = new Map();
 /** docker's stderr can quote a DSN or a password, so a stored error text carries the instance's secrets as ***. */
 function scrubbed(botId: string, text: string): string {
   const instance = containerManager.getBot(botId);
@@ -76,9 +108,6 @@ function clearStuck(botId: string, containerName: string): void {
   if (entries.size === 0) fenceStuck.delete(botId);
 }
 const isStuck = (botId: string, containerName: string) => fenceStuck.get(botId)?.has(containerName) === true;
-export function getFleetBackupError(botId: string): string | null {
-  return lastErrors.get(botId) || null;
-}
 
 /** The last failed restore's notice; only a successful restore or a dismiss clears it. */
 export function getFleetRestoreError(botId: string): string | null {
@@ -153,12 +182,9 @@ export function databaseLaneBlocker(): string | null {
   return null;
 }
 
-/**
- * Effective schedule for an instance; absent config means the defaults for
- * instances that have a fleetDb record.
- */
+/** Effective schedule for an instance; absent config means the defaults. */
 export function effectiveFleetBackup(instance: InstanceConfig): FleetBackupConfig {
-  return instance.fleetBackup || { enabled: true, hour: 4, keep: 7 };
+  return { enabled: instance.fleetBackup?.enabled ?? true, hour: instance.fleetBackup?.hour ?? 4 };
 }
 
 /**
@@ -201,27 +227,6 @@ export function fleetBackupScopeState(instance: InstanceConfig): boolean | null 
   return isFleetBackupScoped(instance);
 }
 
-/**
- * Stale when enabled + in scope and no successful dump within 36h. A never-
- * dumped instance is measured from its creation so a fresh install does not
- * warn before its first scheduled run.
- */
-export function isFleetBackupStale(instance: InstanceConfig): boolean {
-  if (!effectiveFleetBackup(instance).enabled) return false;
-  if (!instance.fleetDb) return false;
-  // A broken store cannot verify scope, and the dumps HAVE stopped - which is
-  // exactly what this badge exists to surface; only a readable store that
-  // genuinely reads out of scope suppresses it. Restart-proof, unlike the
-  // tick's in-memory error entry.
-  const { corrupt, urlUndecryptable } = backupScopeUnverifiable(instance);
-  if (!corrupt && !urlUndecryptable && !isFleetBackupScoped(instance)) return false;
-  const baseline = instance.lastFleetBackupAt || Date.parse(instance.createdAt) || 0;
-  return Date.now() - baseline > STALE_AFTER_MS;
-}
-
-function backupDir(botId: string): string {
-  return path.join(DATA_DIR, 'backups', botId, 'fleet-postgres');
-}
 
 /**
  * The highest control term this lane ever observed live, persisted so a retry
@@ -833,27 +838,53 @@ async function reprobeStuckFences(): Promise<void> {
   }
 }
 
-/**
- * List dump files for an instance, newest first.
- */
-export function listFleetBackups(botId: string): Array<{ file: string; size: number; mtime: number }> {
-  const dir = backupDir(botId);
-  let names: string[];
+export type BackupEntry = {
+  file: string; size: number; mtime: number; kind: DumpKind; family: BackupFamily; takenAt: number;
+  tables: number | null; rows: number | null; dataAt: number | null; test: 'passed' | 'failed' | null;
+};
+
+/** The names in an instance's backup folder; none when it does not exist. Throws when it cannot be read. */
+function readFolder(botId: string): string[] {
   try {
-    names = fs.readdirSync(dir);
+    return fs.readdirSync(backupDir(botId));
   } catch (err: any) {
     if (err?.code === 'ENOENT') return [];
     throw new Error(`The backup folder for ${botId} could not be read: ${err?.message || err}`);
   }
-  const out: Array<{ file: string; size: number; mtime: number }> = [];
+}
+
+function readMeta(botId: string, file: string): DumpMeta | null {
+  try {
+    const checked = validateDumpMeta(JSON.parse(fs.readFileSync(path.join(backupDir(botId), `${file}.json`), 'utf-8')));
+    return checked.ok && checked.meta.file === file ? checked.meta : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List dump files for an instance, newest first, with what each one's counts file records and its test verdict.
+ */
+export function listFleetBackups(botId: string): BackupEntry[] {
+  const names = readFolder(botId);
+  const instance = containerManager.getBot(botId);
+  const out: BackupEntry[] = [];
   for (const name of names) {
     if (!name.endsWith('.dump')) continue;
+    let st: fs.Stats;
     try {
-      const st = fs.statSync(path.join(dir, name));
-      out.push({ file: name, size: st.size, mtime: st.mtimeMs });
-    } catch { /* raced deletion */ }
+      st = fs.statSync(path.join(backupDir(botId), name));
+    } catch { continue; /* raced deletion */ }
+    const parsed = parseDumpName(name);
+    const meta = readMeta(botId, name);
+    const last = instance ? backupCheck.currentTests(instance, parsed.family).last : undefined;
+    const test = last?.file === name && (last.result === 'passed' || last.result === 'failed') ? last.result : null;
+    out.push({
+      file: name, size: st.size, mtime: st.mtimeMs, kind: parsed.kind, family: parsed.family, takenAt: meta?.takenAt ?? parsed.stamp ?? st.mtimeMs,
+      tables: meta?.tables ?? null, rows: meta?.rows ?? null, dataAt: meta?.dataAt ?? null, test,
+    });
   }
-  return out.sort((a, b) => b.mtime - a.mtime);
+  return out.sort((a, b) => b.takenAt - a.takenAt);
 }
 
 /**
@@ -880,51 +911,34 @@ export function orphanedFleetBackups(knownIds: ReadonlySet<string>): Array<{ id:
   return out;
 }
 
-export function isValidFleetBackupKeep(keep: unknown): keep is number {
-  return typeof keep === 'number' && Number.isInteger(keep) && keep >= 1 && keep <= 365;
-}
-
 /**
- * Keep the newest `keep` dumps; every pre-*.dump safety file is exempt
- * (pre-restore-, pre-reseed-, pre-rescue-, pre-decommission-): each one is
- * some destructive lane's recovery copy and must never age out under it.
- * So is the dump a failed restore targeted, while its notice stands, and the
- * dump just written. When any dump is dated in the future (a clock step
- * back), every dump is kept. The keep
- * is the larger of the tick's and the one stored now, so a Keep raised during
- * the dump holds. The primary's dumps and the copy's standin- dumps are
- * trimmed apart, each to the newest `keep` of its own.
+ * Deletes the family's dumps past their keep, each .dump before its .json. Kept: the family's newest, the last dump
+ * that passed a test restore, the dump just written, the dump a failed restore names (backupFiles.trimVictims) and
+ * the dump a running test restore reads.
  */
-function trimFleetBackups(botId: string, tickKeep: number, justWritten: string, family: '' | typeof COPY_PREFIX = ''): void {
-  const dir = backupDir(botId);
-  let trimmable: Array<{ file: string }>;
-  let keep: number;
+function trimFamily(instance: InstanceConfig, family: BackupFamily, justWritten: string | null): void {
+  const label = backupCheck.familyText(instance, family);
+  let names: string[];
   try {
-    const stored = containerManager.getBot(botId);
-    const storedKeep = stored ? effectiveFleetBackup(stored).keep : undefined;
-    if (!isValidFleetBackupKeep(tickKeep) || !isValidFleetBackupKeep(storedKeep)) {
-      console.warn(`[FleetBackup] Kept every dump for ${botId}: Keep (${tickKeep} at the tick, ${storedKeep} stored now) is not a whole number from 1 to 365`);
-      return;
-    }
-    keep = Math.max(tickKeep, storedKeep);
-    if (storedKeep !== tickKeep) console.log(`[FleetBackup] Keep for ${botId} changed during the dump (${tickKeep} to ${storedKeep}); kept the newest ${keep}`);
-    const target = restoreNotice(botId)?.file;
-    const all = listFleetBackups(botId);
-    if (all.some(f => f.mtime > Date.now() + 5 * 60000)) {
-      console.warn(`[FleetBackup] Kept every dump for ${botId}: a dump is dated in the future, so the clock may have stepped back`);
-      return;
-    }
-    trimmable = all.filter(f => !f.file.startsWith('pre-') && f.file.startsWith(COPY_PREFIX) === (family === COPY_PREFIX)
-      && f.file !== target && f.file !== justWritten);
+    names = readFolder(instance.id);
   } catch (err) {
-    console.warn(`[FleetBackup] Kept every dump for ${botId}: ${err}`);
+    console.warn(`[FleetBackup] Kept every backup of ${label}: ${err instanceof Error ? err.message : err}`);
     return;
   }
-  for (const f of trimmable.slice(keep - 1)) {
+  const testing = runningTest?.botId === instance.id ? runningTest.file : null;
+  const protect = [backupCheck.currentTests(instance, family).lastGood, justWritten, restoreNotice(instance.id)?.file, testing];
+  const { victims, clockAhead } = trimVictims(names, family, Date.now(), protect);
+  if (clockAhead) {
+    console.warn(`[FleetBackup] Kept every backup of ${label}: a backup is dated ahead of the clock, so the clock may have stepped back`);
+    return;
+  }
+  const dir = backupDir(instance.id);
+  for (const file of victims) {
     try {
-      fs.unlinkSync(path.join(dir, f.file));
+      fs.unlinkSync(path.join(dir, file));
+      fs.rmSync(path.join(dir, `${file}.json`), { force: true });
     } catch (err) {
-      console.warn(`[FleetBackup] Failed to trim ${f.file} for ${botId}:`, err);
+      console.warn(`[FleetBackup] Failed to trim ${file} of ${label}:`, err);
     }
   }
 }
@@ -939,10 +953,12 @@ function syncPath(target: string, flags: 'r' | 'r+'): void {
   }
 }
 
+type DumpTarget = { containerName: string; user: string; db: string };
+type DumpResult = { success: boolean; file?: string; error?: string; meta?: DumpMeta; conflict?: boolean };
+
 /**
- * One pg_dump of the instance's sidecar, streamed to a .tmp, synced to disk, then renamed.
- * `prefix` names safety dumps (pre-restore-). Skips when the container is not
- * running (scheduler) / fails hard for callers that need the dump.
+ * One pg_dump of the instance's sidecar into a safety dump named `prefix` and the time (pre-restore-, pre-reseed-,
+ * pre-decommission-), with its counts file. Fails when the container is not running.
  */
 export async function runFleetDump(
   instance: InstanceConfig,
@@ -950,202 +966,510 @@ export async function runFleetDump(
 ): Promise<{ success: boolean; file?: string; error?: string }> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'No fleet database record' };
-  return dumpDatabase(instance.id, fleetDb, prefix);
+  const at = Date.now();
+  const kind: DumpKind = prefix.startsWith('pre-') ? 'safety' : 'other';
+  const result = await dumpDatabase(instance, fleetDb, `${prefix}${stampOf(at)}.dump`, 'main', kind, at);
+  return { success: result.success, ...(result.file ? { file: result.file } : {}), ...(result.error !== undefined ? { error: result.error } : {}) };
 }
 
-async function dumpDatabase(
-  botId: string,
-  fleetDb: { containerName: string; user: string; db: string },
-  prefix: string
-): Promise<{ success: boolean; file?: string; error?: string }> {
-  const dbState = await containerState(fleetDb.containerName);
+const MIB = 1024 * 1024;
+
+/**
+ * D-DISK when the folder's disk has less free than max(512 MiB, twice the family's newest dump), plus what a running
+ * test restore holds (twice its database's size and 1 GiB); a statfs error lets the dump go ahead.
+ */
+function diskRefusal(botId: string, family: BackupFamily, dir: string): string | null {
+  let free: number;
+  try {
+    const st = fs.statfsSync(dir);
+    free = Number(st.bavail) * Number(st.bsize);
+  } catch (err) {
+    console.warn(`[FleetBackup] The free space under ${dir} could not be read (${err}); the dump goes ahead`);
+    return null;
+  }
+  let newest = 0;
+  try {
+    const last = newestScheduled(readFolder(botId), family);
+    if (last) newest = fs.statSync(path.join(dir, last.file)).size;
+  } catch { /* no size known: the floor applies */ }
+  const held = runningTest ? 2 * runningTest.dbBytes + GIB : 0;
+  const need = Math.max(MIN_FREE_BYTES, 2 * newest) + held;
+  if (free >= need) return null;
+  const testing = held ? `, of which ${Math.ceil(held / MIB)} MB is held for the test restore that is running` : '';
+  return `only ${Math.floor(free / MIB)} MB is free under ${DATA_DIR}, and a dump needs about ${Math.ceil(need / MIB)} MB${testing}; free space there (backups past their 48-hour or 30-day keep are deleted after each hourly run)`;
+}
+
+/**
+ * Dumps one database with its counts. A live copy whose replay cancels the dump is tried again at once, up to three
+ * attempts in all, and no new attempt starts once the run has taken 10 minutes.
+ */
+async function dumpDatabase(instance: InstanceConfig, target: DumpTarget, fileName: string, family: BackupFamily, kind: DumpKind, at: number): Promise<DumpResult> {
+  const dbState = await containerState(target.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running') };
   }
-
-  const dir = backupDir(botId);
+  const dir = backupDir(instance.id);
   ensurePrivateDir(dir);
+  const disk = diskRefusal(instance.id, family, dir);
+  if (disk) return { success: false, error: disk };
+  const label = backupCheck.familyText(instance, family);
+  const runStart = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    const last = await dbLogin.asManager({ container: target.containerName, user: target.user },
+      role => dumpOnce(target, role, dir, fileName, { family, kind, at, label }), r => !r.success && dbLogin.isMissingManagerRole(r.error ?? ''));
+    if (last.success || !last.conflict) return last;
+    if (attempt >= CONFLICT_ATTEMPTS) {
+      return { success: false, error: "the live copy's replay cancelled the dump 3 times in a row (conflict with recovery); the next hourly run tries again" };
+    }
+    if (Date.now() - runStart >= dumpTiming.conflictBudgetMs) {
+      const times = attempt === 1 ? 'once' : `${attempt} times in a row`;
+      return { success: false, error: `the live copy's replay cancelled the dump ${times} (conflict with recovery), and no new attempt starts once a run has taken 10 minutes; the next hourly run tries again` };
+    }
+  }
+}
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const fileName = `${prefix}${stamp}.dump`;
+/**
+ * The holder (a psql session) exports a snapshot in a read-only repeatable-read transaction and prints the table
+ * counts it sees; pg_dump then dumps that same snapshot, so the counts describe the dump. The dump and its counts
+ * file go through synced temp files and renames, the counts file first; the holder commits once the dump is written.
+ */
+function dumpOnce(target: DumpTarget, role: string, dir: string, fileName: string, about: { family: BackupFamily; kind: DumpKind; at: number; label: string }): Promise<DumpResult> {
   const finalPath = path.join(dir, fileName);
   const tmpPath = `${finalPath}.tmp`;
-
-  const dumpAs = (role: string) => new Promise<{ success: boolean; file?: string; error?: string }>(resolve => {
-    const child = spawn('docker', dbLogin.withRole(['exec', fleetDb.containerName, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', fleetDb.db], role));
-    const out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
-    let stderr = '';
-    let killed = false;
+  const metaPath = `${finalPath}.json`;
+  const metaTmp = `${metaPath}.tmp`;
+  return new Promise<DumpResult>(resolve => {
     let settled = false;
+    let holderOut = '';
+    let holderErr = '';
+    let dumpErr = '';
+    let holderClosed = false;
+    let onHolderClose: (() => void) | null = null;
+    let snapshot: { id: string; inRecovery: boolean; dbBytes: number; dataAt: number | null; counts: Record<string, number> } | null = null;
+    let dump: ReturnType<typeof spawn> | null = null;
+    let out: fs.WriteStream | null = null;
+    let dumpTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const timer = setTimeout(() => {
-      killed = true;
-      child.kill('SIGKILL');
-    }, DUMP_TIMEOUT_MS);
-
+    let holder: ReturnType<typeof spawn>;
+    try {
+      holder = spawn('docker', dbLogin.withRole(['exec', '-i', target.containerName, 'psql', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', MANAGER_DB_ROLE, '-d', target.db], role));
+    } catch (err: any) {
+      return resolve({ success: false, error: `Failed to run docker exec: ${err?.message || err}` });
+    }
     const fail = (error: string) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(snapTimer);
+      if (dumpTimer) clearTimeout(dumpTimer);
+      holder.kill('SIGKILL');
+      dump?.kill('SIGKILL');
+      for (const f of [tmpPath, metaTmp]) {
+        try { fs.unlinkSync(f); } catch { /* already gone */ }
+      }
+      const conflict = isRecoveryConflict(holderErr) || isRecoveryConflict(dumpErr);
+      const result: DumpResult = { success: false, error, ...(conflict ? { conflict } : {}) };
+      // A stream still open can create its file after the unlink above, and the next attempt reuses the name.
+      if (!out || out.closed) return resolve(result);
+      out.once('close', () => {
+        try { fs.unlinkSync(tmpPath); } catch { /* already gone */ }
+        resolve(result);
+      });
       out.destroy();
-      try { fs.unlinkSync(tmpPath); } catch { /* already gone */ }
-      resolve({ success: false, error });
+    };
+    const snapTimer = setTimeout(() => fail('the database did not return its table counts within 5 minutes, so no dump was taken'), dumpTiming.snapshotTimeoutMs);
+    const snapFailed = (detail: string) => fail(`the dump's snapshot and table counts could not be taken (${detail})`);
+
+    const finish = () => {
+      if (settled) return;
+      if (dumpTimer) clearTimeout(dumpTimer);
+      holder.stdin?.end('COMMIT;\n');
+      const snap = snapshot!;
+      const rows = Object.values(snap.counts).reduce((a, b) => a + b, 0);
+      const meta: DumpMeta = {
+        file: fileName, takenAt: about.at, family: about.family, kind: about.kind, inRecovery: snap.inRecovery, dataAt: snap.dataAt,
+        dbBytes: snap.dbBytes, tables: Object.keys(snap.counts).length, rows, counts: snap.counts,
+      };
+      try {
+        syncPath(tmpPath, 'r+');
+      } catch (err) {
+        return fail(`Failed to finalize dump file: ${err}`);
+      }
+      try {
+        fs.writeFileSync(metaTmp, JSON.stringify(meta), { mode: PRIVATE_FILE_MODE });
+        syncPath(metaTmp, 'r+');
+        fs.renameSync(metaTmp, metaPath);
+      } catch (err: any) {
+        return fail(`the dump finished, but its counts file could not be written (${err?.message || err}), so the dump was not kept`);
+      }
+      try {
+        fs.renameSync(tmpPath, finalPath);
+      } catch (err) {
+        try { fs.unlinkSync(metaPath); } catch { /* best effort */ }
+        return fail(`Failed to finalize dump file: ${err}`);
+      }
+      settled = true;
+      let result: DumpResult = { success: true, file: fileName, meta };
+      try {
+        syncPath(dir, 'r');
+      } catch (err) {
+        // Windows cannot open a folder to sync it; NTFS journals the rename itself.
+        if (process.platform !== 'win32') result = { success: false, error: `The dump ${fileName} was written, but its folder could not be synced to disk, so a crash could still lose it: ${err}` };
+      }
+      if (holderClosed) return resolve(result);
+      // A late holder does not fail a complete dump; its session also ends on the idle timeout it set.
+      const late = setTimeout(() => {
+        holder.kill('SIGKILL');
+        console.warn(`[FleetBackup] The snapshot session of ${about.label} did not end 10 s after the dump; it was stopped, and the dump ${fileName} is complete`);
+        resolve(result);
+      }, dumpTiming.holderExitMs);
+      onHolderClose = () => { clearTimeout(late); resolve(result); };
     };
 
-    child.stdout.pipe(out);
-    child.stderr.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
-    child.on('error', err => fail(`Failed to run docker exec: ${err.message}`));
-    out.on('error', err => {
-      child.kill('SIGKILL');
-      fail(`Failed to write dump file: ${err.message}`);
-    });
-
-    child.on('close', code => {
-      if (settled) return;
-      if (killed) return fail(`Dump timed out after ${DUMP_TIMEOUT_MS / 60000} minutes`);
-      if (code !== 0) return fail(`pg_dump exited with code ${code}: ${stderr.trim().slice(0, 500)}`);
-      out.end(() => {
+    const startDump = () => {
+      const snap = snapshot!;
+      try {
+        dump = spawn('docker', dbLogin.withRole(['exec', target.containerName, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', `--snapshot=${snap.id}`, target.db], role));
+      } catch (err: any) {
+        return fail(`Failed to run docker exec: ${err?.message || err}`);
+      }
+      out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
+      let killed = false;
+      dumpTimer = setTimeout(() => { killed = true; dump?.kill('SIGKILL'); }, dumpTiming.dumpTimeoutMs);
+      // A spawn that fails early (EMFILE) has no stdio, and its 'error' follows.
+      dump.stdout?.pipe(out);
+      dump.stderr?.on('data', d => { if (dumpErr.length < STDERR_KEEP) dumpErr += d.toString(); });
+      dump.on('error', err => fail(`Failed to run docker exec: ${err.message}`));
+      out.on('error', err => fail(`Failed to write dump file: ${err.message}`));
+      dump.on('close', code => {
         if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        try {
-          syncPath(tmpPath, 'r+');
-          fs.renameSync(tmpPath, finalPath);
-        } catch (err) {
-          try { fs.unlinkSync(tmpPath); } catch { /* best effort */ }
-          resolve({ success: false, error: `Failed to finalize dump file: ${err}` });
-          return;
-        }
-        try {
-          syncPath(dir, 'r');
-        } catch (err) {
-          // Windows cannot open a folder to sync it; NTFS journals the rename itself.
-          if (process.platform !== 'win32') {
-            resolve({ success: false, error: `The dump ${fileName} was written, but its folder could not be synced to disk, so a crash could still lose it: ${err}` });
-            return;
-          }
-        }
-        resolve({ success: true, file: fileName });
+        if (killed) return fail(`Dump timed out after ${DUMP_TIMEOUT_MS / 60000} minutes`);
+        if (code !== 0) return fail(`pg_dump exited with code ${code}: ${dumpErr.trim().slice(0, 500)}`);
+        out!.end(finish);
       });
+    };
+
+    const onCounts = () => {
+      const line = holderOut.split('\n').map(l => l.trim()).find(l => l.startsWith('snap|')) ?? '';
+      const m = /^snap\|([^|]+)\|([tf])\|(\d+)\|(-?\d+)$/.exec(line);
+      if (!m) return snapFailed(`the snapshot line read back as ${line.slice(0, 200) || 'nothing'}`);
+      const parsed = parseCountLines(holderOut);
+      if (!parsed.ok) return snapFailed(parsed.error);
+      clearTimeout(snapTimer);
+      snapshot = { id: m[1], inRecovery: m[2] === 't', dbBytes: Number(m[3]), dataAt: Number(m[4]) < 0 ? null : Number(m[4]), counts: parsed.counts };
+      startDump();
+    };
+
+    holder.on('error', err => fail(`Failed to run docker exec: ${err.message}`));
+    holder.stdin?.on('error', () => { /* EPIPE when the session ended first; close answers */ });
+    holder.stderr?.on('data', d => { if (holderErr.length < STDERR_KEEP) holderErr += d.toString(); });
+    holder.stdout?.on('data', d => {
+      holderOut += d.toString();
+      if (snapshot === null && !settled && /(^|\n)end\|/.test(holderOut)) onCounts();
     });
+    holder.on('close', () => {
+      holderClosed = true;
+      onHolderClose?.();
+      if (snapshot === null && !settled) snapFailed(errorLine(holderErr) || 'the session ended before its counts');
+    });
+    holder.stdin?.write(holderStdin(DUMP_TIMEOUT_MS / 1000 + 120));
   });
-  return dbLogin.asManager({ container: fleetDb.containerName, user: fleetDb.user }, dumpAs, r => !r.success && dbLogin.isMissingManagerRole(r.error ?? ''));
 }
 
-async function runScheduledDump(instance: InstanceConfig): Promise<void> {
-  busy.add(instance.id);
-  try {
-    const result = await runFleetDump(instance);
-    if (result.success) {
-      lastErrors.delete(instance.id);
-      containerManager.setLastFleetBackupAt(instance.id, Date.now());
-      trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!);
-      console.log(`[FleetBackup] Dumped ${instance.displayName} (${instance.id}) -> ${result.file}`);
-    } else {
-      const error = scrubbed(instance.id, result.error || 'unknown error');
-      lastErrors.set(instance.id, error);
-      console.error(`[FleetBackup] Dump failed for ${instance.displayName} (${instance.id}): ${error}`);
-    }
-  } finally {
-    busy.delete(instance.id);
+const FAMILIES: BackupFamily[] = ['main', 'copy'];
+
+/** What the scheduler does with a family: nothing held, held and skipped, held and failing before a dump, or dumped. */
+type FamilyPlan = { skip: 'scope' | 'seed' } | { error: string } | { target: DumpTarget };
+
+function familyPlan(instance: InstanceConfig, family: BackupFamily): FamilyPlan | null {
+  if (family === 'main') {
+    if (!instance.fleetDb) return null;
+    // A broken store cannot verify scope, and the dumps HAVE stopped: that counts as failing.
+    const scope = backupScopeUnverifiable(instance);
+    if (scope.corrupt) return { error: 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope' };
+    if (scope.urlUndecryptable) return { error: 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope' };
+    if (!isFleetBackupScoped(instance)) return { skip: 'scope' };
+    return { target: instance.fleetDb };
   }
-}
-
-/** When the newest standin- dump was written; null when there is none. Throws when the folder cannot be read. */
-function lastCopyDump(botId: string): { file: string; mtime: number } | null {
-  return listFleetBackups(botId).find(f => f.file.startsWith(COPY_PREFIX)) ?? null;
-}
-
-/** The copy's scheduled-dump state for its banner; null without a standby copy or for a cleared one, which is never dumped. */
-export function copyBackupInfo(instance: InstanceConfig): {
-  enabled: boolean; hour: number; keep: number; lastAt: number | null; lastFile: string | null; stale: boolean; lastError: string | null; listError: string | null;
-} | null {
-  if (!instance.fleetDbReplica || instance.fleetDbReplica.copyCleared) return null;
-  const config = effectiveFleetBackup(instance);
-  let last: { file: string; mtime: number } | null = null;
-  let listError: string | null = null;
-  try {
-    last = lastCopyDump(instance.id);
-  } catch (err: any) {
-    listError = `${err?.message || err}, so the last dump of this copy cannot be named`;
-  }
-  return {
-    enabled: config.enabled,
-    hour: config.hour,
-    keep: config.keep,
-    lastAt: last ? last.mtime : null,
-    lastFile: last ? last.file : null,
-    stale: !!last && Date.now() - last.mtime > STALE_AFTER_MS,
-    lastError: copyErrors.get(instance.id) ?? null,
-    listError,
-  };
-}
-
-async function runScheduledCopyDump(instance: InstanceConfig): Promise<void> {
   const rec = instance.fleetDbReplica;
-  if (!rec || rec.copyCleared) return;
+  if (!rec || rec.copyCleared) return null;
   const seed = fleetReplica.seedView(instance);
-  if (seed && seed.parked !== true) return;
-  let last = 0;
-  try { last = lastCopyDump(instance.id)?.mtime ?? 0; } catch { /* an unreadable folder fails the dump below, which reports it */ }
-  if (Date.now() - Math.max(lastCopyAttempts.get(instance.id) || 0, last) < REFIRE_GUARD_MS) return;
-  lastCopyAttempts.set(instance.id, Date.now());
-  if (!rec.user || !rec.db) {
-    copyErrors.set(instance.id, 'the standby record has no database identity, so no scheduled dump of this copy ran');
+  if (seed && seed.parked !== true) return { skip: 'seed' };
+  if (!rec.user || !rec.db) return { error: 'the standby record has no database identity, so no scheduled dump of this copy ran' };
+  return { target: { containerName: rec.containerName, user: rec.user, db: rec.db } };
+}
+
+/** The scheduled dump of one family when one is due; the seed check, the due check and the slot claim share one synchronous segment. */
+async function scheduledDump(instance: InstanceConfig, family: BackupFamily): Promise<void> {
+  if (!effectiveFleetBackup(instance).enabled) return;
+  const plan = familyPlan(instance, family);
+  if (!plan || 'skip' in plan) return;
+  const key = familyKey(instance.id, family);
+  const now = Date.now();
+  let names: string[];
+  try {
+    names = readFolder(instance.id);
+  } catch (err) {
+    lastErrors.set(key, err instanceof Error ? err.message : String(err));
     return;
   }
-  const target = { containerName: rec.containerName, user: rec.user, db: rec.db };
+  const due = dumpDue(names, family, now, effectiveFleetBackup(instance).hour, attemptedSlots.get(key));
+  if (!due) return;
+  if ('error' in plan) {
+    attemptedSlots.set(key, hourSlot(now));
+    lastErrors.set(key, plan.error);
+    console.error(`[FleetBackup] No scheduled dump of ${backupCheck.familyText(instance, family)}: ${plan.error}`);
+    return;
+  }
+  if (busy.has(instance.id) || containerManager.isShuttingDown()) return;
   busy.add(instance.id);
   try {
-    const result = await dumpDatabase(instance.id, target, COPY_PREFIX);
-    if (result.success) {
-      copyErrors.delete(instance.id);
-      trimFleetBackups(instance.id, effectiveFleetBackup(instance).keep, result.file!, COPY_PREFIX);
-      console.log(`[FleetBackup] Dumped the copy of ${instance.displayName} (${instance.id}) -> ${result.file}`);
-    } else {
-      const error = scrubbed(instance.id, result.error || 'unknown error');
-      copyErrors.set(instance.id, error);
-      console.error(`[FleetBackup] Dump of the copy failed for ${instance.displayName} (${instance.id}): ${error}`);
-    }
+    await runFamilyDump(instance, family, plan.target, due, now);
   } finally {
     busy.delete(instance.id);
   }
+}
+
+async function runFamilyDump(instance: InstanceConfig, family: BackupFamily, target: DumpTarget, due: ScheduledKind, now: number): Promise<void> {
+  const key = familyKey(instance.id, family);
+  const label = backupCheck.familyText(instance, family);
+  const state = await containerState(target.containerName);
+  if (state.running === false) {
+    pausedAt.set(key, now);
+    pausedNow.add(key);
+    return;
+  }
+  pausedNow.delete(key);
+  attemptedSlots.set(key, hourSlot(now));
+  let written: string | null = null;
+  const result = state.running === null
+    ? { success: false, error: dbDownText(state, '') }
+    : await dumpDatabase(instance, target, dumpFileName(family, due, now), family, due, now);
+  if (result.success && result.file) {
+    written = result.file;
+    lastErrors.delete(key);
+    if ('meta' in result && result.meta) dataAtCache.set(result.file, result.meta.dataAt);
+    console.log(`[FleetBackup] Dumped ${label} -> ${result.file}`);
+  } else {
+    const error = scrubbed(instance.id, result.error || 'unknown error');
+    lastErrors.set(key, error);
+    console.error(`[FleetBackup] Dump of ${label} failed: ${error}`);
+  }
+  // The trim runs after a failed attempt too, so a disk filled by aging dumps frees itself; it waits while backups are off.
+  const fresh = containerManager.getBot(instance.id);
+  if (fresh && effectiveFleetBackup(fresh).enabled) trimFamily(fresh, family, written);
+}
+
+/** The newest scheduled dump of the family when its daily test restore is due; null when none is. */
+function dueTestFile(instance: InstanceConfig, family: BackupFamily): string | null {
+  const config = effectiveFleetBackup(instance);
+  if (!config.enabled) return null;
+  const plan = familyPlan(instance, family);
+  if (!plan || !('target' in plan)) return null;
+  const now = Date.now();
+  if (backupCheck.testSkippedThisSlot(instance.id, family, now)) return null;
+  if (!testDue(backupCheck.currentTests(instance, family).last, now, config.hour)) return null;
+  let names: string[];
+  try { names = readFolder(instance.id); } catch { return null; }
+  return newestScheduled(names, family)?.file ?? null;
+}
+
+/** Starts the first due test restore, not awaited, unless one is running: the test lane runs one at a time. */
+function startOneTest(ids: string[]): void {
+  if (runningTest || containerManager.isShuttingDown()) return;
+  for (const id of ids) {
+    for (const family of FAMILIES) {
+      const instance = containerManager.getBot(id);
+      const file = instance ? dueTestFile(instance, family) : null;
+      if (!instance || !file) continue;
+      runningTest = { botId: id, family, file, dbBytes: readMeta(id, file)?.dbBytes ?? 0 };
+      backupCheck.runTestRestore(instance, family, file)
+        .catch(err => console.error(`[FleetBackup] The test restore of ${backupCheck.familyText(instance, family)} stopped on an error:`, err))
+        .finally(() => { runningTest = null; });
+      return;
+    }
+  }
+}
+
+function familyStart(instance: InstanceConfig, family: BackupFamily): number | null {
+  const key = familyKey(instance.id, family);
+  return unsavedStarts.has(key) ? unsavedStarts.get(key)! : instance.fleetBackupStarts?.[family] ?? null;
+}
+
+/**
+ * Saves when the scheduler first found the family to back up (a plan neither null nor skipped), and clears it when the
+ * family's plan goes null or its backups are off (the caller passes null then); the start it now holds.
+ */
+function trackStart(instance: InstanceConfig, family: BackupFamily, plan: FamilyPlan | null, now: number): number | null {
+  const key = familyKey(instance.id, family);
+  const held = familyStart(instance, family);
+  const want = !plan ? null : 'skip' in plan ? held : held ?? now;
+  if (want === (instance.fleetBackupStarts?.[family] ?? null)) {
+    unsavedStarts.delete(key);
+    return want;
+  }
+  try {
+    containerManager.updateInstanceFleetBackupStart(instance.id, family, want);
+    unsavedStarts.delete(key);
+  } catch (err) {
+    unsavedStarts.set(key, want);
+    if (startLoggedSlots.get(key) !== hourSlot(now)) {
+      startLoggedSlots.set(key, hourSlot(now));
+      const what = instance.fleetBackupStarts?.[family] == null
+        ? `No start of the backups of ${backupCheck.familyText(instance, family)} is stored yet`
+        : `The registry still holds the old start of the backups of ${backupCheck.familyText(instance, family)}`;
+      console.error(`[FleetBackup] ${what}: ${want === null ? 'clearing it' : `saving ${utcText(want)}`} failed, and the manager tries again on every tick (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+  return want;
+}
+
+/** Since when the family has had no scheduled dump: its newest, its start, or the last tick that found its database stopped. */
+function failingBaseline(instance: InstanceConfig, family: BackupFamily, names: string[], start = familyStart(instance, family)): number {
+  return Math.max(newestScheduled(names, family)?.stamp ?? 0, start ?? 0, pausedAt.get(familyKey(instance.id, family)) ?? 0);
+}
+
+function dumpsAlertText(instance: InstanceConfig, family: BackupFamily, since: number): string {
+  const error = lastErrors.get(familyKey(instance.id, family));
+  return `No backup of ${backupCheck.familyText(instance, family)}${backupCheck.whereText(instance, family)} has succeeded since ${utcText(since)}.${error ? ` Last error: ${error}.` : ''} The manager tries again every hour; its Database window has the details.`;
+}
+
+function testAlertText(instance: InstanceConfig, family: BackupFamily, last: FleetBackupTestRecord): string {
+  const hour = String(effectiveFleetBackup(instance).hour).padStart(2, '0');
+  return `The daily test restore of ${last.file}, a backup of ${backupCheck.familyText(instance, family)}${backupCheck.whereText(instance, family)}, failed: ${last.text ?? 'no reason was recorded'}. The manager tests the newest backup again after the daily backup at ${hour}:00.`;
+}
+
+/**
+ * The dumps and test alerts of every family the instance holds; a family it does not back up now loses its last test.
+ * A standing dumps alert stays while its condition holds; a new one also needs a dump attempt by this process, or
+ * this process running for 3 hours, so a manager that was down does not alert before it tried.
+ */
+function alertConditions(instance: InstanceConfig, now: number): backupCheck.AlertCondition[] {
+  const conditions: backupCheck.AlertCondition[] = [];
+  const config = effectiveFleetBackup(instance);
+  const standing = backupCheck.currentAlerts(instance.id);
+  let names: string[] = [];
+  try { names = readFolder(instance.id); } catch { /* the error stands; the baseline goes without stamps */ }
+  for (const family of FAMILIES) {
+    const plan = familyPlan(instance, family);
+    const start = trackStart(instance, family, config.enabled ? plan : null, now);
+    if (!plan) {
+      backupCheck.clearLastTest(instance, family, now);
+      continue;
+    }
+    const key = familyKey(instance.id, family);
+    const since = failingBaseline(instance, family, names, start);
+    const failing = config.enabled && !('skip' in plan) && !pausedNow.has(key) && now - since > ALERT_AFTER_MS;
+    const tried = attemptedSlots.has(key) || now - schedulerStartedAt >= ALERT_AFTER_MS;
+    const dumpsOn = failing && (!!standing[`${family}:dumps`] || tried);
+    conditions.push({ family, kind: 'dumps', on: dumpsOn, text: dumpsAlertText(instance, family, since) });
+    const last = backupCheck.currentTests(instance, family).last;
+    const held = standing[`${family}:test`];
+    if (last?.result === 'running' || last?.result === 'interrupted') conditions.push({ family, kind: 'test', on: !!held, text: held?.text ?? '' });
+    else conditions.push({ family, kind: 'test', on: last?.result === 'failed', text: last ? testAlertText(instance, family, last) : '' });
+  }
+  return conditions;
 }
 
 async function runFleetBackupTick(): Promise<void> {
   const fault = containerManager.registryFault();
   if (fault) { console.warn(`[FleetBackup] Tick skipped: ${fault}`); return; }
   await reprobeStuckFences();
-  const currentHour = new Date().getHours();
-  for (const instance of containerManager.getAllBots()) {
-    const config = effectiveFleetBackup(instance);
-    if (!config.enabled || currentHour !== config.hour) continue;
-    if (instance.fleetDb && !busy.has(instance.id)) await runScheduledPrimaryDump(instance);
-    if (instance.fleetDbReplica && !busy.has(instance.id)) {
-      const fresh = containerManager.getBot(instance.id);
-      if (fresh) await runScheduledCopyDump(fresh);
+  const ids = containerManager.getAllBots().map(b => b.id);
+  const first = ids.length > 0 ? dumpRotation++ % ids.length : 0;
+  for (const id of [...ids.slice(first), ...ids.slice(0, first)]) {
+    for (const family of FAMILIES) {
+      const instance = containerManager.getBot(id);
+      if (instance) await scheduledDump(instance, family);
     }
   }
+  if (containerManager.isShuttingDown()) return;
+  for (const id of ids) {
+    const instance = containerManager.getBot(id);
+    if (instance) await backupCheck.stepAlerts(instance, alertConditions(instance, Date.now()), Date.now());
+  }
+  await orphansRemoved;
+  startOneTest(ids);
 }
 
-async function runScheduledPrimaryDump(instance: InstanceConfig): Promise<void> {
-  // A broken store would silently unscope the dump guard and stop the
-  // nightly safety net with no surfaced signal; record the stoppage loudly.
-  const scopeCheck = backupScopeUnverifiable(instance);
-  if (scopeCheck.corrupt || scopeCheck.urlUndecryptable) {
-    lastErrors.set(instance.id, scopeCheck.corrupt
-      ? 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope'
-      : 'the stored database URL no longer decrypts (the encryption key changed?), so the scheduled dump cannot verify its scope');
-    console.error(`[FleetBackup] Skipping the scheduled dump for ${instance.displayName} (${instance.id}): env store unreadable or the database URL undecryptable`);
+export type FamilyStatus = {
+  family: BackupFamily; role: string; enabled: boolean; hour: number; paused: boolean;
+  lastFile: string | null; lastAt: number | null; dataAt: number | null; lastError: string | null; failingSince: number | null; listError: string | null;
+  /** Why the scheduler takes no dump of this family now: out of scope, or its seed runs. */
+  skip: 'scope' | 'seed' | null;
+  test: FleetBackupTestRecord | null; alerts: { dumps: FleetBackupAlert | null; test: FleetBackupAlert | null };
+};
+
+function copyDataAt(botId: string, file: string): number | null {
+  if (!dataAtCache.has(file)) dataAtCache.set(file, readMeta(botId, file)?.dataAt ?? null);
+  return dataAtCache.get(file) ?? null;
+}
+
+/** What the Database window and the card show about the instance's backups; null for an instance that holds no database. */
+export function fleetBackupStatus(instance: InstanceConfig): {
+  enabled: boolean; hour: number; scoped: boolean | null; restoreError: string | null; main: FamilyStatus | null; copy: FamilyStatus | null;
+} {
+  const config = effectiveFleetBackup(instance);
+  let names: string[] = [];
+  let listError: string | null = null;
+  try {
+    names = readFolder(instance.id);
+  } catch (err) {
+    listError = `${err instanceof Error ? err.message : err}, so the last backup cannot be named`;
+  }
+  const alerts = backupCheck.currentAlerts(instance.id);
+  const family = (f: BackupFamily): FamilyStatus | null => {
+    const plan = familyPlan(instance, f);
+    if (!plan) return null;
+    const key = familyKey(instance.id, f);
+    const newest = newestScheduled(names, f);
+    const dumps = alerts[`${f}:dumps`] ?? null;
+    return {
+      family: f, role: backupCheck.roleText(f), enabled: config.enabled, hour: config.hour, paused: pausedNow.has(key),
+      lastFile: newest?.file ?? null, lastAt: newest?.stamp ?? null, dataAt: f === 'copy' && newest ? copyDataAt(instance.id, newest.file) : null,
+      lastError: lastErrors.get(key) ?? null, failingSince: dumps ? failingBaseline(instance, f, names) : null, listError,
+      skip: 'skip' in plan ? plan.skip : null,
+      test: backupCheck.currentTests(instance, f).last ?? null, alerts: { dumps, test: alerts[`${f}:test`] ?? null },
+    };
+  };
+  return {
+    enabled: config.enabled, hour: config.hour,
+    scoped: instance.fleetDb ? fleetBackupScopeState(instance) : null,
+    restoreError: getFleetRestoreError(instance.id),
+    main: family('main'), copy: family('copy'),
+  };
+}
+
+/** At start: the temp files and orphan counts files a stopped manager left, in every folder whose bot holds no backup slot. */
+function sweepUnfinished(): void {
+  let ids: string[];
+  try {
+    ids = fs.readdirSync(path.join(DATA_DIR, 'backups'));
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') console.error(`[FleetBackup] The backups folder could not be read: ${err?.message || err}`);
     return;
   }
-  if (!isFleetBackupScoped(instance)) return;
-
-  const last = Math.max(lastAttempts.get(instance.id) || 0, instance.lastFleetBackupAt || 0);
-  if (Date.now() - last < REFIRE_GUARD_MS) return;
-
-  lastAttempts.set(instance.id, Date.now());
-  await runScheduledDump(instance);
+  for (const id of ids) {
+    if (busy.has(id)) continue;
+    const dir = backupDir(id);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') console.error(`[FleetBackup] The backup folder ${dir} could not be read: ${err?.message || err}`);
+      continue;
+    }
+    const present = new Set(names);
+    let deleted = 0;
+    for (const name of names.filter(n => n.endsWith('.tmp') || (n.endsWith('.dump.json') && !present.has(n.slice(0, -'.json'.length))))) {
+      try {
+        fs.unlinkSync(path.join(dir, name));
+        deleted++;
+      } catch (err) {
+        console.warn(`[FleetBackup] Could not delete the unfinished backup file ${name} in ${dir}: ${err}`);
+      }
+    }
+    if (deleted > 0) console.log(`[FleetBackup] Deleted ${deleted} unfinished backup file(s) a stopped manager left in ${dir}`);
+  }
 }
 
 type RestoreSteps = { stopped: string[]; preRestoreDump: string | null; restored: boolean; termReconciledTo: number | null; guildsRaised: string[] | null; leaseTerm: number | null; restarted: string[] };
@@ -1537,7 +1861,7 @@ async function runFleetRestore(
       const safety = await runFleetDump(instance, 'pre-restore-');
       if (!safety.success) {
         const why = scrubbed(botId, safety.error || 'unknown reason');
-        lastErrors.set(botId, `Pre-restore dump failed: ${why}`);
+        lastErrors.set(familyKey(botId, 'main'), `Pre-restore dump failed: ${why}`);
         return await refuse('Pre-restore dump failed, restore refused', why);
       }
       steps.preRestoreDump = safety.file || null;
@@ -1690,7 +2014,7 @@ async function runFleetRestore(
       return { success: false, error: `The dump was restored, but ${await keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
     }
 
-    lastErrors.delete(botId);
+    lastErrors.delete(familyKey(botId, 'main'));
     unsavedRestoreErrors.delete(botId);
     let noticeWarning = '';
     try {
@@ -1747,6 +2071,16 @@ export function startFleetBackupScheduler(): void {
   if (intervalHandle) return;
 
   console.log(`[FleetBackup] Started (tick: ${TICK_INTERVAL_MS / 1000}s)`);
+  schedulerStartedAt = Date.now();
+  sweepUnfinished();
+  try {
+    backupCheck.recoverInterruptedTests();
+  } catch (err) {
+    console.error('[FleetBackup] The test restores a restart cut short could not be read:', err);
+  }
+  orphansRemoved = backupCheck.removeOrphanThrowaways().catch(err => {
+    console.error('[FleetBackup] Test-restore leftover removal error:', err);
+  });
 
   seedStuckFences().catch(err => {
     console.error('[FleetBackup] Stuck-fence seed error:', err);

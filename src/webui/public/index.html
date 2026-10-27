@@ -1559,11 +1559,9 @@
             const cutBadge = !cut || bot.activeOp || (lane && lane.interrupted && lane.op === cut.op) ? ''
               : `<span class="update-badge danger" style="cursor:pointer;" onclick="viewBuildLogs('${bot.id}', ${jsArg(botName)})" title="${escapeHtml(`${cutOpText(cut)} Open Build Logs to dismiss this note; starting a new operation on the bot also clears it.`)}">${cut.unknown ? 'Last operation unknown' : `${escapeHtml(cut.op.charAt(0).toUpperCase() + cut.op.slice(1))} cut by restart`}</span>`;
 
-            // Fleet DB backup warning (failed or stale sidecar dump)
+            // Backup alerts: dumps that stopped, or a failed daily test restore
             const fb = bot.fleetBackup;
-            const fbWarnBadge = fb && (fb.lastError || fb.stale)
-              ? `<span class="update-badge" title="${escapeHtml(fb.lastError ? `Last database backup failed: ${fb.lastError}` : 'No database backup in over 36 hours')}">DB backup ${fb.lastError ? 'failed' : 'stale'}</span>`
-              : '';
+            const fbWarnBadge = fleetBackupBadges(fb);
             const restoreBadge = fb && fb.restoreError
               ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
               : '';
@@ -1645,7 +1643,7 @@
             // A seed owns the instance through the window in which it carries
             // neither database record; the modal holds its exits.
             const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetWorker || bot.hasDbBackups)
-              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${fb ? 'Backups and replication of this bot\'s managed database' : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine' : 'Earlier database backups kept on this machine'}">Database</button>`
+              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${bot.fleetDb ? 'Backups and replication of this bot\'s managed database' : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine' : 'Earlier database backups kept on this machine'}">Database</button>`
               : '';
 
             return `
@@ -2456,7 +2454,7 @@
 
     // ─── Fleet DB Backups ───
     let fleetBackupBotId = null;
-    let fleetBackupStored = { enabled: true, hour: 4, keep: 7 };
+    let fleetBackupStored = { enabled: true, hour: 4 };
 
     function formatBackupSize(bytes) {
       if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
@@ -2493,8 +2491,8 @@
         return;
       }
 
-      const fb = bot?.fleetBackup || { enabled: true, hour: 4, keep: 7 };
-      fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+      const fb = bot?.fleetBackup || { enabled: true, hour: 4 };
+      fleetBackupStored = { enabled: fb.enabled, hour: fb.hour };
       content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
       const listHtml = await fleetBackupListHtml(botId, fb);
@@ -2514,11 +2512,9 @@
             <input type="checkbox" id="fleet-backup-enabled" ${fb.enabled ? 'checked' : ''} onchange="saveFleetBackupConfig()">
             <span class="toggle-slider"></span>
           </label>
-          <span>Daily backup</span>
-          <select class="auto-update-interval" id="fleet-backup-hour" title="Backup hour" onchange="saveFleetBackupConfig()">${hourOptions}</select>
-          <label style="font-size:0.8rem;color:var(--text-secondary);">Keep
-            <input type="number" id="fleet-backup-keep" min="1" max="365" value="${fb.keep}" onchange="saveFleetBackupConfig()" style="width:60px;">
-          </label>
+          <span>Backups</span>
+          <label for="fleet-backup-hour" style="font-size:0.8rem;color:var(--text-secondary);">Daily backup and test restore at</label>
+          <select class="auto-update-interval" id="fleet-backup-hour" onchange="saveFleetBackupConfig()">${hourOptions}</select>
         </div>
         <div id="fleet-backup-list">${listHtml}</div>
         <div class="env-tip" style="margin-top:8px;">Restoring a backup rewinds every guild's data on this database at once. The database is fenced (it refuses every connection but the manager's and is read-only) and a fresh safety dump is taken under that fence before anything changes (skipped only when the database itself is missing).</div>
@@ -2538,7 +2534,7 @@
       const restore = fb?.restoreError
         ? `<div class="error-message">${escapeHtml(fb.restoreError)}. <button class="btn btn-secondary btn-small" onclick="dismissFleetRestoreError('${fleetBackupBotId}')">Dismiss</button></div>`
         : '';
-      return restore + (fb?.lastError ? `<div class="error-message">Last backup failed: ${escapeHtml(fb.lastError)}</div>` : '');
+      return restore + backupStatusHtml(fb?.main);
     }
 
     async function dismissFleetRestoreError(botId) {
@@ -2558,12 +2554,12 @@
         const res = await api('GET', `/bots/${botId}/fleet-backups`);
         const backups = (res.success && Array.isArray(res.backups)) ? res.backups : [];
         const emptyText = !fb.enabled
-          ? 'No backups. Daily backup is off, so none will be taken until it is turned on.'
+          ? 'Backups are off for this bot: no backup is taken and none is deleted.'
           : fb.scoped === false
             ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
             : fb.scoped === null
             ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
-            : 'No backups yet. The first dump runs at the scheduled hour.';
+            : 'No backup yet; the first one starts within a minute.';
         return !res.success
           ? `<div class="error-message">Could not list the backups: ${escapeHtml(res.error || 'unknown error')}</div>`
           : backups.length === 0
@@ -2641,23 +2637,73 @@
       return seed && seed.safetyDump ? `<div class="env-tip">A safety dump of this database, taken under a write fence, is kept with the backups as ${escapeHtml(seed.safetyDump)}.</div>` : '';
     }
 
-    // Every standby copy is dumped on the instance's schedule as standin-*.dump, in recovery or not; a cleared copy is not dumped and gets no line.
+    function backupTime(ms) {
+      return escapeHtml(new Date(ms).toLocaleString());
+    }
+
+    // The daily test restore of a family, from its last record.
+    function backupTestHtml(f) {
+      const t = f.test;
+      if (!t) return `<div class="env-tip">No test restore yet; the first runs after the daily backup at ${String(f.hour).padStart(2, '0')}:00.</div>`;
+      const file = escapeHtml(t.file);
+      if (t.result === 'running') return `<div class="env-tip">Test restore of ${file} running since ${backupTime(t.startedAt)}.</div>`;
+      if (t.result === 'interrupted') return `<div class="env-tip">Test restore of ${file} was cut short by a manager restart; it runs again within a minute.</div>`;
+      if (t.result === 'passed') return `<div class="env-tip">Test restore of ${file} passed at ${backupTime(t.finishedAt)}: ${t.tables} tables and ${t.rows} rows matched the counts recorded when it was taken${escapeHtml(t.text || '')}.</div>`;
+      return `<div class="error-message">Test restore of ${file} failed at ${backupTime(t.finishedAt)}: ${escapeHtml(t.text || '')}.</div>`;
+    }
+
+    // What became of the owner's DM about a standing alert.
+    function backupAlertHtml(a) {
+      if (!a) return '';
+      const line = a.dm === 'sent' ? `The owner was sent a DM at ${backupTime(a.dmAt)}.`
+        : a.dm === 'pending' ? 'The DM to the owner is being sent.'
+        : a.dm === 'failed' ? `The DM to the owner could not be sent: ${escapeHtml(a.dmError || 'no reason was given')}. The manager tries again every hour.`
+        : a.dm === 'unknown' ? "The bot did not answer within 30 s, so the manager can't confirm the owner got the DM."
+        : 'This app has no notify-owner hook, so this failure shows only here.';
+      return `<div class="env-tip">${line}</div>`;
+    }
+
+    // The backup lines of one family (the main database or the live copy) from the health object.
+    function backupStatusHtml(f) {
+      if (!f) return '';
+      // A failed test stands as an alert while no test runs; its lines stay under any state that takes no backup.
+      const testAlert = f.alerts && f.alerts.test ? backupTestHtml(f) + backupAlertHtml(f.alerts.test) : '';
+      if (!f.enabled) return '<div class="error-message">Backups are off for this bot: no backup is taken and none is deleted.</div>' + testAlert;
+      if (f.skip === 'scope') return testAlert;
+      if (f.skip === 'seed') return '<div class="env-tip">Backups of this copy start after its seed finishes.</div>' + testAlert;
+      const file = escapeHtml(f.lastFile || '');
+      const failing = f.alerts && f.alerts.dumps;
+      const lines = [];
+      if (f.paused) lines.push(`<div class="env-tip">The database container is not running, so no backup is taken; nothing can change in it while it is stopped. Newest backup: ${f.lastFile ? file : 'none'}.</div>`);
+      else if (failing) lines.push(`<div class="error-message">No backup has succeeded since ${backupTime(f.failingSince || failing.since)}.${f.lastError ? ` Last error: ${escapeHtml(f.lastError)}.` : ''}</div>`);
+      else if (f.lastError) lines.push(`<div class="error-message">The last backup attempt failed: ${escapeHtml(f.lastError)}. The next attempt starts at the next hour.</div>`);
+      if (f.listError) lines.push(`<div class="error-message">${escapeHtml(f.listError)}.</div>`);
+      if (!f.paused && f.lastFile) {
+        lines.push(f.family === 'copy'
+          ? `<div class="env-tip">Last backup of this copy: ${file} at ${backupTime(f.lastAt)}, ${f.dataAt ? `holding changes up to ${backupTime(f.dataAt)}` : 'holding no replayed change yet'}.</div>`
+          : `<div class="env-tip">Last backup: ${file} at ${backupTime(f.lastAt)}. Hourly backups are kept for 48 hours and daily ones for 30 days; the daily backup and its test restore run at ${String(f.hour).padStart(2, '0')}:00.</div>`);
+      } else if (!f.paused && !failing && !f.lastError && !f.listError) {
+        lines.push('<div class="env-tip">No backup yet; the first one starts within a minute.</div>');
+      }
+      lines.push(backupAlertHtml(failing));
+      lines.push(backupTestHtml(f));
+      lines.push(backupAlertHtml(f.alerts && f.alerts.test));
+      return lines.join('');
+    }
+
+    function fleetBackupBadges(fb) {
+      if (!fb) return '';
+      const families = [fb.main, fb.copy].filter(Boolean);
+      const dumps = families.map(f => f.alerts && f.alerts.dumps).filter(Boolean);
+      const tests = families.map(f => f.alerts && f.alerts.test).filter(Boolean);
+      return (dumps.length ? `<span class="update-badge" title="${escapeHtml(dumps.map(a => a.text).join('\n'))}">DB backup failed</span>` : '')
+        + (tests.length ? `<span class="update-badge" title="${escapeHtml(tests.map(a => a.text).join('\n'))}">DB test restore failed</span>` : '');
+    }
+
+    // The live copy's backup lines on the replica window; a cleared copy holds no family and gets none.
     function copyDumpHtml(info) {
       if (!info) return '';
-      const failed = (info.lastError ? `<div class="error-message">The last scheduled dump of this copy did not complete: ${escapeHtml(info.lastError)}.</div>` : '')
-        + (info.listError ? `<div class="error-message">${escapeHtml(info.listError)}.</div>` : '');
-      if (!info.enabled && info.lastAt) return `${failed}<div class="error-message">Last dump of this copy: ${escapeHtml(new Date(info.lastAt).toLocaleString())} (${escapeHtml(info.lastFile || '')}). Scheduled dumps are off for this instance, so no further dumps run.</div>`;
-      if (!info.enabled && info.listError) return `${failed}<div class="error-message">Scheduled dumps are off for this instance, so no further dumps run.</div>`;
-      if (!info.enabled) return `${failed}<div class="error-message">Scheduled dumps are off for this instance, so the data this copy holds is in no dump this manager keeps.</div>`;
-      const next = `the next scheduled dump runs at ${String(info.hour).padStart(2, '0')}:00`;
-      if (info.lastAt) {
-        const when = escapeHtml(new Date(info.lastAt).toLocaleString());
-        return failed + (info.stale
-          ? `<div class="error-message">Last dump of this copy: ${when} (${escapeHtml(info.lastFile || '')}), more than 36 hours ago; this manager keeps no newer dump of the data this copy holds.</div>`
-          : `<div class="env-tip">Last dump of this copy: ${when} (${escapeHtml(info.lastFile || '')}); ${next}.</div>`);
-      }
-      if (info.listError) return `${failed}<div class="env-tip">The next scheduled dump runs at ${String(info.hour).padStart(2, '0')}:00.</div>`;
-      return `${failed}<div class="env-tip">No dump of this copy yet; ${next}.</div>`;
+      return backupStatusHtml(info);
     }
 
     function seedWarningHtml(warning) {
@@ -2941,7 +2987,7 @@
       body.innerHTML = `
         <div class="env-group" style="margin-top:14px;">
           <div class="env-group-title">Earlier database backups</div>
-          <div class="env-tip">Dumps taken while this instance hosted this bot's managed database, including the one taken just before it was re-seeded. Kept for recovery; restoring them needs a machine that hosts the database.</div>
+          <div class="env-tip">Backups kept on this machine: dumps of the live copy (copy-) and dumps taken while this machine held the main database. Restoring one needs a machine that holds the main database.</div>
           ${backups.map(b => `
             <div class="env-row" style="align-items:center;">
               <span style="flex:1;font-family:monospace;font-size:0.76rem;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(b.file)}</span>
@@ -3359,30 +3405,19 @@
     async function saveFleetBackupConfig() {
       const enabled = document.getElementById('fleet-backup-enabled').checked;
       const hour = Number(document.getElementById('fleet-backup-hour').value);
-      const keepEl = document.getElementById('fleet-backup-keep');
-      const keepRaw = (keepEl.value || '').trim();
-      const keep = Number(keepRaw);
-      if (isBadNumber(keepEl) || keepRaw === '' || !Number.isInteger(keep) || keep < 1 || keep > 365) {
-        showMessage('error', 'Keep must be a whole number from 1 to 365. Nothing was saved.');
-        return;
-      }
-      if (keep < fleetBackupStored.keep && !confirm(`Keep only ${keep} backups?\n\nThe next backup deletes the older dumps beyond the newest ${keep} (now ${fleetBackupStored.keep} are kept).`)) {
-        showFleetBackupControls(fleetBackupStored);
-        return;
-      }
       const body = { expected: {} };
-      for (const [k, v] of Object.entries({ enabled, hour, keep })) {
+      for (const [k, v] of Object.entries({ enabled, hour })) {
         if (v !== fleetBackupStored[k]) { body[k] = v; body.expected[k] = fleetBackupStored[k]; }
       }
       if (Object.keys(body.expected).length === 0) return;
       try {
         const res = await api('PUT', `/bots/${fleetBackupBotId}/fleet-backup-config`, body);
         const fb = res.fleetBackup;
-        const fbValid = fb && typeof fb.enabled === 'boolean' && typeof fb.hour === 'number' && typeof fb.keep === 'number';
+        const fbValid = fb && typeof fb.enabled === 'boolean' && typeof fb.hour === 'number';
         if (res.success && fbValid) {
-          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour };
         } else if (!res.success && fbValid) {
-          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour, keep: fb.keep };
+          fleetBackupStored = { enabled: fb.enabled, hour: fb.hour };
           showMessage('error', res.error || 'The backup settings were changed elsewhere. Nothing was saved.');
         } else if (res.success) {
           showMessage('error', 'Can\'t confirm the backup settings: the manager did not return them. Reopen this window to see what is stored.');
@@ -3399,10 +3434,8 @@
     function showFleetBackupControls(fb) {
       const enabledEl = document.getElementById('fleet-backup-enabled');
       const hourEl = document.getElementById('fleet-backup-hour');
-      const keepEl = document.getElementById('fleet-backup-keep');
       if (enabledEl) enabledEl.checked = fb.enabled;
       if (hourEl) hourEl.value = String(fb.hour);
-      if (keepEl) keepEl.value = String(fb.keep);
     }
 
     async function restoreSharersText(botId) {

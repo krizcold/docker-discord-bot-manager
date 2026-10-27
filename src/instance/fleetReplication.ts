@@ -11,8 +11,7 @@
  * The stored database URL keeps the container-name form: the host-reachable
  * canonical form cannot hairpin from containers sharing a docker network with
  * the sidecar (F1), and that includes this instance's own bot. The canonical
- * form rides the record's public-URL key instead; the master delivers both and
- * each worker picks the one it can resolve. sslmode=no-verify is the
+ * form is what a node on another host dials. sslmode=no-verify is the
  * node-postgres spelling for "encrypt, pinned trust comes later"
  * (pg-connection-string treats bare `require` as verify-against-CAs, which a
  * self-signed cert fails); the replication DSN for libpq consumers uses
@@ -179,12 +178,6 @@ function storedDbPassword(instance: InstanceConfig): string | null {
   }
 }
 
-function canonicalFleetUrl(instance: InstanceConfig, repl: FleetDbReplication, dbPassword: string): string {
-  const user = instance.fleetDb!.user;
-  const db = instance.fleetDb!.db;
-  return `postgresql://${user}:${encodeURIComponent(dbPassword)}@${repl.publicHost}:${repl.hostPort}/${db}?sslmode=no-verify`;
-}
-
 function sidecarUrl(instance: InstanceConfig, dbPassword: string): string {
   const { containerName, user, db } = instance.fleetDb!;
   return `postgresql://${user}:${encodeURIComponent(dbPassword)}@${containerName}:5432/${db}`;
@@ -312,8 +305,8 @@ async function enableInLane(
   // cluster (role, ssl, pg_hba), so a missing key name must refuse before
   // any of it or a failed enable leaves a live posture no record accounts for.
   const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
-  if (!dbEnv?.publicUrl) {
-    return { success: false, error: 'This app declares no public database URL key, so replication cannot publish the canonical form' };
+  if (!dbEnv) {
+    return { success: false, error: 'This app declares no companion database, so replication cannot write its database URL' };
   }
   const host = publicHost.trim();
   if (!host || !/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(host)) {
@@ -409,15 +402,12 @@ async function enableInLane(
     slotWalKeepMb: keepMb,
     ...(plain.addrs.length > 0 ? { keptPlain: plain.addrs } : {}),
   };
-  // F1: the stored URL stays the container-name form (the public form cannot
+  // The stored URL stays the container-name form (the public form cannot
   // hairpin from containers sharing a docker network with the sidecar, which
-  // includes this instance's own bot). The public form rides a separate env
-  // var; the master delivers both and each worker picks by resolvability.
-  // TLS on the local form too (ssl=on just activated): the authored pg_hba
+  // includes this instance's own bot). TLS on it too (ssl=on just activated): the authored pg_hba
   // accepts non-TLS only from 172.16/12, and a docker daemon with custom
   // address pools allocates outside it; hostssl covers every subnet.
   const localUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
-  const publicUrl = canonicalFleetUrl(instance, replication, dbPassword);
   const changed = `the database already has the replication role, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
   if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
     return { success: false, certRotated, error: `The instance's database record changed while this Enable ran, so the record and the database URL were not written; ${changed}. Check the Replication section, then press Enable again` };
@@ -425,7 +415,7 @@ async function enableInLane(
   try {
     // The env store alone: container env assembly derives sensitive values from
     // it at read time (the two-store strip), so no record mirror exists to sync.
-    envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl, [dbEnv.publicUrl]: publicUrl });
+    envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl });
     containerManager.updateInstanceFleetDbReplication(instance.id, replication);
   } catch (err) {
     return { success: false, certRotated, error: `The database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); ${changed}. Press Enable again once the store can be written` };
@@ -563,14 +553,8 @@ async function disableInLane(
   // The bot may still dial its old non-TLS URL until it restarts, so the lines stay until a start narrows them.
   const keptPlain = fleetDb.replication.keptPlain ?? [];
   const kept = keptPlain.length > 0 ? { plainClientsKept: keptPlain.length } : {};
-  let unedited: string[] = [];
   try {
     envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
-    if (dbEnv.publicUrl) {
-      envManager.deleteEnvVar(instance.id, dbEnv.publicUrl);
-      containerManager.removeBotEnvVars(instance.id, [dbEnv.publicUrl]);
-      unedited = containerManager.removeEnvKeyFromDeployedCompose(instance.id, dbEnv.publicUrl);
-    }
     containerManager.updateInstanceFleetDbReplication(instance.id, null, keptPlain);
   } catch (err) {
     // The disabling mark stays on the record, so the card shows the Disable as unfinished.
@@ -578,9 +562,6 @@ async function disableInLane(
     return { success: false, error: `Replication is off on the database (the slots are dropped and the replication login is revoked), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
   }
   forgetProbes(instance.id);
-  if (unedited.length > 0) {
-    return { success: true, restartRequired: true, ...kept, warning: `Replication is disabled, but ${dbEnv.publicUrl} could not be removed from ${unedited.join(', ')}, which still set it: every start passes the old public database URL to the bot until those files are edited or rewritten` };
-  }
   return { success: true, restartRequired: true, ...kept };
 }
 
@@ -643,7 +624,7 @@ export interface FleetReplicationStatus {
     slotWalKeep: string;
   };
   /** Can a container on the default bridge reach the published endpoint (the
-   * path a REMOTE worker's delivery hands out)? Catches firewall traps before
+   * path a node on another host dials)? Catches firewall traps before
    * a cross-host standby is pointed at a dead port. */
   reachability?: { ok: boolean; error?: string; ageSeconds: number };
   /** The database could not be read (live stays absent): docker's or psql's last line. Absent with no live means docker said it is stopped. */

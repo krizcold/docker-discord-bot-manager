@@ -2993,22 +2993,12 @@
         : !live.running
         ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
         : live.inRecovery === false
-          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. If this machine now serves the fleet, adopt it below so it can hand the old machine a block to re-seed from. If the promotion was a mistake, remove the replica and provision it again; that destroys every write made to this copy since the promote.</div>
+          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. To switch this instance to it, adopt it below. If the promotion was a mistake, remove the replica and provision it again; that destroys every write made to this copy since the promote.</div>
              <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
         : live.receiverStatus !== 'streaming'
           ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
           : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
-      const led = r.autoReseed || null;
-      const cancelled = !!(r.parkedSeed && r.parkedSeed.cancelled);
       const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
-      // The re-seed ledger (20.14): why the last one stopped, or when it last ran.
-      const ledgerHtml = !led
-        ? ''
-        : led.lastError
-          ? `<div class="error-message">Re-seed attempt ${led.attempts} at ${new Date(led.lastAttemptAt).toLocaleString()} did not complete: ${escapeHtml(led.lastError)}${cancelled ? ' It was cancelled; use Re-seed now when you want it.' : ''}</div>`
-          : led.lastSuccessAt
-            ? `<div class="env-tip">Last re-seed completed at ${new Date(led.lastSuccessAt).toLocaleString()}.</div>`
-            : `<div class="env-tip">Re-seed attempt ${led.attempts} started at ${new Date(led.lastAttemptAt).toLocaleString()}.</div>`;
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is adopted or removed,
       // and a record too old to probe has no state to re-seed from.
@@ -3019,11 +3009,10 @@
       const consentHtml = replicaConsentHtml();
       body.innerHTML = `
         ${errHtml}
-        <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
+        <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> once you promote it.</div>
         ${consentHtml}
         ${stateHtml}
         ${copyDumpHtml(res.copyBackup)}
-        ${ledgerHtml}
         <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
@@ -3139,7 +3128,7 @@
     }
 
     async function adoptPromotedReplica(botId) {
-      if (!confirm('Adopt this database as this machine\'s own?\n\nUse this after this node was promoted and now serves the fleet. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
+      if (!confirm('Adopt this database as this machine\'s own?\n\nUse this after you promoted this copy to switch the instance to it. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
         if (res.success) {
@@ -3201,7 +3190,7 @@
     }
 
     async function reseedStandbyNow(botId) {
-      if (!confirm('Re-seed this standby now?\n\nThe current copy is deleted and replaced with a fresh copy of the primary, taken with the copy block the bot holds. Streaming resumes when the copy completes.')) return;
+      if (!confirm('Re-seed this standby now?\n\nThe manager checks for a copy block to seed from first. If it has none, it refuses and changes nothing.')) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replica/reseed`);
         if (res.success) showMessage('success', 'Re-seed started');

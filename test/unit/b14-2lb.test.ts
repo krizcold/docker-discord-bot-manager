@@ -40,7 +40,7 @@ const pg = vi.hoisted(() => ({
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/config/appCapabilities')>();
-  return { ...real, findAppCapabilities: () => ({ companionDb: { env: { url: 'DATABASE_URL', publicUrl: 'DATABASE_PUBLIC_URL' } } }) };
+  return { ...real, findAppCapabilities: () => ({ companionDb: { env: { url: 'DATABASE_URL' } } }) };
 });
 vi.mock('../../src/env/manager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/env/manager')>();
@@ -341,7 +341,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   it('a read-only default that cannot be lifted or stripped stays READ-ONLY', async () => {
     pg.resetFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy, { readOnly: true, hba: false })).toBe('failed');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER, { readOnly: true, hba: false })).toBe('failed');
     expect(pg.events).not.toContain('hba-strip');
   });
 
@@ -360,7 +360,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   it('a reload that landed before the read-only reset failed is failed, and no text says the reload failed', async () => {
     pg.resetFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy)).toBe('failed');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER)).toBe('failed');
     expect(pg.sql.some(s => /-c SELECT pg_reload_conf\(\)$/.test(s) && !s.includes('ALTER SYSTEM'))).toBe(true);
     const note = await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy);
     expect(note).toMatch(/stays READ-ONLY/);
@@ -371,7 +371,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
 
   it('a lone reload that fails before a reset whose own reload lands is lifted, with no strip and no warning', async () => {
     pg.reloadFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy)).toBe('lifted');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER)).toBe('lifted');
     expect(pg.events).toEqual(['hba-strip', 'reload', 'owner-read', 'reset', 'owner-drop']);
     expect(await fleetBackup.liftLaneFence('a', primary, OWNER, 'a decommission', remedy)).toBe('');
     expect(pg.events).not.toContain('volume-strip');
@@ -381,7 +381,7 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   it('an hba-only lift whose reload fails after the strip is stripped, not failed', async () => {
     pg.reloadFails = true;
     pg.volumeStripFails = true;
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, remedy, { readOnly: false, hba: true })).toBe('stripped');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER, { readOnly: false, hba: true })).toBe('stripped');
     expect(pg.events).not.toContain('reset');
   });
 
@@ -407,14 +407,14 @@ describe('B14-2Lb: the lift strips the pg_hba lines first, and each partial outc
   });
 });
 
-describe('B14-2Lb: a consent park lifts the layers it owns', () => {
+describe('B14-2Lb: a lift of some layers leaves the others', () => {
   it('lifting only the pg_hba layer leaves the read-only default another lane set', async () => {
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, 'x', { readOnly: false, hba: true })).toBe('lifted');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER, { readOnly: false, hba: true })).toBe('lifted');
     expect(pg.events).toEqual(['hba-strip', 'reload']);
   });
 
   it('lifting only the read-only layer leaves the pg_hba lines another lane set', async () => {
-    expect(await fleetBackup.liftConsentFence('a', primary, OWNER, 'x', { readOnly: true, hba: false })).toBe('lifted');
+    expect(await fleetBackup.liftOwnedFence(primary, OWNER, { readOnly: true, hba: false })).toBe('lifted');
     expect(pg.events).not.toContain('hba-strip');
     expect(pg.events).toContain('reset');
   });

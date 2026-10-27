@@ -126,31 +126,28 @@ const start = () => reseedStalePrimary(containerManager.getBot('a')!, 'postgresq
 
 const stored = () => JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a;
 
-describe('B20-3s: the stale-primary re-seed marks its own database retired', () => {
-  it('a retire that succeeds records the mark', async () => {
+describe('B20-3s: the stale-primary re-seed commits once its own database is retired', () => {
+  it('a retire that succeeds commits the seed', async () => {
     expect(start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).toContain('retire');
     expect(bot.fleetDbReplicaSeed?.committed).toBe(true);
-    expect(stored().fleetOwnDbRetiredAt).toEqual(expect.any(String));
   });
 
-  it('a retire that fails after it removed the volume records the mark and the commit', async () => {
+  it('a retire that fails after it removed the volume records the commit', async () => {
     pg.retire = { success: false, error: 'compose rewrite failed', volumeRemoved: true };
     expect(start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/^could not retire the stale database: compose rewrite failed/);
     expect(bot.fleetDbReplicaSeed?.committed).toBe(true);
-    expect(stored().fleetOwnDbRetiredAt).toEqual(expect.any(String));
   });
 
-  it('a retire refused before it touched the volume records no mark', async () => {
+  it('a retire refused before it touched the volume records no commit', async () => {
     pg.retire = { success: false, error: 'refused' };
     expect(start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).toContain('retire');
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/^could not retire the stale database: refused/);
     expect(bot.fleetDbReplicaSeed?.committed).not.toBe(true);
-    expect(stored().fleetOwnDbRetiredAt).toBeUndefined();
   });
 });

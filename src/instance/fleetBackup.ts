@@ -595,7 +595,7 @@ async function sweepSessions(db: RestoreFleetDb): Promise<string | null> {
 }
 
 /**
- * The write fence every lane that dumps before a destroy uses, and the consent park: the
+ * The write fence every lane that dumps before a destroy uses: the
  * read-only default, then pg_hba lines that refuse every TCP connection but the managed role's replication, then
  * every other session ended, and once more after authentication_timeout (a login accepted before the reload can
  * finish under the old rules). A session that sets READ WRITE itself passes the default; it cannot pass the lines.
@@ -648,25 +648,6 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
   return { ok: true, stdout: '', stderr: '', changed: true, owned };
 }
 
-/** The database a failback or drop-back run parks on for the operator's consent. */
-export type ConsentFenceTarget = RestoreFleetDb;
-
-/**
- * Fence the database a failback or drop-back run parks on for consent
- * (B7-O19): a client bypassing the bot cannot land rows the dump and the
- * verdict never saw, which the wipe would then destroy. The park takes over
- * only a layer an earlier run of its own lane left.
- */
-export async function fenceForConsent(target: ConsentFenceTarget, owner: string): Promise<{ ok: true } | { ok: false; error: string }> {
-  const fence = await applyWriteFence(target, owner, 'lane');
-  return fence.ok ? { ok: true } : { ok: false, error: fence.stderr.trim().split('\n').pop() || 'unknown reason' };
-}
-
-/** Lift the layers of a consent fence the run owns; one that sticks is named on the instance, on the database it sits on, as the restore's is. */
-export function liftConsentFence(botId: string, target: ConsentFenceTarget, owner: string, failedRemedy: string, layers: FenceLayers = BOTH_LAYERS, held: FenceHeld = noneHeld()): Promise<FenceLift> {
-  return liftAndTrack(botId, target, owner, 'a failback', failedRemedy, layers, held);
-}
-
 function liftNote(result: FenceLift, volume: string, remedy = 'running a restore again retries the lift', held: FenceHeld = noneHeld(), lane = 'this lane'): string {
   const heldNote = held.readOnly || held.hba ? `; ${heldText(held, lane)}` : '';
   return result === 'lifted' ? ''
@@ -709,7 +690,7 @@ export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, owne
 }
 
 /** Which layers of the write fence the database holds now and whose they are; null when it cannot be asked. */
-export async function fenceLayers(target: ConsentFenceTarget): Promise<FenceState | null> {
+export async function fenceLayers(target: RestoreFleetDb): Promise<FenceState | null> {
   const probe = await readDocker(['exec', target.containerName, 'psql', '-U', target.user, '-d', 'postgres', '-tA', '-c',
     `SELECT current_setting('default_transaction_read_only') || '|' || (${FENCE_HBA_COUNT_SQL}) || '|' || ${FENCE_OWNER_FILE_SQL} || '|' || (${FENCE_HBA_OWNER_SQL})`]);
   const m = probe.ok ? /^(on|off)\|(\d+)\|([^|\n]*)\|([^|\n]*)$/.exec(probe.stdout.trim()) : null;

@@ -106,7 +106,7 @@ const DERIVED_KEY = crypto.scryptSync(ENCRYPTION_KEY, loadOrCreateKdfSalt(), 32)
 const SENSITIVE_VARS = [
   'DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN',
   ...APP_CAPABILITIES.flatMap(r => r.companionDb
-    ? [r.companionDb.env.url, r.companionDb.env.publicUrl]
+    ? [r.companionDb.env.url]
     : []),
 ].filter((k): k is string => !!k).map(k => k.toUpperCase());
 

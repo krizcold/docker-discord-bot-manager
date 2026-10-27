@@ -26,7 +26,7 @@ import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fl
 import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal, getAppFacts, hasAppHooks } from './appHookClient';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
-import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
+import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
@@ -57,17 +57,8 @@ const EXEC_TIMEOUT_MS = 120_000;
 /** A docker read (inspect, ps): a hung CLI must not hold its caller; a timed-out read is unknown. */
 const READ_TIMEOUT_MS = 30_000;
 
-/** Attempts the automatic re-seed makes before it stops and asks (20.14). */
-export const AUTO_RESEED_MAX_ATTEMPTS = 3;
-/** Minimum spacing between automatic attempts, so a failing re-seed does not start again at once. */
-const AUTO_RESEED_SPACING_MS = 30 * 60_000;
 /** A facts read on the re-seed's entry must not hang it; the hook's default timeout is sized for a promote. */
 const FACTS_TIMEOUT_MS = 10_000;
-
-/** A node id as the fleet's own UI abbreviates it; the manager knows no node names. */
-function shortId(id: string | null): string {
-  return id ? id.slice(0, 8) : 'an unknown node';
-}
 
 /**
  * The seed in flight lives on the instance record, never in memory: a manager
@@ -277,61 +268,12 @@ export function seedPurposeLabel(purpose: FleetReplicaSeedPurpose): string {
   return 'Provisioning the standby';
 }
 
-function patchLedger(botId: string, fn: (current: FleetReplicaAutoReseedLedger | undefined) => FleetReplicaAutoReseedLedger | undefined): void {
-  const rec = containerManager.getBot(botId)?.fleetDbReplica;
-  if (!rec) return;
-  const { autoReseed: _drop, ...rest } = rec;
-  const next = fn(rec.autoReseed);
-  containerManager.updateInstanceFleetDbReplica(botId, next ? { ...rest, autoReseed: next } : rest);
-}
-
-function ledgerAttempt(botId: string, trigger: 'automatic' | 'operator'): void {
-  patchLedger(botId, current => {
-    const next: FleetReplicaAutoReseedLedger = { attempts: (current?.attempts ?? 0) + 1, lastAttemptAt: Date.now(), trigger };
-    if (current?.lastSuccessAt) next.lastSuccessAt = current.lastSuccessAt;
-    return next;
-  });
-}
-
-function ledgerFailure(botId: string, error: string): void {
-  patchLedger(botId, current => (current ? { ...current, lastError: error } : undefined));
-}
-
-/** Record that a re-seed retired this machine's own database; a refused save leaves Provision's role gate in force. */
-function markOwnDbRetired(botId: string): void {
-  try {
-    containerManager.updateInstanceFleetOwnDbRetired(botId, new Date().toISOString());
-  } catch (error) {
-    console.warn(`[FleetReplica] ${botId}: could not record that its own database was retired: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-/** Retire this node's stale database for a re-seed; a removed volume opens Provision's role gate even when the retire then failed. */
-export async function retireStaleOwnDb(botId: string): Promise<Awaited<ReturnType<typeof containerManager.retireFleetDbSidecar>>> {
-  const retired = await containerManager.retireFleetDbSidecar(botId);
-  if (retired.success || retired.volumeRemoved) markOwnDbRetired(botId);
-  return retired;
-}
-
 /** Record that this standby's copy is gone (or back), for readers that outlive the seed record. */
 function setCopyCleared(botId: string, cleared: boolean): void {
   const rec = containerManager.getBot(botId)?.fleetDbReplica;
   if (!rec || rec.copyCleared === cleared) return;
   const { copyCleared: _drop, ...rest } = rec;
   containerManager.updateInstanceFleetDbReplica(botId, cleared ? { ...rest, copyCleared: true } : rest);
-}
-
-/** The ledger is a count for the automatic re-seed, never the seed's outcome: a refused write is logged. */
-function ledgerOrWarn(botId: string, write: () => void): void {
-  try {
-    write();
-  } catch (err) {
-    console.warn(`[FleetReplica] ${botId}: the re-seed ledger could not be written: ${errorText(err)}`);
-  }
-}
-
-function ledgerSuccess(botId: string): void {
-  patchLedger(botId, current => ({ attempts: 0, lastAttemptAt: current?.lastAttemptAt ?? Date.now(), trigger: current?.trigger ?? 'automatic', lastSuccessAt: Date.now() }));
 }
 
 /** Record a run that ended while a cancel stood, wherever it ended. */
@@ -343,38 +285,12 @@ function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, co
     ? 'cancelled by the operator'
     : purpose === 'reseed-standby'
       ? 'cancelled after the old copy was cleared, so this standby holds no usable copy until it is re-seeded or removed'
-      : 'cancelled after the stale database was retired, so this instance now runs with no copy of its database (its pre-reseed dump is in the backups list if it succeeded)';
-  // The attempt is already counted, so the ledger must carry its reason or
-  // the modal keeps reporting an attempt that is no longer running.
-  if (purpose === 'reseed-standby') ledgerOrWarn(botId, () => ledgerFailure(botId, what));
+      : 'cancelled after the stale database was retired, so this instance has no copy of its database (its pre-reseed dump is in the backups list if it succeeded)';
   if (!stranded) {
     clearSeed(botId);
     return;
   }
   saveSeed(botId, { parked: true, cancelRequested: false, cancelled: true, lastError: what });
-}
-
-/** What the automatic re-seed will still do for this standby: the attempts left and when the next may fire, or why none will. */
-export function autoReseedOutlook(instance: InstanceConfig, now: number = Date.now()): FleetReplicaAutoReseedOutlook {
-  const ledger = instance.fleetDbReplica?.autoReseed;
-  const attempts = ledger?.attempts ?? 0;
-  if (attempts >= AUTO_RESEED_MAX_ATTEMPTS) return { remaining: 0, nextAt: null, none: `it stopped after ${attempts} attempts; fix the cause, then use Re-seed now` };
-  if (instance.fleetDbReplicaSeed?.cancelled === true) return { remaining: 0, nextAt: null, none: 'the last re-seed was cancelled, so nothing retries it; use Re-seed now when you want it' };
-  return { remaining: AUTO_RESEED_MAX_ATTEMPTS - attempts, nextAt: ledger ? Math.max(now, ledger.lastAttemptAt + AUTO_RESEED_SPACING_MS) : now, none: null };
-}
-
-export interface FleetReplicaAutoReseedOutlook {
-  remaining: number;
-  nextAt: number | null;
-  /** Why no automatic attempt will fire; null while one may. */
-  none: string | null;
-}
-
-/** Whether the automatic re-seed may fire for this standby: under the cap and past the spacing. */
-export function autoReseedAllowed(rec: FleetDbReplicaRecord, now: number = Date.now()): boolean {
-  const ledger = rec.autoReseed;
-  if (!ledger) return true;
-  return ledger.attempts < AUTO_RESEED_MAX_ATTEMPTS && now - ledger.lastAttemptAt >= AUTO_RESEED_SPACING_MS;
 }
 
 // 'absent' only when docker itself says "no such volume": any other failure
@@ -494,12 +410,6 @@ export interface FleetReplicaStatus {
   /** What a finished seed left undone (its record clear, or the Apply mark), and the seed it belongs to, for Dismiss. */
   seedNote?: string;
   seedNoteStartedAt?: number;
-  /** The automatic re-seed's attempt ledger, from the standby record. */
-  autoReseed?: FleetReplicaAutoReseedLedger;
-  /** The ledger hit the attempt cap: nothing re-fires until an operator asks. */
-  autoReseedStopped?: boolean;
-  /** The automatic attempts left and the next one's time, or why none will fire. */
-  autoReseedOutlook?: FleetReplicaAutoReseedOutlook;
   lastError?: string;
   /** The standby could not be read (live stays absent): the last line docker or psql gave. */
   probeError?: string;
@@ -563,11 +473,6 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
   if (pinsWarning) status.pinsWarning = pinsWarning;
   const rec = instance.fleetDbReplica;
   if (!rec) return status;
-  if (rec.autoReseed) {
-    status.autoReseed = rec.autoReseed;
-    status.autoReseedStopped = rec.autoReseed.attempts >= AUTO_RESEED_MAX_ATTEMPTS;
-  }
-  status.autoReseedOutlook = autoReseedOutlook(instance);
   status.record = {
     containerName: rec.containerName,
     publicHost: rec.publicHost,
@@ -740,7 +645,6 @@ function startProvisioning(
     } catch (err) {
       holdSeed(instance.id, now, {}, err, true);
     }
-    if (purpose === 'reseed-standby') ledgerOrWarn(instance.id, () => ledgerSuccess(instance.id));
   }, err => {
     if (!ownsRecord()) return;
     const message = String(err instanceof Error ? err.message : err);
@@ -756,7 +660,6 @@ function startProvisioning(
         settleCancelledSeed(instance.id, purpose, seed?.committed === true);
         return;
       }
-      if (purpose === 'reseed-standby') ledgerOrWarn(instance.id, () => ledgerFailure(instance.id, message));
       saveSeed(instance.id, { parked: true, lastError: message });
     } catch (writeErr) {
       holdSeed(instance.id, now, { parked: true, lastError: err instanceof SeedSuperseded ? `${message}; nothing is left to retry, so Dismiss this` : message }, writeErr);
@@ -1072,14 +975,13 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   if (purpose === 'reseed-standby' && (!current || current.containerName !== record.containerName || current.volume !== record.volume)) {
     throw new SeedSuperseded('the standby record was removed while the re-seed ran');
   }
-  const ledger = current?.autoReseed;
   // The copy is byte-complete here, so it goes back whole. Stripped explicitly:
   // a retry was handed the record an earlier attempt had already marked.
   const { copyCleared: _whole, ...restored } = record;
   // The seed that built it, by identity: the run that asked reads it back.
   const builtBy = seedRecord(instance.id)?.startedAt;
   const rebuilt = { ...restored, seededAt: Date.now(), ...(typeof builtBy === 'number' ? { seededBy: builtBy } : {}) };
-  containerManager.updateInstanceFleetDbReplica(instance.id, ledger ? { ...rebuilt, autoReseed: ledger } : rebuilt);
+  containerManager.updateInstanceFleetDbReplica(instance.id, rebuilt);
   if (containerManager.getBot(instance.id)?.fleetDbReplicaKept?.volume === record.volume) containerManager.updateInstanceFleetDbReplicaKept(instance.id, null);
   const apply = await containerManager.applyFleetDbReplicaService(instance.id);
   if (!apply.success) {
@@ -1250,12 +1152,10 @@ export async function instanceRemovalRefusal(
 }
 
 /**
- * Stop pinning the fleet database on a node that no longer hosts it. A worker
- * is not told its database by the manager at all: the master delivers it on
- * register and the bot persists it in its own env file. Leaving the old values
- * in the manager env would pin them into the container, where they outrank the
- * app's own store, so the master's delivery could never take effect and this
- * node could never pair-promote later (its own promote refuses on exactly that
+ * Stop pinning the fleet database on a node that no longer hosts it. The bot
+ * keeps its own database URL in its own env file. Leaving the old values in
+ * the manager env would pin them into the container, where they outrank the
+ * app's own store, and this node could never pair-promote later (its own promote refuses on exactly that
  * pin). The mode key goes too, otherwise the next rebuild reads it with no URL
  * beside it and mints a fresh sidecar for a node that just stopped having one.
  */
@@ -1337,7 +1237,7 @@ function uneditedPinsWarning(files: string[]): string {
 function companionEnvKeys(botId: string): string[] {
   const db = findAppCapabilities(containerManager.getBot(botId)?.sourceUrl)?.companionDb;
   if (!db) return [];
-  const keys = [db.env.url, db.env.publicUrl, db.env.mode?.key];
+  const keys = [db.env.url, db.env.mode?.key];
   return Array.from(new Set(keys.filter((k): k is string => !!k)));
 }
 
@@ -1470,7 +1370,7 @@ export function reseedStalePrimary(
       // The dump above takes minutes, so a cancel filed during it is honoured
       // here, with the sidecar running and the record intact.
       throwIfCancelled(instance.id);
-      const retired = await retireStaleOwnDb(instance.id);
+      const retired = await containerManager.retireFleetDbSidecar(instance.id);
       if (!retired.success) {
         if (retired.volumeRemoved) {
           fenced = false;
@@ -1489,10 +1389,9 @@ export function reseedStalePrimary(
     // before it touches the volume leaves everything in place, and a cancel
     // filed there must not claim the database is gone.
     saveSeedOrHold(instance.id, { committed: true });
-    // BEFORE the seed: if the seed then fails, this node is an ordinary worker
-    // that will take the live fleet database from the master's next delivery
-    // and merely lacks a standby, which beats staying pinned to a database
-    // that was just deleted.
+    // BEFORE the seed: if the seed then fails, the instance has no database
+    // until the operator acts, which beats staying pinned to a database that
+    // was just deleted.
     const pins = retireFleetDbEnvPins(instance.id);
     if (pins.unedited.length > 0) console.error(`[FleetReplica] ${instance.id}: ${uneditedPinsWarning(pins.unedited)}`);
     if (pins.unretired.length > 0) {
@@ -1730,8 +1629,8 @@ export async function instanceDataDir(instance: InstanceConfig): Promise<string>
 
 /**
  * The fleet database password, for an instance whose manager env store has
- * none. A worker is never told the URL by the manager: the master delivers it
- * on register and the bot persists it in its OWN env file (declared as
+ * none. The manager does not hold the URL here: the bot persists it in its
+ * OWN env file (declared as
  * companionDb.appEnvFile, ruling F1: the file read serves exactly the flows
  * where the app is stopped and no hook can answer), so that file is the only
  * place this machine's copy of the fleet credentials exists. An unparseable
@@ -1924,32 +1823,6 @@ export async function fleetDbPasswordFallback(instance: InstanceConfig): Promise
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!db || (envManager.getEnvVars(instance.id)[db.env.url] || '').trim() !== '') return undefined;
   return fleetPasswordFromBotEnv(await instanceDataDir(instance), db) ?? undefined;
-}
-
-/**
- * The copy block for a stand-in's PROMOTED copy (20.5, B6 map F33): the
- * temporary source the returning master re-seeds from. Nothing is filed and
- * nothing is delivered to the bot, so peers still receive no seed source
- * (F35). The credential is the one the seed wrote into this copy's own
- * primary_conninfo: the byte-copied catalog still holds that role, the
- * byte-copied pg_hba still admits it over TLS, and the certificate is the one
- * the seed minted for this machine's endpoint.
- */
-export async function getStandInCopyBlock(
-  instance: InstanceConfig,
-): Promise<{ success: boolean; error?: string; dsn?: string; cert?: string }> {
-  const rec = instance.fleetDbReplica;
-  if (!rec) return { success: false, error: 'This instance has no standby' };
-  if (!rec.user || !rec.db) return { success: false, error: 'This standby record predates identity stamping; the copy cannot be read' };
-  const recovery = await replicaExec(rec.containerName, ['psql', '-U', rec.user, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery();']);
-  if (!recovery.ok) return { success: false, error: 'The copy could not be probed (is the standby container running?)' };
-  if (recovery.stdout.trim() !== 'f') return { success: false, error: 'This copy is still in recovery, so it is not a source yet' };
-  const credential = await readCopyCredential(rec);
-  if (!credential) return { success: false, error: 'The replication credential could not be recovered from the copy\'s own connection settings' };
-  const cert = await replicaExec(rec.containerName, ['cat', `${PGDATA}/server.crt`]);
-  if (!cert.ok) return { success: false, error: 'Could not read the copy\'s server certificate' };
-  const dsn = `postgresql://${credential.user}:${encodeURIComponent(credential.password)}@${rec.publicHost}:${rec.hostPort}/${rec.db}?sslmode=verify-full`;
-  return { success: true, dsn, cert: cert.stdout };
 }
 
 /** The replication credential the seed wrote into this copy's own primary_conninfo; null when unreadable. */
@@ -2152,33 +2025,26 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
       if (apply.success) {
         if (seed.purpose === 'provision') await containerManager.markPendingApplyIfRunning(instance.id);
         if (seedRecord(instance.id)?.startedAt === seed.startedAt) containerManager.updateInstanceFleetDbReplicaSeed(instance.id, null);
-        if (seed.purpose === 'reseed-standby') ledgerSuccess(instance.id);
         continue;
       }
       const failed = `the manager restarted while the standby was starting, and starting it again failed: ${apply.error}`;
       saveSeed(instance.id, { parked: true, lastError: failed });
-      if (seed.purpose === 'reseed-standby') ledgerFailure(instance.id, failed);
       continue;
     }
     const message = `the manager restarted during the seed (phase ${seed.phase})`;
     saveSeed(instance.id, { parked: true, lastError: message });
-    if (seed.purpose === 'reseed-standby') ledgerFailure(instance.id, message);
   }
 }
 
 /**
- * Re-seed an existing standby whose slot the primary reports lost (20.14). The
- * orchestrator's entry: it keys on the manager's OWN standby record and never
- * passes through provisionFleetReplica's intake guards. The fact that fired it
- * is the TRIGGER; everything here is the manager's PERMIT: an unpromoted copy,
- * no other operation, and a copy block the bot itself holds (relayed by the
- * master to designated backups) that names the primary this standby follows.
- * Every refusal after the attempt is counted is written to the ledger, so
- * "it stopped and asks" shows its reason. A copy the probe reports out of
- * recovery is refused whoever asks; the copy must also be up, unless the
+ * Re-seed an existing standby at the operator's request. It keys on the
+ * manager's OWN standby record and never passes through provisionFleetReplica's
+ * intake guards. It needs an unpromoted copy, no other operation, and a copy
+ * block the bot itself holds that names the primary this standby follows.
+ * A copy the probe reports out of recovery is refused; the copy must also be up, unless the
  * manager itself already cleared it, when there is nothing left to protect.
  */
-export async function reseedStandby(instance: InstanceConfig, trigger: 'automatic' | 'operator'): Promise<{ success: boolean; error?: string; started?: boolean }> {
+export async function reseedStandby(instance: InstanceConfig): Promise<{ success: boolean; error?: string; started?: boolean }> {
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to re-seed' };
   if (seedRunning(instance.id)) return { success: false, error: 'A seed is already running on this instance' };
@@ -2188,12 +2054,7 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   const capability = capabilityRefusal(instance);
   if (capability) return { success: false, error: capability };
   const status = await getFleetReplicaStatus(instance);
-  if (trigger === 'operator') patchLedger(instance.id, () => undefined);
-  ledgerAttempt(instance.id, trigger);
-  const refuse = (error: string): { success: false; error: string } => {
-    ledgerOrWarn(instance.id, () => ledgerFailure(instance.id, error));
-    return { success: false, error };
-  };
+  const refuse = (error: string): { success: false; error: string } => ({ success: false, error });
 
   // Never re-seeded over, whoever asks and whatever a stopped run left behind:
   // a promoted copy is the database its fleet now serves.
@@ -2216,13 +2077,13 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
   if (!facts.success) return refuse(`Could not read the copy block from the app: ${facts.error}`);
   const block = facts.facts?.copyBlock;
   if (!block?.dsn || !block.cert) {
-    return refuse('The bot holds no copy block for the primary (only a designated backup receives one); remove the replica and provision it again from the block on the primary machine');
+    return refuse('Re-seed has no source for the main\'s copy block on this manager yet, so nothing was changed. To replace the copy: press Remove replica (the volume is kept), then Provision with the copy block from the main\'s manager, and confirm clearing the kept volume when asked');
   }
   // The app's own verdict. The source check below cannot stand in for it: a
-  // block inherited from a former master names the very primary this standby
+  // stale block names the very primary this standby
   // still follows, so it passes that check while naming a fenced database.
   if (facts.facts?.copyBlockCurrent === false) {
-    return refuse('The block this node holds names a database that is not the one the fleet follows now (it came from a former master). The current primary\'s block reaches this node only at its next registration with that primary, once that primary\'s manager has published it (opening its Replication section does): restart this bot after that, then re-seed');
+    return refuse('The copy block this bot holds names a database the fleet no longer follows, so nothing was changed. To replace the copy: press Remove replica (the volume is kept), then Provision with the copy block from the current main\'s manager, and confirm clearing the kept volume when asked');
   }
   const validated = validateIntake(block.dsn, block.cert, rec.publicHost, rec.hostPort);
   if (!validated.ok) return refuse(`The copy block the bot holds is unusable: ${validated.error}`);
@@ -2252,11 +2113,6 @@ export async function reseedStandby(instance: InstanceConfig, trigger: 'automati
         && slotFactFresh(fact.receivedAt);
       if (!leftBehind) {
         return refuse(`The copy block names ${dsn.host}:${dsn.port} but this standby follows ${rec.primaryHost}:${rec.primaryPort}, and the bot does not report its source as a former master; remove the replica and provision it from the new primary instead`);
-      }
-      // F5 rules out an automatic repoint: moving a standby to a different
-      // primary is the operator's decision, never a lane that runs on its own.
-      if (trigger !== 'operator') {
-        return refuse(`This standby follows ${rec.primaryHost}:${rec.primaryPort}, which is no longer the fleet's master; repointing it at ${dsn.host}:${dsn.port} is an operator decision, so the automatic re-seed stops here`);
       }
     }
     target = { ...rec, primaryHost: dsn.host, primaryPort: dsn.port };

@@ -231,15 +231,14 @@ describe('B22-2s: a seed whose first record write is refused frees what its call
     expect(containerManager.isBotBusy('b1')).toBeNull();
   });
 
-  it('a standby re-seed answers that the seed did not start, leaves the instance free and records the reason', async () => {
+  it('a standby re-seed answers that the seed did not start and leaves the instance free', async () => {
     h.hooks = true;
     writeRegistry({ fleetDbReplica: { ...REPLICA } });
     h.refuseFirst = true;
-    const res = await reseedStandby(bot(), 'operator');
+    const res = await reseedStandby(bot());
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/^The seed did not start: its record could not be saved/);
     expect(containerManager.isBotBusy('b1')).toBeNull();
     expect(bot().fleetDbReplicaSeed).toBeUndefined();
-    expect(bot().fleetDbReplica?.autoReseed?.lastError).toMatch(/^The seed did not start/);
   });
 });

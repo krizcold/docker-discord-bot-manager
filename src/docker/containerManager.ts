@@ -250,15 +250,13 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  * the record's secrets replaced by ***.
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
-  const has = [inst.fleetDbReplicaSeed, inst.fleetDbReplica?.autoReseed]
-    .some(r => typeof r?.lastError === 'string' && r.lastError !== '');
+  const has = typeof inst.fleetDbReplicaSeed?.lastError === 'string' && inst.fleetDbReplicaSeed.lastError !== '';
   if (!has && !inst.fleetRestoreError) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
   const out: InstanceConfig = { ...inst };
   if (out.fleetDbReplicaSeed) out.fleetDbReplicaSeed = scrub(out.fleetDbReplicaSeed);
-  if (out.fleetDbReplica?.autoReseed) out.fleetDbReplica = { ...out.fleetDbReplica, autoReseed: scrub(out.fleetDbReplica.autoReseed) };
   if (out.fleetRestoreError) out.fleetRestoreError = { ...out.fleetRestoreError, text: redactSecrets(out.fleetRestoreError.text, secrets) };
   return out;
 }
@@ -754,15 +752,6 @@ export function updateInstanceFleetRestoreError(botId: string, notice: { file: s
   saveRegistry(registry);
 }
 
-export function updateInstanceFleetOwnDbRetired(botId: string, at: string): void {
-  const registry = loadRegistry();
-  const instance = registry.instances[botId];
-  if (!instance) return;
-  instance.fleetOwnDbRetiredAt = at;
-  instance.updatedAt = new Date().toISOString();
-  saveRegistry(registry);
-}
-
 /** For modules that change an instance outside a route (the routes broadcast themselves). */
 export function broadcastBotUpdated(botId: string): void {
   if (broadcastFn) broadcastFn('bot:updated', withoutRecordSecrets(getBot(botId)));
@@ -858,7 +847,6 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   delete stored.fleetDbReplica;
   // The seed record is about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
-  delete stored.fleetOwnDbRetiredAt;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   const live = getBot(botId);
@@ -866,7 +854,6 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     live.fleetDb = { ...stored.fleetDb };
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
-    delete live.fleetOwnDbRetiredAt;
   }
   // A standby deployed before the app depended on it: order compose down now,
   // so the restart this adopt asks for stops the app before its database.
@@ -954,8 +941,8 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
   const unread = strippedDeployedCompose(composePath, removeFleetDbServices).error;
   if (unread) return { success: false, error: `the deployed compose could not be read (${unread}); nothing was removed` };
   // The mark goes on the record BEFORE the container and the volume: a
-  // failure after the volume removal leaves a record that Start, a failback
-  // Cancel and the next decommission read as a database being destroyed.
+  // failure after the volume removal leaves a record that Start and the next
+  // decommission read as a database being destroyed.
   const markedHere = !fleetDb.retiringAt;
   const retiringAt = fleetDb.retiringAt ?? new Date().toISOString();
   try {
@@ -4357,12 +4344,10 @@ function stampFleetDb(instance: InstanceConfig, record: FleetDbRecord): void {
   const inst = registry.instances[instance.id];
   if (inst) {
     inst.fleetDb = record;
-    delete inst.fleetOwnDbRetiredAt;
     inst.updatedAt = new Date().toISOString();
     saveRegistry(registry);
   }
   instance.fleetDb = record;
-  delete instance.fleetOwnDbRetiredAt;
 }
 
 function buildGitInstance(instance: InstanceConfig, emit: EmitFn, isCasaOS: boolean): Promise<LaneResult> {

@@ -266,28 +266,28 @@ describe('RM1 F3: the primary and its copy keep separate stuck-fence warnings', 
 
   it('a stuck fence shows on its own reader, never as a backup failure', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
+    expect(await fb.liftLaneFence('a', primary, OWNER, 'a re-seed', 'x')).not.toBe('');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
     expect(fb.getFleetBackupError('a')).toBeNull();
   });
 
   it('a lift on the copy leaves the primary\'s stuck-fence warning in place', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
-    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('failed');
+    expect(await fb.liftLaneFence('a', primary, OWNER, 'a re-seed', 'x')).not.toBe('');
+    expect(await fb.liftLaneFence('a', copy, OWNER, 'a re-seed', 'reseed')).not.toBe('');
     h.liftWorks = true;
     h.onLift = (c) => { if (c === primary.containerName) throw new Error('the primary must not be lifted here'); };
-    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('lifted');
+    expect(await fb.liftLaneFence('a', copy, OWNER, 'a re-seed', 'reseed')).toBe('');
     expect(fb.getFleetFenceStuck('a')).toContain('READ-ONLY');
   });
 
   it('a lift on the primary leaves the copy\'s warning, whichever stuck first', async () => {
     const fb = await restartedManager();
-    expect(await fb.liftConsentFence('a', copy, OWNER, 'reseed')).toBe('failed');
-    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('failed');
+    expect(await fb.liftLaneFence('a', copy, OWNER, 'a re-seed', 'reseed')).not.toBe('');
+    expect(await fb.liftLaneFence('a', primary, OWNER, 'a re-seed', 'x')).not.toBe('');
     h.liftWorks = true;
     h.onLift = (c) => { if (c === copy.containerName) throw new Error('the copy must not be lifted here'); };
-    expect(await fb.liftConsentFence('a', primary, OWNER, 'x')).toBe('lifted');
+    expect(await fb.liftLaneFence('a', primary, OWNER, 'a re-seed', 'x')).toBe('');
     expect(fb.getFleetFenceStuck('a')).toContain('reseed');
   });
 

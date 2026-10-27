@@ -70,7 +70,7 @@ beforeEach(() => {
   fs.rmSync(path.join(tmp.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: fakeUrl, DATA_BACKEND_PUBLIC_URL: 'postgresql://fake-public' });
+  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: fakeUrl });
 });
 
 afterAll(() => {

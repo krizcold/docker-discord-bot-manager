@@ -89,7 +89,6 @@ import * as path from 'path';
 import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
-import { disableFleetReplication } from '../../src/instance/fleetReplication';
 import { cancelReplicaSeed, decommissionFleetDb, getFleetReplicaStatus, reseedStalePrimary } from '../../src/instance/fleetReplica';
 
 const botDir = path.join(tmp.dir, 'bots', 'b1');
@@ -115,7 +114,7 @@ beforeEach(() => {
   fs.rmSync(path.join(tmp.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: fakeUrl, DATA_BACKEND_PUBLIC_URL: 'postgresql://fake-public' });
+  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: fakeUrl });
 });
 
 afterAll(() => {
@@ -123,25 +122,6 @@ afterAll(() => {
 });
 
 const unwritableCompose = (): void => { fs.mkdirSync(composePath, { recursive: true }); };
-
-describe('disabling replication', () => {
-  it('answers a named warning when the compose could not be edited', async () => {
-    writeRegistry({ fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'v', replication: { role: 'replicator', password: 'fake', hostPort: 5433, publicHost: 'h', certHost: 'h' } } });
-    unwritableCompose();
-    const res = await disableFleetReplication(containerManager.getBot('b1')!);
-    expect(res.success).toBe(true);
-    expect(res.warning).toContain(composePath);
-    expect(res.warning).toContain('DATA_BACKEND_PUBLIC_URL');
-  });
-
-  it('answers no warning when the compose was edited', async () => {
-    writeRegistry({ fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'v', replication: { role: 'replicator', password: 'fake', hostPort: 5433, publicHost: 'h', certHost: 'h' } } });
-    fs.writeFileSync(composePath, YAML.stringify({ services: { app: { image: 'fake/app:1', environment: { DATA_BACKEND_PUBLIC_URL: 'postgresql://fake-public' } } } }));
-    const res = await disableFleetReplication(containerManager.getBot('b1')!);
-    expect(res).toMatchObject({ success: true });
-    expect(res.warning).toBeUndefined();
-  });
-});
 
 describe('decommissioning the database', () => {
   it('answers a named warning when the compose could not be edited, and keeps it on the instance', async () => {

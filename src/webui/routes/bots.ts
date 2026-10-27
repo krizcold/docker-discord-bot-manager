@@ -1905,9 +1905,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/fleet-replica/reseed - Re-seed this standby now from
-   * the copy block the bot holds (the automatic re-seed's manual retry; resets
-   * its attempt ledger). Async: poll GET /fleet-replica for the phase.
+   * POST /api/bots/:id/fleet-replica/reseed - Re-seed this standby; refuses
+   * when the bot reports no usable copy block. Async: poll GET /fleet-replica for the phase.
    */
   router.post('/:id/fleet-replica/reseed', async (req: Request, res: Response) => {
     try {
@@ -1916,7 +1915,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await fleetReplica.reseedStandby(bot, 'operator');
+      const result = await fleetReplica.reseedStandby(bot);
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {

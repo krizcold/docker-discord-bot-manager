@@ -94,23 +94,12 @@ export interface FleetDbReplicaRecord {
   publicHost: string;                  // this machine's advertised host (post-promotion serving)
   hostPort: number;                    // published host port (container 5432)
   certHost: string;                    // host THIS standby's own server cert names
-  /** The automatic re-seed's attempt ledger (PLAN_REPLICATION 20.14): paces the tick and stops it after the cap. */
-  autoReseed?: FleetReplicaAutoReseedLedger;
   /** The manager cleared this copy for a re-seed that has not finished: there is nothing to serve, protect or start. */
   copyCleared?: boolean;
   /** When this copy was last built whole. Absent on records stamped before 2026-09-09. */
   seededAt?: number;
   /** The seed that last built this copy whole (its startedAt): the run that asked for that seed reads it back as identity. */
   seededBy?: number;
-}
-
-export interface FleetReplicaAutoReseedLedger {
-  attempts: number;
-  lastAttemptAt: number;
-  /** Who asked for the last attempt, so the operator's own retry is never reported as the automation's. */
-  trigger: 'automatic' | 'operator';
-  lastError?: string;
-  lastSuccessAt?: number;
 }
 
 export type FleetReplicaSeedPurpose = 'provision' | 'reseed-standby' | 'reseed-stale-primary';
@@ -183,7 +172,6 @@ export interface InstanceConfig {
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
   fleetDbReplicaKept?: { volume: string; removedAt: string; held: 'standby' | 'promoted' | 'unknown' }; // what the volume Remove replica kept held then; cleared when a seed refiles a standby on it
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
-  fleetOwnDbRetiredAt?: string;       // ISO time a re-seed as a stale primary retired this machine's own fleet database; cleared when a database record is stamped or a standby is adopted as the primary
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
   fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it

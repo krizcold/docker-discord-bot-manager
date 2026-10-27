@@ -126,38 +126,15 @@ export function hasAppHooks(instance: InstanceConfig): boolean {
 }
 
 export interface AppFacts {
-  running: boolean;
-  initialized: boolean;
-  role: string | null;
-  nodeId: string | null;
-  nodeName: string | null;
-  term: number | null;
-  standalone: boolean;
-  backupMaster: boolean;
-  /** The running bot's consent to active backup mode, as it booted; the saved env may differ until the container is recreated. */
-  activeCapable?: boolean;
-  /** The app's own verdict that this node is where the copy block belongs. */
-  copyBlockTarget: boolean;
-  superseded: { byNodeId: string; byNodeName: string; term: number; retireRequested: boolean; at: number; source: string; steppedDown: boolean } | null;
-  promote: any;
-  emptyStoreHold: any;
-  takeoverHold: any;
-  staleMasterPark: { observedTerm: number; localTerm: number; peerUrl: string; at: number } | null;
   copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
   /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
   copyBlockCurrent?: boolean | null;
-  /** The app's own verdict that the block names the database it FOLLOWS while holding or after a step-down (B6 map F32): the source the failback re-seeds from. */
-  copyBlockFollowed?: boolean | null;
-  /** The app's container carries a standby endpoint (it learned its standby); null while the bot is down. */
-  dbReplica?: boolean | null;
   /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
   standbySlot: {
     slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;
     observedAt: number; receivedAt: number; fromNodeId: string; fromTerm: number; sourceIsCurrentMaster: boolean | null;
     sourceAt: number;
   } | null;
-  /** The app's own verdict: the fact is fresh, the slot is lost, and it is on the master this copy follows. */
-  standbySlotLost: boolean;
 }
 
 export interface ActionResult {

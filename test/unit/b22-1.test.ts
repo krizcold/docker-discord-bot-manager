@@ -171,7 +171,7 @@ describe('R16-40: a re-seed over a whole parked copy does not inherit cleared', 
     h.hooks = true;
     h.probeOk = false;
     writeRegistry({ fleetDbReplica: { ...REPLICA, seededBy: 1000 }, fleetDbReplicaSeed: seedOf(1000, { parked: true, committed: true, lastError: 'the manager restarted during the seed (phase starting)' }) });
-    const res = await reseedStandby(bot(), 'operator');
+    const res = await reseedStandby(bot());
     expect(res).toMatchObject({ success: true });
     expect(bot().fleetDbReplicaSeed?.committed).toBeUndefined();
     await waitFor(() => bot().fleetDbReplicaSeed?.parked === true);
@@ -183,7 +183,7 @@ describe('R16-40: a re-seed over a whole parked copy does not inherit cleared', 
     h.hooks = true;
     h.probeOk = false;
     writeRegistry({ fleetDbReplica: { ...REPLICA, copyCleared: true }, fleetDbReplicaSeed: seedOf(1000, { phase: 'seeding', parked: true, committed: true, lastError: 'pg_basebackup failed' }) });
-    const res = await reseedStandby(bot(), 'operator');
+    const res = await reseedStandby(bot());
     expect(res).toMatchObject({ success: true });
     expect(bot().fleetDbReplicaSeed?.committed).toBe(true);
     await waitFor(() => bot().fleetDbReplicaSeed?.parked === true);
@@ -200,13 +200,11 @@ describe('R17-12 and R16-37: a seed the restart caught at starting with its stan
     expect(bot().fleetDbReplica?.seededBy).toBe(5000);
   });
 
-  it('a re-seed is settled at boot and its ledger records the success', async () => {
-    writeRegistry({ fleetDbReplica: { ...REPLICA, seededBy: 5000, autoReseed: { attempts: 1, lastAttemptAt: 4000, trigger: 'automatic' } }, fleetDbReplicaSeed: seedOf(5000, { committed: true }) });
+  it('a re-seed is settled at boot', async () => {
+    writeRegistry({ fleetDbReplica: { ...REPLICA, seededBy: 5000 }, fleetDbReplicaSeed: seedOf(5000, { committed: true }) });
     await parkInterruptedReplicaSeeds();
     expect(h.applied).toBe(1);
     expect(bot().fleetDbReplicaSeed).toBeUndefined();
-    expect(bot().fleetDbReplica?.autoReseed?.attempts).toBe(0);
-    expect(bot().fleetDbReplica?.autoReseed?.lastSuccessAt).toBeTypeOf('number');
   });
 
   it('a failed boot start parks the seed with the reason and keeps the record', async () => {
@@ -321,7 +319,7 @@ describe('R9-23: a removal holds the instance until it ends', () => {
     h.removeGate = new Promise<void>((r) => { release = r; });
     const removing = removeFleetReplica(bot());
     await waitFor(() => h.removing);
-    const reseed = await reseedStandby(bot(), 'operator');
+    const reseed = await reseedStandby(bot());
     release();
     const res = await removing;
     await waitFor(() => containerManager.isBotBusy('b1') === null);

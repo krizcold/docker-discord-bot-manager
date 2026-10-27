@@ -185,7 +185,7 @@ describe('FU-7c: the re-seed ignores a slot fact received in the future', () => 
     h.hooks = true;
     h.probe = 't|streaming|f|1\n';
     h.facts = { ...leftBehindFact(Date.now() + 60_000), copyBlockCurrent: true, copyBlock: { dsn: 'postgresql://replicator:fakepass@other.invalid:5433/smdb', cert: PEM } };
-    const res = await fleetReplica.reseedStandby(bot(), 'operator');
+    const res = await fleetReplica.reseedStandby(bot());
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/does not report its source as a former master/);
   });

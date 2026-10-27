@@ -35,18 +35,12 @@ export interface CompanionDbSpec {
      */
     url: string;
     /**
-     * Canonical DSN a cross-host node dials instead. Authored and retired by
-     * the REPLICATION POSTURE on the hosting instance, not by hosting alone, so
-     * its absence on a live host means replication is off, not a gap to fill.
-     */
-    publicUrl?: string;
-    /**
      * Backend selector the app reads, e.g. DATA_BACKEND=postgres. Operator-set:
      * the install wizard owns the field, and the companion lifecycle never
      * authors it. It reads it as the provisioning gate (against the merged env
-     * view) and re-asserts it in the ENV STORE ONLY when adopting a promoted
-     * copy, so on an adopted node it reaches the container through the app's own
-     * store rather than the compose; the deployed compose carries it only where
+     * view) and re-asserts it in the ENV STORE ONLY when the operator's switch
+     * adopts a copy they promoted, so on an adopted node it reaches the
+     * container through the app's own store rather than the compose; the deployed compose carries it only where
      * the operator's own save put it in the instance record. Retired from all
      * three stores with the rest of the block on an instance that stops hosting:
      * left behind, the next rebuild reads it with no URL beside it and mints a
@@ -97,7 +91,6 @@ export type AppHookAction =
 // row can never drift from the declared key it edits.
 const smdbDbEnv = {
   url: 'DATA_BACKEND_URL',
-  publicUrl: 'DATA_BACKEND_PUBLIC_URL',
   mode: { key: 'DATA_BACKEND', value: 'postgres' },
 };
 

@@ -53,15 +53,6 @@ import {
   botPortBind,
   attachBotToProxy,
   domainRouteForwardAuth,
-  getFleetControlPort,
-  getFleetTransferPort,
-  getFleetControlService,
-  getFleetTransferService,
-  fleetPublicHost,
-  transferPublicHost,
-  attachFleetToProxy,
-  getPublishedFleetHostPort,
-  publishFleetHostPort,
   addFleetPostgresService,
   addFleetPostgresReplicaService,
   removeFleetPostgresReplicaService,
@@ -174,12 +165,13 @@ function loadRegistry(): InstanceRegistry {
 function withoutSensitiveKeys(envVars: Record<string, string> | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, raw] of Object.entries(envVars || {})) {
-    if (envManager.isSensitive(key)) continue;
     // Same scalar coercion as the store's write side, so one dual write can
     // never author two different values (a raw JSON null in the record would
     // bake a literal "null" into the compose while the store reads '').
     const given = raw as unknown;
-    out[key] = given === null || given === undefined ? '' : String(given);
+    const value = given === null || given === undefined ? '' : String(given);
+    if (envManager.isSensitive(key, value)) continue;
+    out[key] = value;
   }
   return out;
 }
@@ -242,7 +234,7 @@ export function recordSecrets(inst: InstanceConfig): string[] {
   try {
     for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
       if (!value) continue;
-      if (envManager.isSensitive(key)) secrets.push(value);
+      if (envManager.isSensitive(key, value)) secrets.push(value);
       const pw = urlPassword(value);
       if (pw) secrets.push(pw);
     }
@@ -2413,7 +2405,7 @@ export function setWebUiReady(botId: string, ready: boolean): void {
 // at <sanitizedName>.<base> over TLS, in addition to its localhost host-port.
 const BOT_DOMAIN_BASE = process.env.BOT_DOMAIN_BASE || '';
 
-function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string, fleetHostPort?: number, transferHostPort?: number): void {
+function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerPort?: number, publicUrl?: string, webUiPath?: string): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (instance) {
@@ -2421,8 +2413,6 @@ function updateInstanceWebAccess(botId: string, hostPort?: number, webContainerP
     instance.webContainerPort = webContainerPort;
     instance.publicUrl = publicUrl;
     instance.webUiPath = webUiPath;
-    instance.fleetHostPort = fleetHostPort;
-    instance.transferHostPort = transferHostPort;
     instance.updatedAt = new Date().toISOString();
     registry.instances[botId] = instance;
     saveRegistry(registry);
@@ -2455,10 +2445,6 @@ export function applyDockerHostPort(composeContent: string, instance: InstanceCo
     for (const b of getAllBots()) {
       if (b.id === instance.id) continue;
       if (typeof b.hostPort === 'number') used.add(b.hostPort);
-      const bFleet = b.fleetHostPort;
-      if (typeof bFleet === 'number') used.add(bFleet);
-      const bTransfer = b.transferHostPort;
-      if (typeof bTransfer === 'number') used.add(bTransfer);
     }
     return used;
   };
@@ -2508,72 +2494,7 @@ export function applyDockerHostPort(composeContent: string, instance: InstanceCo
     }
   }
 
-  // Fleet control endpoint (marker-driven): EVERY fleet node with a public base
-  // gets a wss control route on the bundled Caddy (no forward_auth -
-  // CONTROL_SECRET is the auth). Master-only before the warm-standby arc
-  // (PLAN_STANDBY 3.6): a promotable backup must be dialable in advance, so
-  // every node's route exists before any failover. Every marker instance also
-  // gets a localhost-bound control host-port for host-level tooling; same-box
-  // workers dial the master's container name over dbm_internal.
-  const control = getFleetControlService(content);
-  const transfer = getFleetTransferService(content);
-  let fleetHostPort: number | undefined;
-  let transferHostPort: number | undefined;
-  if (control !== null) {
-    const cp = findAppCapabilities(instance.sourceUrl)?.controlPlane;
-    if (BOT_DOMAIN_BASE) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-fleet.${BOT_DOMAIN_BASE}`, control.port,
-        { envAdvertise: cp ? { key: cp.env.publicUrl, scheme: cp.urlScheme.secure } : null, service: control.service });
-    }
-    // Transfer route: EVERY fleet node advertises one (migration legs dial in
-    // either direction), unlike the master-only control route. Only for an app
-    // whose compose declares the transfer marker label.
-    if (BOT_DOMAIN_BASE && transfer !== null) {
-      content = attachFleetToProxy(content, `${instance.sanitizedName}-transfer.${BOT_DOMAIN_BASE}`, transfer.port,
-        { envAdvertise: cp?.env.transferUrl ? { key: cp.env.transferUrl, scheme: cp.urlScheme.secure } : null, service: transfer.service });
-    }
-    const existing = getPublishedFleetHostPort(content, control.port, control.service);
-    if (existing !== null) {
-      fleetHostPort = existing;   // compose already publishes it; keep that mapping
-    } else {
-      const used = portsClaimedByOthers();
-      if (hostPort !== undefined) used.add(hostPort);
-      const prevFleetPort = instance.fleetHostPort;
-      const allocated = allocateHostPort({
-        botId: instance.id,
-        reuse: typeof prevFleetPort === 'number' ? prevFleetPort : undefined,
-        used,
-        hostBound: portsBoundOnHost(),
-      });
-      if (allocated !== null) {
-        fleetHostPort = allocated;
-        content = publishFleetHostPort(content, allocated, control.port, control.service);
-      }
-    }
-    if (transfer !== null) {
-      const existingTransfer = getPublishedFleetHostPort(content, transfer.port, transfer.service);
-      if (existingTransfer !== null) {
-        transferHostPort = existingTransfer;
-      } else {
-        const used = portsClaimedByOthers();
-        if (hostPort !== undefined) used.add(hostPort);
-        if (fleetHostPort !== undefined) used.add(fleetHostPort);
-        const prevTransferPort = instance.transferHostPort;
-        const allocated = allocateHostPort({
-          botId: instance.id,
-          reuse: typeof prevTransferPort === 'number' ? prevTransferPort : undefined,
-          used,
-          hostBound: portsBoundOnHost(),
-        });
-        if (allocated !== null) {
-          transferHostPort = allocated;
-          content = publishFleetHostPort(content, allocated, transfer.port, transfer.service);
-        }
-      }
-    }
-  }
-
-  updateInstanceWebAccess(instance.id, hostPort, info ? info.containerPort : undefined, publicUrl, webUiPath, fleetHostPort, transferHostPort);
+  updateInstanceWebAccess(instance.id, hostPort, info ? info.containerPort : undefined, publicUrl, webUiPath);
   return content;
 }
 
@@ -3061,7 +2982,7 @@ export function mergedEnvVars(instance: InstanceConfig): Record<string, string> 
   }
   const sensitive: Record<string, string> = {};
   for (const [key, value] of Object.entries(vars)) {
-    if (envManager.isSensitive(key)) sensitive[key] = value;
+    if (envManager.isSensitive(key, value)) sensitive[key] = value;
   }
   return { ...instance.envVars, ...sensitive };
 }
@@ -3074,77 +2995,10 @@ function buildEffectiveEnv(instance: InstanceConfig): Record<string, string> {
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   return {
     ...mergedEnvVars(instance),
-    ...fleetEnv(instance),
     BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '',
     BOT_ID: instance.id,
     BOT_MANAGER_INTERNAL_URL: internalUrl,
   };
-}
-
-/**
- * Fleet wiring derived from the deployed compose's marker labels, spelled by
- * the app's capability record: the control-port key whenever the control
- * marker is present; the public-URL key only for a node with a public base;
- * the transfer pair only when the compose also declares the transfer marker
- * (an absent label means the app has one channel). No record = no authored
- * env. Re-derived from the compose so start-time env syncs agree with what
- * the build exposed.
- */
-function fleetEnv(instance: InstanceConfig): Record<string, string> {
-  try {
-    const composePath = path.join(getBotDir(instance.id), 'docker-compose.yml');
-    if (!fs.existsSync(composePath)) return {};
-    const composeContent = fs.readFileSync(composePath, 'utf-8');
-    const controlPort = getFleetControlPort(composeContent);
-    if (controlPort === null) return {};
-    const env: Record<string, string> = {};
-    const cp = findAppCapabilities(instance.sourceUrl)?.controlPlane;
-    if (cp) {
-      env[cp.env.port] = String(controlPort);
-      const transferPort = getFleetTransferPort(composeContent);
-      if (transferPort !== null && cp.env.transferPort) env[cp.env.transferPort] = String(transferPort);
-      const host = fleetPublicHost(instance.sanitizedName);
-      // Advertise the control route only once the built compose actually
-      // serves it (same rule as the transfer URL below): a pre-standby worker
-      // build restarted after a manager update must not advertise a route no
-      // proxy label backs until its rebuild.
-      if (host && composeContent.includes(host)) env[cp.env.publicUrl] = `${cp.urlScheme.secure}://${host}`;
-      if (transferPort !== null && cp.env.transferUrl) {
-        const transferHost = transferPublicHost(instance.sanitizedName);
-        // Advertise the public route only once the built compose actually
-        // serves it: a pre-transfer build restarted after a manager update
-        // must not advertise a route no proxy label backs until its rebuild.
-        // No same-box container-name fallback: whether a peer can reach a
-        // container name is app topology the manager cannot judge (the old
-        // guess read the dial list and diverged from the app's own role
-        // resolution). A no-base rig sets the transfer URL by hand; without
-        // one the app refuses a migration loudly and names the fix.
-        if (transferHost && composeContent.includes(transferHost)) env[cp.env.transferUrl] = `${cp.urlScheme.secure}://${transferHost}`;
-      }
-    }
-    // Local standby hand-off (PLAN_REPLICATION.md Stage 3 consumes it): the
-    // bot's promote flow promotes this database first. Credentials are the
-    // fleet's own (same database, byte-copied auth); the bot splices them in.
-    if (instance.fleetDbReplica) {
-      const replica = instance.fleetDbReplica;
-      const dbSpec = findAppCapabilities(instance.sourceUrl)?.companionDb;
-      // replica.db absent = a record stamped before the identity fields:
-      // author nothing rather than guess; the standby needs a re-provision.
-      if (dbSpec && replica.db) {
-        // no-verify: the byte-copied PGDATA carries the primary's authored
-        // pg_hba (non-TLS only from 172.16/12) and ssl=on, so TLS keeps this
-        // dialable from any docker subnet (custom address pools included).
-        if (dbSpec.env.replicaUrl) env[dbSpec.env.replicaUrl] = `postgresql://${replica.containerName}:5432/${replica.db}?sslmode=no-verify`;
-        // What the FLEET dials once this pair is promoted: the same canonical
-        // shape the primary publishes, so cross-host workers keep working and
-        // the container-name URL above never escapes this machine.
-        if (dbSpec.env.replicaPublicUrl) env[dbSpec.env.replicaPublicUrl] = `postgresql://${replica.publicHost}:${replica.hostPort}/${replica.db}?sslmode=no-verify`;
-      }
-    }
-    return env;
-  } catch {
-    return {};
-  }
 }
 
 // Env vars that are inputs to compose $-substitution (e.g. the AppShield gateway
@@ -3225,32 +3079,6 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
         Object.assign(env, allEnv);
       } else {
         service.environment = { ...allEnv };
-      }
-      // Role or public base may have changed since build: a public-URL or
-      // transfer-URL value the build injected must not survive when no longer
-      // derivable. Cleanup only reaches keys the RECORD declares (the manager
-      // never authors any other app's spelling), and the transfer key only
-      // where the transfer marker exists; a pre-label compose keeps its built
-      // pins (they still match the routes its own build created) until its
-      // rebuild.
-      const cpDel = findAppCapabilities(instance.sourceUrl)?.controlPlane;
-      if (cpDel) {
-        if (!(cpDel.env.publicUrl in allEnv)) deleteComposeEnv(service.environment, cpDel.env.publicUrl);
-        if (cpDel.env.transferUrl && !(cpDel.env.transferUrl in allEnv) && getFleetTransferPort(raw) !== null) deleteComposeEnv(service.environment, cpDel.env.transferUrl);
-      }
-      // The local-replica keys must not survive in a compose once the standby
-      // they described is gone: a stale copy would keep pointing the app at a
-      // database this machine no longer hosts. Only keys the record declares
-      // are ever deleted (the manager authors no other spelling), and a
-      // PRE-FIELD standby record (no stamped identity) keeps its built pins:
-      // fleetEnv cannot re-author what it cannot derive, and the pins still
-      // match the live standby (the transfer-URL precedent from step 3).
-      const dbDel = findAppCapabilities(instance.sourceUrl)?.companionDb;
-      const preFieldReplica = !!instance.fleetDbReplica && !instance.fleetDbReplica.db;
-      if (!preFieldReplica) {
-        for (const key of [dbDel?.env.replicaUrl, dbDel?.env.replicaPublicUrl]) {
-          if (key && !(key in allEnv)) deleteComposeEnv(service.environment, key);
-        }
       }
       compose.services[targetName] = service;
     }

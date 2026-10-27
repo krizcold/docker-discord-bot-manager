@@ -36,7 +36,7 @@ const writeRegistry = (over: Record<string, unknown> = {}): void => {
     instances: {
       b1: {
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
-        sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'master' },
+        sourceType: 'git', sourceUrl: FLEET_URL, envVars: {},
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
         ...over,
       },
@@ -73,20 +73,12 @@ describe('the automatic re-seed outlook names the attempts left and when none re
 });
 
 describe('Provision after a re-seed retired this node\'s own database', () => {
-  it('passes the role gate for a node whose database the re-seed retired', () => {
-    writeRegistry({ fleetOwnDbRetiredAt: '2026-10-24T00:00:00.000Z' });
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
-    expect(res.error ?? '').not.toMatch(/A replica belongs beside a fleet worker/);
-  });
-
-  it('a re-seed retire that removed the database opens the role gate', async () => {
+  it('a re-seed retire that removed the database records it retired', async () => {
     writeRegistry();
     retire.result = { success: true };
     await fleetReplica.retireStaleOwnDb('b1');
     retire.result = null;
     expect(bot().fleetOwnDbRetiredAt).toBeTruthy();
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
-    expect(res.error ?? '').not.toMatch(/A replica belongs beside a fleet worker/);
   });
 
   it('a retire that failed after removing the volume still records the database retired', async () => {
@@ -104,14 +96,6 @@ describe('Provision after a re-seed retired this node\'s own database', () => {
     await fleetReplica.retireStaleOwnDb('b1');
     retire.result = null;
     expect(bot().fleetOwnDbRetiredAt).toBeUndefined();
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
-    expect(res.error).toMatch(/A replica belongs beside a fleet worker/);
-  });
-
-  it('still refuses a master that retired nothing', () => {
-    writeRegistry();
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
-    expect(res.error).toMatch(/A replica belongs beside a fleet worker/);
   });
 
   it('a node with its own database again is refused as the primary side', () => {
@@ -119,15 +103,11 @@ describe('Provision after a re-seed retired this node\'s own database', () => {
     const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
     expect(res.error).toMatch(/hosts the fleet database itself/);
   });
-  it('an adopt of the promoted copy clears the mark, so a later decommission does not open the gate', () => {
+  it('an adopt of the promoted copy clears the mark', () => {
     writeRegistry({ fleetOwnDbRetiredAt: '2026-10-24T00:00:00.000Z', fleetDbReplica: REPLICA });
     expect(containerManager.adoptFleetDbReplicaAsPrimary('b1').success).toBe(true);
     expect(bot().fleetOwnDbRetiredAt).toBeUndefined();
     const stored = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
     expect(stored.instances.b1.fleetOwnDbRetiredAt).toBeUndefined();
-    delete stored.instances.b1.fleetDb;
-    fs.writeFileSync(registryPath, JSON.stringify(stored));
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
-    expect(res.error).toMatch(/A replica belongs beside a fleet worker/);
   });
 });

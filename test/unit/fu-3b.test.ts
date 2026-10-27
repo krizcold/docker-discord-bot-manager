@@ -21,7 +21,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 import {
-  attachBotToProxy, attachFleetToProxy, createVolumeDirectories, frontingGateway, newDeliveryReport,
+  attachBotToProxy, createVolumeDirectories, frontingGateway, newDeliveryReport,
   prepareDockerBotFiles, processComposeForCasaOS,
 } from '../../src/templates/pcsProcessing';
 import { substituteComposeNames } from '../../src/compose/nameSubstitution';
@@ -360,7 +360,7 @@ describe('B06-3b no delivery directory is world-writable, and the bot user can s
 });
 
 describe('FU-2c every value the manager writes into a label or x-casaos field is $-escaped', () => {
-  it('casaos mode: the web, fleet and transfer caddy hosts hold the domain with $ written $$', () => {
+  it('casaos mode: the web caddy hosts hold the domain with $ written $$', () => {
     process.env.APP_DOMAIN = 'd$HOME.example';
     process.env.APP_PUBLIC_IP_DASH = '1-2-3-4';
     const compose = [
@@ -369,27 +369,20 @@ describe('FU-2c every value the manager writes into a label or x-casaos field is
       '    image: x',
       '    ports:',
       '      - "3000:3000"',
-      '    labels:',
-      '      fleet.control-port: "9000"',
-      '      fleet.transfer-port: "9001"',
       '',
     ].join('\n');
     const labels = processed(compose, 'bot1', 'casaos').services.bot.labels;
     const hosts = Object.entries(labels).filter(([k]) => /^caddy_\d+$/.test(k)).map(([, v]) => v);
-    expect(hosts.length).toBeGreaterThanOrEqual(5);
+    expect(hosts.length).toBeGreaterThan(0);
     for (const v of hosts) expect(String(v)).not.toMatch(/(^|[^$])\$HOME/);
     expect(hosts).toContain('bot1-d$$HOME.example');
-    expect(hosts).toContain('bot1-fleet-d$$HOME.example');
-    expect(hosts).toContain('bot1-transfer-d$$HOME.example');
     expect(processed(compose, 'bot1', 'casaos')['x-casaos'].hostname).toBe('bot1-d$$HOME.example');
   });
 
-  it('attachBotToProxy and attachFleetToProxy write the host with $ written $$', () => {
+  it('attachBotToProxy writes the host with $ written $$', () => {
     const compose = 'services:\n  bot:\n    image: x\n';
     const viaBot = YAML.parse(attachBotToProxy(compose, 'h$HOME.example', 3000));
     expect(viaBot.services.bot.labels.caddy).toBe('h$$HOME.example');
-    const viaFleet = YAML.parse(attachFleetToProxy(compose, 'h$HOME.example', 9000, { envAdvertise: null, service: 'bot' }));
-    expect(viaFleet.services.bot.labels.caddy_0).toBe('h$$HOME.example');
   });
 
   it('the name substitution writes the title name with $ written $$, and keeps repo text as written', () => {

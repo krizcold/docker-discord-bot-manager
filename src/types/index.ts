@@ -75,7 +75,7 @@ export interface FleetDbReplication {
 }
 
 // Manager-provisioned streaming REPLICA of another machine's fleet database
-// (PLAN_REPLICATION.md Stage 2). Lives beside a worker/backup-master instance;
+// (PLAN_REPLICATION.md Stage 2). Lives beside an instance that does not host the database;
 // seeded with pg_basebackup, runs as a hot standby, exposed like the primary
 // so it can serve the whole fleet after a promotion. The replicator password
 // is deliberately NOT retained here - it lives only inside the standby's own
@@ -174,8 +174,6 @@ export interface InstanceConfig {
   envVars?: Record<string, string>;
   port?: number;
   hostPort?: number;                   // docker mode: published host port for the bot's web UI
-  fleetHostPort?: number;              // docker mode: published 127.0.0.1 host port for the fleet control plane
-  transferHostPort?: number;           // docker mode: published 127.0.0.1 host port for the transfer channel (unset without its marker label)
   webContainerPort?: number;           // docker mode: the container port hostPort maps to
   publicUrl?: string;                  // docker remote mode: https URL when routed through the bundled Caddy
   webUiPath?: string;                  // docker mode: web entry path from x-casaos.index, e.g. "/dashboard"

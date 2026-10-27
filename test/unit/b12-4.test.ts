@@ -26,16 +26,6 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   getDeploymentMode: async () => 'docker',
 }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
-vi.mock('../../src/config/appCapabilities', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/config/appCapabilities')>()),
-  findAppCapabilities: () => ({
-    controlPlane: {
-      groupSecretEnv: 'FLEET_SECRET',
-      roleEnv: { key: 'FLEET_ROLE', default: 'leader', dialTargetOrder: ['leader', 'standby'], dialsOut: ['worker'] },
-      urlScheme: { secure: 'wss', plain: 'ws' },
-    },
-  }),
-}));
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -49,7 +39,7 @@ const composePath = path.join(botDir, 'docker-compose.yml');
 
 const writeCompose = (env: Record<string, string>): void => {
   fs.writeFileSync(composePath, YAML.stringify({
-    services: { app: { image: 'fake/app:1', container_name: 'bot1-app', labels: { 'fleet.control-port': '9500' }, environment: env } },
+    services: { app: { image: 'fake/app:1', container_name: 'bot1-app', environment: env } },
   }));
 };
 
@@ -82,45 +72,6 @@ const call = async (method: string, routePath: string, req: any): Promise<{ stat
   await layer.route.stack[layer.route.stack.length - 1].handle({ query: {}, body: {}, params: {}, ...req }, res);
   return out;
 };
-
-describe('the wizard master list offers only the secret the master was deployed with', () => {
-  it('fills the secret when the saved and deployed secrets agree', async () => {
-    const res = await call('get', '/fleet/masters', {});
-    expect(res.body.masters).toHaveLength(1);
-    expect(res.body.masters[0]).toMatchObject({ secretSet: true, controlSecret: 'deployed-secret', secretUnfilled: null });
-  });
-
-  it('leaves the secret unfilled, with the reason, when the saved secret was never deployed', async () => {
-    envManager.setEnvVars('b1', { FLEET_SECRET: 'saved-not-deployed' });
-    const res = await call('get', '/fleet/masters', {});
-    const m = res.body.masters[0];
-    expect(m.controlSecret).toBe('');
-    expect(m.secretUnfilled).toMatch(/not the one it was deployed with/);
-    expect(m.secretUnfilled).toMatch(/Restart Bot 1/);
-  });
-
-  it('compares only the compose that is deployed, not a stale bot-dir copy', async () => {
-    const casaDir = path.join(tmp.dir, 'DATA', 'AppData', 'casaos', 'apps', 'bot1');
-    fs.mkdirSync(casaDir, { recursive: true });
-    try {
-      fs.writeFileSync(path.join(casaDir, 'docker-compose.yml'), YAML.stringify({
-        services: { app: { image: 'fake/app:1', container_name: 'bot1-app', labels: { 'fleet.control-port': '9500' }, environment: { FLEET_SECRET: 'new-secret' } } },
-      }));
-      envManager.setEnvVars('b1', { FLEET_SECRET: 'new-secret' });
-      const m = (await call('get', '/fleet/masters', {})).body.masters[0];
-      expect(m).toMatchObject({ controlSecret: 'new-secret', secretUnfilled: null });
-    } finally {
-      fs.rmSync(path.join(tmp.dir, 'DATA'), { recursive: true, force: true });
-    }
-  });
-
-  it('leaves the secret unfilled when the deployed compose does not set it', async () => {
-    writeCompose({});
-    const m = (await call('get', '/fleet/masters', {})).body.masters[0];
-    expect(m.controlSecret).toBe('');
-    expect(m.secretUnfilled).toBeTruthy();
-  });
-});
 
 describe('an env save to a running bot is marked not applied', () => {
   it('sets pendingApply and says so in the reply', async () => {

@@ -186,7 +186,7 @@ export function createVaultRoutes(): Router {
             name: inst.displayName || inst.id,
             type: 'instance',
             entries: Object.entries(envVars).map(([key, value]) => {
-              const isSensitive = sensitivePatterns.some(p => key.toUpperCase().includes(p));
+              const isSensitive = sensitivePatterns.some(p => key.toUpperCase().includes(p)) || envManager.hasCredentialUrl(value);
               return {
                 key,
                 value: isSensitive ? '' : value,

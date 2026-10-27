@@ -101,13 +101,12 @@ function loadOrCreateKdfSalt(): string {
 const DERIVED_KEY = crypto.scryptSync(ENCRYPTION_KEY, loadOrCreateKdfSalt(), 32);
 
 // Sensitive env vars that should be encrypted: the generic secret shapes, plus
-// every companion-database key each app capability record declares (the DSNs
-// and the repointed/app-owned keys carry the same credentials). Record-derived
-// so a new app's keys are covered without editing this list.
+// every companion-database DSN key each app capability record declares.
+// Record-derived so a new app's keys are covered without editing this list.
 const SENSITIVE_VARS = [
   'DISCORD_TOKEN', 'API_KEY', 'SECRET', 'PASSWORD', 'TOKEN',
   ...APP_CAPABILITIES.flatMap(r => r.companionDb
-    ? [r.companionDb.env.url, r.companionDb.env.publicUrl, ...(r.companionDb.repointedEnv ?? []), ...(r.companionDb.appOwnedEnv ?? [])]
+    ? [r.companionDb.env.url, r.companionDb.env.publicUrl]
     : []),
 ].filter((k): k is string => !!k).map(k => k.toUpperCase());
 
@@ -116,12 +115,17 @@ interface EnvStorage {
   encrypted: Record<string, string>;
 }
 
-/**
- * Check if a variable name is sensitive
- */
-export function isSensitive(key: string): boolean {
+const CREDENTIAL_URL = /(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*:\/\/[^\s\/@:]*:[^\s\/@]+@/i;
+
+/** True when the value holds a URL with a password (scheme://user:password@host). */
+export function hasCredentialUrl(value: string | undefined | null): boolean {
+  return typeof value === 'string' && CREDENTIAL_URL.test(value);
+}
+
+/** Sensitive by name, or by a value that carries a URL with a password. */
+export function isSensitive(key: string, value?: string | null): boolean {
   const upperKey = key.toUpperCase();
-  return SENSITIVE_VARS.some(s => upperKey.includes(s));
+  return SENSITIVE_VARS.some(s => upperKey.includes(s)) || hasCredentialUrl(value);
 }
 
 /**
@@ -241,7 +245,7 @@ function saveEnvStorage(botId: string, storage: EnvStorage): void {
  * reading as ''. Container env assembly refuses on those: starting a bot
  * without its secrets is worse than refusing to start it.
  */
-export function getEnvVarsWithStatus(botId: string): { vars: Record<string, string>; undecryptable: string[]; corrupt: boolean } {
+export function getEnvVarsWithStatus(botId: string): { vars: Record<string, string>; undecryptable: string[]; encrypted: string[]; corrupt: boolean } {
   const { storage, corrupt } = loadEnvStorage(botId);
   const vars: Record<string, string> = { ...storage.vars };
   const undecryptable: string[] = [];
@@ -252,7 +256,7 @@ export function getEnvVarsWithStatus(botId: string): { vars: Record<string, stri
     else vars[key] = value;
   }
 
-  return { vars, undecryptable, corrupt };
+  return { vars, undecryptable, encrypted: Object.keys(storage.encrypted), corrupt };
 }
 
 /**
@@ -281,7 +285,7 @@ export function setEnvVars(botId: string, vars: Record<string, string>): void {
       throw new Error(`The env value for ${key} is not a scalar; refusing to store it`);
     }
     const value = given === null || given === undefined ? '' : String(given);
-    if (isSensitive(key)) {
+    if (isSensitive(key, value)) {
       storage.encrypted[key] = encrypt(value);
       delete storage.vars[key];
     } else {
@@ -565,7 +569,7 @@ export function extractConfigKeys(
     }
     const t = typeof value;
     if (t === 'string' || t === 'number' || t === 'boolean') {
-      out.push({ key, defaultValue: String(value), sensitive: isSensitive(key) });
+      out.push({ key, defaultValue: String(value), sensitive: isSensitive(key, String(value)) });
     }
   }
   return out;

@@ -3,15 +3,11 @@
  * by repo URL exactly like TEMPLATE_MODIFIERS and INSTALL_MANIFESTS. A record
  * declares what an app supports so the manager's database lifecycle stays a
  * generic "managed Postgres companion" capability with no per-bot branch: the
- * manager knows how to copy, stand by, promote and tunnel, and the record says
- * what this app calls its database and where to reach its lifecycle hooks.
+ * record says what this app calls its database, which guided env rows it
+ * offers and where to reach its lifecycle hooks.
  *
  * INSTALL_MANIFESTS is per config FILE (match + target basename); this registry
  * is per SOURCE, so it sits beside it rather than as a field on it.
- *
- * The manager never learns what a master or a backup is. Those are the app's
- * own concepts: it decides, records what it concluded, and the manager acts on
- * the facts through the hook contract below.
  */
 import { matchesSource, SourceMatch } from './sourceMatch';
 import type { WizardEnvVar } from '../env/envList';
@@ -57,13 +53,6 @@ export interface CompanionDbSpec {
      * fresh sidecar for a node that just stopped owning a database.
      */
     mode?: { key: string; value: string };
-    /**
-     * Local-standby hand-off DSNs the manager authors beside a provisioned
-     * standby: the container-name form and the canonical public form. The
-     * app's own promote flow consumes them; retired with the standby.
-     */
-    replicaUrl?: string;
-    replicaPublicUrl?: string;
   };
   /**
    * Path (relative to the app's data dir) of the app's OWN env file. The
@@ -74,21 +63,6 @@ export interface CompanionDbSpec {
    * form) is a manager constant, not a per-app field (ruling F2 2026-09-01).
    */
   appEnvFile?: string;
-  /**
-   * Keys the manager REWRITES only where they are already set, and retires with
-   * the block above. It never authors one: an absent key means this app is not
-   * using that lane, and creating it would opt the instance into a lane its
-   * owner never chose.
-   */
-  repointedEnv?: string[];
-  /**
-   * Keys the APP writes about this database, in the app's own store. The manager
-   * must never author one: a value for these in the INSTANCE RECORD or the
-   * deployed compose is pinned into the container, where it outranks the app's
-   * own store, so finding one there is an anomaly to retire rather than
-   * app-owned state to preserve.
-   */
-  appOwnedEnv?: string[];
 }
 
 /**
@@ -106,91 +80,18 @@ export interface AppHooksSpec {
   portEnvKey?: string;
 }
 
-/**
- * The peer control plane this app runs between its OWN instances. The manager
- * wires it structurally - it discovers the ports from the compose marker
- * labels, mints the hostnames, attaches the proxy routes and publishes the
- * loopback ports - and knows nothing about what the peers are to each other.
- * Only the NAMES live here: what this app calls the wiring it is handed, and
- * how it spells which way a node faces.
- *
- * Declared ahead of most of its consumers (the B4m-1 interface-first order):
- * wizardFields and roleEnv drive the env surface now; the authoring sites for
- * `env` and `urlScheme` migrate in the drill-gated B4m-3 steps and read their
- * own literals until then.
- */
-export interface ControlPlaneSpec {
-  /**
-   * Env keys the manager AUTHORS on the app service: suppressed from the
-   * wizard's detected rows and retired from a stale compose when no longer
-   * derivable. Never author a key absent here. The manager computes these at
-   * deploy and never STORES one, so a stored value under one of these names is
-   * operator-written and the editor keeps it visible; transferUrl in
-   * particular is hand-set on rigs with no public base, where the manager
-   * cannot judge container-name reachability.
-   */
-  env: {
-    port: string;
-    publicUrl: string;
-    transferPort?: string;
-    transferUrl?: string;
-  };
-  /**
-   * Scheme pair for the URLs the manager mints. Two, not one: a public route
-   * is TLS-terminated at the proxy; the same-box container-name dial never is.
-   */
-  urlScheme: { secure: string; plain: string };
-  /**
-   * How this app spells which way a node faces, and nothing more. `dialsOut`
-   * values mean "this node dials a peer"; every other value means peers dial
-   * this node; an absent or empty value reads as `default`. No hierarchy is
-   * expressed and the manager infers none. `dialTargetOrder` is the order a
-   * joining node should list dialable peers.
-   */
-  roleEnv: {
-    key: string;
-    default: string;
-    dialsOut: string[];
-    dialTargetOrder: string[];
-  };
-  /**
-   * The node's consent to standing in as an active backup (PLAN_REPLICATION
-   * 20.5): the key and the one value that means consent. Declared so the
-   * manager can locate and read the row without matching a spelling; the
-   * enable itself is the app's own, on its master's fleet config.
-   */
-  modeEnv?: { key: string; active: string };
-  /** Key holding the ordered list of peer control URLs this node dials. */
-  dialEnv: string;
-  /** Key whose shared value marks a set of peers as one deployment. */
-  groupSecretEnv?: string;
-  /**
-   * The guided install/edit rows for this control plane, rendered verbatim.
-   * Opaque: the manager never reads a key out of here that the fields above
-   * and the companion declaration do not also name.
-   */
-  wizardFields: WizardEnvVar[];
-}
-
 export interface AppCapabilityManifest {
   match: SourceMatch;
   companionDb?: CompanionDbSpec;
-  controlPlane?: ControlPlaneSpec;
+  /** The guided install and edit rows for this app's fleet settings, rendered verbatim. */
+  wizardFields?: WizardEnvVar[];
   hooks?: AppHooksSpec;
 }
 
 /** The lifecycle actions an app implementing the hook contract must serve. */
 export type AppHookAction =
   | 'facts'
-  | 'promote'
-  | 'promote/continue'
-  | 'promote/cancel'
-  | 'demote'
-  /** Return the app to its configured role and store after infrastructure moved its primary (the recovery channel's swap). */
-  | 'role-reset'
-  | 'confirm-fresh'
-  /** Hand the app the copy block for the database it hosts, so it can relay it. */
-  | 'copy-block';
+  | 'confirm-fresh';
 
 // Shared by the companion declaration and the guided rows below, so a wizard
 // row can never drift from the declared key it edits.
@@ -198,66 +99,11 @@ const smdbDbEnv = {
   url: 'DATA_BACKEND_URL',
   publicUrl: 'DATA_BACKEND_PUBLIC_URL',
   mode: { key: 'DATA_BACKEND', value: 'postgres' },
-  replicaUrl: 'FLEET_DB_REPLICA_URL',
-  replicaPublicUrl: 'FLEET_DB_REPLICA_PUBLIC_URL',
 };
-const smdbRoleEnv = {
-  key: 'BOT_NODE_ROLE',
-  default: 'master',
-  dialsOut: ['co-worker', 'backup-master'],
-  dialTargetOrder: ['master', 'backup-master'],
-};
-const smdbModeEnv = { key: 'FLEET_BACKUP_MODE', active: 'active' };
-const smdbDialEnv = 'MASTER_URLS';
-const smdbGroupSecretEnv = 'CONTROL_SECRET';
 
 function smdbWizardFields(): WizardEnvVar[] {
   const base = { defaultValue: '', required: false, source: 'compose' as const, sensitive: false, autoWired: false, group: 'Fleet' };
-  // backup-master is a designated co-worker: it dials a master like any worker
-  // and additionally gets the Promote surface. Every worker-role conditional
-  // must match both values.
-  const whenWorkerRole = { key: smdbRoleEnv.key, equals: smdbRoleEnv.dialsOut };
   return [
-    {
-      ...base,
-      key: smdbRoleEnv.key,
-      displayLabel: 'Fleet Role',
-      description: 'Master runs the control plane and assigns shards. Co-worker dials into a master. Backup Master is a co-worker that can take over when the master dies (postgres data backend only). A single standalone bot is a master.',
-      defaultValue: smdbRoleEnv.default,
-      options: [
-        { value: 'master', label: 'Master' },
-        { value: 'co-worker', label: 'Co-worker' },
-        { value: 'backup-master', label: 'Backup Master' },
-      ],
-      groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
-    },
-    {
-      ...base,
-      key: smdbModeEnv.key,
-      displayLabel: 'Backup Mode',
-      description: 'Passive: this backup only keeps a live copy; taking over is a manual Promote. Active: this backup may STAND IN temporarily while the master is gone, taking the fleet\'s writes on its copy and handing them back when the master returns; the master must also enable it on its Fleet tab. It is not free: while it is on, every write in the fleet waits for this copy, so losing it costs about a second or two of stalled writes before replication drops back to asynchronous.',
-      defaultValue: 'passive',
-      options: [{ value: 'passive', label: 'Passive' }, { value: smdbModeEnv.active, label: 'Active (temporary stand-in)' }],
-      showWhen: { key: smdbRoleEnv.key, equals: 'backup-master' },
-    },
-    {
-      ...base,
-      key: smdbDialEnv,
-      displayLabel: 'Master Candidates',
-      description: 'Ordered list of every master-capable control URL: the master first, then the backup master. Workers cycle through it on reconnect, so a failover needs no reconfiguration. A master lists the OTHER master-capable nodes: it checks them before claiming the fleet at startup, so a master that comes back after a failover parks itself instead of splitting the fleet in two, and can then be demoted from its web UI. Optional for a master, required for a worker. Same-server installs fill this automatically. This is the first-start seed: once the fleet keeps its runtime master list, that list is in force and this value no longer changes it.',
-      placeholder: 'wss://mybot-fleet.dbot.example.com',
-      list: true,
-      requiredWhen: whenWorkerRole,
-    },
-    {
-      ...base,
-      key: smdbGroupSecretEnv,
-      displayLabel: 'Control Secret',
-      description: 'Shared secret for the whole fleet: every node, the backup master included, must carry the SAME value. Generated on the master; same-server installs fill it automatically, workers on other machines paste it from the master.',
-      sensitive: true,
-      generate: true,
-      requiredWhen: whenWorkerRole,
-    },
     {
       ...base,
       key: 'FLEET_SHARD_COUNT',
@@ -270,7 +116,7 @@ function smdbWizardFields(): WizardEnvVar[] {
       ...base,
       key: 'FLEET_SHARD_CAPACITY',
       displayLabel: 'Fleet Shard Capacity',
-      description: 'Advanced: max shards THIS instance holds. Default 1. The master only hands out unassigned shards; a worker with no free shard waits on hold.',
+      description: 'Advanced: max shards THIS instance holds. Default 1.',
       inputType: 'number' as const,
       advanced: true,
     },
@@ -278,7 +124,7 @@ function smdbWizardFields(): WizardEnvVar[] {
       ...base,
       key: 'PIN_TEST_GUILD_SHARD',
       displayLabel: 'Pin Test Guild Shard',
-      description: "Master only: keep the shard containing this bot's GUILD_ID on the master. Useful when testing.",
+      description: "Keep the shard containing this bot's GUILD_ID on this machine. Useful when testing.",
       defaultValue: 'false',
       options: [{ value: 'false' }, { value: 'true' }],
     },
@@ -287,6 +133,7 @@ function smdbWizardFields(): WizardEnvVar[] {
       key: 'NODE_NAME',
       displayLabel: 'Node Name',
       description: "A friendly name for this instance in the Fleet view (e.g. 'yundera', 'home-pc').",
+      groupHelp: 'Run one bot identity across several machines. A single standalone bot needs no changes here.',
     },
     {
       ...base,
@@ -295,7 +142,6 @@ function smdbWizardFields(): WizardEnvVar[] {
       description: 'file keeps data in simple per-instance JSON files (the default). postgres uses a central database, for multi-machine fleets and big bots.',
       defaultValue: 'file',
       options: [{ value: 'file' }, { value: smdbDbEnv.mode.value }],
-      showWhen: { key: smdbRoleEnv.key, equals: smdbRoleEnv.default },
       advanced: true,
     },
     {
@@ -311,25 +157,6 @@ function smdbWizardFields(): WizardEnvVar[] {
   ];
 }
 
-/**
- * The node's consent to active mode as its env holds it (PLAN_REPLICATION
- * 20.5): true or false where the declared row applies to this node (its own
- * display condition, read off the declaration, says which roles it is for),
- * null where it does not or nothing is declared. The saved env, not the
- * container's: the caller says so.
- */
-export function backupModeConsent(record: AppCapabilityManifest | null | undefined, envVars: Record<string, string> | undefined): boolean | null {
-  const cp = record?.controlPlane;
-  if (!cp?.modeEnv) return null;
-  const valueOf = (key: string): string => key === cp.roleEnv.key ? foldedRoleValue(cp.roleEnv, envVars?.[key]) : (envVars?.[key] ?? '');
-  const gate = cp.wizardFields.find(f => f.key === cp.modeEnv?.key)?.showWhen;
-  const applies = gate
-    ? (Array.isArray(gate.equals) ? gate.equals.includes(valueOf(gate.key)) : gate.equals === valueOf(gate.key))
-    : cp.roleEnv.dialsOut.includes(valueOf(cp.roleEnv.key));
-  if (!applies) return null;
-  return (envVars?.[cp.modeEnv.key] ?? '').trim().toLowerCase() === cp.modeEnv.active.toLowerCase();
-}
-
 const superModularDiscordBot: AppCapabilityManifest = {
   match: { urlContains: 'modular-discord-bot' },
   companionDb: {
@@ -338,26 +165,8 @@ const superModularDiscordBot: AppCapabilityManifest = {
     database: 'smdb',
     env: smdbDbEnv,
     appEnvFile: '.env',
-    // Repointed on promotion and on rescue, only where the fleet already runs a
-    // separate control store; never created.
-    repointedEnv: ['CONTROL_STORE_URL'],
-    // The bot splices its own same-box DSN on promotion and at backend boot.
-    appOwnedEnv: ['DATA_BACKEND_LOCAL_URL'],
   },
-  controlPlane: {
-    env: {
-      port: 'CONTROL_PORT',
-      publicUrl: 'FLEET_PUBLIC_URL',
-      transferPort: 'TRANSFER_PORT',
-      transferUrl: 'TRANSFER_URL',
-    },
-    urlScheme: { secure: 'wss', plain: 'ws' },
-    roleEnv: smdbRoleEnv,
-    modeEnv: smdbModeEnv,
-    dialEnv: smdbDialEnv,
-    groupSecretEnv: smdbGroupSecretEnv,
-    wizardFields: smdbWizardFields(),
-  },
+  wizardFields: smdbWizardFields(),
   hooks: {
     basePath: '/api/managed',
     port: 8080,
@@ -373,10 +182,4 @@ export const APP_CAPABILITIES: AppCapabilityManifest[] = [
 export function findAppCapabilities(sourceUrl: string | null | undefined): AppCapabilityManifest | null {
   if (!sourceUrl) return null;
   return APP_CAPABILITIES.find(record => matchesSource(record.match, sourceUrl)) || null;
-}
-
-/** The folded role value: an absent or empty value reads as the record's default. */
-export function foldedRoleValue(roleEnv: ControlPlaneSpec['roleEnv'], raw: string | undefined): string {
-  const value = (raw || '').trim().toLowerCase();
-  return value === '' ? roleEnv.default : value;
 }

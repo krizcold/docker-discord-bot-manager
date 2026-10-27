@@ -261,7 +261,7 @@ const editorPage = (rows: FakeRow[], stored: string[], answer: any) => {
     return { classList: { contains: () => false }, querySelector: (s: string) => (s === '.env-key' ? key : s === '.env-value' ? val : null) };
   });
   const btn = { disabled: false, textContent: 'Save', isConnected: true };
-  const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'saveEnvEditor'], {
+  const ctx = runPage(['botLabel', 'envEditorRemovedKeys', 'semanticWrapper', 'semanticEnvValue', 'saveEnvEditor'], {
     document: { querySelectorAll: () => els, querySelector: () => btn, getElementById: () => ({ classList: { contains: () => false }, querySelector: () => null }) },
     semanticEnvKey: () => null,
     envEditorInitial: {},

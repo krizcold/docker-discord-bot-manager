@@ -96,7 +96,7 @@ const FLEET_DB = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb
 
 const worker = (over: Record<string, unknown> = {}): any => ({
   id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
-  sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'co-worker' }, containerIds: [],
+  sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, containerIds: [],
   createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...over,
 });
 const other = (over: Record<string, unknown> = {}): any => worker({ id: 'b2', sanitizedName: 'bot2', displayName: 'Bot 2', titleName: 'Bot 2', ...over });

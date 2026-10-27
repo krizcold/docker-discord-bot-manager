@@ -240,12 +240,6 @@
       cursor: pointer; font-size: 1rem; line-height: 1; opacity: 0.6;
     }
     .env-list-item .btn-remove:hover { opacity: 1; }
-    .fleet-master-prefill select {
-      padding: 7px 10px; background: var(--bg-primary);
-      border: 1px solid var(--border); border-radius: var(--radius);
-      color: var(--text-primary); font-size: 0.82rem;
-    }
-    .fleet-master-prefill select:focus { outline: none; border-color: var(--border-focus); }
     .env-group {
       border: 1px solid var(--border); border-radius: 6px;
       padding: 8px 10px; margin: 8px 0;
@@ -255,16 +249,6 @@
       cursor: pointer; font-size: 0.72rem; color: var(--text-muted); margin: 4px 0 6px;
     }
     .env-advanced summary:hover { color: var(--text-primary); }
-    .fleet-url-preview {
-      background: var(--bg-tertiary); border-left: 3px solid var(--accent);
-      border-radius: var(--radius); padding: 8px 12px; margin: 6px 0 10px;
-    }
-    .fleet-url-preview .fleet-url-label { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 5px; }
-    .fleet-url-preview .fleet-url-line { display: flex; align-items: center; gap: 8px; }
-    .fleet-url-preview .fleet-url-value {
-      flex: 1; min-width: 0; font-family: monospace; font-size: 0.82rem;
-      color: var(--text-primary); word-break: break-all; user-select: all;
-    }
     /* Source re-clone progress (indeterminate: clone gives no percentage) */
     .source-fetching-label { color: var(--warning); }
     .source-fetch-bar {
@@ -2072,7 +2056,6 @@
           </div>
         `;
         initEnvConditionals('env-editor-rows');
-        attachFleetMasterPrefill('env-editor-rows', res.vars || []);
 
         // Snapshot rendered values (sensitive fields render blank) so the save
         // flow can detect changed values by key name.
@@ -2132,9 +2115,7 @@
       const condAttrs =
         (meta.showWhen ? ` data-show-key="${escapeHtml(meta.showWhen.key)}" data-show-equals="${equalsAttr(meta.showWhen.equals)}"` : '') +
         (meta.requiredWhen ? ` data-req-key="${escapeHtml(meta.requiredWhen.key)}" data-req-equals="${equalsAttr(meta.requiredWhen.equals)}"` : '') +
-        (meta.semantic ? ` data-semantic="${escapeHtml(meta.semantic)}"` : '') +
-        (Array.isArray(meta.semanticValues) && meta.semanticValues.length ? ` data-semantic-values="${escapeHtml(meta.semanticValues.join(','))}"` : '') +
-        (Array.isArray(meta.semanticTargetOrder) && meta.semanticTargetOrder.length ? ` data-semantic-target-order="${escapeHtml(meta.semanticTargetOrder.join(','))}"` : '');
+        (meta.semantic ? ` data-semantic="${escapeHtml(meta.semantic)}"` : '');
       return `<div${condAttrs}>
         ${labelHtml}
         <div class="env-row${meta.list ? ' env-row-list' : ''}">
@@ -2157,11 +2138,6 @@
       const input = btn.closest('.env-row').querySelector('.env-value');
       if (!input) return;
       input.value = randomSecretHex();
-      // Marks the value as machine-minted so a later role switch may clear it;
-      // any real keystroke in the field removes the mark (user-entered values
-      // survive role switches).
-      input.dataset.generated = '1';
-      delete input.dataset.autofilled;
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
@@ -2210,17 +2186,13 @@
         (items.length ? items : ['']).map(v => envListItemHtml(v, list.dataset.placeholder || 'Value')).join('');
     }
 
-    // On a fresh install, pre-fill empty "generate" secrets so the hosting
-    // install has one ready. Skipped for the dialing roles, which carry the
-    // joined fleet's secret instead of minting their own.
+    // On a fresh install, pre-fill empty "generate" secrets so the install has one ready.
     function autofillGenerateSecrets(container) {
-      if (dialsOutRole(container)) return;
       container.querySelectorAll('.env-row').forEach(row => {
         const gen = row.querySelector('button[onclick^="generateEnvSecret"]');
         const input = row.querySelector('.env-value');
         if (gen && input && !input.value.trim()) {
           input.value = randomSecretHex();
-          input.dataset.generated = '1';
           input.dispatchEvent(new Event('input', { bubbles: true }));
         }
       });
@@ -2245,16 +2217,8 @@
 
     function updateEnvConditionals(container) {
       container.querySelectorAll('[data-show-key]').forEach(w => {
-        // data-force-hide is the same-server chooser's channel: an auto-filled
-        // row stays in the DOM (collectors read it) but never shows.
-        const show = envCondMatches(w.dataset.showEquals, envRowValue(container, w.dataset.showKey))
-          && w.dataset.forceHide !== '1';
+        const show = envCondMatches(w.dataset.showEquals, envRowValue(container, w.dataset.showKey));
         w.style.display = show ? '' : 'none';
-      });
-      // Rows force-hidden WITHOUT a showWhen of their own (the fleet secret
-      // row is requiredWhen-only, since a hosting node must always see it).
-      container.querySelectorAll('[data-force-hide]:not([data-show-key])').forEach(w => {
-        w.style.display = w.dataset.forceHide === '1' ? 'none' : '';
       });
       container.querySelectorAll('[data-req-key]').forEach(w => {
         const on = envCondMatches(w.dataset.reqEquals, envRowValue(container, w.dataset.reqKey));
@@ -2273,10 +2237,8 @@
       updateEnvConditionals(c);
     }
 
-    // ─── Fleet master prefill (known masters on this manager) ───
-    // Semantic row lookup (PLAN_REPLICATION 20.18): guided rows arrive stamped
-    // with data-semantic from the app's capability record, so nothing below
-    // matches an env key by spelling.
+    // Semantic row lookup: guided rows arrive stamped with data-semantic from
+    // the app's capability record, so nothing below matches an env key by spelling.
     function semanticWrapper(container, semantic) {
       return container.querySelector(`[data-semantic="${semantic}"]`);
     }
@@ -2290,41 +2252,13 @@
       const v = w && w.querySelector('.env-row .env-value');
       return v ? v.value.trim() : '';
     }
-    function semanticValuesOf(container, semantic) {
-      const w = semanticWrapper(container, semantic);
-      return (w && w.dataset.semanticValues) ? w.dataset.semanticValues.split(',') : [];
-    }
-    function semanticTargetOrderOf(container, semantic) {
-      const w = semanticWrapper(container, semantic);
-      return (w && w.dataset.semanticTargetOrder) ? w.dataset.semanticTargetOrder.split(',') : [];
-    }
-    // "This node dials a peer": the role row's value is one of the dial-out
-    // values the record stamped onto the row itself.
-    function dialsOutRole(container) {
-      const value = semanticEnvValue(container, 'peer-role');
-      return value !== '' && semanticValuesOf(container, 'peer-role').includes(value);
-    }
-
-    // A dialing role with no candidates has nothing to dial. In the editor a
-    // blank masked row keeps its stored value, so only a visible blank counts.
-    function missingMasterCandidates(container, isEditor) {
-      if (!container || !dialsOutRole(container)) return false;
-      const w = semanticWrapper(container, 'peer-list');
-      const v = w && w.querySelector('.env-row .env-value');
-      if (!v) return true;
-      if (v.value.trim() !== '') return false;
-      return !(isEditor && v.dataset.sensitive === 'true');
-    }
-
-    // Every programmatic fill (prefill, vault pick, recovered envs) goes
-    // through here: a list row must re-render its visible items, the
-    // machine-minted mark must clear (the value is now deliberate), and the
-    // input event must fire so conditionals and dependents follow.
+    // Every programmatic fill (vault pick, recovered envs) goes through here: a
+    // list row must re-render its visible items, and the input event must fire
+    // so conditionals and dependents follow.
     function setEnvInputValue(input, value) {
       if (!input) return;
-      // A select handed a value it has no option for blanks itself, and for
-      // these rows an empty value is not neutral (an unset role reads as
-      // master). Match it the way the app does, else carry it as its own option.
+      // A select handed a value it has no option for blanks itself. Match it
+      // the way the app does, else carry it as its own option.
       if (input.tagName === 'SELECT' && String(value) !== '') {
         const cur = String(value);
         const norm = cur.trim().toLowerCase();
@@ -2341,277 +2275,9 @@
         }
       }
       input.value = value;
-      delete input.dataset.generated;
-      delete input.dataset.autofilled;
       const list = input.closest('.env-list');
       if (list) envListRender(list);
       input.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-
-    // The fleet secret across role switches: a machine-minted value must not
-    // linger in a dialing-role form (nothing uses it there; the node needs the
-    // secret of the fleet it joins instead). A user-entered value always
-    // survives switching; the minted value is stashed and returns with the role.
-    function attachFleetSecretRoleCache(container) {
-      const wrapper = semanticWrapper(container, 'peer-secret');
-      const roleWrapper = semanticWrapper(container, 'peer-role');
-      if (!wrapper || !roleWrapper || wrapper.dataset.secretCache === '1') return;
-      wrapper.dataset.secretCache = '1';
-      const dialsOut = semanticValuesOf(container, 'peer-role');
-      const isWorker = r => dialsOut.includes(r);
-      const isInstall = container.id === 'install-env-rows';
-      let lastRole = semanticEnvValue(container, 'peer-role');
-      let stashedMasterSecret = '';
-      const secretEl = wrapper.querySelector('.env-row .env-value');
-      const urlsWrapperEl = semanticWrapper(container, 'peer-list');
-      const urlsEl = urlsWrapperEl ? urlsWrapperEl.querySelector('.env-list .env-value') : null;
-      // Real typing makes a value user-owned: it then survives every switch.
-      // A list row's typing happens in its visible items; the hidden value
-      // only ever sees synthetic events.
-      for (const el of [secretEl, urlsEl]) {
-        const target = el && (el.closest('.env-list') || el);
-        if (target) target.addEventListener('input', e => {
-          if (!e.isTrusted) return;
-          delete el.dataset.generated;
-          delete el.dataset.autofilled;
-        });
-      }
-      container.addEventListener('change', () => {
-        const role = semanticEnvValue(container, 'peer-role');
-        const crossed = isWorker(role) !== isWorker(lastRole);
-        lastRole = role;
-        if (!crossed || !secretEl) return;
-        if (isWorker(role)) {
-          if (secretEl.dataset.generated === '1') {
-            stashedMasterSecret = secretEl.value;
-            setEnvInputValue(secretEl, '');
-          }
-          return;
-        }
-        // Leaving the worker roles: values auto-filled from ANOTHER fleet's
-        // master must not ride into this master install (two fleets would
-        // share one secret, and the hidden candidates row is still collected).
-        for (const el of [secretEl, urlsEl]) {
-          if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
-        }
-        if (!secretEl.value.trim() && (stashedMasterSecret || isInstall)) {
-          // Editor never mints a secret on its own: a blank sensitive field
-          // means "keep the stored value" and a silent mint would rotate it.
-          secretEl.value = stashedMasterSecret || randomSecretHex();
-          secretEl.dataset.generated = '1';
-          secretEl.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-      });
-    }
-
-    // Same-server join for the worker roles: pick a master hosted by THIS
-    // manager and the form hides Master Candidates + Control Secret entirely,
-    // filling them from the master (candidates = the master first, then its
-    // backup masters; the rows stay in the DOM so save collectors read them).
-    // "Another machine" shows the rows for manual entry instead.
-    async function attachFleetMasterPrefill(containerId, vars) {
-      if (!Array.isArray(vars) || !vars.some(v => v.semantic === 'peer-role')) return;
-      const container = document.getElementById(containerId);
-      if (!container) return;
-      const roleKey = semanticEnvKey(container, 'peer-role');
-      if (!roleKey) return;
-      attachFleetSecretRoleCache(container);
-      let masters = [];
-      let fleetUrlTemplate = null;
-      try {
-        const res = await api('GET', '/bots/fleet/masters');
-        if (res && res.success) {
-          if (Array.isArray(res.masters)) masters = res.masters;
-          if (typeof res.fleetUrlTemplate === 'string') fleetUrlTemplate = res.fleetUrlTemplate;
-        }
-      } catch (e) { /* unreachable list = manual entry only */ }
-      if (containerId === 'install-env-rows') attachFleetMasterUrlPreview(container, fleetUrlTemplate);
-
-      // Never offer the instance being edited as its own master: a demoted
-      // master would be autoconfigured to dial itself.
-      const isEditor = containerId === 'env-editor-rows';
-      const joinable = masters.filter(m => m.secretSet
-        && !(isEditor && m.id === envEditorBotId)
-        && ((Array.isArray(m.localCandidates) && m.localCandidates.length) || m.localUrl));
-      const urlsWrapper = semanticWrapper(container, 'peer-list');
-      const secretWrapper = semanticWrapper(container, 'peer-secret');
-      if (!urlsWrapper || joinable.length === 0 || container.querySelector('.fleet-master-prefill')) return;
-
-      const candidatesOf = m => (Array.isArray(m.localCandidates) && m.localCandidates.length)
-        ? m.localCandidates : [m.localUrl].filter(Boolean);
-      const options = joinable.map((m, i) => `<option value="${i}">${escapeHtml(m.name)}${m.unanswered ? ' (not answering)' : ''}</option>`).join('');
-      const block = document.createElement('div');
-      block.className = 'fleet-master-prefill';
-      block.dataset.showKey = roleKey;
-      block.dataset.showEquals = semanticValuesOf(container, 'peer-role').join(',');
-      block.innerHTML = `
-        <div class="env-label">Fleet Location</div>
-        <div style="display:flex;gap:6px;margin-bottom:2px;">
-          <select class="fleet-loc-select" style="flex:1;">
-            <option value="local">This server (autoconfigured)</option>
-            <option value="remote">Another machine (enter URLs)</option>
-          </select>
-          <select class="fleet-master-select" style="flex:1;${joinable.length === 1 ? 'display:none;' : ''}">${options}</select>
-        </div>
-        <div class="env-tip fleet-loc-tip"></div>`;
-
-      const locSel = block.querySelector('.fleet-loc-select');
-      const masterSel = block.querySelector('.fleet-master-select');
-      const tip = block.querySelector('.fleet-loc-tip');
-      const chosen = () => joinable[Number(masterSel.value) || 0];
-      const workerRole = () => dialsOutRole(container);
-
-      // Auto-filled values are machine-owned: marked so that leaving
-      // same-server mode (or the worker roles) can take them back out.
-      const fillFromMaster = () => {
-        const m = chosen();
-        if (!m) return;
-        // Only the row itself, never a fallback element: marking anything else
-        // as machine-owned lets the mode switch below wipe an unrelated field.
-        // A value the operator typed, picked or loaded is theirs: never overwritten.
-        for (const [sem, value] of [['peer-list', candidatesOf(m).join(',')], ['peer-secret', m.controlSecret]]) {
-          const wrapper = semanticWrapper(container, sem);
-          const el = wrapper && wrapper.querySelector('.env-row .env-value');
-          if (!el) continue;
-          if (sem === 'peer-secret' && m.secretUnfilled) {
-            if (el.dataset.autofilled === '1') { setEnvInputValue(el, ''); delete el.dataset.autofilled; }
-            continue;
-          }
-          if (el.value.trim() !== '' && el.dataset.autofilled !== '1') continue;
-          setEnvInputValue(el, value);
-          el.dataset.autofilled = '1';
-        }
-      };
-      const rowEl = sem => {
-        const wrapper = semanticWrapper(container, sem);
-        return wrapper && wrapper.querySelector('.env-row .env-value');
-      };
-      // A kept operator value stays visible in same-server mode unless it
-      // already equals the selected node's: the form never hides a value it
-      // did not fill or match.
-      const machineOwned = sem => {
-        const el = rowEl(sem);
-        const m = chosen();
-        if (sem === 'peer-secret' && m && m.secretUnfilled) return false;
-        const want = !m ? null : sem === 'peer-list' ? candidatesOf(m).join(',') : m.controlSecret;
-        return !el || el.dataset.autofilled === '1' || (want !== null && el.value.trim() === String(want ?? ''));
-      };
-
-      let wasLocal = false;
-
-      const sync = () => {
-        const local = locSel.value === 'local' && workerRole();
-        if (local) {
-          fillFromMaster();
-        } else if (wasLocal) {
-          // Switched to manual entry: take back what same-server filled in, so
-          // the operator edits their own values rather than a hidden fleet's.
-          for (const sem of ['peer-list', 'peer-secret']) {
-            const el = rowEl(sem);
-            if (el && el.dataset.autofilled === '1') setEnvInputValue(el, '');
-          }
-        }
-        wasLocal = local;
-        const kept = local && !(machineOwned('peer-list') && machineOwned('peer-secret'));
-        urlsWrapper.dataset.forceHide = local && machineOwned('peer-list') ? '1' : '';
-        if (secretWrapper) secretWrapper.dataset.forceHide = local && machineOwned('peer-secret') ? '1' : '';
-        tip.textContent = locSel.value !== 'local'
-          ? "Enter every promotable node's control URL in order (the current primary first) and paste the fleet's shared secret from that node (its Usage tab > Connect a worker)."
-          : chosen() && chosen().unanswered
-            ? chosen().unanswered + (chosen().secretUnfilled ? ' ' + chosen().secretUnfilled : '')
-          : chosen() && chosen().secretUnfilled
-            ? chosen().secretUnfilled
-          : kept
-            ? "A value you entered is kept and shown below; clear it to use the selected node's value."
-            : 'Connection and secret are filled automatically from the selected node.';
-        updateEnvConditionals(container);
-      };
-
-      locSel.addEventListener('change', sync);
-      masterSel.addEventListener('change', sync);
-      // Role switches re-run the mode: entering a worker role in local mode
-      // must (re)fill the hidden rows, leaving it must unhide the secret row.
-      container.addEventListener('change', sync);
-
-      // Initial mode. Same-server is assumed ONLY for a value that exactly
-      // matches a local master (or a blank fresh install form): an already
-      // configured node must never be silently re-pointed at another master
-      // just because its editor was opened.
-      const deriveMode = () => {
-        const current = semanticEnvValue(container, 'peer-list');
-        const matching = current === '' ? -1 : joinable.findIndex(m => candidatesOf(m).join(',') === current);
-        if (matching >= 0) {
-          masterSel.value = String(matching);
-          locSel.value = 'local';
-        } else if (current !== '' || isEditor) {
-          locSel.value = 'remote';
-        }
-      };
-      deriveMode();
-      urlsWrapper.parentElement.insertBefore(block, urlsWrapper);
-      sync();
-      // Loaded envs replace the rows the mode was derived from.
-      container.fleetLocationResync = () => { deriveMode(); sync(); };
-    }
-
-    // Preview of the public URL this node advertises, below the role row.
-    // Shown for every dial-target role, by POSITION in the record-stamped
-    // dialTargetOrder: position 0 is the primary target workers connect to,
-    // every later position a target workers must also list so a failover
-    // needs no rewiring. No role value is spelled here (PLAN_REPLICATION
-    // 20.18 step 7). Wizard-only (needs the name input); deliberately not an
-    // .env-row, so env collectors skip it.
-    const FLEET_URL_PREVIEW_TEXT = [
-      {
-        label: 'Workers will connect at',
-        title: 'This URL becomes live once the bot is installed and started in this role.',
-      },
-      {
-        label: 'Workers must also list this URL',
-        title: "Add this URL to every worker's candidate list, after the primary target's, so they follow the failover when this node takes over.",
-      },
-    ];
-
-    function attachFleetMasterUrlPreview(container, fleetUrlTemplate) {
-      if (!fleetUrlTemplate) return;
-      const nameInput = document.getElementById('install-name');
-      if (!nameInput) return;
-      const roleWrapper = semanticWrapper(container, 'peer-role');
-      if (!roleWrapper || container.querySelector('.fleet-url-preview')) return;
-      const targetOrder = semanticTargetOrderOf(container, 'peer-role');
-      if (!targetOrder.length) return;
-
-      const el = document.createElement('div');
-      el.className = 'fleet-url-preview';
-      el.dataset.showKey = semanticEnvKey(container, 'peer-role');
-      el.dataset.showEquals = targetOrder.join(',');
-      el.innerHTML = `
-        <div class="fleet-url-label"></div>
-        <div class="fleet-url-line">
-          <span class="fleet-url-value"></span>
-          <button class="btn btn-secondary btn-small" type="button">Copy</button>
-        </div>`;
-      const urlSpan = el.querySelector('.fleet-url-value');
-      const labelEl = el.querySelector('.fleet-url-label');
-      const urlOf = () => installValidatedName ? fleetUrlTemplate.replace('{name}', installValidatedName) : '';
-      const update = () => {
-        urlSpan.textContent = urlOf() || 'Shown once the name is checked.';
-        btn.disabled = !urlOf();
-        const position = targetOrder.indexOf(semanticEnvValue(container, 'peer-role'));
-        const text = position < 0 ? null : FLEET_URL_PREVIEW_TEXT[Math.min(position, FLEET_URL_PREVIEW_TEXT.length - 1)];
-        if (text) {
-          labelEl.textContent = text.label;
-          labelEl.title = text.title;
-        }
-      };
-      const btn = el.querySelector('button');
-      update();
-      nameInput.addEventListener('input', update);
-      document.addEventListener('install-name-validated', update);
-      container.addEventListener('change', update);
-      btn.addEventListener('click', () => { if (urlOf()) copyToClipboard(btn, urlOf(), 'Copy'); });
-      roleWrapper.insertAdjacentElement('afterend', el);
-      updateEnvConditionals(container);
     }
 
     function addEnvEditorRow() {
@@ -2678,10 +2344,6 @@
       }
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then save. Nothing was saved.`);
-        return;
-      }
-      if (missingMasterCandidates(document.getElementById('env-editor-rows'), true)) {
-        showMessage('error', 'A co-worker needs at least one Master Candidate URL. Pick a node on this server or enter the URLs, then save. Nothing was saved.');
         return;
       }
 
@@ -3045,7 +2707,7 @@
           </div>
           <input type="hidden" id="fleet-repl-dsn" value="${escapeHtml(block.dsn)}">
           <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
-          <div class="env-tip">On each standby machine's manager, open the standby instance's Database button, paste both into its Database Replica section and press Provision. That button shows only on an instance whose Fleet Role is Backup Master or Co-worker.</div>
+          <div class="env-tip">On each standby machine's manager, open the standby instance's Database button, paste both into its Database Replica section and press Provision. That section shows on an instance whose Data Backend is postgres and which does not host the database itself.</div>
         </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" id="fleet-repl-disable" onclick="disableFleetReplication('${botId}')">Disable replication</button>
@@ -3057,7 +2719,7 @@
         </div>
         <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
-          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary, which also restores the pair so you can fail back later. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
+          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
           ${stopped ? `
           <div class="form-group"><label>New primary's replication DSN</label>
             <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
@@ -3242,13 +2904,8 @@
         </div>`;
     }
 
-    // The node's own half of active mode (20.5), as the saved env holds it.
-    function replicaConsentHtml(saved) {
-      if (saved !== true && saved !== false) return '';
-      const howTo = saved
-        ? ' The master enables it on its Fleet tab, which lets this node stand in temporarily while the master is gone.'
-        : ' Taking over is a manual Promote. To let this node stand in temporarily, set Backup Mode to active in this instance\'s env, restart it, then enable it on the master\'s Fleet tab.';
-      return `<div class="env-tip">Backup mode is ${saved ? 'active' : 'passive'} in this instance's saved env; the running bot picks up a change when its container is next recreated (Apply or Restart).${howTo}</div>`;
+    function replicaConsentHtml() {
+      return '<div class="env-tip">This copy follows the primary and never takes over by itself.</div>';
     }
 
     // A poll must not wipe what the operator is typing into the panel.
@@ -3359,7 +3016,7 @@
         ? `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
         : '';
 
-      const consentHtml = replicaConsentHtml((bots.find(b => b.id === botId) || {}).fleetBackupConsent);
+      const consentHtml = replicaConsentHtml();
       body.innerHTML = `
         ${errHtml}
         <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> after a promotion.</div>
@@ -3463,7 +3120,7 @@
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (refuseWhileChecking(botId)) return;
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nAfter it finishes, start the instance and read its Fleet tab: if the node holding the fleet stands in for this node, promote this node there once the copy has caught up (the failback); if the tab says that node no longer stands in for this node, demote it from its own web UI so it rejoins the fleet as a worker.')) return;
+      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nWhen it finishes, this database is a standby that follows the pasted primary and takes no writes of its own. Start the instance, then open its Database modal: the replica section shows "caught up" or the replay lag.')) return;
       const payload = { primaryDsn, cert, publicHost: host };
       if (portRaw !== '') payload.hostPort = Number(portRaw);
       try {
@@ -4584,7 +4241,6 @@
       initEnvConditionals('install-env-rows');
       const installRows = document.getElementById('install-env-rows');
       if (installRows) autofillGenerateSecrets(installRows);
-      attachFleetMasterPrefill('install-env-rows', installEnvHints);
       if (window.guidedInitAll) guidedInitAll();
     }
 
@@ -5443,12 +5099,6 @@
           addInstallEnvRow(env.key, env.value);
           countApplied(env.key);
         }
-        // A loaded role crossing into a dialing role must reach the secret
-        // role cache, or a minted master secret survives into the worker.
-        const roleEl = semanticWrapper(container, 'peer-role');
-        const roleInput = roleEl && roleEl.querySelector('.env-row .env-value');
-        if (roleInput) roleInput.dispatchEvent(new Event('change', { bubbles: true }));
-        if (typeof container.fleetLocationResync === 'function') container.fleetLocationResync();
 
         if (detailEl) {
           const parts = [];
@@ -5495,10 +5145,6 @@
       });
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then create. Nothing was created.`);
-        return;
-      }
-      if (missingMasterCandidates(document.getElementById('install-env-rows'), false)) {
-        showMessage('error', 'A co-worker needs at least one Master Candidate URL. Pick a node on this server or enter the URLs, then create. Nothing was created.');
         return;
       }
 

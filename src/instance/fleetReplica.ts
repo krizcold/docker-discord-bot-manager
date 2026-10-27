@@ -23,8 +23,8 @@ import * as fleetBackupGuards from './fleetBackupGuards';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
-import { findAppCapabilities, foldedRoleValue, CompanionDbSpec } from '../config/appCapabilities';
-import { AppFacts, capabilityRefusal, getAppFacts, hasAppHooks } from './appHookClient';
+import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
+import { capabilityRefusal, getAppFacts, hasAppHooks } from './appHookClient';
 import { probeErrorTail, redactSecrets } from '../config/secretText';
 import { InstanceConfig, FleetDbReplicaRecord, FleetReplicaAutoReseedLedger, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { feedStdin } from '../docker/childStdin';
@@ -343,7 +343,7 @@ function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, co
     ? 'cancelled by the operator'
     : purpose === 'reseed-standby'
       ? 'cancelled after the old copy was cleared, so this standby holds no usable copy until it is re-seeded or removed'
-      : 'cancelled after the stale database was retired, so this node is now an ordinary worker without a standby (its pre-reseed dump is in the backups list if it succeeded)';
+      : 'cancelled after the stale database was retired, so this instance now runs with no copy of its database (its pre-reseed dump is in the backups list if it succeeded)';
   // The attempt is already counted, so the ledger must carry its reason or
   // the modal keeps reporting an attempt that is no longer running.
   if (purpose === 'reseed-standby') ledgerOrWarn(botId, () => ledgerFailure(botId, what));
@@ -793,21 +793,9 @@ export function provisionFleetReplica(
   if (!findAppCapabilities(instance.sourceUrl)?.companionDb) {
     return { success: false, error: 'This app declares no managed database companion' };
   }
-  // A standby lives beside a fleet WORKER (R7): an instance with its own
-  // managed database is the primary side, and a non-fleet bot has no use for
-  // a fleet replica.
+  // An instance with its own managed database is the primary side; a standby
+  // lives beside a node that uses another node's database.
   if (instance.fleetDb) return { success: false, error: 'This instance hosts the fleet database itself - replication is managed from its Database modal' };
-  const controlPlane = findAppCapabilities(instance.sourceUrl)?.controlPlane;
-  if (!controlPlane) {
-    return { success: false, error: 'This app declares no fleet control plane - a standby belongs beside a fleet worker' };
-  }
-  const folded = foldedRoleValue(controlPlane.roleEnv, instance.envVars?.[controlPlane.roleEnv.key]);
-  // A re-seed as a stale primary that retired this machine's own database leaves
-  // the node following another node's database while it keeps its master role.
-  const afterRetire = !!instance.fleetOwnDbRetiredAt && !instance.fleetDb;
-  if (!afterRetire && !controlPlane.roleEnv.dialsOut.includes(folded)) {
-    return { success: false, error: `A replica belongs beside a fleet worker (set ${controlPlane.roleEnv.key} to ${controlPlane.roleEnv.dialsOut.join(' or ')} first)` };
-  }
   if (!containerManager.deployedComposeExists(instance.id)) {
     return { success: false, error: 'Install/build the instance first - the standby joins its compose project' };
   }
@@ -1244,7 +1232,7 @@ export async function instanceRemovalRefusal(
     if (state === 'unknown') return { error: `Docker did not say whether the replica volume ${instance.fleetDbReplica.volume} exists, so the manager can't confirm deleting the data would not destroy it; nothing was removed, try again` };
     if (state === 'exists') return { error: `This instance holds a copy of the fleet database in volume ${instance.fleetDbReplica.volume}, and a copy can be promoted and hold writes no other database has. Remove the replica on the Database modal first (that keeps the volume), or remove the instance and keep its data. Nothing was removed` };
   }
-  if (findAppCapabilities(instance.sourceUrl)?.controlPlane && !confirmFleetData) {
+  if (findAppCapabilities(instance.sourceUrl)?.companionDb && !confirmFleetData) {
     const dir = await instanceDataDir(instance);
     let entries: string[] = [];
     try {
@@ -1312,7 +1300,7 @@ export async function finishPinsRetire(instance: InstanceConfig): Promise<{ succ
     saveSeedOrHold(instance.id, { pinsUnretired: left, lastError: unretiredPinsText(pins.unretired) });
     return { success: false, error: `${left.join(', ')} could still not be removed (${pins.unretired[0].error}); the others are removed. Finish retire again once the store can be written` };
   }
-  const done = 'the stale database was retired and its env pins are removed now; the seed did not run, so this node is an ordinary worker without a standby: Dismiss this, then provision the standby from the block';
+  const done = 'the stale database was retired and its env pins are removed now; the seed did not run, so this instance has no copy of its database: Dismiss this, then provision the standby from the block';
   try {
     containerManager.updateInstanceFleetDbReplicaSeed(instance.id, { ...seed, pinsUnretired: undefined, lastError: done, updatedAt: Date.now() });
     heldSeeds.delete(instance.id);
@@ -1345,13 +1333,11 @@ function uneditedPinsWarning(files: string[]): string {
  * Driven entirely by the app's capability record: an app that declares none
  * has no keys the manager could have pinned, so nothing is deleted from its
  * stores (the manager never invents another app's spelling).
- * appOwnedEnv is included deliberately: the manager never authors those, so a
- * value in ITS stores is an anomaly that would outrank the app's own store.
  */
 function companionEnvKeys(botId: string): string[] {
   const db = findAppCapabilities(containerManager.getBot(botId)?.sourceUrl)?.companionDb;
   if (!db) return [];
-  const keys = [db.env.url, db.env.publicUrl, db.env.mode?.key, ...(db.repointedEnv ?? []), ...(db.appOwnedEnv ?? [])];
+  const keys = [db.env.url, db.env.publicUrl, db.env.mode?.key];
   return Array.from(new Set(keys.filter((k): k is string => !!k)));
 }
 
@@ -1813,7 +1799,7 @@ export async function adoptPromotedReplica(
   // Adopting a copy that still follows somebody would file a standby as a
   // primary and invite a second Enable to fork the pair.
   if (status.live.inRecovery !== false) {
-    return { success: false, error: 'This copy is still following a primary, so it is not this machine\'s database yet. Promote this node first (its own web UI), then adopt' };
+    return { success: false, error: 'This copy still follows a primary, so it is not this machine\'s database; only a copy that no longer follows a primary can be adopted' };
   }
 
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
@@ -1929,23 +1915,6 @@ export async function adoptPromotedReplica(
     // and the operator can retry Enable from the replication section. Rolling
     // the record back would hide a live primary behind a standby surface again.
     return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
-  }
-  // enableFleetReplication repoints the database URL; a repointed key (e.g. a
-  // split control store's URL) only exists when set, and then it moves too.
-  // The env store alone: container env assembly derives sensitive values from
-  // it at read time (the two-store strip).
-  const stored = envManager.getEnvVars(instance.id);
-  const repointUrl = (stored[db.env.url] || '').trim();
-  const repoints: Record<string, string> = {};
-  for (const key of db.repointedEnv ?? []) {
-    if ((stored[key] || '').trim() !== '') repoints[key] = repointUrl;
-  }
-  if (Object.keys(repoints).length) {
-    try {
-      envManager.setEnvVars(instance.id, repoints);
-    } catch (err) {
-      return { success: false, restartRequired: true, error: `The database was adopted and replication is enabled on it, but ${Object.keys(repoints).join(', ')} could not be repointed (${errorText(err)}) and still hold the old database URL: set ${Object.keys(repoints).length === 1 ? 'it' : 'them'} to the value of ${db.env.url} in the Env editor, then restart the instance` };
-    }
   }
   return { success: true, restartRequired: true };
 }
@@ -2135,7 +2104,7 @@ async function seedCancelQuestion(botId: string, seed: FleetReplicaSeedRecord): 
     : seed.purpose === 'reseed-stale-primary'
       ? (whole
         ? `This instance's own database has already been retired. The copy from the node now holding the fleet is complete. ${tail}`
-        : 'This instance\'s own database has already been retired, so this node is an ordinary worker without a standby until it is re-seeded.')
+        : 'This instance\'s own database has already been retired, so this instance has no copy of its database until it is re-seeded.')
       : seed.purpose === 'reseed-standby'
         ? (whole
           ? `The copy is complete. ${tail}`
@@ -2195,14 +2164,6 @@ export async function parkInterruptedReplicaSeeds(): Promise<void> {
     saveSeed(instance.id, { parked: true, lastError: message });
     if (seed.purpose === 'reseed-standby') ledgerFailure(instance.id, message);
   }
-}
-
-/** The remedy for a copy held by a failback that is over, worded from whether the demoted node can receive the current primary's copy block. */
-export function coveredOverRefusal(facts: Pick<AppFacts, 'backupMaster' | 'copyBlockCurrent'> | null): string {
-  const head = "This copy is the returning master's, and its bot is still in the follower hold of a failback that is over (the node it follows no longer stands in for it)";
-  if (facts?.copyBlockCurrent === true) return `${head}; demote the node from its Fleet tab to release the copy, then Re-seed now`;
-  if (facts?.backupMaster === true) return `${head}; demote the node from its Fleet tab to release the copy, then Re-seed now once the current primary's copy block reaches this node`;
-  return `${head}. Demoted, this node is a co-worker, and a co-worker is not sent the current primary's copy block, so Re-seed now would have nothing to follow. Remove the replica and provision it again from the copy block on the current primary's Database modal, or set BOT_NODE_ROLE=backup-master on this node and restart it first, then demote it from its Fleet tab and Re-seed now once the block reaches it`;
 }
 
 /**

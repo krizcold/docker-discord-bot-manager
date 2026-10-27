@@ -29,12 +29,12 @@ import { makeUniqueName, validateName, resolveNames, checkFolderReuse, sanitizeN
 import * as fs from 'fs';
 import * as path from 'path';
 import { readEnvsFromComposeFile } from '../../docker/containerManager';
-import { getFleetControlPort, fleetPublicHost, fleetHostSuffix, fleetAppContainerName, getAppServiceName, getWebUiIndexPath, sharedNetworkName, frontingGatewayDropped, botPortBind, isLoopbackBind } from '../../templates/pcsProcessing';
+import { getAppServiceName, getWebUiIndexPath, sharedNetworkName, frontingGatewayDropped, botPortBind, isLoopbackBind } from '../../templates/pcsProcessing';
 import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
-import { getAppFacts, hasAppHooks } from '../../instance/appHookClient';
-import { backupModeConsent, findAppCapabilities, foldedRoleValue } from '../../config/appCapabilities';
+import { hasAppHooks } from '../../instance/appHookClient';
+import { findAppCapabilities } from '../../config/appCapabilities';
 import { isAutoRebuilding } from '../../instance/instanceUpdater';
 
 const BOT_MANAGER_KEYS = new Set(['BOT_ID', 'BOT_MANAGER_UPDATE_TOKEN', 'BOT_MANAGER_INTERNAL_URL']);
@@ -92,28 +92,9 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
 
 const HEALTH_PUSH_MS = 15000;
 
-const FLEET_MASTER_FACTS_TIMEOUT_MS = 3000;
-
 const UPDATE_HEAD_UNREAD = "The source checkout's current commit could not be read, so the manager can't confirm whether an update is available.";
 const UPDATE_BUILT_UNKNOWN = "The manager has no record of the commit this bot was built from, so it can't confirm whether an update is available. Rebuilding the bot records it.";
 const UPDATE_SOURCE_MISSING = "The bot's source is not in the source list, so the manager can't confirm whether an update is available.";
-
-/** The deployed value of one env key, or null when the deployed compose is missing or unreadable, lacks it or holds two values. */
-function deployedEnvValue(botId: string, key: string): string | null {
-  const deployed = containerManager.deployedComposeEnvValues(botId, [key], true);
-  if (!deployed || deployed.length === 0) return null;
-  const values = new Set(deployed.map(d => d.value.trim()));
-  return values.size === 1 ? [...values][0] : null;
-}
-
-/** The role a bot was deployed with, folded; null when the deployed compose is missing, unreadable or holds two values. */
-function deployedRole(botId: string, roleEnv: Parameters<typeof foldedRoleValue>[0]): string | null {
-  const deployed = containerManager.deployedComposeEnvValues(botId, [roleEnv.key], true);
-  if (!deployed) return null;
-  const values = new Set(deployed.map(d => foldedRoleValue(roleEnv, d.value)));
-  if (values.size > 1) return null;
-  return values.size === 1 ? [...values][0] : foldedRoleValue(roleEnv, undefined);
-}
 
 export function createBotRoutes(wss: WebSocketServer): Router {
   const router = Router();
@@ -211,18 +192,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // Sidecar backup status (null without a managed fleet DB) and the
           // sampler's cached verdict; changes reach open tabs as bot:health.
           ...botHealth(bot),
-          // Fleet-worker marker: drives the Database button's replica surface.
-          // A node that dials out per its app's own record; the default fold
-          // keeps an absent role out of the dial-out set (R7), and an app
-          // declaring no control plane has no worker semantics at all.
+          // Drives the Database button's replica surface: a node whose app
+          // declares a companion database, set to that database's backend,
+          // that does not host the database itself.
           fleetWorker: (() => {
-            const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
-            return !!cp && cp.roleEnv.dialsOut.includes(foldedRoleValue(cp.roleEnv, bot.envVars?.[cp.roleEnv.key]));
+            const mode = findAppCapabilities(bot.sourceUrl)?.companionDb?.env.mode;
+            return !!mode && !bot.fleetDb && (bot.envVars?.[mode.key] ?? '').trim().toLowerCase() === mode.value;
           })(),
-          // The node's consent to active (stand-in) mode as its SAVED env holds
-          // it, read by the key its app declares (20.5, B6-j); null where the
-          // declared row does not apply to this node. The enable is the app's own.
-          fleetBackupConsent: backupModeConsent(findAppCapabilities(bot.sourceUrl), bot.envVars),
           // Whether this app declares lifecycle hooks, so the UI knows if the
           // one-click surfaces can work at all before offering them.
           appHooks: hasAppHooks(bot),
@@ -288,140 +264,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       res.status(400).json({ success: false, error: 'Must provide sourceId or sourceType=docker-image' });
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
-   * GET /api/bots/fleet/masters - Fleet dial targets running on this manager,
-   * with the connection info a joining worker install needs. Returns the shared
-   * control secret in plaintext like /api/recover-envs does: the whole API sits
-   * behind the manager's auth edge and the value exists to be filled into a
-   * joining worker's secret field.
-   * Each entry carries two addresses: localUrl for a same-manager worker (dials
-   * over the shared network, no public round-trip) and masterUrl for a genuinely
-   * cross-host worker (public secure URL). Either may be null when it cannot be
-   * derived. Also returns fleetUrlTemplate: a full URL template with a {name}
-   * placeholder for the sanitized instance name, so the install wizard can
-   * preview a new node's public URL without composing one itself; null when no
-   * public base exists.
-   */
-  router.get('/fleet/masters', async (req: Request, res: Response) => {
-    try {
-      const dataRoot = process.env.DATA_ROOT || '/DATA';
-      // Only the lane this mode's deploy attaches: casaos routes APP_DOMAIN, docker BOT_DOMAIN_BASE.
-      const mode = await getDeploymentMode();
-      // Deployed compose, resolved like containerManager's resolveComposePath:
-      // CasaOS metadata path when present, else the bot-dir copy. Schemes come
-      // from the bot's own record: the public route is TLS-terminated at the
-      // proxy, the same-box container-name dial never is.
-      const fleetAddrsOf = (bot: { id: string; sanitizedName: string }, urlScheme: { secure: string; plain: string }) => {
-        const casaosPath = path.join(dataRoot, 'AppData', 'casaos', 'apps', bot.sanitizedName, 'docker-compose.yml');
-        const composePath = fs.existsSync(casaosPath) ? casaosPath : path.join(getBotDir(bot.id), 'docker-compose.yml');
-        if (!fs.existsSync(composePath)) return null;
-        const composeContent = fs.readFileSync(composePath, 'utf-8');
-        const controlPort = getFleetControlPort(composeContent);
-        if (controlPort === null) return null;
-
-        // Public URL a genuinely cross-host worker uses. Same URL the
-        // injection path authors under the record's publicUrl key; null when no
-        // publicly-trusted base exists for the mode (e.g. standalone/Windows).
-        const host = fleetPublicHost(bot.sanitizedName, mode);
-        const publicUrl = host ? `${urlScheme.secure}://${host}` : null;
-
-        // Local URL a same-host/same-manager worker should dial instead, so the
-        // handshake stays on the box rather than looping out through the public
-        // gateway. Both modes dial the app container by name over the shared
-        // network (pcs on CasaOS, dbm_internal in docker mode):
-        // host.docker.internal is Docker Desktop-only and the fleet host port is
-        // loopback-bound, so on bare Linux a container-name dial is the only
-        // route that works.
-        const cname = fleetAppContainerName(composeContent);
-        const localUrl = cname ? `${urlScheme.plain}://${cname}:${controlPort}` : null;
-        return { publicUrl, localUrl };
-      };
-
-      // Secondary dial targets per each bot's own record: every folded role
-      // value AFTER the first entry of dialTargetOrder. One shared secret per
-      // fleet pairs them with their primary; the manager reads only the
-      // POSITION, never what the values mean. Secondaries come second in a
-      // candidate list (the first dial target leads).
-      const secondaries: Array<{ id: string; localUrl: string | null; publicUrl: string | null; secret: string }> = [];
-      for (const bot of containerManager.getAllBots()) {
-        try {
-          const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
-          if (!cp || !cp.groupSecretEnv) continue;
-          const folded = deployedRole(bot.id, cp.roleEnv);
-          if (folded === null || cp.roleEnv.dialTargetOrder.indexOf(folded) <= 0) continue;
-          const secret = deployedEnvValue(bot.id, cp.groupSecretEnv);
-          if (!secret) continue;
-          const addrs = fleetAddrsOf(bot, cp.urlScheme);
-          if (!addrs) continue;
-          secondaries.push({ id: bot.id, localUrl: addrs.localUrl, publicUrl: addrs.publicUrl, secret });
-        } catch {
-          // an unreadable instance must not break the list
-        }
-      }
-
-      type MasterEntry = {
-        id: string; name: string; masterUrl: string | null; localUrl: string | null;
-        secretSet: boolean; controlSecret: string; secretUnfilled: string | null; localCandidates: string[]; publicCandidates: string[];
-        unanswered: string | null;
-      };
-      // One slot per candidate in record order; a slot settles to null when the app says it is not a live master.
-      const slots: Array<Promise<MasterEntry | null>> = [];
-      for (const bot of containerManager.getAllBots()) {
-        try {
-          const cp = findAppCapabilities(bot.sourceUrl)?.controlPlane;
-          if (!cp) continue;
-          const env = envManager.getEnvVars(bot.id);
-          // The deployed role decides, not a saved edit not yet applied; a blank one folds to the record's default.
-          const folded = deployedRole(bot.id, cp.roleEnv);
-          if (folded === null || folded !== cp.roleEnv.dialTargetOrder[0]) continue;
-          const addrs = fleetAddrsOf(bot, cp.urlScheme);
-          if (!addrs || (!addrs.publicUrl && !addrs.localUrl)) continue;
-
-          const controlSecret = cp.groupSecretEnv ? (env[cp.groupSecretEnv] || '').trim() : '';
-          // Positions in dialTargetOrder are disjoint, so a node cannot match
-          // both lists; the id filter stays as a cheap invariant guard.
-          const runSecret = cp.groupSecretEnv ? deployedEnvValue(bot.id, cp.groupSecretEnv) : null;
-          const peers = !runSecret ? [] : secondaries.filter(b => b.secret === runSecret && b.id !== bot.id);
-          // The wizard fills only the secret the node was deployed with.
-          let secretUnfilled: string | null = null;
-          if (cp.groupSecretEnv && controlSecret !== '') {
-            const deployed = containerManager.deployedComposeEnvValues(bot.id, [cp.groupSecretEnv], true);
-            if (deployed === undefined) secretUnfilled = `The deployed setup of ${bot.displayName} could not be read, so its fleet secret is not filled in. Paste it from that node (its Usage tab > Connect a worker).`;
-            else if (!deployed || deployed.length === 0 || deployed.some(d => d.value.trim() !== controlSecret)) secretUnfilled = `The saved fleet secret of ${bot.displayName} is not the one it was deployed with, so it is not filled in. Restart ${bot.displayName} to apply its saved settings, then reopen this form.`;
-          }
-          const dedupe = (urls: Array<string | null>) => [...new Set(urls.filter((u): u is string => !!u))];
-          const localCandidates = dedupe([addrs.localUrl, ...peers.map(p => p.localUrl)]);
-          const publicCandidates = dedupe([addrs.publicUrl, ...peers.map(p => p.publicUrl)]);
-          const entry: MasterEntry = {
-            id: bot.id, name: bot.displayName, masterUrl: addrs.publicUrl, localUrl: addrs.localUrl,
-            secretSet: controlSecret !== '', controlSecret: secretUnfilled ? '' : controlSecret, secretUnfilled, localCandidates, publicCandidates,
-            unanswered: null,
-          };
-          const cantConfirm = `${bot.displayName} did not answer, so the manager can't confirm it is running as the fleet's master.`;
-          const unanswered = (): MasterEntry => ({ ...entry, unanswered: cantConfirm });
-          if (!hasAppHooks(bot)) {
-            slots.push(Promise.resolve(unanswered()));
-            continue;
-          }
-          slots.push(getAppFacts(bot, FLEET_MASTER_FACTS_TIMEOUT_MS).then(read => {
-            const f = read.success ? read.facts : undefined;
-            if (!f) return unanswered();
-            return f.running && f.initialized && f.role === 'master' && !f.superseded ? entry : null;
-          }, unanswered));
-        } catch {
-          // an unreadable instance must not break the list
-        }
-      }
-      const masters = (await Promise.all(slots)).filter((m): m is MasterEntry => m !== null);
-      // A full template rather than a bare host suffix, so the browser never
-      // composes a URL (or assumes a scheme) itself.
-      const suffix = fleetHostSuffix(mode);
-      res.json({ success: true, fleetUrlTemplate: suffix === null ? null : `wss://{name}${suffix}`, masters });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -2137,7 +1979,7 @@ function recoverableEnvs(name: string, existingInstances: InstanceConfig[]): {
 } {
   const targetSanitized = sanitizeName(name);
   const sensitivePatterns = ['TOKEN', 'SECRET', 'PASSWORD', 'API_KEY'];
-  const isSensitive = (key: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p));
+  const isSensitive = (key: string, value: string) => sensitivePatterns.some(p => key.toUpperCase().includes(p)) || envManager.hasCredentialUrl(value);
 
   const fromVault: Record<string, string> = {};
   const vaultLoad = readVault();
@@ -2161,7 +2003,7 @@ function recoverableEnvs(name: string, existingInstances: InstanceConfig[]): {
     merged[k] = { value: v, source: 'vault' };
   }
 
-  const envs = Object.entries(merged).map(([key, { value, source }]) => ({ key, value, sensitive: isSensitive(key), source }));
+  const envs = Object.entries(merged).map(([key, { value, source }]) => ({ key, value, sensitive: isSensitive(key, value), source }));
   return {
     envs,
     sources: { vault: envs.filter(e => e.source === 'vault').length, compose: envs.filter(e => e.source === 'compose').length },

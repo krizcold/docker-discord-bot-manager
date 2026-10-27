@@ -5,7 +5,7 @@ import YAML from 'yaml';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { extractVariables } from '../../src/templates/variableSubstitution';
 import { generateCompose, generateImageCompose } from '../../src/templates/compose';
-import { processComposeForCasaOS, composeEnvLiteral, attachFleetToProxy } from '../../src/templates/pcsProcessing';
+import { processComposeForCasaOS, composeEnvLiteral } from '../../src/templates/pcsProcessing';
 
 let tmp: string;
 let savedDataRoot: string | undefined;
@@ -90,22 +90,5 @@ describe('FU-2 T-ENVQx extractVariables agrees with the substitution on $$', () 
 
   it('a name after an escaped $ is still reported, and plain names are', () => {
     expect(extractVariables('a: $$$TOKEN\nb: ${ONE}\nc: $TWO\nd: $$\n')).toEqual(['ONE', 'TOKEN', 'TWO']);
-  });
-});
-
-describe('FU-2 B17-1m setServiceEnv writes manager-authored values as literals', () => {
-  const host = 'h$HOME.example';
-
-  it('map-form environment: the advertised URL holds the host with $ escaped', () => {
-    const compose = 'services:\n  bot:\n    image: x\n    environment:\n      A: "1"\n';
-    const doc = YAML.parse(attachFleetToProxy(compose, host, 9000, { envAdvertise: { key: 'PUBLIC_URL', scheme: 'wss' }, service: 'bot' }));
-    expect(doc.services.bot.environment.PUBLIC_URL).toBe('wss://h$$HOME.example');
-    expect(doc.services.bot.environment.A).toBe('1');
-  });
-
-  it('list-form environment: the advertised URL holds the host with $ escaped', () => {
-    const compose = 'services:\n  bot:\n    image: x\n    environment:\n      - A=1\n      - PUBLIC_URL=old\n';
-    const doc = YAML.parse(attachFleetToProxy(compose, host, 9000, { envAdvertise: { key: 'PUBLIC_URL', scheme: 'wss' }, service: 'bot' }));
-    expect(doc.services.bot.environment).toEqual(['A=1', 'PUBLIC_URL=wss://h$$HOME.example']);
   });
 });

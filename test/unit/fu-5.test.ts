@@ -32,16 +32,6 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   getDeploymentMode: async () => 'docker',
 }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
-vi.mock('../../src/config/appCapabilities', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('../../src/config/appCapabilities')>()),
-  findAppCapabilities: () => ({
-    controlPlane: {
-      groupSecretEnv: 'FLEET_SECRET',
-      roleEnv: { key: 'FLEET_ROLE', default: 'leader', dialTargetOrder: ['leader', 'standby'], dialsOut: ['worker'] },
-      urlScheme: { secure: 'wss', plain: 'ws' },
-    },
-  }),
-}));
 // The registry's hash and the checkout's HEAD are set apart, so a row can tell which one a check read.
 vi.mock('../../src/source/sourceManager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/source/sourceManager')>()),
@@ -71,7 +61,7 @@ const B = 'b'.repeat(40);
 
 const writeCompose = (id: string, name: string, env: Record<string, string>): void => {
   fs.writeFileSync(path.join(tmp.dir, 'bots', id, 'docker-compose.yml'), YAML.stringify({
-    services: { app: { image: 'fake/app:1', container_name: `${name}-app`, labels: { 'fleet.control-port': '9500' }, environment: env } },
+    services: { app: { image: 'fake/app:1', container_name: `${name}-app`, environment: env } },
   }));
 };
 
@@ -214,39 +204,5 @@ describe('deleting an env key on a running bot', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.notApplied).toBeUndefined();
     expect(containerManager.getBot('b1')?.pendingApply).toBeUndefined();
-  });
-});
-
-describe('the fleet master list pairs secondaries by the deployed secret', () => {
-  beforeEach(() => {
-    writeInstances({ b1: instance('b1', 'bot1'), b2: instance('b2', 'bot2') });
-  });
-
-  it('pairs a standby whose deployed secret is the master deployed secret, though its saved one differs', async () => {
-    envManager.setEnvVars('b1', { FLEET_SECRET: 'run-secret' });
-    writeCompose('b1', 'bot1', { FLEET_SECRET: 'run-secret' });
-    envManager.setEnvVars('b2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'saved-later' });
-    writeCompose('b2', 'bot2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'run-secret' });
-    const m = (await call('get', '/fleet/masters', {})).body.masters[0];
-    expect(m.localCandidates).toEqual(['ws://bot1-app:9500', 'ws://bot2-app:9500']);
-  });
-
-  it('does not pair a standby whose saved secret matches but whose deployed one does not', async () => {
-    envManager.setEnvVars('b1', { FLEET_SECRET: 'run-secret' });
-    writeCompose('b1', 'bot1', { FLEET_SECRET: 'run-secret' });
-    envManager.setEnvVars('b2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'run-secret' });
-    writeCompose('b2', 'bot2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'other-fleet' });
-    const m = (await call('get', '/fleet/masters', {})).body.masters[0];
-    expect(m.localCandidates).toEqual(['ws://bot1-app:9500']);
-  });
-
-  it('pairs by the master deployed secret when its saved one was changed and not applied', async () => {
-    envManager.setEnvVars('b1', { FLEET_SECRET: 'saved-not-deployed' });
-    writeCompose('b1', 'bot1', { FLEET_SECRET: 'run-secret' });
-    envManager.setEnvVars('b2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'run-secret' });
-    writeCompose('b2', 'bot2', { FLEET_ROLE: 'standby', FLEET_SECRET: 'run-secret' });
-    const m = (await call('get', '/fleet/masters', {})).body.masters[0];
-    expect(m.controlSecret).toBe('');
-    expect(m.localCandidates).toEqual(['ws://bot1-app:9500', 'ws://bot2-app:9500']);
   });
 });

@@ -124,7 +124,7 @@ const writeRegistry = (b1: Record<string, unknown> = {}, others: Record<string, 
       b1: {
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
-        envVars: { BOT_NODE_ROLE: 'co-worker' },
+        envVars: {},
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
         ...b1,
       },

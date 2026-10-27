@@ -72,17 +72,6 @@ describe('copy buttons', () => {
       expect(btn.textContent).toBe('Copied');
     });
   }
-  it('the fleet URL copy button says Copied only when the browser copied', async () => {
-    const m = pageHtml.match(/btn\.addEventListener\('click', (\(\) => [^\n]*)\);\n/);
-    expect(m).not.toBeNull();
-    const { ctx, messages } = page(() => Promise.reject(new Error('denied')));
-    const btn = { textContent: 'Copy' };
-    Object.assign(ctx, { btn, urlOf: () => 'https://x' });
-    await vm.runInContext(`(${m![1]})()`, ctx);
-    await new Promise((r) => setImmediate(r));
-    expect(btn.textContent).toBe('Copy');
-    expect(messages[0]?.[0]).toBe('error');
-  });
 });
 
 describe('instance auto-update controls', () => {

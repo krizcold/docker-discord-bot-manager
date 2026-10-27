@@ -294,7 +294,7 @@ describe('T-WRITABLE the config pages keep an untouched Writable unset', () => {
     });
     vm.runInContext('const cfTemplateOrig = new Map(); let cfTemplateSeq = 0;\n'
       + ['escapeHtml', 'buildConfigFileBlockHtml', 'registerTemplateOrig', 'configFileReadOnly', 'botLabel', 'guidedReadyToSave',
-        'missingMasterCandidates', 'dialsOutRole', 'semanticWrapper', 'semanticEnvValue', 'semanticValuesOf', 'doInstall'].map(fn).join('\n')
+        'semanticWrapper', 'semanticEnvValue', 'doInstall'].map(fn).join('\n')
       + '\nthis.render = buildConfigFileBlockHtml;', ctx);
     const untouched = render(ctx, '/app/a.yml', undefined, false);
     const toggled = render(ctx, '/app/b.yml', undefined, false);

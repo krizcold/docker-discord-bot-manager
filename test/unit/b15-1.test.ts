@@ -290,7 +290,7 @@ describe('minting a fleet database password', () => {
 });
 
 describe('provisioning a standby over a kept volume', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'co-worker' } };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {} };
 
   it('asks, naming the volume, and clears nothing', async () => {
     writeRegistry(worker);
@@ -349,7 +349,7 @@ describe('provisioning a standby over a kept volume', () => {
 });
 
 describe('Remove replica', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'co-worker' } };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {} };
 
   it('asks before removing a copy that was promoted, and records what it held', async () => {
     writeRegistry({ ...worker, fleetDbReplica: REPLICA });
@@ -459,7 +459,7 @@ describe('database dumps after the record is removed', () => {
 });
 
 describe('a keep-data Remove of an instance whose copy was promoted', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: { BOT_NODE_ROLE: 'co-worker' }, fleetDbReplica: REPLICA };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, fleetDbReplica: REPLICA };
 
   it('asks before removing over a promoted copy, and goes on once confirmed', async () => {
     writeRegistry(worker);

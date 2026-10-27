@@ -23,17 +23,17 @@ afterEach(() => {
 describe('appHookClient: a hook that times out is unknown, not failed', () => {
   it('says the call was sent and no answer came, and flags unknown', async () => {
     vi.stubGlobal('fetch', async () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); });
-    const r = await callAppHook({ id: 'b1', sourceUrl: 'x', updateToken: 'tok', envVars: {} } as any, 'promote', 'POST', {}, 5000);
+    const r = await callAppHook({ id: 'b1', sourceUrl: 'x', updateToken: 'tok', envVars: {} } as any, 'confirm-fresh', 'POST', {}, 5000);
     expect(r.ok).toBe(false);
     expect(r.unknown).toBe(true);
-    expect(r.error).toBe("promote sent, no answer within 5 s; check the app's Fleet view before retrying");
+    expect(r.error).toBe("confirm-fresh sent, no answer within 5 s; check the app's Fleet view before retrying");
   });
 
   it('keeps a connection failure as unreachable, without unknown', async () => {
     vi.stubGlobal('fetch', async () => { throw new TypeError('fetch failed'); });
-    const r = await callAppHook({ id: 'b1', sourceUrl: 'x', updateToken: 'tok', envVars: {} } as any, 'promote');
+    const r = await callAppHook({ id: 'b1', sourceUrl: 'x', updateToken: 'tok', envVars: {} } as any, 'confirm-fresh');
     expect(r.unknown).toBeUndefined();
-    expect(r.error).toMatch(/^promote unreachable/);
+    expect(r.error).toMatch(/^confirm-fresh unreachable/);
   });
 
   it('a GET hook that times out says it did not answer, without unknown', async () => {

@@ -42,14 +42,7 @@ export interface EnvFieldMeta {
    * What this row IS (stamped server-side from the app's capability record),
    * so the browser never matches an env key by spelling.
    */
-  semantic?: 'peer-role' | 'peer-list' | 'peer-secret' | 'db-dsn' | 'backup-mode';
-  /** For 'peer-role': the option values meaning "this node dials a peer"; for 'backup-mode': the one value meaning consent. */
-  semanticValues?: string[];
-  /**
-   * For 'peer-role': the record's dialTargetOrder - the order a joining node
-   * lists dialable peers, position 0 being the primary target.
-   */
-  semanticTargetOrder?: string[];
+  semantic?: 'db-dsn';
   /** Why this row has no effect on this deployment; the row renders read-only and is never saved. */
   inactive?: string;
 }
@@ -77,24 +70,8 @@ function gatewayFileNote(gateway: GatewayDeploy): string {
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder, inactive } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, semanticValues, semanticTargetOrder, inactive };
-}
-
-// Keys the manager authors on this app's service at deploy time, per the app's
-// own capability record (PLAN_REPLICATION 20.18: never author a key absent
-// there). Suppressed from the wizard's DETECTED rows only: a STORED value
-// under one of these names is operator-written (the manager never stores one)
-// and the editor keeps it visible - the hand-set transfer URL on a no-base rig
-// is the supported case. An app with no record has no keys to suppress.
-function managerInjectedFleetEnv(sourceUrl?: string | null): Set<string> {
-  const env = findAppCapabilities(sourceUrl)?.controlPlane?.env;
-  if (!env) return new Set();
-  return new Set(
-    [env.port, env.publicUrl, env.transferPort, env.transferUrl]
-      .filter((k): k is string => !!k)
-      .map(k => k.toUpperCase())
-  );
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, inactive } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, inactive };
 }
 
 // Keys the operator is expected to set on a fresh install, so they always stay
@@ -115,7 +92,7 @@ const ALWAYS_SHOW_ENV = new Set([
 function isAdvancedEnv(v: WizardEnvVar): boolean {
   if (v.advanced) return true;
   if (v.required) return false;
-  if (v.sensitive || isSensitive(v.key)) return false;
+  if (v.sensitive || isSensitive(v.key, v.defaultValue)) return false;
   if (ALWAYS_SHOW_ENV.has(v.key.toUpperCase())) return false;
   return (v.defaultValue || '').trim() !== '';
 }
@@ -230,22 +207,13 @@ export function buildWizardEnvList(
     }
   }
 
-  // Fleet section: an app whose capability record declares a control plane gets
-  // its guided rows from that record (PLAN_REPLICATION 20.18: the gate and the
-  // fields come from ONE declaration, so they can never disagree). Guided rows
-  // replace same-key rows a raw scan may have found, so metadata always wins.
+  // Fleet section: an app whose capability record declares guided rows gets
+  // them from that record. Guided rows replace same-key rows a raw scan may
+  // have found, so metadata always wins.
   const record = findAppCapabilities(options?.sourceUrl);
-  const controlPlane = record?.controlPlane;
-  if (controlPlane) {
-    const semanticOf = (key: string): EnvFieldMeta => {
-      if (key === controlPlane.roleEnv.key) return { semantic: 'peer-role', semanticValues: controlPlane.roleEnv.dialsOut, semanticTargetOrder: controlPlane.roleEnv.dialTargetOrder };
-      if (controlPlane.modeEnv && key === controlPlane.modeEnv.key) return { semantic: 'backup-mode', semanticValues: [controlPlane.modeEnv.active] };
-      if (key === controlPlane.dialEnv) return { semantic: 'peer-list' };
-      if (controlPlane.groupSecretEnv && key === controlPlane.groupSecretEnv) return { semantic: 'peer-secret' };
-      if (record?.companionDb && key === record.companionDb.env.url) return { semantic: 'db-dsn' };
-      return {};
-    };
-    const fleet = controlPlane.wizardFields.map(f => ({ ...f, ...semanticOf(f.key) }));
+  if (record?.wizardFields) {
+    const dbKey = record.companionDb?.env.url;
+    const fleet = record.wizardFields.map(f => (f.key === dbKey ? { ...f, semantic: 'db-dsn' as const } : f));
     const fleetKeys = new Set(fleet.map(f => f.key));
     for (let i = vars.length - 1; i >= 0; i--) {
       if (fleetKeys.has(vars[i].key)) vars.splice(i, 1);
@@ -256,9 +224,7 @@ export function buildWizardEnvList(
   // Auto-fold low-touch prefilled rows into Advanced. Only ungrouped rows: a group
   // (e.g. Fleet) curates its own advanced flags, and its primary controls must stay
   // visible. Explicit flags already set on a row are left untouched.
-  const injected = managerInjectedFleetEnv(options?.sourceUrl);
   const surfaced = vars
-    .filter(v => !injected.has(v.key.toUpperCase()))
     .map(v => (!v.group && v.advanced === undefined && isAdvancedEnv(v)) ? { ...v, advanced: true } : v);
   return sourceScan ? { vars: surfaced, detection, sourceScan } : { vars: surfaced, detection };
 }
@@ -342,7 +308,7 @@ export function buildBotEnvList(
   sourceUrl?: string,
   gateway?: GatewayDeploy
 ): EditorEnvVar[] {
-  const { vars: stored, undecryptable } = getEnvVarsWithStatus(botId);
+  const { vars: stored, undecryptable, encrypted } = getEnvVarsWithStatus(botId);
   for (const key of undecryptable) stored[key] = '';
   const unreadable = (key: string) => (undecryptable.includes(key) ? { undecryptable: true } : {});
   const result: EditorEnvVar[] = [];
@@ -355,7 +321,7 @@ export function buildBotEnvList(
     if (d.autoWired) continue;   // deploy-injected, not user-editable
     seen.add(d.key);
     const isSet = stored[d.key] !== undefined;
-    const sensitive = d.sensitive || isSensitive(d.key);
+    const sensitive = d.sensitive || encrypted.includes(d.key) || isSensitive(d.key, isSet ? stored[d.key] : d.defaultValue);
     // A stored value keeps an editable row: a read-only row is not saved, and
     // the save would then remove the stored key.
     const keepEditable = isSet && !!d.inactive;
@@ -381,7 +347,7 @@ export function buildBotEnvList(
   for (const [key, value] of Object.entries(stored)) {
     if (seen.has(key)) continue;
     seen.add(key);
-    const sensitive = isSensitive(key);
+    const sensitive = encrypted.includes(key) || isSensitive(key, value);
     result.push({
       key,
       displayLabel: '',

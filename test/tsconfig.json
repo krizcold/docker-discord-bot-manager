@@ -4,8 +4,10 @@
     "rootDir": "..",
     "noEmit": true,
     "module": "ESNext",
-    "moduleResolution": "Bundler"
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["**/*.ts"],
+  "include": ["**/*.ts", "mutation/**/*.mjs"],
   "exclude": ["node_modules"]
 }

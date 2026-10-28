@@ -110,7 +110,6 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
     if (sql.includes('pg_control_system()')) return cb(null, '7001|2\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
     if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
     return cb(null, '', '');
@@ -140,12 +139,13 @@ vi.mock('child_process', async (importOriginal) => {
     if (cmd === 'docker' && args[0] === 'volume' && args[1] === 'inspect' && args[args.length - 1].endsWith('-fleet-postgres-replica-data')) throw new Error('Error: No such volume');
     return real.execFileSync(cmd, args, opts);
   };
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, execFileSync, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, execFileSync, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED } from './restore-fake';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -171,7 +171,7 @@ beforeEach(() => {
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: {
-    a: { id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
+    a: { id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
     w: { id: 'w', sanitizedName: 'bot-w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
@@ -238,8 +238,8 @@ describe('R8-J6: the restore takes its safety dump under the write fence', () =>
     pg.dumpFails = true;
     pg.liftFails = true;
     const r = await fleetBackup.restoreFleetBackup('a', 'old.dump');
-    expect(r.error).toMatch(/running a restore again retries the lift/);
-    expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/running the restore again retries the lift/);
+    expect(r.error).toMatch(/running a restore again with the bot in Maintenance or Off retries the lift/);
+    expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/running a restore again with the bot in Maintenance or Off retries the lift/);
   });
 });
 

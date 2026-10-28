@@ -1711,7 +1711,8 @@ export async function decommissionFleetDb(
           warning = `The database env pins could not be removed: ${String((err as Error)?.message || err)}`;
         }
         if (warning) console.error(`[FleetReplica] ${instance.id}: ${warning}`);
-        fleetBackup.clearTermFloor(instance.id);
+        fleetBackup.clearClaimFloor(instance.id);
+        fleetBackup.forgetRestoreNotice(instance.id);
         return warning ? { success: true, dumpFile, warning } : { success: true, dumpFile };
       } finally {
         fleetBackupGuards.releaseFleetBackupBusy(instance.id);

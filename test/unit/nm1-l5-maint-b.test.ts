@@ -96,6 +96,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   resetManagerRoleCache: () => { h.events.push('reset-role-cache'); },
   sidecarRunning: async () => h.sidecar,
   ensureManagerDbRole: async () => { h.events.push('ensure'); return h.ensure; },

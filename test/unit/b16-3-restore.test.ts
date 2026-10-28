@@ -38,6 +38,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
     stopBot: async (id: string) => { pg.events.push(`stop:${id}`); pg.live[id] = []; return { success: true }; },
     startBot: async (id: string) => { pg.events.push(`start:${id}`); return { success: true }; },
+    stopBotInOp: async (id: string) => { pg.events.push(`stopInOp:${id}`); pg.live[id] = []; return { success: true }; },
   };
 });
 
@@ -53,11 +54,9 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('ALTER SYSTEM RESET')) { pg.events.push('lift'); return cb(null, '', ''); }
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 't|t\n', '');
     if (sql.includes('SELECT coalesce(GREATEST(')) return cb(null, '7\n', '');
     if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return cb(null, 't\n', '');
     if (sql.includes('UPDATE smdb_data.guild_ownership')) { pg.events.push('raise'); return cb(null, 'g1\n', ''); }
-    if (sql.includes('UPDATE smdb_control.term')) return cb(null, '1\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
     return cb(null, '', '');
   });
@@ -82,12 +81,13 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED, OFF } from './restore-fake';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 
@@ -101,10 +101,10 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
-  fleetBackup.clearTermFloor('a');
+  fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances: {
-    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
+    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
     w: { id: 'w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
@@ -118,7 +118,8 @@ describe('R11-J7: a restore notices an instance started outside the manager whil
     const r = await restore();
     expect(r.success).toBe(true);
     expect(pg.events).toContain('lift');
-    expect(r.steps.restarted).toEqual(['a', 'w']);
+    expect(r.steps.restarted).toEqual(['w']);
+    expect(pg.events).not.toContain('start:a');
   });
 
   it('an instance started before the drop refuses the restore, lifts the fence and drops nothing', async () => {
@@ -132,13 +133,16 @@ describe('R11-J7: a restore notices an instance started outside the manager whil
   });
 
   it('an instance started during pg_restore keeps the write fence on and says the dump was restored', async () => {
+    const registry = JSON.parse(fs.readFileSync(path.join(tmp.dir, 'instances.json'), 'utf-8'));
+    Object.assign(registry.instances.a, OFF);
+    fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify(registry));
     pg.onSpawn = kind => { if (kind === 'pg_restore') pg.live.w = ['bot-w-app']; };
     const r = await restore();
     expect(r.success).toBe(false);
     expect(r.steps.restored).toBe(true);
     expect(r.error).toMatch(/^The dump was restored, but bot-w-app was started outside the manager during the restore/);
     expect(r.error).toMatch(/The write fence stays on .*so nothing writes to the restored database from what was read mid-restore/);
-    expect(r.error).toMatch(/w runs now\. The write fence stays on and the stopped instances stay stopped \(a\)/);
+    expect(r.error).toMatch(/w runs now\. The write fence stays on and the bot stays off, so nothing writes/);
     expect(r.error).not.toMatch(/stay stopped \([^)]*\bw\b/);
     expect(pg.events).not.toContain('lift');
     expect(pg.events.some(e => e.startsWith('start:'))).toBe(false);

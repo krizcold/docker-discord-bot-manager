@@ -121,7 +121,6 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('pg_reload_conf()')) { pg.events.push('reload'); return pg.reloadFails ? fail(cb, 'ERROR: reload refused') : cb(null, '', ''); }
     if (sql.includes("name = 'default_transaction_read_only'")) return cb(null, '0\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
     if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
     return cb(null, '', '');
@@ -149,11 +148,13 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
-  return { ...real, execFile, spawn: heldSpawn, default: { ...real, execFile, spawn: heldSpawn } };
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
+  const claimExecFile = (await import('./restore-fake')).withRestoreFakes(execFile as any);
+  return { ...real, execFile: claimExecFile, spawn: heldSpawn, default: { ...real, execFile: claimExecFile, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED } from './restore-fake';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -166,7 +167,7 @@ const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volum
 const OWNER = 'decommission:1';
 const at = (event: string) => pg.events.indexOf(event);
 const count = (event: string) => pg.events.filter(e => e === event).length;
-const bot = () => ({ id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } } as any);
+const bot = () => ({ id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } } as any);
 
 beforeEach(() => {
   pg.events.length = 0;

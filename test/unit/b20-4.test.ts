@@ -135,6 +135,14 @@ afterAll(() => {
 });
 
 describe('R18-J4 and R7-J27: the fleet database retire', () => {
+  it('NM4 N4: the write that drops the database record also drops the restore notice', async () => {
+    writeRegistry(record({ fleetDb, fleetRestoreError: { file: 'old.dump', text: 'Restore of old.dump failed: x', at: '2026-10-28T10:00:00.000Z' } }));
+    const res = await containerManager.retireFleetDbSidecar('b1');
+    expect(res.success).toBe(true);
+    expect(stored().fleetDb).toBeUndefined();
+    expect(stored().fleetRestoreError).toBeUndefined();
+  });
+
   it('stamps the retiring mark before the container is removed', async () => {
     writeRegistry(record({ fleetDb }));
     let markAtRm: unknown = 'not called';

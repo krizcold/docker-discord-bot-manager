@@ -16,11 +16,6 @@ const pg = vi.hoisted(() => ({
   sql: [] as string[],
   urls: {} as Record<string, string>,
   live: {} as Record<string, string[] | null>,
-  tables: 't|t' as string,
-  probeFails: false,
-  liveTerm: '7',
-  guilds: 'g1\ng2\n',
-  raiseFails: false,
   restoreCode: 0,
   saveFails: false,
   restoreGate: null as Promise<void> | null,
@@ -48,7 +43,8 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
     stopBot: async (id: string) => { pg.events.push(`stop:${id}`); pg.live[id] = []; return { success: true }; },
     startBot: async (id: string) => { pg.events.push(`start:${id}`); return { success: true }; },
-    updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string } | null) => {
+    stopBotInOp: async (id: string) => { pg.events.push(`stopInOp:${id}`); pg.live[id] = []; return { success: true }; },
+    updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string; at: string; doubt: boolean } | null) => {
       if (pg.saveFails) throw new Error('ENOSPC: no space left on device');
       return real.updateInstanceFleetRestoreError(botId, notice);
     },
@@ -65,26 +61,17 @@ vi.mock('child_process', async (importOriginal) => {
     const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (err: Error | null, stdout: string, stderr: string) => void;
     const sql = args.join(' ');
     pg.sql.push(sql);
-    const fail = (text: string) => cb(new Error(text), '', `ERROR:  ${text}`);
     if (args[0] === 'inspect') return cb(null, 'true\n', '');
     if (args[0] === 'stop') { pg.events.push(`docker-stop:${args[1]}`); return cb(null, '', ''); }
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) { pg.events.push('fence'); return cb(null, '0\n', ''); }
     if (sql.includes('ALTER SYSTEM RESET')) { pg.events.push('lift'); return cb(null, '', ''); }
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return pg.probeFails ? fail('connection reset') : cb(null, `${pg.tables}\n`, '');
-    if (sql.includes('SELECT coalesce(GREATEST(')) return cb(null, `${pg.liveTerm}\n`, '');
-    if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return cb(null, 't\n', '');
-    if (sql.includes('UPDATE smdb_data.guild_ownership')) {
-      pg.events.push('raise');
-      return pg.raiseFails ? fail('permission denied for table guild_ownership') : cb(null, pg.guilds, '');
-    }
-    if (sql.includes('UPDATE smdb_control.term')) { pg.events.push('term'); return cb(null, '1\n', ''); }
     if (sql.includes('DROP DATABASE')) {
       pg.events.push('drop');
       const registry = JSON.parse(nodeFs.readFileSync(nodePath.join(tmp.dir, 'instances.json'), 'utf-8'));
       pg.noticeAtDrop = registry.instances.a.fleetRestoreError;
-      const floorFile = nodePath.join(tmp.dir, 'backups', 'a', 'fleet-postgres', 'term-floor.json');
+      const floorFile = nodePath.join(tmp.dir, 'backups', 'a', 'fleet-postgres', 'claim-floor.json');
       pg.floorAtDrop = nodeFs.existsSync(floorFile) ? nodeFs.readFileSync(floorFile, 'utf-8') : null;
     }
     return cb(null, '', '');
@@ -113,12 +100,13 @@ vi.mock('child_process', async (importOriginal) => {
     })();
     return child;
   });
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED, OFF, claimDb, resetClaimDb } from './restore-fake';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -126,12 +114,12 @@ import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
-const FLOOR = path.join(DIR, 'term-floor.json');
+const FLOOR = path.join(DIR, 'claim-floor.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
 
 function writeRegistry(extraA: Record<string, unknown> = {}, wStatus = 'running'): void {
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: {
-    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 }, ...extraA },
+    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 }, ...extraA },
     w: { id: 'w', displayName: 'w', status: wStatus, sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
 }
@@ -141,11 +129,7 @@ beforeEach(() => {
   pg.sql.length = 0;
   pg.urls = { a: 'postgres://app:pw@bot-a-postgres/app', w: 'postgres://app:pw@bot-a-postgres:5432/app?sslmode=no-verify' };
   pg.live = { a: ['bot-a-app'], w: ['bot-w-app'] };
-  pg.tables = 't|t';
-  pg.probeFails = false;
-  pg.liveTerm = '7';
-  pg.guilds = 'g1\ng2\n';
-  pg.raiseFails = false;
+  resetClaimDb({ onRaise: () => pg.events.push('raise') });
   pg.restoreCode = 0;
   pg.saveFails = false;
   pg.restoreGate = null;
@@ -154,7 +138,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
-  fleetBackup.clearTermFloor('a');
+  fleetBackup.clearClaimFloor('a');
   writeRegistry();
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
 });
@@ -163,31 +147,32 @@ afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 const at = (event: string) => pg.events.indexOf(event);
 const restore = () => fleetBackup.restoreFleetBackup('a', 'old.dump');
 
-describe('R6-J14 and R39-J3: the restore keeps the pre-restore term or refuses', () => {
-  it('raises every restored guild lease above the kept term and names the guilds', async () => {
-    pg.liveTerm = '9';
+describe('R6-J14 and R39-J3: the restore keeps the claim floor or refuses', () => {
+  it('raises every restored claim above the kept floor and names the guilds', async () => {
+    claimDb.floor = '9';
+    claimDb.raise = 'seq|10\nguild|g1\nguild|g2\n';
     const r = await restore();
     expect(r.success).toBe(true);
     expect(r.steps.guildsRaised).toEqual(['g1', 'g2']);
-    expect(r.steps.leaseTerm).toBe(10);
-    expect(r.steps.termReconciledTo).toBe(9);
-    const raise = pg.sql.find(s => s.includes('UPDATE smdb_data.guild_ownership'))!;
+    expect(r.steps.claimRaisedTo).toBe(10);
+    expect(r.steps.claimFloor).toBe(9);
+    const raise = claimDb.raiseSql[0];
     expect(raise).toContain('PGOPTIONS=-c default_transaction_read_only=off');
-    expect(raise).toContain('SET term = 10');
-    expect(raise).toContain('WHERE term <= 9');
+    expect(raise).toContain('SET claim = 10');
+    expect(raise).toContain('WHERE claim <= 9');
     expect(at('raise')).toBeGreaterThan(at('pg_restore'));
     expect(at('raise')).toBeLessThan(at('lift'));
-    expect(JSON.parse(fs.readFileSync(FLOOR, 'utf-8'))).toEqual({ term: 9 });
+    expect(JSON.parse(fs.readFileSync(FLOOR, 'utf-8'))).toEqual({ claim: 9 });
   });
 
   it('a floor that cannot be written refuses before the drop, lifts the fence and restarts the writers', async () => {
     fs.mkdirSync(`${FLOOR}.tmp`);
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/pre-restore control term 7 could not be kept on disk, so the restore was refused, and nothing was changed/);
+    expect(r.error).toMatch(/The claim floor 7 could not be kept on disk, so the restore was refused, and nothing was changed/);
     expect(pg.events).not.toContain('drop');
     expect(at('lift')).toBeGreaterThan(at('fence'));
-    expect(r.steps.restarted).toEqual(['a', 'w']);
+    expect(r.steps.restarted).toEqual(['w']);
   });
 
   it('the floor held in memory is written to disk before a retry in the same process drops the database', async () => {
@@ -196,23 +181,23 @@ describe('R6-J14 and R39-J3: the restore keeps the pre-restore term or refuses',
     fs.rmSync(`${FLOOR}.tmp`, { recursive: true, force: true });
     pg.events.length = 0;
     pg.sql.length = 0;
-    pg.liveTerm = '3';
+    claimDb.floor = '3';
     fs.rmSync(FLOOR, { recursive: true, force: true });
-    fs.writeFileSync(FLOOR, JSON.stringify({ term: 2 }));
+    fs.writeFileSync(FLOOR, JSON.stringify({ claim: 2 }));
     const r = await restore();
     expect(r.success).toBe(true);
-    expect(r.steps.leaseTerm).toBe(8);
-    expect(JSON.parse(pg.floorAtDrop ?? 'null')).toEqual({ term: 7 });
+    expect(r.steps.claimRaisedTo).toBe(8);
+    expect(JSON.parse(pg.floorAtDrop ?? 'null')).toEqual({ claim: 7 });
   });
 
   it('a retry whose held floor still cannot be written refuses before the drop', async () => {
     fs.mkdirSync(`${FLOOR}.tmp`);
     await restore();
     pg.events.length = 0;
-    pg.liveTerm = '3';
+    claimDb.floor = '3';
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/pre-restore control term 7 could not be kept on disk/);
+    expect(r.error).toMatch(/The claim floor 7 could not be kept on disk/);
     expect(pg.events).not.toContain('drop');
   });
 
@@ -220,34 +205,34 @@ describe('R6-J14 and R39-J3: the restore keeps the pre-restore term or refuses',
     fs.writeFileSync(FLOOR, 'not json');
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/term floor file .* could not be read/);
+    expect(r.error).toMatch(/claim floor file .* could not be read/);
     expect(r.error).toMatch(/nothing was changed/);
     expect(pg.events).toEqual([]);
   });
 
-  it('a term probe that fails refuses before the drop', async () => {
-    pg.probeFails = true;
+  it('a claim probe that fails refuses before the drop', async () => {
+    claimDb.fail = 'floor';
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/Could not read the control term before the restore/);
+    expect(r.error).toMatch(/Could not read the claim numbers before the restore/);
     expect(pg.events).not.toContain('drop');
   });
 
-  it('a database without the term tables restores with no lease raise', async () => {
-    pg.tables = 'f|f';
+  it('a database without the claim tables restores with no raise', async () => {
+    claimDb.tables = 'f|f|f';
     const r = await restore();
     expect(r.success).toBe(true);
     expect(r.steps.guildsRaised).toBeNull();
     expect(pg.events).not.toContain('raise');
   });
 
-  it('a lease raise that fails keeps the fence on and the instances stopped', async () => {
-    pg.raiseFails = true;
+  it('a claim raise that fails keeps the fence on and the instances stopped', async () => {
+    claimDb.fail = 'raise';
     const r = await restore();
     expect(r.success).toBe(false);
     expect(r.steps.restored).toBe(true);
-    expect(r.error).toMatch(/guild leases could not be raised above the pre-restore term 7/);
-    expect(r.error).toMatch(/write fence stays on and the stopped instances stay stopped/);
+    expect(r.error).toMatch(/restored claim numbers could not be raised above 7/);
+    expect(r.error).toMatch(/write fence stays on, the bot stays in maintenance, and the other stopped instances stay stopped/);
     expect(pg.events.slice(at('raise'))).not.toContain('lift');
     expect(r.steps.restarted).toEqual([]);
     expect(fleetBackup.getFleetFenceStuck('a')).toMatch(/READ-ONLY/);
@@ -261,7 +246,7 @@ describe('R9-J3 and R13-J15: a failure past the drop stays fenced and named', ()
     expect(r.success).toBe(false);
     expect(pg.events.slice(at('pg_restore'))).not.toContain('lift');
     expect(pg.events.filter(e => e.startsWith('start:'))).toEqual([]);
-    expect(r.error).toMatch(/stopped instances stay stopped \(a, w\)/);
+    expect(r.error).toMatch(/stopped instances stay stopped \(w\)/);
     expect(r.error).toContain(r.steps.preRestoreDump!);
     expect(fleetBackup.getFleetRestoreError('a')).toContain(r.steps.preRestoreDump!);
   });
@@ -280,18 +265,28 @@ describe('R9-J3 and R13-J15: a failure past the drop stays fenced and named', ()
     pg.saveFails = true;
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/could not be recorded before the database was dropped/);
+    expect(r.error).toMatch(/could not be recorded before the database was fenced/);
     expect(pg.events).not.toContain('drop');
-    expect(r.steps.restarted).toEqual(['a', 'w']);
+    expect(r.steps.restarted).toEqual(['w']);
   });
 });
 
 describe('R7-J4 and R10-J1: who the restore stops comes from docker and the parsed URL', () => {
-  it('stops itself and a sharer whose URL differs only in its query string', async () => {
+  it('stops a sharer whose URL differs only in its query string, and leaves the bot in Maintenance running', async () => {
+    const r = await restore();
+    expect(r.success).toBe(true);
+    expect(r.steps.stopped).toEqual(['w']);
+    expect(at('stop:w')).toBeLessThan(at('fence'));
+    expect(pg.events).not.toContain('stop:a');
+  });
+
+  it('stops itself when it is Off and docker runs it', async () => {
+    writeRegistry(OFF);
     const r = await restore();
     expect(r.success).toBe(true);
     expect(r.steps.stopped.sort()).toEqual(['a', 'w']);
-    expect(at('stop:a')).toBeLessThan(at('fence'));
+    expect(at('stopInOp:a')).toBeLessThan(at('fence'));
+    expect(r.steps.restarted).toEqual(['w']);
   });
 
   it('a record that says running with nothing running in docker is neither stopped nor restarted', async () => {
@@ -335,6 +330,7 @@ describe('R7-J4 and R10-J1: who the restore stops comes from docker and the pars
 
   it('a sharer on another host is left alone', async () => {
     pg.urls.w = 'postgres://app:pw@other-host:5432/app';
+    writeRegistry(OFF);
     const r = await restore();
     expect(r.steps.stopped).toEqual(['a']);
   });

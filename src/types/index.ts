@@ -239,7 +239,7 @@ export interface InstanceConfig {
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
-  fleetRestoreError?: { file: string; text: string }; // a failed restore's notice; only a successful restore or a dismiss clears it
+  fleetRestoreError?: { file: string; text: string; at: string; doubt: boolean }; // a restore's notice, the time it was written, and whether it leaves the data in doubt; Running is refused while it stands
   fleetBackup?: FleetBackupConfig;     // backup schedule; absent = defaults
   fleetBackupTests?: Partial<Record<BackupFamily, FleetBackupTests>>; // the daily test restore of each family
   fleetBackupAlerts?: Record<string, FleetBackupAlert>; // standing backup alerts by <family>:<dumps|test>

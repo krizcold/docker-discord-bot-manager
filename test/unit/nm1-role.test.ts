@@ -110,6 +110,7 @@ import * as fleetBackup from '../../src/instance/fleetBackup';
 import { fenceLinesRefusal } from '../../src/instance/fleetReplication';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import { fenceOwners } from './fence-fake';
+import { MAINTAINED, TOC } from './restore-fake';
 import * as containerManager from '../../src/docker/containerManager';
 import * as dbLogin from '../../src/instance/dbLogin';
 import { callAppHook } from '../../src/instance/appHookClient';
@@ -165,13 +166,20 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     expectManagerLogins();
   });
 
-  it('probeLiveTerm reads the term as dbm_admin', async () => {
-    await fleetBackup.probeLiveTerm(fleetDb);
+  it('probeClaims reads the claim numbers as dbm_admin', async () => {
+    await fleetBackup.probeClaims(fleetDb);
     expectManagerLogins();
   });
 
-  it('raiseGuildTerms writes the terms as dbm_admin', async () => {
-    await fleetBackup.raiseGuildTerms(fleetDb, 3);
+  it('raiseClaims reads the tables and writes the claim numbers as dbm_admin', async () => {
+    h.answer = args => {
+      const sql = args.join(' ');
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|4\n';
+      return '';
+    };
+    expect(await fleetBackup.raiseClaims(fleetDb, 3)).toEqual({ ok: true, seq: 4, guilds: [] });
+    expect(h.calls.some(a => a.some(x => x.includes('setval')))).toBe(true);
     expectManagerLogins();
   });
 
@@ -197,21 +205,21 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     const dir = path.join(h.dir, 'backups', 'b1', 'fleet-postgres');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'old.dump'), 'dump');
-    writeInstance({ status: 'running', fleetDb, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
+    writeInstance({ status: 'running', ...MAINTAINED, fleetDb, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
     h.env = { DATABASE_URL: `postgres://${fleetDb.user}:pw@${fleetDb.containerName}:5432/${fleetDb.db}` };
     h.answer = args => {
       const sql = args.join(' ');
+      if (args.includes('pg_restore') && args.includes('-l')) return TOC.claims;
       if (args.includes('pg_restore')) return pgRestore;
       if (args.includes('pg_dump')) return 'dump';
       if (args[0] === 'inspect') return 'true\n';
       if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) return '0\n';
       if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
       if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
-      if (sql.includes("to_regclass('smdb_control.term')")) return 't|t\n';
+      if (sql.includes('rolcanlogin')) return 'false|false|0\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
-      if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return 't\n';
-      if (sql.includes('UPDATE smdb_data.guild_ownership')) return 'g1\n';
-      if (sql.includes('UPDATE smdb_control.term')) return '1\n';
+      if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
       return '';
     };
     return [
@@ -233,7 +241,8 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     const recreate = h.calls.find(a => a.some(x => x.startsWith('CREATE DATABASE')))!;
     expect(recreate[recreate.indexOf('-U') + 1]).toBe('dbm_admin');
     expect(recreate).toContain(`CREATE DATABASE "${fleetDb.db}" OWNER "${fleetDb.user}"`);
-    expect(loginOf('pg_restore')).toBe('dbm_admin');
+    expect(loginOf('--exit-on-error')).toBe('dbm_admin');
+    expect(loginOf("setval('smdb_data.claim_seq'")).toBe('dbm_admin');
     expect(loginOf('127.0.0.1')).toBe('dbm_admin');
     expectManagerLogins();
   });
@@ -303,7 +312,6 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
       if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
       if (sql.includes('pg_control_system()')) return '7001|2\n';
-      if (sql.includes("to_regclass('smdb_control.term')")) return 'f|f\n';
       if (sql.includes('to_regclass')) return 'f\n';
       return '';
     };

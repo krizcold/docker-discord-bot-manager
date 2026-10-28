@@ -50,6 +50,7 @@ export function withFence<F extends ExecFileFake>(fake: F): F {
       }
       if (args[1] === '-u' && args[2] === 'root' && sql.includes('smdb-write-fence')) return cb(null, '', '');
       if (sql.includes('pg_terminate_backend(pid, 5000)')) return cb(null, '', '');
+      if (sql.includes('pg_read_file') && sql.includes('pg_file_settings')) return cb(null, `${fenceOwners.get(container) ?? ''}|1\n`, '');
       if (sql.includes('pg_read_file') && sql.includes("current_setting('default_transaction_read_only')")) {
         const owner = fenceOwners.get(container) ?? '';
         if (sql.includes('FROM regexp_split_to_table')) return readOnlyThen(value => `${value}|0|${owner}|`);

@@ -14,7 +14,7 @@ const tmp = vi.hoisted(() => {
 // password; every other step answers as a healthy database does.
 const SECRET = 'Restore-Secret-0123456789';
 const pg = vi.hoisted(() => ({
-  fail: '' as '' | 'exists' | 'term' | 'drop' | 'pg_restore' | 'bump' | 'stop',
+  fail: '' as '' | 'exists' | 'claims' | 'drop' | 'pg_restore' | 'raise' | 'stop',
   stderr: '',
   liveOnce: [] as string[],
 }));
@@ -36,7 +36,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
   return {
     ...real,
-    runningInstanceContainers: async () => pg.liveOnce.splice(0),
+    runningInstanceContainers: async (id: string) => (id === 'w' ? pg.liveOnce.splice(0) : []),
     startFleetDbSidecar: async () => ({ success: true }),
     stopBot: async () => ({ success: true }),
     startBot: async () => (pg.fail === 'stop' ? { success: false, error: `start failed: ${pg.stderr}` } : { success: true }),
@@ -55,11 +55,6 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) return cb(null, '0\n', '');
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return pg.fail === 'exists' ? failed() : cb(null, '1\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return pg.fail === 'term' ? failed() : cb(null, 't|t\n', '');
-    if (sql.includes('SELECT coalesce(GREATEST(')) return cb(null, '7\n', '');
-    if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return cb(null, 't\n', '');
-    if (sql.includes('UPDATE smdb_data.guild_ownership')) return cb(null, 'g1\n', '');
-    if (sql.includes('UPDATE smdb_control.term')) return pg.fail === 'bump' ? failed() : cb(null, '1\n', '');
     if (sql.includes('DROP DATABASE')) return pg.fail === 'drop' ? failed() : cb(null, '', '');
     return cb(null, '', '');
   });
@@ -83,12 +78,13 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED, claimDb, resetClaimDb } from './restore-fake';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: string): string | null =>
@@ -102,6 +98,7 @@ let logged: string[] = [];
 beforeEach(() => {
   pg.fail = '';
   pg.liveOnce = [];
+  resetClaimDb();
   pg.stderr = `psql: error: connection to "postgres://app:${SECRET}@bot-a-postgres/app" failed: FATAL: password authentication failed`;
   logged = [];
   for (const level of ['log', 'warn', 'error'] as const) {
@@ -110,10 +107,11 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
-  fleetBackup.clearTermFloor('a');
+  fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances: {
-    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
+    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
+    w: { id: 'w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
 });
@@ -130,16 +128,17 @@ async function restoreTexts() {
 }
 
 describe('FU-W the restore passes every text built from docker stderr through the secret filter', () => {
-  for (const step of ['exists', 'term', 'drop', 'pg_restore', 'bump', 'stop'] as const) {
+  for (const step of ['exists', 'claims', 'drop', 'pg_restore', 'raise', 'stop'] as const) {
     it(`a failed ${step} step names no secret in the reply, the notices or the logs`, async () => {
       pg.fail = step;
-      if (step === 'stop') pg.liveOnce = ['bot-a-app'];
+      if (step === 'stop') pg.liveOnce = ['bot-w-app'];
+      if (step === 'claims' || step === 'raise') Object.assign(claimDb, { fail: step === 'claims' ? 'floor' : 'raise', failText: pg.stderr });
       const { r, texts } = await restoreTexts();
       const all = texts.join('\n');
       expect(all).toMatch(/password authentication failed/);
       expect(all).not.toContain(SECRET);
       expect(all).toMatch(/\*\*\*/);
-      if (step !== 'bump' && step !== 'stop') expect(r.error ?? '').toMatch(/\*\*\*/);
+      if (step !== 'stop') expect(r.error ?? '').toMatch(/\*\*\*/);
     });
   }
 });

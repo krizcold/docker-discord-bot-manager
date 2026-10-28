@@ -27,6 +27,7 @@ vi.mock('../../src/env/manager', async (importOriginal) => ({
 }));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   sidecarRunning: async () => h.sidecar,
   readBotLogin: async () => h.read,
 }));

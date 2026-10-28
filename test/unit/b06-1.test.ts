@@ -104,7 +104,7 @@ vi.mock('../../src/instance/fleetBackupGuards', async (importOriginal) => ({
 }));
 vi.mock('../../src/instance/fleetBackup', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetBackup')>()),
-  clearTermFloor: () => {},
+  clearClaimFloor: () => {},
   runFleetDump: async () => ({ success: true, file: 'fake.dump' }),
 }));
 vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({

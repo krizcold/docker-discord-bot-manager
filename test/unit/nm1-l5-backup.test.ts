@@ -109,6 +109,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import { FENCE_SETTINGS, fenceOwners } from './fence-fake';
+import { MAINTAINED, TOC } from './restore-fake';
 import * as containerManager from '../../src/docker/containerManager';
 
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
@@ -220,26 +221,26 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     expect(roleChecks()).toBe(0);
   });
 
-  it('probeLiveTerm and raiseGuildTerms run psql with the exact argv', async () => {
+  it('probeClaims and raiseClaims run psql with the exact argv', async () => {
     h.answer = args => {
       const sql = args.join(' ');
-      if (sql.includes("to_regclass('smdb_control.term')")) return 't|f\n';
-      if (sql.includes('GREATEST')) return '7\n';
-      if (sql.includes('UPDATE smdb_data.guild_ownership')) return 'g1\n';
-      if (sql.includes("to_regclass('smdb_data.guild_ownership') IS NOT NULL")) return 't\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes('GREATEST((SELECT last_value')) return '7\n';
+      if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|4\nguild|g1\n';
       return '';
     };
-    expect(await raw(() => fleetBackup.probeLiveTerm(fleetDb))).toEqual({ ok: true, term: 7 });
+    expect(await raw(() => fleetBackup.probeClaims(fleetDb))).toEqual({ ok: true, shape: 'claims', claim: 7 });
     const head = ['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+    const tables = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped)";
     expect(h.calls).toEqual([
-      [...head, "SELECT to_regclass('smdb_control.term') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL"],
-      [...head, 'SELECT coalesce(GREATEST((SELECT max(term) FROM smdb_control.term)), -1)'],
+      [...head, tables],
+      [...head, 'SELECT coalesce(GREATEST((SELECT last_value FROM smdb_data.claim_seq), (SELECT max(claim) FROM smdb_data.guild_ownership)), -1)'],
     ]);
     h.calls.length = 0;
-    expect(await raw(() => fleetBackup.raiseGuildTerms(fleetDb, 3))).toEqual({ ok: true, guilds: ['g1'] });
+    expect(await raw(() => fleetBackup.raiseClaims(fleetDb, 3))).toEqual({ ok: true, seq: 4, guilds: ['g1'] });
     const ex = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C, 'psql', '-U', 'dbm_admin', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
-    expect(h.calls[0]).toEqual([...ex, "SELECT to_regclass('smdb_data.guild_ownership') IS NOT NULL"]);
-    expect(h.calls[1].slice(0, -1)).toEqual(ex);
+    expect(h.calls[0]).toEqual([...head, tables]);
+    expect(h.calls[1]).toEqual([...ex, fleetBackup.claimRaiseSql(3, { seq: true, table: true, claim: true }) as string]);
   });
 
   it('applyWriteFence runs psql, the TCP probe and the left-session count with the exact argv', async () => {
@@ -287,15 +288,17 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
 });
 
 describe('NM1 L5: restoreFleetBackup argv', () => {
-  const odd = { containerName: C, user: 'sm"u', db: `sm'"db`, volume: 'bot1-fleet-postgres-data' };
+  // The maintenance guard refuses a role name the tool cannot block (dbLogin.botRoleRefusal), so only the database name is odd.
+  const odd = { containerName: C, user: 'smu', db: `sm'"db`, volume: 'bot1-fleet-postgres-data' };
   const arrange = (pgRestore: () => string | { stderr: string }, db: typeof odd) => {
     const dir = path.join(h.dir, 'backups', 'b1', 'fleet-postgres');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'old.dump'), 'dump');
-    writeInstance({ status: 'running', fleetDb: db, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
+    writeInstance({ status: 'running', ...MAINTAINED, fleetDb: db, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
     h.env = { DATABASE_URL: `postgres://smdb:pw@${C}:5432/smdb` };
     h.answer = args => {
       const sql = args.join(' ');
+      if (args.includes('pg_restore') && args.includes('-l')) return TOC.claims;
       if (args.includes('pg_restore')) return pgRestore();
       if (isHolder(args)) return HOLDER;
       if (args.includes('pg_dump')) return 'dump';
@@ -304,11 +307,10 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
       if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) return '0\n';
       if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
       if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
-      if (sql.includes("to_regclass('smdb_control.term')")) return 't|t\n';
+      if (sql.includes('rolcanlogin')) return 'false|false|0\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
-      if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return 't\n';
-      if (sql.includes('UPDATE smdb_data.guild_ownership')) return 'g1\n';
-      if (sql.includes('UPDATE smdb_control.term')) return '1\n';
+      if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
       return '';
     };
     return [
@@ -328,27 +330,29 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
   };
   const psql = (db: string) => ['psql', '-U', 'dbm_admin', '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
   const ex = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C];
+  const restores = () => callWith('pg_restore').filter(a => !a.includes('-l'));
   const pgRestoreArgv = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', C, 'timeout', '-s', 'KILL', '600', 'pg_restore', '-U', 'dbm_admin', '--exit-on-error', '-d', `sm'"db`];
 
-  it('a restore runs the existence check, the recreate, pg_restore and the term bump with the exact argv', async () => {
+  it('a restore runs the TOC read, the existence check, the recreate, pg_restore and the claim raise with the exact argv', async () => {
     const r = await run(() => '');
     expect(r.success, r.error).toBe(true);
     expect(h.calls).toContainEqual(['exec', C, ...psql('postgres'), '-c', `SELECT count(*) FROM pg_database WHERE datname = 'sm''"db'`]);
-    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "sm""u"`]);
-    expect(callWith('pg_restore')).toEqual([pgRestoreArgv]);
-    expect(h.calls).toContainEqual([...ex, ...psql(`sm'"db`), '-c', 'WITH u AS (UPDATE smdb_control.term SET term = GREATEST(term, 7) RETURNING 1) SELECT count(*) FROM u']);
+    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`]);
+    expect(restores()).toEqual([pgRestoreArgv]);
+    expect(callWith('pg_restore').filter(a => a.includes('-l'))).toEqual([['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l']]);
+    expect(h.calls).toContainEqual([...ex, ...psql(`sm'"db`), '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true }) as string]);
     expect(roleChecks()).toBe(0);
   });
 
   it('a restore that succeeds or fails for another reason runs docker once and checks no role', async () => {
     const ok = await run(() => '', fleetDb);
     expect(ok.success, ok.error).toBe(true);
-    expect(callWith('pg_restore').length).toBe(1);
+    expect(restores().length).toBe(1);
     expect(h.spawned.every(c => c === 'docker')).toBe(true);
     expect(h.spawned.length).toBeGreaterThan(1);
     const bad = await run(() => ({ stderr: 'pg_restore: error: broken dump' }), fleetDb);
     expect(bad.success).toBe(false);
-    expect(callWith('pg_restore').length).toBe(2);
+    expect(restores().length).toBe(2);
     expect(roleChecks()).toBe(0);
   });
 
@@ -356,7 +360,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     let n = 0;
     const r = await run(() => (n++ === 0 ? { stderr: MISSING } : ''), fleetDb);
     expect(r.success, r.error).toBe(true);
-    expect(callWith('pg_restore').length).toBe(2);
+    expect(restores().length).toBe(2);
     expect(roleChecks()).toBe(1);
   });
 
@@ -365,7 +369,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     expect(r.success).toBe(false);
     expect(r.error).toContain(`pg_restore exited with code 1: ${'y'.repeat(500)}`);
     expect(r.error).not.toContain('y'.repeat(501));
-    expect(callWith('pg_restore').length).toBe(1);
+    expect(restores().length).toBe(1);
     expect(roleChecks()).toBe(0);
     expect(h.calls).toContainEqual(['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
   });

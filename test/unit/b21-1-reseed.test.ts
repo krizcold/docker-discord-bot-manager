@@ -62,7 +62,6 @@ vi.mock('child_process', async (importOriginal) => {
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '1\n', '');
     if (sql.includes('pg_control_system()')) return pg.local ? cb(null, `${pg.local}\n`, '') : cb(new Error('down'), '', 'psql: error: connection refused');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
     if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     return cb(null, '', '');
   });

@@ -14,11 +14,14 @@ vi.mock('child_process', async (importOriginal) => ({
   },
 }));
 
-import { ensureManagerDbRole, readBotLogin, blockBotLogin, endBotSessions, openBotLogin, resetManagerRoleCache, psqlFailureClass, MANAGER_DB_ROLE } from '../../src/instance/dbLogin';
+import { ensureManagerDbRole, readBotLogin, blockBotLogin, endBotSessions, openBotLogin, readWriteFence, resetManagerRoleCache, psqlFailureClass, MANAGER_DB_ROLE } from '../../src/instance/dbLogin';
 
 const t = { container: 'b1-fleet-postgres', user: 'smdb' };
-const READ_SQL = "SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb'), 'missing') || '|' || (SELECT count(*) FROM pg_stat_activity WHERE usename = 'smdb')::text";
+const READ_SQL = "SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb'), 'missing') || '|' || (SELECT count(*) FROM pg_stat_activity WHERE usename = 'smdb' AND backend_type = 'client backend')::text";
 const argv = (role: string, sql: string) => ['docker', 'exec', 'b1-fleet-postgres', 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
+const exemptArgv = (role: string, sql: string) => ['docker', 'exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', 'b1-fleet-postgres', 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
+const FENCE_SQL = "SELECT current_setting('default_transaction_read_only')";
+const FENCE_OWNER_SQL = "SELECT coalesce(btrim(pg_read_file('smdb-fence-owner', true), E' \\n'), '') || '|' || (SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only')";
 const sqlOf = (c: { args: string[] }) => c.args[c.args.length - 1];
 const roleOf = (c: { args: string[] }) => c.args[c.args.indexOf('-U') + 1];
 
@@ -43,10 +46,32 @@ describe('the exact argv and SQL of each function', () => {
     expect(r.ok).toBe(false);
   });
 
-  it('blockBotLogin reads first, then ALTER ROLE NOLOGIN', async () => {
+  it('blockBotLogin reads first, then ALTER ROLE NOLOGIN in the fence-exempt session', async () => {
     dk.answer = () => ({ stdout: 'false|true|2\n' });
     expect(await blockBotLogin(t)).toEqual({ ok: true });
-    expect(dk.calls.map(c => c.args)).toEqual([argv('dbm_admin', READ_SQL), argv('dbm_admin', 'ALTER ROLE "smdb" NOLOGIN')]);
+    expect(dk.calls.map(c => c.args)).toEqual([argv('dbm_admin', READ_SQL), exemptArgv('dbm_admin', 'ALTER ROLE "smdb" NOLOGIN')]);
+  });
+
+  it('readWriteFence reads the read-only default in a session that is not exempt', async () => {
+    let owner = 'reseed:1793181600000|1\n';
+    dk.answer = (args) => ({ stdout: args[args.length - 1] === FENCE_SQL ? 'on\n' : owner });
+    expect(await readWriteFence(t)).toEqual({ ok: true, on: true, owner: 'reseed:1793181600000', persisted: true });
+    owner = '|0\n';
+    expect(await readWriteFence(t)).toEqual({ ok: true, on: true, owner: null, persisted: false });
+    owner = 'garbled\n';
+    expect(await readWriteFence(t)).toEqual({ ok: true, on: true, owner: null, persisted: null });
+    expect(dk.calls.map(c => c.args).slice(0, 2)).toEqual([argv('dbm_admin', FENCE_SQL), argv('dbm_admin', FENCE_OWNER_SQL)]);
+    dk.calls = [];
+    dk.answer = () => ({ stdout: 'off\n' });
+    expect(await readWriteFence(t)).toEqual({ ok: true, on: false });
+    expect(dk.calls.map(c => c.args)).toEqual([argv('dbm_admin', FENCE_SQL)]);
+    dk.answer = () => ({ stdout: 'maybe\n' });
+    expect(await readWriteFence(t)).toMatchObject({ ok: false });
+  });
+
+  it('openBotLogin under the read-only layer of a main answers the write fence, not recovery', async () => {
+    dk.answer = (args) => args[args.length - 1].startsWith('ALTER') ? { err: 'exit 1', stderr: 'ERROR:  cannot execute ALTER ROLE in a read-only transaction' } : { stdout: 'false|false|0\n' };
+    expect(await openBotLogin(t)).toEqual({ ok: false, cls: 'write-fence', error: 'ERROR:  cannot execute ALTER ROLE in a read-only transaction' });
   });
 
   it('openBotLogin reads first, then ALTER ROLE LOGIN', async () => {
@@ -144,7 +169,7 @@ describe('the block and the open refuse a database in recovery', () => {
 });
 
 describe('endBotSessions', () => {
-  const TERM = "SELECT count(*) FROM (SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = 'smdb' AND pid <> pg_backend_pid()) t";
+  const TERM = "SELECT count(*) FROM (SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = 'smdb' AND backend_type = 'client backend' AND pid <> pg_backend_pid()) t";
   const sessions = (counts: number[]) => {
     let reads = 0;
     dk.answer = (args) => args[args.length - 1] === TERM ? { stdout: '1\n' } : { stdout: `false|false|${counts[Math.min(reads++, counts.length - 1)]}\n` };
@@ -163,6 +188,13 @@ describe('endBotSessions', () => {
     sessions([3, 2, 2]);
     expect(await endBotSessions(t, 0)).toMatchObject({ ok: false, left: 2 });
     expect(dk.calls.filter(c => sqlOf(c) === TERM).length).toBe(3);
+  });
+  it('the count and the terminate both name only client sessions, so the replication launcher is never counted', async () => {
+    sessions([0]);
+    expect(await endBotSessions(t, 0)).toEqual({ ok: true });
+    const sql = dk.calls.map(sqlOf);
+    expect(sql).toHaveLength(2);
+    for (const s of sql) expect(s).toContain("FROM pg_stat_activity WHERE usename = 'smdb' AND backend_type = 'client backend'");
   });
   it('a recount that fails ends with that error', async () => {
     dk.answer = (args) => args[args.length - 1] === TERM ? { stdout: '1\n' } : { err: 'exit 2', stderr: 'boom' };
@@ -211,6 +243,7 @@ describe('F2: a missing dbm_admin is made again and the login retried', () => {
       ['dbm_admin', READ_SQL],
       ['dbm_admin', 'ALTER ROLE "smdb" NOLOGIN'],
     ]);
+    expect(dk.calls[dk.calls.length - 1].args).toEqual(exemptArgv('dbm_admin', 'ALTER ROLE "smdb" NOLOGIN'));
   });
   it('on a live copy the role cannot be made, so the login runs as the bot role, logged once', async () => {
     const dbLogin = await import('../../src/instance/dbLogin');

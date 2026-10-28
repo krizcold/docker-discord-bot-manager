@@ -84,6 +84,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   sidecarRunning: async () => h.sidecar,
   ensureManagerDbRole: async () => { h.events.push('ensure'); return h.ensure; },
   readBotLogin: async () => (h.readFail ? { ok: false, cls: 'other', error: h.readFail } : { ok: true, login: { ...h.db } }),
@@ -594,7 +595,7 @@ describe('order Running', () => {
   it('R1 database, from maintenance, app running', async () => {
     fromMaint();
     const r = await order('running');
-    expect(r).toEqual({ settled: true, text: 'The bot is running normally: its database login is restored, and it took the order to leave maintenance.' });
+    expect(r).toEqual({ settled: true, text: "The bot is running normally: its database login is restored, and it took the order to leave maintenance. Whether it restarts is not confirmed (it answered that it can't confirm, or did not say). If a restore ran while it was in maintenance, restart the bot so it loads the restored data." });
     expect(h.events.filter(e => e !== 'ensure')).toEqual(['open', 'hook:running']);
     expect(rec()).toMatchObject({ state: 'running', settled: true, login: 'open', savedByBot: 'running' });
   });
@@ -621,7 +622,7 @@ describe('order Running', () => {
   it('R5 from Off', async () => {
     fromOff();
     const r = await order('running');
-    expect(r).toEqual({ settled: true, text: 'The bot is running normally: it started, its database login is restored, and it took the order to leave maintenance.' });
+    expect(r).toEqual({ settled: true, text: "The bot is running normally: it started, its database login is restored, and it took the order to leave maintenance. Whether it restarts is not confirmed (it answered that it can't confirm, or did not say). If a restore ran while it was in maintenance, restart the bot so it loads the restored data." });
     expect(h.events.filter(e => e !== 'ensure')).toEqual(['open', 'start:maintenance', 'hook:running']);
   });
   it('R6 from Off: start fails', async () => {
@@ -648,7 +649,7 @@ describe('order Running', () => {
   it('R11 json from maintenance: hook ok', async () => {
     fromMaint('json');
     const r = await order('running');
-    expect(r).toEqual({ settled: true, text: 'The bot is running normally: it took the order to leave maintenance.' });
+    expect(r).toEqual({ settled: true, text: "The bot is running normally: it took the order to leave maintenance. Whether it restarts is not confirmed (it answered that it can't confirm, or did not say). If a restore ran while it was in maintenance, restart the bot so it loads the restored data." });
   });
   it('R12 json: hook fails', async () => {
     fromMaint('json');

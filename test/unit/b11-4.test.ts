@@ -31,7 +31,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     runningNonSidecarContainers: async () => [],
     runningInstanceContainers: async () => [],
     startFleetDbSidecar: async () => ({ success: true }),
-    updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string } | null) => {
+    updateInstanceFleetRestoreError: (botId: string, notice: { file: string; text: string; at: string; doubt: boolean } | null) => {
       if (pg.saveFails && notice?.text.includes(' failed: ')) throw new Error('ENOSPC: no space left on device');
       return real.updateInstanceFleetRestoreError(botId, notice);
     },
@@ -48,7 +48,6 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'inspect') return cb(null, 'true\n', '');
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return cb(null, '0\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 'f|f\n', '');
     if (sql.includes('to_regclass')) return cb(null, 'f\n', '');
     if (sql.includes('DROP DATABASE') && pg.recreateFails) return cb(new Error('recreate refused'), '', 'ERROR: disk full');
     return cb(null, '', '');
@@ -69,12 +68,13 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED } from './restore-fake';
 import * as path from 'path';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
@@ -115,7 +115,7 @@ beforeEach(() => {
   fs.utimesSync(path.join(DIR, OLD), old, old);
   fs.writeFileSync(path.join(DIR, OTHER), 'dump');
   fs.utimesSync(path.join(DIR, OTHER), old + 60, old + 60);
-  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', fleetDb: primary, fleetBackup: { enabled: true, hour: new Date().getHours() } } } }, null, 2));
+  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: true, hour: new Date().getHours() } } } }, null, 2));
 });
 afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 

@@ -207,7 +207,6 @@ describe("NM1 L5: reseedStalePrimary's identity read", () => {
     if (sql.includes('ALTER SYSTEM SET default_transaction_read_only = on')) return '0\n';
     if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
     if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
-    if (sql.includes("to_regclass('smdb_control.term')")) return 'f|f\n';
     if (sql.includes('to_regclass')) return 'f\n';
     return '';
   };

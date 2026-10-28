@@ -1638,13 +1638,18 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
-  /** DELETE /api/bots/:id/fleet-backups/restore-error - Dismiss a failed restore's notice. */
+  /** DELETE /api/bots/:id/fleet-backups/restore-error?at=<the notice's time> - Dismiss the restore notice the page shows. */
   router.delete('/:id/fleet-backups/restore-error', (req: Request, res: Response) => {
     if (!containerManager.getBot(req.params.id)) {
       res.status(404).json({ success: false, error: 'Bot not found' });
       return;
     }
-    res.json({ success: true, dismissed: fleetBackup.dismissFleetRestoreError(req.params.id) });
+    const result = fleetBackup.dismissShownRestoreNotice(req.params.id, typeof req.query.at === 'string' ? req.query.at : '');
+    if (result.error) {
+      res.status(409).json({ success: false, error: result.error });
+      return;
+    }
+    res.json({ success: true, dismissed: result.dismissed });
   });
 
   /** GET /api/bots/:id/fleet-backups/restore-preview - The instances a restore would stop, for its confirm. */
@@ -1661,9 +1666,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/fleet-backups/restore - Restore a dump into the sidecar.
-   * Stops every instance on the same URL, takes a pre-restore safety dump
-   * (refusing the restore if it fails), pg_restores, restarts the instances.
+   * POST /api/bots/:id/fleet-backups/restore - Restore a dump of the whole bot into the sidecar.
+   * Runs only while the bot is in Maintenance or Off; stops the other instances on the same database,
+   * takes a pre-restore safety dump (refusing the restore if it fails), pg_restores, raises the claim
+   * numbers, starts the other instances. The bot keeps its state.
    */
   router.post('/:id/fleet-backups/restore', async (req: Request, res: Response) => {
     try {
@@ -1689,7 +1695,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           success: true,
           steps: result.steps,
           ...(result.warning ? { warning: result.warning } : {}),
-          note: 'A restore brings back whatever the dump remembers: if it predates the removal of a fleet node, the shard table may hold frozen leases on that dead registration - check the fleet table and declare-lost any node that no longer exists',
+          note: 'The bot stays in its state until you choose Running in its State window. Then the bot loads the restored data: a process of it that ran before the restore, on this machine or another, restarts itself first. The State window says whether the bot here confirmed its restart.',
         }
         : { success: false, error: result.error, steps: result.steps });
     } catch (error) {

@@ -5,6 +5,7 @@
  */
 import { execFile } from 'child_process';
 import { REPLICATION_ROLE } from './fleetReplication';
+import { FENCE_OWNER_FILE_SQL, parseFenceOwner } from './fleetBackupGuards';
 
 export const MANAGER_DB_ROLE = 'dbm_admin';
 
@@ -12,7 +13,7 @@ const PSQL_TIMEOUT_MS = 30_000;
 
 export interface DbTarget { container: string; user: string }
 export interface BotLogin { inRecovery: boolean; canLogin: boolean | null; sessions: number }
-export type PsqlClass = 'missing-role' | 'refused-login' | 'recovery' | 'other';
+export type PsqlClass = 'missing-role' | 'refused-login' | 'recovery' | 'write-fence' | 'other';
 export type DbFailure = { ok: false; cls: PsqlClass; error: string };
 export type DbResult = { ok: true } | DbFailure;
 
@@ -41,9 +42,12 @@ function lastLine(text: string): string {
   return lines[lines.length - 1] || 'psql failed with no message';
 }
 
-function psql(container: string, role: string, sql: string): Promise<{ ok: true; stdout: string } | DbFailure> {
+/** The session option a lane's own write runs under while a write fence holds the read-only default. */
+const FENCE_EXEMPT = ['-e', 'PGOPTIONS=-c default_transaction_read_only=off'];
+
+function psql(container: string, role: string, sql: string, exempt = false): Promise<{ ok: true; stdout: string } | DbFailure> {
   return new Promise(resolve => {
-    execFile('docker', ['exec', container, 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFile('docker', ['exec', ...(exempt ? FENCE_EXEMPT : []), container, 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ ok: true, stdout: String(stdout) });
       const text = String(stderr || '') || (err.killed ? `docker did not answer within ${PSQL_TIMEOUT_MS / 1000} s` : err.message);
       const cls = psqlFailureClass(text);
@@ -104,8 +108,8 @@ export async function asManager<R>(t: DbTarget, run: (role: string) => Promise<R
   return run(t.user);
 }
 
-function managerPsql(t: DbTarget, sql: string): Promise<{ ok: true; stdout: string } | DbFailure> {
-  return asManager(t, role => psql(t.container, role, sql), r => !r.ok && r.cls === 'missing-role');
+function managerPsql(t: DbTarget, sql: string, exempt = false): Promise<{ ok: true; stdout: string } | DbFailure> {
+  return asManager(t, role => psql(t.container, role, sql, exempt), r => !r.ok && r.cls === 'missing-role');
 }
 
 async function checkManagerRole(container: string): Promise<DbResult> {
@@ -131,7 +135,7 @@ export async function ensureManagerDbRole(t: DbTarget): Promise<DbResult> {
 }
 
 function readSql(user: string): string {
-  return `SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '${user}'), 'missing') || '|' || (SELECT count(*) FROM pg_stat_activity WHERE usename = '${user}')::text`;
+  return `SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT rolcanlogin::text FROM pg_roles WHERE rolname = '${user}'), 'missing') || '|' || (SELECT count(*) FROM pg_stat_activity WHERE usename = '${user}' AND backend_type = 'client backend')::text`;
 }
 
 export async function readBotLogin(t: DbTarget): Promise<{ ok: true; login: BotLogin } | DbFailure> {
@@ -150,12 +154,36 @@ async function alterLogin(t: DbTarget, login: boolean): Promise<DbResult> {
   const read = await readBotLogin(t);
   if (!read.ok) return read;
   if (read.login.inRecovery) return { ok: false, cls: 'recovery', error: 'the database is in recovery' };
-  const alter = await managerPsql(t, `ALTER ROLE "${t.user}" ${login ? 'LOGIN' : 'NOLOGIN'}`);
-  return alter.ok ? { ok: true } : alter;
+  const alter = await managerPsql(t, `ALTER ROLE "${t.user}" ${login ? 'LOGIN' : 'NOLOGIN'}`, !login);
+  if (alter.ok) return { ok: true };
+  return alter.cls === 'recovery' ? { ...alter, cls: 'write-fence' } : alter;
 }
 
+/** The block passes a write fence, so a fenced database can still be put into maintenance; the open does not. */
 export function blockBotLogin(t: DbTarget): Promise<DbResult> {
   return alterLogin(t, false);
+}
+
+/**
+ * The read-only layer on: the lane its owner file names (null: none), and whether its setting is saved in the
+ * configuration (false: a restart clears it; null: either could not be read).
+ */
+export type WriteFenceOn = { ok: true; on: true; owner: string | null; persisted: boolean | null };
+
+const FENCE_OWNER_READ_SQL = `SELECT ${FENCE_OWNER_FILE_SQL} || '|' || (SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only')`;
+
+/** Whether the read-only default is on, read in a session that is not exempt from it, and when on, whose it is. */
+export async function readWriteFence(t: DbTarget): Promise<{ ok: true; on: false } | WriteFenceOn | DbFailure> {
+  const bad = refused(t);
+  if (bad) return bad;
+  const read = await managerPsql(t, "SELECT current_setting('default_transaction_read_only')");
+  if (!read.ok) return read;
+  const value = read.stdout.trim();
+  if (value !== 'on' && value !== 'off') return { ok: false, cls: 'other', error: `the read-only setting read back as ${lastLine(read.stdout)}` };
+  if (value === 'off') return { ok: true, on: false };
+  const who = await managerPsql(t, FENCE_OWNER_READ_SQL);
+  const m = who.ok ? /^([^|\n]*)\|(\d+)$/.exec(who.stdout.trim()) : null;
+  return { ok: true, on: true, owner: m ? parseFenceOwner(m[1]) : null, persisted: m ? Number(m[2]) > 0 : null };
 }
 
 export function openBotLogin(t: DbTarget): Promise<DbResult> {
@@ -166,7 +194,7 @@ export function openBotLogin(t: DbTarget): Promise<DbResult> {
 export async function endBotSessions(t: DbTarget, pauseMs = 1000): Promise<{ ok: true } | (DbFailure & { left?: number })> {
   const bad = refused(t);
   if (bad) return bad;
-  const sql = `SELECT count(*) FROM (SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = '${t.user}' AND pid <> pg_backend_pid()) t`;
+  const sql = `SELECT count(*) FROM (SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE usename = '${t.user}' AND backend_type = 'client backend' AND pid <> pg_backend_pid()) t`;
   let left = 0;
   for (let round = 0; round < 3; round++) {
     const term = await managerPsql(t, sql);

@@ -20,6 +20,7 @@ vi.mock('child_process', async (importOriginal) => {
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import * as fs from 'fs';
+import { MAINTAINED } from './restore-fake';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -30,7 +31,7 @@ afterAll(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
 
 const fleetDb = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
 fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances: {
-  a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb },
+  a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', fleetDb, ...MAINTAINED },
 } }, null, 2));
 
 const router: any = createBotRoutes({ clients: new Set() } as any);

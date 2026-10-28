@@ -9,6 +9,8 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { callAppHook, AppHookResult } from './appHookClient';
 import * as dbLogin from './dbLogin';
+import * as fleetBackup from './fleetBackup';
+import { fenceOwnerLane, fenceOwnerText } from './fleetBackupGuards';
 import { BotRunState, InstanceConfig, MaintenanceRecord } from '../types';
 
 export type MaintenanceKind = 'database' | 'copy' | 'external' | 'json' | 'none';
@@ -41,6 +43,32 @@ const R9 = 'The bot is stopped, and it enters maintenance only through its own a
 const R10 = 'The bot did not confirm it saved maintenance before it was turned off, so starting it would run its modules until it answers. Choose Running, then Maintenance; nothing was changed';
 const R11 = 'Docker did not say whether the bot is running, so nothing was changed; retry in a moment';
 const R12 = (err: string) => `The state change was not recorded, so nothing was changed: ${err}`;
+const R13 = (file: string) => `A restore of ${file} has not finished cleanly (its notice is on the Database window), so Running was refused and nothing was changed; restore a dump again, or dismiss the notice to choose Running anyway`;
+const R13_FENCE = (f: FenceFound): string => {
+  const w = fenceWords(f);
+  const state = w.owned ? `The bot's database is READ-ONLY under ${w.state}, so` : `The bot's database is READ-ONLY, and ${w.state}.`;
+  return `${state} Running was refused and nothing was changed${w.remedy ? `; ${w.remedy}` : ''}`;
+};
+
+/** The read-only layer as a read found it; owner and persisted are unknown when the read failed or said off. */
+type FenceFound = { owner?: string | null; persisted?: boolean | null };
+
+/** The layer as the operator reads it: whose it is, and the remedy its owner gives (null when no known step lifts it). */
+function fenceWords(f: FenceFound): { owned: boolean; state: string; remedy: string | null; retry: string | null } {
+  const lane = fenceOwnerLane(f.owner ?? null);
+  const remedy = f.persisted === false ? "its read-only setting is not saved in the database's configuration, so restarting the instance clears it"
+    : lane === 'restore' ? 'with the bot in Maintenance or Off, run a restore again to lift the fence'
+    : lane === 'reseed' ? 'retrying the re-seed retries the lift'
+    : lane === 'decommission' ? 'running the decommission again retries the lift'
+    : null;
+  const retry = f.persisted === false ? 'Restart the instance'
+    : lane === 'restore' ? 'With the bot in Maintenance or Off, run a restore again to lift the fence'
+    : lane === 'reseed' ? 'Retry the re-seed'
+    : lane === 'decommission' ? 'Run the decommission again'
+    : null;
+  if (!lane) return { owned: false, state: 'this manager cannot tell which step left it so', remedy, retry };
+  return { owned: true, state: `a write fence of ${fenceOwnerText(f.owner ?? null)}`, remedy, retry };
+}
 const busyText = (op: string) => `Operation '${op}' already in progress`;
 const unexpectedText = (err: string) => `The order stopped on an unexpected error: ${err}`;
 
@@ -51,10 +79,15 @@ const COPY_TAIL = " Its database login is not blocked from here: this machine ho
 const EXTERNAL_TAIL = ' Its database login is not blocked: the database is not run by this manager.';
 const RECOVERY_BLOCK = "the database is a live copy in recovery, so its login cannot be blocked on this machine; block it from the main's manager";
 const RECOVERY_OPEN = 'the database is a live copy in recovery';
+const FENCED = 'the database is READ-ONLY under a write fence';
 const NOT_RECORDED = (err: string) => ` The manager could not record this (${err}); the record still holds the order as not confirmed, so the manager runs it again within 30 seconds, except that a retry never starts the bot or its database.`;
 const RETRY_DB_DOWN = 'the database is not running, and a retry does not start it';
 const RETRY_DB_UNKNOWN = 'docker did not say whether the database runs, and a retry does not start it';
 const RETRY_NO_START = 'the bot is stopped, and a retry does not start it';
+
+const H_TRUE = ' It restarts itself once it has saved what it holds (a change the database refuses for its content is dropped at that restart), then loads its data again.';
+const H_FALSE = ' It answered that it does not restart (it was not in maintenance by its own record, or no bot process runs). If a restore ran while it was in maintenance, restart the bot so it loads the restored data.';
+const H_NULL = " Whether it restarts is not confirmed (it answered that it can't confirm, or did not say). If a restore ran while it was in maintenance, restart the bot so it loads the restored data.";
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -154,12 +187,17 @@ export function settledVerdict(p: { kind: MaintenanceKind; to: BotRunState; hook
 }
 
 type HookOutcome =
-  | { hook: 'confirmed' }
+  | { hook: 'confirmed'; restarting?: boolean | null }
   | { hook: 'missing' }
   | { hook: 'unconfirmed'; why: 'unknown' | 'unreachable' | 'refused'; reason: string; detail: string };
 
-function hookOutcome(r: AppHookResult): HookOutcome {
-  if (r.ok) return { hook: 'confirmed' };
+/** The bot's answer to 'running' says whether it restarts its process (contract 1); anything but a boolean reads as null. */
+function hookOutcome(r: AppHookResult, state?: 'running' | 'maintenance'): HookOutcome {
+  if (r.ok) {
+    if (state !== 'running') return { hook: 'confirmed' };
+    const restarting = r.body?.restarting;
+    return { hook: 'confirmed', restarting: typeof restarting === 'boolean' ? restarting : null };
+  }
   if (r.status === 404) return { hook: 'missing' };
   const detail = r.error || 'no reason given';
   if (r.unknown) return { hook: 'unconfirmed', why: 'unknown', reason: 'no answer within 30 seconds', detail };
@@ -177,7 +215,7 @@ const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function waitForHook(inst: InstanceConfig, to: BotRunState, message: string): Promise<HookOutcome> {
   const deadline = Date.now() + MAINTENANCE_TIMING.hookWaitMs;
   for (;;) {
-    const outcome = hookOutcome(await sendHook(inst, hookState(to), message, MAINTENANCE_TIMING.hookWaitTryMs));
+    const outcome = hookOutcome(await sendHook(inst, hookState(to), message, MAINTENANCE_TIMING.hookWaitTryMs), hookState(to));
     if (outcome.hook !== 'unconfirmed') return outcome;
     if (Date.now() >= deadline) {
       const seconds = Math.round(MAINTENANCE_TIMING.hookWaitMs / 1000);
@@ -198,6 +236,7 @@ interface Outcome {
   planRefused?: 'R7' | 'R9' | 'R10';
   dbDownAfterStop?: boolean;
   dbFail?: string;
+  fence?: FenceFound;
   startFail?: string;
   stopFail?: string;
   dbUpAloneFail?: string;
@@ -280,6 +319,12 @@ function orderText(o: Outcome): { text: string; reason?: string } {
     }
     return { text: 'The bot is off: it is stopped.' };
   }
+  if (db && o.dbFail === FENCED) {
+    const w = fenceWords(o.fence ?? {});
+    const state = w.owned ? `the bot's database is READ-ONLY under ${w.state}, so its login could not be restored` : `the bot's login could not be restored, because its database is READ-ONLY and ${w.state}`;
+    const next = w.retry ? `${w.retry}, then choose Running.` : 'Choose Running again once the database is writable.';
+    return { text: `Running is not confirmed: ${state}. ${next}`, reason: FENCED };
+  }
   if (db && o.dbFail) {
     return { text: `Running is not confirmed: the bot's database login could not be restored (${o.dbFail}). The bot answers with the maintenance message until it is. Choose Running again to retry.`, reason: `the bot's database login could not be restored (${o.dbFail})` };
   }
@@ -298,8 +343,9 @@ function orderText(o: Outcome): { text: string; reason?: string } {
   }
   if (h?.hook === 'missing') return { text: `The bot is running normally${db ? ': its database login is restored' : ''}. Its build has no maintenance hook, so it was never in maintenance.` };
   if (h?.hook === 'confirmed') {
-    if (o.started) return { text: `The bot is running normally: it started${db ? ', its database login is restored,' : ''} and it took the order to leave maintenance.` };
-    return { text: db ? 'The bot is running normally: its database login is restored, and it took the order to leave maintenance.' : 'The bot is running normally: it took the order to leave maintenance.' };
+    const restart = h.restarting === true ? H_TRUE : h.restarting === false ? H_FALSE : H_NULL;
+    if (o.started) return { text: `The bot is running normally: it started${db ? ', its database login is restored,' : ''} and it took the order to leave maintenance.${restart}` };
+    return { text: `${db ? 'The bot is running normally: its database login is restored, and it took the order to leave maintenance.' : 'The bot is running normally: it took the order to leave maintenance.'}${restart}` };
   }
   if (o.started) return { text: db ? 'The bot is running normally: it started, and its database login is restored.' : 'The bot is running normally: it started.' };
   return { text: db ? 'The bot is running normally: its database login is restored.' : 'The bot is running normally.' };
@@ -330,6 +376,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   if (hold) return refuse(409, hold.error);
   const deleting = containerManager.deleteLaneRefusal(botId, 'a state change');
   if (deleting) return refuse(409, deleting.error);
+  if (mode === 'order' && to === 'running' && inst.fleetDb && inst.fleetRestoreError) return refuse(409, R13(fleetBackup.shownRestoreNoticeFile(botId) ?? inst.fleetRestoreError.file));
   const kindRead = readKind(inst);
   if ('error' in kindRead) return refuse(409, kindRead.error);
   const kind = kindRead.kind;
@@ -339,6 +386,10 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
     const roleRefusal = dbLogin.botRoleRefusal(inst.fleetDb!.user);
     if (roleRefusal) return refuse(409, roleRefusal);
     target = { container: inst.fleetDb!.containerName, user: inst.fleetDb!.user };
+    if (mode === 'order' && to === 'running') {
+      const fence = await dbLogin.readWriteFence(target);
+      if (fence.ok && fence.on) return refuse(409, R13_FENCE(fence));
+    }
   }
   const app = await containerManager.appContainerRunning(botId);
   if (app === null) return refuse(409, R11);
@@ -416,7 +467,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   for (const step of steps) {
     if (step === 'hook') {
       if (to === 'running' && kind === 'database' && !opened) continue;
-      recordHook(hookOutcome(await sendHook(inst, hookState(to), message)));
+      recordHook(hookOutcome(await sendHook(inst, hookState(to), message), hookState(to)));
       if (!save(rec)) break;
     } else if (step === 'hook-wait') {
       if (o.dbFail || !o.started) continue;
@@ -435,7 +486,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
       if (step === 'block') {
         const r = await dbLogin.blockBotLogin(target!);
         if (r.ok) o.blockLanded = true;
-        else o.dbFail = r.cls === 'recovery' ? RECOVERY_BLOCK : `the database login could not be blocked (${r.error})`;
+        else o.dbFail = r.cls === 'recovery' ? RECOVERY_BLOCK : r.cls === 'write-fence' ? FENCED : `the database login could not be blocked (${r.error})`;
       } else if (step === 'end-sessions') {
         const r = await dbLogin.endBotSessions(target!, MAINTENANCE_TIMING.sessionPauseMs);
         if (!r.ok) o.dbFail = 'left' in r && r.left !== undefined
@@ -444,7 +495,11 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
       } else {
         const r = await dbLogin.openBotLogin(target!);
         if (r.ok) opened = true;
-        else o.dbFail = r.cls === 'recovery' ? RECOVERY_OPEN : r.error;
+        else o.dbFail = r.cls === 'recovery' ? RECOVERY_OPEN : r.cls === 'write-fence' ? FENCED : r.error;
+        if (!r.ok && r.cls === 'write-fence') {
+          const fence = await dbLogin.readWriteFence(target!);
+          o.fence = fence.ok && fence.on ? fence : {};
+        }
       }
     } else if (step === 'stop') {
       stopped = true;

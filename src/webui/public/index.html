@@ -2536,14 +2536,14 @@
 
     function fleetBackupErrorHtml(fb) {
       const restore = fb?.restoreError
-        ? `<div class="error-message">${escapeHtml(fb.restoreError)}. <button class="btn btn-secondary btn-small" onclick="dismissFleetRestoreError('${fleetBackupBotId}')">Dismiss</button></div>`
+        ? `<div class="error-message">${escapeHtml(fb.restoreError)}. <button class="btn btn-secondary btn-small" onclick="dismissFleetRestoreError('${fleetBackupBotId}', '${escapeHtml(fb.restoreErrorAt || '')}')">Dismiss</button></div>`
         : '';
       return restore + backupStatusHtml(fb?.main);
     }
 
-    async function dismissFleetRestoreError(botId) {
+    async function dismissFleetRestoreError(botId, at) {
       try {
-        const res = await api('DELETE', `/bots/${botId}/fleet-backups/restore-error`);
+        const res = await api('DELETE', `/bots/${botId}/fleet-backups/restore-error?at=${encodeURIComponent(at || '')}`);
         if (!res.success) showMessage('error', res.error || 'Could not dismiss the restore notice');
       } catch (err) {
         showNoAnswer('dismiss', true);
@@ -3503,17 +3503,19 @@
     async function restoreSharersText(botId) {
       try {
         const res = await api('GET', `/bots/${botId}/fleet-backups/restore-preview`);
-        if (!res.success || !Array.isArray(res.instances)) return `The manager could not list the instances that share it (${res.error || 'no answer'}); the ones docker shows running when the restore starts are stopped`;
-        const names = res.instances.map(i => `${i.displayName} (${i.running === true ? 'running now' : i.running === false ? 'stopped now' : 'docker did not answer'})`);
-        return `These instances on this manager share it: ${names.join(', ')}. Each one docker shows running when the restore starts is stopped`;
+        if (!res.success || !Array.isArray(res.instances)) return `The manager could not list the other instances that share it (${res.error || 'no answer'}); the ones docker shows running when the restore starts are stopped`;
+        const others = res.instances.filter(i => i.id !== botId);
+        if (others.length === 0) return 'No other instance on this manager shares it';
+        const names = others.map(i => `${i.displayName} (${i.running === true ? 'running now' : i.running === false ? 'stopped now' : 'docker did not answer'})`);
+        return `Other instances on this manager share it: ${names.join(', ')}. Each one docker shows running when the restore starts is stopped`;
       } catch (err) {
-        return 'The manager did not answer the list of instances that share it; the ones docker shows running when the restore starts are stopped';
+        return 'The manager did not answer the list of other instances that share it; the ones docker shows running when the restore starts are stopped';
       }
     }
 
     async function restoreFleetBackupFile(botId, file) {
       const sharers = await restoreSharersText(botId);
-      const warning = `Restore "${file}"?\n\nRestoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database refuses every connection but the manager's, is read-only and has its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, every guild lease in it is raised above the last term the fleet used (a node still holding an older lease can no longer write), and the stopped instances are restarted. If the rebuild fails, the database stays read-only and the instances stay stopped until a restore succeeds. Instances on other machines cannot connect to the database until it finishes. Do not start any of these instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
+      const warning = `Restore "${file}"?\n\nThe bot must be in Maintenance or Off (its State window); otherwise the restore is refused and nothing changes. Restoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database refuses every connection but the manager's, is read-only and has its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, and every guild's claim number is raised above the highest one the bot used before, so a process that ran before the restore can no longer save over the restored data. A bot in Maintenance stays online answering with its message during and after the restore; an Off bot stays stopped. When you choose Running, the bot is asked to restart and load the restored data; the State window says whether it confirmed that, and when it did not, restart the bot by hand. If the rebuild fails, the database stays read-only and Running is refused until a restore succeeds or you dismiss the notice. Do not start the other instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);
@@ -3522,8 +3524,9 @@
         const res = await api('POST', `/bots/${botId}/fleet-backups/restore`, { file });
         if (res.success) {
           const s = res.steps || {};
-          const leases = Array.isArray(s.guildsRaised) ? `, ${s.guildsRaised.length} guild lease${s.guildsRaised.length === 1 ? '' : 's'} raised to term ${s.leaseTerm}` : ', no guild lease raised (no earlier term was known)';
-          showMessage('success', `Restore complete: stopped ${(s.stopped || []).length}, ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}${leases}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
+          const claims = Array.isArray(s.guildsRaised) ? `${s.guildsRaised.length} guild(s) raised to claim ${s.claimRaisedTo}` : 'no claim number raised (none was used before)';
+          const bot = s.botState === 'off' ? 'the bot stays off' : 'the bot stays in maintenance';
+          showMessage('success', `Restore complete: ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, ${claims}, ${bot}, stopped ${(s.stopped || []).length}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
           if (res.warning) alert(`Restore finished WITH A WARNING:\n\n${res.warning}\n\n${res.note || ''}`);
         } else {
           showMessage('error', res.error || 'Restore failed');

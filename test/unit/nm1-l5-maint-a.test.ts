@@ -83,6 +83,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   sidecarRunning: async () => { h.sidecarCalls++; return h.sidecarSeq ? h.sidecarSeq.shift() ?? null : h.sidecar; },
   ensureManagerDbRole: async () => { h.events.push('ensure'); return h.ensure; },
   readBotLogin: async () => ({ ok: true, login: { ...h.db } }),
@@ -534,7 +535,7 @@ describe('Running texts', () => {
   it('a json bot started from Off', async () => {
     setup('json', rec0('off'));
     h.app = false;
-    expect((await order('running')).text).toBe('The bot is running normally: it started and it took the order to leave maintenance.');
+    expect((await order('running')).text).toBe("The bot is running normally: it started and it took the order to leave maintenance. Whether it restarts is not confirmed (it answered that it can't confirm, or did not say). If a restore ran while it was in maintenance, restart the bot so it loads the restored data.");
   });
   it('a bot with no hooks started', async () => {
     setup('none', rec0('off', { hook: 'none', login: 'not-managed' }));

@@ -45,6 +45,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 }));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   sidecarRunning: async () => { h.onSidecar?.(); return h.sidecar; },
   ensureManagerDbRole: async () => { h.events.push('ensure'); return { ok: true }; },
   readBotLogin: async () => { h.events.push('read'); return h.readFail ? { ok: false, cls: 'other', error: h.readFail } : { ok: true, login: { ...h.db } }; },

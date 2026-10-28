@@ -21,6 +21,7 @@ vi.mock('../../src/docker/containerManager', () => ({
 }));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
+  readWriteFence: async () => ({ ok: true, on: false }),
   readBotLogin: async () => h.read,
 }));
 vi.mock('../../src/instance/appHookClient', async (importOriginal) => ({

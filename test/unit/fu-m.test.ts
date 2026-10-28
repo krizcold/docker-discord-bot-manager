@@ -111,7 +111,7 @@ describe('FU-M: stored fence and restore notices carry the record secrets as ***
 
   it('a restore notice saved with a secret is stored and shown scrubbed', () => {
     writeBot({ updateToken: SECRET });
-    containerManager.updateInstanceFleetRestoreError('b1', { file: 'd.sql', text: `Restore of d.sql failed: pg_restore said ${SECRET}` });
+    containerManager.updateInstanceFleetRestoreError('b1', { file: 'd.sql', text: `Restore of d.sql failed: pg_restore said ${SECRET}`, at: '2026-10-28T10:00:00.000Z', doubt: true });
     expect(JSON.stringify(stored().fleetRestoreError)).not.toContain(SECRET);
     expect(stored().fleetRestoreError.text).toContain('***');
     expect(fleetBackup.getFleetRestoreError('b1')).not.toContain(SECRET);

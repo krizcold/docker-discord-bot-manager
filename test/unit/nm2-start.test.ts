@@ -36,14 +36,14 @@ describe('NM2 F: the scheduler start', () => {
   it('F1 unfinished files are deleted in folders whose bot is not busy, and the count is logged', async () => {
     seedBot({ fleetDb: PRIMARY }, 'a');
     seedBot({ fleetDb: PRIMARY }, 'b');
-    put('a', ['hourly-1.dump.tmp', 'hourly-1.dump.json.tmp', 'hourly-2.dump.json', 'hourly-3.dump', 'hourly-3.dump.json', 'term-floor.json', 'term-floor.json.tmp']);
+    put('a', ['hourly-1.dump.tmp', 'hourly-1.dump.json.tmp', 'hourly-2.dump.json', 'hourly-3.dump', 'hourly-3.dump.json', 'claim-floor.json', 'claim-floor.json.tmp']);
     put('b', ['hourly-4.dump.tmp']);
     const fb = await restartedManager();
     const guards = await import('../../src/instance/fleetBackupGuards');
     expect(guards.claimFleetBackupBusy('b')).toBe(true);
     const { lines } = await logged(() => startedWithTick(fb));
     guards.releaseFleetBackupBusy('b');
-    expect(left('a')).toEqual(['hourly-3.dump', 'hourly-3.dump.json', 'term-floor.json']);
+    expect(left('a')).toEqual(['claim-floor.json', 'hourly-3.dump', 'hourly-3.dump.json']);
     expect(left('b')).toEqual(['hourly-4.dump.tmp']);
     expect(lines.join('\n')).toContain(`[FleetBackup] Deleted 4 unfinished backup file(s) a stopped manager left in ${dumpsDir('a')}`);
   });

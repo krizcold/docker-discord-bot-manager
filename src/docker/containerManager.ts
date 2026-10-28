@@ -800,7 +800,7 @@ export function deployedComposeEnvValues(botId: string, keys: string[], activeOn
 }
 
 /** Set or clear a failed restore's notice. Throws when the registry cannot be saved. */
-export function updateInstanceFleetRestoreError(botId: string, notice: { file: string; text: string } | null): void {
+export function updateInstanceFleetRestoreError(botId: string, notice: { file: string; text: string; at: string; doubt: boolean } | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return;
@@ -1145,6 +1145,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     const stored = registry.instances[botId];
     if (stored) {
       delete stored.fleetDb;
+      delete stored.fleetRestoreError;
       stored.updatedAt = new Date().toISOString();
       saveRegistry(registry);
     }
@@ -1152,6 +1153,7 @@ export async function retireFleetDbSidecar(botId: string): Promise<LaneResult & 
     return { success: false, volumeRemoved: true, error: `the database volume ${fleetDb.volume} was removed, but its compose or record could not be updated: ${errorText(err)}` };
   }
   delete instance.fleetDb;
+  delete instance.fleetRestoreError;
   return { success: true, volumeRemoved: true };
 }
 

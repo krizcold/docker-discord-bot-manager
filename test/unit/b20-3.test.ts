@@ -73,7 +73,7 @@ describe('the stuck-fence warning seeded at start names a remedy that works', ()
     const text = await seededWarning();
     expect(text).not.toMatch(/restart the instance to clear it/);
     expect(text).toMatch(/a restart keeps it on/);
-    expect(text).toMatch(/running a restore again retries the lift/);
+    expect(text).toMatch(/running a restore again with the bot in Maintenance or Off retries the lift/);
   });
 
   it('a fence held only by the running server says a restart clears it', async () => {

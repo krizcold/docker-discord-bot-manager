@@ -59,11 +59,9 @@ vi.mock('child_process', async (importOriginal) => {
     if (args[0] === 'run' && sql.includes('postgresql.auto.conf')) { pg.events.push('strip'); return pg.strips.shift() !== false ? cb(null, '', '') : cb(new Error('docker'), '', 'docker down'); }
     if (sql.includes('SHOW default_transaction_read_only')) return cb(null, 'off\n', '');
     if (sql.includes('FROM pg_database WHERE datname')) return pg.existsFail ? cb(new Error('psql'), '', 'psql: error: server closed the connection') : cb(null, '1\n', '');
-    if (sql.includes("to_regclass('smdb_control.term')")) return cb(null, 't|t\n', '');
     if (sql.includes('SELECT coalesce(GREATEST(')) return cb(null, '7\n', '');
     if (sql.includes("to_regclass('smdb_data.guild_ownership')")) return cb(null, 't\n', '');
     if (sql.includes('UPDATE smdb_data.guild_ownership')) { pg.events.push('raise'); return cb(null, 'g1\n', ''); }
-    if (sql.includes('UPDATE smdb_control.term')) return cb(null, '1\n', '');
     if (sql.includes('DROP DATABASE')) pg.events.push('drop');
     return cb(null, '', '');
   });
@@ -88,17 +86,18 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   });
-  const withFence = (await import('./fence-fake')).withFence(execFile as any);
+  const withFence = (await import('./fence-fake')).withFence((await import('./restore-fake')).withRestoreFakes(execFile as any));
   const fencedExecFile = (cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => {
     const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as (err: Error | null, stdout: string, stderr: string) => void;
     if (pg.sweepFail && args.join(' ').includes('pg_terminate_backend')) return cb(new Error('psql'), '', 'psql: error: the session sweep failed');
     return withFence(cmd, args, optsOrCb, maybeCb);
   };
-  const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
+  const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
   return { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, exec, spawn: heldSpawn } };
 });
 
 import * as fs from 'fs';
+import { MAINTAINED } from './restore-fake';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 
@@ -117,10 +116,10 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
-  fleetBackup.clearTermFloor('a');
+  fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   fs.writeFileSync(path.join(tmp.dir, 'instances.json'), JSON.stringify({ instances: {
-    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
+    a: { id: 'a', displayName: 'a', sanitizedName: 'bot-a', status: 'running', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
     w: { id: 'w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },
   } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
@@ -151,7 +150,7 @@ describe('B20-3s: the restore answers with the fence state after its second lift
     pg.strips = [false, false, false, false];
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/^Restored, but the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again retries the lift \(see manager logs\)/);
+    expect(r.error).toMatch(/^Restored, but the write fence could not be lifted or stripped: the database stays READ-ONLY, a restart does not clear it, and running a restore again with the bot in Maintenance or Off retries the lift \(see manager logs\)/);
     expect(r.error).not.toMatch(/until its container restarts/);
   });
 

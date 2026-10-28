@@ -32,6 +32,7 @@ import { feedStdin } from '../docker/childStdin';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
+import { certFingerprint, encodeJoinCode, machineText, sqlLiteral } from '../config/joinCode';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -378,7 +379,7 @@ async function enableInLane(
   const failed = (error: string): EnableResult => ({
     success: false,
     certRotated,
-    error: certRotated ? `${error} (a new server certificate is already installed and the database loads it at its next reload or restart; existing standbys then need the new copy block)` : error,
+    error: certRotated ? `${error} (a new server certificate is already installed and the database loads it at its next reload or restart; every other machine then needs the new join code)` : error,
   });
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
@@ -402,6 +403,8 @@ async function enableInLane(
   if (!hints.ok) return failed(`enabling wal_log_hints failed: ${hints.stderr.trim()}`);
   const keep = await psql(fleetDb.containerName, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
   if (!keep.ok) return failed(`setting the WAL retention bound failed: ${keep.stderr.trim()}`);
+  const asyncOnly = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
+  if (!asyncOnly.ok) return failed(`resetting synchronous replication failed: ${asyncOnly.stderr.trim()}`);
 
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
@@ -409,6 +412,13 @@ async function enableInLane(
   if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
   const reload = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
   if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
+
+  const ownCert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
+  if (!ownCert.ok) return failed(`setting up the address list failed: the server certificate could not be read (${probeErrorTail(ownCert.stderr)})`);
+  const previous = fleetDb.replication;
+  const moved = previous && (previous.publicHost !== host || previous.hostPort !== port) ? { host: previous.publicHost, port: previous.hostPort } : null;
+  const addresses = await psqlScript(fleetDb.containerName, fleetDb.db, addressTableSql(host, port, ownCert.stdout.trim(), machineText(host), moved));
+  if (!addresses.ok) return failed(`setting up the address list failed: ${redactSecrets(addresses.stderr.trim(), [password])}`);
 
   const replication: FleetDbReplication = {
     role: REPLICATION_ROLE,
@@ -500,17 +510,6 @@ async function disableInLane(
   if (senders.stdout.trim() !== '') {
     return { success: false, error: `Replication connections of the ${REPLICATION_ROLE} role are open from ${senders.stdout.trim()} (a standby streaming without a slot, or a seed copying the database); stop or remove them first (nothing was disabled)` };
   }
-  // A live armed setting means the instance's bot is holding writes for a
-  // copy, and only that bot may release them, once it has recorded the relax
-  // on the witness (B7-F23's full partition); relaxing here would release
-  // them with nothing recorded.
-  const posture = await psql(fleetDb.containerName, fleetDb.db, `SELECT current_setting('synchronous_standby_names');`);
-  if (!posture.ok) {
-    return { success: false, error: `could not read the synchronous posture (nothing was disabled): ${posture.stderr.trim()}` };
-  }
-  if (posture.stdout.trim() !== '') {
-    return { success: false, error: `This database still holds its writes for a synchronous standby (${posture.stdout.trim()}), and only the instance's bot may release them, once it has recorded that on the witness: it does so within seconds of the standby leaving, so wait for that, or start the bot if it is stopped, then disable again; if the fleet no longer runs on this database, re-seed it as a standby of the current master or remove it instead (nothing was disabled)` };
-  }
   // Every refusal above changed nothing. From here on each step changes the
   // database, so the record says a Disable is under way until it finishes:
   // an interrupted one is then shown, and pressing Disable again finishes it.
@@ -526,9 +525,8 @@ async function disableInLane(
   } catch (err) {
     return { success: false, error: `could not record that a Disable is under way (nothing was disabled): ${String(err)}` };
   }
-  // With the live setting empty, this clears what an arm that never reached
-  // its reload may have left in auto.conf, which would wedge this database's
-  // next write (B6 map F18). Separate
+  // Clears a synchronous setting a bot or an arm left in auto.conf, which
+  // would wedge this database's next write (B6 map F18). Separate
   // calls, for the reason the enable above records: ALTER SYSTEM refuses to run
   // inside the implicit transaction a multi-statement psql -c wraps its input in.
   const relax = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
@@ -636,7 +634,7 @@ export interface FleetReplicationStatus {
      * standby must re-seed. fleet marks the standby slots this manager family
      * mints.
      */
-    slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null }>;
+    slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null; machine: string | null; address: string | null }>;
     /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */
     slotWalKeep: string;
   };
@@ -748,9 +746,24 @@ export async function getFleetReplicationStatus(
           clientAddr: s.clientAddr ? String(s.clientAddr) : null,
           state: s.state ? String(s.state) : null,
           replayLagSeconds: s.replayLagSeconds === null || s.replayLagSeconds === undefined ? null : Number(s.replayLagSeconds),
+          machine: null,
+          address: null,
         }));
       }
     } catch { /* no slots */ }
+    const listed = await psql(fleetDb.containerName, fleetDb.db, ADDRESS_BY_SLOT_SQL);
+    if (listed.ok) {
+      try {
+        const rows = JSON.parse(listed.stdout.trim() || '[]');
+        for (const slot of slots) {
+          const row = Array.isArray(rows) ? rows.find((r: any) => r && r.slot === slot.slot) : null;
+          if (row) {
+            slot.machine = String(row.machine || '');
+            slot.address = `${row.host}:${row.port}`;
+          }
+        }
+      } catch { /* no machine names */ }
+    }
     status.live = { sslOn: sslOn === 'on', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
   } else {
     status.probeError = probeErrorTail(probe.stderr);
@@ -778,6 +791,9 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
       IF NOT FOUND THEN RAISE EXCEPTION 'no slot named ${slot}'; END IF;
       IF s.active THEN RAISE EXCEPTION 'a standby is streaming on ${slot}; stop or remove it first'; END IF;
       PERFORM pg_drop_replication_slot('${slot}');
+      IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
+        EXECUTE format('DELETE FROM smdb_manager.addresses WHERE slot = %L', '${slot}');
+      END IF;
     END $$;`);
   if (!result.ok) {
     const lines = result.stderr.trim().split('\n');
@@ -786,30 +802,59 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
   return { success: true };
 }
 
+const ADDRESS_BY_SLOT_SQL = `SELECT CASE WHEN to_regclass('smdb_manager.addresses') IS NULL THEN '[]'::json ELSE
+  (SELECT COALESCE(json_agg(json_build_object('slot', slot, 'machine', machine, 'host', host, 'port', port)), '[]'::json)
+   FROM smdb_manager.addresses WHERE slot IS NOT NULL) END;`;
+
+/** Enable's address list script, run as the superuser on stdin: the table, the replication login's grants, and this main's own row. */
+export function addressTableSql(host: string, port: number, certPem: string, machine: string, moved: { host: string; port: number } | null): string {
+  const drop = moved ? `DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = ${sqlLiteral(moved.host)} AND port = ${Number(moved.port)};\n` : '';
+  return `CREATE SCHEMA IF NOT EXISTS smdb_manager;
+CREATE TABLE IF NOT EXISTS smdb_manager.addresses (
+  host text NOT NULL, port integer NOT NULL, slot text, cert text NOT NULL, machine text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (host, port));
+GRANT USAGE ON SCHEMA smdb_manager TO ${REPLICATION_ROLE};
+GRANT SELECT, INSERT, UPDATE, DELETE ON smdb_manager.addresses TO ${REPLICATION_ROLE};
+${drop}INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES (${sqlLiteral(host)}, ${Number(port)}, NULL, ${sqlLiteral(certPem)}, ${sqlLiteral(machine)})
+  ON CONFLICT (host, port) DO UPDATE SET slot = NULL, cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = now();
+`;
+}
+
 /**
- * The copy block the OTHER machine's wizard consumes: a verify-full libpq DSN
- * for the replication role plus the pinned certificate. Secrets included by
- * design - the endpoint sits behind manager auth like the env editor.
+ * The join code another machine's manager pastes: this database's address, its certificate fingerprint, the
+ * replication login and the bot's database login. The code holds passwords; the route sits behind manager auth.
  */
-export async function getReplicaCopyBlock(
-  instance: InstanceConfig,
-): Promise<{ success: boolean; error?: string; dsn?: string; cert?: string }> {
+export async function getJoinCode(instance: InstanceConfig): Promise<{ success: boolean; error?: string; joinCode?: string }> {
   const fleetDb = instance.fleetDb;
   const repl = fleetDb?.replication;
-  if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled' };
+  if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled, so there is no join code.' };
   if (repl.disablingSince) return { success: false, error: 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it' };
-  // A key-loss-scrubbed password would mint a passwordless DSN that fails as
-  // an auth error on the OTHER machine, misdirecting the operator away from
-  // the key loss here.
   if (!repl.password) {
-    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to mint a fresh credential.' };
+    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to make a new one; every other machine then needs the new join code.' };
   }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
-    return { success: false, error: dbDownText(dbState, 'Database container is not running') };
+    return { success: false, error: dbDownText(dbState, 'The database container is not running, so its certificate cannot be read for the join code') };
   }
   const cert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
-  if (!cert.ok) return { success: false, error: 'Could not read the server certificate' };
-  const dsn = `postgresql://${repl.role}:${encodeURIComponent(repl.password)}@${repl.publicHost}:${repl.hostPort}/${fleetDb.db}?sslmode=verify-full`;
-  return { success: true, dsn, cert: cert.stdout };
+  if (!cert.ok) return { success: false, error: `The database's certificate could not be read, so no join code was made: ${probeErrorTail(cert.stderr)}` };
+  let fp: string;
+  try {
+    fp = certFingerprint(cert.stdout);
+  } catch (err) {
+    return { success: false, error: `The database's certificate could not be read, so no join code was made: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const appPassword = storedDbPassword(instance);
+  if (!appPassword) return { success: false, error: "The bot's database password could not be read from the stored database URL, so no join code was made" };
+  const joinCode = encodeJoinCode({
+    v: 1,
+    host: repl.publicHost,
+    port: repl.hostPort,
+    db: fleetDb.db,
+    fp,
+    machine: machineText(repl.publicHost),
+    repl: { user: repl.role, password: repl.password },
+    app: { user: fleetDb.user, password: appPassword },
+  });
+  return { success: true, joinCode };
 }

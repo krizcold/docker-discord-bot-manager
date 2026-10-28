@@ -2462,7 +2462,11 @@
       return bytes + ' B';
     }
 
-    function seedPurposeText(purpose) {
+    function seedPurposeText(purpose, auto, cause) {
+      if (purpose === 'reseed-standby' && auto) {
+        if (cause === 'cleared') return 'Rebuilding the copy (it had been emptied by a Re-seed or rebuild that stopped)';
+        return cause === 'slot' ? 'Rebuilding the copy (the main no longer kept its place)' : 'Rebuilding the copy';
+      }
       if (purpose === 'reseed-standby') return 'Re-seeding the standby';
       if (purpose === 'reseed-stale-primary') return 'Re-seeding this database as a standby';
       return 'Provisioning the standby';
@@ -2620,13 +2624,13 @@
           : p.cancelable
             ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(p.startedAt)}, false)">Cancel</button></div>`
             : '';
-        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${seedDumpHtml(p)}${cancelHtml}`;
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="env-tip">${seedPurposeText(p.purpose, p.auto, p.cause)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>${seedDumpHtml(p)}${cancelHtml}`;
         setTimeout(() => { if (seq === seedBannerSeq) renderSeedBanner(botId); }, 3000);
         return;
       }
       if (r && r.parkedSeed) {
         const k = r.parkedSeed;
-        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}${seedDumpHtml(k)}
+        still.innerHTML = `${seedWarningHtml(r.pinsWarning)}<div class="error-message">${seedPurposeText(k.purpose, k.auto, k.cause)} stopped during <b>${escapeHtml(k.phase)}</b>: ${escapeHtml(k.lastError)}${seedDumpHtml(k)}
           <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(k.startedAt)}, true)">Dismiss</button></div></div>`;
         return;
       }
@@ -2716,7 +2720,7 @@
       if (!body || fleetBackupBotId !== botId) return;
       const seq = renderFleetReplication.seq = (renderFleetReplication.seq || 0) + 1;
       let res = null;
-      try { res = await api('GET', `/bots/${botId}/fleet-replication?include=block`); } catch (err) { res = null; }
+      try { res = await api('GET', `/bots/${botId}/fleet-replication`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== renderFleetReplication.seq) return;
       if (res && res.success && res.replication && res.replication.enabled) {
         const tick = () => { if (seq !== renderFleetReplication.seq || !body.isConnected) return; if (panelHasEntry(body)) setTimeout(tick, 3000); else renderFleetReplication(botId); };
@@ -2744,12 +2748,11 @@
       }
       const stopped = (bots.find(b => b.id === botId) || {}).status !== 'running';
       const live = r.live;
-      const block = res.block;
       const reach = r.reachability;
       const reachAge = reach && reach.ageSeconds > 0 ? ` (checked ${reach.ageSeconds}s ago)` : '';
       const reachHtml = !live ? ''
         : reach && reach.ok ? `<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers${reachAge}</div>`
-        : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}${reachAge}</div>`
+        : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}${reachAge}</div><div class="env-tip">Other machines need this address and port open. A machine that cannot open a port can be the main only when it runs alone.</div>`
         : '';
       const keepBytes = (() => {
         const m = /^(-?\d+)\s*(kB|MB|GB|TB)?$/.exec((live && live.slotWalKeep) || '');
@@ -2763,14 +2766,16 @@
       const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
       const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
       const fleetSlotsHtml = fleetSlots.length === 0
-        ? `<div class="env-tip" style="color:var(--warning);">No standby attached: this machine dying would take this bot's managed database with it. Use the block below on each standby machine.</div>`
+        ? `<div class="env-tip" style="color:var(--warning);">No copy attached: this machine dying would take this bot's database with it. Paste the join code into another machine's manager to add one.</div>`
         : fleetSlots.map(s => {
-            const who = `Standby on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
+            const who = s.machine
+              ? `The copy on <b>${escapeHtml(s.machine)}</b> (slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? `, ${escapeHtml(s.clientAddr)}` : ''})`
+              : `Standby on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
             const retained = s.retainedBytes != null ? Math.round(s.retainedBytes / 1048576) : null;
             const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the primary; a standby that used it must be re-seeded to attach again">Drop slot</button>` : '';
-            if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: retained WAL passed the bound. Its standby cannot resume; re-seed it from the block below, or drop the slot if that standby is gone.${dropBtn}</div>`;
-            if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL retention bound and about to be invalidated; reconnect the standby now.${dropBtn}</div>`;
-            if (!s.active) return `<div class="error-message">${who} is not connected: its standby, if it still exists, is falling behind${retained != null ? `, and the slot retains ${retained} MB of WAL` : ''}. Re-seed it from the standby machine's manager, or drop the slot if that standby is gone.${dropBtn}</div>`;
+            if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: it kept more WAL than the bound. The copy's manager rebuilds it from this database when it next checks; drop the slot if that copy is gone.${dropBtn}</div>`;
+            if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL bound and about to be invalidated; reconnect the copy now.${dropBtn}</div>`;
+            if (!s.active) return `<div class="error-message">${who} is not connected: its copy, if it still exists, is falling behind${retained != null ? `, and the slot keeps ${retained} MB of WAL` : ''}. Drop the slot if that copy is gone.${dropBtn}</div>`;
             if (s.state !== 'streaming') return `<div class="error-message">${who} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale.</div>`;
             const lag = s.replayLagSeconds;
             const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
@@ -2790,17 +2795,15 @@
         ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the standby slots dropped). Press Disable replication to finish it.</div>` : ''}
         ${reachHtml}
         ${slotsHtml}
-        ${block ? `
         <div style="margin-top:6px;">
-          <div style="display:flex;align-items:center;gap:8px;">
-            <span style="font-size:0.78rem;color:var(--text-secondary);">Replica setup block</span>
-            <button class="btn btn-secondary btn-small" onclick="copyFleetReplBlock(this)">Copy DSN</button>
-            <button class="btn btn-secondary btn-small" onclick="copyFleetReplCert(this)">Copy certificate</button>
+          <div class="env-tip">Join code: other machines paste it to use this database (a live copy, shards, or both). It holds this database's address, its certificate fingerprint and two passwords.</div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-small" onclick="copyJoinCode('${botId}')">Copy join code</button>
+            <button class="btn btn-secondary btn-small" onclick="showJoinCode('${botId}')">Show</button>
+            <button class="btn btn-secondary btn-small" onclick="hideJoinCode()">Hide</button>
           </div>
-          <input type="hidden" id="fleet-repl-dsn" value="${escapeHtml(block.dsn)}">
-          <input type="hidden" id="fleet-repl-cert" value="${escapeHtml(block.cert)}">
-          <div class="env-tip">On each standby machine's manager, open the standby instance's Database button, paste both into its Database Replica section and press Provision. That section shows on an instance whose Data Backend is postgres and which does not host the database itself.</div>
-        </div>` : `<div class="env-tip" style="color:var(--warning)">${escapeHtml(res.blockError || 'Setup block unavailable')}</div>`}
+          <div id="fleet-join-code-shown"></div>
+        </div>
         <div style="margin-top:6px;">
           <button class="btn btn-danger btn-small" id="fleet-repl-disable" onclick="disableFleetReplication('${botId}')">Disable replication</button>
         </div>
@@ -2813,12 +2816,10 @@
           <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
           <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
           ${stopped ? `
-          <div class="form-group"><label>New primary's replication DSN</label>
-            <input type="password" id="reseed-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
-          <div class="form-group"><label>New primary's certificate (PEM)</label>
-            <textarea id="reseed-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          <div class="form-group"><label>Join code from the main's manager</label>
+            <textarea id="reseed-join" rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="smdbjoin1...."></textarea></div>
           <div class="env-row" style="align-items:center;">
-            <input type="text" id="reseed-host" value="${escapeHtml(r.publicHost || '')}" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="text" id="reseed-host" value="${escapeHtml(r.publicHost || '')}" placeholder="This machine's address for other machines (blank if it cannot open a port)" style="flex:2;">
             <input type="number" id="reseed-port" value="${r.hostPort || ''}" placeholder="15432" min="1" max="65535" style="flex:1;">
             <button class="btn btn-danger btn-small" onclick="reseedStalePrimary('${botId}')">Re-seed as standby</button>
           </div>`
@@ -2853,7 +2854,7 @@
     // kept non-TLS line are independent facts.
     function fleetReplEnableNotes(res) {
       let notes = '';
-      if (res.certRotated) notes += ' A new server certificate was installed: existing standbys must be set up again with the new copy block.';
+      if (res.certRotated) notes += ' A new server certificate was installed: every other machine needs the new join code.';
       if (res.plainClientsKept) {
         notes += ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.`;
       }
@@ -2938,28 +2939,36 @@
       loadBots();
     }
 
-    async function copyToClipboard(btn, text, label) {
+    async function fetchJoinCode(botId) {
+      let res = null;
+      try { res = await api('GET', `/bots/${botId}/fleet-replication/join-code`); } catch (err) { showNoAnswer('join code'); return null; }
+      if (!res || !res.success || !res.joinCode) { showMessage('error', (res && res.error) || 'No join code was made'); return null; }
+      return res.joinCode;
+    }
+
+    async function copyJoinCode(botId) {
+      const code = await fetchJoinCode(botId);
+      if (!code) return;
       try {
         if (!navigator.clipboard) throw new Error('no clipboard');
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.writeText(code);
       } catch (err) {
-        showMessage('error', 'Not copied: the browser blocked the clipboard (it needs https or localhost)');
+        showMessage('error', 'The join code could not be copied to the clipboard; press Show and copy it by hand.');
         return;
       }
-      btn.textContent = 'Copied';
-      setTimeout(() => { btn.textContent = label; }, 1500);
+      showMessage('success', 'Join code copied. It holds database passwords: paste it only into your own managers.');
     }
 
-    function copyFleetReplBlock(btn, id) {
-      const el = document.getElementById(id || 'fleet-repl-dsn');
-      if (!el) return;
-      return copyToClipboard(btn, el.value, 'Copy DSN');
+    async function showJoinCode(botId) {
+      const code = await fetchJoinCode(botId);
+      const el = document.getElementById('fleet-join-code-shown');
+      if (!code || !el) return;
+      el.innerHTML = `<textarea readonly rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;">${escapeHtml(code)}</textarea>`;
     }
 
-    function copyFleetReplCert(btn, id) {
-      const el = document.getElementById(id || 'fleet-repl-cert');
-      if (!el) return;
-      return copyToClipboard(btn, el.value, 'Copy certificate');
+    function hideJoinCode() {
+      const el = document.getElementById('fleet-join-code-shown');
+      if (el) el.innerHTML = '';
     }
 
     // ─── Fleet DB standby replica (worker side, PLAN_REPLICATION.md Stage 2) ───
@@ -3011,7 +3020,7 @@
       if (!body || fleetBackupBotId !== botId) return;
       const seq = ++replicaPollSeq;
       let res = null;
-      try { res = await api('GET', `/bots/${botId}/fleet-replica?include=block`); } catch (err) { res = null; }
+      try { res = await api('GET', `/bots/${botId}/fleet-replica`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== replicaPollSeq) return;
       if (!res || !res.success) {
         // Keep asking: this panel now carries the live Cancel and Dismiss, so
@@ -3027,12 +3036,13 @@
       // show until the operator retries or dismisses it.
       const parked = r.parkedSeed || null;
       const errHtml = seedWarningHtml(r.pinsWarning) + (parked
-        ? `<div class="error-message">${seedWhat(parked.purpose)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}${seedDumpHtml(parked)}
+        ? `<div class="error-message">${seedWhat(parked.purpose, parked.auto, parked.cause)} stopped during <b>${escapeHtml(parked.phase)}</b>: ${escapeHtml(parked.lastError)}${seedDumpHtml(parked)}${alertOutcomeHtml(res.rebuild, 'stopped')}
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">${parked.pinsUnretired && parked.pinsUnretired.length ? `<button class="btn btn-primary btn-small" onclick="finishPinsRetire('${botId}')">Finish retire</button>` : ''}<button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(parked.startedAt)}, true)">Dismiss</button></div></div>`
         : r.seedNote ? `<div class="error-message">${escapeHtml(r.seedNote)}
              <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(r.seedNoteStartedAt)}, true)">Dismiss</button></div></div>`
         : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>`
-        : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '');
+        : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '')
+        + rebuiltLineHtml(res.rebuild, r);
       if (r.provisioning) {
         const p = r.provisioning;
         const cancelHtml = p.cancelRequested
@@ -3042,7 +3052,7 @@
             : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
         body.innerHTML = `
           ${errHtml}
-          <div class="env-tip">${seedWhat(p.purpose)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
+          <div class="env-tip">${seedWhat(p.purpose, p.auto, p.cause)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
           ${cancelHtml}`;
         setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
         return;
@@ -3051,15 +3061,16 @@
       if (!r.record) {
         body.innerHTML = `
           ${errHtml}
-          <div class="env-tip">A live standby copy of this bot's managed database, streaming from the primary machine. Paste the block from the primary's Database modal (Replication section).</div>
-          <div class="form-group"><label>Replication DSN</label>
-            <input type="password" id="replica-dsn" placeholder="postgresql://replicator:...@host:15432/dbname?sslmode=verify-full"></div>
-          <div class="form-group"><label>Primary certificate (PEM)</label>
-            <textarea id="replica-cert" rows="4" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          ${joinStateHtml(res.join)}
+          <div class="form-group"><label>Join code from the main's manager</label>
+            <textarea id="replica-join" rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="smdbjoin1...."></textarea></div>
           <div class="env-row" style="align-items:center;">
-            <input type="text" id="replica-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
+            <input type="text" id="replica-host" placeholder="This machine's address for other machines (blank if it cannot open a port)" style="flex:2;">
             <input type="number" id="replica-port" placeholder="15432" min="1" max="65535" style="flex:1;">
-            <button class="btn btn-primary btn-small" onclick="provisionFleetReplica('${botId}')">Provision</button>
+          </div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-small" onclick="joinFleetFromPanel('${botId}')">Join</button>
+            <button class="btn btn-primary btn-small" onclick="provisionFleetReplica('${botId}')">Add a live copy</button>
           </div>`;
         return;
       }
@@ -3090,26 +3101,30 @@
         : live.receiverStatus !== 'streaming'
           ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
           : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
-      const appHooks = (bots.find(b => b.id === botId) || {}).appHooks === true;
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is adopted or removed,
       // and a record too old to probe has no state to re-seed from.
-      const reseedHtml = (appHooks && r.live && live.inRecovery !== false)
+      const reseedHtml = (r.live && live.inRecovery !== false)
         ? `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
         : '';
 
       const consentHtml = replicaConsentHtml();
       body.innerHTML = `
         ${errHtml}
-        <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> once you promote it.</div>
+        <div class="env-tip">Follows <b>${escapeHtml(r.record.primaryHost)}:${r.record.primaryPort}</b>${r.record.publicHost ? `; this copy serves at <b>${escapeHtml(r.record.publicHost)}:${r.record.hostPort}</b> once you promote it` : ''}.</div>
+        ${joinStateHtml(res.join)}
         ${consentHtml}
         ${stateHtml}
+        ${rebuildLineHtml(res.rebuild)}
         ${copyDumpHtml(res.copyBackup)}
         <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
           ${reseedHtml}
-        </div>`;
+        </div>
+        <div class="form-group" style="margin-top:8px;"><label>Join code from the main's manager</label>
+          <textarea id="replica-join" rows="2" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="smdbjoin1...."></textarea></div>
+        <div><button class="btn btn-secondary btn-small" onclick="joinFleetFromPanel('${botId}')">Join</button></div>`;
     }
 
     async function finishPinsRetire(botId) {
@@ -3168,16 +3183,59 @@
       return res;
     }
 
+    // What the Database window shows about the join: the main, and the address list's last error.
+    function joinStateHtml(join) {
+      if (!join) return '';
+      const unread = join.codeUnreadable ? `<div class="error-message">The stored join code no longer decrypts (the manager encryption key changed or was lost); paste the join code again.</div>` : '';
+      const listErr = join.addressesError ? `<div class="error-message">${escapeHtml(join.addressesError)}</div>` : '';
+      return `<div class="env-tip">Joined the main at <b>${escapeHtml(join.host)}:${Number(join.port)}</b> (${escapeHtml(join.machine)}).</div>${unread}${listErr}`;
+    }
+
+    // The outcome of one owner message about this copy (held or stopped); empty while it waits for its first send.
+    function alertOutcomeHtml(rebuild, key) {
+      const a = rebuild && rebuild.alerts ? rebuild.alerts[key] : null;
+      return a && a.outcome ? `<div class="env-tip">${escapeHtml(a.outcome)}</div>` : '';
+    }
+
+    // The stored message about the last automatic rebuild and its outcome, unless the seed note already carries it.
+    function rebuiltLineHtml(rebuild, replica) {
+      if (!rebuild || !rebuild.rebuilt || (replica && replica.rebuiltShown)) return '';
+      return `<div class="env-tip">${escapeHtml(rebuild.rebuilt)}</div>`;
+    }
+
+    // The watcher's line about a copy the main stopped keeping a place for.
+    function rebuildLineHtml(rebuild) {
+      if (!rebuild || !rebuild.text) return '';
+      return `<div class="error-message">${escapeHtml(rebuild.text)}${rebuild.kind === 'held' ? alertOutcomeHtml(rebuild, 'held') : ''}</div>`;
+    }
+
+    async function joinFleetFromPanel(botId) {
+      const joinCode = (document.getElementById('replica-join')?.value || '').trim();
+      if (!joinCode) { showMessage('error', 'Paste the join code from the main\'s manager first'); return; }
+      if (refuseWhileChecking(botId)) return;
+      showMessage('info', 'Checking the join code; the first check on a machine downloads the database image and can take a few minutes.');
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-join`, { joinCode });
+        if (!res.success) { showMessage('error', res.error || 'The join code was not used'); return; }
+        showMessage('success', res.message);
+      } catch (err) {
+        showNoAnswer('join');
+      }
+      renderFleetReplica(botId);
+      loadBots();
+    }
+
     async function provisionFleetReplica(botId) {
-      const primaryDsn = (document.getElementById('replica-dsn')?.value || '').trim();
-      const cert = (document.getElementById('replica-cert')?.value || '').trim();
+      const joinCode = (document.getElementById('replica-join')?.value || '').trim();
       const host = (document.getElementById('replica-host')?.value || '').trim();
       const portRaw = (document.getElementById('replica-port')?.value || '').trim();
       if (refuseBadNumbers([['replica-port', 'port']])) return;
-      if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
       if (refuseWhileChecking(botId)) return;
-      const payload = { primaryDsn, cert, publicHost: host };
-      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      const payload = {};
+      if (joinCode) payload.joinCode = joinCode;
+      if (host) payload.publicHost = host;
+      if (host && portRaw !== '') payload.hostPort = Number(portRaw);
+      if (joinCode) showMessage('info', 'Checking the join code; the first check on a machine downloads the database image and can take a few minutes.');
       try {
         const res = await postProvision(`/bots/${botId}/fleet-replica`, payload);
         if (!res) return;
@@ -3194,16 +3252,16 @@
 
 
     async function reseedStalePrimary(botId) {
-      const primaryDsn = (document.getElementById('reseed-dsn')?.value || '').trim();
-      const cert = (document.getElementById('reseed-cert')?.value || '').trim();
+      const joinCode = (document.getElementById('reseed-join')?.value || '').trim();
       const host = (document.getElementById('reseed-host')?.value || '').trim();
       const portRaw = (document.getElementById('reseed-port')?.value || '').trim();
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
-      if (!primaryDsn || !cert || !host) { showMessage('error', 'DSN, certificate and this machine\'s public host are all required'); return; }
+      if (!joinCode) { showMessage('error', 'Paste the join code from the main\'s manager first'); return; }
       if (refuseWhileChecking(botId)) return;
       if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nWhen it finishes, this database is a standby that follows the pasted primary and takes no writes of its own. Start the instance, then open its Database modal: the replica section shows "caught up" or the replay lag.')) return;
-      const payload = { primaryDsn, cert, publicHost: host };
-      if (portRaw !== '') payload.hostPort = Number(portRaw);
+      const payload = { joinCode };
+      if (host) payload.publicHost = host;
+      if (host && portRaw !== '') payload.hostPort = Number(portRaw);
       try {
         const res = await postProvision(`/bots/${botId}/fleet-reseed`, payload, 're-seed');
         if (!res) return;
@@ -3224,7 +3282,7 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
         if (res.success) {
-          showMessage('success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the replica block to the other machine.`);
+          showMessage('success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the join code to the other machine.`);
         } else {
           showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to adopt the database'}`);
         }
@@ -3282,9 +3340,13 @@
     }
 
     async function reseedStandbyNow(botId) {
-      if (!confirm('Re-seed this standby now?\n\nThe manager checks for a copy block to seed from first. If it has none, it refuses and changes nothing.')) return;
+      if (!confirm('Re-seed this copy now?\n\nThe manager checks the main in this machine\'s join code, takes a dump of the copy (kept with the backups), then replaces the copy with a fresh copy of the main. If the check or the dump fails, nothing is deleted.')) return;
       try {
-        const res = await api('POST', `/bots/${botId}/fleet-replica/reseed`);
+        let res = await api('POST', `/bots/${botId}/fleet-replica/reseed`, {});
+        if (!res.success && res.needsConfirm) {
+          if (!confirm(res.error)) { renderFleetReplica(botId); return; }
+          res = await api('POST', `/bots/${botId}/fleet-replica/reseed`, { confirm: true });
+        }
         if (res.success) showMessage('success', 'Re-seed started');
         else showMessage('error', res.error || 'Failed to start the re-seed');
       } catch (err) {

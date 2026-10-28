@@ -21,7 +21,7 @@ const pageFunction = (name: string): string => {
 };
 const optional = (names: string[]) => names.filter((n) => pageHtml.includes(`function ${n}(`));
 const helpers = ['escapeHtml', 'seedPurposeText', 'seedWarningHtml']
-  .concat(optional(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText', 'panelHasEntry', 'copyDumpHtml']));
+  .concat(optional(['replicaPromotable', 'replicaTransferHtml', 'replicaConsentHtml', 'replicaPromiseText', 'panelHasEntry', 'copyDumpHtml', 'joinStateHtml', 'rebuildLineHtml', 'rebuiltLineHtml', 'alertOutcomeHtml']));
 
 const record = { primaryHost: 'p.example', primaryPort: 15432, publicHost: 'h.example', hostPort: 15433 };
 const liveCopy = { running: true, inRecovery: true, receiverStatus: 'streaming', caughtUp: true };

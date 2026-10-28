@@ -57,6 +57,8 @@ export interface CompanionDbSpec {
    * form) is a manager constant, not a per-app field (ruling F2 2026-09-01).
    */
   appEnvFile?: string;
+  /** Where the app's data folder is mounted in its container; the certificate files of a join land under it. */
+  appDataPath?: string;
 }
 
 /**
@@ -143,7 +145,7 @@ function smdbWizardFields(): WizardEnvVar[] {
       ...base,
       key: smdbDbEnv.url,
       displayLabel: 'Database URL',
-      description: 'Blank provisions a managed Postgres on this server. Paste a postgresql:// URL to use an external database instead.',
+      description: "Blank makes a managed Postgres on this server, which becomes the main database. To use another machine's database, paste the join code from that machine's manager. A postgresql:// URL uses an external database.",
       sensitive: true,
       showWhen: { key: smdbDbEnv.mode.key, equals: smdbDbEnv.mode.value },
       placeholder: 'blank = managed Postgres on this server',
@@ -160,6 +162,7 @@ const superModularDiscordBot: AppCapabilityManifest = {
     database: 'smdb',
     env: smdbDbEnv,
     appEnvFile: '.env',
+    appDataPath: '/data',
   },
   wizardFields: smdbWizardFields(),
   hooks: {

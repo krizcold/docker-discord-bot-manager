@@ -87,16 +87,20 @@ import * as os from 'os';
 import * as path from 'path';
 import { validateName, makeUniqueName, checkFolderReuse } from '../../src/naming';
 import { provisionFleetReplica, reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert, joinRecordFor } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const FAULT = 'The instance registry (instances.json) cannot be read, so the bot list is unknown and every change is refused. Repair or replace instances.json (no copy).';
 const FLEET_URL = 'https://example.invalid/fake/super-modular-discord-bot';
-const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
 const FLEET_DB = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
 
 const worker = (over: Record<string, unknown> = {}): any => ({
   id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
   sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, containerIds: [],
+  fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
   createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...over,
 });
 const other = (over: Record<string, unknown> = {}): any => worker({ id: 'b2', sanitizedName: 'bot2', displayName: 'Bot 2', titleName: 'Bot 2', ...over });
@@ -206,7 +210,7 @@ describe('B04-2n: the host-port collision checks refuse while the registry canno
   it('provision refuses with a can\'t-confirm answer and calls no docker', () => {
     h.bots = [worker()];
     h.fault = FAULT;
-    const res = provisionFleetReplica(h.bots[0], DSN, PEM, 'standby.invalid', 5440);
+    const res = provisionFleetReplica(h.bots[0], 'standby.invalid', 5440);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/Host port 5440 cannot be confirmed free/);
     expect(res.error).toContain('instances.json');
@@ -216,14 +220,14 @@ describe('B04-2n: the host-port collision checks refuse while the registry canno
 
   it('provision still names the bot that uses the port when the registry reads', () => {
     h.bots = [worker(), other({ fleetDb: { ...FLEET_DB, replication: { hostPort: 5440, publicHost: 'x.invalid' } } })];
-    const res = provisionFleetReplica(h.bots[0], DSN, PEM, 'standby.invalid', 5440);
+    const res = provisionFleetReplica(h.bots[0], 'standby.invalid', 5440);
     expect(res.error).toMatch(/Host port 5440 is already used by "Bot 2"/);
   });
 
   it('the stale-primary re-seed refuses with a can\'t-confirm answer and calls no docker', () => {
     h.bots = [worker({ fleetDb: FLEET_DB })];
     h.fault = FAULT;
-    const res = reseedStalePrimary(h.bots[0], DSN, PEM, 'standby.invalid', 5440);
+    const res = reseedStalePrimary(h.bots[0], codeFor(DSN), 'standby.invalid', 5440);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/Host port 5440 cannot be confirmed free/);
     expect(res.error).toContain('instances.json');

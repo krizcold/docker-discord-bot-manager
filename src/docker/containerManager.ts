@@ -20,7 +20,9 @@ import {
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
   ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord, BackupFamily, FleetBackupTests, FleetBackupAlert,
+  FleetJoinRecord,
 } from '../types';
+import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
 import { allocateHostPort } from './portAllocator';
@@ -215,6 +217,9 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   if (inst.fleetDb?.replication) {
     inst.fleetDb.replication.password = decryptRecordSecret(inst.id, 'fleetDb.replication.password', inst.fleetDb.replication.password) ?? '';
   }
+  if (inst.fleetJoin) {
+    inst.fleetJoin.code = decryptRecordSecret(inst.id, 'fleetJoin.code', inst.fleetJoin.code) ?? '';
+  }
 }
 
 function encryptedOrStashed(instId: string, field: string, plain: string | undefined): string | undefined {
@@ -230,7 +235,9 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
-  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password];
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetJoin?.code];
+  const joined = inst.fleetJoin?.code ? decodeJoinCode(inst.fleetJoin.code) : null;
+  if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
   try {
     for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
       if (!value) continue;
@@ -251,7 +258,7 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const has = typeof inst.fleetDbReplicaSeed?.lastError === 'string' && inst.fleetDbReplicaSeed.lastError !== '';
-  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts) return inst;
+  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts && !inst.fleetCopyAlerts && !inst.fleetJoin?.addressesError) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
@@ -272,6 +279,14 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
     }
     out.fleetBackupAlerts = alerts;
   }
+  if (out.fleetCopyAlerts) {
+    const alerts: Record<string, FleetBackupAlert> = {};
+    for (const [key, a] of Object.entries(out.fleetCopyAlerts)) {
+      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}) };
+    }
+    out.fleetCopyAlerts = alerts;
+  }
+  if (out.fleetJoin?.addressesError) out.fleetJoin = { ...out.fleetJoin, addressesError: redactSecrets(out.fleetJoin.addressesError, secrets) };
   return out;
 }
 
@@ -280,6 +295,9 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   out.updateToken = encryptedOrStashed(inst.id, 'updateToken', out.updateToken);
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: encryptedOrStashed(inst.id, 'fleetDb.replication.password', out.fleetDb.replication.password) ?? '' } };
+  }
+  if (out.fleetJoin) {
+    out.fleetJoin = { ...out.fleetJoin, code: encryptedOrStashed(inst.id, 'fleetJoin.code', out.fleetJoin.code) ?? '' };
   }
   return out;
 }
@@ -299,6 +317,9 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.maintenance = inst.maintenance ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
+  }
+  if (out.fleetJoin) {
+    out.fleetJoin = { ...out.fleetJoin, code: '' };
   }
   return out;
 }
@@ -682,6 +703,18 @@ export function updateInstanceFleetDbReplica(botId: string, replica: FleetDbRepl
   return instance;
 }
 
+/** The standby record and its seed record in one registry write. Throws when the registry cannot be saved. */
+export function updateInstanceFleetDbReplicaAndSeed(botId: string, replica: FleetDbReplicaRecord, seed: FleetReplicaSeedRecord): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  instance.fleetDbReplica = replica;
+  instance.fleetDbReplicaSeed = seed;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 export function updateInstanceFleetDbReplicaKept(botId: string, kept: InstanceConfig['fleetDbReplicaKept'] | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -806,6 +839,33 @@ export function updateInstanceFleetBackupStart(botId: string, family: BackupFami
   saveRegistry(registry);
 }
 
+/** Set or clear the joined main's record. Throws when the registry cannot be saved. */
+export function updateInstanceFleetJoin(botId: string, join: FleetJoinRecord | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (join) instance.fleetJoin = join;
+  else delete instance.fleetJoin;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** Set or clear one of the owner's messages about this machine's copy, keyed held|stopped. Throws when the registry cannot be saved. */
+export function updateInstanceFleetCopyAlert(botId: string, key: string, alert: FleetBackupAlert | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) return;
+  if (!alert && !instance.fleetCopyAlerts?.[key]) return;
+  const all = { ...(instance.fleetCopyAlerts ?? {}) };
+  if (alert) all[key] = alert;
+  else delete all[key];
+  if (Object.keys(all).length > 0) instance.fleetCopyAlerts = all;
+  else delete instance.fleetCopyAlerts;
+  saveRegistry(registry);
+}
+
 /** Set or clear one backup alert, keyed <family>:<dumps|test>. Throws when the registry cannot be saved. */
 export function updateInstanceFleetBackupAlert(botId: string, key: string, alert: FleetBackupAlert | null): void {
   const registry = loadRegistry();
@@ -915,6 +975,9 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   delete stored.fleetDbReplica;
   // The seed record is about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
+  // This machine is the main now: a join code would make the watcher write the old main's list over its URL.
+  delete stored.fleetJoin;
+  delete stored.fleetCopyAlerts;
   stored.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   const live = getBot(botId);
@@ -922,6 +985,8 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     live.fleetDb = { ...stored.fleetDb };
     delete live.fleetDbReplica;
     delete live.fleetDbReplicaSeed;
+    delete live.fleetJoin;
+    delete live.fleetCopyAlerts;
   }
   // A standby deployed before the app depended on it: order compose down now,
   // so the restart this adopt asks for stops the app before its database.
@@ -3052,7 +3117,12 @@ export function mergedEnvVars(instance: InstanceConfig): Record<string, string> 
   for (const [key, value] of Object.entries(vars)) {
     if (envManager.isSensitive(key, value)) sensitive[key] = value;
   }
-  return { ...instance.envVars, ...sensitive };
+  const merged = { ...instance.envVars, ...sensitive };
+  const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  if (urlKey && isJoinCode(merged[urlKey] || vars[urlKey])) {
+    throw new Error(`The Database URL of ${instance.displayName} holds a join code the manager has not checked yet. Build the instance, or paste the code into Join in its Database window.`);
+  }
+  return merged;
 }
 
 /**
@@ -3184,7 +3254,8 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
     }
     const replicaSvc = services['fleet-postgres-replica'];
     if (replicaSvc && typeof replicaSvc === 'object' && instance.fleetDbReplica) {
-      replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
+      if (instance.fleetDbReplica.publicHost && instance.fleetDbReplica.hostPort) replicaSvc.ports = [`${instance.fleetDbReplica.hostPort}:5432`];
+      else delete replicaSvc.ports;
     }
     // A standby removed while a build wrote its snapshot back must not return
     // on this start; an adopted copy keeps the service key under fleetDb.
@@ -4227,6 +4298,9 @@ async function buildBotImpl(botId: string): Promise<LaneResult> {
       return { success: false, error: modeRefusal };
     }
 
+    const joinRefusal = await (await import('../instance/fleetJoin')).resolveStoredJoinCode(instance, emit);
+    if (joinRefusal) return { success: false, error: joinRefusal };
+
     updateBotStatus(botId, 'building');
 
     if (sourceType === 'docker-image') {
@@ -4408,6 +4482,7 @@ export function ensureFleetDataBackend(instance: InstanceConfig): { containerNam
   const containerName = instance.fleetDb?.containerName || `${instance.sanitizedName}-fleet-postgres`;
   const volume = instance.fleetDb?.volume || `${instance.sanitizedName}-fleet-postgres-data`;
   const url = (stored[spec.env.url] || '').trim();
+  if (!instance.fleetDb && (instance.fleetJoin || isJoinCode(url) || isBackendUrlList(url))) return null;
 
   if (url === '') {
     // Postgres keeps the password a volume was initialized with, so a new one

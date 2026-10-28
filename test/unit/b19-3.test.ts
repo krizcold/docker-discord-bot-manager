@@ -44,7 +44,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
-import { disableFleetReplication, getFleetReplicationStatus, getReplicaCopyBlock } from '../../src/instance/fleetReplication';
+import { disableFleetReplication, getFleetReplicationStatus, getJoinCode } from '../../src/instance/fleetReplication';
 
 const botDir = path.join(tmp.dir, 'bots', 'b1');
 const fakeUrl = 'postgresql://smdb:fake-pass@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
@@ -88,13 +88,13 @@ describe('an interrupted Disable', () => {
     expect(typeof repl.disablingSince).toBe('string');
   });
 
-  it('is reported by the status and blocks the copy block until Disable finishes', async () => {
+  it('is reported by the status and blocks the join code until Disable finishes', async () => {
     tmp.failOn = 'NOLOGIN';
     await disableFleetReplication(containerManager.getBot('b1')!);
     const status = await getFleetReplicationStatus(containerManager.getBot('b1')!, { probeEndpoint: false });
     expect(status.enabled).toBe(true);
     expect(typeof status.disablingSince).toBe('string');
-    const block = await getReplicaCopyBlock(containerManager.getBot('b1')!);
+    const block = await getJoinCode(containerManager.getBot('b1')!);
     expect(block.success).toBe(false);
     expect(block.error).toMatch(/Disable/);
 
@@ -114,7 +114,7 @@ describe('an interrupted Disable', () => {
   });
 
   it('a refusal before the first change leaves no mark', async () => {
-    tmp.failOn = 'synchronous_standby_names\')';
+    tmp.failOn = 'FROM pg_stat_replication WHERE usename';
     const res = await disableFleetReplication(containerManager.getBot('b1')!);
     expect(res.success).toBe(false);
     expect(res.error).toContain('nothing was disabled');

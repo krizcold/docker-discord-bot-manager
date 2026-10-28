@@ -113,6 +113,10 @@ import { fenceOwners } from './fence-fake';
 import * as containerManager from '../../src/docker/containerManager';
 import * as dbLogin from '../../src/instance/dbLogin';
 import { callAppHook } from '../../src/instance/appHookClient';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
 
@@ -311,8 +315,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       vi.spyOn(containerManager, 'retireFleetDbSidecar').mockImplementation(async () => ({ success: true }) as any),
     ];
     try {
-      const r = fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, 'postgresql://replicator:fakepass@primary.invalid:5433/smdb',
-        '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----', 'standby.invalid', 5440, true);
+      const r = fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true);
       expect(r.success, r.error).toBe(true);
       await vi.waitFor(() => expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked).toBe(true), { timeout: 5000 });
     } finally {

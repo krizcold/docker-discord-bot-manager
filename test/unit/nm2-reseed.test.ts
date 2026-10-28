@@ -30,6 +30,14 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   getDeploymentMode: async () => 'docker',
 }));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
+// The main and the copy a Re-seed reads before it starts: the same database, the main at or past the copy.
+vi.mock('../../src/instance/fleetJoin', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetJoin')>()),
+  mainCertificate: async () => ({ ok: true, pem: (await import('./join-fake')).FIXTURE_PEM }),
+  ensureClientImage: async () => null,
+  mainProbe: async () => ({ ok: true, facts: { systemId: '7001', timeline: 1, lsn: 100n, inRecovery: false, slot: 'absent' } }),
+  readCopyFacts: async () => ({ ok: true, facts: { inRecovery: true, streaming: true, systemId: '7001', timeline: 1, lsn: 50n } }),
+}));
 vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
   return {
@@ -55,6 +63,7 @@ import { docker, resetDocker, callsWith } from './nm2-docker';
 import { fenceOwners } from './fence-fake';
 import { PRIMARY, REPLICA, seedBot, clearRegistry, stored, dumps, startedWithTick, tickOnce } from './nm2-harness';
 import { setNow, realNow } from './nm2-harness';
+import { joinRecordFor } from './join-fake';
 
 const R_RESEED = "A dump, restore or replication change is running on this instance's database, so the re-seed was refused and nothing was changed; wait for it to finish, then re-seed again";
 
@@ -77,7 +86,7 @@ beforeEach(() => {
   docker.overrides.push({ match: a => a.join(' ').includes('pg_is_in_recovery(),'), answer: { ok: true, stdout: 't|streaming|f|1\n' } });
   fs.rmSync(path.join(h.dir, 'backups'), { recursive: true, force: true });
   clearRegistry();
-  seedBot({ fleetDbReplica: { ...REPLICA, seededAt: Date.now() - 86400000 }, updateToken: 'tok' });
+  seedBot({ fleetDbReplica: { ...REPLICA, seededAt: Date.now() - 86400000 }, updateToken: 'tok', fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.example:5432/app') });
 });
 afterAll(() => { fs.rmSync(h.dir, { recursive: true, force: true }); });
 

@@ -124,6 +124,10 @@ import * as envManager from '../../src/env/manager';
 import { enableFleetReplication, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 import { getFleetReplicaStatus, reseedStalePrimary } from '../../src/instance/fleetReplica';
 import { scramSha256Verifier } from '../../src/config/secretText';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const botDir = path.join(h.dir, 'bots', 'b1');
 const DB_SECRET = 'Db-Secret-0123456789';
@@ -232,7 +236,7 @@ describe('the endpoint reachability probe', () => {
 describe('seeding a standby', () => {
   it('gives psql and pg_basebackup the password by environment, never in argv', async () => {
     const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-    const started = reseedStalePrimary(containerManager.getBot('b1')!, `postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`, pem, 'standby.invalid', 5440, true, { dumpDone: true });
+    const started = reseedStalePrimary(containerManager.getBot('b1')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
     expect(started).toMatchObject({ success: true });
     await waitFor(() => containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked === true);
     expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked).toBe(true);
@@ -248,7 +252,7 @@ describe('seeding a standby', () => {
 
   it('B14-2Lb: strips the primary\'s fence lines from the copied pg_hba.conf with its inherited settings', async () => {
     const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-    reseedStalePrimary(containerManager.getBot('b1')!, `postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`, pem, 'standby.invalid', 5440, true, { dumpDone: true });
+    reseedStalePrimary(containerManager.getBot('b1')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
     await waitFor(() => containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked === true);
     const seed = h.calls.findIndex(c => c.args.includes('pg_basebackup'));
     const strip = h.calls.findIndex(c => c.args[0] === 'run' && c.args[c.args.length - 1].includes('/^synchronous_standby_names/d'));

@@ -103,11 +103,21 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
 const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
 
+// The main and the copy a Re-seed reads before it starts: the same database, the main at or past the copy.
+vi.mock('../../src/instance/fleetJoin', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetJoin')>()),
+  mainProbe: async () => ({ ok: true, facts: { systemId: '7001', timeline: 1, lsn: 100n, inRecovery: false, slot: 'absent' } }),
+  readCopyFacts: async () => ({ ok: true, facts: { inRecovery: true, streaming: true, systemId: '7001', timeline: 1, lsn: 50n } }),
+}));
 import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert, joinRecordFor } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 const { cancelReplicaSeed, getFleetReplicaStatus, provisionFleetReplica, reseedStalePrimary, reseedStandby, retryHeldSeedRecords } = fleetReplica;
 
 const REPLICA = {
@@ -123,6 +133,7 @@ const writeRegistry = (b1: Record<string, unknown> = {}): void => {
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: {},
+        fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
         ...b1,
       },
@@ -157,7 +168,7 @@ describe('B22-2a: a provision whose service start fails and whose record clear i
   const failed = async () => {
     h.apply = { success: false, error: 'fake apply failure' };
     h.refuseReplicaClear = true;
-    const started = provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const started = provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     expect(started.success).toBe(true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
   };
@@ -214,7 +225,7 @@ describe('B22-2a: a provision whose service start fails and whose record clear i
 describe('B22-2s: a seed whose first record write is refused frees what its caller claimed', () => {
   it('provision answers that the seed did not start and leaves the instance free', () => {
     h.refuseFirst = true;
-    const res = provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const res = provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/^The seed did not start: its record could not be saved \(ENOSPC/);
     expect(containerManager.isBotBusy('b1')).toBeNull();
@@ -224,7 +235,7 @@ describe('B22-2s: a seed whose first record write is refused frees what its call
   it('a stale-primary re-seed answers that the seed did not start and frees the backup slot', () => {
     writeRegistry({ status: 'stopped', fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' } });
     h.refuseFirst = true;
-    const res = reseedStalePrimary(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const res = reseedStalePrimary(bot(), codeFor(DSN), 'standby.invalid', 5440, true);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/^The seed did not start: its record could not be saved/);
     expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);

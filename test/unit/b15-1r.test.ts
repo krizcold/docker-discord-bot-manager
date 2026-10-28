@@ -116,10 +116,13 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import { reseedStalePrimary } from '../../src/instance/fleetReplica';
 import { createBotRoutes } from '../../src/webui/routes/bots';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const REGISTRY = path.join(h.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: PRIMARY_VOL };
-const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/app';
 
 const writeRegistry = (over: Record<string, unknown> = {}, others: Record<string, unknown> = {}): void => {
@@ -146,7 +149,7 @@ const settled = async () => {
   return bot();
 };
 const start = (opts: { dumpDone?: boolean; run?: number; confirmVolume?: string } = {}) =>
-  reseedStalePrimary(bot(), DSN, pem, 'standby.invalid', 5440, true, opts);
+  reseedStalePrimary(bot(), codeFor(DSN), 'standby.invalid', 5440, true, opts);
 
 const router = createBotRoutes({ clients: new Set() } as any);
 const call = async (routePath: string, req: any): Promise<{ status: number; body: any }> => {
@@ -241,7 +244,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
 
   it('the route passes confirmVolume from the body', async () => {
     h.volumes.set(REPLICA_VOL, 'exists');
-    const body = { primaryDsn: DSN, cert: pem, publicHost: 'standby.invalid', hostPort: 5440, confirm: true };
+    const body = { joinCode: codeFor(DSN), publicHost: 'standby.invalid', hostPort: 5440, confirm: true };
     const asked = await call('/:id/fleet-reseed', { params: { id: 'a' }, body });
     expect(asked.body).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
     const ran = await call('/:id/fleet-reseed', { params: { id: 'a' }, body: { ...body, confirmVolume: REPLICA_VOL } });

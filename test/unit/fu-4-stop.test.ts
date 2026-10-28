@@ -115,11 +115,14 @@ import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import { reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
-const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 
 beforeEach(() => {
   pg.events.length = 0;
@@ -166,7 +169,7 @@ describe('B14-2s: a stale-primary re-seed asks docker whether the instance runs'
     for (let i = 0; i < 300 && !containerManager.getBot('a')?.fleetDbReplicaSeed?.parked; i++) await new Promise(r => setTimeout(r, 10));
     return containerManager.getBot('a')!;
   };
-  const start = () => reseedStalePrimary(containerManager.getBot('a')!, 'postgresql://replicator:fakepass@primary.invalid:5433/app', pem, 'standby.invalid', 5440, true);
+  const start = () => reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
 
   it('stops before the dump and the retire when docker runs the instance its record says is stopped', async () => {
     pg.live.a = ['bot-a-app'];

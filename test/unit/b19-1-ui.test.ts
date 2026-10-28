@@ -36,11 +36,11 @@ const applyBound = async (answer: Record<string, unknown>): Promise<string[][]> 
 };
 
 describe('the WAL bound toast reports what its Enable changed', () => {
-  it('names a new certificate and the copy block standbys need', async () => {
+  it('names a new certificate and the join code every other machine needs', async () => {
     const [[kind, text]] = await applyBound({ success: true, restartRequired: true, certRotated: true });
     expect(kind).toBe('success');
     expect(text).toMatch(/WAL retention bound applied/);
-    expect(text).toMatch(/new server certificate was installed: existing standbys must be set up again with the new copy block/);
+    expect(text).toMatch(/new server certificate was installed: every other machine needs the new join code/);
   });
 
   it('says which addresses the database keeps admitting without TLS, claiming no live connection', async () => {

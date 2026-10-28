@@ -39,9 +39,12 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import { enableFleetReplication, disableFleetReplication } from '../../src/instance/fleetReplication';
 import { decommissionFleetDb, reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const botDir = path.join(tmp.dir, 'bots', 'b1');
-const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 
 beforeEach(() => {
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
@@ -68,7 +71,7 @@ describe('R13-J15: lanes in flight refused by the shutdown name the shutdown', (
     const results = [
       await enableFleetReplication(bot(), 'standby.invalid', 5433),
       await disableFleetReplication(bot()),
-      reseedStalePrimary(bot(), 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', pem, 'standby.invalid', 5440, true, { dumpDone: true }),
+      reseedStalePrimary(bot(), codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true }),
       await decommissionFleetDb('b1'),
     ];
     for (const r of results) {

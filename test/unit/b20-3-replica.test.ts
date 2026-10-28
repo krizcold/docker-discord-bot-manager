@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, describe, expect, it, vi, beforeEach } from 'vitest';
 
 const tmp = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -15,9 +15,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { fixtureCert } from './join-fake';
 
-const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
+beforeEach(() => { certSource.fetch = fixtureCert; });
+
 const FLEET_URL = 'https://example.invalid/fake/super-modular-discord-bot';
 
 const registryPath = path.join(tmp.dir, 'instances.json');
@@ -40,7 +42,7 @@ afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 describe('Provision on a node that hosts its own database', () => {
   it('a node with its own database is refused as the primary side', () => {
     writeRegistry({ fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'v' } });
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440);
     expect(res.error).toMatch(/hosts the fleet database itself/);
   });
 });

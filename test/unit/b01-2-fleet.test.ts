@@ -91,6 +91,10 @@ import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
 import * as envManager from '../../src/env/manager';
 import { cancelReplicaSeed, decommissionFleetDb, getFleetReplicaStatus, reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const botDir = path.join(tmp.dir, 'bots', 'b1');
 const composePath = path.join(botDir, 'docker-compose.yml');
@@ -145,8 +149,7 @@ describe('decommissioning the database', () => {
 describe('re-seeding a stale primary', () => {
   it('keeps the unedited-pins warning past a Dismiss of the parked seed', async () => {
     unwritableCompose();
-    const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-    const started = reseedStalePrimary(containerManager.getBot('b1')!, 'postgresql://replicator:fakepass@primary.invalid:5433/smdb', pem, 'standby.invalid', 5440, true, { dumpDone: true });
+    const started = reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true });
     expect(started).toMatchObject({ success: true });
     for (let i = 0; i < 200 && !containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked; i++) await new Promise((r) => setTimeout(r, 10));
     const parked = containerManager.getBot('b1')!;

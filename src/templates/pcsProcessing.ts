@@ -1500,7 +1500,7 @@ function dropDependency(services: Record<string, Record<string, unknown>>, servi
 export function addFleetPostgresReplicaService(
   composeContent: string,
   bot: BotConfig,
-  replica: { containerName: string; volume: string; hostPort: number; user?: string; db?: string },
+  replica: { containerName: string; volume: string; hostPort?: number; user?: string; db?: string },
   opts: { mode?: DeploymentMode } = {}
 ): string {
   let compose: Record<string, unknown>;
@@ -1522,7 +1522,7 @@ export function addFleetPostgresReplicaService(
     restart: 'unless-stopped',
     cpu_shares: 10,
     logging: cappedLogging(),
-    ports: [`${replica.hostPort}:5432`],
+    ...(replica.hostPort ? { ports: [`${replica.hostPort}:5432`] } : {}),
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {
       // A record stamped before the identity fields checks acceptance only

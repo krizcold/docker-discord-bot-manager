@@ -94,14 +94,16 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   getDeploymentMode: async () => 'docker',
 }));
 
-const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import { certSource } from '../../src/instance/fleetJoin';
+import { fixtureCert, joinRecordFor } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 const { cancelReplicaSeed, getFleetReplicaStatus, provisionFleetReplica, removeFleetReplica } = fleetReplica;
 const retryHeldSeedRecords = (): void => (fleetReplica as any).retryHeldSeedRecords?.();
 
@@ -112,6 +114,7 @@ const writeRegistry = (b1: Record<string, unknown> = {}): void => {
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: {},
+        fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
         ...b1,
       },
@@ -143,7 +146,7 @@ afterAll(() => {
 describe('R40-J3: a seed whose success clear is refused reads finished', () => {
   it('names the pending clear, frees the remove guard, and the minute retry clears it', async () => {
     h.refuseClear = true;
-    const started = provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const started = provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     expect(started.success).toBe(true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplica?.seededBy).toBe(bot().fleetDbReplicaSeed?.startedAt);
@@ -159,7 +162,7 @@ describe('R40-J3: a seed whose success clear is refused reads finished', () => {
 
   it('lets Dismiss clear the pending record', async () => {
     h.refuseClear = true;
-    provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     const startedAt = bot().fleetDbReplicaSeed!.startedAt;
     h.refuseClear = false;
@@ -173,7 +176,7 @@ describe('R39-J2: a seed whose park write is refused holds the park', () => {
   it('reads parked with the refused write named, and Dismiss works', async () => {
     h.probeOk = false;
     h.refusePark = true;
-    provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplicaSeed?.parked).toBeUndefined();
     const status = await getFleetReplicaStatus(bot());
@@ -188,7 +191,7 @@ describe('R39-J2: a seed whose park write is refused holds the park', () => {
 describe('R43-J1: a provision whose Apply mark is refused after the standby started names Restart', () => {
   it('settles the seed and says the app needs a restart', async () => {
     h.refuseMark = true;
-    provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplicaSeed).toBeUndefined();
     expect(bot().fleetDbReplica).toBeDefined();
@@ -201,7 +204,7 @@ describe('R43-J1: a provision whose Apply mark and success clear are both refuse
   it('shows the Restart note once the clear-pending note is dismissed', async () => {
     h.refuseMark = true;
     h.refuseClear = true;
-    provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     const startedAt = bot().fleetDbReplicaSeed!.startedAt;
     expect((await getFleetReplicaStatus(bot())).seedNote).toMatch(/its seed record could not be cleared/);
@@ -218,7 +221,7 @@ describe('R43-J1: a provision whose Apply mark and success clear are both refuse
 describe('R40-J3: other lanes read a seed held done as finished', () => {
   it('the self-update does not name a running seed', async () => {
     h.refuseClear = true;
-    provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplicaSeed).toBeDefined();
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();

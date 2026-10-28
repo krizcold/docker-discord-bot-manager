@@ -127,17 +127,7 @@ export function hasAppHooks(instance: InstanceConfig): boolean {
   return !!findAppCapabilities(instance.sourceUrl)?.hooks;
 }
 
-export interface AppFacts {
-  copyBlock: { dsn: string; cert: string; publishedAt: number } | null;
-  /** The app's own verdict that the block names the database this node follows; null when it holds none or cannot tell. */
-  copyBlockCurrent?: boolean | null;
-  /** The primary's last word on this node's standby slot, as the app recorded it (20.17); null when none. */
-  standbySlot: {
-    slotName: string; walStatus: string; active: boolean; retainedBytes: number | null;
-    observedAt: number; receivedAt: number; fromNodeId: string; fromTerm: number; sourceIsCurrentMaster: boolean | null;
-    sourceAt: number;
-  } | null;
-}
+export type AppFacts = Record<string, unknown>;
 
 export interface ActionResult {
   success: boolean;

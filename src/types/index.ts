@@ -91,9 +91,13 @@ export interface FleetDbReplicaRecord {
   slot: string;                        // slot name on the PRIMARY this standby consumes
   primaryHost: string;                 // primary endpoint (for display/diagnostics)
   primaryPort: number;
-  publicHost: string;                  // this machine's advertised host (post-promotion serving)
-  hostPort: number;                    // published host port (container 5432)
-  certHost: string;                    // host THIS standby's own server cert names
+  publicHost?: string;                 // this machine's address for other machines; absent when it opens no port
+  hostPort?: number;                   // published host port (container 5432); absent with publicHost
+  certHost: string;                    // host THIS standby's own server cert names (its container name without an address)
+  /** An operator cancelled or dismissed an automatic rebuild: none starts again until the next Re-seed or Provision. */
+  autoRebuildHeldAt?: string;
+  /** When the copy's last automatic safety dumps were taken (the newest 3): three within 24 hours hold the next rebuild until a Re-seed. */
+  rebuildDumps?: number[];
   /** The manager cleared this copy for a re-seed that has not finished: there is nothing to serve, protect or start. */
   copyCleared?: boolean;
   /** When this copy was last built whole. Absent on records stamped before 2026-09-09. */
@@ -113,8 +117,8 @@ export interface FleetReplicaSeedRecord {
   phase: FleetReplicaSeedPhase;
   startedAt: number;
   updatedAt: number;
-  publicHost: string;
-  hostPort: number;
+  publicHost?: string;
+  hostPort?: number;
   primaryHost: string;
   primaryPort: number;
   slot: string;
@@ -130,6 +134,37 @@ export interface FleetReplicaSeedRecord {
   safetyDump?: string;
   /** The database env pins a re-seed could not retire after it retired the stale database: Finish retire removes them. */
   pinsUnretired?: string[];
+  /** The copy's manager started this rebuild itself. */
+  auto?: boolean;
+  /** Why an automatic rebuild started: the main no longer kept the copy's place, or the copy was found cleared. */
+  rebuildCause?: 'slot' | 'cleared';
+}
+
+/** One row of the main's address list (smdb_manager.addresses). slot null is the main's own row. */
+export interface JoinAddress {
+  host: string;
+  port: number;
+  slot: string | null;
+  cert: string;
+  machine: string;
+}
+
+// The main this instance joined with a join code. The code itself is a record secret (encrypted at rest); the
+// decoded address fields stay readable for display when the key is lost.
+export interface FleetJoinRecord {
+  code: string;
+  host: string;
+  port: number;
+  db: string;
+  fp: string;
+  machine: string;
+  joinedAt: string;
+  /** The main's IDENTIFY_SYSTEM system id, read at the join. */
+  systemId?: string;
+  /** The other databases the main lists, from its last good read. */
+  addresses?: JoinAddress[];
+  addressesReadAt?: number;
+  addressesError?: string;
 }
 
 // Backups of each database the manager holds for the instance. Absent means the defaults (enabled, 04:00):
@@ -162,7 +197,7 @@ export interface FleetBackupTests {
 }
 
 export interface FleetBackupAlert {
-  kind: 'dumps' | 'test';
+  kind: 'dumps' | 'test' | 'held' | 'stopped' | 'rebuilt';
   text: string;
   since: number;
   dm: 'pending' | 'sent' | 'failed' | 'unknown' | 'unsupported';
@@ -209,6 +244,8 @@ export interface InstanceConfig {
   fleetBackupTests?: Partial<Record<BackupFamily, FleetBackupTests>>; // the daily test restore of each family
   fleetBackupAlerts?: Record<string, FleetBackupAlert>; // standing backup alerts by <family>:<dumps|test>
   fleetBackupStarts?: Partial<Record<BackupFamily, number>>; // when the scheduler first found each family to back up
+  fleetJoin?: FleetJoinRecord;         // the main this instance joined with a join code
+  fleetCopyAlerts?: Record<string, FleetBackupAlert>; // the owner's messages about this machine's copy, by held|stopped|rebuilt
 
   // Detection (for git source)
   botType?: BotType;

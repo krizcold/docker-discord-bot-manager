@@ -102,10 +102,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import { reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
-const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 
 beforeEach(() => {
   pg.events.length = 0;
@@ -123,7 +126,7 @@ const settled = async () => {
   for (let i = 0; i < 300 && !containerManager.getBot('a')?.fleetDbReplicaSeed?.parked; i++) await new Promise(r => setTimeout(r, 10));
   return containerManager.getBot('a')!;
 };
-const start = () => reseedStalePrimary(containerManager.getBot('a')!, 'postgresql://replicator:fakepass@primary.invalid:5433/app', pem, 'standby.invalid', 5440, true);
+const start = () => reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
 
 const stored = () => JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.a;
 

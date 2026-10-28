@@ -29,7 +29,7 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord } from '../types';
 import {
-  ALERT_AFTER_MS, backupDir, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
+  ALERT_AFTER_MS, backupDir, COPY_FILE_PREFIX, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
   ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
 } from './backupFiles';
 import * as backupCheck from './backupCheck';
@@ -38,6 +38,7 @@ import * as fleetReplica from './fleetReplica';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
 import { REPLICATION_ROLE } from './fleetReplication';
+import { splitBackendUrls } from '../config/joinCode';
 import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
 const TICK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -972,6 +973,19 @@ export async function runFleetDump(
   return { success: result.success, ...(result.file ? { file: result.file } : {}), ...(result.error !== undefined ? { error: result.error } : {}) };
 }
 
+/**
+ * The safety dump of this machine's live copy before a re-seed or an automatic rebuild deletes it: the copy family,
+ * its counts file, renamed and synced. Claims nothing; the caller holds the backup slot.
+ */
+export async function dumpCopyForRebuild(instance: InstanceConfig, prefix: string): Promise<{ success: true; file: string } | { success: false; error: string }> {
+  const rec = instance.fleetDbReplica;
+  if (!rec?.user || !rec.db) return { success: false, error: 'the standby record has no database identity, so the copy could not be dumped' };
+  const at = Date.now();
+  const result = await dumpDatabase(instance, { containerName: rec.containerName, user: rec.user, db: rec.db }, `${COPY_FILE_PREFIX}${prefix}${stampOf(at)}.dump`, 'copy', 'safety', at);
+  if (result.success && result.file) return { success: true, file: result.file };
+  return { success: false, error: scrubbed(instance.id, result.error || 'unknown error') };
+}
+
 const MIB = 1024 * 1024;
 
 /**
@@ -1504,8 +1518,11 @@ function restoreSharers(instance: InstanceConfig, url: string): InstanceConfig[]
   return containerManager.getAllBots().filter(b => {
     if (b.id === instance.id) return true;
     const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
-    const identity = key ? databaseIdentity((envManager.getEnvVars(b.id)[key] || '').trim()) : null;
-    return identity !== null && aliases.has(identity);
+    const entries = key ? splitBackendUrls(envManager.getEnvVars(b.id)[key]) : [];
+    return entries.some(entry => {
+      const identity = databaseIdentity(entry);
+      return identity !== null && aliases.has(identity);
+    });
   });
 }
 

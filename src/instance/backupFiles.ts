@@ -220,6 +220,15 @@ export function alertStep(prev: FleetBackupAlert | undefined, on: boolean, kind:
   return { next, send };
 }
 
+/** What a message's outcome reads as on the panel: T-40, T-41 or T-42; null while it waits for its first send. */
+export function dmOutcomeText(alert: Pick<FleetBackupAlert, 'dm' | 'dmError'>): string | null {
+  if (alert.dm === 'sent') return 'The owner was sent a Discord message.';
+  if (alert.dm === 'unknown') return "Whether the owner was messaged can't be confirmed: the bot took the message but did not answer in time.";
+  if (alert.dm === 'unsupported') return 'The owner could not be messaged: this app has no notify-owner hook.';
+  if (alert.dm === 'failed') return `The owner could not be messaged: ${alert.dmError || 'notify-owner failed'}.`;
+  return null;
+}
+
 /** A time as DMs and logs write it: YYYY-MM-DD HH:MM UTC. */
 export function utcText(at: number): string {
   return `${new Date(at).toISOString().slice(0, 16).replace('T', ' ')} UTC`;

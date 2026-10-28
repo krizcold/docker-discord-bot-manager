@@ -96,10 +96,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import { decommissionFleetDb, reseedStalePrimary } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { codeFor, fixtureCert } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volume: 'bot-a-pgdata' };
-const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 const RETIRING = '2026-10-20T00:00:00.000Z';
 
 const writeRegistry = (fleetDb: Record<string, unknown>) => {
@@ -160,7 +163,7 @@ describe('R18-J4: a stale-primary re-seed after a partial retire', () => {
     for (let i = 0; i < 300 && !containerManager.getBot('a')?.fleetDbReplicaSeed?.parked; i++) await new Promise(r => setTimeout(r, 10));
     return containerManager.getBot('a')!;
   };
-  const start = () => reseedStalePrimary(containerManager.getBot('a')!, 'postgresql://replicator:fakepass@primary.invalid:5433/app', pem, 'standby.invalid', 5440, true);
+  const start = () => reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
 
   it('marks the seed committed when the retire reports the volume gone', async () => {
     pg.retire = { success: false, volumeRemoved: true, error: 'the database volume bot-a-pgdata was removed, but its compose or record could not be updated: EIO' };

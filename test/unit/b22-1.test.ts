@@ -99,11 +99,21 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
 
 const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
 
+// The main and the copy a Re-seed reads before it starts: the same database, the main at or past the copy.
+vi.mock('../../src/instance/fleetJoin', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetJoin')>()),
+  mainProbe: async () => ({ ok: true, facts: { systemId: '7001', timeline: 1, lsn: 100n, inRecovery: false, slot: 'absent' } }),
+  readCopyFacts: async () => ({ ok: true, facts: { inRecovery: true, streaming: true, systemId: '7001', timeline: 1, lsn: 50n } }),
+}));
 import * as fs from 'fs';
 import * as path from 'path';
 import YAML from 'yaml';
 import * as containerManager from '../../src/docker/containerManager';
 import { cancelReplicaSeed, parkInterruptedReplicaSeeds, provisionFleetReplica, removeFleetReplica, reseedStandby } from '../../src/instance/fleetReplica';
+import { certSource } from '../../src/instance/fleetJoin';
+import { fixtureCert, joinRecordFor } from './join-fake';
+
+beforeEach(() => { certSource.fetch = fixtureCert; });
 
 const cancel = cancelReplicaSeed as unknown as (instance: any, expect?: Record<string, unknown>) => Promise<any>;
 
@@ -125,6 +135,7 @@ const writeRegistry = (b1: Record<string, unknown> = {}, others: Record<string, 
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: {},
+        fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
         ...b1,
       },
@@ -368,7 +379,6 @@ describe('T-FDBVOLw: a seed never clears a volume another instance declares', ()
     b2: { id: 'b2', sanitizedName: 'bot2', displayName: 'Bot 2', titleName: 'Bot 2', status: 'stopped', sourceType: 'git', sourceUrl: 'https://example.invalid/other', createdAt: 'x', updatedAt: 'x', ...extra },
   });
 
-  const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
   const refusedAtRequest = async (res: any, text: string): Promise<void> => {
     expect(res.success).toBe(false);
     expect(res.needsConfirm).toBeUndefined();
@@ -383,25 +393,25 @@ describe('T-FDBVOLw: a seed never clears a volume another instance declares', ()
   it('refuses at the request, naming the other instance, and leaves the volume alone', async () => {
     h.volume = 'exists';
     writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
-    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), 'Bot 2');
+    await refusedAtRequest(provisionFleetReplica(bot(), 'standby.invalid', 5440, true), 'Bot 2');
   });
 
   it("refuses at the request with can't confirm when another instance's compose cannot be read", async () => {
     h.volume = 'exists';
     writeRegistry({}, b2({}));
     fs.mkdirSync(path.join(h.dir, 'bots', 'b2', 'docker-compose.yml'), { recursive: true });
-    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), "can't confirm");
+    await refusedAtRequest(provisionFleetReplica(bot(), 'standby.invalid', 5440, true), "can't confirm");
   });
 
   it('a confirm naming the volume does not override the refusal', async () => {
     h.volume = 'exists';
     writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
-    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true, { confirmVolume: REPLICA.volume }), 'Bot 2');
+    await refusedAtRequest(provisionFleetReplica(bot(), 'standby.invalid', 5440, true, { confirmVolume: REPLICA.volume }), 'Bot 2');
   });
 
   it('refuses at the request even when the volume is absent', async () => {
     writeRegistry({}, b2({ projectVolumes: [REPLICA.volume] }));
-    await refusedAtRequest(provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true), 'Bot 2');
+    await refusedAtRequest(provisionFleetReplica(bot(), 'standby.invalid', 5440, true), 'Bot 2');
   });
 
   it('stops the running seed before the wipe when another instance comes to declare the volume', async () => {
@@ -411,7 +421,7 @@ describe('T-FDBVOLw: a seed never clears a volume another instance declares', ()
       Object.assign(reg.instances, b2({ projectVolumes: [REPLICA.volume] }));
       fs.writeFileSync(file, JSON.stringify(reg));
     };
-    const res = await provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const res = await provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     expect(res.success).toBe(true);
     await waitFor(() => bot().fleetDbReplicaSeed?.parked === true);
     expect(bot().fleetDbReplicaSeed?.lastError).toContain('Bot 2');

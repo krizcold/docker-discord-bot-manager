@@ -163,30 +163,3 @@ describe('FU-7c: the replay lag across two clocks', () => {
     expect((await fleetReplica.getFleetReplicaStatus(bot())).live!.replayLagSeconds).toBe(12.5);
   });
 });
-
-describe('FU-7c: a slot fact received in the future is not fresh', () => {
-  it('counts a fact from the future as not fresh', () => {
-    const now = Date.now();
-    expect(fleetReplica.slotFactFresh(now - 1000, now)).toBe(true);
-    expect(fleetReplica.slotFactFresh(now - 10 * 60_000, now)).toBe(false);
-    expect(fleetReplica.slotFactFresh(now + 60_000, now)).toBe(false);
-    expect(fleetReplica.slotFactFresh(Number.NaN, now)).toBe(false);
-    expect(fleetReplica.slotFactFresh(undefined, now)).toBe(false);
-  });
-});
-
-describe('FU-7c: the re-seed ignores a slot fact received in the future', () => {
-  const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-  const leftBehindFact = (receivedAt: number) => ({
-    running: true,
-    standbySlot: { slotName: REPLICA.slot, walStatus: 'reserved', observedAt: Date.now(), receivedAt, sourceAt: Date.now(), fromNodeId: 'n2', fromTerm: 2, sourceIsCurrentMaster: false },
-  });
-  it('the re-seed refuses a repoint on a future-dated former-master fact', async () => {
-    h.hooks = true;
-    h.probe = 't|streaming|f|1\n';
-    h.facts = { ...leftBehindFact(Date.now() + 60_000), copyBlockCurrent: true, copyBlock: { dsn: 'postgresql://replicator:fakepass@other.invalid:5433/smdb', cert: PEM } };
-    const res = await fleetReplica.reseedStandby(bot());
-    expect(res.success).toBe(false);
-    expect(res.error).toMatch(/does not report its source as a former master/);
-  });
-});

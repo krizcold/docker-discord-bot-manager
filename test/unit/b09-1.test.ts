@@ -43,37 +43,6 @@ describe('the restore request toast', () => {
   });
 });
 
-describe('copy buttons', () => {
-  const page = (writeText: (t: string) => Promise<void>) => {
-    const messages: string[][] = [];
-    const ctx = runPage(fns('copyToClipboard', 'copyFleetReplBlock', 'copyFleetReplCert'), {
-      navigator: { clipboard: { writeText } },
-      document: { getElementById: () => ({ value: 'secret-dsn' }) },
-      showMessage: (t: string, m: string) => messages.push([t, m]),
-      setTimeout: () => {},
-    });
-    return { ctx, messages };
-  };
-  for (const fn of ['copyFleetReplBlock', 'copyFleetReplCert']) {
-    it(`${fn} says Copied only when the browser copied`, async () => {
-      const { ctx, messages } = page(() => Promise.reject(new Error('denied')));
-      const btn = { textContent: 'Copy' };
-      await ctx[fn](btn);
-      await new Promise((r) => setImmediate(r));
-      expect(btn.textContent).toBe('Copy');
-      expect(messages[0]?.[0]).toBe('error');
-    });
-    it(`${fn} says Copied after a copy`, async () => {
-      const copied: string[] = [];
-      const { ctx } = page(async (t) => { copied.push(t); });
-      const btn = { textContent: 'Copy' };
-      await ctx[fn](btn);
-      expect(copied).toEqual(['secret-dsn']);
-      expect(btn.textContent).toBe('Copied');
-    });
-  }
-});
-
 describe('instance auto-update controls', () => {
   const run = async (fn: string, args: unknown[], answer: any) => {
     let reloads = 0;

@@ -20,6 +20,9 @@ import * as sourceManager from '../../source/sourceManager';
 import * as fleetBackup from '../../instance/fleetBackup';
 import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
+import * as fleetJoin from '../../instance/fleetJoin';
+import * as fleetCopyWatch from '../../instance/fleetCopyWatch';
+import { isBackendUrlList } from '../../config/joinCode';
 import * as maintenance from '../../instance/maintenance';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
@@ -1261,6 +1264,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const target = url.trim();
+      if (isBackendUrlList(target)) {
+        res.json({ success: true, ok: false, notTested: true, error: 'This value is a list of database addresses the manager writes from a join code; check them in the Database window.' });
+        return;
+      }
 
       const network = sharedNetworkName(await getDeploymentMode());
       const result = await probeDatabaseUrl(target, network);
@@ -1709,11 +1716,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
-  /**
-   * GET /api/bots/:id/fleet-replication - Replication posture + live probe.
-   * include=block adds the replica copy block (DSN + pinned cert; behind
-   * manager auth by design, like the env editor).
-   */
+  /** GET /api/bots/:id/fleet-replication - Replication posture + live probe. */
   router.get('/:id/fleet-replication', async (req: Request, res: Response) => {
     try {
       const bot = containerManager.getBot(req.params.id);
@@ -1722,12 +1725,45 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       const status = await fleetReplication.getFleetReplicationStatus(bot);
-      if (status.enabled && req.query.include === 'block') {
-        const block = await fleetReplication.getReplicaCopyBlock(bot);
-        res.json({ success: true, replication: status, block: block.success ? { dsn: block.dsn, cert: block.cert } : null, blockError: block.success ? null : block.error });
+      res.json({ success: true, replication: status });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/fleet-replication/join-code - The join code other machines paste (it holds passwords; behind
+   * manager auth by design, like the env editor).
+   */
+  router.get('/:id/fleet-replication/join-code', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, replication: status });
+      res.json(await fleetReplication.getJoinCode(bot));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-join - Join the main a join code names ({ joinCode }). */
+  router.post('/:id/fleet-join', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const { joinCode } = (req.body ?? {}) as { joinCode?: unknown };
+      if (typeof joinCode !== 'string' || !joinCode.trim()) {
+        res.status(400).json({ success: false, error: 'joinCode is required' });
+        return;
+      }
+      const result = await fleetJoin.joinFleet(bot, joinCode);
+      if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
+      res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1792,16 +1828,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, replica: await fleetReplica.getFleetReplicaStatus(bot), copyBackup: fleetBackup.fleetBackupStatus(bot).copy });
+      res.json({
+        success: true,
+        replica: await fleetReplica.getFleetReplicaStatus(bot),
+        copyBackup: fleetBackup.fleetBackupStatus(bot).copy,
+        join: fleetCopyWatch.joinView(bot),
+        rebuild: fleetCopyWatch.rebuildView(bot),
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
   });
 
   /**
-   * POST /api/bots/:id/fleet-replica - Provision a standby from a primary's
-   * copy block ({primaryDsn, cert, publicHost, hostPort?}). Async: poll the
-   * GET for the phase.
+   * POST /api/bots/:id/fleet-replica - Provision a live copy from the joined main
+   * ({joinCode?, publicHost?, hostPort?}); a joinCode joins first. A blank
+   * publicHost makes a copy without an address. Async: poll the GET for the phase.
    */
   router.post('/:id/fleet-replica', async (req: Request, res: Response) => {
     try {
@@ -1810,12 +1852,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort, confirm, confirmVolume } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
-      if (!primaryDsn || !cert || !publicHost) {
-        res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
-        return;
+      const { joinCode, publicHost, hostPort, confirm, confirmVolume } = (req.body ?? {}) as { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
+      let joined: string | undefined;
+      if (typeof joinCode === 'string' && joinCode.trim()) {
+        const join = await fleetJoin.joinFleet(bot, joinCode);
+        if (!join.success) {
+          res.json(join);
+          return;
+        }
+        joined = join.message;
       }
-      res.json(fleetReplica.provisionFleetReplica(bot, primaryDsn, cert, publicHost, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
+      const fresh = containerManager.getBot(req.params.id) ?? bot;
+      const result = fleetReplica.provisionFleetReplica(fresh, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined });
+      res.json(joined ? { ...result, joinMessage: joined } : result);
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1845,8 +1894,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /**
    * POST /api/bots/:id/fleet-reseed - Heal a stale primary by making it a
-   * standby of the machine that now serves the fleet ({primaryDsn, cert,
-   * publicHost, hostPort?}). Destructive: the local database is dumped once
+   * standby of the machine that now serves the fleet ({joinCode,
+   * publicHost?, hostPort?}). Destructive: the local database is dumped once
    * and then deleted. Async: poll GET /fleet-replica for the phase.
    */
   router.post('/:id/fleet-reseed', async (req: Request, res: Response) => {
@@ -1856,12 +1905,12 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { primaryDsn, cert, publicHost, hostPort, confirm, confirmVolume } = req.body as { primaryDsn?: string; cert?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
-      if (!primaryDsn || !cert || !publicHost) {
-        res.status(400).json({ success: false, error: 'primaryDsn, cert and publicHost are required' });
+      const { joinCode, publicHost, hostPort, confirm, confirmVolume } = (req.body ?? {}) as { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
+      if (typeof joinCode !== 'string' || !joinCode.trim()) {
+        res.status(400).json({ success: false, error: 'joinCode is required' });
         return;
       }
-      res.json(fleetReplica.reseedStalePrimary(bot, primaryDsn, cert, publicHost, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
+      res.json(fleetReplica.reseedStalePrimary(bot, joinCode, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1883,7 +1932,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const result = await fleetReplica.removeFleetReplica(bot, { confirmPromoted: (req.body as { confirmPromoted?: boolean } | undefined)?.confirmPromoted === true });
       if (result.success) {
         broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-        res.json({ success: true, warning: `The primary keeps replication slot ${slot}, which retains WAL until it is dropped there: its Database modal lists the slot with a Drop action once nothing streams on it` });
+        res.json({ success: true, warning: `The primary keeps replication slot ${slot}, which retains WAL until it is dropped there: its Database modal lists the slot with a Drop action once nothing streams on it${result.warning ?? ''}` });
         return;
       }
       res.json(result);
@@ -1937,8 +1986,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/fleet-replica/reseed - Re-seed this standby; refuses
-   * when the bot reports no usable copy block. Async: poll GET /fleet-replica for the phase.
+   * POST /api/bots/:id/fleet-replica/reseed - Re-seed this standby from the main
+   * in the stored join code ({joinCode?, confirm?}); a joinCode joins first.
+   * Async: poll GET /fleet-replica for the phase.
    */
   router.post('/:id/fleet-replica/reseed', async (req: Request, res: Response) => {
     try {
@@ -1947,7 +1997,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const result = await fleetReplica.reseedStandby(bot);
+      const { joinCode, confirm } = (req.body ?? {}) as { joinCode?: string; confirm?: boolean };
+      if (typeof joinCode === 'string' && joinCode.trim()) {
+        const join = await fleetJoin.joinFleet(bot, joinCode);
+        if (!join.success) {
+          res.json(join);
+          return;
+        }
+      }
+      const result = await fleetReplica.reseedStandby(containerManager.getBot(req.params.id) ?? bot, { confirm: confirm === true });
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
       res.json(result);
     } catch (error) {

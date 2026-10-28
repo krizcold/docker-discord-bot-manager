@@ -15,6 +15,7 @@ vi.mock('../../src/instance/fleetBackup', () => ({
   startFleetBackupScheduler: () => {}, stopFleetBackupScheduler: () => {}, waitForInFlightLanes: () => new Promise(() => {}),
 }));
 vi.mock('../../src/instance/fleetReplica', () => ({ parkInterruptedReplicaSeeds: async () => {} }));
+vi.mock('../../src/instance/fleetCopyWatch', () => ({ startFleetCopyWatch: () => {}, stopFleetCopyWatch: () => {} }));
 vi.mock('../../src/instance/maintenance', () => ({
   startMaintenanceReconciler: () => { h.started++; },
   stopMaintenanceReconciler: () => { h.stopped++; },

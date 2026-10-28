@@ -104,9 +104,11 @@ import * as envManager from '../../src/env/manager';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import { createBotRoutes } from '../../src/webui/routes/bots';
 import { dispatch } from '../../src/cli/commands';
+import { certSource } from '../../src/instance/fleetJoin';
+import { fixtureCert, joinRecordFor } from './join-fake';
 
-const PEM = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-const DSN = 'postgresql://replicator:fakepass@primary.invalid:5433/smdb';
+beforeEach(() => { certSource.fetch = fixtureCert; });
+
 const DB = 'bot1-fleet-postgres-data';
 const REPLICA_VOL = 'bot1-fleet-postgres-replica-data';
 const FLEET_URL = 'https://example.invalid/fake/super-modular-discord-bot';
@@ -290,12 +292,12 @@ describe('minting a fleet database password', () => {
 });
 
 describe('provisioning a standby over a kept volume', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {} };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb') };
 
   it('asks, naming the volume, and clears nothing', async () => {
     writeRegistry(worker);
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440);
     expect(res).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
     expect(res.error).toMatch(/bot1-fleet-postgres-replica-data already exists/);
     await new Promise((r) => setTimeout(r, 30));
@@ -306,7 +308,7 @@ describe('provisioning a standby over a kept volume', () => {
   it('a confirm for a different question does not clear it', async () => {
     writeRegistry(worker);
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, true);
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
     expect(res).toMatchObject({ success: false, needsConfirm: true });
     expect(wiped()).toBe(false);
   });
@@ -314,14 +316,14 @@ describe('provisioning a standby over a kept volume', () => {
   it('names what Remove replica recorded about the volume', () => {
     writeRegistry({ ...worker, fleetDbReplicaKept: { volume: REPLICA_VOL, removedAt: '2026-10-20T00:00:00.000Z', held: 'promoted' } });
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440);
     expect(res.error).toMatch(/Remove replica left it on 2026-10-20.*promoted/);
   });
 
   it('refuses when docker does not say whether the volume exists', () => {
     writeRegistry(worker);
     h.volumes.set(REPLICA_VOL, 'unknown');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, false, { confirmVolume: REPLICA_VOL });
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440, false, { confirmVolume: REPLICA_VOL });
     expect(res.success).toBe(false);
     expect(res.needsConfirm).toBeUndefined();
     expect(res.error).toMatch(/can't confirm/);
@@ -330,7 +332,7 @@ describe('provisioning a standby over a kept volume', () => {
   it('clears it once the confirm names the volume', async () => {
     writeRegistry(worker);
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440, false, { confirmVolume: REPLICA_VOL });
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440, false, { confirmVolume: REPLICA_VOL });
     expect(res).toMatchObject({ success: true });
     await waitFor(() => !bot().fleetDbReplicaSeed);
     expect(wiped()).toBe(true);
@@ -339,7 +341,7 @@ describe('provisioning a standby over a kept volume', () => {
 
   it('the run refuses a volume that appeared after the request was checked', async () => {
     writeRegistry(worker);
-    const res = fleetReplica.provisionFleetReplica(bot(), DSN, PEM, 'standby.invalid', 5440);
+    const res = fleetReplica.provisionFleetReplica(bot(), 'standby.invalid', 5440);
     expect(res).toMatchObject({ success: true });
     h.volumes.set(REPLICA_VOL, 'exists');
     await waitFor(() => bot().fleetDbReplicaSeed?.parked === true);
@@ -349,7 +351,7 @@ describe('provisioning a standby over a kept volume', () => {
 });
 
 describe('Remove replica', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {} };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb') };
 
   it('asks before removing a copy that was promoted, and records what it held', async () => {
     writeRegistry({ ...worker, fleetDbReplica: REPLICA });
@@ -459,7 +461,7 @@ describe('database dumps after the record is removed', () => {
 });
 
 describe('a keep-data Remove of an instance whose copy was promoted', () => {
-  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, fleetDbReplica: REPLICA };
+  const worker = { sourceType: 'git', sourceUrl: FLEET_URL, envVars: {}, fleetJoin: joinRecordFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), fleetDbReplica: REPLICA };
 
   it('asks before removing over a promoted copy, and goes on once confirmed', async () => {
     writeRegistry(worker);

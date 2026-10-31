@@ -33,7 +33,7 @@ import { addressTableSql, REPLICATION_ROLE } from './fleetReplication';
 import { parseAddressRows, readCopyCert } from './fleetJoin';
 import {
   copiesInsertSql, cutAddressesSql, GEN_READ_SQL, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow,
-  raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql,
+  raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
 } from './switchSql';
 import { splitBackendUrls } from '../config/joinCode';
 import * as maintenance from './maintenance';
@@ -1002,6 +1002,8 @@ function syncPath(target: string, flags: 'r' | 'r+'): void {
 type DumpTarget = { containerName: string; user: string; db: string };
 type DumpResult = { success: boolean; file?: string; error?: string; meta?: DumpMeta; conflict?: boolean };
 
+const PRE_RESTORE_PREFIX = 'pre-restore-';
+
 /**
  * One pg_dump of the instance's sidecar into a safety dump named `prefix` and the time (pre-restore-, pre-reseed-,
  * pre-decommission-), with its counts file. Fails when the container is not running.
@@ -1532,7 +1534,10 @@ function sweepUnfinished(): void {
   }
 }
 
-type RestoreSteps = { stopped: string[]; preRestoreDump: string | null; restored: boolean; claimFloor: number | null; guildsRaised: string[] | null; claimRaisedTo: number | null; botState: 'maintenance' | 'off' | null; restarted: string[]; generation: number | null };
+type RestoreSteps = {
+  stopped: string[]; preRestoreDump: string | null; restored: boolean; claimFloor: number | null; guildsRaised: string[] | null; claimRaisedTo: number | null;
+  shardClaimsRaised: number | null; shardClaimsExpired: number | null; botState: 'maintenance' | 'off' | null; restarted: string[]; generation: number | null;
+};
 
 const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
 
@@ -1644,46 +1649,82 @@ function restoreLiftNotice(start: string, lift: FenceLift, held: FenceHeld, volu
   return `${start}, but ${restoreLiftClause(lift, held, volume, restored)}${tail}`;
 }
 
-/** Whether the bot's database has contract 8's claim sequence, the guild ownership table, and that table's claim column. */
-export type ClaimTables = { seq: boolean; table: boolean; claim: boolean };
+/** Whether the bot's database has contract 8's claim sequence, the guild ownership table and its claim column, and NB4's shard claims and claim clock. */
+export type ClaimTables = { seq: boolean; table: boolean; claim: boolean; shards: boolean; clock: boolean };
 
-const CLAIM_TABLES_SQL = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped)";
+const CLAIM_TABLES_SQL = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped), to_regclass('smdb_data.shard_claims') IS NOT NULL, to_regclass('smdb_data.claim_clock') IS NOT NULL";
 
-/** Exactly `<seq>|<table>|<claim column>`, each t or f; anything else is null. */
+/** Exactly `<seq>|<table>|<claim column>|<shard claims>|<claim clock>`, each t or f; anything else is null. */
 export function parseClaimTables(stdout: string): ClaimTables | null {
-  const m = /^([tf])\|([tf])\|([tf])$/.exec(stdout.replace(/\n$/, ''));
-  return m ? { seq: m[1] === 't', table: m[2] === 't', claim: m[3] === 't' } : null;
+  const m = /^([tf])\|([tf])\|([tf])\|([tf])\|([tf])$/.exec(stdout.replace(/\n$/, ''));
+  return m ? { seq: m[1] === 't', table: m[2] === 't', claim: m[3] === 't', shards: m[4] === 't', clock: m[5] === 't' } : null;
 }
 
-/** The statement that reads the highest claim number the database handed out; old for the term schema, none when neither source exists. */
+/** The statement that reads the highest claim number the database handed out, of the sequence, the guilds and the shard claims; old for the term schema, none when no source exists. */
 export function claimFloorSql(t: ClaimTables): { sql: string } | { old: true } | { none: true } {
   if (t.table && !t.claim) return { old: true };
-  if (!t.seq && !t.table) return { none: true };
+  if (!t.seq && !t.table && !t.shards) return { none: true };
   const sources = [
     ...(t.seq ? ['(SELECT last_value FROM smdb_data.claim_seq)'] : []),
     ...(t.table ? ['(SELECT max(claim) FROM smdb_data.guild_ownership)'] : []),
+    ...(t.shards ? ['(SELECT max(claim) FROM smdb_data.shard_claims)'] : []),
   ];
   return { sql: `SELECT coalesce(GREATEST(${sources.join(', ')}), -1)` };
 }
 
 /**
- * One statement, so the rows and the sequence move together or not at all: every restored claim at or below the floor
- * goes to floor+1 and the sequence to at least floor+1, never back. It answers `seq|<value>` and one `guild|<id>` per row raised.
+ * One statement, so the guild rows, the shard claims and the sequence move together or not at all: guild claims at or
+ * below the floor go to floor+1, each shard claim at or below it gets its own number above it, every shard claim
+ * expires at the restored claim clock (no write without its row), and the sequence goes above every claim, never back.
  */
 export function claimRaiseSql(floor: number, t: ClaimTables): string | { error: string } {
   if (!t.seq) return { error: 'the restored database has no smdb_data.claim_seq' };
   if (t.table && !t.claim) return { error: 'the restored smdb_data.guild_ownership has no claim column' };
+  if (t.shards && !t.clock) return { error: 'the restored database has smdb_data.shard_claims but no smdb_data.claim_clock' };
   const next = floor + 1;
   if (!Number.isSafeInteger(floor) || !Number.isSafeInteger(next)) return { error: `the claim floor ${floor} has no next whole number` };
-  const seq = `setval('smdb_data.claim_seq', GREATEST(last_value, ${next}))`;
-  if (!t.table) return `SELECT 'seq|' || ${seq} FROM smdb_data.claim_seq`;
-  return `WITH u AS (UPDATE smdb_data.guild_ownership SET claim = ${next}, updated_at = now() WHERE claim <= ${floor} RETURNING guild_id), s AS (SELECT ${seq} AS v FROM smdb_data.claim_seq) SELECT 'seq|' || v FROM s UNION ALL SELECT 'guild|' || guild_id FROM u`;
+  if (!t.shards) {
+    const seq = `setval('smdb_data.claim_seq', GREATEST(last_value, ${next}))`;
+    if (!t.table) return `SELECT 'seq|' || ${seq} FROM smdb_data.claim_seq`;
+    return `WITH u AS (UPDATE smdb_data.guild_ownership SET claim = ${next}, updated_at = now() WHERE claim <= ${floor} RETURNING guild_id), s AS (SELECT ${seq} AS v FROM smdb_data.claim_seq) SELECT 'seq|' || v FROM s UNION ALL SELECT 'guild|' || guild_id FROM u`;
+  }
+  const u = t.table ? `, u AS (UPDATE smdb_data.guild_ownership SET claim = ${next}, updated_at = now() WHERE claim <= ${floor} AND EXISTS (SELECT 1 FROM k) RETURNING guild_id)` : '';
+  const guildMax = t.table ? ', (SELECT coalesce(max(claim), 0) FROM smdb_data.guild_ownership)' : '';
+  const guildLines = t.table ? " UNION ALL SELECT 'guild|' || guild_id FROM u" : '';
+  return `WITH k AS (SELECT up_ms FROM smdb_data.claim_clock WHERE id = 1), r AS (SELECT shard_count, shard_id, ${floor} + row_number() OVER (ORDER BY shard_count, shard_id) AS n FROM smdb_data.shard_claims WHERE claim <= ${floor}), c AS (UPDATE smdb_data.shard_claims AS t SET claim = coalesce((SELECT r.n FROM r WHERE r.shard_count = t.shard_count AND r.shard_id = t.shard_id), t.claim), ${SHARD_CAP_SET} FROM k RETURNING t.shard_count, t.shard_id, t.claim)${u}, s AS (SELECT setval('smdb_data.claim_seq', GREATEST(q.last_value, ${next}, (SELECT coalesce(max(claim), 0) FROM c)${guildMax})) AS v FROM smdb_data.claim_seq AS q, k) SELECT 'seq|' || v FROM s UNION ALL SELECT 'clock|' || up_ms FROM k UNION ALL SELECT 'below|' || count(*) FROM r UNION ALL SELECT 'rows|' || count(*) FROM smdb_data.shard_claims UNION ALL SELECT 'capped|' || count(*) FROM c UNION ALL SELECT 'shard|' || c.shard_count || '|' || c.shard_id || '|' || c.claim FROM c JOIN r USING (shard_count, shard_id)${guildLines}`;
 }
 
-/** The raise's answer: exactly one sequence value above the floor, every other line a raised guild. */
-export function parseClaimRaise(stdout: string, floor: number): { ok: true; seq: number; guilds: string[] } | { ok: false; error: string } {
+const COUNT_PREFIXES = ['below', 'rows', 'capped'] as const;
+
+/** A count line's prefix and value, or null when the line is no count line. */
+function countLine(line: string, prefixes: readonly string[]): { prefix: string; value: number } | null {
+  const m = /^([a-z]+)\|(\d+)$/.exec(line);
+  if (!m || !prefixes.includes(m[1]) || !Number.isSafeInteger(Number(m[2]))) return null;
+  return { prefix: m[1], value: Number(m[2]) };
+}
+
+/** The checks the raise and the cap share: one clock value, and each count once. */
+function clockAndCounts(clocks: number[], counts: Map<string, number[]>, prefixes: readonly string[], who: 'raise' | 'cap', noClock: string): { ok: true; clock: number; count: (p: string) => number } | { ok: false; error: string } {
+  if (clocks.length > 1) return { ok: false, error: `the ${who} answered two clock values` };
+  if (clocks.length === 0) return { ok: false, error: noClock };
+  for (const p of prefixes) {
+    const seen = counts.get(p) ?? [];
+    if (seen.length === 0) return { ok: false, error: `the ${who} answered no '${p}' count` };
+    if (seen.length > 1) return { ok: false, error: `the ${who} answered two '${p}' counts` };
+  }
+  return { ok: true, clock: clocks[0], count: (p: string) => counts.get(p)![0] };
+}
+
+/**
+ * The raise's answer: exactly one sequence value above the floor and the raised guilds; with the shard claims also the
+ * restored clock, the counts, and each renumbered shard claim, which must be floor+1 to floor+m once each.
+ */
+export function parseClaimRaise(stdout: string, floor: number, shards = false): { ok: true; seq: number; guilds: string[]; shards?: { raised: number; expired: number; clock: number } } | { ok: false; error: string } {
   let seq: number | null = null;
   const guilds: string[] = [];
+  const clocks: number[] = [];
+  const counts = new Map<string, number[]>();
+  const claims: number[] = [];
   for (const line of stdout.split('\n').map(l => l.trim()).filter(Boolean)) {
     if (line.startsWith('seq|')) {
       if (seq !== null) return { ok: false, error: 'the raise answered two sequence values' };
@@ -1692,18 +1733,70 @@ export function parseClaimRaise(stdout: string, floor: number): { ok: true; seq:
       seq = Number(value);
     } else if (line.startsWith('guild|') && line.length > 'guild|'.length) {
       guilds.push(line.slice('guild|'.length));
+    } else if (shards && countLine(line, ['clock', ...COUNT_PREFIXES])) {
+      const c = countLine(line, ['clock', ...COUNT_PREFIXES])!;
+      if (c.prefix === 'clock') clocks.push(c.value);
+      else counts.set(c.prefix, [...(counts.get(c.prefix) ?? []), c.value]);
+    } else if (shards && /^shard\|\d+\|\d+\|\d+$/.test(line) && line.split('|').slice(1).every(n => Number.isSafeInteger(Number(n)))) {
+      claims.push(Number(line.split('|')[3]));
     } else {
       return { ok: false, error: `the raise answered '${line}'` };
     }
   }
+  if (!shards) {
+    if (seq === null) return { ok: false, error: 'the raise answered no sequence value' };
+    if (seq < floor + 1) return { ok: false, error: `the sequence answered ${seq}, which is not above ${floor}` };
+    return { ok: true, seq, guilds };
+  }
+  const checked = clockAndCounts(clocks, counts, COUNT_PREFIXES, 'raise', 'the restored smdb_data.claim_clock has no row, so no claim number was raised');
+  if (!checked.ok) return checked;
   if (seq === null) return { ok: false, error: 'the raise answered no sequence value' };
-  if (seq < floor + 1) return { ok: false, error: `the sequence answered ${seq}, which is not above ${floor}` };
-  return { ok: true, seq, guilds };
+  const m = checked.count('below');
+  if (claims.length !== m) return { ok: false, error: `the raise answered ${claims.length} raised shard claim(s) for ${m} at or below ${floor}` };
+  const seen = new Set<number>();
+  for (const c of claims) {
+    if (c < floor + 1 || c > floor + m || seen.has(c)) return { ok: false, error: `the raise answered shard claim ${c}, which is not one of ${floor + 1} to ${floor + m} once` };
+    seen.add(c);
+  }
+  const rows = checked.count('rows');
+  const capped = checked.count('capped');
+  if (capped !== rows) return { ok: false, error: `the raise expired ${capped} of ${rows} restored shard claims` };
+  if (m === 0 && seq < floor + 1) return { ok: false, error: `the sequence answered ${seq}, which is not above ${floor}` };
+  if (seq < floor + m) return { ok: false, error: `the sequence answered ${seq}, which is below the highest raised shard claim ${floor + m}` };
+  return { ok: true, seq, guilds, shards: { raised: m, expired: capped, clock: checked.clock } };
 }
 
-/** What a dump's `pg_restore -l` lists: the claim sequence, the term schema's ownership table without it, or neither; null when it is no table of contents. */
+/** The cap with no floor: every restored shard claim expires at the restored claim clock; no write without its row. */
+export function claimCapSql(): string {
+  return `WITH k AS (SELECT up_ms FROM smdb_data.claim_clock WHERE id = 1), c AS (UPDATE smdb_data.shard_claims AS t SET ${SHARD_CAP_SET} FROM k RETURNING t.shard_count) SELECT 'clock|' || up_ms FROM k UNION ALL SELECT 'rows|' || count(*) FROM smdb_data.shard_claims UNION ALL SELECT 'capped|' || count(*) FROM c`;
+}
+
+/** The cap's answer: one restored clock value, and as many capped claims as restored rows. */
+export function parseClaimCap(stdout: string): { ok: true; expired: number; clock: number } | { ok: false; error: string } {
+  const clocks: number[] = [];
+  const counts = new Map<string, number[]>();
+  for (const line of stdout.split('\n').map(l => l.trim()).filter(Boolean)) {
+    const c = countLine(line, ['clock', 'rows', 'capped']);
+    if (!c) return { ok: false, error: `the cap answered '${line}'` };
+    if (c.prefix === 'clock') clocks.push(c.value);
+    else counts.set(c.prefix, [...(counts.get(c.prefix) ?? []), c.value]);
+  }
+  const checked = clockAndCounts(clocks, counts, ['rows', 'capped'], 'cap', 'the restored smdb_data.claim_clock has no row, so no shard claim was expired');
+  if (!checked.ok) return checked;
+  const rows = checked.count('rows');
+  const capped = checked.count('capped');
+  if (capped !== rows) return { ok: false, error: `the cap expired ${capped} of ${rows} restored shard claims` };
+  return { ok: true, expired: capped, clock: checked.clock };
+}
+
+/** Whether a dump's `pg_restore -l` lists NB4's shard claims table and its claim clock table (a TABLE DATA line alone counts for neither). */
+export function dumpShardTables(toc: string): { shards: boolean; clock: boolean } {
+  return { shards: /^\d+; \d+ \d+ TABLE smdb_data shard_claims /m.test(toc), clock: /^\d+; \d+ \d+ TABLE smdb_data claim_clock /m.test(toc) };
+}
+
+/** What a dump's `pg_restore -l` lists: the claim sequence, the term schema's ownership table without it, or neither (also for the header alone that a database with no objects lists); null when it is no table of contents. */
 export function dumpClaimShape(toc: string): 'claims' | 'terms' | 'none' | null {
-  if (!/^\d+; /m.test(toc)) return null;
+  if (!/^\d+; /m.test(toc)) return /^; Selected TOC Entries:\r?$/m.test(toc) && /^;\s+TOC Entries: [1-9]\d*\r?$/m.test(toc) ? 'none' : null;
   if (/^\d+; \d+ \d+ SEQUENCE smdb_data claim_seq /m.test(toc)) return 'claims';
   if (/^\d+; \d+ \d+ TABLE smdb_data guild_ownership /m.test(toc)) return 'terms';
   return 'none';
@@ -1720,10 +1813,11 @@ async function readClaimTables(fleetDb: RestoreFleetDb): Promise<{ ok: true; tab
 }
 
 /**
- * The highest claim number the live database handed out (the sequence's last value or the highest guild claim): every
- * process of the bot holds a claim at or below it. Shape old for the term schema; claim null when neither exists.
+ * The highest claim number the live database handed out (the sequence's last value, the highest guild or shard claim):
+ * every process of the bot holds a claim at or below it. Shape shards when the shard claims exist, old for the term
+ * schema; claim null when no source exists.
  */
-export async function probeClaims(fleetDb: RestoreFleetDb): Promise<{ ok: true; shape: 'claims' | 'old' | 'none'; claim: number | null } | { ok: false; error: string }> {
+export async function probeClaims(fleetDb: RestoreFleetDb): Promise<{ ok: true; shape: 'claims' | 'shards' | 'old' | 'none'; claim: number | null } | { ok: false; error: string }> {
   const read = await readClaimTables(fleetDb);
   if (!read.ok) return read;
   const plan = claimFloorSql(read.tables);
@@ -1734,21 +1828,33 @@ export async function probeClaims(fleetDb: RestoreFleetDb): Promise<{ ok: true; 
   const out = probe.stdout.trim();
   const claim = /^-?\d+$/.test(out) ? Number(out) : NaN;
   if (!Number.isSafeInteger(claim)) return { ok: false, error: `the claim probe answered '${out}'` };
-  return { ok: true, shape: 'claims', claim: claim < 0 ? null : claim };
+  return { ok: true, shape: read.tables.shards ? 'shards' : 'claims', claim: claim < 0 ? null : claim };
 }
 
 /**
- * Raises every restored claim and the claim sequence above the floor in the fence-exempt session, so no process that
- * took its claim before the restore (claim at most floor) can save over a restored row (contract 8). The guilds raised.
+ * Raises every restored claim at or below the floor and the claim sequence above it, and expires every restored shard
+ * claim, in the fence-exempt session, so no process that took its claim before the restore (claim at most floor) can
+ * renew a restored claim or save over a restored row (contract 8). The guilds raised, and the shard counts.
  */
-export async function raiseClaims(fleetDb: RestoreFleetDb, floor: number): Promise<{ ok: true; seq: number; guilds: string[] } | { ok: false; error: string }> {
+export async function raiseClaims(fleetDb: RestoreFleetDb, floor: number): Promise<{ ok: true; seq: number; guilds: string[]; shards?: { raised: number; expired: number; clock: number } } | { ok: false; error: string }> {
   const read = await readClaimTables(fleetDb);
   if (!read.ok) return read;
   const sql = claimRaiseSql(floor, read.tables);
   if (typeof sql !== 'string') return { ok: false, error: sql.error };
   const raise = await managerExec(fleetDb, claimPsql(fleetDb, sql, true));
   if (!raise.ok) return { ok: false, error: lastLine(raise.stderr) };
-  return parseClaimRaise(raise.stdout, floor);
+  return parseClaimRaise(raise.stdout, floor, read.tables.shards);
+}
+
+/** Expires every restored shard claim when there is no floor, in the fence-exempt session; expired null when the restored database has no shard claims; unread when the restored tables could not be read. */
+export async function capClaims(fleetDb: RestoreFleetDb): Promise<{ ok: true; expired: number | null; clock: number | null } | { ok: false; error: string; unread?: true }> {
+  const read = await readClaimTables(fleetDb);
+  if (!read.ok) return { ok: false, error: read.error, unread: true };
+  if (!read.tables.shards) return { ok: true, expired: null, clock: null };
+  if (!read.tables.clock) return { ok: false, error: 'the restored database has smdb_data.shard_claims but no smdb_data.claim_clock' };
+  const cap = await managerExec(fleetDb, claimPsql(fleetDb, claimCapSql(), true));
+  if (!cap.ok) return { ok: false, error: lastLine(cap.stderr) };
+  return parseClaimCap(cap.stdout);
 }
 
 export const tocTiming = { inContainerSec: 60, backstopMs: 90_000 };
@@ -1842,7 +1948,7 @@ const RESTORE_OP = 'restore';
  * (pg_restore --clean cannot restore this schema: the partition PK drops it emits are refused as inherited
  * constraints and the run exits 1 even when everything applied; a fresh database makes any restore error a real
  * failure); pg_restore --exit-on-error of the chosen file with the restoring session exempted; every restored claim
- * and the claim sequence raised above the kept number; fence lifted; the notice cleared only when the lift ended
+ * and the claim sequence raised above the kept number, and every restored shard claim expired; fence lifted; the notice cleared only when the lift ended
  * lifted; the other stopped instances started. The bot keeps its state and its process; it loads the restored data
  * when the operator chooses Running. A failure past the drop keeps the fence on and the instances stopped. docker's
  * stderr can quote the database URL, so the answer passes the secret filter, as do the notices and logs built from
@@ -1864,7 +1970,8 @@ type RestoreResult = { success: boolean; error?: string; warning?: string; steps
 
 async function runFleetRestore(botId: string, file: string): Promise<RestoreResult> {
   const steps: RestoreSteps = {
-    stopped: [], preRestoreDump: null, restored: false, claimFloor: null, guildsRaised: null, claimRaisedTo: null, botState: null, restarted: [], generation: null,
+    stopped: [], preRestoreDump: null, restored: false, claimFloor: null, guildsRaised: null, claimRaisedTo: null, shardClaimsRaised: null, shardClaimsExpired: null,
+    botState: null, restarted: [], generation: null,
   };
 
   if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL, steps };
@@ -2073,6 +2180,11 @@ async function restoreLocked(
       return await refuseBeforeFence(`The dump ${file} was taken before the bot numbered its saves by claim, so the restore was refused`,
         'it has smdb_data.guild_ownership but no smdb_data.claim_seq, and the bot does not run on that schema');
     }
+    const shards = dumpShardTables(toc.toc);
+    if (shards.shards && !shards.clock) {
+      return await refuseBeforeFence(`The dump ${file} has shard claims but no claim clock, so the restore was refused`,
+        'it has smdb_data.shard_claims but no smdb_data.claim_clock, and the bot creates both together');
+    }
 
     // 3. Courtesy stop of every sharing instance docker shows running: the
     // status record can be stale either way (a crashed bot, a hand-started one).
@@ -2171,11 +2283,14 @@ async function restoreLocked(
     // kept on disk before the drop (a retry after a failed restore probes a
     // missing or partial database), and raised over in the restored copy, so
     // a process that took its claim before the restore cannot save over it.
-    let floor: number | null = floorRead.claim;
+    const pushBroken = containerManager.getBot(botId)?.fleetDb?.pushBroken;
+    // D21: an unfinished push's own pre-receive- dump without claim numbers is this database before any claim was drawn.
+    const receiveUndo = shape === 'none' && pushBroken?.safetyDump === file;
+    let floor: number | null = receiveUndo ? null : floorRead.claim;
     let liveGen: GenRow | null = null;
     let ownCopies: JoinAddress[] = [];
     if (exists.stdout.trim() !== '0') {
-      const safety = await runFleetDump(instance, 'pre-restore-');
+      const safety = await runFleetDump(instance, PRE_RESTORE_PREFIX);
       if (!safety.success) {
         const why = scrubbed(botId, safety.error || 'unknown reason');
         lastErrors.set(familyKey(botId, 'main'), `Pre-restore dump failed: ${why}`);
@@ -2183,12 +2298,19 @@ async function restoreLocked(
       }
       steps.preRestoreDump = safety.file || null;
 
-      const live = await probeClaims(fleetDb);
-      if (!live.ok) return await refuse('Could not read the claim numbers before the restore, so the restore was refused', scrubbed(botId, live.error));
-      if (live.shape === 'old') {
-        return await refuse("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused", 'smdb_data.guild_ownership has no claim column');
+      if (!receiveUndo) {
+        const live = await probeClaims(fleetDb);
+        if (!live.ok) return await refuse('Could not read the claim numbers before the restore, so the restore was refused', scrubbed(botId, live.error));
+        if (live.shape === 'old') {
+          return await refuse("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused", 'smdb_data.guild_ownership has no claim column');
+        }
+        // D16, D20: under an unfinished push the live schema is the pushing machine's, and a pre-restore dump is a restore's own undo.
+        if (live.shape === 'shards' && shape === 'claims' && !shards.shards && !pushBroken && !file.startsWith(PRE_RESTORE_PREFIX)) {
+          return await refuse(`The dump ${file} has no shard claims, but the database has them, so the restore was refused`,
+            'the database has smdb_data.shard_claims and the dump does not, and a bot that keeps its shard claims in the database does not start on data without them; a pre-restore dump is never refused for this, so a restore can be undone with the one it took');
+        }
+        if (live.claim !== null && (floor === null || live.claim > floor)) floor = live.claim;
       }
-      if (live.claim !== null && (floor === null || live.claim > floor)) floor = live.claim;
 
       const gen = await managerRead(fleetDb, claimPsql(fleetDb, GEN_READ_SQL, false));
       const row = gen.ok ? parseGenRow(gen.stdout) : missingTable(gen.stderr) ? null : undefined;
@@ -2323,7 +2445,8 @@ async function restoreLocked(
     }
     steps.restored = true;
 
-    // 10. Every restored claim and the sequence go above the floor, in one statement.
+    // 10. Every restored claim and the sequence go above the floor and every restored shard claim expires, in one
+    // statement; with no floor the shard claims still expire.
     if (floor !== null) {
       const raised = await raiseClaims(fleetDb, floor);
       if (!raised.ok) {
@@ -2334,7 +2457,30 @@ async function restoreLocked(
       steps.claimFloor = floor;
       steps.guildsRaised = raised.guilds;
       steps.claimRaisedTo = floor + 1;
-      console.log(`[FleetBackup] Raised the claim numbers on ${fleetDb.containerName} above ${floor}: ${raised.guilds.length} guild(s) to ${floor + 1}, claim_seq to ${raised.seq}`);
+      if (raised.shards) {
+        const { raised: m, expired, clock } = raised.shards;
+        steps.shardClaimsRaised = m;
+        steps.shardClaimsExpired = expired;
+        const renumbered = m === 0 ? `no shard claim at or below ${floor}` : `${m} shard claim(s) to ${floor + 1} to ${floor + m}`;
+        console.log(`[FleetBackup] Raised the claim numbers on ${fleetDb.containerName} above ${floor}: ${raised.guilds.length} guild(s) to ${floor + 1}, ${renumbered}, ${expired} shard claim(s) expired at the restored claim clock ${clock}, claim_seq to ${raised.seq}`);
+      } else {
+        console.log(`[FleetBackup] Raised the claim numbers on ${fleetDb.containerName} above ${floor}: ${raised.guilds.length} guild(s) to ${floor + 1}, claim_seq to ${raised.seq}`);
+      }
+    } else {
+      const capped = await capClaims(fleetDb);
+      if (!capped.ok) {
+        const reason = scrubbed(botId, capped.unread
+          ? `whether the restored database holds shard claims could not be read (${capped.error})`
+          : `the restored shard claims could not be expired (${capped.error})`);
+        setRestoreError(botId, file, reason, capped.unread
+          ? `The manager can't confirm that no restored shard claim is left live, so the write fence stays on (${back})`
+          : `A process named in a restored shard claim could keep that shard, so the write fence stays on (${back})`);
+        return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
+      }
+      if (capped.expired !== null) {
+        steps.shardClaimsExpired = capped.expired;
+        console.log(`[FleetBackup] Expired ${capped.expired} restored shard claim(s) on ${fleetDb.containerName} at the restored claim clock ${capped.clock}; no claim number was raised (none was used before)`);
+      }
     }
 
     // The generation: raised above both the row before the drop and the restored row.

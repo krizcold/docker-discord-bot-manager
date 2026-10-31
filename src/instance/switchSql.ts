@@ -56,6 +56,17 @@ ${extra}SELECT generation || '|' || machine || '|' || ${SINCE} FROM smdb_manager
 COMMIT;`;
 }
 
+/** The expiry cap of NB4's shard claims: a claim expires at the claim clock it was restored or pushed with. */
+export const SHARD_CAP_SET = 'expires_up_ms = LEAST(t.expires_up_ms, k.up_ms)';
+
+/** The cap on every shard claim when the shard claims and the claim clock exist; nothing without them or the clock row. */
+export const SHARD_CAP_DO_SQL = `DO $$ BEGIN
+IF to_regclass('smdb_data.shard_claims') IS NOT NULL AND to_regclass('smdb_data.claim_clock') IS NOT NULL THEN
+  EXECUTE 'UPDATE smdb_data.shard_claims AS t SET ${SHARD_CAP_SET} FROM smdb_data.claim_clock AS k WHERE k.id = 1';
+END IF;
+END $$;
+`;
+
 /** The take-over block (D35): a pg_hba line of its own that refuses the bot role over TCP on the copy. */
 export const TAKEOVER_BLOCK_MARK = '# smdb-takeover-block';
 export const TAKEOVER_ROLE_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;

@@ -8,21 +8,23 @@ type Cb = (err: Error | null, stdout: string, stderr: string) => void;
 type ExecFileFake = (cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => unknown;
 type SpawnFake = (cmd: string, args: string[], opts?: any) => any;
 
-export type TocShape = 'claims' | 'terms' | 'none';
+export type TocShape = 'claims' | 'terms' | 'none' | 'empty' | 'emptyNeg' | 'shards' | 'shardsNoClock' | 'clockOnly';
 
 export interface ClaimDb {
   /** readBotLogin's answer: recovery|canlogin|sessions. */
   login: string;
-  /** The claim tables probe before the drop: claim_seq|guild_ownership|claim column. */
+  /** The claim tables probe before the drop: claim_seq|guild_ownership|claim column|shard_claims|claim_clock. */
   tables: string;
   /** The claim floor probe's answer. */
   floor: string;
   /** The raise statement's answer. */
   raise: string;
-  /** The claim tables probe after the drop. */
+  /** The claim tables probe after the drop, in the same five fields. */
   restoredTables: string;
+  /** The no-floor cap statement's answer. */
+  cap: string;
   toc: TocShape;
-  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear';
+  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'cap' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear';
   /** The receive mark removals (D62, S23), each its argv joined. */
   markClears: string[];
   /** OWN_COPIES_READ_SQL's answer before the drop of a moved- restore (D49). */
@@ -44,19 +46,22 @@ export interface ClaimDb {
   /** The argv of step 7's recreate (the call that holds the replication role ensure, D59). */
   recreateArgs: string[] | null;
   raiseSql: string[];
+  capSql: string[];
   tocReads: number;
   tocInput: number;
   loginReads: number;
   onRaise: (() => void) | null;
   onToc: (() => void) | null;
+  /** Called when the recreate drops the database, after dropSeen is set. */
+  onDrop: (() => void) | null;
 }
 
 export interface GenFake { generation: number; machine: string; since: string | null }
 
 export function freshClaimDb(): ClaimDb {
   return {
-    login: 'false|false|0', tables: 't|t|t', floor: '7', raise: 'seq|8\nguild|g1\nguild|g2\n', restoredTables: 't|t|t', toc: 'claims',
-    fail: null, failText: null, tocCode: 1, dropSeen: false, recreateArgs: null, raiseSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null,
+    login: 'false|false|0', tables: 't|t|t|f|f', floor: '7', raise: 'seq|8\nguild|g1\nguild|g2\n', restoredTables: 't|t|t|f|f', cap: 'clock|1000\nrows|2\ncapped|2\n', toc: 'claims',
+    fail: null, failText: null, tocCode: 1, dropSeen: false, recreateArgs: null, raiseSql: [], capSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null, onDrop: null,
     generation: null, restoredGeneration: null, restoreState: null, genWrites: [], genEvents: [], ownCopies: '[]', markClears: [],
   };
 }
@@ -76,11 +81,20 @@ export const OFF = { maintenance: { state: 'off', message: '', orderedAt: '2026-
 
 const HEAD = ';\n; Archive created at 2026-10-28 10:00:00 UTC\n;     dbname: app\n;     TOC Entries: 12\n;     Compression: gzip\n;     Dump Version: 1.15-0\n;     Format: CUSTOM\n;     Integer: 4 bytes\n;     Offset: 8 bytes\n;     Dumped from database version: 16.4\n;     Dumped by pg_dump version: 16.4\n;\n;\n; Selected TOC Entries:\n;\n';
 
-/** pg_restore -l of PostgreSQL 16 for a dump on contract 8's schema, on the term schema, and with neither table. */
+/** pg_restore -l of PostgreSQL 16 for a dump on contract 8's schema, on the term schema, with neither table, with the
+ * shard claims and the claim clock, with the shard claims alone, and with the claim clock alone; empty is the header
+ * alone, as for a database with no objects. */
+const TOC_CLAIMS = `${HEAD}5; 2615 16385 SCHEMA - smdb_data app\n216; 1259 16386 TABLE smdb_data guild_ownership app\n217; 1259 16392 SEQUENCE smdb_data claim_seq app\n215; 1259 16400 TABLE smdb_data meta app\n3360; 0 16386 TABLE DATA smdb_data guild_ownership app\n3361; 0 16400 TABLE DATA smdb_data meta app\n3367; 0 0 SEQUENCE SET smdb_data claim_seq app\n3200; 2606 16391 CONSTRAINT smdb_data guild_ownership guild_ownership_pkey app\n`;
+
 export const TOC: Record<TocShape, string> = {
-  claims: `${HEAD}5; 2615 16385 SCHEMA - smdb_data app\n216; 1259 16386 TABLE smdb_data guild_ownership app\n217; 1259 16392 SEQUENCE smdb_data claim_seq app\n215; 1259 16400 TABLE smdb_data meta app\n3360; 0 16386 TABLE DATA smdb_data guild_ownership app\n3361; 0 16400 TABLE DATA smdb_data meta app\n3367; 0 0 SEQUENCE SET smdb_data claim_seq app\n3200; 2606 16391 CONSTRAINT smdb_data guild_ownership guild_ownership_pkey app\n`,
+  claims: TOC_CLAIMS,
   terms: `${HEAD}5; 2615 16385 SCHEMA - smdb_data app\n216; 1259 16386 TABLE smdb_data guild_ownership app\n215; 1259 16400 TABLE smdb_data meta app\n3360; 0 16386 TABLE DATA smdb_data guild_ownership app\n3361; 0 16400 TABLE DATA smdb_data meta app\n3200; 2606 16391 CONSTRAINT smdb_data guild_ownership guild_ownership_pkey app\n`,
   none: `${HEAD}5; 2615 16385 SCHEMA - public app\n215; 1259 16400 TABLE public t app\n3361; 0 16400 TABLE DATA public t app\n`,
+  empty: HEAD,
+  emptyNeg: HEAD.replace('TOC Entries: 12', 'TOC Entries: -3'),
+  shards: `${TOC_CLAIMS}218; 1259 16410 TABLE smdb_data shard_claims app\n219; 1259 16420 TABLE smdb_data claim_clock app\n3362; 0 16410 TABLE DATA smdb_data shard_claims app\n3363; 0 16420 TABLE DATA smdb_data claim_clock app\n`,
+  shardsNoClock: `${TOC_CLAIMS}218; 1259 16410 TABLE smdb_data shard_claims app\n3362; 0 16410 TABLE DATA smdb_data shard_claims app\n`,
+  clockOnly: `${TOC_CLAIMS}219; 1259 16420 TABLE smdb_data claim_clock app\n3363; 0 16420 TABLE DATA smdb_data claim_clock app\n`,
 };
 
 export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
@@ -93,7 +107,7 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         claimDb.recreateArgs = [...args];
         if (claimDb.fail === 'ensure') return fail('permission denied to create role');
       }
-      if (sql.includes('DROP DATABASE')) claimDb.dropSeen = true;
+      if (sql.includes('DROP DATABASE')) { claimDb.dropSeen = true; claimDb.onDrop?.(); }
       if (sql.includes('rolcanlogin')) claimDb.loginReads++;
       if (sql.includes('rolcanlogin')) return claimDb.fail === 'login' ? fail('connection to server on socket failed') : cb(null, `${claimDb.login}\n`, '');
       if (sql.includes("to_regclass('smdb_data.claim_seq')")) {
@@ -138,6 +152,11 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         claimDb.genWrites.push(sql);
         if (claimDb.fail === 'genwrite') return fail('cannot execute INSERT in a read-only transaction');
         return cb(null, '', '');
+      }
+      if (sql.includes('SET expires_up_ms = LEAST(') && !sql.includes('setval(')) {
+        claimDb.onRaise?.();
+        claimDb.capSql.push(sql);
+        return claimDb.fail === 'cap' ? fail('permission denied for table shard_claims') : cb(null, claimDb.cap, '');
       }
       if (sql.includes("setval('smdb_data.claim_seq'")) {
         claimDb.onRaise?.();

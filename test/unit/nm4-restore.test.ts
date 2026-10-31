@@ -386,11 +386,11 @@ const ROWS: Row[] = [
     check: r => { afterFenceRefusal(r); expect(r.error).toBe('Could not read the claim numbers before the restore, so the restore was refused, and nothing was changed: ERROR:  connection reset by peer'); },
   },
   {
-    id: 'C31 live schema on terms', setup: () => { claimDb.tables = 't|t|f'; },
+    id: 'C31 live schema on terms', setup: () => { claimDb.tables = 't|t|f|f|f'; },
     check: r => { afterFenceRefusal(r); expect(r.error).toBe("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused, and nothing was changed: smdb_data.guild_ownership has no claim column"); },
   },
   {
-    id: 'C32 neither table nor sequence, file floor', setup: () => { claimDb.tables = 'f|f|f'; fs.writeFileSync(FLOOR, '{"claim":4}'); claimDb.raise = 'seq|5\n'; },
+    id: 'C32 neither table nor sequence, file floor', setup: () => { claimDb.tables = 'f|f|f|f|f'; fs.writeFileSync(FLOOR, '{"claim":4}'); claimDb.raise = 'seq|5\n'; },
     check: r => { expect(r.success).toBe(true); expect(r.steps.claimFloor).toBe(4); expect(r.steps.claimRaisedTo).toBe(5); expect(pg.sql.some(s => s.includes('SELECT coalesce(GREATEST('))).toBe(false); },
   },
   {
@@ -408,7 +408,7 @@ const ROWS: Row[] = [
     check: r => { afterFenceRefusal(r); expect(r.error).toBe('The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'); },
   },
   {
-    id: 'C35 dump without claims, no floor', setup: () => { claimDb.toc = 'none'; claimDb.tables = 'f|f|f'; },
+    id: 'C35 dump without claims, no floor', setup: () => { claimDb.toc = 'none'; claimDb.tables = 'f|f|f|f|f'; },
     check: r => { expect(r.success).toBe(true); expect(pg.events).not.toContain('raise'); expect(r.steps.claimFloor).toBeNull(); expect(r.steps.guildsRaised).toBeNull(); },
   },
   {
@@ -457,12 +457,12 @@ const ROWS: Row[] = [
     },
   },
   {
-    id: 'C42 F null', setup: () => { claimDb.tables = 'f|f|f'; },
+    id: 'C42 F null', setup: () => { claimDb.tables = 'f|f|f|f|f'; },
     check: r => { expect(r.success).toBe(true); expect(r.steps.claimFloor).toBeNull(); expect(r.steps.guildsRaised).toBeNull(); expect(r.steps.claimRaisedTo).toBeNull(); expect(claimDb.raiseSql).toEqual([]); },
   },
   { id: 'C43 restored probe fails', setup: () => { claimDb.fail = 'restored'; }, check: r => { keptFenced(r); expect(r.error).toMatch(/^The dump was restored, but the restored claim numbers could not be raised above 7 \(/); } },
-  { id: 'C43 restored without claim_seq', setup: () => { claimDb.restoredTables = 'f|t|t'; }, check: r => { keptFenced(r); expect(r.error).toMatch(/^The dump was restored, but the restored claim numbers could not be raised above 7 \(the restored database has no smdb_data\.claim_seq\)/); } },
-  { id: 'C43 restored without claim column', setup: () => { claimDb.restoredTables = 't|t|f'; }, check: r => { keptFenced(r); expect(r.error).toMatch(/\(the restored smdb_data\.guild_ownership has no claim column\)/); } },
+  { id: 'C43 restored without claim_seq', setup: () => { claimDb.restoredTables = 'f|t|t|f|f'; }, check: r => { keptFenced(r); expect(r.error).toMatch(/^The dump was restored, but the restored claim numbers could not be raised above 7 \(the restored database has no smdb_data\.claim_seq\)/); } },
+  { id: 'C43 restored without claim column', setup: () => { claimDb.restoredTables = 't|t|f|f|f'; }, check: r => { keptFenced(r); expect(r.error).toMatch(/\(the restored smdb_data\.guild_ownership has no claim column\)/); } },
   {
     id: 'C44 raise fails', setup: () => { claimDb.fail = 'raise'; },
     check: r => {

@@ -174,7 +174,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
   it('raiseClaims reads the tables and writes the claim numbers as dbm_admin', async () => {
     h.answer = args => {
       const sql = args.join(' ');
-      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t|f|f\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|4\n';
       return '';
     };
@@ -217,7 +217,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
       if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
       if (sql.includes('rolcanlogin')) return 'false|false|0\n';
-      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t|f|f\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
       if (sql.includes('FROM smdb_manager.generation') || sql.includes('INSERT INTO smdb_manager.restore_state')) return '0||\n';

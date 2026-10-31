@@ -225,14 +225,14 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
   it('probeClaims and raiseClaims run psql with the exact argv', async () => {
     h.answer = args => {
       const sql = args.join(' ');
-      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t|f|f\n';
       if (sql.includes('GREATEST((SELECT last_value')) return '7\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|4\nguild|g1\n';
       return '';
     };
     expect(await raw(() => fleetBackup.probeClaims(fleetDb))).toEqual({ ok: true, shape: 'claims', claim: 7 });
     const head = ['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
-    const tables = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped)";
+    const tables = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped), to_regclass('smdb_data.shard_claims') IS NOT NULL, to_regclass('smdb_data.claim_clock') IS NOT NULL";
     expect(h.calls).toEqual([
       [...head, tables],
       [...head, 'SELECT coalesce(GREATEST((SELECT last_value FROM smdb_data.claim_seq), (SELECT max(claim) FROM smdb_data.guild_ownership)), -1)'],
@@ -241,7 +241,7 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     expect(await raw(() => fleetBackup.raiseClaims(fleetDb, 3))).toEqual({ ok: true, seq: 4, guilds: ['g1'] });
     const ex = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C, 'psql', '-U', 'dbm_admin', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
     expect(h.calls[0]).toEqual([...head, tables]);
-    expect(h.calls[1]).toEqual([...ex, fleetBackup.claimRaiseSql(3, { seq: true, table: true, claim: true }) as string]);
+    expect(h.calls[1]).toEqual([...ex, fleetBackup.claimRaiseSql(3, { seq: true, table: true, claim: true, shards: false, clock: false }) as string]);
   });
 
   it('applyWriteFence runs psql, the TCP probe and the left-session count with the exact argv', async () => {
@@ -309,7 +309,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
       if (sql.includes('SHOW default_transaction_read_only')) return 'off\n';
       if (sql.includes('FROM pg_database WHERE datname')) return '1\n';
       if (sql.includes('rolcanlogin')) return 'false|false|0\n';
-      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
+      if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t|f|f\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
       if (sql.includes('FROM smdb_manager.generation') || sql.includes('INSERT INTO smdb_manager.restore_state')) return '0||\n';
@@ -342,7 +342,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', replicationRoleEnsureSql('replicator'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`]);
     expect(restores()).toEqual([pgRestoreArgv]);
     expect(callWith('pg_restore').filter(a => a.includes('-l'))).toEqual([['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l']]);
-    expect(h.calls).toContainEqual([...ex, ...psql(`sm'"db`), '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true }) as string]);
+    expect(h.calls).toContainEqual([...ex, ...psql(`sm'"db`), '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true, shards: false, clock: false }) as string]);
     expect(roleChecks()).toBe(0);
   });
 

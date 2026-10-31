@@ -17,7 +17,7 @@ vi.mock('child_process', async (importOriginal) => {
   const execFile = (_f: string, args: string[], opts: any, cb?: any) => {
     const done = typeof opts === 'function' ? opts : cb;
     const sql = args[args.length - 1];
-    const out = sql.startsWith('SELECT to_regclass') ? 't|t|t\n' : h.claimOut;
+    const out = sql.startsWith('SELECT to_regclass') ? 't|t|t|f|f\n' : h.claimOut;
     setImmediate(() => done(null, out, ''));
     return { stdin: null };
   };

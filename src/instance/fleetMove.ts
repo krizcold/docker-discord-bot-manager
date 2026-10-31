@@ -21,7 +21,7 @@ import {
 import { decodeJoinCode, decodeMoveCode, encodeJoinCode, encodeMoveCode, MoveCode, sqlLiteral } from '../config/joinCode';
 import {
   copiesInsertSql, DB_OID_SQL, GEN_READ_SQL, machineNameOf, markIdOf, missingTable, OWN_COPIES_READ_SQL, parseGenRow, pushBrokenOf, raiseSql, RECEIVE_DROP_SQL,
-  RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, replicationRoleEnsureSql,
+  RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, replicationRoleEnsureSql, SHARD_CAP_DO_SQL,
 } from './switchSql';
 import {
   adminSql, LaneOutcome, mainAdmission, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
@@ -482,7 +482,7 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
     const commit = `SET ROLE ${MANAGER_DB_ROLE};\n${raiseSql(code.machine, target, `${addressTableSql(code.host, code.port, cert.pem, code.machine, null)}
 DELETE FROM smdb_manager.addresses WHERE NOT (host = ${sqlLiteral(code.host)} AND port = ${Number(code.port)});
 INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES (${sqlLiteral(code.recv.id)}, ${sqlLiteral(systemId)}, ${sqlLiteral(machineNameOf(inst))}, ${target}) ON CONFLICT (push_id) DO NOTHING;
-`)}`;
+${SHARD_CAP_DO_SQL}`)}`;
     const committed = await receiverClient(inst, code, cert.pem, 'commit', 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', [recvDsn(code, code.db), commit], MOVE_TIMING.clientMs);
     if (!committed.ok) return fail(`The data reached ${machine} and matched, but ${machine} could not be made the main (${committed.error || lastLine(committed.stderr)}). Press Push again.`);
   } else {

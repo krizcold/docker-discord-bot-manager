@@ -219,7 +219,7 @@ describe('R6-J14 and R39-J3: the restore keeps the claim floor or refuses', () =
   });
 
   it('a database without the claim tables restores with no raise', async () => {
-    claimDb.tables = 'f|f|f';
+    claimDb.tables = 'f|f|f|f|f';
     const r = await restore();
     expect(r.success).toBe(true);
     expect(r.steps.guildsRaised).toBeNull();

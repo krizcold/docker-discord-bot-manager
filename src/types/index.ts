@@ -164,6 +164,8 @@ export interface FleetDbTakeover {
   planned: boolean;
   generation: number;
   inherit?: { file: string; at: string };
+  /** Confirmed over an unchecked receive mark, so the raise expires the copy's shard claims (D18). */
+  unchecked?: boolean;
 }
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).

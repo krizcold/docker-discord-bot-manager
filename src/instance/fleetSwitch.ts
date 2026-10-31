@@ -24,7 +24,7 @@ import { DM_RETRY_MS, utcText } from './backupFiles';
 import {
   COPIES_READ_SQL, COPIES_SYNC_SQL, DB_OID_SQL, ensureGenerationSql, FORMER_LISTED_SQL, GEN_READ_SQL, GENERATION_SCHEMA_SQL, GenRow, generationBefore, HANDOVER_READ_SQL, machineNameOf, missingTable, moveModeText,
   parseGenRow, parseReceiveMark, parseRestoreState, raiseSql, RECEIVE_MARK_READ_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkVerdict, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, RestoreState, TAKEOVER_ROLE_RE,
-  takeoverBlockScript, takeoverLiftScript,
+  SHARD_CAP_DO_SQL, takeoverBlockScript, takeoverLiftScript,
 } from './switchSql';
 import { FleetDbConflict, FleetDbFormerMain, FleetDbHandover, FleetDbReplaced, FleetDbReplicaRecord, FleetDbSwitchNotice, InstanceConfig, MaintenanceHeld, MaintenanceRecord, OwnerDm } from '../types';
 
@@ -954,7 +954,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
   const planned = verdict.mode === 'planned' || (verdict.mode === 'resume' && intent?.planned === true);
   if (verdict.mode !== 'resume') {
     try {
-      containerManager.updateInstanceFleetDbReplicaTakeover(botId, { startedAt: new Date().toISOString(), planned, generation: verdict.target, ...(verdict.inherit ? { inherit: verdict.inherit } : {}) });
+      containerManager.updateInstanceFleetDbReplicaTakeover(botId, { startedAt: new Date().toISOString(), planned, generation: verdict.target, ...(verdict.inherit ? { inherit: verdict.inherit } : {}), ...(unchecked ? { unchecked: true } : {}) });
     } catch (err) {
       return refusal(`The take-over could not be recorded (${errText(err)})${NOTHING}`);
     }
@@ -990,7 +990,9 @@ IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
 END IF;
 END $$;
 `;
-  const raised = await adminSql(t, rec.db, raiseSql(machineNameOf(inst), verdict.target, oldRow));
+  // D18, D19: over an unchecked mark the rows hold the pushing machine's live claims; a resume caps as the press that saved its intent did.
+  const capShards = unchecked || (verdict.mode === 'resume' && intent?.unchecked === true);
+  const raised = await adminSql(t, rec.db, raiseSql(machineNameOf(inst), verdict.target, `${oldRow}${capShards ? SHARD_CAP_DO_SQL : ''}`));
   if (!raised.ok) return refusal(`The copy is promoted, but its generation could not be raised (${failText(raised)}), so bots may not choose it over the old main. Press Take over again to finish.`);
   const lifted = await liftBotBlock(t, rec.db);
   if (lifted) return refusal(`This machine's database is the main now (generation ${verdict.target}), but the bot's login to it is still blocked (${lifted}): the line the take-over put in its pg_hba.conf could not be removed. Press Take over again to finish.`);

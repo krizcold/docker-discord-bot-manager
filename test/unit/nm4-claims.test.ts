@@ -27,7 +27,7 @@ const K1 = TRIPLES.flatMap(([seq, table, claim]) => FLOORS.map(floor => ({ seq, 
 
 describe('K1 the floor and raise statements per table shape', () => {
   it.each(K1)('claimFloorSql seq=$seq table=$table claim=$claim floor=$floor', ({ seq, table, claim }) => {
-    const out = fb.claimFloorSql({ seq, table, claim });
+    const out = fb.claimFloorSql({ seq, table, claim, shards: false, clock: false });
     if (table && !claim) return expect(out).toEqual({ old: true });
     if (!seq && !table) return expect(out).toEqual({ none: true });
     const sources = [
@@ -38,7 +38,7 @@ describe('K1 the floor and raise statements per table shape', () => {
   });
 
   it.each(K1)('claimRaiseSql seq=$seq table=$table claim=$claim floor=$floor', ({ seq, table, claim, floor }) => {
-    const out = fb.claimRaiseSql(floor, { seq, table, claim });
+    const out = fb.claimRaiseSql(floor, { seq, table, claim, shards: false, clock: false });
     if (!seq) return expect(out).toEqual({ error: 'the restored database has no smdb_data.claim_seq' });
     if (table && !claim) return expect(out).toEqual({ error: 'the restored smdb_data.guild_ownership has no claim column' });
     const next = floor + 1;
@@ -49,15 +49,15 @@ describe('K1 the floor and raise statements per table shape', () => {
   });
 
   it('a floor whose next number is not a safe integer is an error', () => {
-    expect(fb.claimRaiseSql(2 ** 53 - 1, { seq: true, table: true, claim: true })).toHaveProperty('error');
-    expect(fb.claimRaiseSql(2 ** 53 - 1, { seq: true, table: false, claim: false })).toHaveProperty('error');
+    expect(fb.claimRaiseSql(2 ** 53 - 1, { seq: true, table: true, claim: true, shards: false, clock: false })).toHaveProperty('error');
+    expect(fb.claimRaiseSql(2 ** 53 - 1, { seq: true, table: false, claim: false, shards: false, clock: false })).toHaveProperty('error');
   });
 });
 
 describe('K2 parseClaimTables', () => {
   const rows: Array<[string, unknown]> = [
-    ...TRIPLES.map(([s, t, c]): [string, unknown] => [`${s ? 't' : 'f'}|${t ? 't' : 'f'}|${c ? 't' : 'f'}\n`, { seq: s, table: t, claim: c }]),
-    ['t|t', null], ['t|t|t|t', null], ['x|t|t', null], ['', null],
+    ...TRIPLES.map(([s, t, c]): [string, unknown] => [`${s ? 't' : 'f'}|${t ? 't' : 'f'}|${c ? 't' : 'f'}|f|f\n`, { seq: s, table: t, claim: c, shards: false, clock: false }]),
+    ['t|t|f|f', null], ['t|t|t|t|f|f', null], ['x|t|t|f|f', null], ['', null],
   ];
   it.each(rows)('%j', (stdout, want) => {
     expect(fb.parseClaimTables(stdout)).toEqual(want);
@@ -89,6 +89,7 @@ describe('K4 dumpClaimShape', () => {
     ['claims fixture', TOC.claims, 'claims'],
     ['terms fixture', TOC.terms, 'terms'],
     ['none fixture', TOC.none, 'none'],
+    ['empty fixture (a database with no objects)', TOC.empty, 'none'],
     ['a SEQUENCE SET line alone', `${TOC.terms}3367; 0 0 SEQUENCE SET smdb_data claim_seq app\n`, 'terms'],
     ['mixed, sequence and table', `1; 1259 1 TABLE smdb_data guild_ownership app\n2; 1259 2 SEQUENCE smdb_data claim_seq app\n`, 'claims'],
     ['empty', '', null],

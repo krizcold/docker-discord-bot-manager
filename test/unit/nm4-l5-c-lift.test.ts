@@ -322,7 +322,7 @@ describe('NM4 L5c: the claim parsers', () => {
   });
 
   it('claimRaiseSql names the floor with no next whole number', () => {
-    expect(fleetBackup.claimRaiseSql(2 ** 53 - 1, { seq: true, table: true, claim: true })).toEqual({ error: 'the claim floor 9007199254740991 has no next whole number' });
+    expect(fleetBackup.claimRaiseSql(2 ** 53 - 1, { seq: true, table: true, claim: true, shards: false, clock: false })).toEqual({ error: 'the claim floor 9007199254740991 has no next whole number' });
   });
 
   const raise: Array<[string, number, unknown]> = [

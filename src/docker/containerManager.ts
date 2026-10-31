@@ -23,6 +23,7 @@ import {
   FleetJoinRecord,
 } from '../types';
 import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
+import { switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
 import { allocateHostPort } from './portAllocator';
@@ -220,6 +221,9 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   if (inst.fleetJoin) {
     inst.fleetJoin.code = decryptRecordSecret(inst.id, 'fleetJoin.code', inst.fleetJoin.code) ?? '';
   }
+  if (inst.fleetDb?.formerMain) {
+    inst.fleetDb.formerMain.code = decryptRecordSecret(inst.id, 'fleetDb.formerMain.code', inst.fleetDb.formerMain.code) ?? '';
+  }
 }
 
 function encryptedOrStashed(instId: string, field: string, plain: string | undefined): string | undefined {
@@ -235,9 +239,11 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
-  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetJoin?.code];
-  const joined = inst.fleetJoin?.code ? decodeJoinCode(inst.fleetJoin.code) : null;
-  if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code];
+  for (const text of [inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code]) {
+    const joined = text ? decodeJoinCode(text) : null;
+    if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
+  }
   try {
     for (const [key, value] of Object.entries(envManager.getEnvVars(inst.id))) {
       if (!value) continue;
@@ -296,6 +302,9 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: encryptedOrStashed(inst.id, 'fleetDb.replication.password', out.fleetDb.replication.password) ?? '' } };
   }
+  if (out.fleetDb?.formerMain) {
+    out.fleetDb = { ...out.fleetDb, formerMain: { ...out.fleetDb.formerMain, code: encryptedOrStashed(inst.id, 'fleetDb.formerMain.code', out.fleetDb.formerMain.code) ?? '' } };
+  }
   if (out.fleetJoin) {
     out.fleetJoin = { ...out.fleetJoin, code: encryptedOrStashed(inst.id, 'fleetJoin.code', out.fleetJoin.code) ?? '' };
   }
@@ -317,6 +326,9 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.maintenance = inst.maintenance ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
+  }
+  if (out.fleetDb?.formerMain) {
+    out.fleetDb = { ...out.fleetDb, formerMain: { ...out.fleetDb.formerMain, code: '' } };
   }
   if (out.fleetJoin) {
     out.fleetJoin = { ...out.fleetJoin, code: '' };
@@ -839,6 +851,47 @@ export function updateInstanceFleetBackupStart(botId: string, family: BackupFami
   saveRegistry(registry);
 }
 
+type SwitchFields = Pick<FleetDbRecord, 'handover' | 'receive' | 'replacedBy' | 'mainConflict' | 'switchNotice' | 'pushBroken' | 'formerMain'>;
+
+/** Set (a value) or clear (null) the switch fields of the main's record. Throws when the registry cannot be saved. */
+export function updateInstanceFleetDbSwitch(botId: string, patch: { [K in keyof SwitchFields]?: SwitchFields[K] | null }): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance?.fleetDb) throw new Error('the bot holds no main database record any more');
+  const db: Record<string, unknown> = instance.fleetDb as unknown as Record<string, unknown>;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null || value === undefined) delete db[key];
+    else db[key] = value;
+  }
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** Set or clear the database list offer owed to the running bot. Throws when the registry cannot be saved. */
+export function updateInstanceAddressesPush(botId: string, push: InstanceConfig['addressesPush'] | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is not in the registry any more');
+  if (push) instance.addressesPush = push;
+  else delete instance.addressesPush;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** Set or clear the take-over intent on the copy's record. Throws when the registry cannot be saved. */
+export function updateInstanceFleetDbReplicaTakeover(botId: string, takeover: FleetDbReplicaRecord['takeover'] | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance?.fleetDbReplica) throw new Error('the bot holds no live copy record any more');
+  if (takeover) instance.fleetDbReplica.takeover = takeover;
+  else delete instance.fleetDbReplica.takeover;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
 /** Set or clear the joined main's record. Throws when the registry cannot be saved. */
 export function updateInstanceFleetJoin(botId: string, join: FleetJoinRecord | null): void {
   const registry = loadRegistry();
@@ -956,7 +1009,9 @@ export function deployedComposeExists(botId: string): boolean {
  * re-seeded from) is unreachable. Record only: the container and volume are
  * the ones already running.
  */
-export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetDbReplication): { success: boolean; error?: string } {
+export function adoptFleetDbReplicaAsPrimary(
+  botId: string, replication?: FleetDbReplication, restoreNotice?: InstanceConfig['fleetRestoreError'], formerMain?: { machine: string; generation: number },
+): { success: boolean; error?: string } {
   const registry = loadRegistry();
   const stored = registry.instances[botId];
   if (!stored) return { success: false, error: 'Bot not found' };
@@ -973,8 +1028,18 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
   // already carries (B6 map F30): enable then keeps it instead of minting.
   stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume, ...(replication ? { replication } : {}) };
   delete stored.fleetDbReplica;
+  // A take-over from a main whose restore had not finished: the notice lands in the same save as the flip.
+  if (restoreNotice) stored.fleetRestoreError = restoreNotice;
   // The seed record is about the standby this adopt just consumed.
   delete stored.fleetDbReplicaSeed;
+  // The take-over keeps the old main's join code (D45): this main checks it and reaches it when it runs again.
+  const oldCode = formerMain && stored.fleetJoin?.code ? decodeJoinCode(stored.fleetJoin.code) : null;
+  if (formerMain && oldCode?.ok) {
+    stored.fleetDb.formerMain = {
+      code: stored.fleetJoin!.code, slot: replica.slot, machine: formerMain.machine, host: oldCode.code.host, port: oldCode.code.port,
+      generation: formerMain.generation, at: new Date().toISOString(),
+    };
+  }
   // This machine is the main now: a join code would make the watcher write the old main's list over its URL.
   delete stored.fleetJoin;
   delete stored.fleetCopyAlerts;
@@ -987,6 +1052,7 @@ export function adoptFleetDbReplicaAsPrimary(botId: string, replication?: FleetD
     delete live.fleetDbReplicaSeed;
     delete live.fleetJoin;
     delete live.fleetCopyAlerts;
+    if (restoreNotice) live.fleetRestoreError = { ...restoreNotice };
   }
   // A standby deployed before the app depended on it: order compose down now,
   // so the restart this adopt asks for stops the app before its database.
@@ -1019,11 +1085,13 @@ export function unfinishedRetireRefusal(retiringAt: string): string {
  * dump until this runs; the app service is deliberately left down.
  * retireRetry: the caller proved the volume predates the retiring mark.
  */
-export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: boolean } = {}): Promise<LaneResult> {
+export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: boolean; handedOver?: boolean } = {}): Promise<LaneResult> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
   if (fleetDb.retiringAt && !opts.retireRetry) return { success: false, error: unfinishedRetireRefusal(fleetDb.retiringAt) };
+  const handedOver = opts.handedOver ? null : switchDbStartRefusal(instance);
+  if (handedOver) return { success: false, error: handedOver };
   const appName = resolveAppName(botId);
   const composePath = resolveComposePath(botId, appName);
   if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
@@ -1053,9 +1121,33 @@ export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: b
     // Imported here: dbLogin reaches this module through fleetReplication.
     const role = await (await import('../instance/dbLogin')).ensureManagerDbRole({ container: fleetDb.containerName, user: fleetDb.user });
     if (!role.ok) console.warn(`[ContainerManager] ${botId}: the manager's database role dbm_admin could not be confirmed: ${role.error}`);
+    else await (await import('../instance/fleetSwitch')).ensureMainGeneration(botId);
     return { success: true };
   }
   return { success: false, error: 'database did not become ready within 30 seconds' };
+}
+
+/** Stop only the managed database sidecar, by its compose service; the app service is left as it is. */
+export async function stopFleetDbSidecar(botId: string): Promise<LaneResult> {
+  const instance = getBot(botId);
+  const fleetDb = instance?.fleetDb;
+  if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  const appName = resolveAppName(botId);
+  const composePath = resolveComposePath(botId, appName);
+  if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found' };
+  let service = 'fleet-postgres';
+  try {
+    const compose = YAML.parseDocument(fs.readFileSync(composePath, 'utf-8')).toJSON();
+    for (const [key, svc] of Object.entries((compose?.services || {}) as Record<string, any>)) {
+      if (svc?.container_name === fleetDb.containerName && /^[A-Za-z0-9._-]+$/.test(key)) { service = key; break; }
+    }
+  } catch { /* default stands */ }
+  try {
+    await execAsync(`docker compose -f "${composePath}" -p "${appName}" stop ${service}`, { timeout: 90_000 });
+  } catch (err) {
+    return { success: false, error: String(err) };
+  }
+  return { success: true };
 }
 
 export const START_DB_READY = { deadlineMs: 30_000, tryMs: 5_000, pauseMs: 1000 };
@@ -3401,6 +3493,8 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
   if (instance?.maintenance?.state === 'off') return { success: false, error: OFF_START_REFUSAL };
   const retiringAt = instance?.fleetDb?.retiringAt;
   if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
+  const switched = instance ? switchStartRefusal(instance) : null;
+  if (switched) return { success: false, error: switched };
   return databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
@@ -4071,6 +4165,9 @@ async function pullAndRebuildAfterPreflight(botId: string, instance: InstanceCon
   const wasRunning = instance.status === 'running' || owedStart;
   const retiringAt = (getBot(botId) ?? instance).fleetDb?.retiringAt;
   if (wasRunning && retiringAt) return { success: false, error: `${unfinishedRetireRefusal(retiringAt)}. The update was refused before the bot was stopped` };
+  // D48: the start after the rebuild would meet this refusal, and the stop before it would drop what the bot holds.
+  const switched = wasRunning ? switchStartRefusal(getBot(botId) ?? instance) : null;
+  if (switched) return { success: false, error: `${switched}; the update was refused before the bot was stopped` };
   const log = logCollectors.get(botId);
   const emit: EmitFn = (msg, type = 'info', key) => {
     console.log(`[Update ${botId}] ${msg}`);

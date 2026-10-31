@@ -29,11 +29,11 @@ import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities'
 import { capabilityRefusal } from './appHookClient';
 import { probeErrorTail } from '../config/secretText';
 import { InstanceConfig, FleetBackupAlert, FleetDbReplicaRecord, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
-import { decodeJoinCode, HOST_RE, JoinCode, lsnText } from '../config/joinCode';
+import { decodeJoinCode, HOST_RE, JoinCode, lsnText, splitBackendUrls } from '../config/joinCode';
 import { alertStep, dmOutcomeText, utcText } from './backupFiles';
 import {
-  deleteAddress, ensureClientImage, inRecoveryText, loginOf, machineNameOf, mainCertificate, mainProbe, PrimaryLogin,
-  probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor, storedJoin, writeEnvList,
+  AddressesOutcome, addressesText, deleteAddress, ensureClientImage, sendAddresses, inRecoveryText, loginOf, machineNameOf, mainCertificate, mainProbe, PrimaryLogin,
+  probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor, storedJoin, writeEnvList, joinFleet,
 } from './fleetJoin';
 import { notifyOwner } from './backupCheck';
 import { feedStdin } from '../docker/childStdin';
@@ -598,6 +598,9 @@ interface SeedRunContext {
   serviceOut: boolean;
   notes: string[];
   safetyDump?: string;
+  /** A stale-primary re-seed: the join code the rebuilt copy joins once it runs, and the restore notice its retire removed. */
+  joinText?: string;
+  noticeFile?: string;
 }
 
 interface StartOptions {
@@ -606,6 +609,7 @@ interface StartOptions {
   confirmVolume?: string;
   auto?: boolean;
   cause?: FleetReplicaSeedRecord['rebuildCause'];
+  joinText?: string;
 }
 
 /**
@@ -656,7 +660,7 @@ function startProvisioning(
   heldReplicaClears.delete(instance.id);
   seedNotes.delete(instance.id);
   const ownsRecord = (): boolean => seedRecord(instance.id)?.startedAt === now;
-  const ctx: SeedRunContext = { serviceOut: false, notes: [] };
+  const ctx: SeedRunContext = { serviceOut: false, notes: [], ...(opts.joinText ? { joinText: opts.joinText } : {}) };
   void containerManager.withExternalBotOp(instance.id, 'replica-seed', async () => {
     try {
       throwIfCancelled(instance.id);
@@ -1123,6 +1127,19 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   }
   // The copy runs. Other machines learn its address from the main's list, and this machine's bot gets it first in
   // its database list, which a recreate applies; the running project is marked so Start applies it.
+  if (purpose === 'reseed-stale-primary' && ctx.joinText) {
+    const decoded = decodeJoinCode(ctx.joinText);
+    const target = decoded.ok ? decoded.code.machine : 'the main';
+    const kept = ctx.safetyDump ? ` A dump of the old database is kept with the backups (${ctx.safetyDump}).` : '';
+    let note = `This machine's database was rebuilt as a copy of ${target}.${kept}`;
+    if (ctx.noticeFile) note += ` The restore notice of ${ctx.noticeFile} was about the old database and went with it; that dump holds the old database as it was.`;
+    const joined = await joinFleet(containerManager.getBot(instance.id) ?? instance, ctx.joinText, { inLock: true });
+    if (!joined.success) {
+      ctx.notes.push(`${note} The copy runs, but the join code could not be saved (${joined.error}), so the bot's database list was not written; press Join with ${target}'s code.`);
+      return;
+    }
+    ctx.notes.push(note);
+  }
   const fresh = containerManager.getBot(instance.id) ?? instance;
   if (!storedJoin(fresh)) {
     // No hourly retry runs without a readable join code, so nothing here promises one.
@@ -1137,6 +1154,8 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   }
   try {
     const written = await writeEnvList(instance.id);
+    const offered = addressesText(written.addresses).trim();
+    if (offered) ctx.notes.push(offered);
     if (written.markError) {
       ctx.notes.push(`The standby was provisioned and runs, but the manager could not record that the running bot must be recreated to learn it (${written.markError}). Restart the instance so the bot picks up its standby`);
       console.warn(`[FleetReplica] ${instance.id}: the standby runs, but the Apply mark could not be saved: ${written.markError}`);
@@ -1237,7 +1256,9 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
       if (reason) warning += `; its address could not be taken off the main's list (${reason}), and the main stops listing it once the slot is dropped there`;
     }
     try {
-      await writeEnvList(instance.id);
+      const written = await writeEnvList(instance.id);
+      const offered = addressesText(written.addresses);
+      if (offered) warning = warning ? `${warning}.${offered}` : offered.trim();
     } catch (err) {
       warning += `. The join code is saved, but the Database URL could not be written (${errorText(err)}). The manager writes it again within 5 minutes; press Join again to try now.`;
     }
@@ -1405,7 +1426,7 @@ export function reseedStalePrimary(
   publicHost: string | undefined,
   hostPort?: number,
   confirm?: boolean,
-  opts: { dumpDone?: boolean; confirmVolume?: string } = {},
+  opts: { dumpDone?: boolean; confirmVolume?: string; safetyDump?: string } = {},
 ): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
   if (!instance.fleetDb) {
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
@@ -1467,9 +1488,13 @@ export function reseedStalePrimary(
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
 
-  const preflight = async () => {
+  const preflight = async (ctx: SeedRunContext) => {
     throwIfCancelled(instance.id);
     const fleetDb = instance.fleetDb!;
+    if (opts.dumpDone && opts.safetyDump) {
+      ctx.safetyDump = opts.safetyDump;
+      saveSeedOrHold(instance.id, { safetyDump: opts.safetyDump });
+    }
     // The status record can say stopped while docker runs the bot on this database.
     const live = await containerManager.runningNonSidecarContainers(instance.id);
     if (live === null) throw new Error("docker did not say which containers of this instance run, so the manager can't confirm the bot is stopped; nothing was destroyed, retry");
@@ -1496,11 +1521,12 @@ export function reseedStalePrimary(
         if (volState === 'exists') {
           const reminted = await remintedVolumeRefusal(fleetDb);
           if (reminted) throw new Error(`nothing was destroyed: ${reminted}`);
-          const started = await containerManager.startFleetDbSidecar(instance.id, { retireRetry: true });
+          const started = await containerManager.startFleetDbSidecar(instance.id, { retireRetry: true, handedOver: true });
           if (!started.success) throw new Error(`the database did not come up for the safety dump, so nothing was destroyed: ${started.error}`);
           const dump = await fleetBackup.fencedSafetyDump(instance, 'pre-reseed-', 'a re-seed', RESEED_LIFT_REMEDY, fenceOwner);
           if (!dump.success) throw new Error(`the safety dump failed, so nothing was destroyed: ${dump.error}`);
           fenced = true;
+          ctx.safetyDump = dump.file;
           saveSeedOrHold(instance.id, { safetyDump: dump.file });
         }
       }
@@ -1517,7 +1543,12 @@ export function reseedStalePrimary(
       // The dump above takes minutes, so a cancel filed during it is honoured
       // here, with the sidecar running and the record intact.
       throwIfCancelled(instance.id);
+      const noticeFile = fleetBackup.shownRestoreNoticeFile(instance.id);
       const retired = await containerManager.retireFleetDbSidecar(instance.id);
+      if (retired.success) {
+        fleetBackup.forgetRestoreNotice(instance.id);
+        if (noticeFile) ctx.noticeFile = noticeFile;
+      }
       if (!retired.success) {
         if (retired.volumeRemoved) {
           fenced = false;
@@ -1556,7 +1587,7 @@ export function reseedStalePrimary(
   }
   let started: { success: boolean; error?: string };
   try {
-    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', { preflight, onSettled: () => fleetBackupGuards.releaseFleetBackupBusy(instance.id), confirmVolume });
+    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', { preflight, onSettled: () => fleetBackupGuards.releaseFleetBackupBusy(instance.id), confirmVolume, joinText: joinCode });
   } catch (err) {
     fleetBackupGuards.releaseFleetBackupBusy(instance.id);
     throw err;
@@ -1824,24 +1855,26 @@ function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string |
  */
 export async function adoptPromotedReplica(
   instance: InstanceConfig,
-): Promise<{ success: boolean; error?: string; restartRequired?: boolean }> {
+  opts: { op?: string; alone?: boolean; restoreNotice?: InstanceConfig['fleetRestoreError']; formerMain?: { machine: string; generation: number } } = {},
+): Promise<{ success: boolean; error?: string; restartRequired?: boolean; alone?: boolean; flipped?: boolean; addresses?: AddressesOutcome }> {
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'This instance has no standby to adopt' };
   if (instance.fleetDb) return { success: false, error: 'This instance already hosts a fleet database' };
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
   const busyOp = containerManager.isBotBusy(instance.id);
-  if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  if (busyOp && busyOp !== opts.op) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
 
   // The pre-field gate first, with the real remedy: the status probe cannot
   // even run for such a record, and "start the instance" would be a lie.
   if (!rec.user || !rec.db) {
     return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby before adopting' };
   }
-  if (!rec.publicHost || !rec.hostPort) {
+  const alone = !rec.publicHost || !rec.hostPort;
+  if (alone && !opts.alone) {
     return { success: false, error: 'This copy was set up without an address for other machines, so it cannot become their main. A machine that cannot open a port can be the main only when it runs alone.' };
   }
-  const publicHost = rec.publicHost;
-  const hostPort = rec.hostPort;
+  const publicHost = rec.publicHost ?? '';
+  const hostPort = rec.hostPort ?? 0;
   const status = await getFleetReplicaStatus(instance);
   if (!status.live) {
     return { success: false, error: `Could not read the standby container (${status.probeError || 'no output'}), so it cannot be verified for adoption; try again` };
@@ -1870,7 +1903,7 @@ export async function adoptPromotedReplica(
   // until this instance is filed like any other database host.
   const dataDir = await instanceDataDir(instance);
   const password = (() => {
-    const current = (envManager.getEnvVars(instance.id)[db.env.url] || '').trim();
+    const current = splitBackendUrls(envManager.getEnvVars(instance.id)[db.env.url])[0] ?? '';
     if (current !== '') {
       try { return decodeURIComponent(new URL(current).password) || null; } catch { return null; }
     }
@@ -1902,7 +1935,7 @@ export async function adoptPromotedReplica(
   // both instead of minting, so a handover does not invalidate the fleet's
   // trust. Unreadable means enable mints, as before.
   const credential = await readCopyCredential(rec);
-  const replication = credential && credential.user === REPLICATION_ROLE
+  const replication = !alone && credential && credential.user === REPLICATION_ROLE
     ? { role: credential.user, password: credential.password, hostPort, publicHost, certHost: rec.certHost }
     : undefined;
   // The container-name form, written before the record flip so a refused env
@@ -1935,7 +1968,7 @@ export async function adoptPromotedReplica(
   };
   let adopted: { success: boolean; error?: string };
   try {
-    adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication);
+    adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication, opts.restoreNotice, opts.formerMain);
   } catch (err) {
     const left = putEnvBack();
     return { success: false, error: `The instance record could not be written (${errorText(err)}), so the standby was not adopted; ${left ?? 'nothing was changed'}` };
@@ -1961,15 +1994,18 @@ export async function adoptPromotedReplica(
   }
   const reload = await managerReplicaExec(rec.containerName, rec.user, ['psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', 'SELECT pg_reload_conf();']);
   if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${reload.stderr.trim().split('\n').pop()}`);
+  if (alone) return { success: true, restartRequired: true, alone: true, flipped: true, addresses: await sendAddresses(instance.id) };
 
-  const enabled = await enableFleetReplication(live, publicHost, hostPort, undefined, { dbPassword: password });
+  const enabled = await enableFleetReplication(live, publicHost, hostPort, undefined, { dbPassword: password, offerAddresses: false });
+  // One offer after the flip covers Enable's own write of the URL key too.
+  const addresses = await sendAddresses(instance.id);
   if (!enabled.success) {
     // Leave the adopted record in place: the database IS this machine's now,
     // and the operator can retry Enable from the replication section. Rolling
     // the record back would hide a live primary behind a standby surface again.
-    return { success: false, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
+    return { success: false, flipped: true, addresses, error: `The database was adopted, but enabling replication on it failed (retry from the Replication section): ${enabled.error}` };
   }
-  return { success: true, restartRequired: true };
+  return { success: true, restartRequired: true, flipped: true, addresses };
 }
 
 /** The fleet database password for an instance whose manager env holds no database URL: the bot's own env file carries it. */

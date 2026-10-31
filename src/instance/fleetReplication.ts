@@ -33,6 +33,7 @@ import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
 import { certFingerprint, encodeJoinCode, machineText, sqlLiteral } from '../config/joinCode';
+import { AddressesOutcome, sendAddresses } from './fleetJoin';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -185,7 +186,7 @@ function isIpAddress(host: string): boolean {
 }
 
 /** The database password, recovered from the stored URL like the managed-lane redeploy does. */
-function storedDbPassword(instance: InstanceConfig): string | null {
+export function storedDbPassword(instance: InstanceConfig): string | null {
   const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
   if (!urlKey) return null;
   const url = (envManager.getEnvVars(instance.id)[urlKey] || '').trim();
@@ -273,7 +274,7 @@ export function enableFleetReplication(
   publicHost: string,
   hostPort?: number,
   slotWalKeepMb?: number,
-  opts: { admit?: Admission; dbPassword?: string } = {},
+  opts: { admit?: Admission; dbPassword?: string; offerAddresses?: boolean } = {},
 ): Promise<EnableResult> {
   return inReplicationLane<EnableResult>(instance.id, 'Enable', async () => {
     const fresh = containerManager.getBot(instance.id);
@@ -287,7 +288,7 @@ export function enableFleetReplication(
 /** A caller's own refusal, read inside the lane before anything runs; null admits. */
 type Admission = (instance: InstanceConfig) => Promise<string | null>;
 
-type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number };
+type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number; addresses?: AddressesOutcome };
 
 /**
  * One replication lane per instance: Enable, Disable and the adopt take the
@@ -315,7 +316,7 @@ async function enableInLane(
   publicHost: string,
   hostPort: number | undefined,
   slotWalKeepMb: number | undefined,
-  opts: { dbPassword?: string },
+  opts: { dbPassword?: string; offerAddresses?: boolean },
 ): Promise<EnableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb) return { success: false, error: 'This instance has no managed fleet database' };
@@ -448,7 +449,8 @@ async function enableInLane(
     return { success: false, certRotated, error: `The database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); ${changed}. Press Enable again once the store can be written` };
   }
   forgetProbes(instance.id);
-  return { success: true, restartRequired: true, certRotated, ...(plain.addrs.length > 0 ? { plainClientsKept: plain.addrs.length } : {}) };
+  const offered = opts.offerAddresses === false ? undefined : await sendAddresses(instance.id);
+  return { success: true, restartRequired: true, certRotated, ...(plain.addrs.length > 0 ? { plainClientsKept: plain.addrs.length } : {}), ...(offered ? { addresses: offered } : {}) };
 }
 
 /**
@@ -475,7 +477,7 @@ export function disableFleetReplication(
   });
 }
 
-type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string; plainClientsKept?: number };
+type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string; plainClientsKept?: number; addresses?: AddressesOutcome };
 
 async function disableInLane(
   instance: InstanceConfig,
@@ -577,7 +579,7 @@ async function disableInLane(
     return { success: false, error: `Replication is off on the database (the slots are dropped and the replication login is revoked), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
   }
   forgetProbes(instance.id);
-  return { success: true, restartRequired: true, ...kept };
+  return { success: true, restartRequired: true, ...kept, addresses: await sendAddresses(instance.id) };
 }
 
 /**

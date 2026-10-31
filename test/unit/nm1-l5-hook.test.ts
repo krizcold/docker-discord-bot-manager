@@ -26,12 +26,12 @@ afterEach(() => {
 describe('NM1 L5: what callAppHook reports for each answer', () => {
   it("an HTTP error carries the app's named error", async () => {
     answer(JSON.stringify({ error: 'the guild is held elsewhere' }), 409);
-    expect(await callAppHook(instance, 'confirm-fresh')).toEqual({ ok: false, status: 409, error: 'the guild is held elsewhere' });
+    expect(await callAppHook(instance, 'confirm-fresh')).toEqual({ ok: false, status: 409, body: { error: 'the guild is held elsewhere' }, error: 'the guild is held elsewhere' });
   });
 
   it('an HTTP error with no body names the action and the status', async () => {
     answer('not json', 500);
-    expect(await callAppHook(instance, 'confirm-fresh')).toEqual({ ok: false, status: 500, error: 'confirm-fresh returned 500' });
+    expect(await callAppHook(instance, 'confirm-fresh')).toEqual({ ok: false, status: 500, body: null, error: 'confirm-fresh returned 500' });
   });
 
   it("a refusal carries the app's named reason and its body", async () => {

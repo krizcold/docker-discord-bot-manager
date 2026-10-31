@@ -100,7 +100,8 @@ export async function callAppHook<T = any>(
     });
     const parsed: any = await res.json().catch(() => null);
     if (!res.ok) {
-      return { ok: false, status: res.status, error: String(parsed?.error || `${action} returned ${res.status}`) };
+      // The bot's can't-confirm is a 502 whose body says unknown (contracts 3, 5 and 7).
+      return { ok: false, status: res.status, body: parsed as T, error: String(parsed?.error || `${action} returned ${res.status}`), ...(parsed?.unknown === true ? { unknown: true } : {}) };
     }
     if (!parsed || parsed.success !== true) {
       // A refusal is a real answer, not a transport failure: the app's named

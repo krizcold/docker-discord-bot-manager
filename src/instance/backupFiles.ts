@@ -130,6 +130,45 @@ export const COUNTS_SQL = "SELECT 'count|' || format('%I.%I', n.nspname, c.relna
   + "AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e') "
   + 'ORDER BY n.nspname, c.relname';
 
+/**
+ * One `checksum|"schema"."table"|<md5>` line per table of COUNTS_SQL's selection: the md5 of every row's text form,
+ * sorted, so row order and physical layout do not change it.
+ */
+export const CHECKSUM_SQL = "SELECT 'checksum|' || format('%I.%I', n.nspname, c.relname) || '|' || "
+  + "(xpath('/row/h/text()', query_to_xml(format('SELECT md5(coalesce(string_agg(md5(t::text), '''' ORDER BY md5(t::text)), '''')) AS h FROM %I.%I t', n.nspname, c.relname), false, true, '')))[1]::text "
+  + 'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
+  + "WHERE c.relkind = 'r' AND c.relpersistence = 'p' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
+  + "AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%' "
+  + "AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e') "
+  + 'ORDER BY n.nspname, c.relname';
+
+/** The checksums in psql output; a `checksum|` line whose value is not an md5 refuses the lot. */
+export function parseChecksumLines(text: string): { ok: true; sums: Record<string, string> } | { ok: false; error: string } {
+  const sums: Record<string, string> = {};
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.startsWith('checksum|')) continue;
+    const cut = line.lastIndexOf('|');
+    const name = line.slice('checksum|'.length, cut);
+    const h = line.slice(cut + 1);
+    if (!name || !/^[0-9a-f]{32}$/.test(h)) return { ok: false, error: `a table checksum read back as ${line.slice(0, 200)}` };
+    sums[name] = h;
+  }
+  return { ok: true, sums };
+}
+
+/** Same tables, same checksums; text names the first difference. A table on one side only differs. */
+export function compareChecksums(here: Record<string, string>, there: Record<string, string>): { ok: boolean; text: string } {
+  for (const name of Object.keys(here).sort()) {
+    if (!(name in there)) return { ok: false, text: `${name} is missing on the other side` };
+    if (there[name] !== here[name]) return { ok: false, text: `${name} holds different rows` };
+  }
+  for (const name of Object.keys(there).sort()) {
+    if (!(name in here)) return { ok: false, text: `${name} is not in this database` };
+  }
+  return { ok: true, text: '' };
+}
+
 /** `snap|<snapshot id>|<t|f>|<database bytes>|<dataAt ms or -1>` from the transaction that holds the snapshot. */
 export const SNAP_SQL = "SELECT 'snap|' || pg_export_snapshot() || '|' || (CASE WHEN pg_is_in_recovery() THEN 't' ELSE 'f' END) || '|' || "
   + 'pg_database_size(current_database()) || \'|\' || '

@@ -66,6 +66,10 @@ vi.mock('../../src/casaos/detector', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/casaos/detector')>()),
   getDeploymentMode: async () => 'docker',
 }));
+vi.mock('../../src/docker/containerManager', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/docker/containerManager')>()),
+  appContainerRunning: async () => false,
+}));
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import * as fs from 'fs';
@@ -116,7 +120,7 @@ describe('the adopt of a promoted copy', () => {
   it('hands the recovered database password to the enable', async () => {
     const res = await fleetReplica.adoptPromotedReplica(bot());
     expect(res.success).toBe(true);
-    expect(h.enableOpts).toEqual([{ dbPassword: 'Db-Secret-0123456789' }]);
+    expect(h.enableOpts).toEqual([{ dbPassword: 'Db-Secret-0123456789', offerAddresses: false }]);
   });
 
   it('refuses a copy set up without an address for other machines', async () => {

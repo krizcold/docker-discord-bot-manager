@@ -19,7 +19,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
-import { InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord } from '../types';
+import { InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, JoinAddress } from '../types';
 import {
   ALERT_AFTER_MS, backupDir, COPY_FILE_PREFIX, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
   ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
@@ -29,7 +29,12 @@ import { probeErrorTail, redactSecrets } from '../config/secretText';
 import * as fleetReplica from './fleetReplica';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
-import { REPLICATION_ROLE } from './fleetReplication';
+import { addressTableSql, REPLICATION_ROLE } from './fleetReplication';
+import { parseAddressRows, readCopyCert } from './fleetJoin';
+import {
+  copiesInsertSql, cutAddressesSql, GEN_READ_SQL, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow,
+  raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql,
+} from './switchSql';
 import { splitBackendUrls } from '../config/joinCode';
 import * as maintenance from './maintenance';
 import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
@@ -1527,7 +1532,7 @@ function sweepUnfinished(): void {
   }
 }
 
-type RestoreSteps = { stopped: string[]; preRestoreDump: string | null; restored: boolean; claimFloor: number | null; guildsRaised: string[] | null; claimRaisedTo: number | null; botState: 'maintenance' | 'off' | null; restarted: string[] };
+type RestoreSteps = { stopped: string[]; preRestoreDump: string | null; restored: boolean; claimFloor: number | null; guildsRaised: string[] | null; claimRaisedTo: number | null; botState: 'maintenance' | 'off' | null; restarted: string[]; generation: number | null };
 
 const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
 
@@ -1587,10 +1592,19 @@ export async function previewFleetRestore(botId: string): Promise<{ success: tru
   return { success: true, instances };
 }
 
-/** The lane that holds this instance's database against a restore: the refusal, and the step that clears it; null when none does. */
-function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string } | null {
+/**
+ * The lane that holds this instance's database against a restore: the refusal, and the step that clears it (whole:
+ * the step is the remedy itself, not a step before a restore); null when none does.
+ */
+function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string; whole?: boolean } | null {
   const seed = fleetReplica.seedView(instance);
   if (seed && seed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
+  const db = instance.fleetDb;
+  if (db?.handover) return { refusal: `A move of this database is recorded (${moveModeText(db.handover)}); Cancel it in the Database window before restoring a dump`, step: 'cancel the move' };
+  if (db?.receive) return { refusal: 'This database is waiting to receive a main pushed from another machine; Stop receiving before restoring a dump', step: 'stop receiving' };
+  if (db?.replacedBy) {
+    return { refusal: `${db.replacedBy.machine} replaced this database as the main; rejoin this machine as a copy instead of restoring a dump`, step: 'rejoining this machine as a copy rebuilds the database without the fence', whole: true };
+  }
   return null;
 }
 
@@ -1602,6 +1616,7 @@ function restoreAdmissionRefusal(instance: InstanceConfig): string | null {
 /** A restore retry as a fence remedy, after the step a restore would first refuse on. */
 function restoreRetryRemedy(instance: InstanceConfig): string {
   const block = restoreAdmissionBlock(instance);
+  if (block?.whole) return block.step;
   return block ? `${block.step}, then run a restore again with the bot in Maintenance or Off to retry the lift` : RESTORE_RETRY_LIFT;
 }
 
@@ -1849,7 +1864,7 @@ type RestoreResult = { success: boolean; error?: string; warning?: string; steps
 
 async function runFleetRestore(botId: string, file: string): Promise<RestoreResult> {
   const steps: RestoreSteps = {
-    stopped: [], preRestoreDump: null, restored: false, claimFloor: null, guildsRaised: null, claimRaisedTo: null, botState: null, restarted: [],
+    stopped: [], preRestoreDump: null, restored: false, claimFloor: null, guildsRaised: null, claimRaisedTo: null, botState: null, restarted: [], generation: null,
   };
 
   if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL, steps };
@@ -2157,6 +2172,8 @@ async function restoreLocked(
     // missing or partial database), and raised over in the restored copy, so
     // a process that took its claim before the restore cannot save over it.
     let floor: number | null = floorRead.claim;
+    let liveGen: GenRow | null = null;
+    let ownCopies: JoinAddress[] = [];
     if (exists.stdout.trim() !== '0') {
       const safety = await runFleetDump(instance, 'pre-restore-');
       if (!safety.success) {
@@ -2172,6 +2189,19 @@ async function restoreLocked(
         return await refuse("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused", 'smdb_data.guild_ownership has no claim column');
       }
       if (live.claim !== null && (floor === null || live.claim > floor)) floor = live.claim;
+
+      const gen = await managerRead(fleetDb, claimPsql(fleetDb, GEN_READ_SQL, false));
+      const row = gen.ok ? parseGenRow(gen.stdout) : missingTable(gen.stderr) ? null : undefined;
+      if (row === undefined) {
+        return await refuse("Could not read the database's generation before the restore, so the restore was refused", scrubbed(botId, gen.ok ? `it answered '${gen.stdout.trim()}'` : lastLine(gen.stderr)));
+      }
+      liveGen = row;
+      // D49: a moved- restore replaces the address rows; this machine's own copies are written back after it.
+      if (restoreKindOf(file) === 'moved') {
+        const copies = await managerRead(fleetDb, claimPsql(fleetDb, OWN_COPIES_READ_SQL, false));
+        if (copies.ok) ownCopies = parseAddressRows(copies.stdout);
+        else console.warn(`[Switch] ${instance.displayName}: this machine's copies could not be read before the restore (${scrubbed(botId, lastLine(copies.stderr))}); they register again within an hour`);
+      }
     }
     if (shape === 'none' && floor !== null) {
       return await refuse(`The dump ${file} holds no claim numbers, so the restore was refused`,
@@ -2186,6 +2216,16 @@ async function restoreLocked(
           `${kept}; free space under ${DATA_DIR} and retry (this manager holds the number in memory until it restarts)`);
       }
     }
+
+    // The generation before the drop, kept in the cluster's postgres database (the drop leaves it): a retry after a
+    // failed restore meets a missing or partial database whose row is lower.
+    const kept = await managerExec(fleetDb, ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
+      'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateUpsertSql(file, liveGen)]);
+    const keptFloor = kept.ok ? parseGenRow(kept.stdout) : undefined;
+    if (keptFloor === undefined) {
+      return await refuse("The database's generation could not be kept before the drop, so the restore was refused", scrubbed(botId, kept.ok ? `it answered '${kept.stdout.trim()}'` : lastLine(kept.stderr)));
+    }
+    const genBefore = generationBefore(liveGen, keptFloor);
 
     const outside = await sharersRunning(others);
     if (outside === null) {
@@ -2212,6 +2252,7 @@ async function restoreLocked(
     const dbIdent = `"${fleetDb.db.replace(/"/g, '""')}"`;
     const recreate = await managerExec(fleetDb, ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', fleetDb.containerName,
       'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
+      '-c', replicationRoleEnsureSql(REPLICATION_ROLE),
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`]);
     if (!recreate.ok) {
@@ -2296,6 +2337,15 @@ async function restoreLocked(
       console.log(`[FleetBackup] Raised the claim numbers on ${fleetDb.containerName} above ${floor}: ${raised.guilds.length} guild(s) to ${floor + 1}, claim_seq to ${raised.seq}`);
     }
 
+    // The generation: raised above both the row before the drop and the restored row.
+    const genWrite = await writeRestoredGeneration(instance, fleetDb, file, genBefore, ownCopies);
+    if (!genWrite.ok) {
+      const reason = scrubbed(botId, `the generation row could not be written back (${genWrite.error})`);
+      setRestoreError(botId, file, reason, `Bots may take another database of this bot for the main while this one shows the dump's older generation, so the write fence stays on (${back})`);
+      return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
+    }
+    steps.generation = genWrite.generation;
+
     // An instance started meanwhile (a CasaOS tile click) read the database while it was dropped and rebuilt.
     const startedMeanwhile = await sharersRunning(others);
     if (startedMeanwhile === null || startedMeanwhile.names.length > 0) {
@@ -2327,11 +2377,30 @@ async function restoreLocked(
     let noticeWarning = '';
     if (lift === 'lifted') {
       unsavedRestoreErrors.delete(botId);
+      let cleared = true;
       try {
         containerManager.updateInstanceFleetRestoreError(botId, null);
       } catch (err) {
+        cleared = false;
         console.error(`[FleetBackup] Could not clear the restore notice for ${botId}: ${err}`);
         noticeWarning = '; the notice that this restore had not finished could not be cleared (dismiss it on the Database modal)';
+      }
+      if (cleared) {
+        const done = await managerRead(fleetDb, ['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', RESTORE_STATE_CLEAR]);
+        if (!done.ok) console.error(`[FleetBackup] Could not mark the restore of ${file} finished for ${botId}'s copies (${scrubbed(botId, lastLine(done.stderr))}); the switch check marks it within a minute`);
+        if (containerManager.getBot(botId)?.fleetDb?.pushBroken) {
+          let unmarked = false;
+          try {
+            containerManager.updateInstanceFleetDbSwitch(botId, { pushBroken: null });
+            unmarked = true;
+          } catch (err) {
+            console.error(`[Switch] ${nameOf(botId)}: the restore finished, but the mark of an unfinished push could not be cleared (${err instanceof Error ? err.message : String(err)})`);
+          }
+          if (unmarked) {
+            const gone = await managerRead(fleetDb, ['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', receiveMarkClearSql(null)]);
+            if (!gone.ok) console.error(`[Switch] ${nameOf(botId)}: the restore finished, but the mark that tells this database's copies a push did not finish could not be removed (${scrubbed(botId, lastLine(gone.stderr))}); the switch check removes it within a minute`);
+          }
+        }
       }
     } else {
       keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran`, lift, layersHeld, fleetDb.volume, true), lift === 'gone');
@@ -2361,6 +2430,40 @@ async function restoreLocked(
     release();
     busy.delete(botId);
   }
+}
+
+/**
+ * O9's write after the restore, in the session exempt from the fence: a raise above both the generation the database
+ * had before the drop and the restored row, with this machine's name. An ordinary backup owes no switch notice, which
+ * is recorded before the raise; a backup made for a move also cuts the address rows to this machine's own.
+ */
+async function writeRestoredGeneration(instance: InstanceConfig, fleetDb: RestoreFleetDb, file: string, before: GenRow | null, ownCopies: JoinAddress[]): Promise<{ ok: true; generation: number } | { ok: false; error: string }> {
+  const kind = restoreKindOf(file);
+  const read = await managerRead(fleetDb, claimPsql(fleetDb, GEN_READ_SQL, false));
+  const restored = read.ok ? parseGenRow(read.stdout) : missingTable(read.stderr) ? null : undefined;
+  if (restored === undefined) return { ok: false, error: read.ok ? `the restored row read back as '${read.stdout.trim()}'` : lastLine(read.stderr) };
+  const machine = machineNameOf(instance);
+  const target = generationAfterRestore(before, restored, machine, new Date().toISOString());
+  let sql: string;
+  if (kind === 'ordinary') {
+    try {
+      containerManager.updateInstanceFleetDbSwitch(instance.id, { switchNotice: { generation: target.generation, machine, since: null, state: 'not-owed' } });
+    } catch (err) {
+      console.error(`[Switch] ${instance.displayName}: the manager could not record that this restore owes no switch notice (${err instanceof Error ? err.message : String(err)}); the bot may post one for generation ${target.generation}`);
+    }
+    sql = raiseSql(machine, target.generation);
+  } else {
+    const repl = instance.fleetDb?.replication;
+    let own = '';
+    if (repl) {
+      const cert = await readCopyCert(fleetDb.containerName);
+      if (!cert) return { ok: false, error: "this database's certificate could not be read for its address row" };
+      own = addressTableSql(repl.publicHost, repl.hostPort, cert, machine, null);
+    }
+    sql = raiseSql(machine, target.generation, `${cutAddressesSql(repl ? { host: repl.publicHost, port: repl.hostPort } : null)}${own}${copiesInsertSql(ownCopies)}`);
+  }
+  const write = await managerExec(fleetDb, claimPsql(fleetDb, sql, true));
+  return write.ok ? { ok: true, generation: target.generation } : { ok: false, error: lastLine(write.stderr) };
 }
 
 /**

@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { replicationRoleEnsureSql } from '../../src/instance/switchSql';
 
 const h = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -311,6 +312,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
       if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
+      if (sql.includes('FROM smdb_manager.generation') || sql.includes('INSERT INTO smdb_manager.restore_state')) return '0||\n';
       return '';
     };
     return [
@@ -337,7 +339,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     const r = await run(() => '');
     expect(r.success, r.error).toBe(true);
     expect(h.calls).toContainEqual(['exec', C, ...psql('postgres'), '-c', `SELECT count(*) FROM pg_database WHERE datname = 'sm''"db'`]);
-    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`]);
+    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', replicationRoleEnsureSql('replicator'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`]);
     expect(restores()).toEqual([pgRestoreArgv]);
     expect(callWith('pg_restore').filter(a => a.includes('-l'))).toEqual([['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l']]);
     expect(h.calls).toContainEqual([...ex, ...psql(`sm'"db`), '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true }) as string]);

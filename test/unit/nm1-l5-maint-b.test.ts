@@ -552,12 +552,12 @@ describe('the reconciler', () => {
   it('a confirmed hook retry drops the take-the-message error', async () => {
     setup('json', settled('maintenance', { hook: 'unconfirmed', savedByBot: null, lastError: 'the bot did not take the message (busy)' }));
     await pass();
-    expect(rec()).toEqual(settled('maintenance'));
+    expect(rec()).toEqual(settled('maintenance', { held: { state: 'unknown' } }));
   });
   it('a confirmed hook retry keeps another error', async () => {
     setup('json', settled('maintenance', { hook: 'unconfirmed', savedByBot: null, lastError: 'something else' }));
     await pass();
-    expect(rec()).toEqual(settled('maintenance', { lastError: 'something else' }));
+    expect(rec()).toEqual(settled('maintenance', { lastError: 'something else', held: { state: 'unknown' } }));
   });
   it('a hook retry whose write fails is logged', async () => {
     setup('json', settled('maintenance', { hook: 'unconfirmed', savedByBot: null }));

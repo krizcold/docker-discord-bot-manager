@@ -5,6 +5,7 @@
 import * as crypto from 'crypto';
 
 export const JOIN_CODE_PREFIX = 'smdbjoin1.';
+export const MOVE_CODE_PREFIX = 'smdbmove1.';
 export const JOIN_CODE_MAX = 4096;
 
 export interface JoinLogin { user: string; password: string }
@@ -53,21 +54,67 @@ function login(value: unknown, name: string, tamePassword: boolean): JoinLogin |
   return { user, password };
 }
 
-/** Whitespace and line breaks anywhere are ignored, so a code wrapped by a chat window still decodes. */
-export function decodeJoinCode(text: string): DecodedJoin {
+/** A code's body after its prefix, parsed; whitespace and line breaks anywhere are ignored. */
+function codeBody(text: string, prefix: string): { ok: true; o: Record<string, unknown> } | { ok: false; why: string } {
   const raw = String(text ?? '').replace(/\s+/g, '');
-  if (raw.length > JOIN_CODE_MAX) return bad(`it is longer than ${JOIN_CODE_MAX} characters`);
-  if (!raw.startsWith(JOIN_CODE_PREFIX)) return bad(`it does not start with ${JOIN_CODE_PREFIX}`);
-  const body = raw.slice(JOIN_CODE_PREFIX.length);
-  if (!/^[A-Za-z0-9_-]+$/.test(body)) return bad('it is damaged (it does not decode)');
+  if (raw.length > JOIN_CODE_MAX) return { ok: false, why: `it is longer than ${JOIN_CODE_MAX} characters` };
+  if (!raw.startsWith(prefix)) return { ok: false, why: `it does not start with ${prefix}` };
+  const body = raw.slice(prefix.length);
+  if (!/^[A-Za-z0-9_-]+$/.test(body)) return { ok: false, why: 'it is damaged (it does not decode)' };
   let parsed: unknown;
   try {
     parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf-8'));
   } catch {
-    return bad('it is damaged (it does not decode)');
+    return { ok: false, why: 'it is damaged (it does not decode)' };
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return bad('it is damaged (it does not decode)');
-  const o = parsed as Record<string, unknown>;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, why: 'it is damaged (it does not decode)' };
+  return { ok: true, o: parsed as Record<string, unknown> };
+}
+
+/** Whitespace and line breaks anywhere are ignored, so a code wrapped by a chat window still decodes. */
+export function decodeJoinCode(text: string): DecodedJoin {
+  const body = codeBody(text, JOIN_CODE_PREFIX);
+  return body.ok ? checkJoinFields(body.o) : bad(body.why);
+}
+
+/**
+ * The move code a receiving manager hands out: the join code's fields plus the time-limited receive login. The
+ * pushing manager logs in with it to replace the receiver's database.
+ */
+export interface MoveCode extends JoinCode { recv: JoinLogin & { id: string } }
+
+export type DecodedMove = { ok: true; code: MoveCode } | { ok: false; why: string };
+
+const PUSH_ID_RE = /^[0-9a-f]{24}$/;
+
+export function encodeMoveCode(code: MoveCode): string {
+  const body = {
+    v: 1, host: code.host, port: code.port, db: code.db, fp: code.fp, machine: code.machine,
+    repl: { user: code.repl.user, password: code.repl.password },
+    app: { user: code.app.user, password: code.app.password },
+    recv: { user: code.recv.user, password: code.recv.password, id: code.recv.id },
+  };
+  return `${MOVE_CODE_PREFIX}${base64url(JSON.stringify(body))}`;
+}
+
+export function decodeMoveCode(text: string): DecodedMove {
+  const body = codeBody(text, MOVE_CODE_PREFIX);
+  if (!body.ok) return { ok: false, why: body.why };
+  const fields = checkJoinFields(body.o);
+  if (!fields.ok) return fields;
+  const recv = login(body.o.recv, 'receive', true);
+  if (typeof recv === 'string') return { ok: false, why: `it names no valid ${recv}` };
+  const id = (body.o.recv as Record<string, unknown>).id;
+  if (typeof id !== 'string' || !PUSH_ID_RE.test(id)) return { ok: false, why: 'it names no valid receive id' };
+  return { ok: true, code: { ...fields.code, recv: { ...recv, id } } };
+}
+
+export function isMoveCode(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.trim().startsWith(MOVE_CODE_PREFIX);
+}
+
+/** The fields a join code and a move code share. */
+function checkJoinFields(o: Record<string, unknown>): DecodedJoin {
   if (o.v !== 1) return field('version');
   if (typeof o.host !== 'string' || o.host.length > 253 || !HOST_RE.test(o.host)) return field('host');
   if (typeof o.port !== 'number' || !Number.isInteger(o.port) || o.port < 1 || o.port > 65535) return field('port');

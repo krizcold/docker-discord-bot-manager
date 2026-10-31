@@ -313,26 +313,6 @@ describe('install form rendering', () => {
   });
 });
 
-describe('fleet adopt closes only the modal it ran from', () => {
-  it('a late adopt answer leaves another bot\'s fleet modal open and names its instance', async () => {
-    const d = deferred();
-    let hidden = 0; const messages: string[][] = [];
-    const ctx = runPage(['botLabel', 'adoptPromotedReplica'], {
-      bots, fleetBackupBotId: 'b1', confirm: () => true,
-      api: async () => d.promise,
-      hideFleetBackups: () => { hidden++; }, loadBots: () => {},
-      showMessage: (t: string, m: string) => messages.push([t, m]),
-    });
-    const p = ctx.adoptPromotedReplica('b1');
-    await tick();
-    ctx.fleetBackupBotId = 'b2';
-    d.resolve({ success: true });
-    await p;
-    expect(hidden).toBe(0);
-    expect(messages[0][1]).toMatch(/Bot 1/);
-  });
-});
-
 describe('review fixes', () => {
   const renderGlobals = (content: any) => ({
     sources: [{ id: 's1', url: 'https://x/one.git' }], installSourceId: 's1', installNameLocked: true, installEnvHints: [],

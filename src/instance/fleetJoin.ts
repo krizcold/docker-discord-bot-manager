@@ -15,12 +15,14 @@ import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
 import { getBotDir } from '../git/repoManager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { callAppHook } from './appHookClient';
 import { redactSecrets } from '../config/secretText';
 import {
   addressList, CERT_PEM_RE, certFingerprint, decodeJoinCode, formatBackendUrlList, fp16, HOST_RE, isJoinCode,
   JoinCode, lsnToBigInt, machineText, sqlLiteral,
 } from '../config/joinCode';
 import { FleetJoinRecord, InstanceConfig, JoinAddress } from '../types';
+import { GEN_READ_SQL, GenRow, machineNameOf, parseGenRow, RECEIVE_MARK_COUNT_SQL } from './switchSql';
 
 const PGDATA = '/var/lib/postgresql/data';
 export const CERT_TIMEOUT_MS = 10_000;
@@ -62,18 +64,33 @@ function dockerRm(name: string): Promise<void> {
  */
 export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password'>, mounts: string[], entrypoint: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    const child = spawn('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
-      ...mounts.flatMap(m => ['-v', m]),
-      '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
+        ...mounts.flatMap(m => ['-v', m]),
+        '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
+    } catch (err) {
+      resolve({ ok: false, stdout: '', stderr: `docker run could not start (${errorText(err)})` });
+      return;
+    }
     let stdout = '';
     let stderr = '';
+    let done = false;
+    const finish = (r: { ok: boolean; stdout: string; stderr: string }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
     const timer = setTimeout(() => {
-      execFile('docker', ['rm', '-f', name], () => child.kill('SIGKILL'));
+      try {
+        execFile('docker', ['rm', '-f', name], () => { try { child.kill('SIGKILL'); } catch { /* gone */ } });
+      } catch { /* the rm could not start; the close or error ends the wait */ }
     }, timeoutMs);
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr: redactSecrets(stderr, [dsn.password]) }); });
+    child.stdout?.on('data', d => { stdout += d; });
+    child.stderr?.on('data', d => { stderr += d; });
+    child.on('error', () => finish({ ok: false, stdout, stderr: stderr || 'docker run failed' }));
+    child.on('close', code => finish({ ok: code === 0, stdout, stderr: redactSecrets(stderr, [dsn.password]) }));
   });
 }
 
@@ -265,6 +282,47 @@ export async function mainProbe(instance: InstanceConfig, code: JoinCode, pem: s
   return { ok: true, facts: { systemId, timeline: Number(timeline), lsn, inRecovery: rec === 'true', slot: slotState as SlotState } };
 }
 
+export type PeerProbe =
+  | { kind: 'writable' | 'in-recovery'; systemId: string; timeline: number; gen: GenRow | null; receiveMark: boolean | null }
+  | { kind: 'fenced'; systemId: string; reason: string }
+  | { kind: 'unreachable'; reason: string }
+  | { kind: 'login-refused'; reason: string };
+
+const HBA_REJECT_RE = /pg_hba\.conf rejects connection|no pg_hba\.conf entry/i;
+
+/**
+ * Another database of this bot, read as the replication login over verify-full: IDENTIFY_SYSTEM, whether it is in
+ * recovery, and its generation row. When IDENTIFY_SYSTEM answered and the SQL session was refused by pg_hba, the
+ * database is under a write fence (its lines admit replication only).
+ */
+export async function peerProbe(instance: InstanceConfig, code: JoinCode, pem: string, suffix = 'peer'): Promise<PeerProbe> {
+  const login = loginOf(code);
+  const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
+  const name = `${instance.sanitizedName}-fleet-${suffix}-probe`;
+  await dockerRm(name);
+  const dsn = seedDsnFor(login);
+  const script = 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 3; '
+    + 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
+    + 'psql "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
+  const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, GEN_READ_SQL, seedDsnFor({ ...login, db: 'postgres' }), RECEIVE_MARK_COUNT_SQL], CLIENT_TIMEOUT_MS);
+  const lines = r.stdout.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const [systemId, timeline] = (lines[0] || '').split('|');
+  const identified = /^\d+$/.test(systemId || '') && /^\d+$/.test(timeline || '');
+  if (!r.ok) {
+    const reason = firstReason(r.stderr).split(login.password).join('***');
+    if (identified && lines.length === 1 && HBA_REJECT_RE.test(r.stderr)) return { kind: 'fenced', systemId, reason };
+    if (identified) return { kind: 'unreachable', reason };
+    return { kind: isLoginRefusal(r.stderr) ? 'login-refused' : 'unreachable', reason };
+  }
+  const rec = lines[1];
+  const gen = parseGenRow(lines[2] || '');
+  if (!identified || (rec !== 'true' && rec !== 'false') || gen === undefined) {
+    return { kind: 'unreachable', reason: 'the database gave an answer the manager does not read' };
+  }
+  const receiveMark = /^\d+$/.test(lines[3] ?? '') ? Number(lines[3]) > 0 : null;
+  return { kind: rec === 'true' ? 'in-recovery' : 'writable', systemId, timeline: Number(timeline), gen, receiveMark };
+}
+
 export function probeFailureText(code: JoinCode, p: Extract<MainProbe, { ok: false }>): string {
   return p.kind === 'login' ? loginRefusedText(code.host, code.port, p.reason) : unreachableText(code.host, code.port, p.reason);
 }
@@ -274,7 +332,7 @@ const ADDRESS_READ_SQL = `SELECT COALESCE(json_agg(json_build_object('host', a.h
 FROM smdb_manager.addresses a
 WHERE a.slot IS NULL OR EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.slot_name = a.slot);`;
 
-function primarySql(instance: InstanceConfig, code: JoinCode, pem: string, suffix: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+export function primarySql(instance: InstanceConfig, code: JoinCode, pem: string, suffix: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   const login = loginOf(code);
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   const name = `${instance.sanitizedName}-fleet-join-${suffix}`;
@@ -290,6 +348,16 @@ function validAddress(row: unknown): JoinAddress | null {
   if (typeof r.cert !== 'string' || !CERT_PEM_RE.test(r.cert.trim())) return null;
   try { certFingerprint(r.cert); } catch { return null; }
   return { host: r.host, port: r.port, slot: (r.slot as string | null) ?? null, cert: r.cert.trim(), machine: machineText(typeof r.machine === 'string' ? r.machine : '') };
+}
+
+/** A JSON list of address rows (OWN_COPIES_READ_SQL's answer), malformed rows left out; empty when it does not parse. */
+export function parseAddressRows(text: string): JoinAddress[] {
+  try {
+    const parsed = JSON.parse(text.trim() || '[]');
+    return Array.isArray(parsed) ? parsed.map(validAddress).filter((a): a is JoinAddress => a !== null) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** J7 and F2: the main's address list, rows with a malformed field left out. */
@@ -388,7 +456,94 @@ export function computeEnvList(instance: InstanceConfig): string[] | null {
  * value differs. Throws when the env store refuses the write. The instance is read here, in the same synchronous step as
  * the env write, so a join or copy record saved while the caller awaited is never overwritten by an older one.
  */
-export async function writeEnvList(botId: string, opts: { mark?: boolean } = {}): Promise<{ changed: boolean; markError?: string }> {
+/** What the running bot answered to a new database list (contract 3's addresses hook, D31). */
+export type AddressesOutcome =
+  | { state: 'not-running' }
+  | { state: 'applied'; note?: string }
+  | { state: 'refused'; error: string }
+  | { state: 'unsupported' }
+  | { state: 'pending'; error: string };
+
+export function addressesState(r: { ok: boolean; status?: number; unknown?: boolean; error?: string; body?: unknown } | 'not-running'): AddressesOutcome {
+  if (r === 'not-running') return { state: 'not-running' };
+  if (r.ok) {
+    const note = (r.body as { note?: unknown } | undefined)?.note;
+    return typeof note === 'string' && note ? { state: 'applied', note } : { state: 'applied' };
+  }
+  if (r.status === 400) return { state: 'refused', error: r.error || 'no reason given' };
+  if (r.status === 404 || r.status === 409) return { state: 'unsupported' };
+  return { state: 'pending', error: r.error || 'no reason given' };
+}
+
+/** The AD tail a writer adds to its own text; '' when the bot was not running. */
+export function addressesText(o: AddressesOutcome | undefined): string {
+  if (!o || o.state === 'not-running') return '';
+  if (o.state === 'applied') return o.note ? ` The bot took the new database list (${o.note}).` : ' The running bot took the new database list.';
+  if (o.state === 'refused') return ` The bot refused the new database list (${o.error}), so it uses the list only from its next start (Apply on the card, or Restart).`;
+  if (o.state === 'unsupported') return " This bot's build does not take a new database list while it runs, so it uses the list from its next start (Apply on the card, or Restart).";
+  return ` The manager can't confirm that the running bot took the new database list (${o.error}); it sends the list again every minute until the bot answers.`;
+}
+
+/** The bot's own answer timeout is 5 s; the manager waits a little longer. */
+export const ADDRESSES_HOOK_MS = 10_000;
+
+const listDigest = (value: string) => crypto.createHash('sha256').update(value).digest('hex').slice(0, 16);
+
+function recordOffer(instance: InstanceConfig, digest: string, o: AddressesOutcome): void {
+  const at = new Date().toISOString();
+  const rec = o.state === 'refused' ? { digest, state: 'refused' as const, error: o.error, at }
+    : o.state === 'unsupported' ? { digest, state: 'unsupported' as const, at }
+    : o.state === 'pending' ? { digest, state: 'pending' as const, error: o.error, at }
+    : null;
+  try {
+    if (rec || instance.addressesPush) containerManager.updateInstanceAddressesPush(instance.id, rec);
+  } catch (err) {
+    console.error(`[Switch] ${instance.displayName}: the outcome of the database list offer could not be recorded (${errorText(err)})`);
+  }
+}
+
+/**
+ * Contract 3's addresses hook (D31): the URL key's value offered to the running bot. A bot that is not running reads
+ * the env at its next start, so nothing is sent or recorded. The env value is never undone, whatever the answer.
+ */
+export async function sendAddresses(botId: string): Promise<AddressesOutcome> {
+  const instance = containerManager.getBot(botId);
+  const key = instance ? findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url : undefined;
+  if (!instance || !key) return { state: 'not-running' };
+  if (await containerManager.appContainerRunning(botId) !== true) return { state: 'not-running' };
+  const value = (envManager.getEnvVars(botId)[key] || '').trim();
+  const outcome = addressesState(await callAppHook(instance, 'addresses', 'POST', { url: value }, ADDRESSES_HOOK_MS));
+  recordOffer(containerManager.getBot(botId) ?? instance, listDigest(value), outcome);
+  return outcome;
+}
+
+/** AD-LOG's words for an outcome. */
+export function addressesLogText(o: AddressesOutcome): string {
+  if (o.state === 'applied') return 'took the new database list';
+  if (o.state === 'refused') return `refused the new database list (${o.error})`;
+  if (o.state === 'unsupported') return 'has no hook for a new database list';
+  return o.state === 'pending' ? `did not confirm the new database list (${o.error}); the manager sends it again every minute` : 'is not running';
+}
+
+/** N-h: a pending offer sent again while the env value is the one it was for; a newer value drops it. */
+export async function retryAddresses(botId: string): Promise<void> {
+  const instance = containerManager.getBot(botId);
+  const push = instance?.addressesPush;
+  if (!instance || push?.state !== 'pending') return;
+  const key = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+  const value = key ? (envManager.getEnvVars(botId)[key] || '').trim() : '';
+  if (!key || listDigest(value) !== push.digest || await containerManager.appContainerRunning(botId) === false) {
+    recordOffer(instance, push.digest, { state: 'not-running' });
+    return;
+  }
+  const o = await sendAddresses(botId);
+  if (o.state !== 'pending' && o.state !== 'not-running') {
+    const line = `[Switch] ${instance.displayName}: the running bot ${addressesLogText(o)}`;
+    if (o.state === 'applied') console.log(line); else console.warn(line);
+  }
+}
+
+export async function writeEnvList(botId: string, opts: { mark?: boolean } = {}): Promise<{ changed: boolean; markError?: string; addresses?: AddressesOutcome }> {
   const instance = containerManager.getBot(botId);
   if (!instance) return { changed: false };
   const key = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
@@ -397,12 +552,13 @@ export async function writeEnvList(botId: string, opts: { mark?: boolean } = {})
   const value = formatBackendUrlList(list);
   if ((envManager.getEnvVars(instance.id)[key] || '').trim() === value) return { changed: false };
   envManager.setEnvVars(instance.id, { [key]: value });
-  if (opts.mark === false) return { changed: true };
+  const addresses = await sendAddresses(botId);
+  if (opts.mark === false) return { changed: true, addresses };
   try {
     await containerManager.markPendingApplyIfRunning(instance.id);
-    return { changed: true };
+    return { changed: true, addresses };
   } catch (err) {
-    return { changed: true, markError: errorText(err) };
+    return { changed: true, addresses, markError: errorText(err) };
   }
 }
 
@@ -443,15 +599,14 @@ export function readCopyCert(containerName: string): Promise<string | null> {
   });
 }
 
-/** The name other machines see for this machine: its address when it has one, else the instance's name. */
-export function machineNameOf(instance: InstanceConfig): string {
-  return machineText(instance.fleetDbReplica?.publicHost || instance.fleetDb?.replication?.publicHost || instance.displayName || '');
-}
+export { machineNameOf };
 
 export type JoinResult = { success: true; message: string; addressCount: number } | { success: false; error: string };
 
 export interface JoinOpts {
   inBuild?: boolean;
+  /** The caller holds the instance's op lock already: the join runs in it and marks the bot for an Apply as a normal join does. */
+  inLock?: boolean;
   emit?: (msg: string) => void;
 }
 
@@ -530,13 +685,15 @@ async function joinRun(instance: InstanceConfig, code: JoinCode, text: string, o
     if (registered) console.warn(`[FleetCopy] ${instance.displayName}: the copy's address could not be added to the main's list: ${registered}`);
   }
   const count = computeEnvList(containerManager.getBot(instance.id) ?? instance)?.length ?? 1;
-  let written: { changed: boolean; markError?: string };
+  let written: { changed: boolean; markError?: string; addresses?: AddressesOutcome };
   try {
     written = await writeEnvList(instance.id, { mark: !opts.inBuild });
   } catch (err) {
     return { success: false, error: `The join code is saved, but the Database URL could not be written (${errorText(err)}). The manager writes it again within 5 minutes; press Join again to try now.` };
   }
-  let message = `Joined the main at ${code.host}:${code.port}. The bot uses the ${count} database address(es) from its next start (Apply on the card, or Restart).`;
+  let message = written.addresses?.state === 'applied'
+    ? `Joined the main at ${code.host}:${code.port}. The bot uses the ${count} database address(es) now.${addressesText(written.addresses)}`
+    : `Joined the main at ${code.host}:${code.port}. The bot uses the ${count} database address(es) from its next start (Apply on the card, or Restart).${addressesText(written.addresses)}`;
   if (rec && (rec.primaryHost !== code.host || rec.primaryPort !== code.port)) {
     message += ` The copy on this machine still follows ${rec.primaryHost}:${rec.primaryPort}; press Re-seed to rebuild it from ${code.host}:${code.port}.`;
   }
@@ -551,6 +708,10 @@ export async function joinFleet(instance: InstanceConfig, codeText: string, opts
   const decoded = decodeJoinCode(text);
   if (!decoded.ok) return { success: false, error: `This is not a join code: ${decoded.why}` };
   if (opts.inBuild) return joinRun(instance, decoded.code, text, opts);
+  if (opts.inLock) {
+    const fresh = containerManager.getBot(instance.id);
+    return fresh ? joinRun(fresh, decoded.code, text, opts) : { success: false, error: 'Bot not found' };
+  }
   if (!findAppCapabilities(instance.sourceUrl)?.companionDb) return { success: false, error: COMPANION_REFUSAL };
   const busy = containerManager.isBotBusy(instance.id);
   if (busy) return { success: false, error: `Operation '${busy}' is running on this instance; wait for it to finish` };

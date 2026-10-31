@@ -8,7 +8,7 @@ import * as containerManager from '../docker/containerManager';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as fleetReplica from './fleetReplica';
 import {
-  mainCertificate, mainProbe, machineNameOf, readCopyFacts, refreshDue, refreshJoin, SlotState, storedJoin, writeEnvList,
+  AddressesOutcome, addressesLogText, mainCertificate, mainProbe, machineNameOf, readCopyFacts, refreshDue, refreshJoin, SlotState, storedJoin, writeEnvList,
 } from './fleetJoin';
 import { alertStep, dmOutcomeText, utcText } from './backupFiles';
 import { notifyOwner } from './backupCheck';
@@ -288,12 +288,24 @@ function watched(id: string): InstanceConfig | null {
   return instance;
 }
 
+const offerLogged = new Map<string, string>();
+
+/** AD-LOG: an offer the running bot did not take, logged once per change of its outcome. */
+function logOffer(instance: InstanceConfig, written: { addresses?: AddressesOutcome }): void {
+  const o = written.addresses;
+  if (!o || o.state === 'not-running') return;
+  const line = `[Switch] ${instance.displayName}: the running bot ${addressesLogText(o)}`;
+  if (offerLogged.get(instance.id) === line) return;
+  offerLogged.set(instance.id, line);
+  if (o.state !== 'applied') console.warn(line);
+}
+
 /** Each env write reads the instance in the same synchronous step, so a join saved while the tick ran is never overwritten. */
 async function tickOne(id: string, now: number): Promise<void> {
   const instance = watched(id);
   if (!instance) return;
   try {
-    await writeEnvList(id);
+    logOffer(instance, await writeEnvList(id));
   } catch (err) {
     console.warn(`[FleetCopy] ${instance.displayName}: the Database URL could not be written: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -301,7 +313,7 @@ async function tickOne(id: string, now: number): Promise<void> {
   if (before?.fleetJoin && refreshDue(before.fleetJoin, now)) {
     try {
       await refreshJoin(before);
-      if (watched(id)) await writeEnvList(id);
+      if (watched(id)) logOffer(instance, await writeEnvList(id));
     } catch (err) {
       console.warn(`[FleetCopy] ${instance.displayName}: the address list could not be refreshed: ${err instanceof Error ? err.message : String(err)}`);
     }

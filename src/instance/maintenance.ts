@@ -11,14 +11,15 @@ import { callAppHook, AppHookResult } from './appHookClient';
 import * as dbLogin from './dbLogin';
 import * as fleetBackup from './fleetBackup';
 import { fenceOwnerLane, fenceOwnerText } from './fleetBackupGuards';
-import { BotRunState, InstanceConfig, MaintenanceRecord } from '../types';
+import { hasSwitchMark, switchStateRefusal } from './switchSql';
+import { BotRunState, InstanceConfig, MaintenanceHeld, MaintenanceRecord } from '../types';
 
 export type MaintenanceKind = 'database' | 'copy' | 'external' | 'json' | 'none';
 export type PlanStep = 'hook' | 'db-up' | 'block' | 'end-sessions' | 'stop' | 'db-up-alone' | 'open' | 'start' | 'hook-wait';
 export type OrderResult = { settled: boolean; text: string };
 export type Admission = { accepted: true } | { accepted: false; status: number; error: string };
 export type MaintenanceProof =
-  | { ok: true; state: 'maintenance' | 'off'; enforcement: 'database' | 'hook' | 'stopped'; botConfirmed: boolean }
+  | { ok: true; state: 'maintenance' | 'off'; enforcement: 'database' | 'hook' | 'stopped'; botConfirmed: boolean; held?: MaintenanceHeld }
   | { ok: false; error: string };
 
 export const MESSAGE_MAX = 1500;
@@ -51,10 +52,10 @@ const R13_FENCE = (f: FenceFound): string => {
 };
 
 /** The read-only layer as a read found it; owner and persisted are unknown when the read failed or said off. */
-type FenceFound = { owner?: string | null; persisted?: boolean | null };
+export type FenceFound = { owner?: string | null; persisted?: boolean | null };
 
 /** The layer as the operator reads it: whose it is, and the remedy its owner gives (null when no known step lifts it). */
-function fenceWords(f: FenceFound): { owned: boolean; state: string; remedy: string | null; retry: string | null } {
+export function fenceWords(f: FenceFound): { owned: boolean; state: string; remedy: string | null; retry: string | null } {
   const lane = fenceOwnerLane(f.owner ?? null);
   const remedy = f.persisted === false ? "its read-only setting is not saved in the database's configuration, so restarting the instance clears it"
     : lane === 'restore' ? 'with the bot in Maintenance or Off, run a restore again to lift the fence'
@@ -187,13 +188,27 @@ export function settledVerdict(p: { kind: MaintenanceKind; to: BotRunState; hook
 }
 
 type HookOutcome =
-  | { hook: 'confirmed'; restarting?: boolean | null }
+  | { hook: 'confirmed'; restarting?: boolean | null; held?: MaintenanceHeld }
   | { hook: 'missing' }
   | { hook: 'unconfirmed'; why: 'unknown' | 'unreachable' | 'refused'; reason: string; detail: string };
 
-/** The bot's answer to 'running' says whether it restarts its process (contract 1); anything but a boolean reads as null. */
+const countOf = (v: unknown): number => (Array.isArray(v) ? v.length : typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0);
+
+/** Contract 1's `saved`: true, false (with what was left), or anything else as unknown. */
+export function heldOf(body: unknown): MaintenanceHeld {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  if (b.saved === true) return { state: 'yes' };
+  if (b.saved === false) return { state: 'no', guilds: countOf(b.unsavedGuilds), files: countOf(b.unsavedFiles) };
+  return { state: 'unknown' };
+}
+
+/**
+ * The bot's answer to 'running' says whether it restarts its process, and its answer to 'maintenance' whether it saved
+ * what it held (contract 1); anything but a boolean reads as null or unknown.
+ */
 function hookOutcome(r: AppHookResult, state?: 'running' | 'maintenance'): HookOutcome {
   if (r.ok) {
+    if (state === 'maintenance') return { hook: 'confirmed', held: heldOf(r.body) };
     if (state !== 'running') return { hook: 'confirmed' };
     const restarting = r.body?.restarting;
     return { hook: 'confirmed', restarting: typeof restarting === 'boolean' ? restarting : null };
@@ -376,6 +391,8 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   if (hold) return refuse(409, hold.error);
   const deleting = containerManager.deleteLaneRefusal(botId, 'a state change');
   if (deleting) return refuse(409, deleting.error);
+  const switched = switchStateRefusal(inst, to);
+  if (switched) return refuse(409, switched);
   if (mode === 'order' && to === 'running' && inst.fleetDb && inst.fleetRestoreError) return refuse(409, R13(fleetBackup.shownRestoreNoticeFile(botId) ?? inst.fleetRestoreError.file));
   const kindRead = readKind(inst);
   if ('error' in kindRead) return refuse(409, kindRead.error);
@@ -459,7 +476,11 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
     rec.hook = h.hook;
     if (h.hook === 'confirmed') rec.savedByBot = hookState(to);
     o.savedByBot = rec.savedByBot;
+    if (to === 'running') return;
+    if (h.hook === 'confirmed' && h.held) rec.held = h.held;
+    else delete rec.held;
   };
+  if (mode === 'order' && to !== 'running' && app === false && !steps.includes('hook') && !steps.includes('hook-wait')) rec.held = { state: 'not-running' };
   let dbTouched = false;
   let opened = false;
   let stopped = false;
@@ -505,6 +526,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
       stopped = true;
       const r = await containerManager.stopBotInOp(botId, OP);
       if (!r.success && r.error !== 'Bot is not running') o.stopFail = r.error || 'no reason given';
+      else if (rec.held?.state !== 'yes') rec.held = { state: 'stopped' };
     } else if (step === 'db-up-alone') {
       if (await dbLogin.sidecarRunning(target!.container) === true) continue;
       const r = await containerManager.startFleetDbSidecar(botId);
@@ -629,7 +651,7 @@ export async function requireMaintenance(botId: string, need: 'database' | 'any'
     if (read.login.canLogin === null) return { ok: false, error: `The manager can't confirm the bot's database login is blocked: the role ${target.user} does not exist` };
     if (read.login.canLogin) return { ok: false, error: `The bot's database login is open although the state is ${NAME[state]}; the manager blocks it again within 30 seconds, then retry` };
     if (read.login.sessions > 0) return { ok: false, error: `${read.login.sessions} session(s) of the bot's database role are open although its login is blocked; retry in a moment` };
-    return { ok: true, state, enforcement: 'database', botConfirmed: rec.hook === 'confirmed' };
+    return { ok: true, state, enforcement: 'database', botConfirmed: rec.hook === 'confirmed', ...(rec.held ? { held: rec.held } : {}) };
   }
   if (need === 'database') {
     if (kind === 'copy') return { ok: false, error: "This machine holds a live copy, so this manager cannot confirm the bot's database login is blocked" };
@@ -642,11 +664,11 @@ export async function requireMaintenance(botId: string, need: 'database' | 'any'
     const app = await containerManager.appContainerRunning(botId);
     if (app === null) return { ok: false, error: "Docker did not say whether the bot runs, so the manager can't confirm it is off" };
     if (app) return { ok: false, error: 'The state is Off, but the bot runs; choose Off again' };
-    return { ok: true, state, enforcement: 'stopped', botConfirmed: rec.hook === 'confirmed' };
+    return { ok: true, state, enforcement: 'stopped', botConfirmed: rec.hook === 'confirmed', ...(rec.held ? { held: rec.held } : {}) };
   }
-  const h = hookOutcome(await sendHook(inst, 'maintenance', rec.message));
+  const h = hookOutcome(await sendHook(inst, 'maintenance', rec.message), 'maintenance');
   if (h.hook !== 'confirmed') return { ok: false, error: `The bot did not confirm it is in maintenance (${h.hook === 'missing' ? 'its build has no maintenance hook' : h.reason})` };
-  return { ok: true, state, enforcement: 'hook', botConfirmed: true };
+  return { ok: true, state, enforcement: 'hook', botConfirmed: true, ...(h.held ? { held: h.held } : {}) };
 }
 
 function postgresBackendOf(inst: InstanceConfig): boolean {
@@ -788,9 +810,13 @@ async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<voi
       const now = containerManager.getBot(inst.id);
       const stored = now ? maintenanceOf(now) : null;
       if (!stored || !stored.settled || stored.state !== rec.state || stored.hook !== 'unconfirmed') return;
-      const h = hookOutcome(await sendHook(inst, hookState(stored.state), stored.message));
+      const h = hookOutcome(await sendHook(inst, hookState(stored.state), stored.message), hookState(stored.state));
       if (h.hook === 'unconfirmed') return;
       const next: MaintenanceRecord = { ...stored, hook: h.hook, ...(h.hook === 'confirmed' ? { savedByBot: hookState(stored.state) } : {}) };
+      if (stored.state !== 'running') {
+        if (h.hook === 'confirmed' && h.held) next.held = h.held;
+        else delete next.held;
+      }
       if (h.hook === 'confirmed' && next.lastError?.startsWith('the bot did not take the message')) delete next.lastError;
       containerManager.updateInstanceMaintenance(inst.id, next);
       if (h.hook === 'confirmed') console.log(`[Maintenance] ${inst.displayName}: the bot took the ${NAME[stored.state]} order on a retry`);
@@ -803,6 +829,7 @@ async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<voi
   const current = latest ? maintenanceOf(latest) : null;
   if (!current?.settled) return;
   if (current.state === 'running') {
+    if (read.login.canLogin === false && hasSwitchMark(latest!)) return;
     if (read.login.canLogin === false) setDrift(inst, D_LOGIN, `[Maintenance] ${inst.displayName}: the bot's database login is blocked while its state is Running`);
     else if (read.login.canLogin === true) clearDrift(inst.id);
     return;

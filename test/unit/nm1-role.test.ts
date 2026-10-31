@@ -220,6 +220,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t\n';
       if (sql.includes('SELECT coalesce(GREATEST(')) return '7\n';
       if (sql.includes("setval('smdb_data.claim_seq'")) return 'seq|8\nguild|g1\n';
+      if (sql.includes('FROM smdb_manager.generation') || sql.includes('INSERT INTO smdb_manager.restore_state')) return '0||\n';
       return '';
     };
     return [

@@ -57,6 +57,113 @@ export interface FleetDbRecord {
   replication?: FleetDbReplication;
   retiringAt?: string;                 // ISO time a retire first began removing this database; leaves with the record once a retire finishes
   keptPlain?: string[];                // FleetDbReplication.keptPlain a Disable carried over; the next start narrows them
+  handover?: FleetDbHandover;          // this main was handed over, pushed or moved out by file; cleared by Cancel or with the record at the rejoin
+  receive?: FleetDbReceive;            // this database waits for a push from another machine
+  replacedBy?: FleetDbReplaced;        // another database of this bot took over as the main with a higher generation
+  mainConflict?: FleetDbConflict;      // another database accepts writes as the main with the same generation
+  switchNotice?: FleetDbSwitchNotice;  // the switch-notice sent to the bot for the generation this main holds
+  pushBroken?: { at: string; safetyDump: string; copies?: JoinAddress[] }; // a push replaced this database and did not finish; cleared by a finished push or a restore
+  formerMain?: FleetDbFormerMain;      // the main this database took over from, with its join code (encrypted at rest)
+}
+
+export interface FleetDbFormerMain {
+  code: string;
+  slot: string;
+  machine: string;
+  host: string;
+  port: number;
+  generation: number;
+  at: string;
+  /** Why N-d cannot check the old main: its certificate or its join code (D56). */
+  checkError?: { kind: 'cert' | 'code'; reason: string };
+}
+
+export interface FleetDbHandover {
+  mode: 'stream' | 'push' | 'file';
+  phase: 'waiting' | 'stopped' | 'pushing' | 'done';
+  at: string;
+  slot?: string;
+  machine?: string;
+  host?: string;
+  port?: number;
+  cert?: string;
+  generation?: number;
+  file?: string;
+  lastError?: string;
+  rejoinError?: string;
+  rejoinTriedAt?: number;
+  lastCheck?: string;
+}
+
+export interface FleetDbReceive {
+  startedAt: string;
+  expiresAt: string;
+  safetyDump: string;
+  /** The id the move code carries and the push's received row names; a new one at every Receive. */
+  pushId: string;
+  /** The push ids of the earlier codes of this mark (Receive again); a push made with one of them still counts (D53). */
+  priorIds?: string[];
+  /** The bot database's oid when receiving began: a push that dropped it changes it. */
+  dbOid: string;
+  /** This machine's copy rows, written back once a push finishes. */
+  copies?: JoinAddress[];
+}
+
+export interface FleetDbReplaced {
+  machine: string;
+  host: string;
+  port: number;
+  generation: number;
+  own: number;
+  since: string | null;
+  at: string;
+  cert?: string;
+  blockError?: string;
+  /** N-g: the replaced main's bot put in Off once it holds nothing it could not save. */
+  off?: { state: 'off' | 'held' | 'failed'; held?: MaintenanceHeld; askedAt?: number; at: string; error?: string };
+  dm?: OwnerDm;
+}
+
+/** The outcome of an owner message (contract 7), kept so a posted one is never sent again. */
+export interface OwnerDm {
+  key: string;
+  state: 'posted' | 'repeat' | 'failed' | 'unknown' | 'unsupported';
+  place?: 'channel' | 'dm';
+  note?: string;
+  error?: string;
+  triedAt: number;
+}
+
+export interface FleetDbConflict {
+  machine: string;
+  host: string;
+  port: number;
+  generation: number;
+  at: string;
+  cert?: string;
+  blockError?: string;
+  dm?: OwnerDm;
+}
+
+export interface FleetDbSwitchNotice {
+  generation: number;
+  machine: string;
+  since: string | null;
+  state: 'pending' | 'sent' | 'already' | 'refused' | 'unknown' | 'unsupported' | 'not-owed';
+  triedAt?: number;
+  /** The bot's own note and where its copy went (contract 5's answer). */
+  note?: string;
+  channel?: string;
+  /** The bot was not running, so nothing was sent yet. */
+  waiting?: boolean;
+  error?: string;
+}
+
+export interface FleetDbTakeover {
+  startedAt: string;
+  planned: boolean;
+  generation: number;
+  inherit?: { file: string; at: string };
 }
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).
@@ -104,6 +211,8 @@ export interface FleetDbReplicaRecord {
   seededAt?: number;
   /** The seed that last built this copy whole (its startedAt): the run that asked for that seed reads it back as identity. */
   seededBy?: number;
+  /** A Take over that started and has not finished. */
+  takeover?: FleetDbTakeover;
 }
 
 export type FleetReplicaSeedPurpose = 'provision' | 'reseed-standby' | 'reseed-stale-primary';
@@ -235,6 +344,7 @@ export interface InstanceConfig {
   fleetDb?: FleetDbRecord;             // manager-provisioned fleet Postgres sidecar
   fleetDbReplica?: FleetDbReplicaRecord; // manager-provisioned standby of another machine's fleet DB
   fleetDbReplicaSeed?: FleetReplicaSeedRecord; // standby seed in flight or parked (B4m-2b); cleared on success, cancel or dismiss
+  addressesPush?: { digest: string; state: 'pending' | 'refused' | 'unsupported'; error?: string; at: string }; // a database list offered to the running bot (contract 3), never the value
   fleetDbReplicaKept?: { volume: string; removedAt: string; held: 'standby' | 'promoted' | 'unknown' }; // what the volume Remove replica kept held then; cleared when a seed refiles a standby on it
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
@@ -278,6 +388,10 @@ export interface InstanceConfig {
 
 export type BotRunState = 'running' | 'maintenance' | 'off';
 
+export type MaintenanceHeld =
+  | { state: 'yes' | 'unknown' | 'stopped' | 'not-running' }
+  | { state: 'no'; guilds: number; files: number };
+
 export interface MaintenanceRecord {
   state: BotRunState;
   message: string;                    // '' = the bot's default text
@@ -286,6 +400,7 @@ export interface MaintenanceRecord {
   hook: 'confirmed' | 'unconfirmed' | 'missing' | 'none';
   login: 'blocked' | 'open' | 'unconfirmed' | 'not-managed';
   savedByBot: 'running' | 'maintenance' | null; // the last state the bot confirmed saving, across orders
+  held?: MaintenanceHeld;             // what the bot answered about the changes it holds in memory (contract 1's saved)
   prior?: { state: BotRunState; message: string };
   lastError?: string;                 // why the order is not settled, or the warning a settled order carries
 }

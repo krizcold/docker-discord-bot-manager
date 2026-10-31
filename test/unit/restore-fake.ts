@@ -22,12 +22,27 @@ export interface ClaimDb {
   /** The claim tables probe after the drop. */
   restoredTables: string;
   toc: TocShape;
-  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'toc' | 'restored';
+  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear';
+  /** The receive mark removals (D62, S23), each its argv joined. */
+  markClears: string[];
+  /** OWN_COPIES_READ_SQL's answer before the drop of a moved- restore (D49). */
+  ownCopies: string;
+  /** The generation row of the bot's database before the drop (null: no table), and of the restored dump. */
+  generation: GenFake | null;
+  restoredGeneration: GenFake | null;
+  /** The restore record in the postgres database (null: no table). */
+  restoreState: (GenFake & { pending: boolean; file: string }) | null;
+  /** The generation writes after the restore (the carry or the raise), in order. */
+  genWrites: string[];
+  /** Every O9 call by its step name, in order. */
+  genEvents: string[];
   /** The stderr a failing claim call answers; null for a fixed ERROR line. */
   failText: string | null;
   /** The TOC read's exit code when fail is 'toc'. */
   tocCode: number;
   dropSeen: boolean;
+  /** The argv of step 7's recreate (the call that holds the replication role ensure, D59). */
+  recreateArgs: string[] | null;
   raiseSql: string[];
   tocReads: number;
   tocInput: number;
@@ -36,12 +51,18 @@ export interface ClaimDb {
   onToc: (() => void) | null;
 }
 
+export interface GenFake { generation: number; machine: string; since: string | null }
+
 export function freshClaimDb(): ClaimDb {
   return {
     login: 'false|false|0', tables: 't|t|t', floor: '7', raise: 'seq|8\nguild|g1\nguild|g2\n', restoredTables: 't|t|t', toc: 'claims',
-    fail: null, failText: null, tocCode: 1, dropSeen: false, raiseSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null,
+    fail: null, failText: null, tocCode: 1, dropSeen: false, recreateArgs: null, raiseSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null,
+    generation: null, restoredGeneration: null, restoreState: null, genWrites: [], genEvents: [], ownCopies: '[]', markClears: [],
   };
 }
+
+const genLine = (g: GenFake | null) => (g ? `${g.generation}|${g.machine}|${g.since ?? ''}` : '0||');
+const NO_GEN = 'ERROR:  relation "smdb_manager.generation" does not exist';
 
 export const claimDb: ClaimDb = ((globalThis as { __claimDb?: ClaimDb }).__claimDb ??= freshClaimDb());
 
@@ -68,6 +89,10 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
     const sql = args.join(' ');
     const fail = (text: string) => cb(Object.assign(new Error(text), { code: 1 }), '', claimDb.failText ?? `ERROR:  ${text}`);
     if (cmd === 'docker' && args[0] === 'exec') {
+      if (sql.includes('NOLOGIN REPLICATION')) {
+        claimDb.recreateArgs = [...args];
+        if (claimDb.fail === 'ensure') return fail('permission denied to create role');
+      }
       if (sql.includes('DROP DATABASE')) claimDb.dropSeen = true;
       if (sql.includes('rolcanlogin')) claimDb.loginReads++;
       if (sql.includes('rolcanlogin')) return claimDb.fail === 'login' ? fail('connection to server on socket failed') : cb(null, `${claimDb.login}\n`, '');
@@ -77,6 +102,43 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         return cb(null, `${claimDb.dropSeen ? claimDb.restoredTables : claimDb.tables}\n`, '');
       }
       if (sql.includes('SELECT coalesce(GREATEST(')) return claimDb.fail === 'floor' ? fail('connection reset by peer') : cb(null, `${claimDb.floor}\n`, '');
+      if (sql.includes('FROM smdb_manager.generation), \'0||\')') && !sql.includes('INSERT INTO')) {
+        claimDb.genEvents.push(claimDb.dropSeen ? 'gen-restored' : 'gen-live');
+        if (claimDb.fail === 'gen' && !claimDb.dropSeen) return fail('connection reset by peer');
+        const row = claimDb.dropSeen ? claimDb.restoredGeneration : claimDb.generation;
+        return row ? cb(null, `${genLine(row)}\n`, '') : cb(Object.assign(new Error(NO_GEN), { code: 1 }), '', NO_GEN);
+      }
+      if (sql.includes("json_build_object('host', host") && sql.includes('FROM smdb_manager.addresses a WHERE slot IS NOT NULL')) {
+        claimDb.genEvents.push('own-copies');
+        return claimDb.fail === 'owncopies' ? fail('connection reset by peer') : cb(null, `${claimDb.ownCopies}\n`, '');
+      }
+      if (sql.includes('INSERT INTO smdb_manager.restore_state')) {
+        claimDb.genEvents.push('state-upsert');
+        if (claimDb.fail === 'state') return fail('could not write to file');
+        const m = /now\(\), (\d+), '([^']*)', (?:'([^']*)'::timestamptz|NULL)/.exec(sql);
+        const g = m ? Number(m[1]) : 0;
+        const prior = claimDb.restoreState;
+        const higher = !prior || g > prior.generation;
+        claimDb.restoreState = { pending: true, file: (/VALUES \(true, true, '([^']*)'/.exec(sql) ?? [])[1] ?? '', generation: higher ? g : prior!.generation, machine: higher ? (m?.[2] ?? '') : prior!.machine, since: higher ? (m?.[3] ?? null) : prior!.since };
+        return cb(null, `${claimDb.restoreState.generation}|${claimDb.restoreState.machine}|${claimDb.restoreState.since ?? ''}\n`, '');
+      }
+      if (sql.includes('DELETE FROM smdb_manager.receive_mark')) {
+        claimDb.genEvents.push('mark-clear');
+        claimDb.markClears.push(sql);
+        return claimDb.fail === 'markclear' ? fail('connection reset by peer') : cb(null, '', '');
+      }
+      if (sql.includes('UPDATE smdb_manager.restore_state SET pending = false')) {
+        claimDb.genEvents.push('state-clear');
+        if (claimDb.fail === 'clear') return fail('connection reset by peer');
+        if (claimDb.restoreState) claimDb.restoreState.pending = false;
+        return cb(null, '', '');
+      }
+      if (sql.includes('INSERT INTO smdb_manager.generation')) {
+        claimDb.genEvents.push('gen-write');
+        claimDb.genWrites.push(sql);
+        if (claimDb.fail === 'genwrite') return fail('cannot execute INSERT in a read-only transaction');
+        return cb(null, '', '');
+      }
       if (sql.includes("setval('smdb_data.claim_seq'")) {
         claimDb.onRaise?.();
         claimDb.raiseSql.push(sql);

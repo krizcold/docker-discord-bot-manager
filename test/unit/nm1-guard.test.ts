@@ -60,7 +60,7 @@ describe('requireMaintenance', () => {
   });
   it('G0b need any, json, settled maintenance, the hook re-sent answers', async () => {
     setup('json', rec('maintenance', { login: 'not-managed' }));
-    expect(await requireMaintenance('b1', 'any')).toEqual({ ok: true, state: 'maintenance', enforcement: 'hook', botConfirmed: true });
+    expect(await requireMaintenance('b1', 'any')).toEqual({ ok: true, state: 'maintenance', enforcement: 'hook', botConfirmed: true, held: { state: 'unknown' } });
     expect(h.hookBodies).toEqual([{ action: 'maintenance', method: 'POST', body: { state: 'maintenance', message: 'Back soon' }, timeout: 30_000 }]);
   });
   it('G0c need any, json, settled off, no app container', async () => {

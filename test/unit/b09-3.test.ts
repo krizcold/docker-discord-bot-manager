@@ -43,7 +43,6 @@ describe('write catches say the op may still be running and re-read', () => {
   const cases: [string, unknown[], string][] = [
     ['decommissionFleetDb', ['b1'], 'loadBots'],
     ['restoreFleetBackupFile', ['b1', 'x.dump'], 'loadBots'],
-    ['adoptPromotedReplica', ['b1'], 'loadBots'],
     ['enableFleetReplication', ['b1'], 'renderFleetReplication'],
     ['fetchSource', ['s1'], 'loadSources'],
     ['addSource', [], 'loadSources'],

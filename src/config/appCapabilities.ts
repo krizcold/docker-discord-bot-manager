@@ -89,7 +89,9 @@ export type AppHookAction =
   | 'facts'
   | 'confirm-fresh'
   | 'maintenance'
-  | 'notify-owner';
+  | 'notify-owner'
+  | 'switch-notice'
+  | 'addresses';
 
 // Shared by the companion declaration and the guided rows below, so a wizard
 // row can never drift from the declared key it edits.
@@ -149,6 +151,16 @@ function smdbWizardFields(): WizardEnvVar[] {
       sensitive: true,
       showWhen: { key: smdbDbEnv.mode.key, equals: smdbDbEnv.mode.value },
       placeholder: 'blank = managed Postgres on this server',
+      advanced: true,
+    },
+    {
+      ...base,
+      key: 'DATA_NOTICE_CHECK',
+      displayLabel: 'Switch Notice Check',
+      description: "on: before it uses its database, the bot reads the switch notices in its owner's DMs, and while it cannot read them it waits, says it can't confirm its database is the main, and DMs the owner once. off: when it cannot read them, the bot starts on the databases alone. Choose off only for a bot that cannot read its owner's DMs.",
+      defaultValue: 'on',
+      options: [{ value: 'on' }, { value: 'off' }],
+      showWhen: { key: smdbDbEnv.mode.key, equals: smdbDbEnv.mode.value },
       advanced: true,
     },
   ];

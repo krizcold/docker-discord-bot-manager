@@ -66,6 +66,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
   return {
     ...real,
+    appContainerRunning: async () => false,
     markPendingApplyIfRunning: async (id: string) => {
       if (h.markFail) throw new Error(h.markFail);
       h.marks.push(id);
@@ -273,13 +274,13 @@ describe('writeEnvList', () => {
   });
 
   it('writes the list and marks the bot', async () => {
-    expect(await writeEnvList('b')).toEqual({ changed: true });
+    expect(await writeEnvList('b')).toEqual({ changed: true, addresses: { state: 'not-running' } });
     expect(envManager.getEnvVars('b').DATA_BACKEND_URL).toBe(value());
     expect(h.marks).toEqual(['b']);
   });
 
   it('writes the list without a mark when asked not to', async () => {
-    expect(await writeEnvList('b', { mark: false })).toEqual({ changed: true });
+    expect(await writeEnvList('b', { mark: false })).toEqual({ changed: true, addresses: { state: 'not-running' } });
     expect(h.marks).toEqual([]);
   });
 
@@ -291,7 +292,7 @@ describe('writeEnvList', () => {
 
   it('reports a mark that fails after the write', async () => {
     h.markFail = 'docker is gone';
-    expect(await writeEnvList('b')).toEqual({ changed: true, markError: 'docker is gone' });
+    expect(await writeEnvList('b')).toEqual({ changed: true, addresses: { state: 'not-running' }, markError: 'docker is gone' });
   });
 });
 

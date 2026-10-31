@@ -145,7 +145,7 @@ describe('CERT_PEM_RE', () => {
 describe('the bot manifest', () => {
   const manifest = findAppCapabilities('https://github.com/krizcold/fully-modular-discord-bot')!;
   it('lists its wizard fields', () => {
-    expect(manifest.wizardFields?.map(f => f.key)).toEqual(['FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY', 'PIN_TEST_GUILD_SHARD', 'NODE_NAME', 'DATA_BACKEND', 'DATA_BACKEND_URL']);
+    expect(manifest.wizardFields?.map(f => f.key)).toEqual(['FLEET_SHARD_COUNT', 'FLEET_SHARD_CAPACITY', 'PIN_TEST_GUILD_SHARD', 'NODE_NAME', 'DATA_BACKEND', 'DATA_BACKEND_URL', 'DATA_NOTICE_CHECK']);
   });
   it('describes the database URL field', () => {
     expect(manifest.wizardFields?.find(f => f.key === 'DATA_BACKEND_URL')?.description).toBe(

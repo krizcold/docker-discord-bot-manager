@@ -309,11 +309,19 @@ function saveAlert(instance: InstanceConfig, key: string, alert: FleetBackupAler
   }
 }
 
-export async function notifyOwner(instance: InstanceConfig, text: string): Promise<{ dm: FleetBackupAlert['dm']; dmError?: string }> {
+export type OwnerMessageOutcome = { dm: FleetBackupAlert['dm']; dmError?: string; posted?: boolean; place?: 'channel' | 'dm'; note?: string; notFound?: boolean };
+
+export async function notifyOwner(instance: InstanceConfig, text: string, key?: string): Promise<OwnerMessageOutcome> {
   if (!hasAppHooks(instance)) return { dm: 'unsupported' };
-  const r = await callAppHook(instance, 'notify-owner', 'POST', { text: text.slice(0, 1500) }, alertTiming.hookTimeoutMs);
-  if (r.ok) return { dm: 'sent' };
-  if (r.unknown) return { dm: 'unknown' };
+  const r = await callAppHook(instance, 'notify-owner', 'POST', { text: text.slice(0, 1500), ...(key ? { key } : {}) }, alertTiming.hookTimeoutMs);
+  if (r.ok) {
+    const body = (r.body ?? {}) as { posted?: unknown; place?: unknown; note?: unknown };
+    const place = body.place === 'channel' || body.place === 'dm' ? body.place : undefined;
+    return { dm: 'sent', posted: body.posted !== false, ...(place ? { place } : {}), ...(typeof body.note === 'string' && body.note ? { note: body.note } : {}) };
+  }
+  // NM2's alerts retry an older bot's 404 hourly; NM5's owner messages read notFound as a build without the hook.
+  if (r.status === 404) return { dm: 'failed', dmError: r.error || 'notify-owner returned 404', notFound: true };
+  if (r.unknown) return { dm: 'unknown', dmError: r.error || 'notify-owner did not answer' };
   return { dm: 'failed', dmError: r.error || 'notify-owner failed' };
 }
 

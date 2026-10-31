@@ -1247,6 +1247,10 @@
             onBotMaintenance(payload);
             break;
 
+          case 'bot:switch':
+            onBotSwitch(payload);
+            break;
+
           // Backup status and replication verdict, merged by id
           case 'bot:health':
             mergeBotState(payload);
@@ -1570,7 +1574,7 @@
             const stateControl = `<button class="btn btn-secondary btn-small" onclick="showStateWindow('${bot.id}')" title="Running, Maintenance or Off, and the maintenance message">${escapeHtml(stateButtonLabel(bot))}</button>`;
             const fenceBadge = (bot.fenceStuck
               ? `<span class="update-badge danger" title="${escapeHtml(bot.fenceStuck)}">Database fenced</span>`
-              : '');
+              : '') + switchBadges(bot);
 
             // Fetch vs Update: show Fetch when the bot is up to date and its source still exists
             const hasValidSource = isGit && bot.sourceId && sources.some(s => s.id === bot.sourceId);
@@ -2485,11 +2489,13 @@
           <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
           <div id="fleet-state-line"></div>
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
+          <div class="env-group" style="margin-top:14px;"><div class="env-group-title">Move</div><div id="fleet-switch-body"></div></div>
           <div id="fleet-past-backups"></div>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
           </div>`;
         renderFleetReplica(botId);
+        renderFleetSwitch(botId);
         renderPastFleetBackups(botId);
         refreshStateLine(botId);
         return;
@@ -2526,11 +2532,16 @@
           <div class="env-group-title">Replication</div>
           <div id="fleet-replication-body"><div class="loading">Loading...</div></div>
         </div>
+        <div class="env-group" style="margin-top:14px;">
+          <div class="env-group-title">Move</div>
+          <div id="fleet-switch-body"></div>
+        </div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
         </div>`;
       renderSeedBanner(botId);
       renderFleetReplication(botId);
+      renderFleetSwitch(botId);
       if (bots.find(b => b.id === botId)?.fleetBackup !== bot?.fleetBackup) refreshFleetBackupStatus(botId);
     }
 
@@ -2858,7 +2869,7 @@
       if (res.plainClientsKept) {
         notes += ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.`;
       }
-      return notes;
+      return notes + (res.addressesText || '');
     }
 
     async function enableFleetReplication(botId) {
@@ -2926,7 +2937,7 @@
         if (res.success && res.warning) {
           showMessage('error', `${res.warning}. Restart the instance to apply.${keptNote}`);
         } else if (res.success) {
-          showMessage('success', `Replication disabled. Restart the instance to apply.${keptNote}`);
+          showMessage('success', `Replication disabled. Restart the instance to apply.${keptNote}${res.addressesText || ''}`);
         } else {
           showMessage('error', res.error || 'Failed to disable replication');
         }
@@ -3096,13 +3107,13 @@
         : !live.running
         ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
         : live.inRecovery === false
-          ? `<div class="error-message">This copy has been PROMOTED and no longer follows a primary. To switch this instance to it, adopt it below. If the promotion was a mistake, remove the replica and provision it again; that destroys every write made to this copy since the promote.</div>
-             <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="adoptPromotedReplica('${botId}')">Adopt as this machine's database</button></div>`
+          ? `<div class="error-message">This copy has been PROMOTED outside the manager and no longer follows a main. Take over makes it this machine's main database: the manager checks the old main, then raises this copy's generation before any bot can use it. If the promotion was a mistake, remove the replica and provision it again; that deletes every write made to this copy since the promote.</div>
+             <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="takeOverFleet(${jsArg(botId)})">Take over</button></div>`
         : live.receiverStatus !== 'streaming'
           ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
           : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
       // Offered while this is still a copy: a live one, or one the manager's own
-      // stopped re-seed took down. A promoted database is adopted or removed,
+      // stopped re-seed took down. A promoted database is taken over or removed,
       // and a record too old to probe has no state to re-seed from.
       const reseedHtml = (r.live && live.inRecovery !== false)
         ? `<button class="btn btn-secondary btn-small" onclick="reseedStandbyNow('${botId}')">Re-seed now</button>`
@@ -3277,21 +3288,6 @@
       loadBots();
     }
 
-    async function adoptPromotedReplica(botId) {
-      if (!confirm('Adopt this database as this machine\'s own?\n\nUse this after you promoted this copy to switch the instance to it. It files the database as this machine\'s own and turns on replication, so the old machine can be re-seeded as the new standby.\n\nRestart the instance afterwards to publish the change.')) return;
-      try {
-        const res = await api('POST', `/bots/${botId}/fleet-adopt-primary`);
-        if (res.success) {
-          showMessage('success', `${botLabel(botId)}: adopted. Restart the instance to apply, then copy the join code to the other machine.`);
-        } else {
-          showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to adopt the database'}`);
-        }
-      } catch (err) {
-        showNoAnswer('adoption');
-      }
-      if (fleetBackupBotId === botId) hideFleetBackups();
-      loadBots();
-    }
     async function removeFleetReplica(botId) {
       const rec = (bots.find(b => b.id === botId) || {}).fleetDbReplica;
       if (!confirm(`Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
@@ -3363,6 +3359,209 @@
       const line = document.getElementById('fleet-state-line');
       if (!line || fleetBackupBotId !== botId) return;
       line.textContent = res?.success ? (res.summary || '') : res ? (res.error || '') : "No answer from the manager, so the bot's state can't be shown.";
+    }
+
+    // ─── Switch and move ───
+
+    // The card's badges from the switch records the bot carries.
+    function switchBadges(bot) {
+      const db = bot.fleetDb || {};
+      const b = (text, title, danger) => `<span class="update-badge${danger ? ' danger' : ''}" title="${escapeHtml(title)}">${escapeHtml(text)}</span>`;
+      let html = '';
+      const h = db.handover;
+      if (h) {
+        const machine = h.machine || 'another machine';
+        if (h.mode === 'stream' && h.phase === 'waiting') html += b('Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true);
+        else if (h.mode === 'stream') {
+          html += b('Handed over', h.host
+            ? `Handed over to ${machine} on ${switchDate(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`
+            : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped; decommission it, or move the main back here with Push from ${machine}.`, false);
+        } else if (h.phase === 'done') html += b('Handed over', h.mode === 'push' ? `a push to ${machine}` : 'a backup made for a move', false);
+        else html += b('Hand-over not finished', 'Press Push again, or Cancel the push', true);
+      }
+      if (db.receive) html += b('Receiving', `Waiting for a push until ${switchDate(db.receive.expiresAt)}`, false);
+      if (db.replacedBy) html += b(`Replaced by ${db.replacedBy.machine}`, `${db.replacedBy.machine} replaced this database as the main (generation ${db.replacedBy.generation}). Rejoin this machine as a copy.`, true);
+      if (db.mainConflict) html += b('Two mains', db.mainConflict.blockError
+        ? `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here could not be blocked (${db.mainConflict.blockError}), so bots may still write to this database. Choose one in the Database window.`
+        : `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here is blocked. Choose one in the Database window.`, true);
+      if (db.pushBroken) html += b('Push not finished', `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
+      if (bot.fleetDbReplica && bot.fleetDbReplica.takeover) html += b('Take-over not finished', 'Press Take over again', true);
+      return html;
+    }
+
+    function switchDate(iso) {
+      const t = Date.parse(iso || '');
+      return Number.isFinite(t) ? `${new Date(t).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time';
+    }
+
+    function onBotSwitch(payload) {
+      mergeBotState(payload);
+      clearActiveOp(payload.id);
+      showMessage(payload.success ? 'success' : 'error', payload.text || '');
+      if (payload.success && payload.file) downloadFleetBackup(payload.id, payload.file);
+      redraw();
+      if (fleetBackupBotId === payload.id) renderFleetSwitch(payload.id);
+    }
+
+    function downloadFleetBackup(botId, file) {
+      const a = document.createElement('a');
+      a.href = `/api/bots/${encodeURIComponent(botId)}/fleet-backups/${encodeURIComponent(file)}/download`;
+      a.download = file;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    // One switch request: a confirm question asks and sends again with confirm; an accepted lane answers through bot:switch.
+    async function switchRequest(botId, method, endpoint, body, what) {
+      try {
+        let res = await api(method, endpoint, body);
+        if (!res.success && res.needsConfirm) {
+          if (!confirm(res.error)) return;
+          if (method === 'DELETE') res = await api(method, `${endpoint}${endpoint.includes('?') ? '&' : '?'}confirm=1`);
+          else res = await api(method, endpoint, { ...(body || {}), confirm: true, ...(res.confirmFlag ? { [res.confirmFlag]: true } : {}) });
+        }
+        if (!res.success) { showMessage('error', res.error || `The ${what} was refused`); return; }
+        if (res.opId) {
+          const bot = bots.find(b => b.id === botId);
+          showMessage('info', `Working on ${bot ? bot.displayName : botId}; the result shows here when it finishes`);
+        } else {
+          showMessage('success', res.text || 'Done');
+          if (res.file) downloadFleetBackup(botId, res.file);
+        }
+        return res;
+      } catch (err) {
+        showNoAnswer(what);
+      } finally {
+        if (fleetBackupBotId === botId) renderFleetSwitch(botId);
+      }
+    }
+
+    async function renderFleetSwitch(botId) {
+      const el = document.getElementById('fleet-switch-body');
+      if (!el) return;
+      let view;
+      try {
+        view = await api('GET', `/bots/${botId}/fleet-switch`);
+      } catch (err) {
+        el.innerHTML = '<div class="error-message">No answer from the manager; the move controls are not shown.</div>';
+        return;
+      }
+      if (fleetBackupBotId !== botId || !view.success) return;
+      const bot = bots.find(b => b.id === botId) || {};
+      el.innerHTML = switchPanelHtml(botId, bot, view);
+    }
+
+    function switchPanelHtml(botId, bot, view) {
+      const id = jsArg(botId);
+      const lines = (view.lines || []).map(l => `<div class="env-tip">${escapeHtml(l)}</div>`).join('');
+      const btn = (label, onclick, title) => `<button class="btn btn-secondary btn-small" onclick="${onclick}"${title ? ` title="${escapeHtml(title)}"` : ''}>${escapeHtml(label)}</button>`;
+      if (!bot.fleetDb) {
+        return `${lines}<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${btn('Take over', `takeOverFleet(${id})`)}
+          <label style="font-size:0.8rem;"><input type="checkbox" id="fleet-takeover-start" checked> Start the bot here when done</label></div>`;
+      }
+      const db = bot.fleetDb;
+      const parts = [];
+      for (const c of view.copies || []) {
+        if (c.streaming) parts.push(btn(`Hand over to ${c.machine}`, `handOverFleet(${id}, ${jsArg(c.slot)}, ${jsArg(c.machine)})`));
+      }
+      if (db.handover) parts.push(btn(db.handover.mode === 'stream' ? 'Cancel the hand-over' : 'Cancel the move', `cancelFleetMove(${id})`));
+      if (db.receive) parts.push(btn('Stop receiving', `stopReceivingFleet(${id})`));
+      else if (!db.handover) parts.push(btn('Receive a main', `receiveFleet(${id})`));
+      if (!db.handover && !db.receive) {
+        parts.push(btn('Download for a move', `moveOutFleet(${id})`));
+        parts.push(`<input type="text" id="fleet-move-code" placeholder="Move code from the receiving machine" style="min-width:220px;">` + btn('Push the main', `pushFleet(${id})`));
+      }
+      parts.push(`<input type="file" id="fleet-upload-file" style="display:none" onchange="uploadFleetBackup(${id})">` + btn('Upload a backup', `document.getElementById('fleet-upload-file').click()`));
+      if (db.mainConflict) parts.push(btn('Keep this machine as the main', `keepFleetMain(${id}, ${jsArg(db.mainConflict.machine)})`));
+      if (db.replacedBy || db.mainConflict || (db.handover && db.handover.mode === 'stream' && db.handover.phase === 'stopped')) {
+        const target = (db.replacedBy || db.mainConflict || db.handover).machine || 'the main';
+        parts.push(btn('Rejoin as a copy', `rejoinFleet(${id}, ${jsArg(target)}, ${db.replacedBy || (db.handover && db.handover.host) ? 'true' : 'false'})`));
+      }
+      return `${lines}<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${parts.join('')}</div><div id="fleet-move-code-out"></div>`;
+    }
+
+    function handOverFleet(botId, slot, machine) {
+      if (!confirm(`Hand over the main to ${machine}? The bot stays in maintenance; this machine's database stops once the copy holds every change, and it rejoins as a copy after ${machine} takes over.`)) return;
+      switchRequest(botId, 'POST', `/bots/${botId}/fleet-handover`, { slot }, 'hand-over');
+    }
+
+    function cancelFleetMove(botId) {
+      switchRequest(botId, 'DELETE', `/bots/${botId}/fleet-handover`, null, 'cancel');
+    }
+
+    function takeOverFleet(botId) {
+      if (!confirm('Make this copy the main database? The manager checks the old main first; if it handed over to this copy, nothing is lost.')) return;
+      const start = document.getElementById('fleet-takeover-start');
+      switchRequest(botId, 'POST', `/bots/${botId}/fleet-takeover`, { start: !start || start.checked }, 'take-over');
+    }
+
+    async function receiveFleet(botId) {
+      const broken = (bots.find(b => b.id === botId)?.fleetDb || {}).pushBroken;
+      const ask = broken
+        ? `Replace this machine's database with one pushed from another machine? The bot must be Off. This database holds a push that did not finish, so no new dump is taken; the dump ${broken.safetyDump}, taken before that push, stays with the backups.`
+        : "Replace this machine's database with one pushed from another machine? The bot must be Off; a dump of this database is kept first.";
+      if (!confirm(ask)) return;
+      const res = await switchRequest(botId, 'POST', `/bots/${botId}/fleet-receive`, null, 'receive');
+      const out = document.getElementById('fleet-move-code-out');
+      if (res && res.moveCode && out) out.innerHTML = `<div class="env-tip">${escapeHtml(res.text || '')}</div><textarea readonly style="width:100%;height:80px;">${escapeHtml(res.moveCode)}</textarea>`;
+    }
+
+    function stopReceivingFleet(botId) {
+      switchRequest(botId, 'DELETE', `/bots/${botId}/fleet-receive`, null, 'stop');
+    }
+
+    function pushFleet(botId) {
+      const code = (document.getElementById('fleet-move-code') || {}).value || '';
+      if (!code.trim()) { showMessage('error', 'Paste the move code from the receiving machine first'); return; }
+      switchRequest(botId, 'POST', `/bots/${botId}/fleet-push`, { moveCode: code.trim() }, 'push');
+    }
+
+    function moveOutFleet(botId) {
+      if (!confirm('Make a backup for a move to a machine without an open port? The bot stays stopped here until you Cancel the move.')) return;
+      switchRequest(botId, 'POST', `/bots/${botId}/fleet-move-out`, {}, 'move');
+    }
+
+    function keepFleetMain(botId, machine) {
+      if (!confirm(`Make this machine the main? Its generation is raised above ${machine}'s; ${machine}'s manager blocks its bot's login when it next reads this machine (it checks every 5 minutes while it can reach it).`)) return;
+      switchRequest(botId, 'POST', `/bots/${botId}/fleet-keep-main`, null, 'keep');
+    }
+
+    async function rejoinFleet(botId, machine, recorded) {
+      let body;
+      if (recorded) {
+        if (!confirm(`Rebuild this machine's database as a copy of ${machine}? A dump of it is kept with the backups first; it holds every change this machine has that ${machine} lacks.`)) return;
+        body = { replaced: true };
+      } else {
+        const code = prompt(`Paste ${machine}'s join code to rebuild this machine's database as its copy. A dump of it is kept with the backups first; it holds every change this machine has that ${machine} lacks.`);
+        if (!code || !code.trim()) return;
+        body = { joinCode: code.trim() };
+      }
+      try {
+        const res = await api('POST', `/bots/${botId}/fleet-reseed`, body);
+        showMessage(res.success ? 'success' : 'error', res.success ? 'Rejoining as a copy; the Database window shows its progress' : (res.error || 'The rejoin was refused'));
+      } catch (err) {
+        showNoAnswer('rejoin');
+      } finally {
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
+    }
+
+    async function uploadFleetBackup(botId) {
+      const input = document.getElementById('fleet-upload-file');
+      const file = input && input.files && input.files[0];
+      if (!file) return;
+      showMessage('info', `Uploading ${file.name}...`);
+      try {
+        const res = await fetch(`/api/bots/${encodeURIComponent(botId)}/fleet-backups/upload`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+        const body = await res.json().catch(() => ({}));
+        showMessage(body.success ? 'success' : 'error', body.success ? body.message : (body.error || `The upload was refused (${res.status})`));
+      } catch (err) {
+        showNoAnswer('upload', true);
+      } finally {
+        input.value = '';
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
     }
 
     function onBotMaintenance(payload) {
@@ -3515,7 +3714,8 @@
 
     async function restoreFleetBackupFile(botId, file) {
       const sharers = await restoreSharersText(botId);
-      const warning = `Restore "${file}"?\n\nThe bot must be in Maintenance or Off (its State window); otherwise the restore is refused and nothing changes. Restoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database refuses every connection but the manager's, is read-only and has its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, and every guild's claim number is raised above the highest one the bot used before, so a process that ran before the restore can no longer save over the restored data. A bot in Maintenance stays online answering with its message during and after the restore; an Off bot stays stopped. When you choose Running, the bot is asked to restart and load the restored data; the State window says whether it confirmed that, and when it did not, restart the bot by hand. If the rebuild fails, the database stays read-only and Running is refused until a restore succeeds or you dismiss the notice. Do not start the other instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
+      const moved = file.startsWith('moved-') ? " This backup was made for a move: restoring it makes this machine's database the main, with a generation above the file's and this database's." : '';
+      const warning = `Restore "${file}"?${moved}\n\nThe bot must be in Maintenance or Off (its State window); otherwise the restore is refused and nothing changes. Restoring rewinds EVERY guild's data on this database at once. ${sharers}, and a fresh safety dump is taken under a write fence: from then until the restore ends, the database refuses every connection but the manager's, is read-only and has its sessions closed. The dump is skipped only when the database itself is missing; if it fails, nothing is restored. The database is then dropped and rebuilt from the chosen dump, and every guild's claim number is raised above the highest one the bot used before, so a process that ran before the restore can no longer save over the restored data. A bot in Maintenance stays online answering with its message during and after the restore; an Off bot stays stopped. When you choose Running, the bot is asked to restart and load the restored data; the State window says whether it confirmed that, and when it did not, restart the bot by hand. If the rebuild fails, the database stays read-only and Running is refused until a restore succeeds or you dismiss the notice. Do not start the other instances from CasaOS until the restore ends: one started before the drop refuses the restore, and one started after it keeps the database read-only until a restore runs with it stopped.`;
       if (!confirm(warning)) return;
       const content = document.getElementById('fleet-backup-content');
       content.querySelectorAll('button').forEach(b => b.disabled = true);
@@ -3526,7 +3726,8 @@
           const s = res.steps || {};
           const claims = Array.isArray(s.guildsRaised) ? `${s.guildsRaised.length} guild(s) raised to claim ${s.claimRaisedTo}` : 'no claim number raised (none was used before)';
           const bot = s.botState === 'off' ? 'the bot stays off' : 'the bot stays in maintenance';
-          showMessage('success', `Restore complete: ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, ${claims}, ${bot}, stopped ${(s.stopped || []).length}, restarted ${(s.restarted || []).length}${res.note ? `. ${res.note}` : ''}`);
+          const movedLine = typeof s.generation !== 'number' ? '' : file.startsWith('moved-') ? `. This machine is the main now (generation ${s.generation}); the Database window shows whether the owner was sent a switch notice` : `. The database's main generation is ${s.generation} now, above the dump's and the one it had before the restore`;
+          showMessage('success', `Restore complete: ${s.preRestoreDump ? 'safety dump taken' : 'no safety dump (the database was missing)'}, ${claims}, ${bot}, stopped ${(s.stopped || []).length}, restarted ${(s.restarted || []).length}${movedLine}${res.note ? `. ${res.note}` : ''}`);
           if (res.warning) alert(`Restore finished WITH A WARNING:\n\n${res.warning}\n\n${res.note || ''}`);
         } else {
           showMessage('error', res.error || 'Restore failed');

@@ -22,7 +22,9 @@ import * as fleetReplication from '../../instance/fleetReplication';
 import * as fleetReplica from '../../instance/fleetReplica';
 import * as fleetJoin from '../../instance/fleetJoin';
 import * as fleetCopyWatch from '../../instance/fleetCopyWatch';
-import { isBackendUrlList } from '../../config/joinCode';
+import { isBackendUrlList, isMoveCode } from '../../config/joinCode';
+import * as fleetSwitch from '../../instance/fleetSwitch';
+import * as fleetMove from '../../instance/fleetMove';
 import * as maintenance from '../../instance/maintenance';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
@@ -1268,6 +1270,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.json({ success: true, ok: false, notTested: true, error: 'This value is a list of database addresses the manager writes from a join code; check them in the Database window.' });
         return;
       }
+      if (isMoveCode(target)) {
+        res.json({ success: true, ok: false, notTested: true, error: "This is a move code, not a database address; paste it into Push the main in the Database window of the machine that holds the main." });
+        return;
+      }
 
       const network = sharedNetworkName(await getDeploymentMode());
       const result = await probeDatabaseUrl(target, network);
@@ -1806,7 +1812,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(400).json({ success: false, error: 'enabled (boolean) is required' });
         return;
       }
-      let result: { success: boolean; error?: string };
+      let result: { success: boolean; error?: string; addresses?: fleetJoin.AddressesOutcome };
       if (enabled) {
         if (!publicHost || typeof publicHost !== 'string') {
           res.status(400).json({ success: false, error: 'publicHost is required to enable replication' });
@@ -1817,7 +1823,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         result = await fleetReplication.disableFleetReplication(bot);
       }
       if (result.success) broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      res.json(result);
+      const offered = fleetJoin.addressesText(result.addresses);
+      res.json({ ...result, ...(offered ? { addressesText: offered } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1877,28 +1884,6 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   /**
-   * POST /api/bots/:id/fleet-adopt-primary - File a promoted standby as this
-   * machine's fleet database and enable replication on it, so the machine that
-   * just took over can hand out the copy block the old one re-seeds from.
-   */
-  router.post('/:id/fleet-adopt-primary', async (req: Request, res: Response) => {
-    try {
-      const bot = containerManager.getBot(req.params.id);
-      if (!bot) {
-        res.status(404).json({ success: false, error: 'Bot not found' });
-        return;
-      }
-      const result = await fleetReplica.adoptPromotedReplica(bot);
-      if (result.success) {
-        broadcastToClients(wss, 'bot:updated', publicBot(containerManager.getBot(req.params.id)));
-      }
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ success: false, error: String(error) });
-    }
-  });
-
-  /**
    * POST /api/bots/:id/fleet-reseed - Heal a stale primary by making it a
    * standby of the machine that now serves the fleet ({joinCode,
    * publicHost?, hostPort?}). Destructive: the local database is dumped once
@@ -1911,7 +1896,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      const { joinCode, publicHost, hostPort, confirm, confirmVolume } = (req.body ?? {}) as { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
+      const { joinCode, publicHost, hostPort, confirm, confirmVolume, replaced } = (req.body ?? {}) as { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string; replaced?: boolean };
+      if (replaced === true && (typeof joinCode !== 'string' || !joinCode.trim())) {
+        res.json(fleetSwitch.rejoinComposed(bot.id));
+        return;
+      }
       if (typeof joinCode !== 'string' || !joinCode.trim()) {
         res.status(400).json({ success: false, error: 'joinCode is required' });
         return;
@@ -1919,6 +1908,160 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json(fleetReplica.reseedStalePrimary(bot, joinCode, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  // ─── Switch and move (fleetSwitch, fleetMove) ───
+
+  const switchDone = (botId: string, opId: string) => (r: fleetSwitch.LaneOutcome) => {
+    const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
+    broadcastToClients(wss, 'bot:switch', { ...(bot ?? {}), id: botId, opId, success: r.success, text: r.text, ...(r.file ? { file: r.file } : {}) });
+  };
+
+  /** Runs a lane: a refusal or a confirm question answers the request; an admitted lane answers { opId } and ends with bot:switch. */
+  const laneRoute = async (req: Request, res: Response, op: string, fn: (admit: () => void) => Promise<fleetSwitch.LaneOutcome>) => {
+    const botId = req.params.id;
+    if (!containerManager.getBot(botId)) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+    const opId = randomUUID();
+    const answer = await fleetSwitch.startLane(botId, op, fn, switchDone(botId, opId));
+    if ('accepted' in answer) {
+      res.json({ success: true, opId });
+      return;
+    }
+    if (answer.success) {
+      broadcastToClients(wss, 'bot:updated', withHealth(withActiveOp(publicBot(containerManager.getBot(botId)))));
+      res.json({ success: true, text: answer.text, ...(answer.moveCode ? { moveCode: answer.moveCode } : {}), ...(answer.file ? { file: answer.file } : {}) });
+      return;
+    }
+    res.status(answer.status ?? 409).json({ success: false, error: answer.text, ...(answer.needsConfirm ? { needsConfirm: true } : {}), ...(answer.confirmFlag ? { confirmFlag: answer.confirmFlag } : {}) });
+  };
+
+  /** GET /api/bots/:id/fleet-switch - The switch records as the Database window reads them, and the streaming copies. */
+  router.get('/:id/fleet-switch', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, ...fleetSwitch.switchView(bot), copies: await fleetSwitch.streamingCopies(bot) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-handover { slot, confirm? } - Hand the main over to the copy on that slot. */
+  router.post('/:id/fleet-handover', async (req: Request, res: Response) => {
+    try {
+      const { slot, confirm } = (req.body ?? {}) as { slot?: unknown; confirm?: unknown };
+      if (typeof slot !== 'string' || !slot) {
+        res.status(400).json({ success: false, error: 'slot is required' });
+        return;
+      }
+      await laneRoute(req, res, 'handover', admit => fleetSwitch.handOverMain(req.params.id, slot, confirm === true, admit));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /api/bots/:id/fleet-handover?confirm=1 - Cancel the hand-over or the move. */
+  router.delete('/:id/fleet-handover', async (req: Request, res: Response) => {
+    try {
+      await laneRoute(req, res, 'handover', () => fleetSwitch.cancelMove(req.params.id, req.query.confirm === '1'));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-takeover { confirm?, confirmUnchecked?, start? } - Make this machine's copy the main. */
+  router.post('/:id/fleet-takeover', async (req: Request, res: Response) => {
+    try {
+      const { confirm, confirmUnchecked, start } = (req.body ?? {}) as { confirm?: unknown; confirmUnchecked?: unknown; start?: unknown };
+      await laneRoute(req, res, 'takeover', admit => fleetSwitch.takeOver(req.params.id, { confirm: confirm === true, start: start !== false, confirmUnchecked: confirmUnchecked === true }, admit));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-receive - Wait for a push: a dump, a time-limited login and the move code. */
+  router.post('/:id/fleet-receive', async (req: Request, res: Response) => {
+    try {
+      await laneRoute(req, res, 'receive', () => fleetMove.receiveMain(req.params.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /api/bots/:id/fleet-receive - Stop receiving: the login is removed. */
+  router.delete('/:id/fleet-receive', async (req: Request, res: Response) => {
+    try {
+      await laneRoute(req, res, 'receive', () => fleetMove.stopReceiving(req.params.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-push { moveCode, confirm? } - Push this main to the machine that made the move code. */
+  router.post('/:id/fleet-push', async (req: Request, res: Response) => {
+    try {
+      const { moveCode, confirm } = (req.body ?? {}) as { moveCode?: unknown; confirm?: unknown };
+      if (typeof moveCode !== 'string' || !moveCode.trim()) {
+        res.status(400).json({ success: false, error: 'moveCode is required' });
+        return;
+      }
+      await laneRoute(req, res, 'push', admit => fleetMove.pushMain(req.params.id, moveCode, confirm === true, admit));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-move-out { confirm? } - A backup made for a move by file; the bot stays stopped here. */
+  router.post('/:id/fleet-move-out', async (req: Request, res: Response) => {
+    try {
+      const { confirm } = (req.body ?? {}) as { confirm?: unknown };
+      await laneRoute(req, res, 'move-out', () => fleetMove.moveOut(req.params.id, confirm === true));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-keep-main - Keep this machine as the main when two databases accept writes. */
+  router.post('/:id/fleet-keep-main', async (req: Request, res: Response) => {
+    try {
+      await laneRoute(req, res, 'keep-main', () => fleetSwitch.keepMain(req.params.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** GET /api/bots/:id/fleet-backups/:file/download - One dump of this bot, streamed. */
+  router.get('/:id/fleet-backups/:file/download', (req: Request, res: Response) => {
+    if (!containerManager.getBot(req.params.id)) {
+      res.status(404).json({ success: false, error: 'Bot not found' });
+      return;
+    }
+    const found = fleetMove.downloadPath(req.params.id, req.params.file);
+    if (!found.ok) {
+      res.status(found.status).json({ success: false, error: found.error });
+      return;
+    }
+    const stream = fs.createReadStream(found.path);
+    stream.on('error', () => res.destroy());
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.params.file}"`);
+    stream.pipe(res);
+  });
+
+  /** POST /api/bots/:id/fleet-backups/upload - A backup from another machine, as application/octet-stream. */
+  router.post('/:id/fleet-backups/upload', async (req: Request, res: Response) => {
+    try {
+      const r = await fleetMove.receiveUpload(req.params.id, req);
+      if (!res.headersSent && !res.writableEnded) res.status(r.status).json(r.body);
+    } catch (error) {
+      if (!res.headersSent) res.status(500).json({ success: false, error: String(error) });
     }
   });
 

@@ -15,6 +15,8 @@ import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUp
 import { startFleetBackupScheduler, stopFleetBackupScheduler, waitForInFlightLanes } from './instance/fleetBackup';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
 import { startFleetCopyWatch, stopFleetCopyWatch } from './instance/fleetCopyWatch';
+import { startFleetSwitchTick, stopFleetSwitchTick } from './instance/fleetSwitch';
+import './instance/fleetMove';
 import { startMaintenanceReconciler, stopMaintenanceReconciler } from './instance/maintenance';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
@@ -124,6 +126,7 @@ async function main(): Promise<void> {
   // Start fleet Postgres sidecar backup scheduler
   startFleetBackupScheduler();
   startFleetCopyWatch();
+  startFleetSwitchTick();
 
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
   startStateReconciler(() => wss.clients.size);
@@ -143,6 +146,7 @@ function shutdown(signal: string): void {
   stopInstanceUpdater();
   stopFleetBackupScheduler();
   stopFleetCopyWatch();
+  stopFleetSwitchTick();
   stopMaintenanceReconciler();
   void waitForInFlightLanes(SHUTDOWN_LANE_WAIT_MS).then(lane => {
     if (lane) console.error(`[Shutdown] Exiting with a lane still running, which is cut short: ${lane}`);

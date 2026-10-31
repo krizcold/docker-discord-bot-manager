@@ -30,7 +30,15 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     runningInstanceContainers: async () => [],
     deployedComposeExists: () => true,
     startFleetDbSidecar: async () => ({ success: true }),
-    retireFleetDbSidecar: async () => ({ success: true }),
+    retireFleetDbSidecar: async () => {
+      const nodeFs = await import('fs');
+      const file = (await import('path')).join(process.env.DATA_DIR!, 'instances.json');
+      const reg = JSON.parse(nodeFs.readFileSync(file, 'utf-8'));
+      delete reg.instances.a.fleetDb;
+      delete reg.instances.a.fleetRestoreError;
+      nodeFs.writeFileSync(file, JSON.stringify(reg, null, 2));
+      return { success: true };
+    },
     applyFleetDbReplicaService: async () => ({ success: true }),
     markPendingApplyIfRunning: async () => undefined,
   };
@@ -135,15 +143,30 @@ const finished = async () => {
   throw new Error('the seed did not settle');
 };
 
-describe('F8: the stale-primary re-seed keeps no join code', () => {
-  it('its note says the address was not added and how to add it, and promises no retry', async () => {
+describe('F8 (NM5 J9): the stale-primary re-seed joins the main it was rebuilt from', () => {
+  it('a join that fails after the copy runs keeps no join code, and the note names the rebuild, its dump and the failed join', async () => {
     const started = reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
     expect(started).toMatchObject({ success: true });
     const bot = await finished();
     expect(bot.fleetDbReplicaSeed).toBeUndefined();
     expect(bot.fleetJoin).toBeUndefined();
-    const note = (await getFleetReplicaStatus(bot)).seedNote;
-    expect(note).toBe("The copy runs, but its address was not added to the main's list: this machine keeps no join code. Paste the main's join code into Join in the Database window to add it.");
-    expect(tmp.logs).toContain('[FleetReplica] a: the Database URL was not written: this machine keeps no join code');
+    const note = (await getFleetReplicaStatus(bot)).seedNote ?? '';
+    expect(note).toMatch(/^This machine's database was rebuilt as a copy of primary\.invalid\. A dump of the old database is kept with the backups \(pre-reseed-[^)]+\.dump\)\. The copy runs, but the join code could not be saved \(.+\), so the bot's database list was not written; press Join with primary\.invalid's code\.$/);
+  });
+});
+
+describe('NM5 J12: the operator Rejoin of a main holding a restore notice', () => {
+  it('the notice goes with the old database, and the seed note says so after J-DONE', async () => {
+    const fb = await import('../../src/instance/fleetBackup');
+    const reg = JSON.parse(fs.readFileSync(REGISTRY, 'utf-8'));
+    reg.instances.a.fleetRestoreError = { file: 'old.dump', text: 'Restore of old.dump failed: the copy was cut', at: '2026-10-30T09:00:00.000Z', doubt: true };
+    fs.writeFileSync(REGISTRY, JSON.stringify(reg, null, 2));
+    expect(fb.shownRestoreNoticeFile('a')).toBe('old.dump');
+    const started = reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
+    expect(started).toMatchObject({ success: true });
+    const bot = await finished();
+    expect(fb.shownRestoreNoticeFile('a')).toBeNull();
+    const note = (await getFleetReplicaStatus(bot)).seedNote ?? '';
+    expect(note).toMatch(/^This machine's database was rebuilt as a copy of primary\.invalid\. A dump of the old database is kept with the backups \(pre-reseed-[^)]+\.dump\)\. The restore notice of old\.dump was about the old database and went with it; that dump holds the old database as it was\. The copy runs, but /);
   });
 });

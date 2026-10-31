@@ -115,7 +115,7 @@ describe('B09-4 health changes are pushed', () => {
       fleetBackupBotId: 'b1', fleetBackupStored: null, fleetBackupRefreshSeq: 0,
       document: { getElementById: (id: string) => boxes[id] ?? null },
       escapeHtml: (s: string) => String(s), formatBackupSize: () => '', jsArg: (s: string) => JSON.stringify(s),
-      renderSeedBanner: () => {}, renderFleetReplication: () => {}, api,
+      renderSeedBanner: () => {}, renderFleetReplication: () => {}, renderFleetSwitch: () => {}, api,
     });
     for (const fn of ['mergeBotState', 'refreshFleetBackupStatus', 'showFleetBackups', 'fleetBackupErrorHtml', 'fleetBackupListHtml', 'backupTime', 'backupTestHtml', 'backupAlertHtml', 'backupStatusHtml']) vm.runInContext(pageFunction(fn), ctx);
     return { ctx, boxes };

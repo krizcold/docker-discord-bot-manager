@@ -314,6 +314,9 @@ export interface FleetBackupAlert {
   dm: 'pending' | 'sent' | 'failed' | 'unknown' | 'unsupported';
   dmAt?: number;
   dmError?: string;
+  dmPlace?: 'channel' | 'dm';         // where the bot said it posted (contract 7)
+  dmNote?: string;
+  dmRepeat?: true;                    // the bot had already posted this key
 }
 
 export interface InstanceConfig {
@@ -391,8 +394,8 @@ export interface InstanceConfig {
 export type BotRunState = 'running' | 'maintenance' | 'off';
 
 export type MaintenanceHeld =
-  | { state: 'yes' | 'unknown' | 'stopped' | 'not-running' }
-  | { state: 'no'; guilds: number; files: number };
+  | { state: 'yes' | 'unknown' | 'stopped' | 'not-running'; note?: string }
+  | { state: 'no'; guilds: number; files: number; note?: string };
 
 export interface MaintenanceRecord {
   state: BotRunState;

@@ -10,8 +10,8 @@ import * as fleetReplica from './fleetReplica';
 import {
   AddressesOutcome, addressesLogText, mainCertificate, mainProbe, machineNameOf, readCopyFacts, refreshDue, refreshJoin, SlotState, storedJoin, writeEnvList,
 } from './fleetJoin';
-import { alertStep, dmOutcomeText, utcText } from './backupFiles';
-import { notifyOwner } from './backupCheck';
+import { alertStep, dmOutcomeText, ownerMessageKey, utcText } from './backupFiles';
+import { notifyOwner, withOutcome } from './backupCheck';
 import { FleetBackupAlert, InstanceConfig } from '../types';
 import { lsnText } from '../config/joinCode';
 
@@ -269,13 +269,12 @@ export async function stepCopyAlerts(instance: InstanceConfig, cases: Record<'he
     }
     if (!prev || prev.text !== next.text) saveCopyAlert(instance, key, next);
     if (!send) continue;
-    const result = await notifyOwner(instance, next.text);
+    const result = await notifyOwner(instance, next.text, ownerMessageKey(instance.id, `copy-${key}`, next.since));
     console.log(`[FleetCopy] Message to the owner of ${instance.displayName} about the copy (${key}): ${result.dm}${result.dmError ? ` (${result.dmError})` : ''}`);
     // The send can take 30 s without a lock: an adopt or a newer case in that time must not get this outcome written back.
     const live = containerManager.getBot(instance.id);
     if (!live || live.fleetDb || currentCopyAlerts(live)[key]?.since !== next.since) continue;
-    const { dmError: _old, ...rest } = next;
-    saveCopyAlert(instance, key, { ...rest, dm: result.dm, dmAt: now, ...(result.dmError ? { dmError: result.dmError } : {}) });
+    saveCopyAlert(instance, key, withOutcome(next, result, now));
   }
 }
 

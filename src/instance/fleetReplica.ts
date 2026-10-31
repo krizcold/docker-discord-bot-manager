@@ -30,12 +30,12 @@ import { capabilityRefusal } from './appHookClient';
 import { probeErrorTail } from '../config/secretText';
 import { InstanceConfig, FleetBackupAlert, FleetDbReplicaRecord, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { decodeJoinCode, HOST_RE, JoinCode, lsnText, splitBackendUrls } from '../config/joinCode';
-import { alertStep, dmOutcomeText, utcText } from './backupFiles';
+import { alertStep, dmOutcomeText, ownerMessageKey, utcText } from './backupFiles';
 import {
   AddressesOutcome, addressesText, deleteAddress, ensureClientImage, sendAddresses, inRecoveryText, loginOf, machineNameOf, mainCertificate, mainProbe, PrimaryLogin,
   probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor, storedJoin, writeEnvList, joinFleet,
 } from './fleetJoin';
-import { notifyOwner } from './backupCheck';
+import { notifyOwner, withOutcome, type OwnerMessageOutcome } from './backupCheck';
 import { feedStdin } from '../docker/childStdin';
 
 /** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
@@ -705,7 +705,9 @@ function startProvisioning(
     }, { safetyDump: ctx.safetyDump, sendsNow: true });
     let rebuilt: { panel: string; outcome: string | null } | undefined;
     if (texts) {
-      const result = stored ? await sendRebuiltAlert(instance.id, Date.now()) : await deliverRebuilt(instance.id, texts.message);
+      const result = stored
+        ? await sendRebuiltAlert(instance.id, Date.now())
+        : withOutcome({ kind: 'rebuilt', text: texts.message, since: now, dm: 'pending' }, await deliverRebuilt(instance.id, texts.message, now), Date.now());
       rebuilt = { panel: texts.panel, outcome: result ? dmOutcomeText(result) : null };
     }
     if (ctx.notes.length > 0 || rebuilt) seedNotes.set(instance.id, { startedAt: now, text: ctx.notes.join(' '), ...(rebuilt ? { rebuilt } : {}) });
@@ -774,12 +776,12 @@ function endBuiltSeed(botId: string, startedAt: number, clear: () => void, opts:
   return { texts, stored };
 }
 
-/** One send of T-38; a bot that is not running is not called. */
-async function deliverRebuilt(botId: string, text: string): Promise<Pick<FleetBackupAlert, 'dm' | 'dmError'>> {
+/** One send of T-38 for the rebuild that started at `since`; a bot that is not running is not called. */
+async function deliverRebuilt(botId: string, text: string, since: number): Promise<OwnerMessageOutcome> {
   const bot = containerManager.getBot(botId);
-  const result = !bot || bot.status !== 'running'
-    ? { dm: 'failed' as const, dmError: 'the bot on this machine is not running' }
-    : await notifyOwner(bot, text);
+  const result: OwnerMessageOutcome = !bot || bot.status !== 'running'
+    ? { dm: 'failed', dmError: 'the bot on this machine is not running' }
+    : await notifyOwner(bot, text, ownerMessageKey(botId, 'copy-rebuilt', since));
   console.log(`[FleetCopy] Message to the owner of ${bot?.displayName ?? botId} about the rebuild: ${result.dm}${result.dmError ? ` (${result.dmError})` : ''}`);
   return result;
 }
@@ -797,9 +799,7 @@ export async function sendRebuiltAlert(botId: string, now = Date.now()): Promise
   if (!send) return prev;
   sendingRebuilt.add(botId);
   try {
-    const result = await deliverRebuilt(botId, prev.text);
-    const { dmError: _old, ...rest } = prev;
-    const done: FleetBackupAlert = { ...rest, dm: result.dm, dmAt: now, ...(result.dmError ? { dmError: result.dmError } : {}) };
+    const done = withOutcome(prev, await deliverRebuilt(botId, prev.text, prev.since), now);
     const live = containerManager.getBot(botId);
     if (!live || live.fleetDb || live.fleetCopyAlerts?.rebuilt?.since !== prev.since) return done;
     try {

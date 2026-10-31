@@ -1760,6 +1760,8 @@
     async function updateBot(id) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status)) || bot?.activeOp) return;
+      const warning = heldWarningText(bot, 'update');
+      if (warning && !confirm(warning)) return;
       busyBots.add(id); renderBots();
       openTerminalPopup(id, bot ? bot.displayName : id, 'Updating');
       try {
@@ -1836,6 +1838,8 @@
     async function startBot(id, verb) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status)) || bot?.activeOp) return;
+      const warning = verb === 'Applying' ? heldWarningText(bot, 'apply') : '';
+      if (warning && !confirm(warning)) return;
       busyBots.add(id); renderBots();
       openTerminalPopup(id, bot ? bot.displayName : id, verb || 'Installing');
       try {
@@ -1869,6 +1873,8 @@
     async function stopBot(id) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      const warning = heldWarningText(bot, 'stop');
+      if (warning && !confirm(warning)) return;
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/stop`);
@@ -1879,6 +1885,8 @@
     async function restartBot(id) {
       const bot = bots.find(b => b.id === id);
       if (busyBots.has(id) || (bot && isTransientStatus(bot.status))) return;
+      const warning = heldWarningText(bot, 'restart');
+      if (warning && !confirm(warning)) return;
       busyBots.add(id); renderBots();
       try {
         const res = await api('POST', `/bots/${id}/restart`);
@@ -2667,13 +2675,17 @@
       return `<div class="error-message">Test restore of ${file} failed at ${backupTime(t.finishedAt)}: ${escapeHtml(t.text || '')}.</div>`;
     }
 
-    // What became of the owner's DM about a standing alert.
+    // What became of the owner's message about a standing alert.
     function backupAlertHtml(a) {
       if (!a) return '';
-      const line = a.dm === 'sent' ? `The owner was sent a DM at ${backupTime(a.dmAt)}.`
-        : a.dm === 'pending' ? 'The DM to the owner is being sent.'
-        : a.dm === 'failed' ? `The DM to the owner could not be sent: ${escapeHtml(a.dmError || 'no reason was given')}. The manager tries again every hour.`
-        : a.dm === 'unknown' ? "The bot did not answer within 30 s, so the manager can't confirm the owner got the DM."
+      const sent = a.dmRepeat ? `At ${backupTime(a.dmAt)} the bot answered that it had already posted this message, so it posted nothing new.`
+        : a.dmPlace === 'channel' ? `The owner was sent a message in the owner messages channel at ${backupTime(a.dmAt)}.`
+        : a.dmPlace === 'dm' ? `The owner was sent a DM at ${backupTime(a.dmAt)}.`
+        : `The owner was sent a Discord message at ${backupTime(a.dmAt)}.`;
+      const line = a.dm === 'sent' ? `${sent}${a.dmNote ? ` The bot's note: ${escapeHtml(a.dmNote)}` : ''}`
+        : a.dm === 'pending' ? 'The message to the owner is being sent.'
+        : a.dm === 'failed' ? `The message to the owner could not be sent: ${escapeHtml(a.dmError || 'no reason was given')}. The manager tries again every hour.`
+        : a.dm === 'unknown' ? (a.dmError ? `The manager can't confirm the owner got the message: ${escapeHtml(a.dmError)}.` : "The bot did not answer within 30 s, so the manager can't confirm the owner got the message.")
         : 'This app has no notify-owner hook, so this failure shows only here.';
       return `<div class="env-tip">${line}</div>`;
     }
@@ -3572,6 +3584,31 @@
       refreshStateLine(payload.id);
     }
 
+    // The bot's last answer to Maintenance about the changes it holds (contract 1's saved); '' with no reading.
+    function heldLineText(held) {
+      if (!held) return '';
+      const line = held.state === 'yes' ? "The bot's last answer: it saved every change it held."
+        : held.state === 'no' ? `The bot reports changes it could not save: ${Number(held.guilds) || 0} guild(s), ${Number(held.files) || 0} file(s). Its log names them.`
+        : held.state === 'unknown' ? "The manager can't confirm the bot saved the changes it holds: its last answer did not say."
+        : held.state === 'stopped' ? 'The bot was stopped without confirming that it saved what it held.'
+        : '';
+      return line && held.note ? `${line} The bot's note: ${held.note}` : line;
+    }
+
+    // NB5 finding 4: what a stop or recreate drops, from the last answer kept as held; it warns and never refuses.
+    function heldWarningText(bot, action) {
+      const m = bot && bot.maintenance;
+      const held = m && m.state !== 'running' ? m.held : null;
+      if (!bot || bot.status !== 'running' || !held || (held.state !== 'no' && held.state !== 'unknown')) return '';
+      const lead = held.state === 'no'
+        ? `The bot reports changes it could not save: ${Number(held.guilds) || 0} guild(s), ${Number(held.files) || 0} file(s).`
+        : "The manager can't confirm the bot saved the changes it holds.";
+      const note = held.note ? ` The bot's note: ${held.note}` : '';
+      const does = { restart: 'A restart stops the bot and drops', update: 'An update recreates the bot and drops', apply: 'Apply recreates the bot and drops', off: 'Off stops the bot and drops', stop: 'Stopping the bot drops' }[action];
+      const ask = { restart: 'Restart anyway?', update: 'Update anyway?', apply: 'Apply anyway?', off: 'Choose Off anyway?', stop: 'Stop anyway?' }[action];
+      return `${lead}${note} ${does} ${held.state === 'no' ? 'those changes' : 'any it still holds'}. ${ask}`;
+    }
+
     let stateBotId = null;
     function stateWindowHtml(bot, info) {
       const kindNotes = {
@@ -3593,8 +3630,10 @@
             <div class="env-tip">${escapeHtml(lines[state])}</div>
           </label>`;
       const message = info.message || '';
+      const held = heldLineText(info.held);
       return `
         <h3>${escapeHtml(`State: ${bot.displayName || bot.id}`)}</h3>
+        ${held ? `<div class="env-tip" id="state-held" style="margin-bottom:12px;">${escapeHtml(held)}</div>` : ''}
         ${radio('running')}${radio('maintenance')}${radio('off')}
         <div class="env-tip" style="margin-bottom:12px;">${escapeHtml(kindNotes[info.kind] || '')}</div>
         <label for="state-message">Maintenance message</label>
@@ -3633,6 +3672,9 @@
     async function applyState(botId) {
       const choice = document.querySelector('input[name="state-choice"]:checked');
       if (!choice) return;
+      const current = bots.find(b => b.id === botId);
+      const warning = choice.value === 'off' ? heldWarningText(current, 'off') : '';
+      if (warning && !confirm(warning)) return;
       const button = document.getElementById('state-apply');
       button.disabled = true;
       button.textContent = 'Applying...';

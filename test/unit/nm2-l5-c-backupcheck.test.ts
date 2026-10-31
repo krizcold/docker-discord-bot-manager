@@ -517,17 +517,17 @@ describe('NM2 L5 c: backupCheck survivors', () => {
   it('the DM log names the outcome and its error', async () => {
     const { bc, bot } = await load();
     const a = await logged(() => bc.stepAlerts(bot(), [{ family: 'main', kind: 'test', on: true, text: 'x' }], NOW));
-    expect(a.lines).toEqual(['[FleetBackup] DM to the owner of Bot a about main:test: unsupported']);
+    expect(a.lines).toEqual(['[FleetBackup] Message to the owner of Bot a about main:test: unsupported']);
     h.hooks = true;
     h.hookAnswer = { ok: false, error: 'boom' };
     const b = await logged(() => bc.stepAlerts(bot(), [{ family: 'main', kind: 'dumps', on: true, text: 'y' }], NOW));
-    expect(b.lines).toEqual(['[FleetBackup] DM to the owner of Bot a about main:dumps: failed (boom)']);
+    expect(b.lines).toEqual(['[FleetBackup] Message to the owner of Bot a about main:dumps: failed (boom)']);
   });
 
   it('a refused hook with no error text reads notify-owner failed', async () => {
     h.hooks = true;
     h.hookAnswer = { ok: false, error: '' };
     const { bc, bot } = await load();
-    expect(await bc.notifyOwner(bot(), 'x')).toEqual({ dm: 'failed', dmError: 'notify-owner failed' });
+    expect(await bc.notifyOwner(bot(), 'x', 'k')).toEqual({ dm: 'failed', dmError: 'notify-owner failed' });
   });
 });

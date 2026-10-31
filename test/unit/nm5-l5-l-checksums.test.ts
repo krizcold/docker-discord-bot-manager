@@ -52,10 +52,10 @@ describe('compareChecksums names the first difference by table name', () => {
 describe('notifyOwner without an error text from the hook client', () => {
   it('a 404', async () => {
     h.answer = { ok: false, status: 404 };
-    expect(await notifyOwner({ id: 'a', displayName: 'a', appHooks: true } as any, 'text')).toMatchObject({ dm: 'failed', dmError: 'notify-owner returned 404', notFound: true });
+    expect(await notifyOwner({ id: 'a', displayName: 'a', appHooks: true } as any, 'text', 'k')).toMatchObject({ dm: 'failed', dmError: 'notify-owner returned 404', notFound: true });
   });
   it('no answer', async () => {
     h.answer = { ok: false, status: 502, unknown: true };
-    expect(await notifyOwner({ id: 'a', displayName: 'a', appHooks: true } as any, 'text')).toEqual({ dm: 'unknown', dmError: 'notify-owner did not answer' });
+    expect(await notifyOwner({ id: 'a', displayName: 'a', appHooks: true } as any, 'text', 'k')).toEqual({ dm: 'unknown', dmError: 'notify-owner did not answer' });
   });
 });

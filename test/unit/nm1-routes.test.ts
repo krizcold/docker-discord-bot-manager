@@ -129,7 +129,7 @@ describe('PUT /:id/maintenance', () => {
 describe('GET /:id/maintenance', () => {
   it('P3 kind database, the read answers: the summary follows the record and the read', async () => {
     const r = await call('get', '/:id/maintenance', 'db1');
-    expect(r.body).toEqual({ success: true, state: 'maintenance', message: 'Back soon', settled: true, kind: 'database', orderedAt: '2026-10-02T10:00:00.000Z', lastError: null, summary: "State: Maintenance. The bot's database login is blocked and none of its sessions is open." });
+    expect(r.body).toEqual({ success: true, state: 'maintenance', message: 'Back soon', settled: true, kind: 'database', orderedAt: '2026-10-02T10:00:00.000Z', lastError: null, summary: "State: Maintenance. The bot's database login is blocked and none of its sessions is open.", held: null });
   });
   it('P3 the read shows the login open', async () => {
     h.read = { ok: true, login: { inRecovery: false, canLogin: true, sessions: 0 } };

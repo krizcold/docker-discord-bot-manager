@@ -61,7 +61,7 @@ describe('write catches say the op may still be running and re-read', () => {
         hideFleetBackups: () => {}, showFleetBackups: () => {}, hideAddSourceModal: () => {}, renderBots: () => {},
       };
       for (const r of ['loadBots', 'loadSources', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
-      const ctx = runPage([fn, ...fns('showNoAnswer', 'waitForSourceUrl', 'restoreSharersText')], g);
+      const ctx = runPage([fn, ...fns('showNoAnswer', 'waitForSourceUrl', 'restoreSharersText', 'heldWarningText')], g);
       await ctx[fn](...args);
       expect(messages.some(hedged)).toBe(true);
       expect(calls).toContain(reread);

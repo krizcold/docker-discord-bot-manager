@@ -400,6 +400,14 @@ describe('N39 to N44: the owner messages carry a key and keep their outcome (D37
     expect(h.notified[0]).toEqual({ key: 'a:replaced:4', text: "The main database of A moved to copy.example on 2026-10-28 14:00 UTC, and the old main on main.example is running again. Its manager blocked the bot's login there and stops the bot there once it holds no change it could not save; rejoin it as a copy in that machine's manager." });
     expect(switchView(stored('a')).lines[0]).toContain(clause.replace('DATE', utcText(r.dm.triedAt)));
   });
+  it('N42b the manager stops waiting: the real writer records the fixed reason, no Fleet view or retry', async () => {
+    replace();
+    h.notifyOutcome = 'real';
+    h.hook = () => ({ ok: false, unknown: true, error: "notify-owner sent, no answer within 30 s; check the app's Fleet view before retrying" });
+    await switchTick(now);
+    expect(stored('a').fleetDb.replacedBy.dm).toMatchObject({ state: 'unknown', error: 'the bot did not answer within 30 s' });
+    expect(switchView(stored('a')).lines[0]).toContain(" Whether the message to the owner was posted can't be confirmed (the bot did not answer within 30 s); the manager sends it again within an hour, and the bot drops a repeat.");
+  });
   it('N39 and N40: posted or repeat is never sent again', async () => {
     replace();
     await switchTick(now);

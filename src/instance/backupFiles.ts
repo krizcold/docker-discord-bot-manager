@@ -259,10 +259,21 @@ export function alertStep(prev: FleetBackupAlert | undefined, on: boolean, kind:
   return { next, send };
 }
 
+/** Contract 7's key: the bot, the case and when it began, from the case's saved record, so a resend after a restart repeats it. */
+export function ownerMessageKey(botId: string, kase: string, since: number): string {
+  return `${botId}:${kase}:${since}`.slice(0, 200);
+}
+
 /** What a message's outcome reads as on the panel: T-40, T-41 or T-42; null while it waits for its first send. */
-export function dmOutcomeText(alert: Pick<FleetBackupAlert, 'dm' | 'dmError'>): string | null {
-  if (alert.dm === 'sent') return 'The owner was sent a Discord message.';
-  if (alert.dm === 'unknown') return "Whether the owner was messaged can't be confirmed: the bot took the message but did not answer in time.";
+export function dmOutcomeText(alert: Pick<FleetBackupAlert, 'dm' | 'dmError' | 'dmPlace' | 'dmNote' | 'dmRepeat'>): string | null {
+  if (alert.dm === 'sent') {
+    const line = alert.dmRepeat ? 'The bot had already posted this message, so it posted nothing new.'
+      : alert.dmPlace === 'channel' ? 'The owner was sent a Discord message in the owner messages channel.'
+      : alert.dmPlace === 'dm' ? 'The owner was sent a Discord message by DM.'
+      : 'The owner was sent a Discord message.';
+    return alert.dmNote ? `${line} The bot's note: ${alert.dmNote}` : line;
+  }
+  if (alert.dm === 'unknown') return `Whether the owner was messaged can't be confirmed: ${alert.dmError || 'the bot took the message but did not answer in time'}.`;
   if (alert.dm === 'unsupported') return 'The owner could not be messaged: this app has no notify-owner hook.';
   if (alert.dm === 'failed') return `The owner could not be messaged: ${alert.dmError || 'notify-owner failed'}.`;
   return null;

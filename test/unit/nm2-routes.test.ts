@@ -159,10 +159,12 @@ describe('NM2 the Database window texts (section 10)', () => {
     ['T-PASS', fam({ test: { file: 'daily-x.dump', startedAt: T0, finishedAt: T0, result: 'passed', tables: 4, rows: 120 } }), `Test restore of daily-x.dump passed at ${when(T0)}: 4 tables and 120 rows matched the counts recorded when it was taken.`],
     ['T-FAIL', fam({ test: { file: 'daily-x.dump', startedAt: T0, finishedAt: T0, result: 'failed', text: 'pg_restore did not finish within 10 minutes' } }), `Test restore of daily-x.dump failed at ${when(T0)}: pg_restore did not finish within 10 minutes.`],
     ['T-CUT', fam({ test: { file: 'daily-x.dump', startedAt: T0, result: 'interrupted', cutShort: 1 } }), 'Test restore of daily-x.dump was cut short by a manager restart; it runs again within a minute.'],
-    ['N-SENT', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'sent', dmAt: T0 } } }), `The owner was sent a DM at ${when(T0)}.`],
-    ['N-PENDING', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'pending' } } }), 'The DM to the owner is being sent.'],
-    ['N-FAILED', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'failed', dmAt: T0, dmError: 'notify-owner returned 404' } } }), 'The DM to the owner could not be sent: notify-owner returned 404. The manager tries again every hour.'],
-    ['N-UNKNOWN', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'unknown', dmAt: T0 } } }), "The bot did not answer within 30 s, so the manager can't confirm the owner got the DM."],
+    ['N-SENT', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'sent', dmAt: T0 } } }), `The owner was sent a Discord message at ${when(T0)}.`],
+    ['N-SENT-DM', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'sent', dmAt: T0, dmPlace: 'dm' } } }), `The owner was sent a DM at ${when(T0)}.`],
+    ['N-PENDING', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'pending' } } }), 'The message to the owner is being sent.'],
+    ['N-FAILED', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'failed', dmAt: T0, dmError: 'notify-owner returned 404' } } }), 'The message to the owner could not be sent: notify-owner returned 404. The manager tries again every hour.'],
+    ['N-UNKNOWN', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'unknown', dmAt: T0 } } }), "The bot did not answer within 30 s, so the manager can't confirm the owner got the message."],
+    ['N-UNKNOWN-BOT', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'unknown', dmAt: T0, dmError: 'Discord did not answer within 20 s' } } }), "The manager can't confirm the owner got the message: Discord did not answer within 20 s."],
     ['N-NONE', fam({ alerts: { dumps: null, test: { kind: 'test', text: 'x', since: T0, dm: 'unsupported', dmAt: T0 } } }), 'This app has no notify-owner hook, so this failure shows only here.'],
   ])('%s', (_id, f, text) => {
     expect(line(f)).toContain(text);
@@ -181,11 +183,11 @@ describe('NM2 the Database window texts (section 10)', () => {
     const out = line(fam({ enabled: false, ...failedTest }));
     expect(out).toContain('Backups are off for this bot');
     expect(out).toContain(`Test restore of d.dump failed at ${when(T0)}: x.`);
-    expect(out).toContain(`The owner was sent a DM at ${when(T0)}.`);
+    expect(out).toContain(`The owner was sent a Discord message at ${when(T0)}.`);
     expect(out).not.toContain('Last backup');
     const copy = run('copyDumpHtml(f)', { f: fam({ family: 'copy', role: 'live copy', enabled: false, ...failedTest }) }) as string;
     expect(copy).toContain('Test restore of d.dump failed');
-    expect(copy).toContain('The owner was sent a DM');
+    expect(copy).toContain('The owner was sent a Discord message');
   });
 
   it('T-SCOPE: a family out of scope shows no status line, and no promise of a dump or a test', () => {
@@ -202,7 +204,7 @@ describe('NM2 the Database window texts (section 10)', () => {
     for (const skip of ['scope', 'seed']) {
       const out = line(fam({ skip, ...failedTest }));
       expect(out).toContain(`Test restore of d.dump failed at ${when(T0)}: x.`);
-      expect(out).toContain(`The owner was sent a DM at ${when(T0)}.`);
+      expect(out).toContain(`The owner was sent a Discord message at ${when(T0)}.`);
       expect(out).not.toMatch(/within a minute|first runs after/);
     }
   });

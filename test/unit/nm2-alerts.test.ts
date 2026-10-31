@@ -79,7 +79,7 @@ describe('NM2 C: the alert and its one DM', () => {
     expect(calls.length).toBe(1);
     expect(calls[0].dmAtCall).toBe('pending');
     expect(calls[0].url).toBe('http://app-1:3000/api/managed/notify-owner');
-    expect(calls[0].body).toEqual({ text: 'Backups failed' });
+    expect(calls[0].body).toEqual({ text: 'Backups failed', key: `a:backup-main-test:${NOW}` });
   });
 
   it('C2 an alert that cannot be saved is held in memory, the DM is still sent, and it is logged', async () => {

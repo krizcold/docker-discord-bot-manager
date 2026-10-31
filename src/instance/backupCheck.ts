@@ -10,7 +10,7 @@ import { execFile, spawn } from 'child_process';
 import * as containerManager from '../docker/containerManager';
 import { BackupFamily, FleetBackupAlert, FleetBackupTestRecord, FleetBackupTests, InstanceConfig } from '../types';
 import { callAppHook, hasAppHooks } from './appHookClient';
-import { alertStep, backupDir, DumpMeta, compareCounts, COUNTS_SQL, hourSlot, parseCountLines, parseDfFreeKb, validateDumpMeta } from './backupFiles';
+import { alertStep, ownerMessageKey, backupDir, DumpMeta, compareCounts, COUNTS_SQL, hourSlot, parseCountLines, parseDfFreeKb, validateDumpMeta } from './backupFiles';
 
 export const testTiming = { readyDeadlineMs: 90_000, readyGapMs: 1_000, restoreSec: 600, backstopMs: 630_000 };
 export const alertTiming = { hookTimeoutMs: 30_000 };
@@ -309,11 +309,11 @@ function saveAlert(instance: InstanceConfig, key: string, alert: FleetBackupAler
   }
 }
 
-export type OwnerMessageOutcome = { dm: FleetBackupAlert['dm']; dmError?: string; posted?: boolean; place?: 'channel' | 'dm'; note?: string; notFound?: boolean };
+export type OwnerMessageOutcome = { dm: FleetBackupAlert['dm']; dmError?: string; posted?: boolean; place?: 'channel' | 'dm'; note?: string; notFound?: boolean; noAnswer?: true };
 
-export async function notifyOwner(instance: InstanceConfig, text: string, key?: string): Promise<OwnerMessageOutcome> {
+export async function notifyOwner(instance: InstanceConfig, text: string, key: string): Promise<OwnerMessageOutcome> {
   if (!hasAppHooks(instance)) return { dm: 'unsupported' };
-  const r = await callAppHook(instance, 'notify-owner', 'POST', { text: text.slice(0, 1500), ...(key ? { key } : {}) }, alertTiming.hookTimeoutMs);
+  const r = await callAppHook(instance, 'notify-owner', 'POST', { text: text.slice(0, 1500), key }, alertTiming.hookTimeoutMs);
   if (r.ok) {
     const body = (r.body ?? {}) as { posted?: unknown; place?: unknown; note?: unknown };
     const place = body.place === 'channel' || body.place === 'dm' ? body.place : undefined;
@@ -321,8 +321,19 @@ export async function notifyOwner(instance: InstanceConfig, text: string, key?: 
   }
   // NM2's alerts retry an older bot's 404 hourly; NM5's owner messages read notFound as a build without the hook.
   if (r.status === 404) return { dm: 'failed', dmError: r.error || 'notify-owner returned 404', notFound: true };
-  if (r.unknown) return { dm: 'unknown', dmError: r.error || 'notify-owner did not answer' };
+  if (r.unknown) return r.status === undefined ? { dm: 'unknown', dmError: 'the bot did not answer within 30 s', noAnswer: true } : { dm: 'unknown', dmError: r.error || 'notify-owner did not answer' };
   return { dm: 'failed', dmError: r.error || 'notify-owner failed' };
+}
+
+/** The alert with one send's outcome in place of the last one's; a key already posted counts as sent. */
+export function withOutcome(alert: FleetBackupAlert, result: OwnerMessageOutcome, now: number): FleetBackupAlert {
+  const { dmError: _e, dmPlace: _p, dmNote: _n, dmRepeat: _r, ...rest } = alert;
+  return {
+    ...rest, dm: result.dm, dmAt: now,
+    ...(result.dmError && !result.noAnswer ? { dmError: result.dmError } : {}),
+    ...(result.dm === 'sent' && result.posted === false ? { dmRepeat: true as const } : result.place ? { dmPlace: result.place } : {}),
+    ...(result.note ? { dmNote: result.note } : {}),
+  };
 }
 
 export type AlertCondition = { family: BackupFamily; kind: FleetBackupAlert['kind']; on: boolean; text: string };
@@ -342,10 +353,8 @@ export async function stepAlerts(instance: InstanceConfig, conditions: AlertCond
     }
     if (!prev || prev.text !== next.text) saveAlert(instance, key, next);
     if (!send) continue;
-    const result = await notifyOwner(instance, next.text);
-    const { dmError: _old, ...rest } = next;
-    const done: FleetBackupAlert = { ...rest, dm: result.dm, dmAt: now, ...(result.dmError ? { dmError: result.dmError } : {}) };
-    saveAlert(instance, key, done);
-    console.log(`[FleetBackup] DM to the owner of ${instance.displayName} about ${key}: ${result.dm}${result.dmError ? ` (${result.dmError})` : ''}`);
+    const result = await notifyOwner(instance, next.text, ownerMessageKey(instance.id, `backup-${c.family}-${c.kind}`, next.since));
+    saveAlert(instance, key, withOutcome(next, result, now));
+    console.log(`[FleetBackup] Message to the owner of ${instance.displayName} about ${key}: ${result.dm}${result.dmError ? ` (${result.dmError})` : ''}`);
   }
 }

@@ -281,14 +281,14 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   if (out.fleetBackupAlerts) {
     const alerts: Record<string, FleetBackupAlert> = {};
     for (const [key, a] of Object.entries(out.fleetBackupAlerts)) {
-      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}) };
+      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}), ...(typeof a.dmNote === 'string' ? { dmNote: redactSecrets(a.dmNote, secrets) } : {}) };
     }
     out.fleetBackupAlerts = alerts;
   }
   if (out.fleetCopyAlerts) {
     const alerts: Record<string, FleetBackupAlert> = {};
     for (const [key, a] of Object.entries(out.fleetCopyAlerts)) {
-      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}) };
+      alerts[key] = { ...a, text: redactSecrets(a.text, secrets), ...(typeof a.dmError === 'string' ? { dmError: redactSecrets(a.dmError, secrets) } : {}), ...(typeof a.dmNote === 'string' ? { dmNote: redactSecrets(a.dmNote, secrets) } : {}) };
     }
     out.fleetCopyAlerts = alerts;
   }

@@ -197,9 +197,10 @@ const countOf = (v: unknown): number => (Array.isArray(v) ? v.length : typeof v 
 /** Contract 1's `saved`: true, false (with what was left), or anything else as unknown. */
 export function heldOf(body: unknown): MaintenanceHeld {
   const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
-  if (b.saved === true) return { state: 'yes' };
-  if (b.saved === false) return { state: 'no', guilds: countOf(b.unsavedGuilds), files: countOf(b.unsavedFiles) };
-  return { state: 'unknown' };
+  const note = typeof b.note === 'string' && b.note ? { note: b.note } : {};
+  if (b.saved === true) return { state: 'yes', ...note };
+  if (b.saved === false) return { state: 'no', guilds: countOf(b.unsavedGuilds), files: countOf(b.unsavedFiles), ...note };
+  return { state: 'unknown', ...note };
 }
 
 /**
@@ -705,7 +706,7 @@ export function maintenanceView(rec: MaintenanceRecord, kind: MaintenanceKind | 
 }
 
 /** The GET answer: the record, the kind and the state line, with a live login read for a database bot. */
-export async function maintenanceStatus(inst: InstanceConfig, driftText: string | null): Promise<{ state: BotRunState; message: string; settled: boolean; kind: MaintenanceKind | null; orderedAt: string; lastError: string | null; summary: string }> {
+export async function maintenanceStatus(inst: InstanceConfig, driftText: string | null): Promise<{ state: BotRunState; message: string; settled: boolean; kind: MaintenanceKind | null; orderedAt: string; lastError: string | null; summary: string; held: MaintenanceHeld | null }> {
   const rec = maintenanceOf(inst);
   const kindRead = readKind(inst);
   const kind = 'kind' in kindRead ? kindRead.kind : null;
@@ -720,6 +721,7 @@ export async function maintenanceStatus(inst: InstanceConfig, driftText: string 
   return {
     state: rec.state, message: rec.message, settled: rec.settled, kind, orderedAt: rec.orderedAt,
     lastError: rec.lastError ?? null, summary: maintenanceView(rec, kind, driftText, live),
+    held: rec.state !== 'running' && rec.held ? rec.held : null,
   };
 }
 

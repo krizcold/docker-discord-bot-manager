@@ -106,7 +106,7 @@ describe('U3 Start on an Off bot', () => {
 });
 
 describe('U4 the State window per kind', () => {
-  const ctx = load(['stateWindowHtml']);
+  const ctx = load(['heldLineText', 'stateWindowHtml']);
   const notes: Record<string, string> = {
     database: 'The manager blocks the bot&#39;s database login',
     copy: 'This machine holds a live copy of the database.',

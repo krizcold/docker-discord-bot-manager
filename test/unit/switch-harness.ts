@@ -42,7 +42,7 @@ export interface Harness {
   endSessions: { ok: true } | { ok: false; cls: 'other'; error: string; left?: number };
   /** Lets a row apply what the mocked order would have written. */
   onOrder: ((to: string) => void) | null;
-  notifyOutcome: Record<string, unknown>;
+  notifyOutcome: Record<string, unknown> | 'real';
   block: { ok: true } | { ok: false; cls: 'other'; error: string };
   open: { ok: true } | { ok: false; cls: 'other'; error: string };
   /** fleetJoin.registerAddress: the calls, and the error it answers (null: registered). */
@@ -236,7 +236,7 @@ export function appHookMock(real: typeof import('../../src/instance/appHookClien
 export function backupCheckMock(real: typeof import('../../src/instance/backupCheck')): Record<string, unknown> {
   return {
     ...real,
-    notifyOwner: async (_inst: unknown, text: string, key?: string) => { h.notified.push({ text, ...(key ? { key } : {}) }); return h.notifyOutcome; },
+    notifyOwner: async (_inst: unknown, text: string, key?: string) => { h.notified.push({ text, ...(key ? { key } : {}) }); return h.notifyOutcome === 'real' ? real.notifyOwner(_inst as any, text, key as string) : h.notifyOutcome; },
   };
 }
 

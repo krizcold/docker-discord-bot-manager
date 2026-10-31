@@ -81,7 +81,7 @@ describe('the answer parse', () => {
     [{ saved: false, unsavedGuilds: 3, unsavedFiles: 2 }, { state: 'no', guilds: 3, files: 2 }],
     [{ saved: false, unsavedGuilds: ['g1', 'g2'], unsavedFiles: ['a.json'] }, { state: 'no', guilds: 2, files: 1 }],
     [{ saved: false }, { state: 'no', guilds: 0, files: 0 }],
-    [{ saved: null, note: 'busy' }, { state: 'unknown' }],
+    [{ saved: null, note: 'busy' }, { state: 'unknown', note: 'busy' }],
     [{}, { state: 'unknown' }],
     [{ saved: 'yes' }, { state: 'unknown' }],
   ])('%j reads as %j', (body, want) => {

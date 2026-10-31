@@ -1185,11 +1185,13 @@
             if (payload.warning) showMessage('error', payload.warning);
             busyBots.delete(id);
             redraw();
+            if (fleetBackupBotId === id) renderFleetSwitch(id);
             break;
           case 'bot:stopped':
             mergeBotState(payload);
             busyBots.delete(id);
             redraw();
+            if (fleetBackupBotId === id) renderFleetSwitch(id);
             break;
           case 'bot:restarted':
             payload.warning ? showMessage('error', payload.warning) : showMessage('success', 'Bot restarted');
@@ -1641,14 +1643,7 @@
                 <option value="public" ${webAuthMode === 'public' ? 'selected' : ''}>Auth: Public</option>
               </select>` : '';
 
-            // Database modal: backups + replication on a managed-DB instance;
-            // the standby replica surface on fleet workers; the kept safety
-            // dumps after a decommission destroyed the database itself.
-            // A seed owns the instance through the window in which it carries
-            // neither database record; the modal holds its exits.
-            const fleetBackupControl = (fb || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetWorker || bot.hasDbBackups)
-              ? `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${bot.fleetDb ? 'Backups and replication of this bot\'s managed database' : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine' : 'Earlier database backups kept on this machine'}">Database</button>`
-              : '';
+            const fleetBackupControl = databaseButtonHtml(bot);
 
             return `
             <div class="bot-card">
@@ -2484,6 +2479,21 @@
       return 'Provisioning the standby';
     }
 
+    // Database modal: backups + replication on a managed-DB instance; the
+    // standby replica surface on fleet workers; the kept safety dumps after a
+    // decommission destroyed the database itself; the state and memory of any
+    // other bot that takes the manager's hooks. A seed owns the instance
+    // through the window in which it carries neither database record.
+    function databaseButtonHtml(bot) {
+      const own = bot.fleetBackup || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetWorker || bot.hasDbBackups;
+      if (!own && !bot.appHooks) return '';
+      const title = bot.fleetDb ? 'Backups and replication of this bot\'s managed database'
+        : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine'
+        : own ? 'Earlier database backups kept on this machine'
+        : 'State and memory of this bot';
+      return `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${title}">Database</button>`;
+    }
+
     async function showFleetBackups(botId) {
       fleetBackupBotId = botId;
       const bot = bots.find(b => b.id === botId);
@@ -2491,11 +2501,29 @@
       const content = document.getElementById('fleet-backup-content');
       modal.classList.remove('hidden');
 
+      if (bot && !bot.fleetDb && !bot.fleetDbReplica && !bot.fleetDbReplicaSeed && !bot.fleetWorker && !bot.hasDbBackups) {
+        const place = bot.dataPlace === 'json' ? 'This bot keeps its data in JSON files.'
+          : bot.dataPlace === 'outside' ? 'This bot keeps its data in a database this manager does not run.'
+          : 'Can\'t confirm where this bot keeps its data: its env store cannot be read.';
+        content.innerHTML = `
+          <h3>Database: ${escapeHtml(bot.displayName || botId)}</h3>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div id="fleet-state-line"></div><button class="btn btn-secondary btn-small" onclick="showStateWindow(${jsArg(botId)})">State...</button></div>
+          <div id="fleet-memory-line" class="env-tip"></div>
+          <div class="env-tip">${place}</div>
+          <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
+          </div>`;
+        refreshStateLine(botId);
+        renderMemoryLine(botId);
+        return;
+      }
+
       // Worker instances (no managed DB of their own) get the standby surface.
       if (!bot?.fleetDb) {
         content.innerHTML = `
-          <h3>Database Replica: ${escapeHtml(bot?.displayName || botId)}</h3>
-          <div id="fleet-state-line"></div>
+          <h3>Database: ${escapeHtml(bot?.displayName || botId)}</h3>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div id="fleet-state-line"></div><button class="btn btn-secondary btn-small" onclick="showStateWindow(${jsArg(botId)})">State...</button></div>
+          <div id="fleet-memory-line" class="env-tip"></div>
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
           <div class="env-group" style="margin-top:14px;"><div class="env-group-title">Move</div><div id="fleet-switch-body"></div></div>
           <div id="fleet-past-backups"></div>
@@ -2506,12 +2534,13 @@
         renderFleetSwitch(botId);
         renderPastFleetBackups(botId);
         refreshStateLine(botId);
+        renderMemoryLine(botId);
         return;
       }
 
       const fb = bot?.fleetBackup || { enabled: true, hour: 4 };
       fleetBackupStored = { enabled: fb.enabled, hour: fb.hour };
-      content.innerHTML = `<h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
+      content.innerHTML = `<h3>Database: ${escapeHtml(bot?.displayName || botId)}</h3><div class="loading">Loading...</div>`;
 
       const listHtml = await fleetBackupListHtml(botId, fb);
       if (fleetBackupBotId !== botId) return;
@@ -2521,8 +2550,9 @@
       ).join('');
 
       content.innerHTML = `
-        <h3>Database Backups: ${escapeHtml(bot?.displayName || botId)}</h3>
-        <div id="fleet-state-line"></div>
+        <h3>Database: ${escapeHtml(bot?.displayName || botId)}</h3>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div id="fleet-state-line"></div><button class="btn btn-secondary btn-small" onclick="showStateWindow(${jsArg(botId)})">State...</button></div>
+        <div id="fleet-memory-line" class="env-tip"></div>
         <div id="fleet-seed-banner"></div>
         <div id="fleet-backup-error">${fleetBackupErrorHtml(bots.find(b => b.id === botId)?.fleetBackup || fb)}</div>
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
@@ -2550,6 +2580,8 @@
       renderSeedBanner(botId);
       renderFleetReplication(botId);
       renderFleetSwitch(botId);
+      refreshStateLine(botId);
+      renderMemoryLine(botId);
       if (bots.find(b => b.id === botId)?.fleetBackup !== bot?.fleetBackup) refreshFleetBackupStatus(botId);
     }
 
@@ -2737,7 +2769,7 @@
       return warning ? `<div class="error-message">${escapeHtml(warning)}</div>` : '';
     }
 
-    // ─── Fleet DB Replication (PLAN_REPLICATION.md Stage 1) ───
+    // ─── Replication (the main) ───
     async function renderFleetReplication(botId) {
       const body = document.getElementById('fleet-replication-body');
       if (!body || fleetBackupBotId !== botId) return;
@@ -2757,11 +2789,11 @@
       const r = res.replication || { enabled: false };
       if (!r.enabled) {
         body.innerHTML = `
-          <div class="env-tip">A standby copy of this database on another machine. Without one, this machine dying takes the database with it and the fleet cannot fail over.</div>
+          <div class="env-tip">A copy of this database on another machine. Without one, this machine dying takes the database with it and no other machine can take over as the main.</div>
           <div class="env-row" style="align-items:center;">
             <input type="text" id="fleet-repl-host" placeholder="Public host or IP of THIS machine" style="flex:2;">
             <input type="number" id="fleet-repl-port" placeholder="15432" min="1" max="65535" style="flex:1;">
-            <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached standby may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
+            <input type="number" id="fleet-repl-keep" placeholder="WAL bound MB (4096)" min="64" max="1048576" title="How much WAL a detached copy may pin on this disk before its slot is invalidated and it must re-seed" style="flex:1;">
             <button class="btn btn-primary btn-small" id="fleet-repl-enable" onclick="enableFleetReplication('${botId}')">Enable</button>
           </div>
           <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
@@ -2769,7 +2801,6 @@
           </div>`;
         return;
       }
-      const stopped = (bots.find(b => b.id === botId) || {}).status !== 'running';
       const live = r.live;
       const reach = r.reachability;
       const reachAge = reach && reach.ageSeconds > 0 ? ` (checked ${reach.ageSeconds}s ago)` : '';
@@ -2783,39 +2814,40 @@
         const f = { kB: 1024, MB: 1048576, GB: 1073741824, TB: 1099511627776 }[m[2] || 'MB'];
         return Number(m[1]) * f;
       })();
-      // Every standby that ever seeded left its slot on this primary, so the
-      // slots ARE the standbys: each one is read with the link streaming on it,
-      // and an inactive one can be dropped once its standby is gone.
+      // Every copy that ever seeded left its slot on this main, so the slots
+      // are the copies: each one is read with the link streaming on it, and an
+      // inactive one can be dropped once its copy is gone.
       const fleetSlots = ((live && live.slots) || []).filter(s => s.fleet);
       const otherSlots = ((live && live.slots) || []).filter(s => !s.fleet);
       const fleetSlotsHtml = fleetSlots.length === 0
         ? `<div class="env-tip" style="color:var(--warning);">No copy attached: this machine dying would take this bot's database with it. Paste the join code into another machine's manager to add one.</div>`
         : fleetSlots.map(s => {
             const who = s.machine
-              ? `The copy on <b>${escapeHtml(s.machine)}</b> (slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? `, ${escapeHtml(s.clientAddr)}` : ''})`
-              : `Standby on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
+              ? `The copy on <b>${escapeHtml(s.machine)}</b> (slot <b>${escapeHtml(s.slot)}</b>)`
+              : `The copy on slot <b>${escapeHtml(s.slot)}</b>${s.clientAddr ? ` (${escapeHtml(s.clientAddr)})` : ''}`;
             const retained = s.retainedBytes != null ? Math.round(s.retainedBytes / 1048576) : null;
-            const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the primary; a standby that used it must be re-seeded to attach again">Drop slot</button>` : '';
+            const dropBtn = !s.active ? ` <button class="btn btn-secondary btn-small" onclick="dropFleetSlot('${botId}', ${jsArg(s.slot)})" title="Drop this slot on the main; a copy that used it must be re-seeded to attach again">Drop slot</button>` : '';
             if (s.walStatus === 'lost') return `<div class="error-message">${who} was invalidated: it kept more WAL than the bound. The copy's manager rebuilds it from this database when it next checks; drop the slot if that copy is gone.${dropBtn}</div>`;
             if (s.walStatus === 'unreserved') return `<div class="error-message">${who} is past the WAL bound and about to be invalidated; reconnect the copy now.${dropBtn}</div>`;
             if (!s.active) return `<div class="error-message">${who} is not connected: its copy, if it still exists, is falling behind${retained != null ? `, and the slot keeps ${retained} MB of WAL` : ''}. Drop the slot if that copy is gone.${dropBtn}</div>`;
             if (s.state !== 'streaming') return `<div class="error-message">${who} is <b>${escapeHtml(s.state || 'not streaming')}</b>, not streaming: the copy is going stale.</div>`;
             const lag = s.replayLagSeconds;
-            const lagText = lag != null ? `, replay lag ${lag.toFixed(1)}s` : '';
+            const behind = s.behindBytes == null ? '' : s.behindBytes === 0 ? ', caught up' : s.behindBytes < 1048576 ? ', less than 1 MB behind' : `, ${Math.round(s.behindBytes / 1048576)} MB behind`;
+            const lagText = `${behind}${lag != null ? `, replay lag ${lag.toFixed(1)}s` : ''}`;
             const warn = lag != null && lag > 60;
             const retain = keepBytes !== null && s.retainedBytes !== null && s.retainedBytes > keepBytes / 2 ? ` - retains ${retained} MB of WAL (bound ${Math.round(keepBytes / 1048576)} MB)` : '';
-            return `<div class="env-tip" style="color:var(--${warn || retain ? 'warning' : 'success'});">${who}: streaming${lagText}${warn ? ' - a failover to it now would lose that much' : ''}${retain}</div>`;
+            return `<div class="env-tip" style="color:var(--${warn || retain ? 'warning' : 'success'});">${who}: streaming${lagText}${warn ? ' - a take-over by it now would lose that much' : ''}${retain}</div>`;
           }).join('');
       // A slot this manager did not mint retains WAL on the same bound, so it is
       // listed whether or not a standby of this primary is attached.
       const slotsHtml = !live ? '' : fleetSlotsHtml
-        + otherSlots.map(s => `<div class="env-tip">Slot <b>${escapeHtml(s.slot)}</b> (not a fleet standby): ${escapeHtml(s.walStatus)}${s.active ? ', active' : ''}</div>`).join('');
+        + otherSlots.map(s => `<div class="env-tip">Slot <b>${escapeHtml(s.slot)}</b> (not a fleet copy): ${escapeHtml(s.walStatus)}${s.active ? ', active' : ''}</div>`).join('');
       const keepTip = live && live.slotWalKeep === '-1'
         ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span> <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`
         : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : r.probeError ? ` - <span style="color:var(--warning)">could not read the database (${escapeHtml(r.probeError)})</span>` : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
-        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the standby slots dropped). Press Disable replication to finish it.</div>` : ''}
+        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the copies' slots dropped). Press Disable replication to finish it.</div>` : ''}
         ${reachHtml}
         ${slotsHtml}
         <div style="margin-top:6px;">
@@ -2835,19 +2867,6 @@
             <button class="btn btn-danger btn-small" onclick="decommissionFleetDb('${botId}')">Decommission this database</button>
           </div>
         </div>
-        <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);">
-          <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:4px;">Failed over to another machine?</div>
-          <div class="env-tip">If the fleet now runs on the other machine's database, this copy is a stale fork that must never serve again. Re-seeding turns it into a standby of the new primary. This database is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the failover survives only in that dump.</div>
-          ${stopped ? `
-          <div class="form-group"><label>Join code from the main's manager</label>
-            <textarea id="reseed-join" rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="smdbjoin1...."></textarea></div>
-          <div class="env-row" style="align-items:center;">
-            <input type="text" id="reseed-host" value="${escapeHtml(r.publicHost || '')}" placeholder="This machine's address for other machines (blank if it cannot open a port)" style="flex:2;">
-            <input type="number" id="reseed-port" value="${r.hostPort || ''}" placeholder="15432" min="1" max="65535" style="flex:1;">
-            <button class="btn btn-danger btn-small" onclick="reseedStalePrimary('${botId}')">Re-seed as standby</button>
-          </div>`
-          : '<div class="env-tip" style="color:var(--warning);">Stop the instance to re-seed: this deletes the database it is currently running on.</div>'}
-        </div>
         `;
     }
 
@@ -2856,7 +2875,7 @@
      * fresh safety dump succeeds; that dump is the recovery path.
      */
     async function decommissionFleetDb(botId) {
-      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first under a write fence (while it runs, the database refuses every connection but the manager\'s, is read-only and has its sessions closed) and kept with the backups; if the fence or the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a standby streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
+      const warning = 'Decommission this database?\n\nThe database container and its volume on this machine are DESTROYED. A fresh safety dump is taken first under a write fence (while it runs, the database refuses every connection but the manager\'s, is read-only and has its sessions closed) and kept with the backups; if the fence or the dump fails, nothing is destroyed. If anything still uses this database, it goes down until you restore that dump into a re-provisioned database, and a copy streaming from it on another machine loses its source.\n\nThe instance must be stopped first.';
       if (!confirm(warning)) return;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
@@ -2908,7 +2927,8 @@
         if (btn) btn.disabled = false;
       }
       renderFleetReplication(botId);
-      loadBots();
+      await loadBots();
+      if (fleetBackupBotId === botId) renderFleetSwitch(botId);
     }
 
     async function applyFleetReplBound(botId) {
@@ -2929,7 +2949,7 @@
     }
 
     async function dropFleetSlot(botId, slot) {
-      if (!confirm(`Drop replication slot ${slot} on this primary?\n\nThe WAL it retains is released. A standby that used it can no longer resume and must be re-seeded to attach again.`)) return;
+      if (!confirm(`Drop replication slot ${slot} on this main?\n\nThe WAL it retains is released. A copy that used it can no longer resume and must be re-seeded to attach again.`)) return;
       try {
         const res = await api('DELETE', `/bots/${botId}/fleet-replication/slots/${encodeURIComponent(slot)}`);
         showMessage(res.success ? 'success' : 'error', res.success ? `Slot ${slot} dropped` : (res.error || 'Failed to drop the slot'));
@@ -2940,7 +2960,7 @@
     }
 
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nRefused while a standby streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive standby slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
+      if (!confirm('Disable replication?\n\nRefused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
       const btn = document.getElementById('fleet-repl-disable');
       if (btn) btn.disabled = true;
       try {
@@ -2959,7 +2979,8 @@
         if (btn) btn.disabled = false;
       }
       renderFleetReplication(botId);
-      loadBots();
+      await loadBots();
+      if (fleetBackupBotId === botId) renderFleetSwitch(botId);
     }
 
     async function fetchJoinCode(botId) {
@@ -2994,7 +3015,7 @@
       if (el) el.innerHTML = '';
     }
 
-    // ─── Fleet DB standby replica (worker side, PLAN_REPLICATION.md Stage 2) ───
+    // ─── The copy ───
     let replicaPollSeq = 0;
 
 
@@ -3029,7 +3050,7 @@
     }
 
     function replicaConsentHtml() {
-      return '<div class="env-tip">This copy follows the primary and never takes over by itself.</div>';
+      return '<div class="env-tip">This copy follows the main and never takes over by itself.</div>';
     }
 
     // A poll must not wipe what the operator is typing into the panel.
@@ -3049,7 +3070,7 @@
         // Keep asking: this panel now carries the live Cancel and Dismiss, so
         // one unreadable answer must not take them away until the modal is
         // closed and reopened.
-        body.innerHTML = '<div class="error-message">Failed to load replica status; retrying...</div>';
+        body.innerHTML = '<div class="error-message">Failed to load the copy\'s status; retrying...</div>';
         setTimeout(() => { if (seq === replicaPollSeq) renderFleetReplica(botId); }, 3000);
         return;
       }
@@ -3063,8 +3084,8 @@
              <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">${parked.pinsUnretired && parked.pinsUnretired.length ? `<button class="btn btn-primary btn-small" onclick="finishPinsRetire('${botId}')">Finish retire</button>` : ''}<button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(parked.startedAt)}, true)">Dismiss</button></div></div>`
         : r.seedNote ? `<div class="error-message">${escapeHtml(r.seedNote)}
              <div style="margin-top:6px;"><button class="btn btn-secondary btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(r.seedNoteStartedAt)}, true)">Dismiss</button></div></div>`
-        : r.lastError ? `<div class="error-message">Standby needs attention: ${escapeHtml(r.lastError)}</div>`
-        : !r.live && r.probeError ? `<div class="error-message">Could not read the standby (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '')
+        : r.lastError ? `<div class="error-message">The copy needs attention: ${escapeHtml(r.lastError)}</div>`
+        : !r.live && r.probeError ? `<div class="error-message">Could not read the copy (${escapeHtml(r.probeError)}); its state is unknown.</div>` : '')
         + rebuiltLineHtml(res.rebuild, r);
       if (r.provisioning) {
         const p = r.provisioning;
@@ -3072,7 +3093,7 @@
           ? '<div class="env-tip">Cancelling at the next step...</div>'
           : p.cancelable
             ? `<div style="margin-top:6px;"><button class="btn btn-danger btn-small" onclick="cancelReplicaSeed('${botId}', ${Number(p.startedAt)}, false)">Cancel</button></div>`
-            : '<div class="env-tip">Past the point of cancelling: the copy is complete and the standby is starting.</div>';
+            : '<div class="env-tip">Past the point of cancelling: the copy is complete and its database is starting.</div>';
         body.innerHTML = `
           ${errHtml}
           <div class="env-tip">${seedWhat(p.purpose, p.auto, p.cause)}: <b>${escapeHtml(p.phase)}</b> (${p.forSeconds}s). Seeding copies the whole database; large fleets take a while.</div>
@@ -3107,7 +3128,7 @@
       const lagText = live.caughtUp === true
         ? (live.receiverStatus === 'streaming' ? ', caught up' : '; it replayed everything received before the link dropped')
         : live.replayLagSeconds != null ? `, replay lag ${live.replayLagSeconds.toFixed(1)}s`
-        : live.clockSkewSeconds != null ? `; this machine's clock runs ${live.clockSkewSeconds}s behind the primary's, so the time behind cannot be read` : '';
+        : live.clockSkewSeconds != null ? `; this machine's clock runs ${live.clockSkewSeconds}s behind the main's, so the time behind cannot be read` : '';
       // Every branch above the last means this copy has stopped protecting the
       // fleet, which must not read as an ordinary status line. An absent live
       // block means the state could not be read at all (the reason rides
@@ -3117,13 +3138,13 @@
       const stateHtml = !r.live
         ? ''
         : !live.running
-        ? '<div class="error-message">Standby container is not running: it is receiving nothing and falls further behind every minute.</div>'
+        ? '<div class="error-message">The copy\'s database container is not running: it is receiving nothing and falls further behind every minute.</div>'
         : live.inRecovery === false
-          ? `<div class="error-message">This copy has been PROMOTED outside the manager and no longer follows a main. Take over makes it this machine's main database: the manager checks the old main, then raises this copy's generation before any bot can use it. If the promotion was a mistake, remove the replica and provision it again; that deletes every write made to this copy since the promote.</div>
+          ? `<div class="error-message">This copy has been PROMOTED outside the manager and no longer follows a main. Take over makes it this machine's main database: the manager checks the old main, then raises this copy's generation before any bot can use it. If the promotion was a mistake, press Remove replica and add the copy again; that deletes every write made to this copy since the promote.</div>
              <div style="margin-top:6px;"><button class="btn btn-primary btn-small" onclick="takeOverFleet(${jsArg(botId)})">Take over</button></div>`
         : live.receiverStatus !== 'streaming'
-          ? `<div class="error-message">Not streaming from the primary (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the primary's published port, then re-seed if the gap is large.</div>`
-          : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a failover now would lose that much' : ''}</div>`;
+          ? `<div class="error-message">Not streaming from the main (${escapeHtml(live.receiverStatus || 'no connection')})${lagText}. Check the main's published port, then re-seed if the gap is large.</div>`
+          : `<div class="env-tip" style="color:var(--${laggingBehind || lagUnreadable ? 'warning' : 'success'});">Receiver: streaming${lagText}${laggingBehind ? ' - a take-over now would lose that much' : ''}</div>`;
       // Offered while this is still a copy: a live one, or one the manager's own
       // stopped re-seed took down. A promoted database is taken over or removed,
       // and a record too old to probe has no state to re-seed from.
@@ -3140,7 +3161,7 @@
         ${stateHtml}
         ${rebuildLineHtml(res.rebuild)}
         ${copyDumpHtml(res.copyBackup)}
-        <div class="env-tip">The bot on this instance learns its standby when its container is next recreated: Apply on the card (in place) or Restart.</div>
+        <div class="env-tip">The bot on this instance learns its copy when its container is next recreated: Apply on the card (in place) or Restart.</div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;">
           <button class="btn btn-danger btn-small" onclick="removeFleetReplica('${botId}')">Remove replica</button>
           ${reseedHtml}
@@ -3281,7 +3302,7 @@
       if (refuseBadNumbers([['reseed-port', 'port']])) return;
       if (!joinCode) { showMessage('error', 'Paste the join code from the main\'s manager first'); return; }
       if (refuseWhileChecking(botId)) return;
-      if (!confirm('Re-seed this database as a standby?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed), then DELETED and replaced with a fresh copy of the pasted primary. Before the delete, the pasted primary must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted primary does not is discarded.\n\nWhen it finishes, this database is a standby that follows the pasted primary and takes no writes of its own. Start the instance, then open its Database modal: the replica section shows "caught up" or the replay lag.')) return;
+      if (!confirm('Rejoin this machine as a copy?\n\nThis instance\'s database is dumped once under a write fence (outside connections refused, read-only, sessions closed) and the dump is kept with the backups, then the database is DELETED and replaced with a fresh copy of the pasted main. Before the delete, the pasted main must report a copy of this database (the same system id) on the same or a later timeline; if it does not, or if the dump fails, nothing is deleted. Whatever this database holds that the pasted main does not is discarded; anything written here after the other machine became the main survives only in that dump.\n\nWhen it finishes, this database is a copy that follows the pasted main and takes no writes of its own. Start the instance, then open its Database window: the copy\'s section shows "caught up" or the replay lag.')) return;
       const payload = { joinCode };
       if (host) payload.publicHost = host;
       if (host && portRaw !== '') payload.hostPort = Number(portRaw);
@@ -3290,7 +3311,7 @@
         if (!res) return;
         // Failure keeps the form (and everything pasted into it) intact.
         if (!res.success) { showMessage('error', `${botLabel(botId)}: ${res.error || 'Failed to start re-seeding'}`); return; }
-        showMessage('success', `${botLabel(botId)}: re-seeding started`);
+        showMessage('success', `${botLabel(botId)}: rejoining as a copy started`);
       } catch (err) {
         showNoAnswer('re-seed');
         await followLostProvisioning(botId, () => { if (fleetBackupBotId === botId) hideFleetBackups(); });
@@ -3302,7 +3323,7 @@
 
     async function removeFleetReplica(botId) {
       const rec = (bots.find(b => b.id === botId) || {}).fleetDbReplica;
-      if (!confirm(`Remove this replica?\n\nThe data volume is kept, but the PRIMARY keeps this standby's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the primary's Database modal lists it with a Drop action once nothing streams on it.`)) return;
+      if (!confirm(`Remove this copy?\n\nThe data volume is kept, but the MAIN keeps this copy's replication slot${rec ? ` (${rec.slot})` : ''}, which retains WAL until it is dropped there: the main's Database window lists it with a Drop action once nothing streams on it.`)) return;
       try {
         let res = await api('DELETE', `/bots/${botId}/fleet-replica`);
         if (!res.success && res.needsConfirm) {
@@ -3310,12 +3331,12 @@
           res = await api('DELETE', `/bots/${botId}/fleet-replica`, { confirmPromoted: true });
         }
         if (res.success) {
-          showMessage('success', res.warning || 'Replica removed');
+          showMessage('success', res.warning || 'Copy removed');
         } else {
-          showMessage('error', res.error || 'Failed to remove replica');
+          showMessage('error', res.error || 'Failed to remove the copy');
         }
       } catch (err) {
-        showNoAnswer('replica removal');
+        showNoAnswer('copy removal');
       }
       renderFleetReplica(botId);
       loadBots();
@@ -3371,6 +3392,25 @@
       const line = document.getElementById('fleet-state-line');
       if (!line || fleetBackupBotId !== botId) return;
       line.textContent = res?.success ? (res.summary || '') : res ? (res.error || '') : "No answer from the manager, so the bot's state can't be shown.";
+    }
+
+    function memoryLineText(res) {
+      const lead = 'Room to reshard beside the running shards: ';
+      if (!res) return `${lead}can't confirm: no answer from the manager`;
+      if (!res.success) return `${lead}can't confirm: ${res.error || 'the manager refused the reading'}`;
+      const m = res.memory || {};
+      if (m.running === false) return `${lead}the bot is not running`;
+      if (m.room === true || m.room === false) return `${lead}${m.room ? 'yes' : 'no'}, ${m.freeMb} MB free for ${m.useMb} MB`;
+      return `${lead}can't confirm: ${m.error || 'no reading'}`;
+    }
+
+    async function renderMemoryLine(botId) {
+      if (!document.getElementById('fleet-memory-line') || fleetBackupBotId !== botId) return;
+      let res;
+      try { res = await api('GET', `/bots/${botId}/memory`); } catch (err) { res = null; }
+      const line = document.getElementById('fleet-memory-line');
+      if (!line || fleetBackupBotId !== botId) return;
+      line.textContent = memoryLineText(res);
     }
 
     // ─── Switch and move ───
@@ -3473,6 +3513,10 @@
           <label style="font-size:0.8rem;"><input type="checkbox" id="fleet-takeover-start" checked> Start the bot here when done</label></div>`;
       }
       const db = bot.fleetDb;
+      const g = view.generation;
+      const genLine = !g || db.replacedBy || db.mainConflict || db.pushBroken || db.handover || db.receive || view.takeover ? ''
+        : g.error ? `<div class="env-tip" style="color:var(--warning);">Can't confirm this database's generation: ${escapeHtml(g.error)}</div>`
+        : `<div class="env-tip">This database is the main${g.machine ? `: ${escapeHtml(g.machine)},` : ','} generation ${g.generation}${g.since ? ` since ${escapeHtml(g.since.slice(0, 10))} ${escapeHtml(g.since.slice(11, 16))} UTC` : ''}.</div>`;
       const parts = [];
       for (const c of view.copies || []) {
         if (c.streaming) parts.push(btn(`Hand over to ${c.machine}`, `handOverFleet(${id}, ${jsArg(c.slot)}, ${jsArg(c.machine)})`));
@@ -3486,11 +3530,23 @@
       }
       parts.push(`<input type="file" id="fleet-upload-file" style="display:none" onchange="uploadFleetBackup(${id})">` + btn('Upload a backup', `document.getElementById('fleet-upload-file').click()`));
       if (db.mainConflict) parts.push(btn('Keep this machine as the main', `keepFleetMain(${id}, ${jsArg(db.mainConflict.machine)})`));
-      if (db.replacedBy || db.mainConflict || (db.handover && db.handover.mode === 'stream' && db.handover.phase === 'stopped')) {
+      const recordedRejoin = db.replacedBy || db.mainConflict || (db.handover && db.handover.mode === 'stream' && db.handover.phase === 'stopped');
+      if (recordedRejoin) {
         const target = (db.replacedBy || db.mainConflict || db.handover).machine || 'the main';
         parts.push(btn('Rejoin as a copy', `rejoinFleet(${id}, ${jsArg(target)}, ${db.replacedBy || (db.handover && db.handover.host) ? 'true' : 'false'})`));
       }
-      return `${lines}<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${parts.join('')}</div><div id="fleet-move-code-out"></div>`;
+      const r = db.replication || {};
+      const tip = '<div class="env-tip">When the bot now runs on another machine\'s database, this database is a stale fork that must never serve again. Rejoining makes it a copy of the new main: it is dumped once under a write fence (kept with the backups) and then <b>deleted</b>; if the dump fails, nothing is deleted. Anything written here after the other machine became the main survives only in that dump.</div>';
+      const rejoinForm = bot.status === 'running' ? `<div style="margin-top:10px;">${tip}<div class="env-tip" style="color:var(--warning);">Stop the bot to rejoin this machine as a copy: that deletes the database it runs on.</div></div>`
+        : `<div style="margin-top:10px;">${tip}
+          <div class="form-group"><label>Join code from the main's manager</label>
+            <textarea id="reseed-join" rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;" placeholder="smdbjoin1...."></textarea></div>
+          <div class="env-row" style="align-items:center;">
+            <input type="text" id="reseed-host" value="${escapeHtml(r.publicHost || '')}" placeholder="This machine's address for other machines (blank if it cannot open a port)" style="flex:2;">
+            <input type="number" id="reseed-port" value="${r.hostPort || ''}" placeholder="15432" min="1" max="65535" style="flex:1;">
+            <button class="btn btn-danger btn-small" onclick="reseedStalePrimary(${jsArg(botId)})">Rejoin as a copy</button>
+          </div></div>`;
+      return `${genLine}${lines}<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">${parts.join('')}</div><div id="fleet-move-code-out"></div>${db.replication && !recordedRejoin ? rejoinForm : ''}`;
     }
 
     function handOverFleet(botId, slot, machine) {

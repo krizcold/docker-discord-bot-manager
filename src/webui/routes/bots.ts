@@ -26,6 +26,7 @@ import { isBackendUrlList, isMoveCode } from '../../config/joinCode';
 import * as fleetSwitch from '../../instance/fleetSwitch';
 import * as fleetMove from '../../instance/fleetMove';
 import * as maintenance from '../../instance/maintenance';
+import { memoryReading, readHostMemory } from '../../instance/memoryRoom';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -40,6 +41,7 @@ import { getBotDir, getEnvPath } from '../../git/repoManager';
 import { probeDatabaseUrl } from '../dbProbe';
 import { listCorruptCopies } from '../../config/storeFile';
 import { hasAppHooks } from '../../instance/appHookClient';
+import { dataPlace } from '../../instance/dataPlace';
 import { findAppCapabilities } from '../../config/appCapabilities';
 import { isAutoRebuilding } from '../../instance/instanceUpdater';
 
@@ -207,6 +209,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           // Whether this app declares lifecycle hooks, so the UI knows if the
           // one-click surfaces can work at all before offering them.
           appHooks: hasAppHooks(bot),
+          // The Database window's data line for a hooks bot with no managed database.
+          ...(hasAppHooks(bot) && !bot.fleetDb && !bot.fleetDbReplica ? { dataPlace: dataPlace(bot) } : {}),
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           ...(updateCantConfirm ? { updateCantConfirm } : {}),
@@ -940,6 +944,22 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       res.json({ success: true, stats: result.stats });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /**
+   * GET /api/bots/:id/memory - The room to reshard beside the running shards
+   */
+  router.get('/:id/memory', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, memory: memoryReading(await containerManager.getAppMemory(bot), () => readHostMemory()) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1947,7 +1967,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, ...fleetSwitch.switchView(bot), copies: await fleetSwitch.streamingCopies(bot) });
+      const generation = await fleetSwitch.generationView(bot);
+      res.json({ success: true, ...fleetSwitch.switchView(bot), copies: await fleetSwitch.streamingCopies(bot), ...(generation !== undefined ? { generation } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

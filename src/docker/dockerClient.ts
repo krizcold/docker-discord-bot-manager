@@ -567,6 +567,11 @@ function dockerReadFailure(error: unknown): DockerReadFailure {
   return /no such container/i.test(text) ? { gone: true } : { error: text || 'docker did not answer' };
 }
 
+function mbPerUnit(unit: string): number {
+  const prefix = unit.charAt(0).toUpperCase();
+  return prefix === 'K' ? 1 / 1024 : prefix === 'M' ? 1 : prefix === 'G' ? 1024 : prefix === 'T' ? 1048576 : 1 / 1048576;
+}
+
 /**
  * Get container stats (CPU, memory usage); a failure as getContainerLogs.
  */
@@ -598,8 +603,8 @@ export async function getContainerStats(containerId: string): Promise<{
       const limit = parseFloat(memMatch[3]);
       const limitUnit = memMatch[4];
 
-      memoryUsageMB = usageUnit.includes('G') ? usage * 1024 : usage;
-      memoryLimitMB = limitUnit.includes('G') ? limit * 1024 : limit;
+      memoryUsageMB = usage * mbPerUnit(usageUnit);
+      memoryLimitMB = limit * mbPerUnit(limitUnit);
     }
 
     return {

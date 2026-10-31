@@ -636,7 +636,7 @@ export interface FleetReplicationStatus {
      * standby must re-seed. fleet marks the standby slots this manager family
      * mints.
      */
-    slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null; machine: string | null; address: string | null }>;
+    slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null; behindBytes: number | null; machine: string | null; address: string | null }>;
     /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */
     slotWalKeep: string;
   };
@@ -718,7 +718,8 @@ export async function getFleetReplicationStatus(
                'retainedBytes', GREATEST(pg_wal_lsn_diff(pg_current_wal_lsn(), s.restart_lsn), 0),
                'clientAddr', r.client_addr::text,
                'state', r.state,
-               'replayLagSeconds', EXTRACT(EPOCH FROM r.replay_lag)))
+               'replayLagSeconds', EXTRACT(EPOCH FROM r.replay_lag),
+               'behindBytes', CASE WHEN r.replay_lsn IS NULL THEN NULL ELSE GREATEST(pg_wal_lsn_diff(pg_current_wal_lsn(), r.replay_lsn), 0) END))
              FROM pg_replication_slots s LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid
              WHERE s.slot_type = 'physical'),
             current_setting('max_slot_wal_keep_size');`);
@@ -748,6 +749,7 @@ export async function getFleetReplicationStatus(
           clientAddr: s.clientAddr ? String(s.clientAddr) : null,
           state: s.state ? String(s.state) : null,
           replayLagSeconds: s.replayLagSeconds === null || s.replayLagSeconds === undefined ? null : Number(s.replayLagSeconds),
+          behindBytes: s.behindBytes === null || s.behindBytes === undefined ? null : Number(s.behindBytes),
           machine: null,
           address: null,
         }));

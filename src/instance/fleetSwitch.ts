@@ -1740,6 +1740,18 @@ export function switchView(inst: InstanceConfig): SwitchView {
   };
 }
 
+/** The main's own generation for the Database window: undefined when this bot holds no main or its database is not running. */
+export async function generationView(inst: InstanceConfig): Promise<{ machine: string; generation: number; since: string | null } | null | { error: string } | undefined> {
+  const db = inst.fleetDb;
+  if (!db) return undefined;
+  const running = await dbLogin.sidecarRunning(db.containerName);
+  if (running === null) return { error: 'docker did not answer' };
+  if (!running) return undefined;
+  const own = await ownGeneration({ container: db.containerName, user: db.user }, db.db);
+  if (!own.ok) return { error: own.error };
+  return own.row ? { machine: own.row.machine, generation: own.row.generation, since: own.row.since } : null;
+}
+
 /** The streaming copies of this main, for the Hand over buttons; empty when the database does not answer. */
 export async function streamingCopies(inst: InstanceConfig): Promise<Array<{ slot: string; machine: string; streaming: boolean }>> {
   const db = inst.fleetDb;

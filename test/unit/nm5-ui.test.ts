@@ -123,7 +123,7 @@ describe('W5: the Database window buttons and confirms', () => {
     return [...html.matchAll(/<button [^>]*>([^<]*)<\/button>/g)].map(m => m[1]);
   };
   it('main view, nothing recorded: Hand over per streaming copy, Receive, Download, Push, Upload', () => {
-    expect(panel({ fleetDb: {} }, { lines: [], copies: [{ machine: 'copy.example', slot: 'slot_c', streaming: true }, { machine: 'down.example', slot: 'slot_d', streaming: false }] }))
+    expect(panel({ fleetDb: {}, status: 'running' }, { lines: [], copies: [{ machine: 'copy.example', slot: 'slot_c', streaming: true }, { machine: 'down.example', slot: 'slot_d', streaming: false }] }))
       .toEqual(['Hand over to copy.example', 'Receive a main', 'Download for a move', 'Push the main', 'Upload a backup']);
   });
   it('a hand-over stopped: Cancel the hand-over, Upload, Rejoin as a copy', () => {
@@ -170,7 +170,7 @@ describe('W5: the Database window buttons and confirms', () => {
 describe('W10: the panel of a copy promoted outside the manager offers Take over (D46)', () => {
   it('the promoted text and a Take over button calling takeOverFleet; no Adopt anywhere on the page', () => {
     const panel = pageFunction('renderFleetReplica');
-    expect(panel).toContain("This copy has been PROMOTED outside the manager and no longer follows a main. Take over makes it this machine's main database: the manager checks the old main, then raises this copy's generation before any bot can use it. If the promotion was a mistake, remove the replica and provision it again; that deletes every write made to this copy since the promote.");
+    expect(panel).toContain("This copy has been PROMOTED outside the manager and no longer follows a main. Take over makes it this machine's main database: the manager checks the old main, then raises this copy's generation before any bot can use it. If the promotion was a mistake, press Remove replica and add the copy again; that deletes every write made to this copy since the promote.");
     expect(panel).toContain('<button class="btn btn-primary btn-small" onclick="takeOverFleet(${jsArg(botId)})">Take over</button>');
     expect(pageHtml).not.toContain('adoptPromotedReplica');
     expect(pageHtml).not.toContain('fleet-adopt-primary');

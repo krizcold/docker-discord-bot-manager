@@ -177,8 +177,8 @@ describe('U5 the bot:maintenance push', () => {
 });
 
 describe('U6 the Database window state line', () => {
-  it('both views of the Database window hold the line', () => {
-    expect(pageFunction('showFleetBackups').match(/<div id="fleet-state-line"><\/div>/g)?.length).toBe(2);
+  it('every view of the Database window holds the line', () => {
+    expect(pageFunction('showFleetBackups').match(/<div id="fleet-state-line"><\/div>/g)?.length).toBe(3);
   });
   it("fills the line with the GET's summary as text", async () => {
     const el = { textContent: '' };

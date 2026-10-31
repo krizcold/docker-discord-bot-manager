@@ -24,6 +24,7 @@ import {
 } from '../types';
 import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
 import { switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
+import type { AppMemory } from '../instance/memoryRoom';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
 import { allocateHostPort } from './portAllocator';
@@ -5074,6 +5075,17 @@ export async function getBotLogs(botId: string, tail = 100): Promise<{ success: 
   } catch (error) {
     return { success: false, error: String(error) };
   }
+}
+
+/** The app container's memory use and limit alone, for the memory reading; null running when docker did not answer. */
+export async function getAppMemory(instance: InstanceConfig): Promise<AppMemory> {
+  const appId = await runningAppContainerId(instance.id, instance.sanitizedName);
+  if (appId === undefined) return { running: null, error: 'docker did not answer' };
+  if (appId === null) return { running: false };
+  const stats = await dockerClient.getContainerStats(appId);
+  if ('gone' in stats) return { running: false };
+  if ('error' in stats) return { running: null, error: stats.error };
+  return { running: true, useMb: stats.memoryUsageMB, limitMb: stats.memoryLimitMB };
 }
 
 export async function getBotStats(botId: string): Promise<{ success: boolean; stats?: { cpuPercent: number; memoryUsageMB: number; memoryLimitMB: number }; error?: string; unanswered?: true }> {

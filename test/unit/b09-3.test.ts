@@ -60,7 +60,7 @@ describe('write catches say the op may still be running and re-read', () => {
         refuseBadNumbers: () => false, botLabel: (id: string) => id, isTransientStatus: () => false,
         hideFleetBackups: () => {}, showFleetBackups: () => {}, hideAddSourceModal: () => {}, renderBots: () => {},
       };
-      for (const r of ['loadBots', 'loadSources', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
+      for (const r of ['loadBots', 'loadSources', 'renderFleetReplica', 'renderFleetReplication', 'renderFleetSwitch']) g[r] = async () => { calls.push(r); };
       const ctx = runPage([fn, ...fns('showNoAnswer', 'waitForSourceUrl', 'restoreSharersText', 'heldWarningText')], g);
       await ctx[fn](...args);
       expect(messages.some(hedged)).toBe(true);
@@ -98,7 +98,7 @@ describe('the remaining write catches say the op may still be running and re-rea
         showMessage: (t: string, m: string) => messages.push([t, m]), lockBtns: () => () => {},
         refuseBadNumbers: () => false, botLabel: (id: string) => id, renderSeedBanner: async () => {}, hideEditSourceModal: () => {},
       };
-      for (const r of ['loadBots', 'loadSources', 'loadVault', 'renderFleetReplica', 'renderFleetReplication']) g[r] = async () => { calls.push(r); };
+      for (const r of ['loadBots', 'loadSources', 'loadVault', 'renderFleetReplica', 'renderFleetReplication', 'renderFleetSwitch']) g[r] = async () => { calls.push(r); };
       const ctx = runPage([fn, ...fns('showNoAnswer')], g);
       await ctx[fn](...args);
       expect(messages.some(hedged)).toBe(true);

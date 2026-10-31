@@ -48,6 +48,8 @@ export interface Harness {
   /** fleetJoin.registerAddress: the calls, and the error it answers (null: registered). */
   registerCalls: Array<{ host: string; port: number; row: unknown }>;
   register: string | null;
+  /** The app's companionDb mode (null: none, so postgresBackend is always true). */
+  capsMode: { key: string; value: string } | null;
 }
 
 export function freshHarness(): Harness {
@@ -63,7 +65,7 @@ export function freshHarness(): Harness {
     hook: () => ({ ok: true, status: 200 }), dump: { success: true, file: 'pre-x-2026-10-28T12-00-00-000Z.dump' },
     notified: [], hookCalls: [], reseedCalls: [], adoptCalls: [], failSwitchWrite: null, failTakeoverWrite: null, endSessions: { ok: true }, onOrder: null,
     notifyOutcome: { dm: 'sent', posted: true, place: 'dm' },
-    block: { ok: true }, open: { ok: true }, registerCalls: [], register: null,
+    block: { ok: true }, open: { ok: true }, registerCalls: [], register: null, capsMode: null,
   };
 }
 
@@ -253,7 +255,7 @@ export function envMock(real: typeof import('../../src/env/manager')): Record<st
 export function capsMock(real: typeof import('../../src/config/appCapabilities')): Record<string, unknown> {
   return {
     ...real,
-    findAppCapabilities: () => ({ companionDb: { env: { url: 'DATABASE_URL' }, user: 'app', database: 'app' }, hooks: { port: 3000, basePath: '/hooks' } }),
+    findAppCapabilities: () => ({ companionDb: { env: { url: 'DATABASE_URL', ...(h.capsMode ? { mode: h.capsMode } : {}) }, user: 'app', database: 'app' }, hooks: { port: 3000, basePath: '/hooks' } }),
   };
 }
 

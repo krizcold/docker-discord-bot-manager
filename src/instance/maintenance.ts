@@ -100,7 +100,7 @@ function hasHooks(inst: InstanceConfig): boolean {
   return !!findAppCapabilities(inst.sourceUrl)?.hooks;
 }
 
-function postgresBackend(inst: InstanceConfig, env: Record<string, string>): boolean {
+export function postgresBackend(inst: InstanceConfig, env: Record<string, string>): boolean {
   const companion = findAppCapabilities(inst.sourceUrl)?.companionDb;
   if (!companion) return false;
   const mode = companion.env.mode;

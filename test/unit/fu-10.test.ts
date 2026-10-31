@@ -169,7 +169,7 @@ describe('B19-1h: a Disable keeps the non-TLS lines an Enable kept where the nex
       confirm: () => true, document: { getElementById: () => null },
       api: async () => ({ success: true, restartRequired: true, plainClientsKept: 1 }),
       showMessage: (t: string, m: string) => messages.push([t, m]),
-      showNoAnswer: () => {}, renderFleetReplication: () => {}, loadBots: () => {},
+      showNoAnswer: () => {}, renderFleetReplication: () => {}, loadBots: () => {}, fleetBackupBotId: null,
     });
     vm.runInContext(source, ctx);
     await ctx.disableFleetReplication('b1');

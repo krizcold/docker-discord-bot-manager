@@ -217,3 +217,17 @@ export function sidecarRunning(container: string): Promise<boolean | null> {
     });
   });
 }
+
+/** Docker's state of the container: restarting while its restart policy loops (Running stays true then); null when docker could not say. */
+export function sidecarState(container: string): Promise<'running' | 'restarting' | 'stopped' | null> {
+  return new Promise(resolve => {
+    execFile('docker', ['inspect', '-f', '{{.State.Running}} {{.State.Restarting}}', container], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
+      if (err) return resolve(/no such object|no such container/i.test(String(stderr || err.message)) ? 'stopped' : null);
+      const [running, restarting] = String(stdout).trim().split(/\s+/);
+      if (running === 'false' && (restarting === 'true' || restarting === 'false')) return resolve('stopped');
+      if (running === 'true' && restarting === 'false') return resolve('running');
+      if (running === 'true' && restarting === 'true') return resolve('restarting');
+      resolve(null);
+    });
+  });
+}

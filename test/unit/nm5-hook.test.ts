@@ -21,6 +21,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   getBot: (id: string) => (h.inst?.id === id ? JSON.parse(JSON.stringify(h.inst)) : null),
   getAllBots: () => (h.inst ? [JSON.parse(JSON.stringify(h.inst))] : []),
   isBotBusy: () => h.lock,
+  migrateRefusal: () => null, heldOrderRefusal: () => null,
   isShuttingDown: () => false,
   registryFault: () => null,
   databaseHoldRefusal: () => null,

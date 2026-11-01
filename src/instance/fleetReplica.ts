@@ -863,7 +863,7 @@ export function provisionFleetReplica(
   // standby but a shape 20.9 lists, so the operator owns the trade.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
-    return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
+    return repl && repl.publicHost.toLowerCase() === parsedDsn.host.toLowerCase() && repl.hostPort === parsedDsn.port;
   });
   if (samehost && !confirm) {
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
@@ -1474,7 +1474,7 @@ export function reseedStalePrimary(
   // standby from the very database that is about to be deleted.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
-    return repl && repl.publicHost === parsedDsn.host && repl.hostPort === parsedDsn.port;
+    return repl && repl.publicHost.toLowerCase() === parsedDsn.host.toLowerCase() && repl.hostPort === parsedDsn.port;
   });
   if (samehost?.id === instance.id) {
     return { success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet' };
@@ -1668,6 +1668,8 @@ export async function decommissionFleetDb(
     return await containerManager.withExternalBotOp(botId, 'decommission', async () => {
       const instance = containerManager.getBot(botId);
       if (!instance?.fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+      const held = containerManager.migrationHoldRefusal(botId);
+      if (held) return held;
       const refusal = capabilityRefusal(instance);
       if (refusal) return { success: false, error: refusal };
       if (instance.fleetDbReplica) return { success: false, error: 'This instance also holds a standby copy - remove or adopt it before decommissioning the primary database' };

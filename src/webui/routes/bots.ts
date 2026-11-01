@@ -27,6 +27,7 @@ import * as fleetSwitch from '../../instance/fleetSwitch';
 import * as fleetMove from '../../instance/fleetMove';
 import * as maintenance from '../../instance/maintenance';
 import { memoryReading, readHostMemory } from '../../instance/memoryRoom';
+import * as migrate from '../../instance/migrate';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -105,6 +106,19 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.use(function shutdownGate(req: Request, res: Response, next: NextFunction) {
     if (!containerManager.isShuttingDown() || req.method === 'GET' || req.method === 'HEAD' || /^\/[^/]+\/webui-ready$/.test(req.path)) return next();
     res.status(503).json({ success: false, error: containerManager.SHUTDOWN_REFUSAL });
+  });
+
+  /** True when an open migration record refused the request (and the 409 is sent). */
+  function refusedWhileMigrating(res: Response, botId: string, key: Parameters<typeof containerManager.migrateRefusal>[1]): boolean {
+    const refusal = containerManager.migrateRefusal(botId, key) ?? (key === 'db' ? containerManager.migrationHoldRefusal(botId) : null);
+    if (!refusal) return false;
+    res.status(409).json(refusal);
+    return true;
+  }
+
+  migrate.setMigrateListener((botId, ev) => {
+    const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
+    broadcastToClients(wss, 'bot:migrate', { ...bot, id: botId, text: containerManager.scrubbedRecordText(botId, ev.text), final: ev.final });
   });
 
   maintenance.setMaintenanceListener((botId, result, notify) => {
@@ -322,6 +336,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.put('/:id', async (req: Request, res: Response) => {
     try {
       const update = req.body;
+      const current = containerManager.getBot(req.params.id);
+      if (current && update && typeof update === 'object') {
+        const held = update.envVars && typeof update.envVars === 'object' ? containerManager.migrateEnvRefusal(current.id, { vars: update.envVars }) : null;
+        if (held) {
+          res.status(409).json(held);
+          return;
+        }
+        if (typeof update.displayName === 'string' && resolveNames(update.displayName).sanitizedName !== current.sanitizedName && refusedWhileMigrating(res, current.id, 'setup')) return;
+      }
       const bot = await containerManager.updateBot(req.params.id, update);
       if (!bot) {
         res.status(404).json({ success: false, error: 'Bot not found' });
@@ -339,6 +362,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * PUT /api/bots/:id/source - Reassign instance to a different source
    */
   router.put('/:id/source', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'setup')) return;
     try {
       const { sourceId } = req.body as { sourceId: string };
       if (!sourceId) {
@@ -508,6 +532,35 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       res.json({ success: true, ...await maintenance.maintenanceStatus(bot, maintenance.getMaintenanceDrift(bot.id)) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** GET /api/bots/:id/migrate - The State window's Migrate control: direction, destination, sharers, the open record and the last outcome. */
+  router.get('/:id/migrate', (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, ...migrate.migrateView(bot) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/migrate - Start or go on with a data migration (non-blocking; progress arrives as bot:migrate). */
+  router.post('/:id/migrate', async (req: Request, res: Response) => {
+    try {
+      const { to } = (req.body || {}) as { to?: unknown };
+      const admission = await migrate.runMigration(req.params.id, to, 'press');
+      if (!admission.accepted) {
+        res.status(admission.status).json({ success: false, error: admission.error });
+        return;
+      }
+      res.json({ success: true, opId: randomUUID() });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }
@@ -1109,6 +1162,13 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
 
       const { vars: given, removed, renamed } = req.body as { vars: Record<string, string>; removed?: string[]; renamed?: Record<string, string> };
+      if (given && typeof given === 'object') {
+        const held = containerManager.migrateEnvRefusal(bot.id, { vars: given, removed, renamed });
+        if (held) {
+          res.status(409).json(held);
+          return;
+        }
+      }
       if (!given || typeof given !== 'object') {
         res.status(400).json({ success: false, error: 'vars object is required' });
         return;
@@ -1150,6 +1210,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           }
           vars[to] = stored[from];
         }
+      }
+      const carried = carry.length > 0 ? containerManager.migrateEnvRefusal(bot.id, { vars }) : null;
+      if (carried) {
+        res.status(409).json(carried);
+        return;
       }
       const toRemove = (removed || []).filter(k => !has(vars, k));
       // Same reason as the single-key removal below: an in-flight start would
@@ -1211,6 +1276,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * DELETE /api/bots/:id/env/:key - Remove an environment variable
    */
   router.delete('/:id/env/:key', async (req: Request, res: Response) => {
+    const heldKey = containerManager.migrateEnvRefusal(req.params.id, { removed: [req.params.key] });
+    if (heldKey) {
+      res.status(409).json(heldKey);
+      return;
+    }
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1356,6 +1426,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * Body: { files: [{ path, body, readOnly?, enabled? }] }
    */
   router.put('/:id/config', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1407,6 +1478,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   router.put('/:id/fs/write', fsWriteBody, async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const { target, path, body, eol } = req.body as { target?: string; path?: string; body?: string; eol?: string };
       if (typeof path !== 'string' || typeof body !== 'string') {
@@ -1420,6 +1492,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   router.post('/:id/fs/create', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const { target, path } = req.body as { target?: string; path?: string };
       if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
@@ -1430,6 +1503,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   router.post('/:id/fs/mkdir', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const { target, path } = req.body as { target?: string; path?: string };
       if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
@@ -1440,6 +1514,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   router.post('/:id/fs/delete', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const { target, path } = req.body as { target?: string; path?: string };
       if (typeof path !== 'string') { res.status(400).json({ success: false, error: 'path is required' }); return; }
@@ -1450,6 +1525,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   });
 
   router.post('/:id/fs/rename', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'files')) return;
     try {
       const { target, from, to, overwrite } = req.body as { target?: string; from?: string; to?: string; overwrite?: boolean };
       if (typeof from !== 'string' || typeof to !== 'string') { res.status(400).json({ success: false, error: 'from and to are required' }); return; }
@@ -1736,6 +1812,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * app facts.
    */
   router.post('/:id/fleet-db/decommission', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1782,6 +1859,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /** POST /api/bots/:id/fleet-join - Join the main a join code names ({ joinCode }). */
   router.post('/:id/fleet-join', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1803,6 +1881,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /** DELETE /api/bots/:id/fleet-replication/slots/:slot - drop one inactive fleet standby slot on this primary. */
   router.delete('/:id/fleet-replication/slots/:slot', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1821,6 +1900,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * posture. Port publish and the rewritten URL apply on the next start.
    */
   router.post('/:id/fleet-replication', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1879,6 +1959,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * publicHost makes a copy without an address. Async: poll the GET for the phase.
    */
   router.post('/:id/fleet-replica', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -1910,6 +1991,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * and then deleted. Async: poll GET /fleet-replica for the phase.
    */
   router.post('/:id/fleet-reseed', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -2092,6 +2174,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * reminds the caller, and the UI confirm warns beforehand.
    */
   router.delete('/:id/fleet-replica', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -2119,6 +2202,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * seed it was worded from, and the confirmed call adds { committed, confirm }.
    */
   router.delete('/:id/fleet-replica/seed', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -2141,6 +2225,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /** POST /api/bots/:id/fleet-replica/finish-retire - remove the env pins a stale-primary re-seed could not. */
   router.post('/:id/fleet-replica/finish-retire', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {
@@ -2161,6 +2246,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
    * Async: poll GET /fleet-replica for the phase.
    */
   router.post('/:id/fleet-replica/reseed', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
     try {
       const bot = containerManager.getBot(req.params.id);
       if (!bot) {

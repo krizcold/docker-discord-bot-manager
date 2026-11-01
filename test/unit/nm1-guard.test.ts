@@ -17,6 +17,7 @@ vi.mock('../../src/env/manager', async (importOriginal) => ({
 vi.mock('../../src/docker/containerManager', () => ({
   getBot: (id: string) => (h.inst?.id === id ? JSON.parse(JSON.stringify(h.inst)) : null),
   isBotBusy: () => h.lock,
+  migrateRefusal: () => null, heldOrderRefusal: () => null,
   appContainerRunning: async () => h.app,
 }));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({

@@ -51,8 +51,8 @@ export const FENCE_OWNER_FILE = 'smdb-fence-owner';
 export const FENCE_OWNER_FILE_SQL = `coalesce(btrim(pg_read_file('${FENCE_OWNER_FILE}', true), E' \\n'), '')`;
 
 /** The lanes that name themselves on a fence layer, as lane:<epoch ms>. */
-export type FenceLane = 'restore' | 'reseed' | 'decommission';
-const OWNER_RE = /^(restore|reseed|decommission):(\d+)$/;
+export type FenceLane = 'restore' | 'reseed' | 'decommission' | 'migrate';
+const OWNER_RE = /^(restore|reseed|decommission|migrate):(\d+)$/;
 
 /** An owner read back from a layer; null when the text names no lane (a promote's layer, a hand fence, or several owners). */
 export function parseFenceOwner(text: string | null | undefined): string | null {
@@ -66,7 +66,7 @@ export function fenceOwnerLane(owner: string | null): FenceLane | null {
 }
 
 const LANE_WORDS: Record<FenceLane, string> = {
-  restore: 'a restore', reseed: 'a re-seed', decommission: 'a decommission',
+  restore: 'a restore', reseed: 'a re-seed', decommission: 'a decommission', migrate: 'a migration',
 };
 
 /** The owner as the operator reads it: the lane and when its run started; null names no lane of this manager. */

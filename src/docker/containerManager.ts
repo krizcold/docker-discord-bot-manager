@@ -20,7 +20,7 @@ import {
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
   ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord, BackupFamily, FleetBackupTests, FleetBackupAlert,
-  FleetJoinRecord,
+  FleetJoinRecord, MigrateLast, MigrateRecord,
 } from '../types';
 import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
 import { switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
@@ -92,6 +92,7 @@ import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { databaseHostIn, namesDatabaseOf, readDatabaseUrl, URL_FORM, DatabaseUrlForm } from '../config/databaseUrl';
 import { writePrivateFile } from '../config/fileModes';
 import { redactSecrets, urlPassword } from '../config/secretText';
 import { getDeploymentMode, isModeExplicit } from '../casaos/detector';
@@ -265,7 +266,7 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const has = typeof inst.fleetDbReplicaSeed?.lastError === 'string' && inst.fleetDbReplicaSeed.lastError !== '';
-  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts && !inst.fleetCopyAlerts && !inst.fleetJoin?.addressesError) return inst;
+  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts && !inst.fleetCopyAlerts && !inst.fleetJoin?.addressesError && !inst.migrate?.text && !inst.migrateLast?.text) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
@@ -294,6 +295,8 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
     out.fleetCopyAlerts = alerts;
   }
   if (out.fleetJoin?.addressesError) out.fleetJoin = { ...out.fleetJoin, addressesError: redactSecrets(out.fleetJoin.addressesError, secrets) };
+  if (out.migrate?.text) out.migrate = { ...out.migrate, text: redactSecrets(out.migrate.text, secrets) };
+  if (out.migrateLast?.text) out.migrateLast = { ...out.migrateLast, text: redactSecrets(out.migrateLast.text, secrets) };
   return out;
 }
 
@@ -325,6 +328,8 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.pendingApply = inst.pendingApply === true;
   out.lane = inst.lane ?? null;
   out.maintenance = inst.maintenance ?? null;
+  out.migrate = inst.migrate ?? null;
+  out.migrateLast = inst.migrateLast ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
   }
@@ -750,6 +755,173 @@ export function updateInstanceMaintenance(botId: string, record: MaintenanceReco
   saveRegistry(registry);
 }
 
+/** Throws when the registry cannot be written; null closes the record, and `last` (when given) lands in the same save. */
+export function updateInstanceMigrate(botId: string, record: MigrateRecord | null, last?: MigrateLast): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (record) instance.migrate = record;
+  else delete instance.migrate;
+  if (last) instance.migrateLast = last;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+export const migrateTo = (rec: MigrateRecord) => (rec.to === 'postgres' ? 'Postgres' : 'JSON files');
+
+export const MIGRATE_GATE = {
+  order: (x: string) => `A data migration to ${x} is open on this bot, so its state cannot change until the migration ends; nothing was changed`,
+  start: (x: string) => `A data migration to ${x} is open on this bot; it starts only through Migrate, so press Migrate to go on`,
+  build: (x: string) => `A data migration to ${x} is open on this bot; Update waits until it ends, and Build until the migration waits for you; nothing was changed`,
+  envKey: (x: string, modeKey: string, urlKey: string) => `A data migration to ${x} is open on this bot, so ${modeKey} and ${urlKey} cannot change until it ends; nothing was changed`,
+  envPort: (x: string) => `A data migration to ${x} is open on this bot, so PGPORT, which the bot's Postgres driver reads for an address with no port, cannot change until it ends; nothing was changed`,
+  files: (x: string) => `A data migration to ${x} is open on this bot, so its files cannot change until it ends; nothing was changed`,
+  db: (x: string) => `A data migration to ${x} is open on this bot, so its database setup cannot change until it ends; nothing was changed`,
+  guard: (x: string) => `A data migration to ${x} is open on this bot, and its database login is open for it, so this waits until the migration ends; nothing was changed`,
+  setup: (x: string) => `A data migration to ${x} is open on this bot, so its source and its project name cannot change until it ends; nothing was changed`,
+  heldDb: (other: string, x: string) => `${other}'s data migration to ${x} is open on the database this bot uses, so this bot's database setup cannot change until that migration ends; nothing was changed`,
+  heldOrder: (other: string, x: string) => `${other}'s data migration to ${x} is open on the database this bot uses, so this bot's state cannot change until that migration ends; nothing was changed`,
+  destUrl: (owner: string) => `A data migration to Postgres is open on this bot and waits for the Database URL of the database the copy went to; the URL given names a database in ${owner}'s managed database container, and Migrate does not move a bot onto another bot's managed database; nothing was changed`,
+  needsBuild: "the bot's image or compose is missing, and a build in the middle of a migration would rewrite the compose, so the manager did not build it",
+};
+
+type MigrateGateKey = Exclude<keyof typeof MIGRATE_GATE, 'needsBuild' | 'envKey' | 'envPort' | 'heldDb' | 'heldOrder' | 'destUrl'>;
+
+/** The refusal an open migration record gives, in every phase; null only when no record is open. */
+export function migrateRefusal(botId: string, text: MigrateGateKey): { success: false; error: string } | null {
+  const rec = getBot(botId)?.migrate;
+  if (!rec) return null;
+  return { success: false, error: MIGRATE_GATE[text](migrateTo(rec)) };
+}
+
+/** MG-SHARER-HELD: another instance's open record holds this one (stopped by its M5, or found at its adoption and left as it runs); only that record's close (at closing, under its op) may start it. */
+export function sharerRefusal(botId: string, opts: { closingStart?: boolean } = {}): { success: false; error: string } | null {
+  const registry = loadRegistry();
+  for (const other of Object.values(registry.instances)) {
+    const rec = other.migrate;
+    if (!rec || other.id === botId || !rec.sharers?.includes(botId)) continue;
+    if (opts.closingStart && rec.phase === 'closing' && activeOps.get(other.id) === 'migrate') continue;
+    const self = registry.instances[botId];
+    return { success: false, error: `${self?.displayName ?? botId} is held by ${other.displayName}'s open data migration to ${migrateTo(rec)}, since it uses the same database; try again once that migration ends; nothing was changed` };
+  }
+  return null;
+}
+
+export type MigrationHold = { other: InstanceConfig; rec: MigrateRecord };
+
+/** Every other instance's open record that lists this bot in `sharers`, in registry order. */
+export function migrationHolds(botId: string): MigrationHold[] {
+  const out: MigrationHold[] = [];
+  for (const other of Object.values(loadRegistry().instances)) {
+    const rec = other.migrate;
+    if (!rec || other.id === botId) continue;
+    if (rec.sharers?.includes(botId)) out.push({ other, rec });
+  }
+  return out;
+}
+
+/** D63: the instance whose managed database container a URL or `host:port/db` names, by container name or by replication address and port. */
+export function databaseHostOf(address: string): InstanceConfig | null {
+  return databaseHostIn(address, getAllBots());
+}
+
+/** MG-HELD-DB: this bot's database setup waits while another open record reads its database. */
+export function migrationHoldRefusal(botId: string): { success: false; error: string } | null {
+  const held = migrationHolds(botId)[0];
+  return held ? { success: false, error: MIGRATE_GATE.heldDb(held.other.displayName, migrateTo(held.rec)) } : null;
+}
+
+/** MG-HELD-ORDER: no state order runs on a bot another open record names in its sharers. */
+export function heldOrderRefusal(botId: string): { success: false; error: string } | null {
+  const held = migrationHolds(botId)[0];
+  return held ? { success: false, error: MIGRATE_GATE.heldOrder(held.other.displayName, migrateTo(held.rec)) } : null;
+}
+
+/** The env keys an open record holds: the app's mode and url keys, the contract's DATA_BACKEND and DATA_BACKEND_URL, and PGPORT (O38). */
+export function migrateKeys(inst: InstanceConfig): { modeKey: string; modeValue: string; urlKey: string; all: string[] } {
+  const env = findAppCapabilities(inst.sourceUrl)?.companionDb?.env;
+  const modeKey = env?.mode?.key ?? 'DATA_BACKEND';
+  const modeValue = env?.mode?.value ?? 'postgres';
+  const urlKey = env?.url ?? 'DATA_BACKEND_URL';
+  return { modeKey, modeValue, urlKey, all: Array.from(new Set([modeKey, urlKey, 'DATA_BACKEND', 'DATA_BACKEND_URL', 'PGPORT'])) };
+}
+
+const urlFormText = (form: DatabaseUrlForm) => `The Database URL ${URL_FORM[form].what}, so the manager can't tell which database the bot's Postgres driver connects to; ${URL_FORM[form].instead}; nothing was saved`;
+
+/**
+ * MG-ENVKEY: while a record is open, a held key may not change. A given value that differs from the stored one changes
+ * it (a blank included; an absent key reads as blank), as does a removal or a rename. A mode key with no stored value
+ * reads as the bot reads it, as file: a given value changes it only when it reads as Postgres. The url key alone may
+ * change while the record awaits a destination, to a value that names no other bot's managed database (O34) and is in
+ * no form of D88 (O37). PGPORT alone (or with the url keys at that park) answers MG-ENVKEY-PORT (O38).
+ */
+export function migrateEnvRefusal(botId: string, change: { vars?: Record<string, unknown>; removed?: unknown; renamed?: unknown }): { success: false; error: string } | null {
+  const inst = getBot(botId);
+  const rec = inst?.migrate;
+  if (!inst || !rec) return null;
+  const keys = migrateKeys(inst);
+  let stored: Record<string, string> | null = null;
+  try { stored = envManager.getEnvVars(botId); } catch { /* unreadable: every given key counts as a change */ }
+  const vars = change.vars && typeof change.vars === 'object' ? change.vars : {};
+  const removed = Array.isArray(change.removed) ? change.removed : [];
+  const renamed = change.renamed && typeof change.renamed === 'object' ? change.renamed as Record<string, unknown> : {};
+  const given = (k: string) => {
+    if (!Object.prototype.hasOwnProperty.call(vars, k)) return false;
+    if (stored === null) return true;
+    return heldKeyChanged(keys, stored, k, String(vars[k] ?? ''));
+  };
+  const touched = keys.all.filter(k => given(k) || removed.includes(k) || Object.keys(renamed).includes(k) || Object.values(renamed).includes(k));
+  if (touched.length === 0) return null;
+  if (rec.awaiting === 'destination' && touched.every(k => k === keys.urlKey || k === 'DATA_BACKEND_URL')) {
+    for (const k of touched) {
+      if (!Object.prototype.hasOwnProperty.call(vars, k)) continue;
+      for (const a of readDatabaseUrl(String(vars[k] ?? '')).addresses) {
+        const host = getAllBots().find(b => b.fleetDb && namesDatabaseOf(a, b.fleetDb));
+        if (host && host.id !== botId) return { success: false, error: MIGRATE_GATE.destUrl(host.displayName) };
+      }
+    }
+    for (const k of touched) {
+      if (!Object.prototype.hasOwnProperty.call(vars, k)) continue;
+      const form = readDatabaseUrl(String(vars[k] ?? ''), { PGPORT: stored?.PGPORT }).form;
+      if (form) return { success: false, error: urlFormText(form) };
+    }
+    return null;
+  }
+  const portOnly = touched.includes('PGPORT') && touched.every(k => k === 'PGPORT' || (rec.awaiting === 'destination' && (k === keys.urlKey || k === 'DATA_BACKEND_URL')));
+  if (portOnly) return { success: false, error: MIGRATE_GATE.envPort(migrateTo(rec)) };
+  return { success: false, error: MIGRATE_GATE.envKey(migrateTo(rec), keys.modeKey, keys.urlKey) };
+}
+
+/**
+ * Whether a given value changes a held key (D75). A mode key with a stored value changes when the two differ after trim
+ * and lower case; with none stored, only a value that reads as Postgres changes it. The url keys compare literally.
+ */
+function heldKeyChanged(keys: ReturnType<typeof migrateKeys>, stored: Record<string, string>, k: string, value: string): boolean {
+  const pg = k === keys.modeKey ? keys.modeValue : k === 'DATA_BACKEND' ? 'postgres' : null;
+  const was = stored[k] ?? '';
+  if (pg === null) return value !== was;
+  const norm = (v: string) => v.trim().toLowerCase();
+  if (was.trim() === '') return norm(value) === norm(pg);
+  return norm(value) !== norm(was);
+}
+
+/** The held keys in vars that read as stored while a record is open; updateBotCore leaves them out of the write. */
+export function migrateEnvUnchanged(botId: string, vars: Record<string, unknown>): string[] {
+  const inst = getBot(botId);
+  if (!inst?.migrate) return [];
+  let stored: Record<string, string>;
+  try { stored = envManager.getEnvVars(botId); } catch { return []; }
+  const keys = migrateKeys(inst);
+  return keys.all.filter(k => Object.prototype.hasOwnProperty.call(vars, k) && !heldKeyChanged(keys, stored, k, String(vars[k] ?? '')));
+}
+
+/** A record text as the registry stores it and the `bot:migrate` broadcast sends it: the record's secrets replaced by ***. */
+export function scrubbedRecordText(botId: string, text: string): string {
+  const inst = getBot(botId);
+  return inst ? redactSecrets(text, recordSecrets(inst)) : text;
+}
+
 export function updateInstanceFleetDbReplicaSeed(botId: string, seed: FleetReplicaSeedRecord | null): InstanceConfig | null {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
@@ -970,6 +1142,48 @@ export async function applyFleetDbReplicaService(botId: string): Promise<LaneRes
       rewriteComposeFile(composePath, content);
     } catch (revertErr) {
       return { success: false, error: `${String(err)}; the deployed compose still names the standby service, because restoring it failed: ${revertErr instanceof Error ? revertErr.message : String(revertErr)}` };
+    }
+    return { success: false, error: String(err) };
+  }
+}
+
+/**
+ * Write the managed Postgres service into the DEPLOYED compose of a bot whose
+ * Data Backend is not Postgres yet (a migration onto its companion), and start
+ * it; the file is reverted when up fails. A compose that already names the
+ * database container is left as it is.
+ */
+export async function attachFleetDbService(botId: string): Promise<LaneResult> {
+  const instance = getBot(botId);
+  if (!instance) return { success: false, error: 'Bot not found' };
+  let spec: ReturnType<typeof ensureFleetDataBackend>;
+  try {
+    spec = ensureFleetDataBackend(instance, { forMigrate: true });
+  } catch (err) {
+    return { success: false, error: errorText(err) };
+  }
+  if (!spec) return { success: false, error: 'no managed database applies to this bot' };
+  const appName = resolveAppName(botId);
+  const composePath = resolveComposePath(botId, appName);
+  if (!fs.existsSync(composePath)) return { success: false, error: 'Deployed compose not found (install the instance first)' };
+  let content: string;
+  try {
+    content = fs.readFileSync(composePath, 'utf-8');
+    const services = (YAML.parseDocument(content).toJSON()?.services || {}) as Record<string, any>;
+    if (Object.values(services).some(svc => svc?.container_name === spec!.containerName)) return { success: true };
+    const mode = await getDeploymentMode();
+    rewriteComposeFile(composePath, addFleetPostgresService(content, { ...instance, envVars: mergedEnvVars(instance) } as any, spec, { mode }));
+  } catch (err) {
+    return { success: false, error: `The database service could not be written into the deployed compose, so nothing was started: ${errorText(err)}` };
+  }
+  try {
+    await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d fleet-postgres`);
+    return { success: true };
+  } catch (err) {
+    try {
+      rewriteComposeFile(composePath, content);
+    } catch (revertErr) {
+      return { success: false, error: `${String(err)}; the deployed compose still names the database service, because restoring it failed: ${errorText(revertErr)}` };
     }
     return { success: false, error: String(err) };
   }
@@ -1402,6 +1616,16 @@ function deployedTraces(instance: InstanceConfig): string[] {
 }
 
 export async function updateBot(botId: string, update: UpdateInstanceRequest): Promise<InstanceConfig | null> {
+  return updateBotCore(botId, update, false);
+}
+
+/** updateBot for a lane that already holds this instance's op lock under op; only the migrate lane may change the held env keys. */
+export async function updateBotInOp(botId: string, update: UpdateInstanceRequest, op: string): Promise<InstanceConfig | null> {
+  if (activeOps.get(botId) !== op) throw new Error(`the update must run under the '${op}' operation, which is not held`);
+  return updateBotCore(botId, update, op === 'migrate');
+}
+
+async function updateBotCore(botId: string, update: UpdateInstanceRequest, migrateLane: boolean): Promise<InstanceConfig | null> {
   const before = loadRegistry();
   if (!before.instances[botId]) return null;
   const foreignProjects = update.displayName && resolveNames(update.displayName).sanitizedName !== before.instances[botId].sanitizedName
@@ -1410,6 +1634,13 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
+  let envVars = update.envVars;
+  if (envVars && !migrateLane) {
+    const held = migrateEnvRefusal(botId, { vars: envVars });
+    if (held) throw new Error(held.error);
+    const keep = migrateEnvUnchanged(botId, envVars);
+    if (keep.length > 0) envVars = Object.fromEntries(Object.entries(envVars).filter(([k]) => !keep.includes(k)));
+  }
 
   if (update.displayName) {
     const names = resolveNames(update.displayName);
@@ -1418,6 +1649,8 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     // AppData folder and the primary vhost. Excluding this instance keeps
     // cosmetic self-renames allowed.
     const renamesProject = names.sanitizedName !== instance.sanitizedName;
+    const migrating = renamesProject ? migrateRefusal(botId, 'setup') : null;
+    if (migrating) throw new Error(migrating.error);
     if (renamesProject) {
       const deployed = deployedTraces(instance);
       if (deployed.length > 0) {
@@ -1448,14 +1681,14 @@ export async function updateBot(botId: string, update: UpdateInstanceRequest): P
     instance.titleName = names.titleName;
   }
   let storeBefore: envManager.StoredKeys | null = null;
-  if (update.envVars) {
+  if (envVars) {
     // The single env dual-write funnel, AFTER the rename validation so a
     // refused update persists nothing anywhere: the store takes everything
     // (sensitive values encrypted; throws on a corrupt store before any state
     // changes), the record keeps only the non-sensitive keys.
-    storeBefore = envManager.snapshotStoredKeys(botId, Object.keys(update.envVars));
-    envManager.setEnvVars(botId, update.envVars);
-    instance.envVars = withoutSensitiveKeys({ ...instance.envVars, ...update.envVars });
+    storeBefore = envManager.snapshotStoredKeys(botId, Object.keys(envVars));
+    envManager.setEnvVars(botId, envVars);
+    instance.envVars = withoutSensitiveKeys({ ...instance.envVars, ...envVars });
   }
   instance.updatedAt = new Date().toISOString();
 
@@ -1580,6 +1813,8 @@ export function reassignSource(botId: string, newSourceId: string): InstanceConf
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
+  const migrating = migrateRefusal(botId, 'setup');
+  if (migrating) throw new Error(migrating.error);
 
   const source = sourceManager.getSource(newSourceId);
   if (!source) return null;
@@ -1889,6 +2124,10 @@ export function deleteLaneRefusal(botId: string, action: string): { success: fal
   const lane = getBot(botId)?.lane;
   if (lane?.op !== 'delete') return null;
   return { success: false, error: `A Delete of this instance${lane.keepData ? ' (keeping its data)' : ''} did not finish, so its containers, image or compose may already be gone; ${action} is refused until Delete is run again` };
+}
+
+function deleteFenceKept(volume: string, why: string): string {
+  return `The delete stopped before it removed the instance record: the lines the open migration added to the database's pg_hba.conf, which refuse every connection but this bot's and the manager's, could not be removed from the kept database volume ${volume} (${why}), and a reinstall on that volume would meet them. Press Delete again to remove them and finish the delete.`;
 }
 
 function laneRecordRefusal(op: string, err: unknown): { success: false; error: string } {
@@ -2385,6 +2624,17 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
       const shared = sharedVolumeReason(instance.fleetDb.volume, botId);
       if (shared) failures.push(`database volume ${instance.fleetDb.volume} kept: ${shared}`);
       else if (!dockerClient.removeVolume(instance.fleetDb.volume)) failures.push(`database volume ${instance.fleetDb.volume}: docker volume rm reported failure`);
+    }
+  }
+
+  // O43: a kept volume would bring the open migration's pg_hba lines to a reinstall.
+  if (keepData && instance.fleetDb && instance.migrate?.hbaFence) {
+    const lift = await (await import('../instance/fleetBackup')).liftMigrateFence(instance.fleetDb, instance.migrate.hbaFence);
+    if (lift.result === 'locked' || lift.result === 'unknown') {
+      await stampFailureFromDocker(botId, instance.status);
+      throw new Error(deleteFenceKept(instance.fleetDb.volume, lift.result === 'locked'
+        ? `docker could not change the file in the volume (${lift.detail || 'no reason given'})`
+        : 'docker did not answer whether the volume exists'));
     }
   }
 
@@ -3450,6 +3700,42 @@ export async function appContainerRunning(botId: string): Promise<boolean | null
   return id === undefined ? null : id !== null;
 }
 
+/** The named keys of the running app container's env as docker reads it; absent keys are left out. */
+export async function appContainerEnv(botId: string, keys: string[]): Promise<{ ok: true; env: Record<string, string> } | { ok: false; error: string }> {
+  const id = await runningAppContainerId(botId, resolveAppName(botId));
+  if (id === undefined) return { ok: false, error: 'docker did not answer' };
+  if (id === null) return { ok: false, error: 'the bot container is not running' };
+  try {
+    const { stdout } = await execAsync(`docker inspect --format "{{json .Config.Env}}" ${id}`, { timeout: 30_000 });
+    const list = JSON.parse(stdout.trim());
+    if (!Array.isArray(list)) return { ok: false, error: 'docker inspect gave no env list' };
+    const env: Record<string, string> = {};
+    for (const entry of list) {
+      if (typeof entry !== 'string') continue;
+      const i = entry.indexOf('=');
+      const key = i < 0 ? entry : entry.slice(0, i);
+      if (keys.includes(key)) env[key] = i < 0 ? '' : entry.slice(i + 1);
+    }
+    return { ok: true, env };
+  } catch (err) {
+    return { ok: false, error: errorText(err) };
+  }
+}
+
+/** The addresses docker reports for the running app container, on every network it joins (D97). */
+export async function appContainerAddresses(botId: string): Promise<{ ok: true; addresses: string[] } | { ok: false; error: string }> {
+  const id = await runningAppContainerId(botId, resolveAppName(botId));
+  if (id === undefined) return { ok: false, error: 'docker did not answer' };
+  if (id === null) return { ok: false, error: 'the bot container is not running' };
+  try {
+    const { stdout } = await execAsync(`docker inspect --format "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}" ${id}`, { timeout: 30_000 });
+    const addresses = Array.from(new Set(stdout.split(/\s+/).filter(a => /^[0-9A-Fa-f:.]+$/.test(a))));
+    return { ok: true, addresses };
+  } catch (err) {
+    return { ok: false, error: errorText(err) };
+  }
+}
+
 async function hasRunningContainer(botId: string, appName: string): Promise<boolean> {
   // A docker query that failed keeps the conservative refusal.
   return await runningAppContainerId(botId, appName) !== null;
@@ -3490,19 +3776,24 @@ export async function startBot(botId: string): Promise<LaneResult> {
 export const OFF_START_REFUSAL = 'This bot is Off. Choose Running in its State window to start it';
 
 export function startPreflightRefusal(botId: string): { success: false; error: string } | null {
+  return startRefusal(botId, false);
+}
+
+/** Only the migrate lane's own start (startBotInOp under 'migrate') skips MG-START. */
+function startRefusal(botId: string, migrateLane: boolean): { success: false; error: string } | null {
   const instance = getBot(botId);
   if (instance?.maintenance?.state === 'off') return { success: false, error: OFF_START_REFUSAL };
   const retiringAt = instance?.fleetDb?.retiringAt;
   if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
   const switched = instance ? switchStartRefusal(instance) : null;
   if (switched) return { success: false, error: switched };
-  return databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
+  return (migrateLane ? null : migrateRefusal(botId, 'start')) ?? sharerRefusal(botId, { closingStart: true }) ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
-async function startBotImpl(botId: string): Promise<LaneResult> {
+async function startBotImpl(botId: string, migrateLane = false): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  const preflight = startPreflightRefusal(botId);
+  const preflight = startRefusal(botId, migrateLane);
   if (preflight) return preflight;
   let statusBefore = instance.status;
   let applyInPlace: { projectIds: string[] | undefined; webUiReady?: boolean; lastStartAt?: number } | null = null;
@@ -3630,6 +3921,11 @@ async function startGitBot(instance: InstanceConfig, statusBefore: BotStatus): P
 
     const imageMissing = fs.existsSync(localComposePath) && (await builtImageMissing(latestInstance, localComposePath));
     if (!fs.existsSync(localComposePath) || imageMissing) {
+      const migrating = activeOps.get(botId) === 'migrate' ? getBot(botId)?.migrate : null;
+      if (migrating && migrating.phase !== 'finishing') {
+        emit(`[Start] ${MIGRATE_GATE.needsBuild}`, 'error');
+        return { success: false, error: MIGRATE_GATE.needsBuild };
+      }
       emit(imageMissing ? '[Build] The bot image is missing, running build first...' : '[Build] No compose file found, running build first...', 'info');
       const buildResult = await buildBotImpl(botId);
       if (!buildResult.success) {
@@ -3969,9 +4265,10 @@ async function getContainerIdsForBot(botId: string): Promise<string[] | null> {
 
 // ─── Stop ───
 
-export async function stopBot(botId: string): Promise<LaneResult> {
+/** Stop under the 'stop' op; with seen, a bot whose status is not running is stopped when docker shows its app container running. */
+export async function stopBot(botId: string, opts: { seen?: boolean } = {}): Promise<LaneResult> {
   return withBotOp(botId, 'stop', async () => {
-    const result = await stopBotImpl(botId);
+    const result = await stopBotImpl(botId, undefined, opts);
     return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
   });
 }
@@ -3979,7 +4276,7 @@ export async function stopBot(botId: string): Promise<LaneResult> {
 /** Start for a caller that already holds this instance's op lock under op (withExternalBotOp); refuses when it does not. */
 export async function startBotInOp(botId: string, op: string): Promise<LaneResult> {
   if (activeOps.get(botId) !== op) return { success: false, error: `the start must run under the '${op}' operation, which is not held` };
-  return startBotImpl(botId);
+  return startBotImpl(botId, op === 'migrate');
 }
 
 /** Stop for a caller that already holds this instance's op lock under op (withExternalBotOp); refuses when it does not. */
@@ -3989,10 +4286,10 @@ export async function stopBotInOp(botId: string, op: string): Promise<LaneResult
   return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
 }
 
-async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
+async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean } = {}): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  if (instance.status !== 'running') return { success: false, error: 'Bot is not running' };
+  if (instance.status !== 'running' && !(opts.seen && await appContainerRunning(botId) === true)) return { success: false, error: 'Bot is not running' };
 
   try {
     updateBotStatus(botId, 'stopping');
@@ -4138,7 +4435,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  return databaseHoldRefusal(botId, 'Update') ?? deleteLaneRefusal(botId, 'Update');
+  return migrateRefusal(botId, 'build') ?? sharerRefusal(botId) ?? databaseHoldRefusal(botId, 'Update') ?? deleteLaneRefusal(botId, 'Update');
 }
 
 /** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
@@ -4312,7 +4609,8 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
 
 /** The synchronous refusal a Build answers before touching anything; null when it may proceed. */
 export function buildPreflightRefusal(botId: string): { success: false; error: string } | null {
-  return databaseHoldRefusal(botId, 'Build') ?? deleteLaneRefusal(botId, 'Build');
+  const own = getBot(botId)?.migrate?.phase === 'waiting' ? null : migrateRefusal(botId, 'build');
+  return own ?? sharerRefusal(botId) ?? databaseHoldRefusal(botId, 'Build') ?? deleteLaneRefusal(botId, 'Build');
 }
 
 export async function buildBot(botId: string): Promise<LaneResult> {
@@ -4567,7 +4865,7 @@ function fillKnownDockerfileArgs(dockerfilePath: string, provided: Record<string
  * injection but KEEPS the volume and the record (data retention). Returns what
  * the compose injection needs, or null when no sidecar applies.
  */
-export function ensureFleetDataBackend(instance: InstanceConfig): { containerName: string; volume: string; password: string; user: string; db: string } | null {
+export function ensureFleetDataBackend(instance: InstanceConfig, opts: { forMigrate?: boolean } = {}): { containerName: string; volume: string; password: string; user: string; db: string } | null {
   const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!spec) return null;
 
@@ -4577,7 +4875,7 @@ export function ensureFleetDataBackend(instance: InstanceConfig): { containerNam
   const stored = { ...mergedEnvVars(instance), ...envManager.getEnvVars(instance.id) };
   // An app declaring no mode key has no operator opt-in gate: the URL semantics
   // below decide alone.
-  if (spec.env.mode && (stored[spec.env.mode.key] || '').trim().toLowerCase() !== spec.env.mode.value) return null;
+  if (!opts.forMigrate && spec.env.mode && (stored[spec.env.mode.key] || '').trim().toLowerCase() !== spec.env.mode.value) return null;
 
   const containerName = instance.fleetDb?.containerName || `${instance.sanitizedName}-fleet-postgres`;
   const volume = instance.fleetDb?.volume || `${instance.sanitizedName}-fleet-postgres-data`;
@@ -4602,21 +4900,21 @@ export function ensureFleetDataBackend(instance: InstanceConfig): { containerNam
     return { containerName, volume, password, user: spec.user, db: spec.database };
   }
 
-  let host: string;
   let password: string;
   try {
-    const parsed = new URL(url);
-    host = parsed.hostname;
-    password = decodeURIComponent(parsed.password);
+    password = decodeURIComponent(new URL(url).password);
   } catch {
     return null;
   }
+  const a = readDatabaseUrl(url).addresses[0];
+  if (!a) return null;
+  const bare = (h: string) => h.replace(/^\[|\]$/g, '').toLowerCase();
   // Managed = the sidecar's container name, OR the replication posture's public
   // host (the canonical URL rewrite points at the same sidecar through the
   // published port; treating it as external would drop the database service
   // from the next rebuild's compose).
   const replicationHost = instance.fleetDb?.replication?.publicHost;
-  if (host !== containerName && !(replicationHost && host === replicationHost)) return null;   // external lane
+  if (a.host !== containerName.toLowerCase() && !(replicationHost && a.host === bare(replicationHost))) return null;   // external lane
 
   if (!instance.fleetDb) stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume });
   return { containerName, volume, password, user: instance.fleetDb!.user, db: instance.fleetDb!.db };
@@ -4717,7 +5015,7 @@ async function buildGitInstanceHeld(
   updateInstanceDetection(botId, detection);
 
   // Before env assembly so a freshly provisioned database URL rides this deploy.
-  const fleetDb = ensureFleetDataBackend(instance);
+  const fleetDb = ensureFleetDataBackend(instance, { forMigrate: getBot(botId)?.migrate?.companion === true });
 
   const internalUrl = process.env.BOT_MANAGER_INTERNAL_URL || `http://discordbotmanagerapp:${process.env.PORT || '8080'}`;
   const envWithToken = { ...mergedEnvVars(instance), BOT_MANAGER_UPDATE_TOKEN: instance.updateToken || '', BOT_ID: instance.id, BOT_MANAGER_INTERNAL_URL: internalUrl };

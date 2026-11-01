@@ -19,6 +19,7 @@ vi.mock('../../src/instance/fleetReplica', () => ({ parkInterruptedReplicaSeeds:
 vi.mock('../../src/instance/fleetCopyWatch', () => ({ startFleetCopyWatch: () => {}, stopFleetCopyWatch: () => {} }));
 vi.mock('../../src/instance/fleetSwitch', () => ({ startFleetSwitchTick: mark('switch-tick-start'), stopFleetSwitchTick: mark('switch-tick-stop') }));
 vi.mock('../../src/instance/fleetMove', () => ({}));
+vi.mock('../../src/instance/migrate', () => ({ resumeMigrations: () => {} }));
 vi.mock('../../src/instance/maintenance', () => ({ startMaintenanceReconciler: () => {}, stopMaintenanceReconciler: () => {} }));
 vi.mock('../../src/docker/stateReconciler', () => ({ startStateReconciler: mark('state-reconciler-start'), stopStateReconciler: () => {} }));
 vi.mock('../../src/casaos/detector', () => ({ getDeploymentMode: async () => 'casaos' }));

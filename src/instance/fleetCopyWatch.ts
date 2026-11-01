@@ -283,7 +283,7 @@ export { dmOutcomeText };
 /** The instance as the registry holds it now, when the watcher still looks after it: joined, not the main itself, and free. */
 function watched(id: string): InstanceConfig | null {
   const instance = containerManager.getBot(id);
-  if (!instance?.fleetJoin || instance.fleetDb || containerManager.isBotBusy(id)) return null;
+  if (!instance?.fleetJoin || instance.fleetDb || instance.migrate || containerManager.isBotBusy(id)) return null;
   return instance;
 }
 

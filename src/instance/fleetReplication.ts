@@ -34,6 +34,7 @@ import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
 import { certFingerprint, encodeJoinCode, machineText, sqlLiteral } from '../config/joinCode';
 import { AddressesOutcome, sendAddresses } from './fleetJoin';
+import { hasHostParam, namesDatabaseOf, readDatabaseUrl, URL_FORM } from '../config/databaseUrl';
 
 export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
@@ -149,9 +150,12 @@ export async function fenceLinesRefusal(containerName: string, db: string): Prom
   if (Number(count) === 0) return null;
   const owners = await psql(containerName, db, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
   const owner = owners.ok ? fleetBackupGuards.parseFenceOwner(owners.stdout) : null;
+  const holder = containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName);
   const whose = !owners.ok ? 'whose lane set it could not be read'
-    : owner ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, and that lane lifts it when it finishes`
-    : `no lane of this manager set its lines; a restore takes them over and lifts them, or remove them by hand if nothing should hold them`;
+    : !owner ? `no lane of this manager set its lines; a restore takes them over and lifts them, or remove them by hand if nothing should hold them`
+    : fleetBackupGuards.fenceOwnerLane(owner) !== 'migrate' ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, and that lane lifts it when it finishes`
+    : holder?.migrate?.hbaFence === owner ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, which lifts it when it ends`
+    : `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)} that is no longer open, so no lane lifts it; a restore takes it over and lifts it, or remove the lines by hand if nothing should hold them`;
   return `a write fence stands in pg_hba.conf (lines ending in ${fleetBackupGuards.WRITE_FENCE_MARK}); ${whose}`;
 }
 
@@ -196,6 +200,29 @@ export function storedDbPassword(instance: InstanceConfig): string | null {
     return null;
   }
 }
+
+/**
+ * D103: what a stored Database URL names when Enable and Disable must keep it: null when it is blank or one address
+ * that names the bot's own managed database (they write it then), else what it names, for the kept text. O44: a
+ * first address on the managed container's name with no host or hostaddr parameter is that database in every form.
+ */
+function keptUrlWhat(instance: InstanceConfig, urlKey: string): string | null {
+  const env = envManager.getEnvVars(instance.id);
+  const value = (env[urlKey] || '').trim();
+  if (!value) return null;
+  const read = readDatabaseUrl(value, env);
+  const first = read.addresses[0];
+  if (first && instance.fleetDb && first.host === instance.fleetDb.containerName.toLowerCase() && !hasHostParam(value)) return null;
+  if (read.form) return `an address the manager reads differently from the bot's Postgres driver (it ${URL_FORM[read.form].what})`;
+  if (!first) return 'no single database address';
+  if (instance.fleetDb && namesDatabaseOf(first, instance.fleetDb)) return null;
+  return `${first.host.includes(':') ? `[${first.host}]` : first.host}:${first.port}/${first.db}`;
+}
+
+const urlKeptEnable = (what: string) => `The Database URL was kept as it is: it names ${what}, not this bot's managed database, so the bot goes on using it; Enable writes the managed database's address only when the Database URL is blank or names that database.`;
+const urlKeptDisable = (what: string) => `The Database URL was kept as it is: it names ${what}, not this bot's managed database, and Disable sets it back only when it names that database.`;
+const URL_KEPT_CHANGED_E = "The Database URL was kept as it is: it changed while Enable ran, and Enable writes the managed database's address only over the value it read when it started.";
+const URL_KEPT_CHANGED_D = 'The Database URL was kept as it is: it changed while Disable ran, and Disable sets back only the value it read when it started.';
 
 function sidecarUrl(instance: InstanceConfig, dbPassword: string): string {
   const { containerName, user, db } = instance.fleetDb!;
@@ -288,7 +315,7 @@ export function enableFleetReplication(
 /** A caller's own refusal, read inside the lane before anything runs; null admits. */
 type Admission = (instance: InstanceConfig) => Promise<string | null>;
 
-type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number; addresses?: AddressesOutcome };
+type EnableResult = { success: boolean; error?: string; restartRequired?: boolean; certRotated?: boolean; plainClientsKept?: number; addresses?: AddressesOutcome; urlKept?: string };
 
 /**
  * One replication lane per instance: Enable, Disable and the adopt take the
@@ -302,7 +329,11 @@ async function inReplicationLane<T extends { success: boolean; error?: string }>
   }
   let entered = false;
   try {
-    return await containerManager.withExternalBotOp(botId, 'replication', () => { entered = true; return fn(); });
+    return await containerManager.withExternalBotOp(botId, 'replication', async () => {
+      entered = true;
+      const held = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+      return held ?? fn();
+    });
   } catch (err) {
     if (entered) throw err;
     return { success: false, error: `${err instanceof Error ? err.message : String(err)}; ${action} is refused until it finishes (nothing was changed)` };
@@ -350,8 +381,9 @@ async function enableInLane(
   const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
   if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; nothing was changed, so retry Enable after that` };
   // The caller's password is a fallback for a manager env that holds no database URL (an adopt whose env write was refused).
-  const dbPassword = storedDbPassword(instance) || opts.dbPassword || null;
-  if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
+  const kept = keptUrlWhat(instance, dbEnv.url);
+  const dbPassword = kept ? null : storedDbPassword(instance) || opts.dbPassword || null;
+  if (!kept && !dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   // An existing posture whose password reads empty is a key-loss scrub, not an
   // absent credential: minting a fresh one here would silently rotate the
   // fleet's replication credential and break every standby at its next
@@ -430,12 +462,12 @@ async function enableInLane(
     slotWalKeepMb: keepMb,
     ...(plain.addrs.length > 0 ? { keptPlain: plain.addrs } : {}),
   };
+  let keptAtWrite: string | null = null;
   // The stored URL stays the container-name form (the public form cannot
   // hairpin from containers sharing a docker network with the sidecar, which
   // includes this instance's own bot). TLS on it too (ssl=on just activated): the authored pg_hba
   // accepts non-TLS only from 172.16/12, and a docker daemon with custom
   // address pools allocates outside it; hostssl covers every subnet.
-  const localUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   const changed = `the database already has the replication role, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
   if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
     return { success: false, certRotated, error: `The instance's database record changed while this Enable ran, so the record and the database URL were not written; ${changed}. Check the Replication section, then press Enable again` };
@@ -443,14 +475,16 @@ async function enableInLane(
   try {
     // The env store alone: container env assembly derives sensitive values from
     // it at read time (the two-store strip), so no record mirror exists to sync.
-    envManager.setEnvVars(instance.id, { [dbEnv.url]: localUrl });
+    const now = keptUrlWhat(instance, dbEnv.url);
+    if (!kept && !now) envManager.setEnvVars(instance.id, { [dbEnv.url]: `${sidecarUrl(instance, dbPassword!)}?sslmode=no-verify` });
     containerManager.updateInstanceFleetDbReplication(instance.id, replication);
+    keptAtWrite = now ? urlKeptEnable(now) : kept ? URL_KEPT_CHANGED_E : null;
   } catch (err) {
     return { success: false, certRotated, error: `The database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); ${changed}. Press Enable again once the store can be written` };
   }
   forgetProbes(instance.id);
   const offered = opts.offerAddresses === false ? undefined : await sendAddresses(instance.id);
-  return { success: true, restartRequired: true, certRotated, ...(plain.addrs.length > 0 ? { plainClientsKept: plain.addrs.length } : {}), ...(offered ? { addresses: offered } : {}) };
+  return { success: true, restartRequired: true, certRotated, ...(plain.addrs.length > 0 ? { plainClientsKept: plain.addrs.length } : {}), ...(offered ? { addresses: offered } : {}), ...(keptAtWrite ? { urlKept: keptAtWrite } : {}) };
 }
 
 /**
@@ -477,7 +511,7 @@ export function disableFleetReplication(
   });
 }
 
-type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string; plainClientsKept?: number; addresses?: AddressesOutcome };
+type DisableResult = { success: boolean; error?: string; restartRequired?: boolean; warning?: string; plainClientsKept?: number; addresses?: AddressesOutcome; urlKept?: string };
 
 async function disableInLane(
   instance: InstanceConfig,
@@ -485,10 +519,11 @@ async function disableInLane(
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
   const disableRecordAtStart = JSON.stringify(fleetDb);
-  const dbPassword = storedDbPassword(instance);
-  if (!dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
   if (!dbEnv) return { success: false, error: 'This app declares no managed database companion (nothing was disabled)' };
+  const kept = keptUrlWhat(instance, dbEnv.url);
+  const dbPassword = kept ? null : storedDbPassword(instance);
+  if (!kept && !dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
@@ -566,20 +601,22 @@ async function disableInLane(
   }
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
-  const revertUrl = `${sidecarUrl(instance, dbPassword)}?sslmode=no-verify`;
   // The bot may still dial its old non-TLS URL until it restarts, so the lines stay until a start narrows them.
   const keptPlain = fleetDb.replication.keptPlain ?? [];
-  const kept = keptPlain.length > 0 ? { plainClientsKept: keptPlain.length } : {};
+  const plainKept = keptPlain.length > 0 ? { plainClientsKept: keptPlain.length } : {};
+  let keptAtWrite: string | null = null;
   try {
-    envManager.setEnvVars(instance.id, { [dbEnv.url]: revertUrl });
+    const now = keptUrlWhat(instance, dbEnv.url);
+    if (!kept && !now) envManager.setEnvVars(instance.id, { [dbEnv.url]: `${sidecarUrl(instance, dbPassword!)}?sslmode=no-verify` });
     containerManager.updateInstanceFleetDbReplication(instance.id, null, keptPlain);
+    keptAtWrite = now ? urlKeptDisable(now) : kept ? URL_KEPT_CHANGED_D : null;
   } catch (err) {
     // The disabling mark stays on the record, so the card shows the Disable as unfinished.
     forgetProbes(instance.id);
     return { success: false, error: `Replication is off on the database (the slots are dropped and the replication login is revoked), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
   }
   forgetProbes(instance.id);
-  return { success: true, restartRequired: true, ...kept, addresses: await sendAddresses(instance.id) };
+  return { success: true, restartRequired: true, ...plainKept, addresses: await sendAddresses(instance.id), ...(keptAtWrite ? { urlKept: keptAtWrite } : {}) };
 }
 
 /**

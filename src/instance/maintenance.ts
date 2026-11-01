@@ -7,12 +7,13 @@
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { readDatabaseUrl } from '../config/databaseUrl';
 import { callAppHook, AppHookResult } from './appHookClient';
 import * as dbLogin from './dbLogin';
 import * as fleetBackup from './fleetBackup';
 import { fenceOwnerLane, fenceOwnerText } from './fleetBackupGuards';
 import { hasSwitchMark, switchStateRefusal } from './switchSql';
-import { BotRunState, InstanceConfig, MaintenanceHeld, MaintenanceRecord } from '../types';
+import { BotRunState, InstanceConfig, MaintenanceHeld, MaintenanceRecord, MigrateTo } from '../types';
 
 export type MaintenanceKind = 'database' | 'copy' | 'external' | 'json' | 'none';
 export type PlanStep = 'hook' | 'db-up' | 'block' | 'end-sessions' | 'stop' | 'db-up-alone' | 'open' | 'start' | 'hook-wait';
@@ -112,10 +113,10 @@ function managedMain(inst: InstanceConfig, url: string): boolean {
   const db = inst.fleetDb;
   if (!db || db.retiringAt) return false;
   if (url.trim() === '') return true;
-  let host: string;
-  try { host = new URL(url.trim()).hostname; } catch { return false; }
+  const a = readDatabaseUrl(url.trim()).addresses[0];
+  if (!a) return false;
   const publicHost = db.replication?.publicHost;
-  return host === db.containerName || (!!publicHost && host === publicHost);
+  return a.host === db.containerName.toLowerCase() || (!!publicHost && a.host === publicHost.replace(/^\[|\]$/g, '').toLowerCase());
 }
 
 export function maintenanceKind(inst: InstanceConfig, env: Record<string, string>): MaintenanceKind {
@@ -377,7 +378,7 @@ const refuse = (status: number, error: string): CoreResult => ({ refused: true, 
  * order again in full; 'retry' (later passes) runs its remaining steps but never a start of the bot or its database.
  * Both take the order from the record read under the lock, and do nothing once it is settled.
  */
-async function runCore(botId: string, ordered: BotRunState, orderedMessage: string, mode: Mode, onAdmit: () => void = () => {}): Promise<CoreResult> {
+async function runCore(botId: string, ordered: BotRunState, orderedMessage: string, mode: Mode, onAdmit: () => void = () => {}, inOp?: string): Promise<CoreResult> {
   const inst = containerManager.getBot(botId);
   if (!inst) return refuse(404, 'Bot not found');
   const before = inst.maintenance ?? null;
@@ -394,6 +395,10 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   if (deleting) return refuse(409, deleting.error);
   const switched = switchStateRefusal(inst, to);
   if (switched) return refuse(409, switched);
+  const migrating = inOp === 'migrate' && containerManager.isBotBusy(botId) === 'migrate' ? null : containerManager.migrateRefusal(botId, 'order'); // R16
+  if (migrating) return refuse(409, migrating.error);
+  const heldOrder = containerManager.heldOrderRefusal(botId);
+  if (heldOrder) return refuse(409, heldOrder.error);
   if (mode === 'order' && to === 'running' && inst.fleetDb && inst.fleetRestoreError) return refuse(409, R13(fleetBackup.shownRestoreNoticeFile(botId) ?? inst.fleetRestoreError.file));
   const kindRead = readKind(inst);
   if ('error' in kindRead) return refuse(409, kindRead.error);
@@ -578,9 +583,9 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   return unsaved(`${NAME[to]} is not confirmed.${NOT_RECORDED(notRecorded)}`);
 }
 
-async function runLockedCore(botId: string, to: BotRunState, message: string, mode: Mode, onAdmit?: () => void): Promise<CoreResult> {
+async function runLockedCore(botId: string, to: BotRunState, message: string, mode: Mode, onAdmit?: () => void, inOp?: string): Promise<CoreResult> {
   try {
-    return await runCore(botId, to, message, mode, onAdmit);
+    return await runCore(botId, to, message, mode, onAdmit, inOp);
   } catch (err) {
     const text = unexpectedText(errText(err));
     try {
@@ -600,6 +605,24 @@ export async function runMaintenanceOrder(botId: string, to: BotRunState, messag
   const mode: Mode = opts.retry ? 'retry' : opts.resumed ? 'resumed' : 'order';
   const core = await containerManager.withExternalBotOp(botId, OP, () => runLockedCore(botId, to, message, mode));
   return core.refused ? { settled: false, text: core.error } : core.result;
+}
+
+/** An order run by a lane that already holds the bot's op lock under `op` (Migrate's Running after done). */
+export async function runOrderInOp(botId: string, to: BotRunState, message: string, op: string): Promise<OrderResult | { refused: true; error: string }> {
+  if (containerManager.isBotBusy(botId) !== op) return { refused: true, error: `the order must run under the '${op}' operation, which is not held` };
+  const core = await runLockedCore(botId, to, message, 'order', undefined, op);
+  return core.refused ? { refused: true, error: core.error } : core.result;
+}
+
+/** M4 of a migration: the bot's answer about the changes it holds, written beside the order it answers. */
+export function recordHeld(botId: string, held: MaintenanceHeld): void {
+  const inst = containerManager.getBot(botId);
+  if (!inst?.maintenance) return;
+  try {
+    containerManager.updateInstanceMaintenance(botId, { ...inst.maintenance, held });
+  } catch (err) {
+    console.error(`[Maintenance] ${inst.displayName}: the bot's save answer could not be recorded: ${errText(err)}`);
+  }
 }
 
 /** The route entry: answers once the order is refused or recorded; onDone gets the result of an accepted order. */
@@ -637,6 +660,8 @@ export async function requireMaintenance(botId: string, need: 'database' | 'any'
   if (!op || op === OP) return { ok: false, error: 'The maintenance check ran outside an operation on this bot, so its answer could not hold; nothing was changed' };
   const inst = containerManager.getBot(botId);
   if (!inst) return { ok: false, error: 'Bot not found' };
+  const migrating = containerManager.migrateRefusal(botId, 'guard');
+  if (migrating) return { ok: false, error: migrating.error };
   const rec = maintenanceOf(inst);
   if (rec.state === 'running') return { ok: false, error: 'This bot is not in maintenance; put it into Maintenance or Off first' };
   if (!rec.settled) return { ok: false, error: `The bot's change to ${NAME[rec.state]} is not confirmed yet (${rec.lastError || 'the order has not finished'}), so it does not count as maintenance` };
@@ -685,8 +710,14 @@ function postgresBackendOf(inst: InstanceConfig): boolean {
 
 type LiveLogin = { down: true } | { ok: false; error: string } | { ok: true; login: dbLogin.BotLogin };
 
-export function maintenanceView(rec: MaintenanceRecord, kind: MaintenanceKind | null, driftText: string | null, live?: LiveLogin): string {
+export function maintenanceView(rec: MaintenanceRecord, kind: MaintenanceKind | null, driftText: string | null, live?: LiveLogin, migrating?: MigrateTo): string {
   const name = NAME[rec.state];
+  if (migrating) {
+    const x = migrating === 'postgres' ? 'Postgres' : 'JSON files';
+    return kind === 'database'
+      ? `State: Maintenance. A data migration to ${x} is open, so the bot's database login is open for it until the migration ends.`
+      : `State: Maintenance. A data migration to ${x} is open.`;
+  }
   if (driftText) return driftText;
   if (!rec.settled) return `State: ${name}, not confirmed: ${rec.lastError || 'the order has not finished'}`;
   if (rec.state === 'running') return 'State: Running.';
@@ -711,7 +742,7 @@ export async function maintenanceStatus(inst: InstanceConfig, driftText: string 
   const kindRead = readKind(inst);
   const kind = 'kind' in kindRead ? kindRead.kind : null;
   let live: LiveLogin | undefined;
-  if (kind === 'database' && rec.settled && rec.state !== 'running' && !driftText) {
+  if (kind === 'database' && rec.settled && rec.state !== 'running' && !driftText && !inst.migrate) {
     const target = { container: inst.fleetDb!.containerName, user: inst.fleetDb!.user };
     const up = await dbLogin.sidecarRunning(target.container);
     if (up === true) live = await dbLogin.readBotLogin(target);
@@ -720,7 +751,7 @@ export async function maintenanceStatus(inst: InstanceConfig, driftText: string 
   }
   return {
     state: rec.state, message: rec.message, settled: rec.settled, kind, orderedAt: rec.orderedAt,
-    lastError: rec.lastError ?? null, summary: maintenanceView(rec, kind, driftText, live),
+    lastError: rec.lastError ?? null, summary: maintenanceView(rec, kind, driftText, live, inst.migrate?.to),
     held: rec.state !== 'running' && rec.held ? rec.held : null,
   };
 }
@@ -779,6 +810,7 @@ async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<voi
   const inst = containerManager.getBot(listed.id);
   if (!inst) return;
   if (containerManager.isBotBusy(inst.id) || containerManager.databaseHoldRefusal(inst.id, 'the maintenance check')) return;
+  if (inst.migrate) return;
   const kindRead = readKind(inst);
   if ('error' in kindRead) return;
   const kind = kindRead.kind;

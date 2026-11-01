@@ -30,6 +30,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   getBot: (id: string) => (h.inst?.id === id ? JSON.parse(JSON.stringify(h.inst)) : null),
   getAllBots: () => (h.inst ? [JSON.parse(JSON.stringify(h.inst))] : []),
   isBotBusy: () => h.lock,
+  migrateRefusal: () => null, heldOrderRefusal: () => null,
   databaseHoldRefusal: () => (h.hold ? { success: false, error: 'held' } : null),
   deleteLaneRefusal: () => null,
   updateInstanceMaintenance: (_id: string, rec: any) => { if (h.writeFail) throw new Error(h.writeFail); h.events.push('write'); if (rec) h.inst.maintenance = JSON.parse(JSON.stringify(rec)); else delete h.inst.maintenance; },

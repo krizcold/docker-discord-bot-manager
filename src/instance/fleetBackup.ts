@@ -35,7 +35,7 @@ import {
   copiesInsertSql, cutAddressesSql, GEN_READ_SQL, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow,
   raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
 } from './switchSql';
-import { splitBackendUrls } from '../config/joinCode';
+import { readDatabaseUrl } from '../config/databaseUrl';
 import * as maintenance from './maintenance';
 import { busy, FENCE_HBA_COUNT_SQL, FENCE_HBA_OWNER_SQL, FENCE_OWNER_FILE, FENCE_OWNER_FILE_SQL, FENCE_OWNER_TAG, FenceLane, fenceOwnerLane, fenceOwnerText, parseFenceOwner, WRITE_FENCE_MARK } from './fleetBackupGuards';
 
@@ -240,15 +240,12 @@ export function isFleetBackupScoped(instance: InstanceConfig): boolean {
   if (!urlKey) return false;
   const url = (envManager.getEnvVars(instance.id)[urlKey] || '').trim();
   if (!url) return false;
-  try {
-    const host = new URL(url).hostname;
-    // The replication posture's canonical URL points at the same sidecar
-    // through the published port; it stays in dump scope.
-    return host === instance.fleetDb.containerName
-      || (!!instance.fleetDb.replication && host === instance.fleetDb.replication.publicHost);
-  } catch {
-    return false;
-  }
+  const a = readDatabaseUrl(url).addresses[0];
+  if (!a) return false;
+  // The replication posture's canonical URL points at the same sidecar
+  // through the published port; it stays in dump scope.
+  return a.host === instance.fleetDb.containerName.toLowerCase()
+    || (!!instance.fleetDb.replication && a.host === instance.fleetDb.replication.publicHost.replace(/^\[|\]$/g, '').toLowerCase());
 }
 
 /**
@@ -555,7 +552,7 @@ export async function liftOwnedFence(fleetDb: RestoreFleetDb, owner: string, lay
   ].join(' && ');
   const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script]);
   if (!strip.ok) {
-    held.detail = lastLine(strip.stderr) || 'docker did not answer';
+    held.detail = lastLine(strip.stderr);
     return hba?.ok === false ? 'locked' : hba && !reloaded ? 'unreloaded' : 'failed';
   }
   heldFrom(strip.stdout, held);
@@ -586,6 +583,7 @@ const capitalized = (text: string) => text.charAt(0).toUpperCase() + text.slice(
 function holderRemedy(owner: string | null): string {
   const lane = fenceOwnerLane(owner);
   if (!lane) return `if nothing should hold it, lift it by hand (ALTER SYSTEM RESET default_transaction_read_only, then SELECT pg_reload_conf(); remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf)`;
+  if (lane === 'migrate') return `no open migration holds it, so a restore of a dump into this database lifts it (a restore takes over every write fence line), or remove the lines ending in ${WRITE_FENCE_MARK} from pg_hba.conf by hand, then run SELECT pg_reload_conf()`;
   return 'running that lane again lifts it';
 }
 
@@ -647,9 +645,16 @@ async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
   }
 }
 
-/** Ends every client session and every walsender but the managed role's physical ones; the reason when one did not end, else null. */
-async function sweepSessions(db: RestoreFleetDb): Promise<string | null> {
-  const sweep = await managerExec(db, psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`));
+/**
+ * Ends every client session and every walsender but the managed role's physical ones; with admitted, every TCP session
+ * from an address not in it, and with keepRole, leaves that role's client sessions open. The reason when one did not
+ * end, else null.
+ */
+async function sweepSessions(db: RestoreFleetDb, admitted?: string[], keepRole?: string): Promise<string | null> {
+  const where = admitted
+    ? `pid <> pg_backend_pid() AND client_addr IS NOT NULL AND backend_type IN ('client backend', 'walsender') AND host(client_addr) NOT IN (${admitted.map(a => `'${a}'`).join(', ')})${keepRole ? ` AND (backend_type = 'walsender' OR usename IS DISTINCT FROM '${keepRole.replace(/'/g, "''")}')` : ''}`
+    : `pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`;
+  const sweep = await managerExec(db, psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE ${where}`));
   if (!sweep.ok) return `the open sessions could not be ended (${lastLine(sweep.stderr)})`;
   const kept = sweep.stdout.split('\n').map(l => l.trim().split('|')).filter(([pid, ended]) => /^\d+$/.test(pid) && ended !== 't').map(([pid]) => pid);
   if (kept.length === 0) return null;
@@ -711,6 +716,79 @@ export async function applyWriteFence(fleetDb: RestoreFleetDb, owner: string, ta
   const second = await sweepSessions(fleetDb);
   if (second) return refused(second);
   return { ok: true, stdout: '', stderr: '', changed: true, owned };
+}
+
+/**
+ * A migration's pg_hba lines, naming owner, first: an admit line for each address of the bot's app container, then
+ * a reject for every other replication and TCP client. Prints "held-hba <owner>" and changes nothing when a marked
+ * line of another owner or of none stands; drops only this owner's older lines. Run as root.
+ */
+export function migrateFenceHbaScript(owner: string, admit: string[], file = FENCE_HBA_FILE): string {
+  const tail = `${FENCE_OWNER_TAG}${owner} ${WRITE_FENCE_MARK}`;
+  const lines = [
+    ...admit.map(a => `host all all ${a}/${a.includes(':') ? 128 : 32} scram-sha-256 ${tail}`),
+    `host replication all all reject ${tail}`,
+    `host all all all reject ${tail}`,
+  ].map(l => `'${l}'`).join(' ');
+  return `f=${file}; if grep '${WRITE_FENCE_MARK}$' "$f" | grep -qv '${tail}$'; then echo "held-hba $(grep '${WRITE_FENCE_MARK}$' "$f" | grep -v '${tail}$' | grep -o 'smdb-fence-owner=[a-z]*:[0-9]*' | head -n 1 | cut -d= -f2)"; exit 0; fi; { printf '%s\\n' ${lines} && { grep -v '${tail}$' "$f" || [ $? -eq 1 ]; }; } > "$f.fence" && chown postgres:postgres "$f.fence" && chmod 600 "$f.fence" && mv -f "$f.fence" "$f" && echo fenced`;
+}
+
+/** Removes this owner's lines from <dir>/pg_hba.conf and nothing else; a file with none is left as it is. Run as root. */
+export function liftMigrateFenceScript(owner: string, dir = FENCE_PGDATA): string {
+  const tail = `${FENCE_OWNER_TAG}${owner} ${WRITE_FENCE_MARK}`;
+  return `(f=${dir}/pg_hba.conf; [ -e "$f" ] || exit 0; grep -q '${tail}$' "$f"; r=$?; [ $r -eq 1 ] && exit 0; [ $r -eq 0 ] || exit $r; sed -i '/${tail}$/d' "$f" && chown postgres:postgres "$f" && chmod 600 "$f" && echo stripped-hba)`;
+}
+
+/**
+ * D96: closes the bot's own managed database to every client but the bot's app container (by its addresses) and the
+ * manager (over the local socket), then ends every other TCP session: every walsender, and every client session but
+ * those of the bot's own role; unless refresh, it ends them again after authentication_timeout (a login accepted
+ * before the reload can finish under the old rules). Null once the lines stand; else why they could not be set.
+ */
+export async function fenceMigrateSource(instance: InstanceConfig, owner: string, opts: { refresh?: boolean } = {}): Promise<string | null> {
+  const db = instance.fleetDb;
+  if (!db) return 'the bot has no managed database on record';
+  const found = await containerManager.appContainerAddresses(instance.id);
+  if (!found.ok) return `docker did not say which addresses the bot's container has (${found.error})`;
+  if (found.addresses.length === 0) return "docker reports no address for the bot's container";
+  const read = await managerRead(db, psqlArgs(db, "SELECT current_setting('hba_file') || '|' || (SELECT setting FROM pg_settings WHERE name = 'authentication_timeout') || '|' || (SELECT count(*) FROM pg_subscription WHERE subenabled)"));
+  if (!read.ok) return `the database's settings could not be read (${lastLine(read.stderr)})`;
+  const fields = read.stdout.trim().split('|');
+  if (fields.length !== 3 || !/^\d+$/.test(fields[1]) || !/^\d+$/.test(fields[2])) return `the database's settings read back in an unknown form (${read.stdout.trim().slice(0, 200) || 'empty'})`;
+  const [hbaFile, authTimeout, subscriptions] = fields;
+  if (hbaFile !== FENCE_HBA_FILE) return `the database reads its pg_hba from ${hbaFile || 'an unnamed file'}, not ${FENCE_HBA_FILE}`;
+  if (Number(subscriptions) > 0) return `the database has ${subscriptions} enabled subscription(s), whose workers write past the fence; disable them (ALTER SUBSCRIPTION ... DISABLE) and retry`;
+  const write = await execDocker(['exec', '-u', 'root', db.containerName, 'sh', '-c', migrateFenceHbaScript(owner, found.addresses)]);
+  if (!write.ok) return `pg_hba.conf could not be rewritten (${lastLine(write.stderr)})`;
+  const held = /held-hba ?(\S*)/.exec(write.stdout);
+  if (held) return `a write fence of ${fenceOwnerText(parseFenceOwner(held[1]))} stands in its pg_hba.conf`;
+  if (!write.stdout.includes('fenced')) return `pg_hba.conf could not be rewritten (${lastLine(write.stdout || write.stderr)})`;
+  const reload = await managerExec(db, psqlArgs(db, RELOAD_SQL));
+  if (!reload.ok) return `the rewritten pg_hba.conf could not be reloaded (${lastLine(reload.stderr)})`;
+  if (!await rejectInForce(db)) return `the database still did not refuse a TCP connection ${fenceTiming.probeDeadlineMs / 1000} s after the reload of its rewritten pg_hba.conf`;
+  const first = await sweepSessions(db, found.addresses, db.user);
+  if (first) return first;
+  if (opts.refresh) return null;
+  await fenceSleep(Number(authTimeout) * 1000);
+  return sweepSessions(db, found.addresses, db.user);
+}
+
+/**
+ * F10, F11, G21 and O43: removes this owner's lines and reloads. stripped: this lift removed lines, but no reload
+ * reached the server; unconfirmed: the file held none and no reload reached the server, which may still apply lines an
+ * earlier lift removed; locked: neither the container's file nor the volume's could be changed (detail says why).
+ */
+export async function liftMigrateFence(fleetDb: RestoreFleetDb, owner: string): Promise<{ result: 'lifted' | 'stripped' | 'unconfirmed' | 'gone' | 'unknown' | 'locked'; detail?: string }> {
+  const live = await execDocker(['exec', '-u', 'root', fleetDb.containerName, 'sh', '-c', liftMigrateFenceScript(owner)]);
+  if (live.ok) {
+    const reload = await managerExec(fleetDb, psqlArgs(fleetDb, RELOAD_SQL));
+    return { result: reload.ok ? 'lifted' : live.stdout.includes('stripped-hba') ? 'stripped' : 'unconfirmed' };
+  }
+  // The strip's docker run would mint an absent volume.
+  const volState = await (await import('./fleetReplica')).dockerVolumeState(fleetDb.volume);
+  if (volState !== 'exists') return { result: volState === 'absent' ? 'gone' : 'unknown' };
+  const strip = await execDocker(['run', '--rm', '-v', `${fleetDb.volume}:/pgdata`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', liftMigrateFenceScript(owner, '/pgdata')]);
+  return strip.ok ? { result: strip.stdout.includes('stripped-hba') ? 'stripped' : 'unconfirmed' } : { result: 'locked', detail: lastLine(strip.stderr) };
 }
 
 function liftNote(result: FenceLift, volume: string, remedy = 'running a restore again retries the lift', held: FenceHeld = noneHeld(), lane = 'this lane'): string {
@@ -776,6 +854,11 @@ function ownersText(layers: FenceState): string {
   return `it belongs to ${fenceOwnerText(layers.readOnly ? layers.readOnlyOwner : layers.hbaOwner)}`;
 }
 
+/** O41, X25: the pg_hba lines are the bot's own open migration's, which admit the bot. */
+function migrationOwnLines(instance: InstanceConfig | null, layers: FenceState): boolean {
+  return !layers.readOnly && layers.hba && layers.hbaOwner !== null && layers.hbaOwner === instance?.migrate?.hbaFence;
+}
+
 /** The Start warning while the fence's pg_hba lines stand on the instance's database, or when they cannot be read; null when they do not. */
 export async function fenceStartWarning(botId: string): Promise<string | null> {
   const db = containerManager.getBot(botId)?.fleetDb;
@@ -783,6 +866,7 @@ export async function fenceStartWarning(botId: string): Promise<string | null> {
   const layers = await fenceLayers(db);
   if (!layers) return "The manager can't confirm the database has no write fence on it: its fence settings could not be read, and a fence left on refuses the bot's connections";
   if (!layers.hba) return null;
+  if (migrationOwnLines(containerManager.getBot(botId), layers)) return null;
   return `${fencedState(layers, 'The database')}: the pg_hba lines of a write fence (ending in ${WRITE_FENCE_MARK}) are still on it, and a restart keeps them; ${ownersText(layers)}, and ${holderRemedy(layers.hbaOwner)}`;
 }
 
@@ -814,7 +898,7 @@ async function seedStuckFences(): Promise<void> {
     if (!await isContainerRunning(db.containerName)) continue;
     const layers = await fenceLayers(db);
     await dropStaleOwner(instance.id, db, layers);
-    if (anyLayer(layers)) setStuck(instance.id, db, `${fencedState(layers, 'The database')} (a write fence was not lifted); ${await seededFenceRemedy(instance, db, layers)}`);
+    if (anyLayer(layers) && !migrationOwnLines(instance, layers)) setStuck(instance.id, db, `${fencedState(layers, 'The database')} (a write fence was not lifted); ${await seededFenceRemedy(instance, db, layers)}`);
   }
 }
 
@@ -1541,18 +1625,6 @@ type RestoreSteps = {
 
 const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
 
-/** host:port/database of a postgres URL, which two instances share a database by; null when it does not parse. */
-function databaseIdentity(url: string): string | null {
-  try {
-    const u = new URL(url);
-    const db = decodeURIComponent(u.pathname.replace(/^\//, ''));
-    if (!u.hostname || !db) return null;
-    return `${u.hostname.toLowerCase()}:${u.port || '5432'}/${db}`;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * The instances on this manager that share the database: this one always, and every other whose stored URL names
  * the same host, port and database (a query-string difference such as ?sslmode does not hide one). The key is
@@ -1561,20 +1633,57 @@ function databaseIdentity(url: string): string | null {
  * fence is the actual protection.
  */
 function restoreSharers(instance: InstanceConfig, url: string): InstanceConfig[] {
-  const fleetDb = instance.fleetDb!;
-  const aliases = new Set<string>([`${fleetDb.containerName.toLowerCase()}:5432/${fleetDb.db}`]);
-  const ownIdentity = databaseIdentity(url);
-  if (ownIdentity) aliases.add(ownIdentity);
-  if (fleetDb.replication) aliases.add(`${fleetDb.replication.publicHost.toLowerCase()}:${fleetDb.replication.hostPort}/${fleetDb.db}`);
-  return containerManager.getAllBots().filter(b => {
-    if (b.id === instance.id) return true;
+  return databaseSharers(instance, url);
+}
+
+/** The host:port/db spellings of the database url names, with the managed database's own when the instance hosts one. */
+function sharerAliases(instance: InstanceConfig, url: string): Set<string> {
+  const fleetDb = instance.fleetDb;
+  const aliases = new Set<string>();
+  if (fleetDb) aliases.add(`${fleetDb.containerName.toLowerCase()}:5432/${fleetDb.db}`);
+  const own = readDatabaseUrl(url).addresses[0];
+  if (own) aliases.add(`${own.host}:${own.port}/${own.db}`);
+  if (fleetDb?.replication) aliases.add(`${fleetDb.replication.publicHost.replace(/^\[|\]$/g, '').toLowerCase()}:${fleetDb.replication.hostPort}/${fleetDb.db}`);
+  return aliases;
+}
+
+/**
+ * restoreSharers for any instance, in registry order: this one, and every other whose stored Database URL the manager
+ * can read and that names the database. A store that cannot be read, or a URL in a form of D88, leaves that bot out;
+ * the fences keep it off the database.
+ */
+export function databaseSharers(instance: InstanceConfig, url: string): InstanceConfig[] {
+  const aliases = sharerAliases(instance, url);
+  const sharers: InstanceConfig[] = [];
+  for (const b of containerManager.getAllBots()) {
+    if (b.id === instance.id) { sharers.push(b); continue; }
     const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
-    const entries = key ? splitBackendUrls(envManager.getEnvVars(b.id)[key]) : [];
-    return entries.some(entry => {
-      const identity = databaseIdentity(entry);
-      return identity !== null && aliases.has(identity);
-    });
-  });
+    if (!key) continue;
+    let store: ReturnType<typeof envManager.getEnvVarsWithStatus>;
+    try { store = envManager.getEnvVarsWithStatus(b.id); } catch { continue; }
+    if (store.corrupt || store.undecryptable.includes(key)) continue;
+    const read = readDatabaseUrl(store.vars[key] ?? '', store.vars);
+    if (read.form) continue;
+    if (read.addresses.some(a => aliases.has(`${a.host}:${a.port}/${a.db}`))) sharers.push(b);
+  }
+  return sharers;
+}
+
+/** M5's list (B37): databaseSharers, and each running bot whose deployed Database URL names the database, in registry order. */
+export async function runningDatabaseSharers(instance: InstanceConfig, url: string): Promise<InstanceConfig[]> {
+  const aliases = sharerAliases(instance, url);
+  const ids = new Set(databaseSharers(instance, url).map(b => b.id));
+  const all = containerManager.getAllBots();
+  for (const b of all) {
+    if (ids.has(b.id)) continue;
+    const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
+    if (!key) continue;
+    const deployed = await containerManager.appContainerEnv(b.id, [key, 'PGPORT']);
+    if (!deployed.ok) continue;
+    const read = readDatabaseUrl(deployed.env[key] ?? '', deployed.env);
+    if (!read.form && read.addresses.some(a => aliases.has(`${a.host}:${a.port}/${a.db}`))) ids.add(b.id);
+  }
+  return all.filter(b => ids.has(b.id));
 }
 
 /**
@@ -1602,6 +1711,13 @@ export async function previewFleetRestore(botId: string): Promise<{ success: tru
  * the step is the remedy itself, not a step before a restore); null when none does.
  */
 function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string; whole?: boolean } | null {
+  if (instance.migrate) return { refusal: 'A data migration of this bot is open; finish it before restoring a dump', step: 'finish the migration with Migrate' };
+  const held = containerManager.migrationHolds(instance.id)[0];
+  if (held) {
+    const other = held.other.displayName;
+    const refusal = `${other}'s data migration to ${containerManager.migrateTo(held.rec)} is open on the database this bot's Database URL names; finish it with Migrate on ${other} before restoring a dump`;
+    return { refusal, step: `finish ${other}'s migration with Migrate` };
+  }
   const seed = fleetReplica.seedView(instance);
   if (seed && seed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
   const db = instance.fleetDb;

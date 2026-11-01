@@ -377,6 +377,8 @@ export interface InstanceConfig {
   pendingApply?: boolean;              // a build finished while the project ran; Start (in place) or Restart applies it
   lane?: InstanceLane | null;          // a destructive lane in flight or cut short; null in a browser copy once cleared
   maintenance?: MaintenanceRecord | null; // the operator's state order; absent = Running, settled; null in a browser copy
+  migrate?: MigrateRecord | null;      // an open data migration; absent = none; null in a browser copy
+  migrateLast?: MigrateLast | null;    // the last migration's outcome
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
@@ -409,6 +411,39 @@ export interface MaintenanceRecord {
   prior?: { state: BotRunState; message: string };
   lastError?: string;                 // why the order is not settled, or the warning a settled order carries
 }
+
+export type MigrateTo = 'postgres' | 'file';
+export type MigratePhase = 'preparing' | 'posting' | 'following' | 'finishing' | 'closing' | 'waiting';
+
+export interface MigrateRecord {
+  to: MigrateTo;
+  from: MigrateTo;                    // the stored DATA_BACKEND when the record opened
+  destination: string | null;         // to postgres: host:port/db of the database the copy goes to (no credentials)
+  companion: boolean;                 // to postgres onto this bot's managed database
+  jobId: string;                      // the job the manager posts or follows
+  jobIds: string[];                   // every jobId this record POSTed or followed
+  posted: boolean;                    // a POST may have reached the bot, or the record follows a job; never cleared
+  started: number;                    // POSTs answered 'started' since the operator's last press (cap 3)
+  kept: number;                       // POSTs sent by the keep rule since the last press (bound 5)
+  phase: MigratePhase;
+  resumeAt?: Exclude<MigratePhase, 'waiting'>; // where a 'waiting' record goes on at the operator's press
+  awaiting?: 'destination';           // the Database URL may change until the next press
+  finishing?: 'stored' | 'applied' | 'confirmed';
+  stage?: string;                     // the bot's last stage
+  loginOpened: boolean;               // the manager opened a blocked login for this record
+  hbaFence?: string;                  // the owner (migrate:<ms>) of the pg_hba lines the step of M5 and B35 (isolate) set on the bot's own managed database; lifted at F, G and a Delete that keeps the data
+  hbaFenceSet?: true;                 // the full write of those lines stood once; until then each write is a full one
+  fenceLift?: 'stripped' | 'unconfirmed'; // G21's lift left the file clean without a confirmed reload; read by the done text
+  isolated?: true;                    // M5 and B35 ran to their end on this record; no POST of a move to file from Postgres goes out without it
+  adoptedJob?: string;                // the job a press adopted (A29), written in the record's first write and never dropped; copyOpenOf reads it to set copyOpen, which the done text reads (G24)
+  copyOpen?: 'open' | 'unsure';       // G24, G25: the copy that finished was started by the bot itself, with no line of this record (open) or after its step began without finishing (unsure); written in done()'s finishing write
+  sharers: string[];                  // other instances on the source database; their Start, Build and Update refuse while the record is open
+  sharersStopped: string[];           // the sharers M5 itself stopped, each id written before its stop; F5 starts only these
+  openedAt: string;
+  text?: string;                      // the progress line, or the reason it waits
+}
+
+export interface MigrateLast { to: MigrateTo; outcome: 'done' | 'failed'; jobId: string | null; text: string; at: string }
 
 /**
  * Written before a lane's first destructive step. An update, restart or build

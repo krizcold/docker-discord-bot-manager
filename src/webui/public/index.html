@@ -968,6 +968,19 @@
       }
       return html;
     }
+    function migrateName(to) {
+      return to === 'postgres' ? 'Postgres' : 'JSON files';
+    }
+    function migrateBadges(bot) {
+      const rec = bot.migrate;
+      if (!rec) return '';
+      if (bot.activeOp === 'migrate') {
+        const title = `${rec.text || ''} Stop and Delete are refused until the manager finishes the migration or leaves it waiting for you; that lasts as long as the copy runs, plus the retries after it stops answering or is interrupted.`;
+        return `<span class="update-badge" title="${escapeHtml(title.trim())}">${escapeHtml(`Migrating to ${migrateName(rec.to)}`)}</span>`;
+      }
+      if (rec.phase === 'waiting') return `<span class="update-badge danger" title="${escapeHtml(rec.text || '')}">Migration waiting</span>`;
+      return '';
+    }
     function redraw() {
       renderBots();
       if (sources.length > 0) renderSourceSidebar();
@@ -1251,6 +1264,10 @@
 
           case 'bot:switch':
             onBotSwitch(payload);
+            break;
+
+          case 'bot:migrate':
+            onBotMigrate(payload);
             break;
 
           // Backup status and replication verdict, merged by id
@@ -1571,7 +1588,7 @@
             const restoreBadge = fb && fb.restoreError
               ? `<span class="update-badge danger" title="${escapeHtml(fb.restoreError)}">DB restore failed</span>`
               : '';
-            const stateBadges = maintenanceBadges(bot);
+            const stateBadges = maintenanceBadges(bot) + migrateBadges(bot);
             const offStart = startOffRefusal(bot) ? ` disabled title="${escapeHtml(startOffRefusal(bot))}"` : '';
             const stateControl = `<button class="btn btn-secondary btn-small" onclick="showStateWindow('${bot.id}')" title="Running, Maintenance or Off, and the maintenance message">${escapeHtml(stateButtonLabel(bot))}</button>`;
             const fenceBadge = (bot.fenceStuck
@@ -2900,7 +2917,12 @@
       if (res.plainClientsKept) {
         notes += ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.`;
       }
+      if (res.urlKept) notes += ` ${res.urlKept}`;
       return notes + (res.addressesText || '');
+    }
+
+    function fleetReplEnabledText(res) {
+      return `Replication enabled. Restart the instance to publish the port${res.urlKept ? '' : ' and apply the new database URL'}.${fleetReplEnableNotes(res)}`;
     }
 
     async function enableFleetReplication(botId) {
@@ -2917,7 +2939,7 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, payload);
         if (res.success) {
-          showMessage('success', `Replication enabled. Restart the instance to publish the port and apply the new database URL.${fleetReplEnableNotes(res)}`);
+          showMessage('success', fleetReplEnabledText(res));
         } else {
           showMessage('error', res.error || 'Failed to enable replication');
         }
@@ -2960,16 +2982,17 @@
     }
 
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nRefused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the replication login is revoked at once; the published port closes and the database URL reverts at the next restart.')) return;
+      if (!confirm('Disable replication?\n\nRefused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the replication login is revoked at once; the published port closes at the next restart, and a database URL that names this database is set back to its private form then.')) return;
       const btn = document.getElementById('fleet-repl-disable');
       if (btn) btn.disabled = true;
       try {
         const res = await api('POST', `/bots/${botId}/fleet-replication`, { enabled: false });
         const keptNote = res.plainClientsKept ? ` The database keeps admitting connections without TLS from ${res.plainClientsKept} address(es) outside 172.16.0.0/12 that the bot may still use on its old URL, until a start finds none of them connected that way.` : '';
+        const urlNote = res.urlKept ? ` ${res.urlKept}` : '';
         if (res.success && res.warning) {
-          showMessage('error', `${res.warning}. Restart the instance to apply.${keptNote}`);
+          showMessage('error', `${res.warning}. Restart the instance to apply.${urlNote}${keptNote}`);
         } else if (res.success) {
-          showMessage('success', `Replication disabled. Restart the instance to apply.${keptNote}${res.addressesText || ''}`);
+          showMessage('success', `Replication disabled. Restart the instance to apply.${urlNote}${keptNote}${res.addressesText || ''}`);
         } else {
           showMessage('error', res.error || 'Failed to disable replication');
         }
@@ -3665,6 +3688,63 @@
       return `${lead}${note} ${does} ${held.state === 'no' ? 'those changes' : 'any it still holds'}. ${ask}`;
     }
 
+    function onBotMigrate(payload) {
+      mergeBotState(payload);
+      if (payload.final) {
+        clearActiveOp(payload.id);
+        showMessage(payload.migrate ? 'error' : payload.migrateLast?.outcome === 'done' ? 'success' : 'error', payload.text);
+      }
+      redraw();
+      if (stateBotId === payload.id) showStateWindow(payload.id);
+    }
+
+    function migrateHtml(bot, view) {
+      if (!view || view.hidden || !view.to) return '';
+      const x = migrateName(view.to);
+      const when = (at) => new Date(at).toLocaleString();
+      const rec = view.record;
+      const last = view.last;
+      const button = view.refusal
+        ? `<button class="btn btn-secondary" disabled title="${escapeHtml(view.refusal)}">${escapeHtml(`Migrate to ${x}`)}</button>`
+        : `<button class="btn btn-secondary" id="state-migrate" title="${escapeHtml(`Copy this bot's data to ${x} and switch to it`)}" onclick="startMigrate('${bot.id}')">${escapeHtml(`Migrate to ${x}`)}</button>`;
+      return `
+        <div class="env-tip" style="margin:12px 0 8px;">${button}</div>
+        ${rec ? `<div class="env-tip">${escapeHtml(`Migration to ${migrateName(rec.to)}, opened ${when(rec.openedAt)}: ${rec.text || ''}`)}</div>` : ''}
+        ${last ? `<div class="env-tip">${escapeHtml(`Last migration (${when(last.at)}): ${last.text}`)}</div>` : ''}`;
+    }
+
+    function migrateConfirmText(bot, view) {
+      const name = bot.displayName || bot.id;
+      const steps = 'The bot restarts once into maintenance, then copies its data while it stays in Maintenance.';
+      const adopt = (x, extra) => {
+        const parts = ['the bot does not restart', ...extra];
+        const said = parts.length < 3 ? parts.join(', and ') : `${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}`;
+        return ` If the bot is already running a move to ${x} that the manager did not start, the manager follows that move instead: ${said}.`;
+      };
+      if (view.to === 'postgres') {
+        const where = view.companion ? 'the managed Postgres on this server' : `Postgres at ${String(view.destination).replace(/^([^/]*:[^/]*):(\d+)\//, '[$1]:$2/')}`;
+        return `Migrate ${name}'s data to ${where}? ${steps} Once the copy is checked, its Data Backend becomes Postgres and it leaves Maintenance. Its JSON files stay in its data folder.${adopt('Postgres', [])}`;
+      }
+      const sharers = view.sharers && view.sharers.length ? ` ${view.sharers.join(', ')} use the same database: they are stopped for the migration and stay stopped after it.` : '';
+      const fence = view.fenced ? " While the migration runs, the database refuses every new connection but this bot's and the manager's, so any other bot or program that uses it and is not named here gets login errors until the migration ends; its open connections under another database login are closed, and while one under this bot's own login stays open, the move fails with nothing switched." : '';
+      return `Migrate ${name}'s data to JSON files? ${steps} Once the copy is checked, the database store is renamed aside (kept, not deleted), its Data Backend becomes JSON files and it leaves Maintenance.${sharers}${fence}${adopt('JSON files', [
+        ...(view.sharers && view.sharers.length ? ['no bot named above is stopped while that move runs'] : []),
+        ...(view.fenced ? ['the database stays open to other connections'] : []),
+      ])}`;
+    }
+
+    async function startMigrate(botId) {
+      const bot = bots.find(b => b.id === botId) || { id: botId };
+      let view;
+      try { view = await api('GET', `/bots/${botId}/migrate`); } catch (err) { view = null; }
+      if (!view?.success) { showMessage('error', view ? view.error : "No answer from the manager, so the migration can't start."); return; }
+      if (!view.record && !confirm(migrateConfirmText(bot, view))) return;
+      let res;
+      try { res = await api('POST', `/bots/${botId}/migrate`, { to: view.to }); } catch (err) { res = null; }
+      if (!res?.success) { showMessage('error', res ? res.error : "No answer from the manager, so it can't confirm the migration started."); return; }
+      showMessage('info', view.record ? `The manager goes on with the open migration to ${migrateName(view.to)}; the State window shows its progress and its outcome` : `The manager accepted the migration to ${migrateName(view.to)}; the State window shows its progress and its outcome`);
+    }
+
     let stateBotId = null;
     function stateWindowHtml(bot, info) {
       const kindNotes = {
@@ -3695,6 +3775,7 @@
         <label for="state-message">Maintenance message</label>
         <textarea id="state-message" maxlength="1500" rows="4" style="width:100%;" oninput="document.getElementById('state-count').textContent = this.value.length + ' / 1500'">${escapeHtml(message)}</textarea>
         <div class="env-tip">Blank uses the bot's default maintenance text. Up to 1500 characters. <span id="state-count">${message.length} / 1500</span></div>
+        ${migrateHtml(bot, info.migrate)}
         <div class="modal-actions">
           <button class="btn btn-primary" id="state-apply" onclick="applyState('${bot.id}')">Apply</button>
           <button class="btn btn-secondary" onclick="hideStateWindow()">Close</button>
@@ -3717,7 +3798,10 @@
           <div class="modal-actions"><button class="btn btn-secondary" onclick="hideStateWindow()">Close</button></div>`;
         return;
       }
-      content.innerHTML = stateWindowHtml(bot, res);
+      let view;
+      try { view = await api('GET', `/bots/${botId}/migrate`); } catch (err) { view = null; }
+      if (stateBotId !== botId) return;
+      content.innerHTML = stateWindowHtml(bot, { ...res, migrate: view?.success ? view : null });
     }
 
     function hideStateWindow() {

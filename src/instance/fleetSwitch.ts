@@ -392,6 +392,8 @@ export async function startLane(botId: string, op: string, fn: (admit: () => voi
   if (containerManager.isShuttingDown()) return refusal(containerManager.SHUTDOWN_REFUSAL, 503);
   const busy = containerManager.isBotBusy(botId);
   if (busy) return refusal(busyText(busy));
+  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+  if (migrating) return refusal(migrating.error);
   let admitted = false;
   let answer!: (r: { accepted: true } | LaneOutcome) => void;
   const answered = new Promise<{ accepted: true } | LaneOutcome>(resolve => { answer = resolve; });
@@ -410,6 +412,8 @@ export async function runLane(botId: string, op: string, fn: (admit: () => void)
   if (containerManager.isShuttingDown()) return refusal(containerManager.SHUTDOWN_REFUSAL, 503);
   const busy = containerManager.isBotBusy(botId);
   if (busy) return refusal(busyText(busy));
+  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+  if (migrating) return refusal(migrating.error);
   try {
     return await settle(await containerManager.withExternalBotOp(botId, op, () => fn(() => undefined)));
   } catch (err) {
@@ -1559,7 +1563,7 @@ export function setReceiveStep(fn: ((inst: InstanceConfig, now: number) => Promi
 }
 
 async function tickBot(listed: InstanceConfig, now: number): Promise<void> {
-  if (containerManager.isBotBusy(listed.id)) return;
+  if (containerManager.isBotBusy(listed.id) || containerManager.getBot(listed.id)?.migrate || containerManager.migrationHolds(listed.id).length > 0) return;
   await fleetJoin.retryAddresses(listed.id);
   const inst = containerManager.getBot(listed.id);
   const db = inst?.fleetDb;
@@ -1582,6 +1586,8 @@ async function tickBot(listed: InstanceConfig, now: number): Promise<void> {
 }
 
 /** One pass over every bot; a pass that finds the previous one still running does nothing. */
+let tickOn: string | null = null;
+
 export async function switchTick(now = Date.now()): Promise<void> {
   if (tickRunning) return;
   tickRunning = true;
@@ -1590,14 +1596,23 @@ export async function switchTick(now = Date.now()): Promise<void> {
     for (const inst of containerManager.getAllBots()) {
       if (containerManager.isShuttingDown()) return;
       try {
+        tickOn = inst.id;
         await tickBot(inst, now);
       } catch (err) {
         console.error(`[Switch] ${inst.displayName}: the switch check failed: ${errText(err)}`);
+      } finally {
+        tickOn = null;
       }
     }
   } finally {
     tickRunning = false;
+    tickOn = null;
   }
+}
+
+/** Whether the switch tick's pass is on this bot now (Migrate refuses a new record meanwhile, A34). */
+export function switchTickOn(botId: string): boolean {
+  return tickOn === botId;
 }
 
 export function startFleetSwitchTick(): void {
@@ -1619,6 +1634,7 @@ export function stopFleetSwitchTick(): void {
 }
 
 export function resetSwitchState(): void {
+  tickOn = null;
   peerCheckedAt.clear();
   rejoinCheckedAt.clear();
   ensureLogged.clear();

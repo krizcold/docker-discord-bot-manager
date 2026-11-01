@@ -465,6 +465,12 @@ describe('the stale-primary re-seed refusals', () => {
       success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet',
     });
   });
+
+  it('D86 (round 5) its own join code with the host in upper case is refused the same way', () => {
+    expect(fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@SELF.INVALID:5440/smdb'), 'standby.invalid', 5440)).toEqual({
+      success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet',
+    });
+  });
 });
 
 describe('Provision', () => {

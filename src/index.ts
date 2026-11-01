@@ -18,6 +18,7 @@ import { startFleetCopyWatch, stopFleetCopyWatch } from './instance/fleetCopyWat
 import { startFleetSwitchTick, stopFleetSwitchTick } from './instance/fleetSwitch';
 import './instance/fleetMove';
 import { startMaintenanceReconciler, stopMaintenanceReconciler } from './instance/maintenance';
+import { resumeMigrations } from './instance/migrate';
 import { startStateReconciler, stopStateReconciler } from './docker/stateReconciler';
 import { getDeploymentMode } from './casaos/detector';
 import { warnOnOpenDataRoot } from './config/fileModes';
@@ -116,6 +117,7 @@ async function main(): Promise<void> {
 
   // Resumes the state orders a restart cut, then keeps the database logins in line with each bot's state.
   startMaintenanceReconciler();
+  resumeMigrations();
 
   // Start source auto-update scheduler
   startSourceUpdater();

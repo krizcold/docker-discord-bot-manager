@@ -63,7 +63,7 @@ describe('hookAnswer', () => {
 });
 
 describe('transientRefusal', () => {
-  it('the restart-in-progress refusal is transient', () => expect(transientRefusal('A start or restart of the bot is in progress; wait')).toBe('transient'));
+  it('the restart-in-progress refusal is transient', () => expect(transientRefusal('A start or restart of the bot is in progress; try again once it ends')).toBe('transient'));
   it('a session text without the migration prefix is no retry', () => expect(transientRefusal('x session is still open')).toBeNull());
 });
 

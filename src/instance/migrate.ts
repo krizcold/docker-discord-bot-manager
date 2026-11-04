@@ -162,11 +162,31 @@ export function hookAnswer(r: AppHookResult, method: 'GET' | 'POST'): HookAnswer
   return { kind: 'unusable', status, error: bodyError ?? (ok2xx ? 'the answer holds no readable job' : `the bot answered HTTP ${status}`) };
 }
 
-/** NB3-RS-2 and NB3-RS-4 retry in the readiness window; the open session refusal retries for 5 minutes. */
-export function transientRefusal(error: string): 'transient' | 'session' | null {
+/** NB3-RS-2 and NB3-RS-4 retry in the readiness window; the open session refusal (S0's on the POST, S2's at checking) retries for 5 minutes. */
+export function transientRefusal(error: string, allowed: readonly string[] = []): 'transient' | 'session' | null {
   if (error.startsWith('The bot process is still starting') || error.startsWith('A start or restart of the bot is in progress')) return 'transient';
   if (error.startsWith("can't confirm; migration ") && error.includes('session is still open')) return 'session';
-  return null;
+  const parts = sessionParts(error);
+  return parts && parts.every(p => p.last || allowed.includes(p.jobId)) ? 'session' : null;
+}
+
+const SESSION_LAST = /^Migration (.+?)'s database session is still open; the database ends it once it notices the connection is gone; run the migration again once it no longer shows$/;
+const SESSION_OTHER = /^Migration (.+?), which is not this bot's last one, holds a session on this database; run this migration once it no longer shows$/;
+
+/** S2's text as its migration-session parts (bot:929 joins them with ". "); null when any part is another text. */
+function sessionParts(error: string): Array<{ jobId: string; last: boolean }> | null {
+  const out: Array<{ jobId: string; last: boolean }> = [];
+  for (const part of error.split('. ')) {
+    const a = SESSION_LAST.exec(part);
+    const b = a ? null : SESSION_OTHER.exec(part);
+    if (!a && !b) return null;
+    out.push({ jobId: (a ?? b)![1], last: !!a });
+  }
+  return out;
+}
+
+function sessionJobIds(error: string): string[] {
+  return (sessionParts(error) ?? []).map(p => p.jobId);
 }
 
 export type Job = { jobId: string; state: string; to: MigrateTo; stage?: string; error?: string; destination?: unknown; leftOut?: unknown };
@@ -194,7 +214,7 @@ export type PostVerdict =
   | { act: 'failed'; job: Job }
   | { act: 'park'; why: 'otherjob' | 'nohook' | 'auth'; job?: Job; status?: number; error?: string }
   | { act: 'close'; why: 'nohook' | 'auth'; status?: number; error?: string }
-  | { act: 'retry'; why: 'unknown' | 'unreachable' | 'transient' | 'session'; error: string }
+  | { act: 'retry'; why: 'unknown' | 'unreachable' | 'session'; error: string }
   | { act: 'refusal'; error: string };
 
 const jobOf = (b: any): Job => ({
@@ -208,8 +228,7 @@ export function postVerdict(a: HookAnswer, rec: RecView): PostVerdict {
   if (a.kind === 'nohook') return rec.posted ? { act: 'park', why: 'nohook' } : { act: 'close', why: 'nohook' };
   if (a.kind === 'auth') return rec.posted ? { act: 'park', why: 'auth', status: a.status, error: a.error } : { act: 'close', why: 'auth', status: a.status, error: a.error };
   if (a.kind !== 'answer') {
-    const t = transientRefusal(a.error);
-    return t ? { act: 'retry', why: t, error: a.error } : { act: 'refusal', error: a.error };
+    return transientRefusal(a.error) === 'session' ? { act: 'retry', why: 'session', error: a.error } : { act: 'refusal', error: a.error };
   }
   const b = a.body;
   if (typeof b.jobId !== 'string' || !['started', ...STATES].includes(b.state) || (b.to !== 'postgres' && b.to !== 'file')) {
@@ -236,6 +255,7 @@ export type GetVerdict =
   | { act: 'follow'; jobId: string }
   | { act: 'done'; job: Job }
   | { act: 'failed'; job: Job }
+  | { act: 'transient'; why: 'transient' | 'session'; job: Job }
   | { act: 'again'; job: Job }
   | { act: 'spent'; job: Job }
   | { act: 'keep'; keep: Keep }
@@ -244,7 +264,7 @@ export type GetVerdict =
   | { act: 'silent'; unusable: { status: number; error: string } | null; error: string };
 
 /** D: a GET while following the record's job. */
-export function getVerdict(a: HookAnswer, rec: RecView): GetVerdict {
+export function getVerdict(a: HookAnswer, rec: RecView, sessionJobs: readonly string[] = []): GetVerdict {
   if (a.kind === 'nohook') return { act: 'park', why: 'nohook' };
   if (a.kind === 'auth') return { act: 'park', why: 'auth', status: a.status, error: a.error };
   if (a.kind === 'cantconfirm') return { act: 'keep', keep: { kind: 'cantconfirm', error: a.error } };
@@ -255,7 +275,10 @@ export function getVerdict(a: HookAnswer, rec: RecView): GetVerdict {
   if (job.jobId === rec.jobId && job.to === rec.to) {
     if (job.state === 'running') return { act: 'poll', job };
     if (job.state === 'done') return { act: 'done', job };
-    if (job.state === 'failed') return { act: 'failed', job };
+    if (job.state === 'failed') {
+      const why = job.stage === 'checking' && job.error ? transientRefusal(job.error, [...rec.jobIds, ...sessionJobs]) : null;
+      return why ? { act: 'transient', why, job } : { act: 'failed', job };
+    }
     const v = interruptVerdict(job, rec);
     return v.act === 'keep' ? v : { act: v.act, job };
   }
@@ -768,10 +791,13 @@ export function migrateView(inst: InstanceConfig): {
 
 type SharerRefusal = { clause: string; retry?: string };
 
+/** sessionJobs: the jobs this episode's session refusals named; counted: the job the last POST added to `started`. */
+type Carry = { windowEnd: number; sessionEnd: number; sessionJobs: string[]; counted?: string };
+
 type Next =
   | { go: 'prepare' }
-  | { go: 'post' }
-  | { go: 'follow' }
+  | { go: 'post'; carry?: Carry }
+  | { go: 'follow'; carry?: Carry }
   | { go: 'refusal'; error: string; spent?: Job }
   | { go: 'keep'; keep: Keep }
   | { go: 'done'; job: Job | null }
@@ -957,8 +983,8 @@ class Lane {
       if (containerManager.isShuttingDown() && next.go !== 'end') return;
       switch (next.go) {
         case 'prepare': next = await this.prepare(); break;
-        case 'post': next = await this.post(); break;
-        case 'follow': next = await this.follow(); break;
+        case 'post': next = await this.post(next.carry); break;
+        case 'follow': next = await this.follow(next.carry); break;
         case 'refusal': next = await this.refusal(next.error, next.spent); break;
         case 'keep': next = await this.keep(next.keep); break;
         case 'done': next = await this.done(next.job); break;
@@ -1184,7 +1210,7 @@ class Lane {
   }
 
   // M7
-  private async post(): Promise<Next> {
+  private async post(carry?: Carry): Promise<Next> {
     if (this.rec.to === 'file' && this.rec.from === 'postgres' && !this.rec.isolated) {
       const held = await this.isolate('park');
       if (held) return held;
@@ -1192,9 +1218,9 @@ class Lane {
     let sentBefore = this.rec.posted;
     if (!this.save({ phase: 'posting', posted: true, ...this.addJob(this.rec.jobId), text: T.pPost(this.rec.jobId) })) return this.stop();
     emit(this.botId, T.pPost(this.rec.jobId));
-    const windowEnd = this.windowEnd > Date.now() ? this.windowEnd : Date.now() + MIGRATE_TIMING.windowMs;
+    const windowEnd = carry ? carry.windowEnd : this.windowEnd > Date.now() ? this.windowEnd : Date.now() + MIGRATE_TIMING.windowMs;
     let unknown = 0;
-    let sessionEnd = 0;
+    let sessionEnd = carry?.sessionEnd ?? 0;
     let unreachableSince = 0;
     for (;;) {
       if (containerManager.isShuttingDown()) return { go: 'end' };
@@ -1208,7 +1234,7 @@ class Lane {
         case 'follow':
           if (!this.save({ ...this.addJob(v.jobId), ...(v.started ? { started: this.rec.started + 1 } : {}) })) return this.stop();
           this.progress(T.pRun(v.jobId));
-          return { go: 'follow' };
+          return { go: 'follow', carry: { windowEnd, sessionEnd, sessionJobs: carry?.sessionJobs ?? [], ...(v.started ? { counted: v.jobId } : {}) } };
         case 'done':
           if (!this.save(this.addJob(v.jobId))) return this.stop();
           return { go: 'follow' };
@@ -1233,10 +1259,6 @@ class Lane {
           } else if (v.why === 'unreachable') {
             if (!unreachableSince) unreachableSince = Date.now();
             if (Date.now() >= windowEnd) return { go: 'park', resumeAt: 'following', text: T.noAnswer(this.rec.jobId, spanText(Date.now() - unreachableSince), v.error) };
-            await sleep(MIGRATE_TIMING.retryPauseMs);
-          } else if (v.why === 'transient') {
-            unreachableSince = 0;
-            if (Date.now() >= windowEnd) return { go: 'refusal', error: v.error };
             await sleep(MIGRATE_TIMING.retryPauseMs);
           } else {
             unreachableSince = 0;
@@ -1264,7 +1286,7 @@ class Lane {
   }
 
   // M8
-  private async follow(): Promise<Next> {
+  private async follow(carry?: Carry): Promise<Next> {
     if (this.rec.phase !== 'following' && !this.save({ phase: 'following' })) return this.stop();
     let silentSince = 0;
     let startedOnce = false;
@@ -1272,7 +1294,7 @@ class Lane {
     for (;;) {
       if (containerManager.isShuttingDown()) return { go: 'end' };
       const a = hookAnswer(await this.get(), 'GET');
-      const v = getVerdict(a, this.rec);
+      const v = getVerdict(a, this.rec, carry?.sessionJobs ?? []);
       if (v.act !== 'silent') { silentSince = 0; lastUnusable = null; }
       switch (v.act) {
         case 'poll':
@@ -1289,6 +1311,24 @@ class Lane {
           return { go: 'done', job: v.job };
         case 'failed':
           return { go: 'close', text: T.failed(v.job.jobId, v.job.stage || 'an unnamed stage', v.job.error || 'the bot gave no error', sourceText(this.rec.from)) };
+        case 'transient': {
+          const now = Date.now();
+          const w: Carry = carry ? { ...carry, sessionJobs: [...carry.sessionJobs] } : { windowEnd: this.windowEnd > now ? this.windowEnd : now + MIGRATE_TIMING.windowMs, sessionEnd: 0, sessionJobs: [] };
+          const takeBack = carry?.counted === v.job.jobId ? 1 : 0;
+          delete w.counted;
+          if (v.why === 'session') {
+            for (const id of sessionJobIds(v.job.error ?? '')) if (!w.sessionJobs.includes(id)) w.sessionJobs.push(id);
+            w.sessionEnd = w.sessionEnd || now + MIGRATE_TIMING.sessionMs;
+            if (now >= w.sessionEnd) return { go: 'refusal', error: v.job.error || 'the bot gave no error' };
+            this.progress(T.pSession(v.job.jobId, seconds(now - (w.sessionEnd - MIGRATE_TIMING.sessionMs))));
+            await sleep(MIGRATE_TIMING.sessionPauseMs);
+          } else {
+            if (now >= w.windowEnd) return { go: 'refusal', error: v.job.error || 'the bot gave no error' };
+            await sleep(MIGRATE_TIMING.retryPauseMs);
+          }
+          if (!this.save({ jobId: mintJobId(), started: Math.max(0, this.rec.started - takeBack) })) return this.stop();
+          return { go: 'post', carry: w };
+        }
         case 'again':
           return this.interrupted(v.job);
         case 'spent':

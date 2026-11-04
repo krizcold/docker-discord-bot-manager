@@ -10,7 +10,11 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { laneDone, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { botGet, botPost, fastTiming, getJob, http, m, noAnswer, postJob, refusal, resetMigrate, seedBot, seedSharer, unknownPost, COMPANION_URL, EXTERNAL_URL, FLEET_DB } from './migrate-fake';
+import { botGet, botPost, fastTiming, getJob, http, m, noAnswer, postJob, refusal, resetMigrate, seedBot, seedSharer, unknownPost, COMPANION_URL, EXTERNAL_URL, FLEET_DB, UNREADABLE } from './migrate-fake';
+
+const RS2 = "The bot process is still starting; can't confirm whether it boots in maintenance; try again once it has started";
+const S0S = "can't confirm; migration mgr-old's database session is still open; the database ends it once it notices the connection is gone; run the migration again once it no longer shows";
+const GONE = 'The job stopped before it finished; the old store still serves';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 
@@ -131,15 +135,15 @@ describe('C: the POST', () => {
     expect(rec()).toMatchObject({ phase: 'waiting', resumeAt: 'following' });
     expect(rec().text).toMatch(/now answers that it has no migrate hook \(404\)/);
   });
-  it('C11 a transient refusal retries within the window, then E', async () => {
+  it('C11 (NM10F) RS-2 at the job\'s first checks: a new jobId within the window, then E', async () => {
     seedBot();
-    MIGRATE_TIMING.readyMs = 0;
-    for (let i = 0; i < 300; i++) m.bot.postQueue.push(refusal('The bot process is still starting; try again shortly'));
-    m.bot.getQueue.push(getJob(null), getJob(null));
+    Object.assign(MIGRATE_TIMING, { readyMs: 0, windowMs: 200 });
+    for (let i = 0; i < 1000; i++) m.bot.checks.push(RS2);
     await press();
-    expect(posts().length).toBeGreaterThan(1);
-    expect(last().text).toMatch(/^The bot refused the migration: The bot process is still starting/);
-    m.bot.postQueue = [];
+    const ids = posts().map(p => p.jobId);
+    expect(ids.length).toBeGreaterThan(1);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(last().text).toBe(`The bot refused the migration: ${RS2}. Nothing was switched: the bot stays in Maintenance and keeps its data in its JSON files.`);
   });
   it('C12 any other refusal goes through E (null job: F)', async () => {
     seedBot();
@@ -218,10 +222,10 @@ describe('C: round 1', () => {
     expect(Math.abs(n - (m.postAt[m.postAt.length - 1] - m.postAt[0]) / 1000)).toBeLessThanOrEqual(1);
     expect(n).not.toBe(60);
   });
-  it('C9 (round 2, C-6) a transient refusal ends the silence: MG-NOANSWER counts from the first unreachable POST after it', async () => {
+  it('C9 (round 2, C-6) a session refusal ends the silence: MG-NOANSWER counts from the first unreachable POST after it', async () => {
     seedBot();
-    Object.assign(MIGRATE_TIMING, { windowMs: 60_000, readyMs: 6_000, retryPauseMs: 1_500 });
-    m.bot.postQueue.push(noAnswer(), noAnswer(), refusal('The bot process is still starting'));
+    Object.assign(MIGRATE_TIMING, { windowMs: 60_000, readyMs: 6_000, retryPauseMs: 1_500, sessionPauseMs: 1_500, sessionMs: 60_000 });
+    m.bot.postQueue.push(noAnswer(), noAnswer(), { ...refusal(S0S), body: { success: false, error: S0S, jobId: 'mgr-old', to: 'postgres' } });
     for (let i = 0; i < 500; i++) m.bot.postQueue.push(noAnswer());
     await press();
     m.bot.postQueue = [];
@@ -254,13 +258,13 @@ describe('the fake bot answers a POST in contract 9\'s S0 order (C-9)', () => {
   beforeEach(() => seedBot({ postgres: true }));
   it.each([
     ['1 the last job running, the same `to`: that job', [job({ state: 'running' })], { jobId: 'mgr-2', to: 'file' }, { ok: true, state: 'running', jobId: 'mgr-1' }],
-    ['1 the last job running, the other `to`: refused naming it', [job({ state: 'running' })], { jobId: 'mgr-2', to: 'postgres' }, { ok: false, error: 'Migration mgr-1 to file is running' }],
+    ['1 the last job running, the other `to`: refused naming it', [job({ state: 'running' })], { jobId: 'mgr-2', to: 'postgres' }, { ok: false, error: 'Migration mgr-1 (--to file) is running' }],
     ['2 fact 1 (done): done with its jobId', [job({ state: 'done', stage: 'env' })], { jobId: 'mgr-2', to: 'file' }, { ok: true, state: 'done', jobId: 'mgr-1' }],
     ['2 fact 2 (file at switching): written done', [job({ stage: 'switching' })], { jobId: 'mgr-2', to: 'file' }, { ok: true, state: 'done', jobId: 'mgr-1' }],
     ['2 fact 3: the earlier job failed, a new job started', [job({})], { jobId: 'mgr-2', to: 'file' }, { ok: true, state: 'started', jobId: 'mgr-2' }],
-    ['2 fact 4: can\'t confirm', [job({ stage: 'retire-source', to: 'postgres', fact: 4 })], { jobId: 'mgr-2', to: 'postgres' }, { ok: false, error: expect.stringMatching(/^can't confirm; /) }],
+    ['2 fact 4: can\'t confirm', [job({ stage: 'retire-source', fact: 4, error: "can't confirm whether the old store was renamed aside" })], { jobId: 'mgr-2', to: 'file' }, { ok: false, error: "can't confirm; the marker /data/.backend.json names file under no migration, not migration mgr-1" }],
     ['3 a known jobId of the other `to`: that job', [job({ jobId: 'mgr-9', to: 'file', state: 'failed', error: 'x' })], { jobId: 'mgr-9', to: 'postgres' }, { ok: true, state: 'failed', jobId: 'mgr-9' }],
-    ['4 anything else: a new job, its destination the stored URL', [], { jobId: 'mgr-2', to: 'postgres' }, { ok: true, state: 'started', jobId: 'mgr-2', destination: { host: 'b1-fleet-postgres', port: 5432, database: 'smdb' } }],
+    ['4 anything else: a new job, started at checking', [], { jobId: 'mgr-2', to: 'postgres' }, { ok: true, state: 'started', jobId: 'mgr-2' }],
   ])('case %s', (_n, journal, body, want) => {
     m.bot.journal = journal as any;
     const r = botPost(inst, body as any);
@@ -269,12 +273,47 @@ describe('the fake bot answers a POST in contract 9\'s S0 order (C-9)', () => {
     else got.error = r.body?.error;
     expect(got).toEqual(want);
   });
-  it('fact 3 writes the earlier job failed; fact 4 makes the GET answer can\'t confirm', () => {
+  it('fact 3 writes the earlier job failed; fact 4 refuses naming the earlier job, whose GET goes on answering it', () => {
     m.bot.journal = [job({})];
     botPost(inst, { jobId: 'mgr-2', to: 'file' });
     expect(m.bot.journal[0]).toMatchObject({ state: 'failed', error: 'The old store was not retired; nothing was switched' });
-    m.bot.journal = [job({ fact: 4 })];
-    botPost(inst, { jobId: 'mgr-2', to: 'file' });
-    expect(botGet().body).toEqual({ success: false, error: expect.stringMatching(/^can't confirm which store holds the data: /) });
+    m.bot.journal = [job({ fact: 4, error: GONE })];
+    const r = botPost(inst, { jobId: 'mgr-2', to: 'file' });
+    expect(r.status).toBe(409);
+    expect(r.body).toEqual({ success: false, error: "can't confirm; the marker /data/.backend.json names file under no migration, not migration mgr-1", jobId: 'mgr-1', to: 'file' });
+    expect(botGet().body).toEqual({ success: true, job: expect.objectContaining({ jobId: 'mgr-1', state: 'interrupted', stage: 'copying' }) });
+  });
+  it('T-F1 a started answer holds only its fields; the destination shows once the job is past its checks', () => {
+    m.bot.journal = [];
+    m.bot.script = [{ stage: 'draining' }, { stage: 'copying' }];
+    const r = botPost(inst, { jobId: 'mgr-2', to: 'postgres' });
+    expect(Object.keys(r.body).sort()).toEqual(['jobId', 'stage', 'state', 'success', 'to']);
+    expect('destination' in botGet().body.job).toBe(false);
+    expect(botGet().body.job.destination).toEqual({ host: 'b1-fleet-postgres', port: 5432, database: 'smdb' });
+  });
+  it('T-F2 a running job of the same `to` answers running with no stage', () => {
+    m.bot.journal = [job({ state: 'running' })];
+    expect(botPost(inst, { jobId: 'mgr-2', to: 'file' }).body).toEqual({ success: true, jobId: 'mgr-1', to: 'file', state: 'running' });
+  });
+  it('T-F3 a jobId older than the last job starts a new job', () => {
+    m.bot.journal = [job({ jobId: 'mgr-9', state: 'failed', error: 'x' }), job({ jobId: 'mgr-3', error: GONE })];
+    expect(botPost(inst, { jobId: 'mgr-9', to: 'postgres' }).body).toMatchObject({ state: 'started', jobId: 'mgr-9' });
+  });
+  it('T-F4 a check refusal: the POST answers started and the journal holds the job failed at checking', () => {
+    m.bot.checks = [RS2];
+    expect(botPost(inst, { jobId: 'mgr-2', to: 'file' }).body.state).toBe('started');
+    const want = { jobId: 'mgr-2', state: 'failed', stage: 'checking', error: RS2 };
+    expect(m.bot.journal[m.bot.journal.length - 1]).toMatchObject(want);
+    expect(botGet().body.job).toMatchObject(want);
+  });
+  it('T-F5 an unreadable journal: the POST refuses 409, the GET answers 200 with the same body', () => {
+    m.bot.unreadable = UNREADABLE;
+    m.bot.journal = [job({ error: GONE })];
+    const p = botPost(inst, { jobId: 'mgr-2', to: 'file' });
+    expect(p.status).toBe(409);
+    expect(p.body).toEqual({ success: false, error: UNREADABLE });
+    const g = botGet();
+    expect(g.status).toBe(200);
+    expect(g.body).toEqual({ success: false, error: UNREADABLE });
   });
 });

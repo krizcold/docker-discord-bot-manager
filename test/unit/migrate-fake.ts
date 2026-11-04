@@ -4,7 +4,7 @@ type Result = { ok: boolean; status?: number; body?: any; error?: string; unknow
 /** A queue entry; a function is called when its turn comes, and the row settles the promise it returns (the hook mock awaits it). */
 type QueueEntry = Result | null | (() => Result | Promise<Result>);
 /** fact: contract 9's S0 class of a finished or stopped job (1 done, 2 past the switch and settled done, 3 not retired, 4 can't confirm). */
-export type FakeJob = { jobId: string; to: 'postgres' | 'file'; state: string; stage: string; destination?: unknown; error?: string; leftOut?: unknown[]; fact?: 1 | 2 | 3 | 4; unsettled?: boolean };
+export type FakeJob = { jobId: string; to: 'postgres' | 'file'; state: string; stage: string; destination?: unknown; error?: string; leftOut?: unknown[]; fact?: 1 | 2 | 3 | 4; dest?: unknown };
 export type KillPoint = { at: string; nth?: number; when: 'before' | 'after' };
 
 export const SMDB = 'https://github.com/x/fully-modular-discord-bot';
@@ -115,6 +115,8 @@ export interface MigrateFake {
     gets: number;
     down: boolean;
     destination: unknown;
+    checks: Array<Check | (() => Check)>;
+    unreadable: string | null;
   };
   listener: Array<{ id: string; text: string; final: boolean }>;
 }
@@ -133,7 +135,7 @@ function fresh(): MigrateFake {
     order: { settled: true, text: 'The bot is running normally.' }, saveAnswers: [], held: [], notice: null, notices: {}, seed: null, seeds: {}, tickOn: null, sharers: [], liveSharers: [] as string[],
     fenceUp: null as string | null | ((refresh: boolean) => string | null), fenceLift: 'lifted' as 'lifted' | 'stripped' | 'unconfirmed' | 'gone' | 'unknown' | 'locked',
     kill: null, killSeen: 0, postAt: [],
-    bot: { journal: [], script: [{ stage: 'copying' }, { state: 'done', stage: 'switching' }], postQueue: [], getQueue: [], posts: [], gets: 0, down: false, destination: undefined },
+    bot: { journal: [], script: [{ stage: 'copying' }, { state: 'done', stage: 'switching' }], postQueue: [], getQueue: [], posts: [], gets: 0, down: false, destination: undefined, checks: [], unreadable: null },
     listener: [],
   };
 }
@@ -182,6 +184,23 @@ export const unknownPost = (): Result => ({ ok: false, unknown: true, error: 'mi
 export const http = (status: number, body: any = null): Result => ({ ok: false, status, body, error: body?.error || `migrate returned ${status}` });
 export const getJob = (job: Partial<FakeJob> | null): Result => ok({ job: job ? { startedAt: '2026-10-31T00:00:00.000Z', stage: 'checking', ...job } : null });
 export const postJob = (job: Partial<FakeJob>): Result => ok({ stage: 'checking', ...job });
+/** The bot's recognition guard when /data/.migration.json is unreadable. */
+export const UNREADABLE = "can't confirm which store holds the data: /data/.migration.json does not hold a job id, a direction and a stage";
+const view = ({ fact, dest, ...j }: FakeJob) => j;
+/** S2's session refusal: the jobs whose sessions linger and the bot sessions, built as the bot builds it from its last job. */
+export type SessionCheck = { sessions: string[]; bots?: number };
+type Check = string | SessionCheck;
+
+function sessionText(c: SessionCheck, lastJobId: string | null): string {
+  const parts: string[] = [];
+  if (c.bots) parts.push(`${c.bots} other session(s) of the bot's database role are connected (smdb-bot: ${c.bots}); stop every bot on this database first`);
+  for (const id of c.sessions) {
+    parts.push(id === lastJobId
+      ? `Migration ${id}'s database session is still open; the database ends it once it notices the connection is gone; run the migration again once it no longer shows`
+      : `Migration ${id}, which is not this bot's last one, holds a session on this database; run this migration once it no longer shows`);
+  }
+  return parts.join('. ');
+}
 
 function current(): FakeJob | null {
   return m.bot.journal.length ? m.bot.journal[m.bot.journal.length - 1] : null;
@@ -207,9 +226,14 @@ function factOf(job: FakeJob): 1 | 2 | 3 | 4 {
 
 function startJob(inst: any, body: { jobId: string; to: 'postgres' | 'file'; url?: string }): Result {
   const url = body.url ?? (inst?.id ? m.env[inst.id]?.DATA_BACKEND_URL : undefined);
-  const job: FakeJob = { jobId: body.jobId, to: body.to, state: 'running', stage: 'checking', ...(body.to === 'postgres' ? { destination: m.bot.destination ?? identity(url) } : {}) };
+  const job: FakeJob = { jobId: body.jobId, to: body.to, state: 'running', stage: 'checking', ...(body.to === 'postgres' ? { dest: m.bot.destination ?? identity(url) } : {}) };
+  if (m.bot.checks.length) {
+    const f = m.bot.checks.shift()!;
+    const c = typeof f === 'function' ? f() : f;
+    Object.assign(job, { state: 'failed', error: typeof c === 'string' ? c : sessionText(c, current()?.jobId ?? null) });
+  }
   m.bot.journal.push(job);
-  return postJob({ ...job, state: 'started' });
+  return ok({ jobId: job.jobId, to: job.to, state: 'started', stage: 'checking' });
 }
 
 /** Contract 9's POST in NB3's S0 order, as the bot answers it. */
@@ -223,23 +247,26 @@ export function botPost(inst: any, body: { jobId: string; to: 'postgres' | 'file
   if (m.bot.down) return noAnswer();
   const cur = current();
   if (cur && cur.state === 'running') {
-    if (cur.to === body.to) return postJob({ ...cur });
-    return { ...refusal(`Migration ${cur.jobId} to ${cur.to} is running`), body: { success: false, error: `Migration ${cur.jobId} to ${cur.to} is running`, jobId: cur.jobId, to: cur.to } };
+    if (cur.to === body.to) return ok({ jobId: cur.jobId, to: cur.to, state: 'running' });
+    const error = `Migration ${cur.jobId} (--to ${cur.to}) is running`;
+    return { ...refusal(error), body: { success: false, error, jobId: cur.jobId, to: cur.to } };
   }
+  if (m.bot.unreadable) return refusal(m.bot.unreadable);
   if (cur && cur.to === body.to) {
     const fact = factOf(cur);
-    if (fact === 1) return postJob({ ...cur, state: 'done' });
+    if (fact === 1) return postJob({ ...view(cur), state: 'done' });
     if (fact === 2) {
       Object.assign(cur, { state: 'done', fact: 1 });
-      return postJob({ ...cur });
+      return postJob(view(cur));
     }
-    if (fact === 4) cur.unsettled = true;
-    if (fact === 4) return refusal(`can't confirm; migration ${cur.jobId} stopped at ${cur.stage || 'an unknown stage'} and the bot cannot tell which store holds the data`);
+    if (fact === 4) {
+      const error = `can't confirm; the marker /data/.backend.json names ${cur.to} under no migration, not migration ${cur.jobId}`;
+      return { ...refusal(error), body: { success: false, error, jobId: cur.jobId, to: cur.to } };
+    }
     if (cur.state !== 'failed') Object.assign(cur, { state: 'failed', error: 'The old store was not retired; nothing was switched' });
     return startJob(inst, body);
   }
-  const known = m.bot.journal.find(j => j.jobId === body.jobId && j.to !== body.to);
-  if (known) return postJob({ ...known });
+  if (cur && cur.jobId === body.jobId) return ok({ jobId: cur.jobId, to: cur.to, state: cur.state, stage: cur.stage, ...(cur.error !== undefined ? { error: cur.error } : {}) });
   return startJob(inst, body);
 }
 
@@ -251,10 +278,11 @@ export function botGet(): Result {
     if (q) return (typeof q === 'function' ? q() : q) as Result;
   }
   if (m.bot.down) return noAnswer();
+  if (m.bot.unreadable) return refusal(m.bot.unreadable, 200);
   const cur = current();
   if (cur && cur.state === 'running' && m.bot.script.length) Object.assign(cur, m.bot.script.shift());
-  if (cur && cur.unsettled) return refusal(`can't confirm which store holds the data: migration ${cur.jobId} stopped at ${cur.stage || 'an unknown stage'}`);
-  return getJob(cur ? { ...cur } : null);
+  if (cur && cur.dest !== undefined && cur.destination === undefined && !['checking', 'draining', 'reading'].includes(cur.stage)) cur.destination = cur.dest;
+  return getJob(cur ? view(cur) : null);
 }
 
 // ─── Mock factories ───

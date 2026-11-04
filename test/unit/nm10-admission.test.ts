@@ -11,7 +11,7 @@ vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-f
 
 import { laneDone, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
 import { APP_CAPABILITIES } from '../../src/config/appCapabilities';
-import { fastTiming, getJob, http, m, noAnswer, resetMigrate, seedBot, COMPANION_URL, EXTERNAL_URL, FLEET_DB, MG_FLEET_REPL_ON, MG_URL_FORM_A, URL_FORM_CLAUSE } from './migrate-fake';
+import { fastTiming, getJob, http, m, noAnswer, refusal, resetMigrate, seedBot, COMPANION_URL, EXTERNAL_URL, FLEET_DB, MG_FLEET_REPL_ON, MG_URL_FORM_A, URL_FORM_CLAUSE } from './migrate-fake';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 
@@ -103,7 +103,7 @@ describe('A: admission refusals change nothing', () => {
     ['A25 404', http(404), /has no migrate hook/],
     ['A26 no answer', noAnswer('migrate unreachable: ECONNREFUSED'), /did not answer \(migrate unreachable: ECONNREFUSED\)/],
     ['A26b unusable', http(500, { success: false, error: 'boom' }), /answer the manager cannot use \(HTTP 500: boom\)/],
-    ['A27 can\'t confirm', http(500, { success: false, error: "can't confirm which store holds the data: the marker is unreadable" }), /can't confirm which store holds its data/],
+    ['A27 can\'t confirm', refusal("can't confirm which store holds the data: /data/.backend.json does not name file or postgres", 200), /can't confirm which store holds its data/],
     ['A28 another direction running', getJob({ jobId: 'mgr-x', to: 'file', state: 'running' }), /running migration mgr-x to JSON files, so a migration to Postgres was refused/],
     ['A33 token refused', http(401, { success: false, error: 'bad token' }), /refused the manager's token \(HTTP 401: bad token\)/],
   ];

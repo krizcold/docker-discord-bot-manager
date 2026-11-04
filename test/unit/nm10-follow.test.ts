@@ -10,7 +10,7 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { laneDone, resumeMigrations, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { fastTiming, getJob, http, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, FLEET_DB, MG_DONE_OPEN, MG_DONE_UNSURE, MG_FENCE_WAIT, MG_NOT_AGAIN, MG_P_FENCE, MG_P_OPEN, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_SHARERS_UNSURE } from './migrate-fake';
+import { fastTiming, getJob, http, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, UNREADABLE, FLEET_DB, MG_DONE_OPEN, MG_DONE_UNSURE, MG_FENCE_WAIT, MG_NOT_AGAIN, MG_P_FENCE, MG_P_OPEN, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_SHARERS_UNSURE } from './migrate-fake';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 
@@ -90,9 +90,19 @@ describe('D: following the job', () => {
       expect(last()).toMatchObject({ outcome: 'done', jobId: m.bot.posts[0].jobId });
     } else {
       expect(rec()).toMatchObject({ phase: 'waiting', resumeAt: 'posting' });
-      expect(rec().text).toMatch(/the bot can't confirm which store holds the data, and its boot refuses until that is settled/);
+      expect(rec().text).toMatch(clause);
+      expect(rec().text.endsWith('(cut). The bot stays in Maintenance; the manager asked five times and does not ask again; press Migrate to go on.')).toBe(true);
       expect(m.env.b1.DATA_BACKEND).toBe('file');
     }
+  });
+  it('T-F6 a move to JSON files cut at retire-source with the bot\'s own error; fact 4: MG-KEPT with the can\'t-confirm clause', async () => {
+    m.bot.journal.push({ jobId: 'mgr-a', to: 'file', state: 'running', stage: 'copying', fact: 4 });
+    m.bot.script = [{ state: 'interrupted', stage: 'retire-source', error: "can't confirm whether the old store was renamed aside" }];
+    await follow([], { kept: 4 }, 'file', 'resume');
+    expect(m.bot.posts).toHaveLength(1);
+    expect(rec()).toMatchObject({ phase: 'waiting', resumeAt: 'posting' });
+    expect(rec().text).toBe(`Migration ${m.bot.posts[0].jobId} is not finished: the manager can't confirm whether the old database store was renamed aside, and until the migration finishes the bot refuses to boot on either store (can't confirm whether the old store was renamed aside). The bot stays in Maintenance; the manager asked five times and does not ask again; press Migrate to go on.`);
+    expect(m.env.b1.DATA_BACKEND).toBe('postgres');
   });
   it('D8 another jobId done, same `to`: G with that jobId', async () => {
     await follow([getJob({ jobId: 'mgr-b', to: 'postgres', state: 'done', stage: 'switching', destination: DEST })]);
@@ -124,9 +134,9 @@ describe('D: following the job', () => {
     await follow([getJob(null)], { kept: 5 }, 'postgres', 'resume');
     expect(rec().text).toBe("The manager can't confirm the outcome of migration mgr-a: the bot reports no migration. The bot stays in Maintenance; press Migrate to ask again.");
   });
-  it('D12 the can\'t-confirm answer keeps (E3), and the capital-C phrase reads the same (R3-B1)', async () => {
-    const cc = http(500, { success: false, error: "Can't confirm which store holds the data: the journal is unreadable" });
-    await follow([cc, ...Array(6).fill(cc)], { kept: 4 });
+  it('D12 the can\'t-confirm answer keeps (E3)', async () => {
+    m.bot.unreadable = UNREADABLE;
+    await follow([], { kept: 4 });
     expect(rec().text).toMatch(/the bot can't confirm which store holds the data, and its boot refuses until that is settled/);
   });
   it('D13 to D15 an unusable answer (500, a refusal without the phrase): MG-UNUSABLE with the last status and error (R4-B2)', async () => {

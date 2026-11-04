@@ -421,12 +421,13 @@ describe('M7: the POST', () => {
     expect(texts()).toContain(P_SESSION(id, 0));
     expect(last()).toMatchObject({ outcome: 'done' });
   });
-  it('an interrupted job started three times already: MG-SPENT, with no POST again', async () => {
-    seedAt('posting', 'postgres', { started: 3 });
-    m.bot.postQueue.push(postJob({ jobId: 'mgr-a', to: 'postgres', state: 'interrupted', stage: 'checking' }));
+  it('a POST answering a job interrupted past the switch after three starts: MG-KEPT with the cap clause, no POST again', async () => {
+    seedAt('posting', 'file', { started: 3 });
+    m.bot.postQueue.push(postJob({ jobId: 'mgr-a', to: 'file', state: 'interrupted', stage: 'switching', error: 'The marker could not be switched: EACCES: permission denied' }));
     await resume();
     expect(m.bot.posts).toHaveLength(1);
-    expect(last().text.startsWith(SPENT('mgr-a', 'checking', 'the bot gave no error', 'its JSON files'))).toBe(true);
+    expect(m.bots.b1.migrate).toMatchObject({ phase: 'waiting', resumeAt: 'posting' });
+    expect(m.bots.b1.migrate.text).toBe('Migration mgr-a is not finished: the old database store is renamed aside and the switch to JSON files is not written, so until the migration finishes the bot refuses to boot on either store (The marker could not be switched: EACCES: permission denied). The bot stays in Maintenance; the manager has started it three times and does not ask again; press Migrate to go on.');
   });
 });
 

@@ -10,7 +10,9 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { identityOf, laneDone, runMigration, setMigrateListener, MIGRATE_TEXT as T, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { fastTiming, m, refusal, resetMigrate, seedBot, COMPANION_URL } from './migrate-fake';
+import { fastTiming, m, resetMigrate, seedBot, COMPANION_URL } from './migrate-fake';
+
+const RS2 = "The bot process is still starting; can't confirm whether it boots in maintenance; try again once it has started";
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 afterEach(() => { setMigrateListener(null); vi.restoreAllMocks(); });
@@ -47,10 +49,10 @@ describe('the lane (L5 k)', () => {
     seedBot();
     let clock = 1_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => clock);
-    const still = () => refusal('The bot process is still starting');
-    m.bot.postQueue.push(() => { clock += MIGRATE_TIMING.readyMs; return still(); }, () => { clock += 1; return still(); }, () => { clock += 1; return still(); });
+    m.bot.checks.push(() => { clock += MIGRATE_TIMING.readyMs; return RS2; }, () => RS2, () => RS2);
     await press('postgres');
     expect(m.bot.posts.length).toBe(1);
+    expect(m.bots.b1.migrateLast.text).toBe(T.refused(RS2, 'its JSON files'));
   });
 
   it('a Data Backend read back as postgres after a move to JSON files parks the finish', async () => {

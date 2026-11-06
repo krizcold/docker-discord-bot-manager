@@ -9,7 +9,7 @@ const tmp = vi.hoisted(() => {
   const dir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), 'nm5-addresses-'));
   process.env.DATA_DIR = dir;
   process.env.DATA_ROOT = nodePath.join(dir, 'DATA');
-  return { dir, env: {} as Record<string, string>, recreates: 0 };
+  return { dir, env: {} as Record<string, string>, recreates: 0, corrupt: false };
 });
 
 vi.mock('child_process', async (o) => (await import('./switch-harness')).childProcessMock(await o()));
@@ -32,13 +32,13 @@ vi.mock('../../src/docker/containerManager', async (o) => {
 vi.mock('../../src/env/manager', async (o) => ({
   ...(await o<typeof import('../../src/env/manager')>()),
   getEnvVars: () => ({ ...tmp.env }),
-  getEnvVarsWithStatus: () => ({ vars: { ...tmp.env }, corrupt: false, undecryptable: [] }),
+  getEnvVarsWithStatus: () => ({ vars: { ...tmp.env }, corrupt: tmp.corrupt, undecryptable: [] }),
   setEnvVars: (_id: string, vars: Record<string, string>) => { Object.assign(tmp.env, vars); },
 }));
 
 import * as crypto from 'crypto';
 import * as fs from 'fs';
-import { sendAddresses, writeEnvList } from '../../src/instance/fleetJoin';
+import { addressesLogText, addressesText, sendAddresses, writeEnvList } from '../../src/instance/fleetJoin';
 import { resetSwitchState, switchTick, switchView } from '../../src/instance/fleetSwitch';
 import * as containerManager from '../../src/docker/containerManager';
 import { fakeJoinRecord, h, resetHarness, stored, writeRegistry } from './switch-harness';
@@ -52,6 +52,7 @@ beforeEach(() => {
   resetSwitchState();
   tmp.env = { DATABASE_URL: URL1 };
   tmp.recreates = 0;
+  tmp.corrupt = false;
   writeRegistry({ c: { fleetJoin: fakeJoinRecord() } });
   now += 10 * 60_000;
 });
@@ -93,8 +94,44 @@ describe('A1 to A8, A10: one offer and what it records', () => {
     expect(stored('c').addressesPush).toMatchObject({ digest: digest(URL1), state: 'pending', error: r.error });
     expect(switchView(stored('c')).lines).toContain(`The manager can't confirm that the running bot took its new database list (${r.error}); it sends the list again every minute until the bot answers.`);
   });
-  it.each([404, 409])('A7: a %i is unsupported and not repeated', async status => {
-    answer({ ok: false, status, error: 'x' });
+  const FILES = 'This bot keeps its data in files, so it has no main database';
+  it.each([
+    ['Postgres', 'postgres', false, true],
+    ['files', 'json', false, false],
+    ['unreadable', 'postgres', true, null],
+  ] as const)('A7: a 409 with the stored mode %s is files, not recorded and not repeated', async (_n, mode, corrupt, next) => {
+    h.capsMode = { key: 'DATA_BACKEND', value: 'postgres' };
+    tmp.env.DATA_BACKEND = mode;
+    tmp.corrupt = corrupt;
+    answer({ ok: false, status: 409, error: FILES });
+    expect(await sendAddresses('c')).toEqual({ state: 'files', error: FILES, next });
+    expect(stored('c').addressesPush).toBeUndefined();
+    expect(switchView(stored('c')).lines.filter(l => l.includes('database list'))).toEqual([]);
+    await switchTick(now);
+    expect(calls()).toHaveLength(1);
+  });
+  it('A7: an older pending record is cleared by a 409, and the tick sends nothing', async () => {
+    answer({ ok: false, status: 502, unknown: true, error: 'x' });
+    await sendAddresses('c');
+    expect(stored('c').addressesPush).toMatchObject({ state: 'pending' });
+    answer({ ok: false, status: 409, error: FILES });
+    expect(await sendAddresses('c')).toMatchObject({ state: 'files' });
+    expect(stored('c').addressesPush).toBeUndefined();
+    await switchTick(now);
+    expect(calls()).toHaveLength(2);
+  });
+  it.each([
+    [true, ` The running bot keeps its data in files, so it uses the new database list from its next start (Apply on the card, or Restart).`],
+    [false, ` The bot keeps its data in files, and its settings keep it on files, so it does not use the new database list.`],
+    [null, ` The running bot keeps its data in files, and the manager can't read the bot's settings, so it can't confirm whether the bot's next start uses the new database list.`],
+  ] as const)('A7: the files text with next %s', (next, want) => {
+    expect(addressesText({ state: 'files', error: 'e1', next })).toBe(want);
+  });
+  it('A7: the files log text', () => {
+    expect(addressesLogText({ state: 'files', error: 'e1', next: null })).toBe('keeps its data in files and did not take the new database list');
+  });
+  it('A7: a 404 is unsupported and not repeated', async () => {
+    answer({ ok: false, status: 404, error: 'x' });
     expect(await sendAddresses('c')).toEqual({ state: 'unsupported' });
     expect(stored('c').addressesPush).toMatchObject({ state: 'unsupported' });
     await switchTick(now);

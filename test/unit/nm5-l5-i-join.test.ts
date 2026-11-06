@@ -8,7 +8,7 @@ const h = vi.hoisted(() => {
   const dir = nodeFs.mkdtempSync(nodePath.join(os.tmpdir(), 'nm5-l5-i-join-'));
   process.env.DATA_DIR = dir;
   process.env.DATA_ROOT = nodePath.join(dir, 'DATA');
-  return { dir, app: false as boolean | null };
+  return { dir, app: false as boolean | null, hook: null as Record<string, unknown> | null, place: undefined as 'json' | 'outside' | null | undefined };
 });
 
 vi.mock('child_process', async (o) => (await import('./join-fake')).childProcessMock(await o<typeof import('child_process')>()));
@@ -19,8 +19,12 @@ vi.mock('../../src/casaos/detector', async (o) => ({
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 vi.mock('../../src/instance/appHookClient', async (o) => ({
   ...(await o<typeof import('../../src/instance/appHookClient')>()),
-  callAppHook: async () => ({ ok: true, status: 200, body: { success: true, applied: true } }),
+  callAppHook: async () => h.hook ?? ({ ok: true, status: 200, body: { success: true, applied: true } }),
 }));
+vi.mock('../../src/instance/dataPlace', async (o) => {
+  const real = await o<typeof import('../../src/instance/dataPlace')>();
+  return { ...real, dataPlace: (i: any) => (h.place === undefined ? real.dataPlace(i) : h.place) };
+});
 vi.mock('../../src/docker/containerManager', async (o) => ({
   ...(await o<typeof import('../../src/docker/containerManager')>()),
   markPendingApplyIfRunning: async () => undefined,
@@ -42,6 +46,8 @@ const bot = () => containerManager.getBot('b')!;
 beforeEach(() => {
   resetDocker();
   h.app = false;
+  h.hook = null;
+  h.place = undefined;
   certSource.fetch = async () => ({ ok: true, pem: FIXTURE_PEM, fp: FIXTURE_FP });
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(h.dir, 'bots', 'b', 'env'), { recursive: true });
@@ -61,6 +67,23 @@ describe('joinFleet', () => {
     expect(await joinFleet(bot(), fakeJoinCode())).toEqual({
       success: true, addressCount: 1,
       message: 'Joined the main at main.invalid:15432. The bot uses the 1 database address(es) now. The running bot took the new database list.',
+    });
+  });
+  it.each([
+    ['json', ' The bot keeps its data in files, and its settings keep it on files, so it does not use the new database list.'],
+    [null, " The running bot keeps its data in files, and the manager can't read the bot's settings, so it can't confirm whether the bot's next start uses the new database list."],
+  ] as const)('the running bot answers 409 and the stored mode reads %s: the reply has only the join line and the files text', async (place, tail) => {
+    h.app = true;
+    h.hook = { ok: false, status: 409, error: 'e1' };
+    h.place = place;
+    expect(await joinFleet(bot(), fakeJoinCode())).toEqual({ success: true, addressCount: 1, message: 'Joined the main at main.invalid:15432.' + tail });
+  });
+  it('the running bot answers 409 and the stored mode is Postgres: the reply keeps the next start lead', async () => {
+    h.app = true;
+    h.hook = { ok: false, status: 409, error: 'e1' };
+    expect(await joinFleet(bot(), fakeJoinCode())).toEqual({
+      success: true, addressCount: 1,
+      message: NEXT + ' The running bot keeps its data in files, so it uses the new database list from its next start (Apply on the card, or Restart).',
     });
   });
   it('inside a lock the caller holds, the join runs', async () => {

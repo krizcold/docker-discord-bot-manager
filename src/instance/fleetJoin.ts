@@ -15,6 +15,7 @@ import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
 import { getBotDir } from '../git/repoManager';
 import { findAppCapabilities } from '../config/appCapabilities';
+import { dataPlace } from './dataPlace';
 import { callAppHook } from './appHookClient';
 import { redactSecrets } from '../config/secretText';
 import {
@@ -461,6 +462,7 @@ export type AddressesOutcome =
   | { state: 'not-running' }
   | { state: 'applied'; note?: string }
   | { state: 'refused'; error: string }
+  | { state: 'files'; error: string; next: boolean | null }
   | { state: 'unsupported' }
   | { state: 'pending'; error: string };
 
@@ -471,7 +473,8 @@ export function addressesState(r: { ok: boolean; status?: number; unknown?: bool
     return typeof note === 'string' && note ? { state: 'applied', note } : { state: 'applied' };
   }
   if (r.status === 400) return { state: 'refused', error: r.error || 'no reason given' };
-  if (r.status === 404 || r.status === 409) return { state: 'unsupported' };
+  if (r.status === 409) return { state: 'files', error: r.error || 'no reason given', next: null };
+  if (r.status === 404) return { state: 'unsupported' };
   return { state: 'pending', error: r.error || 'no reason given' };
 }
 
@@ -480,6 +483,11 @@ export function addressesText(o: AddressesOutcome | undefined): string {
   if (!o || o.state === 'not-running') return '';
   if (o.state === 'applied') return o.note ? ` The bot took the new database list (${o.note}).` : ' The running bot took the new database list.';
   if (o.state === 'refused') return ` The bot refused the new database list (${o.error}), so it uses the list only from its next start (Apply on the card, or Restart).`;
+  if (o.state === 'files') {
+    if (o.next === true) return ' The running bot keeps its data in files, so it uses the new database list from its next start (Apply on the card, or Restart).';
+    if (o.next === false) return ' The bot keeps its data in files, and its settings keep it on files, so it does not use the new database list.';
+    return ` The running bot keeps its data in files, and the manager can't read the bot's settings, so it can't confirm whether the bot's next start uses the new database list.`;
+  }
   if (o.state === 'unsupported') return " This bot's build does not take a new database list while it runs, so it uses the list from its next start (Apply on the card, or Restart).";
   return ` The manager can't confirm that the running bot took the new database list (${o.error}); it sends the list again every minute until the bot answers.`;
 }
@@ -512,7 +520,11 @@ export async function sendAddresses(botId: string): Promise<AddressesOutcome> {
   if (!instance || !key) return { state: 'not-running' };
   if (await containerManager.appContainerRunning(botId) !== true) return { state: 'not-running' };
   const value = (envManager.getEnvVars(botId)[key] || '').trim();
-  const outcome = addressesState(await callAppHook(instance, 'addresses', 'POST', { url: value }, ADDRESSES_HOOK_MS));
+  let outcome = addressesState(await callAppHook(instance, 'addresses', 'POST', { url: value }, ADDRESSES_HOOK_MS));
+  if (outcome.state === 'files') {
+    const place = dataPlace(containerManager.getBot(botId) ?? instance);
+    outcome = { ...outcome, next: place === 'outside' ? true : place === 'json' ? false : null };
+  }
   recordOffer(containerManager.getBot(botId) ?? instance, listDigest(value), outcome);
   return outcome;
 }
@@ -521,6 +533,7 @@ export async function sendAddresses(botId: string): Promise<AddressesOutcome> {
 export function addressesLogText(o: AddressesOutcome): string {
   if (o.state === 'applied') return 'took the new database list';
   if (o.state === 'refused') return `refused the new database list (${o.error})`;
+  if (o.state === 'files') return 'keeps its data in files and did not take the new database list';
   if (o.state === 'unsupported') return 'has no hook for a new database list';
   return o.state === 'pending' ? `did not confirm the new database list (${o.error}); the manager sends it again every minute` : 'is not running';
 }
@@ -691,7 +704,10 @@ async function joinRun(instance: InstanceConfig, code: JoinCode, text: string, o
   } catch (err) {
     return { success: false, error: `The join code is saved, but the Database URL could not be written (${errorText(err)}). The manager writes it again within 5 minutes; press Join again to try now.` };
   }
-  let message = written.addresses?.state === 'applied'
+  const filesOnly = written.addresses?.state === 'files' && written.addresses.next !== true;
+  let message = filesOnly
+    ? `Joined the main at ${code.host}:${code.port}.${addressesText(written.addresses)}`
+    : written.addresses?.state === 'applied'
     ? `Joined the main at ${code.host}:${code.port}. The bot uses the ${count} database address(es) now.${addressesText(written.addresses)}`
     : `Joined the main at ${code.host}:${code.port}. The bot uses the ${count} database address(es) from its next start (Apply on the card, or Restart).${addressesText(written.addresses)}`;
   if (rec && (rec.primaryHost !== code.host || rec.primaryPort !== code.port)) {

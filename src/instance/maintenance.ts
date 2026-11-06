@@ -10,6 +10,7 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import { readDatabaseUrl } from '../config/databaseUrl';
 import { callAppHook, AppHookResult } from './appHookClient';
 import * as dbLogin from './dbLogin';
+import { postgresBackend } from './dataPlace';
 import * as fleetBackup from './fleetBackup';
 import { fenceOwnerLane, fenceOwnerText } from './fleetBackupGuards';
 import { hasSwitchMark, switchStateRefusal } from './switchSql';
@@ -99,13 +100,6 @@ export function maintenanceOf(inst: InstanceConfig): MaintenanceRecord {
 
 function hasHooks(inst: InstanceConfig): boolean {
   return !!findAppCapabilities(inst.sourceUrl)?.hooks;
-}
-
-export function postgresBackend(inst: InstanceConfig, env: Record<string, string>): boolean {
-  const companion = findAppCapabilities(inst.sourceUrl)?.companionDb;
-  if (!companion) return false;
-  const mode = companion.env.mode;
-  return mode ? (env[mode.key] || '').trim().toLowerCase() === mode.value : true;
 }
 
 /** ensureFleetDataBackend's managed test, without its side effects. */

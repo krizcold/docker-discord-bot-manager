@@ -230,7 +230,7 @@ describe('addressesState (D31)', () => {
     [{ ok: true, status: 200, body: { success: true, applied: true, note: 'n' } }, { state: 'applied', note: 'n' }],
     [{ ok: false, status: 400, error: 'bad' }, { state: 'refused', error: 'bad' }],
     [{ ok: false, status: 404, error: 'x' }, { state: 'unsupported' }],
-    [{ ok: false, status: 409, error: 'x' }, { state: 'unsupported' }],
+    [{ ok: false, status: 409, error: 'files' }, { state: 'files', error: 'files', next: null }],
     [{ ok: false, status: 502, unknown: true, error: 'u' }, { state: 'pending', error: 'u' }],
     [{ ok: false, unknown: true, error: 't' }, { state: 'pending', error: 't' }],
     [{ ok: false, error: 'unreachable' }, { state: 'pending', error: 'unreachable' }],

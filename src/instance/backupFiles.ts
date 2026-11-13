@@ -216,6 +216,40 @@ export function compareCounts(recorded: Record<string, number>, restored: Record
   return { ok: false, text: `${diffs.length} table(s) differ from the counts recorded when the backup was taken: ${diffs.slice(0, 5).join('; ')}${more}` };
 }
 
+const IDENT = '("(?:[^"]|"")+"|[^."]+)';
+const QUALIFIED_RE = new RegExp(`^${IDENT}\\.${IDENT}$`);
+const unquote = (ident: string) => (ident.startsWith('"') ? ident.slice(1, -1).replace(/""/g, '"') : ident);
+
+/** A counts file's table name, `schema.table` with either part quoted as format('%I') quotes it; null for anything else. */
+export function parseQualifiedName(name: string): { schema: string; table: string } | null {
+  const m = QUALIFIED_RE.exec(name);
+  return m ? { schema: unquote(m[1]), table: unquote(m[2]) } : null;
+}
+
+/**
+ * Each table of a counts file that a dump's table of contents (`pg_restore -l`) does not hold: no TABLE entry, or rows
+ * recorded and no TABLE DATA entry. pg_restore prints a line break in a name as a space.
+ */
+export function metaTocGaps(counts: Record<string, number>, toc: string): string[] {
+  const entries: string[] = [];
+  for (const raw of toc.split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    const head = /^\d+; \d+ \d+ /.exec(line);
+    if (head) entries.push(line.slice(head[0].length));
+  }
+  const holds = (prefix: string) => entries.some(e => e === prefix || e.startsWith(`${prefix} `));
+  const gaps: string[] = [];
+  for (const name of Object.keys(counts).sort()) {
+    const parsed = parseQualifiedName(name);
+    if (!parsed) { gaps.push(`${name}: not a schema and table name`); continue; }
+    const s = parsed.schema.replace(/[\r\n]/g, ' ');
+    const t = parsed.table.replace(/[\r\n]/g, ' ');
+    if (!holds(`TABLE ${s} ${t}`)) gaps.push(`${name}: no table in the dump`);
+    else if (counts[name] > 0 && !holds(`TABLE DATA ${s} ${t}`)) gaps.push(`${name}: ${counts[name]} row(s) recorded, no data in the dump`);
+  }
+  return gaps;
+}
+
 const isCount = (n: unknown): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0;
 
 /** Every reader of a counts file goes through this. */

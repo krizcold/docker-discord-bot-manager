@@ -33,6 +33,7 @@ import * as path from 'path';
 import { COUNTS_SQL, backupDir, compareCounts, parseCountLines } from '../../src/instance/backupFiles';
 import * as dbLogin from '../../src/instance/dbLogin';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import { writeDumpMeta } from './restore-fake';
 
 const fb = fleetBackup as any;
 
@@ -72,6 +73,8 @@ const countsOf = (db: string) => {
   if (!parsed.ok) throw new Error(parsed.error);
   return parsed.counts;
 };
+// The restore compares smdb_data before it writes its own smdb_manager rows (the generation row and its tables).
+const dataOnly = (counts: Record<string, number>) => Object.fromEntries(Object.entries(counts).filter(([k]) => k.startsWith('smdb_data.')));
 
 const V2 = `CREATE SCHEMA smdb_data AUTHORIZATION ${USER};
 CREATE TABLE smdb_data.meta (key text PRIMARY KEY, value text);
@@ -188,7 +191,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM4 the claim floo
     expect(ok('SHOW default_transaction_read_only')).toBe('off');
     expect(run(['exec', NAME, 'grep', '-c', 'smdb-write-fence', '/var/lib/postgresql/data/pg_hba.conf']).out).toBe('0');
     expect(ok(`SELECT rolcanlogin FROM pg_roles WHERE rolname = '${USER}'`)).toBe('f');
-    expect(compareCounts(meta.counts, countsOf('pg5')).ok).toBe(true);
+    expect(compareCounts(dataOnly(meta.counts), dataOnly(countsOf('pg5')))).toEqual({ ok: true, text: '' });
   }, 300000);
 
   it('PG6 a live database on the term schema refuses with T6 and changes nothing', async () => {
@@ -200,6 +203,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM4 the claim floo
     fs.mkdirSync(backupDir(id), { recursive: true });
     expect(run(['exec', NAME, 'pg_dump', '-U', ADMIN, '-Fc', '-f', '/tmp/pg6src.dump', 'pg6src']).status).toBe(0);
     expect(run(['cp', `${NAME}:/tmp/pg6src.dump`, path.join(backupDir(id), 'v2.dump')]).status).toBe(0);
+    writeDumpMeta(backupDir(id), 'v2.dump', countsOf('pg6src'));
     const oid = ok("SELECT oid FROM pg_database WHERE datname = 'pg6'");
     const before = countsOf('pg6');
     const r = await fleetBackup.restoreFleetBackup(id, 'v2.dump');

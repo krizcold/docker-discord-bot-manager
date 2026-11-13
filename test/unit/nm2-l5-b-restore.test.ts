@@ -145,7 +145,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import * as fs from 'fs';
-import { MAINTAINED } from './restore-fake';
+import { MAINTAINED, writeDumpMeta } from './restore-fake';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -167,6 +167,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: {
     a: { id: 'a', displayName: 'a', status: 'stopped', sourceUrl: 'https://example.invalid/fake/app', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } },
     w: { id: 'w', sanitizedName: 'bot-w', displayName: 'w', status: 'running', sourceUrl: 'https://example.invalid/fake/app' },

@@ -106,7 +106,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import * as fs from 'fs';
-import { MAINTAINED, OFF, claimDb, resetClaimDb } from './restore-fake';
+import { MAINTAINED, OFF, claimDb, resetClaimDb, writeDumpMeta } from './restore-fake';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -138,6 +138,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fleetBackup.clearClaimFloor('a');
   writeRegistry();
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });

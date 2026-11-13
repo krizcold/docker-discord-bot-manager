@@ -147,7 +147,7 @@ import * as fleetBackup from '../../src/instance/fleetBackup';
 import { reseedStalePrimary } from '../../src/instance/fleetReplica';
 import { certSource } from '../../src/instance/fleetJoin';
 import { codeFor, fixtureCert } from './join-fake';
-import { MAINTAINED } from './restore-fake';
+import { MAINTAINED, writeDumpMeta } from './restore-fake';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
@@ -170,6 +170,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, OLD), 'dump');
+  writeDumpMeta(DIR, OLD);
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
   writeReg({ instances: { a: { id: 'a', sanitizedName: 'a', displayName: 'a', ...MAINTAINED, sourceUrl: 'https://example.invalid/fake/app', fleetDb: primary, fleetBackup: { enabled: false, hour: 4, keep: 7 } } } });
 });

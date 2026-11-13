@@ -154,7 +154,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import * as fs from 'fs';
-import { MAINTAINED } from './restore-fake';
+import { MAINTAINED, writeDumpMeta } from './restore-fake';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import * as fleetBackup from '../../src/instance/fleetBackup';
@@ -193,6 +193,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: bot() } }, null, 2));
   fs.mkdirSync(path.join(tmp.dir, 'bots', 'a'), { recursive: true });
 });

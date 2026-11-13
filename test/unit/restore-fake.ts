@@ -2,7 +2,10 @@
 // fake docker CLIs written before the restore read the bot's login, its claim numbers and the dump's table of contents.
 // withRestoreFakes wraps an execFile fake and withTocFake a spawn fake; every other call passes to the wrapped fake.
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 import { PassThrough } from 'stream';
+import { DumpMeta, parseDumpName } from '../../src/instance/backupFiles';
 
 type Cb = (err: Error | null, stdout: string, stderr: string) => void;
 type ExecFileFake = (cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => unknown;
@@ -24,7 +27,17 @@ export interface ClaimDb {
   /** The no-floor cap statement's answer. */
   cap: string;
   toc: TocShape;
-  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'cap' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear';
+  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'cap' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear' | 'counts';
+  /** The counts the restored database answers (null: the counts file of the dump the TOC read was fed). */
+  restoredCounts: Record<string, number> | null;
+  /** When set, the count answers this as its stdout. */
+  countRaw: string | null;
+  countReads: number;
+  onCount: (() => void) | null;
+  /** When set, the TOC read prints this in place of TOC[toc]. */
+  tocText: string | null;
+  /** The file the last TOC read was fed. */
+  tocPath: string | null;
   /** The receive mark removals (D62, S23), each its argv joined. */
   markClears: string[];
   /** OWN_COPIES_READ_SQL's answer before the drop of a moved- restore (D49). */
@@ -63,6 +76,7 @@ export function freshClaimDb(): ClaimDb {
     login: 'false|false|0', tables: 't|t|t|f|f', floor: '7', raise: 'seq|8\nguild|g1\nguild|g2\n', restoredTables: 't|t|t|f|f', cap: 'clock|1000\nrows|2\ncapped|2\n', toc: 'claims',
     fail: null, failText: null, tocCode: 1, dropSeen: false, recreateArgs: null, raiseSql: [], capSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null, onDrop: null,
     generation: null, restoredGeneration: null, restoreState: null, genWrites: [], genEvents: [], ownCopies: '[]', markClears: [],
+    restoredCounts: null, countRaw: null, countReads: 0, onCount: null, tocText: null, tocPath: null,
   };
 }
 
@@ -96,6 +110,65 @@ export const TOC: Record<TocShape, string> = {
   shardsNoClock: `${TOC_CLAIMS}218; 1259 16410 TABLE smdb_data shard_claims app\n3362; 0 16410 TABLE DATA smdb_data shard_claims app\n`,
   clockOnly: `${TOC_CLAIMS}219; 1259 16420 TABLE smdb_data claim_clock app\n3363; 0 16420 TABLE DATA smdb_data claim_clock app\n`,
 };
+
+const CLAIM_COUNTS = { 'smdb_data.guild_ownership': 2, 'smdb_data.meta': 1 };
+
+/** The counts COUNTS_SQL prints for a database each TOC fixture was dumped from. */
+export const COUNTS_OF: Record<TocShape, Record<string, number>> = {
+  claims: CLAIM_COUNTS,
+  terms: CLAIM_COUNTS,
+  none: { 'public.t': 3 },
+  empty: {},
+  emptyNeg: {},
+  shards: { ...CLAIM_COUNTS, 'smdb_data.shard_claims': 1, 'smdb_data.claim_clock': 1 },
+  shardsNoClock: { ...CLAIM_COUNTS, 'smdb_data.shard_claims': 1 },
+  clockOnly: { ...CLAIM_COUNTS, 'smdb_data.claim_clock': 1 },
+};
+
+const META_TAKEN_AT = Date.parse('2026-11-12T10:00:00.000Z');
+
+/** The counts file <file>.json as the dump writes it beside the dump. */
+export function writeDumpMeta(dir: string, file: string, counts: Record<string, number> = COUNTS_OF[claimDb.toc], over: Partial<DumpMeta> = {}): void {
+  const parsed = parseDumpName(file);
+  const values = Object.values(counts);
+  const meta: DumpMeta = {
+    file, takenAt: META_TAKEN_AT, family: parsed.family, kind: parsed.kind, inRecovery: false, dataAt: META_TAKEN_AT, dbBytes: 1000,
+    tables: values.length, rows: values.reduce((a, b) => a + b, 0), counts, ...over,
+  };
+  fs.writeFileSync(path.join(dir, `${file}.json`), JSON.stringify(meta));
+}
+
+/** The counts the restored database answers: restoredCounts, else the counts file of the dump read, else the TOC's. */
+function restoredCountsNow(): Record<string, number> {
+  if (claimDb.restoredCounts) return claimDb.restoredCounts;
+  if (claimDb.tocPath) {
+    try {
+      const counts = JSON.parse(fs.readFileSync(`${claimDb.tocPath}.json`, 'utf-8')).counts;
+      if (counts && typeof counts === 'object') return counts;
+    } catch { /* no counts file: an uploaded dump */ }
+  }
+  return COUNTS_OF[claimDb.toc];
+}
+
+const COUNT_MARK = 'SELECT count(*) AS c FROM';
+
+function answerCount(cb: Cb): unknown {
+  claimDb.countReads++;
+  claimDb.onCount?.();
+  if (claimDb.fail === 'counts') return cb(Object.assign(new Error('connection reset by peer'), { code: 1 }), '', claimDb.failText ?? 'ERROR:  connection reset by peer');
+  if (claimDb.countRaw !== null) return cb(null, claimDb.countRaw, '');
+  const counts = restoredCountsNow();
+  return cb(null, Object.keys(counts).sort().map(name => `count|${name}|${counts[name]}\n`).join(''), '');
+}
+
+/** Only the restore's count of the restored tables, for an execFile fake that answers the rest of the lane itself. */
+export function withCountFake<F extends ExecFileFake>(fake: F): F {
+  return ((cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => {
+    const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as Cb;
+    if (cmd === 'docker' && args[0] === 'exec' && args.join(' ').includes(COUNT_MARK)) return answerCount(cb);
+    return fake(cmd, args, optsOrCb, maybeCb);
+  }) as F;
+}
 
 export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
   return ((cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => {
@@ -163,6 +236,7 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         claimDb.raiseSql.push(sql);
         return claimDb.fail === 'raise' ? fail('permission denied for sequence claim_seq') : cb(null, claimDb.raise, '');
       }
+      if (sql.includes(COUNT_MARK) && claimDb.dropSeen) return answerCount(cb);
     }
     return fake(cmd, args, optsOrCb, maybeCb);
   }) as F;
@@ -178,10 +252,11 @@ function tocChild(): any {
   child.stderr = new PassThrough();
   child.stdin = new PassThrough();
   child.stdin.on('data', (d: Buffer) => { claimDb.tocInput += d.length; });
+  child.stdin.on('pipe', (src: { path?: unknown }) => { claimDb.tocPath = typeof src.path === 'string' ? src.path : null; });
   child.kill = () => true;
   const failing = claimDb.fail === 'toc';
   setTimeout(() => {
-    child.stdout.end(failing ? '' : TOC[claimDb.toc]);
+    child.stdout.end(failing ? '' : claimDb.tocText ?? TOC[claimDb.toc]);
     child.stderr.end(failing ? 'pg_restore: error: input file does not appear to be a valid archive' : '');
     setTimeout(() => child.emit('close', failing ? claimDb.tocCode : 0), 2);
   }, 2);

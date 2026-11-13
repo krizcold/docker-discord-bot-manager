@@ -26,7 +26,7 @@ vi.mock('child_process', async (importOriginal) => {
     else setImmediate(() => done(Object.assign(new Error('docker failed'), { code: 1 }), '', answer?.stderr ?? 'refused'));
     return { stdin: null };
   };
-  const fenced = (await import('./fence-fake')).withFence(refuse as any);
+  const fenced = (await import('./fence-fake')).withFence((await import('./restore-fake')).withCountFake(refuse as any));
   const execFile = (_f: string, args: string[], opts: any, cb?: any) => {
     h.calls.push(args);
     if (h.answer) return (h.raw ? refuse : fenced)(_f, args, opts, cb);
@@ -110,7 +110,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import { FENCE_SETTINGS, fenceOwners } from './fence-fake';
-import { MAINTAINED, TOC } from './restore-fake';
+import { MAINTAINED, TOC, writeDumpMeta } from './restore-fake';
 import * as containerManager from '../../src/docker/containerManager';
 
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
@@ -295,6 +295,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     const dir = path.join(h.dir, 'backups', 'b1', 'fleet-postgres');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'old.dump'), 'dump');
+    writeDumpMeta(dir, 'old.dump');
     writeInstance({ status: 'running', ...MAINTAINED, fleetDb: db, fleetBackup: { enabled: false, hour: 4, keep: 7 } });
     h.env = { DATABASE_URL: `postgres://smdb:pw@${C}:5432/smdb` };
     h.answer = args => {

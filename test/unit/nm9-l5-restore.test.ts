@@ -125,7 +125,7 @@ import * as path from 'path';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import { fenceOwners } from './fence-fake';
-import { claimDb, resetClaimDb, MAINTAINED } from './restore-fake';
+import { claimDb, resetClaimDb, MAINTAINED, writeDumpMeta } from './restore-fake';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
@@ -151,6 +151,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   writeRegistry();

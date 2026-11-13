@@ -210,7 +210,7 @@ import * as fleetBackup from '../../src/instance/fleetBackup';
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as maintenance from '../../src/instance/maintenance';
 import { fenceOwners } from './fence-fake';
-import { claimDb, resetClaimDb, MAINTAINED, OFF } from './restore-fake';
+import { claimDb, resetClaimDb, MAINTAINED, OFF, writeDumpMeta } from './restore-fake';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
 const OPS = path.join(tmp.dir, 'active-ops.json');
@@ -242,6 +242,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   writeRegistry();
@@ -417,11 +418,11 @@ const ROWS: Row[] = [
     },
   },
   {
-    id: 'C34 dump without claims, floor known', setup: () => { claimDb.toc = 'none'; },
+    id: 'C34 dump without claims, floor known', setup: () => { claimDb.toc = 'none'; writeDumpMeta(DIR, 'old.dump'); },
     check: r => { afterFenceRefusal(r); expect(r.error).toBe('The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'); },
   },
   {
-    id: 'C35 dump without claims, no floor', setup: () => { claimDb.toc = 'none'; claimDb.tables = 'f|f|f|f|f'; },
+    id: 'C35 dump without claims, no floor', setup: () => { claimDb.toc = 'none'; claimDb.tables = 'f|f|f|f|f'; writeDumpMeta(DIR, 'old.dump'); },
     check: r => { expect(r.success).toBe(true); expect(pg.events).not.toContain('raise'); expect(r.steps.claimFloor).toBeNull(); expect(r.steps.guildsRaised).toBeNull(); },
   },
   {

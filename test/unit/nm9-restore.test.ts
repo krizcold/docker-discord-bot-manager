@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 const tmp = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -139,7 +139,8 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import { fenceOwners } from './fence-fake';
-import { claimDb, resetClaimDb, MAINTAINED } from './restore-fake';
+import { claimDb, resetClaimDb, MAINTAINED, writeDumpMeta, COUNTS_OF } from './restore-fake';
+import { holder, resetHolder } from './dump-fake';
 
 const fb = fleetBackup as any;
 const REGISTRY = path.join(tmp.dir, 'instances.json');
@@ -170,6 +171,7 @@ beforeEach(() => {
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
+  writeDumpMeta(DIR, 'old.dump');
   fleetBackup.clearClaimFloor('a');
   fleetBackup.dismissFleetRestoreError('a');
   writeRegistry();
@@ -276,11 +278,11 @@ const ROWS: Row[] = [
     },
   },
   {
-    id: 'A10 live v3, a dump with no claims: T5', setup: () => v3({ toc: 'none' }),
+    id: 'A10 live v3, a dump with no claims: T5', setup: () => { v3({ toc: 'none' }); writeDumpMeta(DIR, 'old.dump'); },
     check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
   {
-    id: 'A10e live v3, a dump of a database with no objects: T5', setup: () => v3({ toc: 'empty' }),
+    id: 'A10e live v3, a dump of a database with no objects: T5', setup: () => { v3({ toc: 'empty' }); writeDumpMeta(DIR, 'old.dump'); },
     check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
   { id: 'A11 live v2, a dump with the shard tables', setup: () => v3({ tables: V2 }), check: r => { succeeded(r); shardSteps(r, 2, 3); } },
@@ -438,7 +440,7 @@ const ROWS: Row[] = [
     },
   },
   {
-    id: 'A40 under pushBroken a dump with no claim numbers that pushBroken does not name: T5 with the pushed floor', setup: () => { brokenPush(); Object.assign(claimDb, { tables: V3, floor: '20', toc: 'none' }); },
+    id: 'A40 under pushBroken a dump with no claim numbers that pushBroken does not name: T5 with the pushed floor', setup: () => { brokenPush(); Object.assign(claimDb, { tables: V3, floor: '20', toc: 'none' }); writeDumpMeta(DIR, 'old.dump'); },
     check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 20, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
 ];
@@ -562,6 +564,8 @@ describe('NM9 A35 to A39, A41: a restore can be undone, and the pre-receive- dum
   };
 
   it('A35 R-UNDO: a v3 dump restored over a v2 database, then its own pre-restore dump restored over the v3 copy', async () => {
+    holder.counts = { ...COUNTS_OF.claims };
+    onTestFinished(resetHolder);
     v3({ tables: V2 });
     const r1 = await quietly(() => restore());
     succeeded(r1);
@@ -573,6 +577,8 @@ describe('NM9 A35 to A39, A41: a restore can be undone, and the pre-receive- dum
   });
 
   it('A36 R-UNDO-FENCED: the first restore ends fenced after pg_restore, then its pre-restore dump is restored', async () => {
+    holder.counts = { ...COUNTS_OF.claims };
+    onTestFinished(resetHolder);
     v3({ tables: V2, fail: 'raise' });
     const r1 = await quietly(() => restore());
     keptFenced(r1);
@@ -601,6 +607,7 @@ describe('NM9 A35 to A39, A41: a restore can be undone, and the pre-receive- dum
     fs.writeFileSync(path.join(DIR, 'pre-receive-x.dump'), 'dump');
     brokenPush();
     Object.assign(claimDb, { tables: V3, floor: '20', toc: 'none', restoredTables: NONE });
+    writeDumpMeta(DIR, 'pre-receive-x.dump');
   };
   const receiveUndone = (r: any) => {
     succeeded(r);
@@ -625,6 +632,7 @@ describe('NM9 A35 to A39, A41: a restore can be undone, and the pre-receive- dum
   it('A38e: as A38 with the pre-receive- dump of a database with no objects', async () => {
     receiveUndo();
     claimDb.toc = 'empty';
+    writeDumpMeta(DIR, 'pre-receive-x.dump');
     const r = await quietly(() => restore('pre-receive-x.dump'));
     receiveUndone(r);
     expect(floorFile()).toBeNull();
@@ -649,6 +657,7 @@ describe('NM9 A35 to A39, A41: a restore can be undone, and the pre-receive- dum
 
   it('A41: under pushBroken the pre-receive- dump with claim numbers keeps the live floor', async () => {
     fs.writeFileSync(path.join(DIR, 'pre-receive-x.dump'), 'dump');
+    writeDumpMeta(DIR, 'pre-receive-x.dump');
     brokenPush();
     Object.assign(claimDb, { tables: V3, floor: '20', toc: 'claims', restoredTables: V2, raise: 'seq|21\nguild|g1\n' });
     const r = await quietly(() => restore('pre-receive-x.dump'));

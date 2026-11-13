@@ -1772,8 +1772,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   /**
    * POST /api/bots/:id/fleet-backups/restore - Restore a dump of the whole bot into the sidecar.
    * Runs only while the bot is in Maintenance or Off; stops the other instances on the same database,
-   * takes a pre-restore safety dump (refusing the restore if it fails), pg_restores, raises the claim
-   * numbers, starts the other instances. The bot keeps its state.
+   * takes a pre-restore safety dump (refusing the restore if it fails), pg_restores, compares the restored
+   * table counts with the dump's counts file, raises the claim numbers, starts the other instances unless
+   * the counts differed. The bot keeps its state.
    */
   router.post('/:id/fleet-backups/restore', async (req: Request, res: Response) => {
     try {

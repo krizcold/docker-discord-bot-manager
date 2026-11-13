@@ -74,7 +74,7 @@ vi.mock('child_process', async (importOriginal) => {
 });
 
 import * as fs from 'fs';
-import { MAINTAINED } from './restore-fake';
+import { MAINTAINED, writeDumpMeta } from './restore-fake';
 import * as path from 'path';
 
 const REGISTRY = path.join(tmp.dir, 'instances.json');
@@ -112,8 +112,10 @@ beforeEach(() => {
   fs.mkdirSync(DIR, { recursive: true });
   const old = Date.now() / 1000 - 3600;
   fs.writeFileSync(path.join(DIR, OLD), 'dump');
+  writeDumpMeta(DIR, OLD);
   fs.utimesSync(path.join(DIR, OLD), old, old);
   fs.writeFileSync(path.join(DIR, OTHER), 'dump');
+  writeDumpMeta(DIR, OTHER);
   fs.utimesSync(path.join(DIR, OTHER), old + 60, old + 60);
   fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { a: { id: 'a', displayName: 'a', ...MAINTAINED, fleetDb: primary, fleetBackup: { enabled: true, hour: new Date().getHours() } } } }, null, 2));
 });

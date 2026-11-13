@@ -35,6 +35,7 @@ import * as path from 'path';
 import { COUNTS_SQL, backupDir, compareCounts, parseCountLines } from '../../src/instance/backupFiles';
 import * as dbLogin from '../../src/instance/dbLogin';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import { writeDumpMeta } from './restore-fake';
 import { addressTableSql } from '../../src/instance/fleetReplication';
 import * as fleetSwitch from '../../src/instance/fleetSwitch';
 import * as switchSql from '../../src/instance/switchSql';
@@ -123,6 +124,7 @@ const register = (id: string, db: string) => {
 const dumpTo = (db: string, file: string) => {
   expect(run(['exec', NAME, 'pg_dump', '-U', ADMIN, '-Fc', '-f', `/tmp/${db}.dump`, db]).status).toBe(0);
   expect(run(['cp', `${NAME}:/tmp/${db}.dump`, file]).status).toBe(0);
+  writeDumpMeta(path.dirname(file), path.basename(file), countsOf(db));
 };
 const ALL = { seq: true, table: true, claim: true, shards: true, clock: true };
 const SHARDS = 'SELECT shard_count || \':\' || shard_id || \'=\' || claim || \'@\' || expires_up_ms FROM smdb_data.shard_claims ORDER BY shard_count, shard_id';

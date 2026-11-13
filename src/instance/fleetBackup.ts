@@ -22,7 +22,7 @@ import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
 import { ContainerInfo, InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, JoinAddress } from '../types';
 import {
-  ALERT_AFTER_MS, backupDir, COPY_FILE_PREFIX, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
+  ALERT_AFTER_MS, backupDir, compareCounts, COPY_FILE_PREFIX, COUNTS_SQL, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, metaTocGaps, newestScheduled, parseCountLines, parseDumpName,
   ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
 } from './backupFiles';
 import * as backupCheck from './backupCheck';
@@ -1617,7 +1617,11 @@ function sweepUnfinished(): void {
 type RestoreSteps = {
   stopped: string[]; preRestoreDump: string | null; restored: boolean; claimFloor: number | null; guildsRaised: string[] | null; claimRaisedTo: number | null;
   shardClaimsRaised: number | null; shardClaimsExpired: number | null; botState: 'maintenance' | 'off' | null; restarted: string[]; generation: number | null;
+  counts: RestoreCounts | null;
 };
+
+/** The restored tables, counted right after pg_restore: compared with the dump's counts file, or unrecorded for an uploaded dump that has none. */
+type RestoreCounts = { result: 'matched' | 'differ' | 'unread' | 'unrecorded'; tables: number | null; rows: number | null; text: string | null };
 
 const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
 
@@ -1761,12 +1765,15 @@ function restoreLiftClause(lift: FenceLift, held: FenceHeld, volume: string, res
 }
 
 /** The restore notice for a lift that did not end lifted: what happened, the clause, then what clears the notice. A
- * notice added to an earlier one, which is added only when that one left the data in doubt, gives no dismissal step. */
-function restoreLiftNotice(start: string, lift: FenceLift, held: FenceHeld, volume: string, restored: boolean, merged = false): string {
-  const then = merged ? 'restore a dump again' : 'dismiss this notice';
+ * notice added to an earlier one, which is added only when that one left the data in doubt, gives no dismissal step.
+ * doubtBack, for restored data whose counts were not confirmed, names the dump that holds the database as it was. */
+function restoreLiftNotice(start: string, lift: FenceLift, held: FenceHeld, volume: string, restored: boolean, merged = false, doubtBack?: string): string {
+  const then = doubtBack !== undefined ? `restore a dump again (${doubtBack}), or dismiss this notice to keep the restored data`
+    : merged ? 'restore a dump again' : 'dismiss this notice';
   const tail = lift === 'stripped' ? `; restart the instance, then ${then}`
     : lift === 'held' ? `; once the fence is lifted, ${then}`
     : lift === 'gone' ? '; with the bot in Maintenance or Off, restore a dump again'
+    : doubtBack !== undefined ? `; restore a dump again (${doubtBack})`
     : '';
   return `${start}, but ${restoreLiftClause(lift, held, volume, restored)}${tail}`;
 }
@@ -1980,7 +1987,9 @@ export async function capClaims(fleetDb: RestoreFleetDb): Promise<{ ok: true; ex
 }
 
 export const tocTiming = { inContainerSec: 60, backstopMs: 90_000 };
-const TOC_MAX_CHARS = 8 * 1024 * 1024;
+export const TOC_MAX_CHARS = 8 * 1024 * 1024;
+/** The count of the restored tables, bounded as the test restore's count is. */
+export const restoreCountTiming = { ms: 300_000 };
 
 /** A dump's table of contents: `pg_restore -l` in the sidecar, the file on stdin. pg_restore -l connects to no database. */
 export function readDumpToc(containerName: string, dumpPath: string): Promise<{ ok: true; toc: string } | { ok: false; error: string }> {
@@ -2057,6 +2066,34 @@ async function sharersRunning(sharing: InstanceConfig[]): Promise<{ ids: string[
 
 const RESTORE_OP = 'restore';
 
+/** The dump's counts file, read before the restore changes anything; meta null for an uploaded dump that has none. */
+function readRestoreMeta(botId: string, file: string): { ok: true; meta: DumpMeta | null } | { ok: false; error: string } {
+  const refused = 'so the manager cannot check what it restores and the restore was refused (nothing was changed); restore another dump';
+  const unread = (why: string) => ({ ok: false as const, error: `The counts file of the dump ${file} could not be read (${why}), ${refused}` });
+  let text: string;
+  try {
+    text = fs.readFileSync(path.join(backupDir(botId), `${file}.json`), 'utf-8');
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') return unread(err instanceof Error ? err.message : String(err));
+    if (restoreKindOf(file) === 'moved') return { ok: true, meta: null };
+    return { ok: false, error: `The dump ${file} has no counts file (${file}.json), ${refused}` };
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return unread('it is not JSON');
+  }
+  const checked = validateDumpMeta(value);
+  if (!checked.ok) return unread(checked.error);
+  if (checked.meta.file !== file) {
+    return { ok: false, error: `The counts file ${file}.json names the dump ${checked.meta.file}, so it does not describe this dump and the restore was refused (nothing was changed); restore another dump` };
+  }
+  return { ok: true, meta: checked.meta };
+}
+
+const totalsOf = (counts: Record<string, number>) => ({ tables: Object.keys(counts).length, rows: Object.values(counts).reduce((a, b) => a + b, 0) });
+
 /**
  * Restore a dump of the whole bot into its sidecar, under the bot's op lock 'restore'. Refused while another lane
  * holds the database (a seed run, an op lock on an instance that shares it). In order: the instances that share the
@@ -2070,7 +2107,10 @@ const RESTORE_OP = 'restore';
  * constraints and the run exits 1 even when everything applied; a fresh database makes any restore error a real
  * failure); pg_restore --exit-on-error of the chosen file with the restoring session exempted; every restored claim
  * and the claim sequence raised above the kept number, and every restored shard claim expired; fence lifted; the notice cleared only when the lift ended
- * lifted; the other stopped instances started. The bot keeps its state and its process; it loads the restored data
+ * lifted; the other stopped instances started. The dump's counts file is checked against the dump before anything
+ * changes, and the restored tables are counted and compared with it right after pg_restore: on a difference the lane
+ * still raises and lifts, but leaves a notice, keeps the other instances stopped and reports no success (an uploaded
+ * dump without a counts file is counted, not compared). The bot keeps its state and its process; it loads the restored data
  * when the operator chooses Running. A failure past the drop keeps the fence on and the instances stopped. docker's
  * stderr can quote the database URL, so the answer passes the secret filter, as do the notices and logs built from
  * stderr.
@@ -2092,7 +2132,7 @@ type RestoreResult = { success: boolean; error?: string; warning?: string; steps
 async function runFleetRestore(botId: string, file: string): Promise<RestoreResult> {
   const steps: RestoreSteps = {
     stopped: [], preRestoreDump: null, restored: false, claimFloor: null, guildsRaised: null, claimRaisedTo: null, shardClaimsRaised: null, shardClaimsExpired: null,
-    botState: null, restarted: [], generation: null,
+    botState: null, restarted: [], generation: null, counts: null,
   };
 
   if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL, steps };
@@ -2128,10 +2168,13 @@ async function runFleetRestore(botId: string, file: string): Promise<RestoreResu
     return { success: false, error: `The claim floor file ${claimFloorPath(botId)} could not be read (${floorRead.error}), so the highest claim number the bot used before is unknown and the restore was refused (nothing was changed); repair the file, then retry`, steps };
   }
 
+  const metaRead = readRestoreMeta(botId, file);
+  if (!metaRead.ok) return { success: false, error: metaRead.error, steps };
+
   // No await between this check and the lock, so no other op can take the bot in between.
   const op = containerManager.isBotBusy(botId);
   if (op) return { success: false, error: `Operation '${op}' is running on this bot; wait for it before restoring a dump (nothing was changed)`, steps };
-  return containerManager.withExternalBotOp(botId, RESTORE_OP, () => restoreLocked(instance, fleetDb, file, dumpPath, url, floorRead, steps));
+  return containerManager.withExternalBotOp(botId, RESTORE_OP, () => restoreLocked(instance, fleetDb, file, dumpPath, url, floorRead, metaRead.meta, steps));
 }
 
 async function restoreLocked(
@@ -2141,6 +2184,7 @@ async function restoreLocked(
   dumpPath: string,
   url: string,
   floorRead: { claim: number | null; disk: number | null },
+  meta: DumpMeta | null,
   steps: RestoreSteps
 ): Promise<RestoreResult> {
   const botId = instance.id;
@@ -2305,6 +2349,17 @@ async function restoreLocked(
     if (shards.shards && !shards.clock) {
       return await refuseBeforeFence(`The dump ${file} has shard claims but no claim clock, so the restore was refused`,
         'it has smdb_data.shard_claims but no smdb_data.claim_clock, and the bot creates both together');
+    }
+    // A table of contents cut at the read cap could miss a table it holds; the count after pg_restore still compares.
+    if (meta && toc.toc.length >= TOC_MAX_CHARS) {
+      console.warn(`[FleetBackup] The table of contents of ${file} is longer than 8 MB, so its counts file was checked only after the restore`);
+    } else if (meta) {
+      const gaps = metaTocGaps(meta.counts, toc.toc);
+      if (gaps.length > 0) {
+        const more = gaps.length > 5 ? `, and ${gaps.length - 5} more` : '';
+        return await refuseBeforeFence(`The counts file of the dump ${file} records tables the dump does not hold, so the restore was refused`,
+          `${gaps.length} table(s) do not fit its table of contents: ${gaps.slice(0, 5).join('; ')}${more}`);
+      }
     }
 
     // 3. Courtesy stop of every sharing instance docker shows running: the
@@ -2568,12 +2623,42 @@ async function restoreLocked(
     }
     steps.restored = true;
 
+    // Before anything else writes, the restored tables are counted and compared with the dump's counts file.
+    const count = await managerExec(fleetDb, claimPsql(fleetDb, COUNTS_SQL, false), restoreCountTiming.ms);
+    const parsedCount = count.ok ? parseCountLines(count.stdout) : null;
+    const restoredCounts = parsedCount?.ok ? parsedCount.counts : null;
+    const countError = !count.ok ? scrubbed(botId, lastLine(count.stderr)) : parsedCount && !parsedCount.ok ? parsedCount.error : null;
+    let countsText = '';
+    if (meta && restoredCounts) {
+      const compared = compareCounts(meta.counts, restoredCounts);
+      if (compared.ok) {
+        steps.counts = { result: 'matched', tables: meta.tables, rows: meta.rows, text: null };
+        console.log(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: ${meta.tables} tables and ${meta.rows} rows match its counts file`);
+      } else {
+        steps.counts = { result: 'differ', ...totalsOf(restoredCounts), text: compared.text };
+        countsText = compared.text;
+      }
+    } else if (meta) {
+      steps.counts = { result: 'unread', tables: null, rows: null, text: countError };
+      countsText = `the restored tables could not be counted (${countError}), so the manager can't confirm that the database holds what the backup held`;
+    } else if (restoredCounts) {
+      const totals = totalsOf(restoredCounts);
+      steps.counts = { result: 'unrecorded', ...totals, text: null };
+      console.log(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: the uploaded backup has no counts file, so the restored ${totals.tables} tables and ${totals.rows} rows were not compared`);
+    } else {
+      steps.counts = { result: 'unrecorded', tables: null, rows: null, text: countError };
+      console.warn(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: the uploaded backup has no counts file, and the restored tables could not be counted (${countError})`);
+    }
+    const doubtful = countsText !== '';
+    if (doubtful) console.error(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: ${countsText}`);
+    const countsSuffix = doubtful ? `; ${countsText}` : '';
+
     // 10. Every restored claim and the sequence go above the floor and every restored shard claim expires, in one
     // statement; with no floor the shard claims still expire.
     if (floor !== null) {
       const raised = await raiseClaims(fleetDb, floor);
       if (!raised.ok) {
-        const reason = scrubbed(botId, `the restored claim numbers could not be raised above ${floor} (${raised.error})`);
+        const reason = scrubbed(botId, `the restored claim numbers could not be raised above ${floor} (${raised.error})${countsSuffix}`);
         setRestoreError(botId, file, reason, `A process of the bot that ran before the restore could save over the restored rows, so the write fence stays on (${back})`);
         return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
       }
@@ -2594,7 +2679,7 @@ async function restoreLocked(
       if (!capped.ok) {
         const reason = scrubbed(botId, capped.unread
           ? `whether the restored database holds shard claims could not be read (${capped.error})`
-          : `the restored shard claims could not be expired (${capped.error})`);
+          : `the restored shard claims could not be expired (${capped.error})`) + countsSuffix;
         setRestoreError(botId, file, reason, capped.unread
           ? `The manager can't confirm that no restored shard claim is left live, so the write fence stays on (${back})`
           : `A process named in a restored shard claim could keep that shard, so the write fence stays on (${back})`);
@@ -2609,7 +2694,7 @@ async function restoreLocked(
     // The generation: raised above both the row before the drop and the restored row.
     const genWrite = await writeRestoredGeneration(instance, fleetDb, file, genBefore, ownCopies);
     if (!genWrite.ok) {
-      const reason = scrubbed(botId, `the generation row could not be written back (${genWrite.error})`);
+      const reason = scrubbed(botId, `the generation row could not be written back (${genWrite.error})${countsSuffix}`);
       setRestoreError(botId, file, reason, `Bots may take another database of this bot for the main while this one shows the dump's older generation, so the write fence stays on (${back})`);
       return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
     }
@@ -2618,9 +2703,9 @@ async function restoreLocked(
     // An instance started meanwhile (a CasaOS tile click) read the database while it was dropped and rebuilt.
     const startedMeanwhile = await sharersRunning(others);
     if (startedMeanwhile === null || startedMeanwhile.names.length > 0) {
-      const reason = startedMeanwhile === null
+      const reason = (startedMeanwhile === null
         ? "docker could not say whether an instance sharing the database was started during the restore, so the manager can't confirm that none read it while it was rebuilt"
-        : `${startedMeanwhile.names.join(', ')} was started outside the manager during the restore and may act on what it read while the database was rebuilt; stop it`;
+        : `${startedMeanwhile.names.join(', ')} was started outside the manager during the restore and may act on what it read while the database was rebuilt; stop it`) + countsSuffix;
       setRestoreError(botId, file, reason, `The dump was restored, but the write fence stays on so nothing writes from what was read mid-restore (${back})`);
       return { success: false, error: `The dump was restored, but ${await keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
     }
@@ -2643,8 +2728,18 @@ async function restoreLocked(
     release();
 
     lastErrors.delete(familyKey(botId, 'main'));
+    // After a difference or an unread count the other instances stay stopped and the notice refuses Running.
+    const stayStopped = steps.stopped.filter(id => id !== botId).map(nameOf);
+    const doubtBack = steps.preRestoreDump
+      ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
+      : 'no pre-restore dump was taken, because the database was missing';
     let noticeWarning = '';
-    if (lift === 'lifted') {
+    if (doubtful && lift === 'lifted') {
+      const stoppedClause = stayStopped.length > 0 ? `, and the other instances stopped for the restore stay stopped (${stayStopped.join(', ')})` : '';
+      keepNotice(botId, file, `Restore of ${file} ran, but ${countsText}. The bot's login stays blocked, so the bot writes nothing${stoppedClause}. Running is refused until you restore a dump again (${doubtBack}) or dismiss this notice to keep the restored data`, true);
+    } else if (doubtful) {
+      keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran (${countsText})`, lift, layersHeld, fleetDb.volume, true, false, doubtBack), true);
+    } else if (lift === 'lifted') {
       unsavedRestoreErrors.delete(botId);
       let cleared = true;
       try {
@@ -2673,6 +2768,20 @@ async function restoreLocked(
       }
     } else {
       keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran`, lift, layersHeld, fleetDb.volume, true), lift === 'gone');
+    }
+
+    if (doubtful) {
+      const handStart = stayStopped.length > 0 ? `. The other instances stopped for the restore stay stopped (${stayStopped.join(', ')}); start them by hand once the data is settled` : '';
+      if (lift === 'lifted') {
+        const self = steps.botState === 'off' ? 'The bot stays off' : 'The bot stays in maintenance';
+        return { success: false, error: `The dump ${file} was restored, but ${countsText}. ${self}, and Running is refused while the notice on the Database window stands: restore a dump again (${doubtBack}), or dismiss the notice to keep the restored data${handStart}`, steps };
+      }
+      const keep = `restore a dump again (${doubtBack}), or dismiss the notice on the Database window to keep the restored data`;
+      const way = lift === 'stripped' ? `Restart the instance, then ${keep}`
+        : lift === 'held' ? `Once the fence is lifted, ${keep}`
+        : lift === 'gone' ? 'With the bot in Maintenance or Off, restore a dump again'
+        : `Restore a dump again (${doubtBack})`;
+      return { success: false, error: `${lift === 'gone' ? 'The restore ran' : 'Restored'}, but ${countsText}, and ${restoreLiftClause(lift, layersHeld, fleetDb.volume, true)} (see manager logs). ${way}${handStart}`, steps };
     }
 
     // 12. Start the other instances stopped in step 3; the bot itself keeps its state.

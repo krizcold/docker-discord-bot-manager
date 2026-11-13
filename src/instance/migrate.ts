@@ -464,6 +464,7 @@ const T = {
   destUrlRead: (jobId: string, named: string) => `Migration ${jobId} is done, and the bot names ${named} as the database the copy went to, but the env store for this bot cannot be read, so the manager can't tell which database the Database URL names. The bot stays in Maintenance and its Data Backend is unchanged. Set the Database URL to ${named}, then press Migrate.`,
   destUrl: (jobId: string, named: string, url: string) => `Migration ${jobId} is done, and the bot names ${named} as the database the copy went to, but the Database URL names ${url}. The bot stays in Maintenance and its Data Backend is unchanged. Set the Database URL to ${named}, then press Migrate.`,
   envStore: (jobId: string, dest: string, err: string) => `Migration ${jobId} moved the data to ${dest}, but the new Data Backend could not be stored (${err}). The bot stays in Maintenance; press Migrate to store it again.`,
+  formerKept: (jobId: string, dest: string, err: string) => `Migration ${jobId} moved the data to ${dest} and stored the new Data Backend, but the old main's join code kept on this bot could not be deleted (${err}). The bot stays in Maintenance; press Migrate to finish.`,
   apply: (jobId: string, dest: string, err: string) => `Migration ${jobId} moved the data to ${dest}, and the new Data Backend is stored, but the restart that applies it failed (${err}). The bot stays in Maintenance; press Migrate to apply it again.`,
   env: (jobId: string, dest: string, value: string, url: string | null, notApplied: string) => `Migration ${jobId} moved the data to ${dest}, but after the restart the bot's container reads DATA_BACKEND=${value}${url !== null ? `, and its Database URL names ${url}` : ''} (${notApplied}). The bot stays in Maintenance; press Migrate to apply it again.`,
   envDocker: (jobId: string, dest: string, err: string) => `Migration ${jobId} moved the data to ${dest}, but docker did not say what the bot's container reads after the restart (${err}). The bot stays in Maintenance; press Migrate to check it again.`,
@@ -1471,6 +1472,15 @@ class Lane {
         await containerManager.updateBotInOp(this.botId, { envVars: { DATA_BACKEND: rec().to } }, OP);
       } catch (err) {
         return { go: 'park', resumeAt: 'finishing', text: T.envStore(rec().jobId, dest(), errText(err)) };
+      }
+      const former = rec().to === 'file' ? this.fresh().fleetDb?.formerMain : undefined;
+      if (former) {
+        try {
+          containerManager.updateInstanceFleetDbSwitch(this.botId, { formerMain: null });
+        } catch (err) {
+          return { go: 'park', resumeAt: 'finishing', text: T.formerKept(rec().jobId, dest(), errText(err)) };
+        }
+        console.log(`[Migrate] ${this.name}: this bot keeps its data in JSON files now, so the manager no longer checks the old main ${former.machine}`);
       }
       if (!this.save({ finishing: 'stored' })) return this.stop();
     }

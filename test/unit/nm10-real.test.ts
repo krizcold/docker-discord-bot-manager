@@ -281,6 +281,17 @@ describe('the lane against the real start, compose and gates (B-7)', () => {
     while (!f() && Date.now() < end) await new Promise(r => setTimeout(r, 5));
     expect(f()).toBe(true);
   }
+  it('NM17 a move to JSON files of a bot with formerMain closes done, and instances.json holds no formerMain', async () => {
+    await companionBot();
+    containerManager.updateInstanceFleetDbSwitch('b1', { formerMain: { code: 'join-code', slot: 'slot1', machine: 'old-box', host: 'old.example.test', port: 5433, generation: 3, at: '2026-11-01T00:00:00.000Z' } });
+    expect(stored().fleetDb.formerMain).toBeTruthy();
+    m.bot.script = [{ state: 'done', stage: 'switching' }];
+    expect(await press('file')).toEqual({ accepted: true });
+    expect(stored().migrateLast).toMatchObject({ outcome: 'done', to: 'file' });
+    expect(stored().fleetDb).toBeTruthy();
+    expect(stored().fleetDb.formerMain).toBeUndefined();
+    expect(containerManager.startPreflightRefusal('b1')).toBeNull();
+  });
   const files = (dir: string): string[] => (fs.existsSync(dir) ? fs.readdirSync(dir, { recursive: true }).map(String).sort() : []);
 
   const routes: Array<[string, 'put' | 'post' | 'delete', string, Record<string, string>, unknown, RegExp]> = [

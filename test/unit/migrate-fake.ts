@@ -81,6 +81,7 @@ export interface MigrateFake {
   migrateWrites: any[];
   failMigrateWrite: (n: number, rec: any) => string | null;
   failUpdateBot: string | null;
+  failSwitch: string | null;
   ensure: (() => any) | null;
   attach: { success: boolean; error?: string };
   dbStart: { success: boolean; error?: string };
@@ -129,7 +130,7 @@ function fresh(): MigrateFake {
     bots: {}, env: {}, envStatus: { corrupt: false, undecryptable: [] }, lock: {}, shuttingDown: false, hold: false, deleteLane: false,
     app: {}, sidecar: {}, login: { inRecovery: false, canLogin: false, sessions: 0 }, loginReadFail: null,
     openResult: { ok: true }, openSticks: true, blockResult: { ok: true }, fence: { ok: true, on: false },
-    events: [], migrateWrites: [], failMigrateWrite: () => null, failUpdateBot: null, ensure: null,
+    events: [], migrateWrites: [], failMigrateWrite: () => null, failUpdateBot: null, failSwitch: null, ensure: null,
     attach: { success: true }, dbStart: { success: true }, dbReady: true, stop: { success: true }, start: { success: true },
     sharerStop: { success: true }, sharerStopOpts: [] as any[], sharerStart: { success: true }, containerEnv: null,
     order: { settled: true, text: 'The bot is running normally.' }, saveAnswers: [], held: [], notice: null, notices: {}, seed: null, seeds: {}, tickOn: null, sharers: [], liveSharers: [] as string[],
@@ -344,6 +345,16 @@ export function cmMock(): Record<string, unknown> {
       else delete m.bots[id].migrate;
       if (last !== undefined) m.bots[id].migrateLast = clone(last);
       m.events.push(rec ? `record:${rec.phase}${rec.finishing ? `:${rec.finishing}` : ''}` : 'record:closed');
+    },
+    updateInstanceFleetDbSwitch: (id: string, patch: Record<string, unknown>) => {
+      if (m.failSwitch) throw new Error(m.failSwitch);
+      const db = m.bots[id]?.fleetDb;
+      if (!db) throw new Error('the bot holds no main database record any more');
+      for (const [k, v] of Object.entries(patch)) {
+        if (v === null || v === undefined) delete db[k];
+        else db[k] = clone(v);
+      }
+      m.events.push(`switch:${JSON.stringify(patch)}`);
     },
     updateBot: async (id: string, update: any) => {
       if (m.failUpdateBot) throw new Error(m.failUpdateBot);

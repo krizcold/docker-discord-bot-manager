@@ -7,6 +7,7 @@
 
 import { execSync } from 'child_process';
 import { startServer } from './webui/server';
+import { initGate } from './webui/gate';
 import { checkDockerConnection } from './docker/dockerClient';
 import { syncContainerStates, resetTransientStatuses, beginShutdown, loadOpRecords } from './docker/containerManager';
 import { seedDefaultSources } from './source/sourceManager';
@@ -113,7 +114,8 @@ async function main(): Promise<void> {
 
   // Start web server
   console.log('[Init] Starting web server...');
-  const { wss } = startServer();
+  const gate = await initGate();
+  const { wss } = startServer(gate);
 
   // Resumes the state orders a restart cut, then keeps the database logins in line with each bot's state.
   startMaintenanceReconciler();

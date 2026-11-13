@@ -88,12 +88,12 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as dbLogin from '../../src/instance/dbLogin';
 import * as fleetReplica from '../../src/instance/fleetReplica';
 import { certSource } from '../../src/instance/fleetJoin';
-import { codeFor, fixtureCert } from './join-fake';
+import { codeFor, fixtureCert, roleVerifierAnswer } from './join-fake';
 import { disableFleetReplication, dropFleetSlot, enableFleetReplication, fenceLinesRefusal, getFleetReplicationStatus } from '../../src/instance/fleetReplication';
 
 const MISSING = 'psql: error: connection to server on socket failed: FATAL:  role "dbm_admin" does not exist';
 const SUPER = 'SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user';
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'primary.invalid', certHost: 'primary.invalid', slotWalKeepMb: 4096 };
 const copy = { containerName: 'bot1-fleet-postgres-replica', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-replica-data', publicHost: 'standby.invalid', hostPort: 5440, primaryHost: 'primary.invalid', primaryPort: 5433 };
 
@@ -184,6 +184,7 @@ describe('NM1 L5: fleetReplica logins as dbm_admin', () => {
       if (sql.includes("grep '^primary_conninfo'")) return "primary_conninfo = 'user=replicator password=rpw host=primary.invalid'\n";
       if (sql.includes('regexp_split_to_table') && sql.includes('count(*)')) return '0\n';
       if (sql.includes('FROM pg_roles WHERE rolname')) return '0\n';
+      if (sql.includes('pg_authid')) return roleVerifierAnswer('pw');
       return '';
     });
     await fleetReplica.adoptPromotedReplica(containerManager.getBot('b1')!);

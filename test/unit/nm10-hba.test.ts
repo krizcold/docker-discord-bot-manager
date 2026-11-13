@@ -118,7 +118,7 @@ import { runOnDataDir, FENCED_HBA, MANAGED_HBA, ownedFencedHba } from './fence-f
 
 const botDir = path.join(h.dir, 'bots', 'b1');
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const OUTSIDE = 'postgresql://u:secret@db.example.test:5432/app';
 const record = (over: Record<string, unknown> = {}) => ({ to: 'file', from: 'postgres', destination: null, companion: false, jobId: 'mgr-a', jobIds: ['mgr-a'], posted: true, started: 1, kept: 0, phase: 'following', loginOpened: true, sharers: [], sharersStopped: [], openedAt: '2026-10-31T00:00:00.000Z', ...over });
 

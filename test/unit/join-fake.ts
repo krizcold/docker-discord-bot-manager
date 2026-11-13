@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import { PassThrough } from 'stream';
 import { encodeJoinCode, JoinCode } from '../../src/config/joinCode';
+import { scramSha256Verifier } from '../../src/config/secretText';
 
 export const FIXTURE_PEM = `-----BEGIN CERTIFICATE-----
 MIIBnjCCAUSgAwIBAgIUCdC6jqTA0KJPSvixvqeQ7rZT39QwCgYIKoZIzj0EAwIw
@@ -43,6 +44,11 @@ iFORJQp+zks/LQ==
 `;
 
 export const COPY_FP = 'bb4b800f36f202bda5dce3afd633fb152f82b1dc90d46b9ae46daaf25f3f7528';
+
+/** The answer of the pg_authid read for a bot role whose SCRAM verifier was made from this password. */
+export function roleVerifierAnswer(password: string): string {
+  return `v|${scramSha256Verifier(password, Buffer.alloc(16, 5), 4096)}\n`;
+}
 
 export function fakeJoin(over: Partial<JoinCode> = {}): JoinCode {
   return {

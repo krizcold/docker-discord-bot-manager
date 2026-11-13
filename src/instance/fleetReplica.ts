@@ -27,9 +27,10 @@ import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
 import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal } from './appHookClient';
-import { probeErrorTail } from '../config/secretText';
+import { probeErrorTail, urlPassword, verifierAccepts } from '../config/secretText';
 import { InstanceConfig, FleetBackupAlert, FleetDbReplicaRecord, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { decodeJoinCode, HOST_RE, JoinCode, lsnText, splitBackendUrls } from '../config/joinCode';
+import { hasHostParam, readDatabaseUrl } from '../config/databaseUrl';
 import { alertStep, dmOutcomeText, ownerMessageKey, utcText } from './backupFiles';
 import {
   AddressesOutcome, addressesText, deleteAddress, ensureClientImage, sendAddresses, inRecoveryText, loginOf, machineNameOf, mainCertificate, mainProbe, PrimaryLogin,
@@ -1812,7 +1813,7 @@ export async function instanceDataDir(instance: InstanceConfig): Promise<string>
 }
 
 /**
- * The fleet database password, for an instance whose manager env store has
+ * The fleet database URL, for an instance whose manager env store has
  * none. The manager does not hold the URL here: the bot persists it in its
  * OWN env file (declared as
  * companionDb.appEnvFile, ruling F1: the file read serves exactly the flows
@@ -1820,7 +1821,7 @@ export async function instanceDataDir(instance: InstanceConfig): Promise<string>
  * place this machine's copy of the fleet credentials exists. An unparseable
  * value refuses (returns null) rather than guessing.
  */
-function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string | null {
+function fleetUrlFromBotEnv(dataDir: string, db: CompanionDbSpec): string | null {
   if (!db.appEnvFile) return null;
   let raw: string;
   try {
@@ -1834,8 +1835,7 @@ function fleetPasswordFromBotEnv(dataDir: string, db: CompanionDbSpec): string |
     if (!match) continue;
     const value = match[1].trim().replace(/^["']|["']$/g, '');
     try {
-      const password = decodeURIComponent(new URL(value).password);
-      if (password) return password;
+      if (decodeURIComponent(new URL(value).password)) return value;
     } catch {
       return null;
     }
@@ -1906,18 +1906,12 @@ export async function adoptPromotedReplica(
   // checks (and the password enableFleetReplication needs) have nothing to read
   // until this instance is filed like any other database host.
   const dataDir = await instanceDataDir(instance);
-  const password = (() => {
-    const current = splitBackendUrls(envManager.getEnvVars(instance.id)[db.env.url])[0] ?? '';
-    if (current !== '') {
-      try { return decodeURIComponent(new URL(current).password) || null; } catch { return null; }
-    }
-    return fleetPasswordFromBotEnv(dataDir, db);
-  })();
-  if (!password) {
-    // Naming the file keeps a wrong data dir apart from a genuinely absent
-    // credential: the two read identically from the outside.
-    const appEnvFile = db.appEnvFile ? path.posix.join(dataDir, db.appEnvFile) : 'no app env file is declared';
-    return { success: false, error: `Could not recover the fleet database credentials from this instance (neither the manager env nor ${appEnvFile} carries a usable database URL), so the database cannot be adopted` };
+  // Naming the file keeps a wrong data dir apart from a genuinely absent
+  // credential: the two read identically from the outside.
+  const appEnvFile = db.appEnvFile ? path.posix.join(dataDir, db.appEnvFile) : 'no app env file is declared';
+  const candidates = adoptPasswordCandidates(instance, rec, db, dataDir);
+  if (candidates.length === 0) {
+    return { success: false, error: `Could not recover the fleet database credentials from this instance (no join code is kept, and neither the manager env nor ${appEnvFile} carries a database URL with a password), so the database cannot be adopted` };
   }
 
   // A copy can carry the write fence's pg_hba lines (copied before the copy
@@ -1950,6 +1944,22 @@ export async function adoptPromotedReplica(
   // Identity from the STAMP (rec.user/rec.db): adoption files an EXISTING
   // byte-copied cluster, whose role and database are whatever provisioning
   // stamped, not whatever the mutable per-source record says today.
+  // Only a password the copy's own bot role accepts is written into the URL and the record.
+  const verifier = await dbLogin.readRoleVerifier({ container: rec.containerName, user: rec.user });
+  if (!verifier.ok) {
+    return { success: false, error: `Could not recover the fleet database credentials from this instance: the database's password for ${rec.user} could not be read (${verifier.why}), so the database cannot be adopted; try again` };
+  }
+  let password: string | undefined;
+  for (const c of candidates) {
+    const verdict = await verifierAccepts(verifier.verifier, c, rec.user);
+    if (typeof verdict === 'object') {
+      return { success: false, error: `Could not recover the fleet database credentials from this instance: the database's password for ${rec.user} could not be checked (${verdict.why}), so the database cannot be adopted` };
+    }
+    if (verdict) { password = c; break; }
+  }
+  if (password === undefined) {
+    return { success: false, error: `Could not recover the fleet database credentials from this instance: the database does not accept any password kept in its join code, the manager env or ${appEnvFile} for ${rec.user}, so the database cannot be adopted. Put a Database URL with this database's password into the bot's env in the Env editor, then try again` };
+  }
   const envKeys = [db.env.url, ...(db.env.mode ? [db.env.mode.key] : [])];
   let envBefore: envManager.StoredKeys;
   try {
@@ -1972,7 +1982,7 @@ export async function adoptPromotedReplica(
   };
   let adopted: { success: boolean; error?: string };
   try {
-    adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication, opts.restoreNotice, opts.formerMain);
+    adopted = containerManager.adoptFleetDbReplicaAsPrimary(instance.id, replication, opts.restoreNotice, opts.formerMain, password);
   } catch (err) {
     const left = putEnvBack();
     return { success: false, error: `The instance record could not be written (${errorText(err)}), so the standby was not adopted; ${left ?? 'nothing was changed'}` };
@@ -2012,11 +2022,29 @@ export async function adoptPromotedReplica(
   return { success: true, restartRequired: true, flipped: true, addresses };
 }
 
+/**
+ * The adopt's password candidates in the order they are tried: the kept join code's bot login, then the URLs (the
+ * manager env's, then the bot's env file's) that name this machine's database, then the other URLs.
+ */
+function adoptPasswordCandidates(instance: InstanceConfig, rec: FleetDbReplicaRecord, db: CompanionDbSpec, dataDir: string): string[] {
+  const joined = instance.fleetJoin?.code ? decodeJoinCode(instance.fleetJoin.code) : null;
+  const fromCode = joined?.ok ? joined.code.app.password : '';
+  const sources = [splitBackendUrls(envManager.getEnvVars(instance.id)[db.env.url])[0] ?? '', fleetUrlFromBotEnv(dataDir, db) ?? ''].filter(Boolean);
+  const local = new Set([rec.containerName.toLowerCase(), `${instance.sanitizedName}-fleet-postgres`.toLowerCase()]);
+  const namesThis = (url: string): boolean => {
+    const first = readDatabaseUrl(url).addresses[0];
+    return !!first && local.has(first.host) && first.port === 5432 && first.db === rec.db && !hasHostParam(url);
+  };
+  const ordered = [...sources.filter(namesThis), ...sources.filter(u => !namesThis(u))].map(u => urlPassword(u));
+  return [...new Set([fromCode, ...ordered].filter((p): p is string => !!p))];
+}
+
 /** The fleet database password for an instance whose manager env holds no database URL: the bot's own env file carries it. */
 export async function fleetDbPasswordFallback(instance: InstanceConfig): Promise<string | undefined> {
   const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
   if (!db || (envManager.getEnvVars(instance.id)[db.env.url] || '').trim() !== '') return undefined;
-  return fleetPasswordFromBotEnv(await instanceDataDir(instance), db) ?? undefined;
+  const url = fleetUrlFromBotEnv(await instanceDataDir(instance), db);
+  return (url && urlPassword(url)) || undefined;
 }
 
 /** The replication credential the seed wrote into this copy's own primary_conninfo; null when unreadable. */

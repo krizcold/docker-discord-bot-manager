@@ -75,7 +75,7 @@ export function resetHarness(over: Partial<Harness> = {}): void {
   fake.onEvent = e => h.events.push(e);
 }
 
-export const MAIN = { containerName: 'a-pg', user: 'app', db: 'app', volume: 'a-pgdata', replication: { role: 'replicator', password: 'replpass', hostPort: 5433, publicHost: 'main.example', certHost: 'main.example' } };
+export const MAIN = { containerName: 'a-pg', user: 'app', db: 'app', volume: 'a-pgdata', password: 'apppass', replication: { role: 'replicator', password: 'replpass', hostPort: 5433, publicHost: 'main.example', certHost: 'main.example' } };
 export const COPY = {
   containerName: 'c-pg', volume: 'c-replica', user: 'app', db: 'app', slot: 'slot_c', primaryHost: 'main.invalid', primaryPort: 15432,
   publicHost: 'copy.example', hostPort: 5434, certHost: 'copy.example', seededAt: 1,

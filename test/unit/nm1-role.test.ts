@@ -115,11 +115,11 @@ import * as containerManager from '../../src/docker/containerManager';
 import * as dbLogin from '../../src/instance/dbLogin';
 import { callAppHook } from '../../src/instance/appHookClient';
 import { certSource } from '../../src/instance/fleetJoin';
-import { codeFor, fixtureCert } from './join-fake';
+import { codeFor, fixtureCert, roleVerifierAnswer } from './join-fake';
 
 beforeEach(() => { certSource.fetch = fixtureCert; });
 
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 
 /** Every psql, pg_dump and pg_restore the fake saw run inside a container, with the role it logged in as. */
 const logins = () => h.calls
@@ -345,6 +345,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       if (sql.includes("grep '^primary_conninfo'")) return "primary_conninfo = 'user=replicator password=rpw host=primary.invalid'\n";
       if (sql.includes('regexp_split_to_table') && sql.includes('count(*)')) return '0\n';
       if (sql.includes('FROM pg_roles WHERE rolname')) return '0\n';
+      if (sql.includes('pg_authid')) return roleVerifierAnswer('pw');
       return '';
     };
     await fleetReplica.adoptPromotedReplica(containerManager.getBot('b1')!);

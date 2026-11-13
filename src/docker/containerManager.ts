@@ -194,7 +194,7 @@ function withoutSensitiveKeys(envVars: Record<string, string> | undefined): Reco
 const warnedRecordSecrets = new Set<string>();
 const lostRecordBlobs = new Map<string, string>();
 
-function decryptRecordSecret(instId: string, field: string, value: string | undefined): string | undefined {
+function decryptRecordSecret(instId: string, field: string, value: string | undefined, tail = 'restore the key, or re-provision the value'): string | undefined {
   if (!value || !value.startsWith('v2:')) return value;
   const key = `${instId}:${field}`;
   // The derived key is fixed for the process lifetime, so a blob that failed
@@ -210,7 +210,7 @@ function decryptRecordSecret(instId: string, field: string, value: string | unde
   lostRecordBlobs.set(key, value);
   if (!warnedRecordSecrets.has(key)) {
     warnedRecordSecrets.add(key);
-    console.error(`[ContainerManager] ${field} for instance ${instId} no longer decrypts (encryption key changed or lost); its ciphertext stays preserved in the registry - restore the key, or re-provision the value`);
+    console.error(`[ContainerManager] ${field} for instance ${instId} no longer decrypts (encryption key changed or lost); its ciphertext stays preserved in the registry - ${tail}`);
   }
   return '';
 }
@@ -219,6 +219,9 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   inst.updateToken = decryptRecordSecret(inst.id, 'updateToken', inst.updateToken);
   if (inst.fleetDb?.replication) {
     inst.fleetDb.replication.password = decryptRecordSecret(inst.id, 'fleetDb.replication.password', inst.fleetDb.replication.password) ?? '';
+  }
+  if (inst.fleetDb && inst.fleetDb.password !== undefined) {
+    inst.fleetDb.password = decryptRecordSecret(inst.id, 'fleetDb.password', inst.fleetDb.password, 'restore the key') ?? '';
   }
   if (inst.fleetJoin) {
     inst.fleetJoin.code = decryptRecordSecret(inst.id, 'fleetJoin.code', inst.fleetJoin.code) ?? '';
@@ -241,7 +244,7 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
-  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code];
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetDb?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code];
   for (const text of [inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code]) {
     const joined = text ? decodeJoinCode(text) : null;
     if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
@@ -306,6 +309,9 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: encryptedOrStashed(inst.id, 'fleetDb.replication.password', out.fleetDb.replication.password) ?? '' } };
   }
+  if (out.fleetDb && out.fleetDb.password !== undefined) {
+    out.fleetDb = { ...out.fleetDb, password: encryptedOrStashed(inst.id, 'fleetDb.password', out.fleetDb.password) ?? '' };
+  }
   if (out.fleetDb?.formerMain) {
     out.fleetDb = { ...out.fleetDb, formerMain: { ...out.fleetDb.formerMain, code: encryptedOrStashed(inst.id, 'fleetDb.formerMain.code', out.fleetDb.formerMain.code) ?? '' } };
   }
@@ -332,6 +338,9 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.migrateLast = inst.migrateLast ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
+  }
+  if (out.fleetDb && out.fleetDb.password !== undefined) {
+    out.fleetDb = { ...out.fleetDb, password: '' };
   }
   if (out.fleetDb?.formerMain) {
     out.fleetDb = { ...out.fleetDb, formerMain: { ...out.fleetDb.formerMain, code: '' } };
@@ -704,6 +713,17 @@ export function updateInstanceFleetDbReplication(
   } else {
     instance.fleetDb = keptPlain.length > 0 ? { ...rest, keptPlain } : rest;
   }
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return instance;
+}
+
+/** Record the bot role's password for the managed database; null when the instance or its record is gone. */
+export function updateInstanceFleetDbPassword(botId: string, password: string): InstanceConfig | null {
+  const registry = loadRegistry();
+  const instance = registry.instances[botId];
+  if (!instance || !instance.fleetDb) return null;
+  instance.fleetDb = { ...instance.fleetDb, password };
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
   return instance;
@@ -1225,7 +1245,7 @@ export function deployedComposeExists(botId: string): boolean {
  * the ones already running.
  */
 export function adoptFleetDbReplicaAsPrimary(
-  botId: string, replication?: FleetDbReplication, restoreNotice?: InstanceConfig['fleetRestoreError'], formerMain?: { machine: string; generation: number },
+  botId: string, replication?: FleetDbReplication, restoreNotice?: InstanceConfig['fleetRestoreError'], formerMain?: { machine: string; generation: number }, password?: string,
 ): { success: boolean; error?: string } {
   const registry = loadRegistry();
   const stored = registry.instances[botId];
@@ -1241,7 +1261,7 @@ export function adoptFleetDbReplicaAsPrimary(
   }
   // The replication posture, when the caller recovered the credential the copy
   // already carries (B6 map F30): enable then keeps it instead of minting.
-  stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume, ...(replication ? { replication } : {}) };
+  stored.fleetDb = { containerName: replica.containerName, user: replica.user, db: replica.db, volume: replica.volume, ...(password ? { password } : {}), ...(replication ? { replication } : {}) };
   delete stored.fleetDbReplica;
   // A take-over from a main whose restore had not finished: the notice lands in the same save as the flip.
   if (restoreNotice) stored.fleetRestoreError = restoreNotice;
@@ -4974,7 +4994,7 @@ export function ensureFleetDataBackend(instance: InstanceConfig, opts: { forMigr
     const password = crypto.randomBytes(24).toString('base64url');
     const newUrl = `postgresql://${spec.user}:${password}@${containerName}:5432/${spec.database}`;
     envManager.setEnvVars(instance.id, { [spec.env.url]: newUrl });
-    stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume });
+    stampFleetDb(instance, { containerName, user: spec.user, db: spec.database, volume, password });
     return { containerName, volume, password, user: spec.user, db: spec.database };
   }
 

@@ -133,7 +133,7 @@ const botDir = path.join(h.dir, 'bots', 'b1');
 const DB_SECRET = 'Db-Secret-0123456789';
 const REPL_SECRET = 'Repl-Secret-0123456789';
 const dbUrl = `postgresql://smdb:${DB_SECRET}@bot1-fleet-postgres:5432/smdb?sslmode=no-verify`;
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: DB_SECRET };
 const replication = { role: 'replicator', password: REPL_SECRET, hostPort: 15432, publicHost: 'primary.invalid', certHost: 'primary.invalid', slotWalKeepMb: 4096 };
 
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {

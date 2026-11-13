@@ -155,9 +155,10 @@ describe('composeJoinCode and peerCode', () => {
   it("without the replication login", () => {
     expect(composeJoinCode(inst({ fleetDb: { ...(inst().fleetDb), replication: { ...inst().fleetDb.replication, password: '' } } }), target)).toEqual({ ok: false, error: "this machine's replication login is not stored" });
   });
-  it('without the bot password in the stored URL', () => {
-    vi.spyOn(envManager, 'getEnvVars').mockReturnValue({} as any);
-    expect(composeJoinCode(inst(), target)).toEqual({ ok: false, error: "the bot's database password could not be read from the stored database URL" });
+  it('without the bot password on record (NM14 CJ-ABSENT, CJ-LOST)', () => {
+    const { password: _p, ...absent } = inst().fleetDb;
+    expect(composeJoinCode(inst({ fleetDb: absent }), target)).toEqual({ ok: false, error: "the managed database's password is not on record (a join code or Enable records it from a Database URL whose password this database accepts)" });
+    expect(composeJoinCode(inst({ fleetDb: { ...inst().fleetDb, password: '' } }), target)).toEqual({ ok: false, error: "the managed database's password on record no longer decrypts" });
   });
   it('with a certificate that does not read', () => {
     expect(composeJoinCode(inst(), { ...target, cert: 'junk' })).toEqual({ ok: false, error: 'the registered certificate does not read' });

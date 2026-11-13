@@ -54,6 +54,7 @@ export interface FleetDbRecord {
   user: string;
   db: string;
   volume: string;
+  password?: string;                   // the bot role's password in this database; encrypted at rest
   replication?: FleetDbReplication;
   retiringAt?: string;                 // ISO time a retire first began removing this database; leaves with the record once a retire finishes
   keptPlain?: string[];                // FleetDbReplication.keptPlain a Disable carried over; the next start narrows them

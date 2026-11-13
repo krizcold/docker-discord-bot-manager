@@ -80,7 +80,7 @@ import { disableFleetReplication, dropFleetSlot, enableFleetReplication, getFlee
 import { FIXTURE_FP, FIXTURE_PEM } from './join-fake';
 
 const dbUrl = 'postgresql://smdb:Db-Secret,%25x@m-fleet-postgres:5432/smdb?sslmode=no-verify';
-const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'm-fleet-postgres-data' };
+const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'm-fleet-postgres-data', password: 'Db-Secret,%x' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'main.invalid', certHost: 'main.invalid', slotWalKeepMb: 4096 };
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { m: {
@@ -120,7 +120,7 @@ describe('O1: the join code (C1 to C7)', () => {
     ['T-1 replication off', () => writeRegistry({ fleetDb }), 'Replication is not enabled, so there is no join code.'],
     ['T-2 an unfinished Disable', () => writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, disablingSince: '2026-10-25T00:00:00.000Z' } } }), 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it'],
     ['T-4 the database is stopped', () => { h.running = 'false'; }, 'The database container is not running, so its certificate cannot be read for the join code'],
-    ['T-6 no app password', () => envManager.setEnvVars('m', { DATA_BACKEND_URL: '' }), "The bot's database password could not be read from the stored database URL, so no join code was made"],
+    ['T-6 no app password (NM14 JC-ABSENT)', () => { writeRegistry({ fleetDb: { ...fleetDb, password: undefined, replication } }); envManager.setEnvVars('m', { DATA_BACKEND_URL: '' }); }, "The managed database's password is not on record (the Database URL holds no password to check), so no join code was made"],
   ])('C1, C4, C6: %s', async (_n, arrange, error) => {
     arrange();
     expect(await getJoinCode(bot())).toEqual({ success: false, error });

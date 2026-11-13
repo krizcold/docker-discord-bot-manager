@@ -57,7 +57,7 @@ const writeRegistry = (sourceUrl = 'https://example.invalid/fake/super-modular-d
         id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl,
         envVars: { DATA_BACKEND: 'postgres' },
-        fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'v', replication },
+        fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'v', password: 'fake-pass', replication },
         createdAt: '2026-10-22T00:00:00.000Z', updatedAt: '2026-10-22T00:00:00.000Z',
       },
     },

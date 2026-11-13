@@ -148,6 +148,18 @@ export async function readBotLogin(t: DbTarget): Promise<{ ok: true; login: BotL
   return { ok: true, login };
 }
 
+/** The SCRAM verifier the database keeps for the bot role, read as the manager's role; never logged or shown. */
+export async function readRoleVerifier(t: DbTarget): Promise<{ ok: true; verifier: string } | { ok: false; why: string }> {
+  const bad = botRoleRefusal(t.user);
+  if (bad) return { ok: false, why: bad };
+  const read = await managerPsql(t, `SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_authid WHERE rolname = '${t.user}') THEN 'missing' ELSE 'v|' || coalesce((SELECT rolpassword FROM pg_authid WHERE rolname = '${t.user}'), '') END`);
+  if (!read.ok) return { ok: false, why: read.error };
+  const out = read.stdout.trim();
+  if (out === 'missing') return { ok: false, why: `the role ${t.user} does not exist in the database` };
+  if (out.startsWith('v|SCRAM-SHA-256$')) return { ok: true, verifier: out.slice(2) };
+  return { ok: false, why: `the database keeps no SCRAM-SHA-256 password for ${t.user}` };
+}
+
 async function alterLogin(t: DbTarget, login: boolean): Promise<DbResult> {
   const bad = refused(t);
   if (bad) return bad;

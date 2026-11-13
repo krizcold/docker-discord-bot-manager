@@ -117,7 +117,7 @@ import { runOnDataDir, FENCED_HBA, MANAGED_HBA, ownedFencedHba } from './fence-f
 
 const botDir = path.join(h.dir, 'bots', 'b1');
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const OUTSIDE = 'postgresql://u:secret@db.example.test:5432/app';
 const record = (over: Record<string, unknown> = {}) => ({ to: 'file', from: 'postgres', destination: null, companion: false, jobId: 'mgr-a', jobIds: ['mgr-a'], posted: true, started: 1, kept: 0, phase: 'following', loginOpened: true, sharers: [], sharersStopped: [], openedAt: '2026-10-31T00:00:00.000Z', ...over });
 
@@ -174,7 +174,14 @@ afterAll(() => {
 
 
 const PRIVATE = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
-const NO_PASSWORD = 'Could not recover the database password from the stored URL';
+const NO_PASSWORD = "The managed database's password is not on record (the Database URL holds no password to check), so Enable cannot write its address into the Database URL; nothing was changed";
+const NO_PASSWORD_D = "The managed database's password is not on record (the Database URL holds no password to check), so Disable cannot set the Database URL back; nothing was disabled";
+const dropRecordPassword = () => {
+  const file = path.join(h.dir, 'instances.json');
+  const reg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  delete reg.instances.b1.fleetDb.password;
+  fs.writeFileSync(file, JSON.stringify(reg));
+};
 
 describe('fenceLinesRefusal names the lane that owns the lines', () => {
   const addBot2 = () => {
@@ -207,21 +214,24 @@ describe('the Database URL Enable and Disable read', () => {
     expect(r.urlKept).toBeUndefined();
     expect(storedUrl()).toBe(PRIVATE);
   });
-  it('a Database URL of spaces is blank, so Enable needs the stored password and refuses without it', async () => {
+  it('a Database URL of spaces is blank, so Enable needs the recorded password and refuses without it', async () => {
+    dropRecordPassword();
     envManager.setEnvVars('b1', { DATA_BACKEND_URL: '   ' });
     expect(await enable()).toEqual({ success: false, error: NO_PASSWORD });
     expect(bot().fleetDb!.replication).toBeUndefined();
   });
-  it('a managed URL with no password: Enable refuses and changes nothing', async () => {
+  it('a managed URL with no password and none recorded: Enable refuses and changes nothing', async () => {
+    dropRecordPassword();
     envManager.setEnvVars('b1', { DATA_BACKEND_URL: 'postgresql://smdb@bot1-fleet-postgres:5432/smdb' });
     expect(await enable()).toEqual({ success: false, error: NO_PASSWORD });
     expect(bot().fleetDb!.replication).toBeUndefined();
     expect(ran(/replicator/).length).toBe(0);
   });
-  it('a managed URL with no password: Disable refuses and keeps replication on', async () => {
+  it('a managed URL with no password and none recorded: Disable refuses and keeps replication on', async () => {
     expect((await enable()).success).toBe(true);
+    dropRecordPassword();
     envManager.setEnvVars('b1', { DATA_BACKEND_URL: 'postgresql://smdb@bot1-fleet-postgres:5432/smdb' });
-    expect(await disableFleetReplication(bot())).toEqual({ success: false, error: NO_PASSWORD });
+    expect(await disableFleetReplication(bot())).toEqual({ success: false, error: NO_PASSWORD_D });
     expect(bot().fleetDb!.replication!.hostPort).toBe(15432);
   });
   it('a join code saved as the Database URL is kept as no single database address', async () => {

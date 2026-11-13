@@ -25,11 +25,13 @@ vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
   const { EventEmitter } = await import('events');
   const { PassThrough } = await import('stream');
+  const { roleVerifierAnswer } = await import('./join-fake');
   const execFile = (_cmd: string, args: string[], opts: any, cb?: any) => {
     const done = typeof opts === 'function' ? opts : cb;
     h.calls.push(args);
     const line = args.join(' ');
     if (args[0] === 'inspect') setImmediate(() => done(null, 'true\n', ''));
+    else if (args[0] === 'exec' && args.join(' ').includes('pg_authid')) setImmediate(() => done(null, roleVerifierAnswer('Db-Secret-0123456789'), ''));
     else if (args[0] === 'exec' && line.includes('smdb-write-fence')) {
       setImmediate(() => h.stripFails ? done(new Error('exit 1'), '', 'sed: cannot rename pg_hba.conf: Read-only file system\n') : done(null, '', ''));
     } else if (args[0] === 'exec' && line.includes('pg_is_in_recovery(),')) setImmediate(() => done(null, h.probe, ''));

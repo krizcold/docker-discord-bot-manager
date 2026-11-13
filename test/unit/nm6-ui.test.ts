@@ -313,3 +313,32 @@ describe('UG10 (fixer 3): the window of a bot on JSON files or an outside databa
     expect(tips((await open({ dataPlace: null })).html)).toContain("Can't confirm where this bot keeps its data: its env store cannot be read.");
   });
 });
+
+describe('NM14 T6: a probe that did not run says so', () => {
+  const render = async (reachability: Record<string, unknown>): Promise<string> => {
+    const body: any = { isConnected: true, innerHTML: '', querySelectorAll: () => [] };
+    const replication = { enabled: true, publicHost: 'h', hostPort: 15432, live: { sslOn: true, standbys: [], slots: [], slotWalKeep: '4096MB' }, reachability };
+    const ctx = vm.createContext({
+      document: { activeElement: null, getElementById: (id: string) => (id === 'fleet-replication-body' ? body : null) },
+      setTimeout: () => 0,
+      bots: [{ id: 'b1', status: 'running' }],
+      fleetBackupBotId: 'b1',
+      api: async () => ({ success: true, replication }),
+      Array, String, Number, JSON, Date, Math, Object, encodeURIComponent,
+    });
+    const names = ['escapeHtml', 'jsArg', 'renderFleetReplication'].concat(['panelHasEntry', 'fleetReplEnabledText'].filter(n => pageHtml.includes(`function ${n}(`)));
+    vm.runInContext(names.map(pageFunction).join('\n'), ctx);
+    await ctx.renderFleetReplication('b1');
+    return body.innerHTML as string;
+  };
+  it('an unchecked probe reads "Endpoint not checked" with its reason, never "NOT reachable"', async () => {
+    const html = await render({ ok: false, unchecked: true, error: "the bot's database password is not on record", ageSeconds: 0 });
+    expect(tips(html)).toContain('Endpoint not checked: the bot&#39;s database password is not on record');
+    expect(html).not.toContain('NOT reachable');
+  });
+  it('a probe that ran and failed keeps its text', async () => {
+    const html = await render({ ok: false, error: 'timeout', ageSeconds: 0 });
+    expect(html).toContain('Endpoint NOT reachable from containers yet');
+    expect(html).not.toContain('Endpoint not checked');
+  });
+});

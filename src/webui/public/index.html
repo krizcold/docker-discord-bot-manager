@@ -2862,6 +2862,7 @@
       const reachAge = reach && reach.ageSeconds > 0 ? ` (checked ${reach.ageSeconds}s ago)` : '';
       const reachHtml = !live ? ''
         : reach && reach.ok ? `<div class="env-tip" style="color:var(--success);">Endpoint reachable from containers${reachAge}</div>`
+        : reach && reach.unchecked ? `<div class="env-tip" style="color:var(--warning);">Endpoint not checked: ${escapeHtml(reach.error || 'no reason given')}</div>`
         : reach ? `<div class="env-tip" style="color:var(--warning);">Endpoint NOT reachable from containers yet (restart pending, or blocked by a firewall / hairpin routing): ${escapeHtml(reach.error || 'no response')}${reachAge}</div><div class="env-tip">Other machines need this address and port open. A machine that cannot open a port can be the main only when it runs alone.</div>`
         : '';
       const keepBytes = (() => {

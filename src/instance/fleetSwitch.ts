@@ -18,7 +18,7 @@ import * as maintenance from './maintenance';
 import { callAppHook, capabilityRefusal } from './appHookClient';
 import { notifyOwner } from './backupCheck';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
-import { storedDbPassword } from './fleetReplication';
+import { managedDbPassword } from './fleetReplication';
 import { certFingerprint, decodeJoinCode, encodeJoinCode, JoinCode, lsnToBigInt, machineText, sqlLiteral } from '../config/joinCode';
 import { DM_RETRY_MS, utcText } from './backupFiles';
 import {
@@ -343,8 +343,11 @@ export function composeJoinCode(instance: InstanceConfig, target: { host: string
   const db = instance.fleetDb;
   const repl = db?.replication;
   if (!db || !repl || !repl.password) return { ok: false, error: "this machine's replication login is not stored" };
-  const password = storedDbPassword(instance);
-  if (!password) return { ok: false, error: "the bot's database password could not be read from the stored database URL" };
+  const app = managedDbPassword(instance);
+  if (!app.ok) {
+    return { ok: false, error: app.why === 'lost' ? "the managed database's password on record no longer decrypts" : "the managed database's password is not on record (a join code or Enable records it from a Database URL whose password this database accepts)" };
+  }
+  const password = app.password;
   let fp: string;
   try { fp = certFingerprint(target.cert); } catch { return { ok: false, error: 'the registered certificate does not read' }; }
   const code: JoinCode = { v: 1, host: target.host, port: target.port, db: db.db, fp, machine: machineText(target.machine), repl: { user: repl.role, password: repl.password }, app: { user: db.user, password } };

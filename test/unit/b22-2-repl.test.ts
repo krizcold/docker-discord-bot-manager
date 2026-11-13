@@ -16,9 +16,11 @@ vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
   const { EventEmitter } = await import('events');
   const { PassThrough } = await import('stream');
+  const { roleVerifierAnswer } = await import('./join-fake');
   const execFile = (_cmd: string, args: string[], opts: any, cb?: any) => {
     const done = typeof opts === 'function' ? opts : cb;
     if (args[0] === 'inspect') setImmediate(() => done(null, 'true\n', ''));
+    else if (args[0] === 'exec' && args.join(' ').includes('pg_authid')) setImmediate(() => done(null, roleVerifierAnswer('Db-Secret-0123456789'), ''));
     else if (args[0] === 'exec' && h.conninfo && args.join(' ').includes("grep '^primary_conninfo'")) setImmediate(() => done(null, h.conninfo, ''));
     else if (args[0] === 'exec') setImmediate(() => done(null, h.exec, ''));
     else setImmediate(() => done(null, '', ''));
@@ -55,9 +57,9 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
   return {
     ...real,
-    adoptFleetDbReplicaAsPrimary: (id: string, replication?: any) => {
+    adoptFleetDbReplicaAsPrimary: (...args: Parameters<typeof real.adoptFleetDbReplicaAsPrimary>) => {
       if (h.refuseFlip) throw new Error('ENOSPC: no space left on device');
-      return real.adoptFleetDbReplicaAsPrimary(id, replication);
+      return real.adoptFleetDbReplicaAsPrimary(...args);
     },
   };
 });
@@ -76,7 +78,7 @@ import * as fleetReplica from '../../src/instance/fleetReplica';
 const { adoptPromotedReplica } = fleetReplica;
 
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
-const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
+const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'primary.invalid', certHost: 'primary.invalid', slotWalKeepMb: 4096 };
 const REPLICA = {
   containerName: 'bot1-fleet-postgres-replica', volume: 'bot1-fleet-postgres-replica-data', slot: 'fleet_standby_b1',

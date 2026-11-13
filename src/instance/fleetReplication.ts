@@ -27,12 +27,12 @@ import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
 import { InstanceConfig, FleetDbReplication } from '../types';
-import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier } from '../config/secretText';
+import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier, urlPassword, verifierAccepts } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
-import { certFingerprint, encodeJoinCode, machineText, sqlLiteral } from '../config/joinCode';
+import { certFingerprint, encodeJoinCode, machineText, splitBackendUrls, sqlLiteral } from '../config/joinCode';
 import { AddressesOutcome, sendAddresses } from './fleetJoin';
 import { hasHostParam, namesDatabaseOf, readDatabaseUrl, URL_FORM } from '../config/databaseUrl';
 
@@ -191,16 +191,76 @@ function isIpAddress(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
 }
 
-/** The database password, recovered from the stored URL like the managed-lane redeploy does. */
-export function storedDbPassword(instance: InstanceConfig): string | null {
+export type PasswordRead = { ok: true; password: string } | { ok: false; why: 'lost' } | { ok: false; why: 'absent'; detail?: string };
+
+/** The bot role's password the manager recorded for its managed database: absent when never recorded, lost when it no longer decrypts. */
+export function managedDbPassword(instance: InstanceConfig): { ok: true; password: string } | { ok: false; why: 'absent' | 'lost' } {
+  const password = instance.fleetDb?.password;
+  if (password === undefined) return { ok: false, why: 'absent' };
+  if (password === '') return { ok: false, why: 'lost' };
+  return { ok: true, password };
+}
+
+/** The record without its password: a password recorded while a lane runs is not a change of the record. */
+export function fleetDbShape(fleetDb: InstanceConfig['fleetDb'] | null | undefined): string | undefined {
+  if (!fleetDb) return JSON.stringify(undefined);
+  const { password: _p, ...rest } = fleetDb;
+  return JSON.stringify(rest);
+}
+
+const FILL_NOURL = 'the Database URL holds no password to check';
+const fillUnread = (why: string) => `the password in the Database URL could not be checked against the database: ${why}`;
+
+/**
+ * managedDbPassword, and when none is recorded, the first password of the Database URL (then `extra`) that the bot
+ * role's verifier in the database accepts. With `record`, an accepted password is written into the record.
+ */
+export async function managedDbPasswordFilled(instance: InstanceConfig, opts: { extra?: string; record: boolean }): Promise<PasswordRead> {
+  const read = managedDbPassword(instance);
+  if (read.ok || read.why === 'lost') return read;
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb) return { ok: false, why: 'absent', detail: FILL_NOURL };
   const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
-  if (!urlKey) return null;
-  const url = (envManager.getEnvVars(instance.id)[urlKey] || '').trim();
-  try {
-    return decodeURIComponent(new URL(url).password) || null;
-  } catch {
-    return null;
+  const unreadStore = urlKey ? urlStoreRefusal(instance.id, urlKey) : null;
+  if (unreadStore) return { ok: false, why: 'absent', detail: fillUnread(unreadStore) };
+  const value = urlKey ? (envManager.getEnvVars(instance.id)[urlKey] || '').trim() : '';
+  const named: string[] = [];
+  const others: string[] = [];
+  for (const entry of value === '' ? [] : splitBackendUrls(value)) {
+    const pw = urlPassword(entry);
+    if (!pw) continue;
+    const first = readDatabaseUrl(entry).addresses[0];
+    (first && namesDatabaseOf(first, fleetDb) ? named : others).push(pw);
   }
+  const fromUrl = [...new Set([...named, ...others])];
+  const extra = opts.extra || '';
+  const candidates = [...new Set([...fromUrl, ...(extra ? [extra] : [])])];
+  if (candidates.length === 0) return { ok: false, why: 'absent', detail: FILL_NOURL };
+  const state = await containerState(fleetDb.containerName);
+  if (state.running !== true) return { ok: false, why: 'absent', detail: fillUnread(dbDownText(state, 'the database is not running')) };
+  const verifier = await dbLogin.readRoleVerifier({ container: fleetDb.containerName, user: fleetDb.user });
+  if (!verifier.ok) return { ok: false, why: 'absent', detail: fillUnread(verifier.why) };
+  let accepted: string | undefined;
+  for (const c of candidates) {
+    const verdict = await verifierAccepts(verifier.verifier, c, fleetDb.user);
+    if (typeof verdict === 'object') return { ok: false, why: 'absent', detail: fillUnread(verdict.why) };
+    if (verdict) { accepted = c; break; }
+  }
+  if (accepted === undefined) {
+    const where = fromUrl.length > 0 && extra ? "in the Database URL or in the bot's env file" : fromUrl.length > 0 ? 'in the Database URL' : "in the bot's env file";
+    return { ok: false, why: 'absent', detail: `the database does not accept the password ${where} for ${fleetDb.user}` };
+  }
+  if (opts.record) {
+    try {
+      // Only over the record the caller read: a lane whose record changed meanwhile refuses on its own check.
+      if (fleetDbShape(containerManager.getBot(instance.id)?.fleetDb) === fleetDbShape(fleetDb)) {
+        containerManager.updateInstanceFleetDbPassword(instance.id, accepted);
+      }
+    } catch (err) {
+      console.warn(`[FleetReplication] ${instance.id}: the database accepted the password in the Database URL, but it could not be recorded (${err instanceof Error ? err.message : String(err)}); the next use checks it again`);
+    }
+  }
+  return { ok: true, password: accepted };
 }
 
 /**
@@ -219,6 +279,14 @@ function keptUrlWhat(instance: InstanceConfig, urlKey: string): string | null {
   if (!first) return 'no single database address';
   if (instance.fleetDb && namesDatabaseOf(first, instance.fleetDb)) return null;
   return `${first.host.includes(':') ? `[${first.host}]` : first.host}:${first.port}/${first.db}`;
+}
+
+/** Why the Database URL cannot be written over now: the env store does not read, or its URL value no longer decrypts. */
+function urlStoreRefusal(botId: string, urlKey: string): string | null {
+  const store = envManager.getEnvVarsWithStatus(botId);
+  if (store.corrupt) return envManager.storeBrokenDiagnosis(botId);
+  if (store.undecryptable.includes(urlKey)) return `the env store's value of ${urlKey} no longer decrypts; re-enter it or restore the encryption key first`;
+  return null;
 }
 
 const urlKeptEnable = (what: string) => `The Database URL was kept as it is: it names ${what}, not this bot's managed database, so the bot goes on using it; Enable writes the managed database's address only when the Database URL is blank or names that database.`;
@@ -382,10 +450,20 @@ async function enableInLane(
   }
   const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
   if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; nothing was changed, so retry Enable after that` };
-  // The caller's password is a fallback for a manager env that holds no database URL (an adopt whose env write was refused).
   const kept = keptUrlWhat(instance, dbEnv.url);
-  const dbPassword = kept ? null : storedDbPassword(instance) || opts.dbPassword || null;
-  if (!kept && !dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
+  let dbPassword: string | null = null;
+  if (!kept) {
+    const broken = urlStoreRefusal(instance.id, dbEnv.url);
+    if (broken) return { success: false, error: broken };
+    // The caller's password is checked too: the bot's env file, for a manager env that holds no database URL.
+    const read = await managedDbPasswordFilled(instance, { extra: opts.dbPassword, record: true });
+    if (!read.ok) {
+      return { success: false, error: read.why === 'lost'
+        ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Enable cannot write its address into the Database URL; nothing was changed"
+        : `The managed database's password is not on record (${read.detail}), so Enable cannot write its address into the Database URL; nothing was changed` };
+    }
+    dbPassword = read.password;
+  }
   // An existing posture whose password reads empty is a key-loss scrub, not an
   // absent credential: minting a fresh one here would silently rotate the
   // fleet's replication credential and break every standby at its next
@@ -393,7 +471,7 @@ async function enableInLane(
   if (fleetDb.replication && !fleetDb.replication.password) {
     return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable replication and re-enable it to mint a fresh credential (existing standbys must then be re-seeded).' };
   }
-  const recordAtStart = JSON.stringify(fleetDb);
+  const recordAtStart = fleetDbShape(fleetDb);
 
   const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.db);
   if (!live.ok) return { success: false, error: `could not read which clients connect without TLS (nothing was changed): ${live.error}` };
@@ -471,7 +549,7 @@ async function enableInLane(
   // accepts non-TLS only from 172.16/12, and a docker daemon with custom
   // address pools allocates outside it; hostssl covers every subnet.
   const changed = `the database already has the replication role, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
-  if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
+  if (fleetDbShape(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
     return { success: false, certRotated, error: `The instance's database record changed while this Enable ran, so the record and the database URL were not written; ${changed}. Check the Replication section, then press Enable again` };
   }
   try {
@@ -520,12 +598,22 @@ async function disableInLane(
 ): Promise<DisableResult> {
   const fleetDb = instance.fleetDb;
   if (!fleetDb?.replication) return { success: false, error: 'Replication is not enabled' };
-  const disableRecordAtStart = JSON.stringify(fleetDb);
+  const disableRecordAtStart = fleetDbShape(fleetDb);
   const dbEnv = findAppCapabilities(instance.sourceUrl)?.companionDb?.env;
   if (!dbEnv) return { success: false, error: 'This app declares no managed database companion (nothing was disabled)' };
   const kept = keptUrlWhat(instance, dbEnv.url);
-  const dbPassword = kept ? null : storedDbPassword(instance);
-  if (!kept && !dbPassword) return { success: false, error: envManager.storeBrokenDiagnosis(instance.id) || 'Could not recover the database password from the stored URL' };
+  let dbPassword: string | null = null;
+  if (!kept) {
+    const broken = urlStoreRefusal(instance.id, dbEnv.url);
+    if (broken) return { success: false, error: broken };
+    const read = await managedDbPasswordFilled(instance, { record: true });
+    if (!read.ok) {
+      return { success: false, error: read.why === 'lost'
+        ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Disable cannot set the Database URL back; nothing was disabled"
+        : `The managed database's password is not on record (${read.detail}), so Disable cannot set the Database URL back; nothing was disabled` };
+    }
+    dbPassword = read.password;
+  }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
@@ -553,14 +641,14 @@ async function disableInLane(
   // database, so the record says a Disable is under way until it finishes:
   // an interrupted one is then shown, and pressing Disable again finishes it.
   const before = containerManager.getBot(instance.id);
-  if (JSON.stringify(before?.fleetDb) !== disableRecordAtStart) {
+  if (fleetDbShape(before?.fleetDb) !== disableRecordAtStart) {
     return { success: false, error: "The instance's database record changed while this Disable ran its checks (nothing was disabled); check the Replication section, then press Disable replication again" };
   }
   let markedRecord: string;
   try {
     const marked = containerManager.updateInstanceFleetDbReplication(instance.id, { ...fleetDb.replication, disablingSince: fleetDb.replication.disablingSince ?? new Date().toISOString() });
     if (!marked?.fleetDb?.replication) return { success: false, error: 'The instance record is gone (nothing was disabled)' };
-    markedRecord = JSON.stringify(containerManager.getBot(instance.id)?.fleetDb);
+    markedRecord = fleetDbShape(containerManager.getBot(instance.id)?.fleetDb)!;
   } catch (err) {
     return { success: false, error: `could not record that a Disable is under way (nothing was disabled): ${String(err)}` };
   }
@@ -598,7 +686,7 @@ async function disableInLane(
     return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
   }
 
-  if (JSON.stringify(containerManager.getBot(instance.id)?.fleetDb) !== markedRecord) {
+  if (fleetDbShape(containerManager.getBot(instance.id)?.fleetDb) !== markedRecord) {
     return { success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the replication login is revoked. Check the Replication section, then press Disable replication again to finish it" };
   }
   // ssl=on and the authored pg_hba survive the disable, so the local form
@@ -682,23 +770,27 @@ export interface FleetReplicationStatus {
   /** Can a container on the default bridge reach the published endpoint (the
    * path a node on another host dials)? Catches firewall traps before
    * a cross-host standby is pointed at a dead port. */
-  reachability?: { ok: boolean; error?: string; ageSeconds: number };
+  reachability?: { ok: boolean; unchecked?: true; error?: string; ageSeconds: number };
   /** The database could not be read (live stays absent): docker's or psql's last line. Absent with no live means docker said it is stopped. */
   probeError?: string;
 }
 
 const PROBE_CACHE_MS = 60_000;
 const PROBE_TIMEOUT_MS = 20_000;
-const probeCache: Map<string, { ok: boolean; error?: string; at: number }> = new Map();
+type Reachability = { ok: boolean; unchecked?: true; error?: string };
+const probeCache: Map<string, Reachability & { at: number }> = new Map();
 
 function forgetProbes(botId: string): void {
   for (const key of [...probeCache.keys()]) if (key.startsWith(`${botId}|`)) probeCache.delete(key);
 }
 
-function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?: string }> {
+async function probeEndpoint(instance: InstanceConfig): Promise<Reachability> {
   const repl = instance.fleetDb!.replication!;
-  const dbPassword = storedDbPassword(instance);
-  if (!dbPassword) return Promise.resolve({ ok: false, error: 'stored URL unreadable' });
+  const read = await managedDbPasswordFilled(instance, { record: false });
+  if (!read.ok) {
+    return { ok: false, unchecked: true, error: read.why === 'lost' ? "the bot's database password on record no longer decrypts" : `the bot's database password is not on record (${read.detail})` };
+  }
+  const dbPassword = read.password;
   const url = `postgresql://${instance.fleetDb!.user}@${repl.publicHost}:${repl.hostPort}/${instance.fleetDb!.db}?sslmode=require&connect_timeout=8`;
   // The password rides the docker CLI's environment (`-e NAME` with no value), never its argv.
   return new Promise(resolve => {
@@ -710,12 +802,12 @@ function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?:
   });
 }
 
-async function cachedReachability(instance: InstanceConfig): Promise<{ ok: boolean; error?: string; ageSeconds: number }> {
+async function cachedReachability(instance: InstanceConfig): Promise<Reachability & { ageSeconds: number }> {
   const repl = instance.fleetDb!.replication!;
   const key = `${instance.id}|${repl.publicHost}:${repl.hostPort}`;
   const cached = probeCache.get(key);
   if (cached && Date.now() - cached.at < PROBE_CACHE_MS) {
-    return { ok: cached.ok, error: cached.error, ageSeconds: Math.round((Date.now() - cached.at) / 1000) };
+    return { ok: cached.ok, ...(cached.unchecked ? { unchecked: true as const } : {}), error: cached.error, ageSeconds: Math.round((Date.now() - cached.at) / 1000) };
   }
   const result = await probeEndpoint(instance);
   probeCache.set(key, { ...result, at: Date.now() });
@@ -887,8 +979,13 @@ export async function getJoinCode(instance: InstanceConfig): Promise<{ success: 
   } catch (err) {
     return { success: false, error: `The database's certificate could not be read, so no join code was made: ${err instanceof Error ? err.message : String(err)}` };
   }
-  const appPassword = storedDbPassword(instance);
-  if (!appPassword) return { success: false, error: "The bot's database password could not be read from the stored database URL, so no join code was made" };
+  const app = await managedDbPasswordFilled(instance, { record: true });
+  if (!app.ok) {
+    return { success: false, error: app.why === 'lost'
+      ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so no join code was made; restore the key"
+      : `The managed database's password is not on record (${app.detail}), so no join code was made` };
+  }
+  const appPassword = app.password;
   const joinCode = encodeJoinCode({
     v: 1,
     host: repl.publicHost,

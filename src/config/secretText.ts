@@ -74,6 +74,34 @@ export function scramSha256Verifier(password: string, salt: Buffer = crypto.rand
   return `SCRAM-SHA-256$${iterations}:${salt.toString('base64')}$${storedKey.toString('base64')}:${serverKey.toString('base64')}`;
 }
 
+const MAX_VERIFIER_ITERATIONS = 100000;
+
+/**
+ * Whether a stored `SCRAM-SHA-256$<iterations>:<salt>$<storedKey>:<serverKey>` verifier of `user` was made from this
+ * password; `{ why }` when its iteration count is above what the manager derives.
+ */
+export async function verifierAccepts(verifier: string, candidate: string, user: string): Promise<boolean | { why: string }> {
+  const m = /^SCRAM-SHA-256\$([1-9]\d{0,9}):([A-Za-z0-9+/]+={0,2})\$[A-Za-z0-9+/]+={0,2}:[A-Za-z0-9+/]+={0,2}$/.exec(String(verifier ?? ''));
+  if (!m) return false;
+  const iterations = Number(m[1]);
+  if (iterations > MAX_VERIFIER_ITERATIONS) {
+    return { why: `the database's SCRAM-SHA-256 password for ${user} uses ${iterations} iterations, more than the ${MAX_VERIFIER_ITERATIONS} the manager checks` };
+  }
+  const password = String(candidate ?? '');
+  if (!/^[\x00-\x7f]*$/.test(password)) return false;
+  const salt = Buffer.from(m[2], 'base64');
+  const salted = await new Promise<Buffer | null>(resolve => {
+    crypto.pbkdf2(password, salt, iterations, 32, 'sha256', (err, key) => resolve(err ? null : key));
+  });
+  if (!salted) return false;
+  const storedKey = crypto.createHash('sha256').update(crypto.createHmac('sha256', salted).update('Client Key').digest()).digest();
+  const serverKey = crypto.createHmac('sha256', salted).update('Server Key').digest();
+  const made = `SCRAM-SHA-256$${iterations}:${salt.toString('base64')}$${storedKey.toString('base64')}:${serverKey.toString('base64')}`;
+  const a = Buffer.from(made);
+  const b = Buffer.from(verifier);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 /**
  * The session settings that keep a role statement out of the server log: a
  * failing statement is logged with its text at the default

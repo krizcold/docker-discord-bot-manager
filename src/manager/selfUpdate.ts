@@ -13,7 +13,8 @@
  * recreate untouched, so users and MFA seeds are preserved. Sessions are not: they
  * live in Authelia's memory, so a restart or recreate of Authelia logs admins out.
  */
-import { spawn, execFile } from 'child_process';
+import { execFile } from 'child_process';
+import { startProcess, execFileGuarded } from '../docker/processStart';
 import { randomUUID, createHash } from 'crypto';
 import { promisify } from 'util';
 import * as fs from 'fs';
@@ -223,7 +224,7 @@ async function gitAsync(args: string[], opts: { writes?: boolean; termAfterMs?: 
 /** One docker CLI call off the event loop. A read passes a timeout; a call that changes the stack passes none. */
 function dockerCall(args: string[], opts: { timeout?: number; cwd?: string } = {}): Promise<{ status: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    execFile('docker', args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+    execFileGuarded('docker', args, { encoding: 'utf-8', maxBuffer: 16 * 1024 * 1024, ...opts }, (err, stdout, stderr) => {
       const timedOut = !!err && (err as { killed?: boolean }).killed === true;
       resolve({
         status: err ? 1 : 0,
@@ -300,10 +301,12 @@ async function composeHasService(self: SelfInfo, service: string): Promise<boole
 /** Stream a child process's stdout+stderr to emit(), line by line. */
 function streamProc(cmd: string, args: string[], emit: Emit, cwd?: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd, env: { ...process.env, DOCKER_BUILDKIT: '1' } });
+    const started = startProcess(cmd, args, { cwd, env: { ...process.env, DOCKER_BUILDKIT: '1' } });
+    if (!started.child) return reject(new Error(started.error));
+    const child = started.child;
     const onData = (buf: Buffer) => buf.toString().split(/[\r\n]+/).forEach((l) => { if (l.trim()) emit(l); });
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
     child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`${cmd} exited with code ${code}`))));
     child.on('error', reject);
   });

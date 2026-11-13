@@ -3,7 +3,8 @@
  * identity and its address list, writes the certificate files the bot reads, and keeps the bot's DATA_BACKEND_URL
  * as the list of every database address.
  */
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
+import { startProcess, execFileGuarded } from '../docker/processStart';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
@@ -54,7 +55,7 @@ function errorText(err: unknown): string {
 }
 
 function dockerRm(name: string): Promise<void> {
-  return new Promise(resolve => execFile('docker', ['rm', '-f', name], { timeout: READ_TIMEOUT_MS }, () => resolve()));
+  return new Promise(resolve => execFileGuarded('docker', ['rm', '-f', name], { timeout: READ_TIMEOUT_MS }, () => resolve()));
 }
 
 /**
@@ -65,15 +66,14 @@ function dockerRm(name: string): Promise<void> {
  */
 export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password'>, mounts: string[], entrypoint: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
-        ...mounts.flatMap(m => ['-v', m]),
-        '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
-    } catch (err) {
-      resolve({ ok: false, stdout: '', stderr: `docker run could not start (${errorText(err)})` });
+    const started = startProcess('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
+      ...mounts.flatMap(m => ['-v', m]),
+      '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
+    if (!started.child) {
+      resolve({ ok: false, stdout: '', stderr: `docker run could not start (${started.reason})` });
       return;
     }
+    const child = started.child;
     let stdout = '';
     let stderr = '';
     let done = false;
@@ -175,7 +175,7 @@ export async function mainCertificate(code: JoinCode): Promise<CertCheck> {
   let got: { ok: true; pem: string; fp: string } | { ok: false; reason: string };
   if (local?.fleetDb) {
     got = await new Promise(resolve => {
-      execFile('docker', ['exec', local.fleetDb!.containerName, 'cat', `${PGDATA}/server.crt`], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
+      execFileGuarded('docker', ['exec', local.fleetDb!.containerName, 'cat', `${PGDATA}/server.crt`], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) return resolve({ ok: false, reason: (String(stderr || err.message).trim().split('\n').pop() || 'docker exec failed') });
         try {
           const pem = String(stdout);
@@ -220,11 +220,11 @@ export function ensureProbeCert(botId: string, fp: string, pem: string): string 
 /** J4: the client image, pulled when missing. */
 export async function ensureClientImage(): Promise<string | null> {
   const present = await new Promise<boolean>(resolve => {
-    execFile('docker', ['image', 'inspect', 'postgres:16-alpine'], { timeout: READ_TIMEOUT_MS }, err => resolve(!err));
+    execFileGuarded('docker', ['image', 'inspect', 'postgres:16-alpine'], { timeout: READ_TIMEOUT_MS }, err => resolve(!err));
   });
   if (present) return null;
   return new Promise(resolve => {
-    execFile('docker', ['pull', 'postgres:16-alpine'], { timeout: PULL_TIMEOUT_MS }, (err, _o, stderr) => {
+    execFileGuarded('docker', ['pull', 'postgres:16-alpine'], { timeout: PULL_TIMEOUT_MS }, (err, _o, stderr) => {
       resolve(err ? `could not pull postgres:16-alpine: ${String(stderr || err).trim().split('\n').pop()}` : null);
     });
   });
@@ -591,7 +591,7 @@ export async function readCopyFacts(rec: { containerName: string; user?: string;
     COALESCE(GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())::text, pg_current_wal_lsn()::text)`;
   const args = ['exec', rec.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', sql];
   const r = await dbLogin.asManager({ container: rec.containerName, user: rec.user }, role => new Promise<{ ok: boolean; out: string }>(resolve => {
-    execFile('docker', dbLogin.withRole(args, role), { timeout: COPY_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
+    execFileGuarded('docker', dbLogin.withRole(args, role), { timeout: COPY_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
   }), x => !x.ok && dbLogin.isMissingManagerRole(x.out));
   if (!r.ok) return { ok: false, reason: "the copy's database did not answer" };
   const [rec_, status, systemId, timeline, lsnText] = r.out.trim().split('|');
@@ -605,7 +605,7 @@ export async function readCopyFacts(rec: { containerName: string; user?: string;
 /** The copy's own server certificate, read from its running container. */
 export function readCopyCert(containerName: string): Promise<string | null> {
   return new Promise(resolve => {
-    execFile('docker', ['exec', containerName, 'cat', `${PGDATA}/server.crt`], { timeout: READ_TIMEOUT_MS }, (err, stdout) => {
+    execFileGuarded('docker', ['exec', containerName, 'cat', `${PGDATA}/server.crt`], { timeout: READ_TIMEOUT_MS }, (err, stdout) => {
       const pem = err ? '' : String(stdout).trim();
       resolve(CERT_PEM_RE.test(pem) ? pem : null);
     });

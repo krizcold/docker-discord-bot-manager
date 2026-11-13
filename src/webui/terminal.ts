@@ -18,7 +18,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { spawn, ChildProcess, ChildProcessWithoutNullStreams } from 'child_process';
+import { ChildProcess } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import { createHash, randomBytes } from 'crypto';
 import { WebSocket } from 'ws';
 import { getBot } from '../docker/containerManager';
@@ -43,19 +44,18 @@ export function spawnCapture(
   opts: { input?: Buffer; timeoutMs?: number } = {}
 ): Promise<{ stdout: Buffer; stderr: string; code: number; timedOut: boolean }> {
   return new Promise((resolve) => {
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      child = spawn(cmd, args, { windowsHide: true });
-    } catch (e) {
-      resolve({ stdout: Buffer.alloc(0), stderr: (e as Error).message || 'spawn failed', code: 1, timedOut: false });
+    const started = startProcess(cmd, args, { windowsHide: true });
+    if (!started.child) {
+      resolve({ stdout: Buffer.alloc(0), stderr: started.reason || 'spawn failed', code: 1, timedOut: false });
       return;
     }
+    const child = started.child;
     const out: Buffer[] = [];
     let err = '';
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* ignore */ } }, opts.timeoutMs || EXEC_TIMEOUT_MS);
-    child.stdout.on('data', (d) => out.push(d as Buffer));
-    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.stdout?.on('data', (d) => out.push(d as Buffer));
+    child.stderr?.on('data', (d) => { err += d.toString(); });
     child.on('error', () => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err || 'spawn failed', code: 1, timedOut }); });
     child.on('close', (code) => { clearTimeout(timer); resolve({ stdout: Buffer.concat(out), stderr: err, code: code == null ? 1 : code, timedOut }); });
     feedStdin(child.stdin, opts.input);
@@ -342,14 +342,13 @@ function boundedContainerOp(t: ContainerTarget, paths: string[], argv: string[])
     }
   };
   return new Promise((resolve) => {
-    let child: ChildProcess;
-    try {
-      child = spawn('docker', execArgs(t, argv), { windowsHide: true });
-    } catch (e) {
+    const started = startProcess('docker', execArgs(t, argv), { windowsHide: true });
+    if (!started.child) {
       release(0);
-      resolve({ stdout: '', stderr: (e as Error).message || 'spawn failed', code: 1, timedOut: false });
+      resolve({ stdout: '', stderr: started.reason || 'spawn failed', code: 1, timedOut: false });
       return;
     }
+    const child = started.child;
     const out: Buffer[] = [];
     let err = '';
     let answered = false;
@@ -1323,8 +1322,13 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
 
   // Node's stdin is a pipe, so some daemons refuse `-t` ("the input device is not
   // a TTY"). On that error, retry once without a TTY (line-buffered but usable).
-  const launch = (useTty: boolean): void => {
-    const child = spawn('docker', buildExecArgs(target, useTty, cols, rows), { windowsHide: true });
+  const launch = (useTty: boolean): boolean => {
+    const started = startProcess('docker', buildExecArgs(target, useTty, cols, rows), { windowsHide: true });
+    if (!started.child) {
+      send(ws, 'terminal:error', { message: started.reason });
+      return false;
+    }
+    const child = started.child;
     (ws as any).__term = { child } as TermSession;
     child.stdin?.on('error', () => { /* the exit event tells the browser the session ended */ });
 
@@ -1334,7 +1338,7 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
       if (useTty && !retried && /not a TTY/i.test(d.toString())) {
         retried = true;
         try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        launch(false);
+        if (!launch(false)) (ws as any).__term = undefined;
         return;
       }
       forward(d);
@@ -1348,10 +1352,10 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
       if (retried && useTty) return;
       send(ws, 'terminal:error', { message: err instanceof Error ? err.message : String(err) });
     });
+    return true;
   };
 
-  launch(true);
-  send(ws, 'terminal:ready', { container: target });
+  if (launch(true)) send(ws, 'terminal:ready', { container: target });
 }
 
 /**

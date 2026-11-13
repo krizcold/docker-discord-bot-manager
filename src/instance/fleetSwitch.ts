@@ -4,7 +4,7 @@
  * rejoin as a copy, Keep this machine as the main, and the tick that writes the generation row, sends the switch
  * notice and finds a main that another database replaced. Every switch raises the generation row (contract 4).
  */
-import { spawn } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as containerManager from '../docker/containerManager';
@@ -63,13 +63,12 @@ export type Guarded = { ok: boolean; code: number | null; stdout: string; stderr
  */
 export function runGuarded(cmd: string, args: string[], opts: { input?: string; inputPath?: string; timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<Guarded> {
   return new Promise(resolve => {
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn(cmd, args, opts.env ? { env: opts.env } : {});
-    } catch (err) {
-      resolve({ ok: false, code: null, stdout: '', stderr: '', error: `${cmd} could not start (${errText(err)})` });
+    const started = startProcess(cmd, args, opts.env ? { env: opts.env } : {});
+    if (!started.child) {
+      resolve({ ok: false, code: null, stdout: '', stderr: '', error: started.error });
       return;
     }
+    const child = started.child;
     let stdout = '';
     let stderr = '';
     let done = false;

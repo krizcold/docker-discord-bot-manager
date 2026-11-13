@@ -5,7 +5,7 @@
  * line on either side. Errors come back password-redacted.
  */
 
-import { spawn } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import { redactSecrets, urlPassword } from '../config/secretText';
 
 const PROBE_TIMEOUT_MS = 10_000;
@@ -16,7 +16,9 @@ type RunResult = { code: number | null; stderr: string; killed: boolean; spawnEr
 
 function runDocker(args: string[], timeoutMs: number, env: NodeJS.ProcessEnv = process.env): Promise<RunResult> {
   return new Promise(resolve => {
-    const child = spawn('docker', args, { env });
+    const started = startProcess('docker', args, { env });
+    if (!started.child) return resolve({ code: null, stderr: '', killed: false, spawnError: started.reason });
+    const child = started.child;
     let stderr = '';
     let killed = false;
     let settled = false;

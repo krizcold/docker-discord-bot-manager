@@ -7,7 +7,7 @@
  * (see templates/pcsProcessing), not in how it is run.
  */
 
-import { spawn } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import { verifyComposeProjectRunning } from '../docker/dockerClient';
 import { createLineHandler, DockerLogFn } from '../docker/outputStream';
 
@@ -25,7 +25,13 @@ export async function deployApp(
     console.log(`[CasaOS API] Deploying ${appName} from ${composePath}`);
 
     const args = ['compose', '-p', appName, '-f', composePath, 'up', '-d', '--remove-orphans'];
-    const child = spawn('docker', args);
+    const started = startProcess('docker', args);
+    if (!started.child) {
+      console.error(`[CasaOS API] Failed to spawn docker compose for ${appName}:`, started.reason);
+      resolve({ success: false, error: `Failed to start deploy: ${started.reason}` });
+      return;
+    }
+    const child = started.child;
     const outputLines: string[] = [];
 
     const timeout = setTimeout(() => {
@@ -41,15 +47,15 @@ export async function deployApp(
     };
     const out = createLineHandler(onLine);
     const err = createLineHandler(onLine);
-    child.stdout.on('data', out.data);
-    child.stderr.on('data', err.data);
+    child.stdout?.on('data', out.data);
+    child.stderr?.on('data', err.data);
 
     child.on('close', async (code) => {
       clearTimeout(timeout);
       out.flush();
       err.flush();
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       if (code !== 0) {
@@ -78,8 +84,8 @@ export async function deployApp(
 
     child.on('error', (err) => {
       clearTimeout(timeout);
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       console.error(`[CasaOS API] Failed to spawn docker compose for ${appName}:`, err);
@@ -103,7 +109,13 @@ export async function composeDown(
     console.log(`[CasaOS API] Tearing down ${appName} from ${composePath}`);
 
     const args = ['compose', '-p', appName, '-f', composePath, 'down', '--remove-orphans'];
-    const child = spawn('docker', args);
+    const started = startProcess('docker', args);
+    if (!started.child) {
+      console.error(`[CasaOS API] Failed to spawn docker compose down for ${appName}:`, started.reason);
+      resolve({ success: false, error: `Failed to start compose down: ${started.reason}` });
+      return;
+    }
+    const child = started.child;
     const outputLines: string[] = [];
 
     const timeout = setTimeout(() => {
@@ -119,15 +131,15 @@ export async function composeDown(
     };
     const out = createLineHandler(onLine);
     const err = createLineHandler(onLine);
-    child.stdout.on('data', out.data);
-    child.stderr.on('data', err.data);
+    child.stdout?.on('data', out.data);
+    child.stderr?.on('data', err.data);
 
     child.on('close', (code) => {
       clearTimeout(timeout);
       out.flush();
       err.flush();
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       if (code === 0) {
@@ -145,8 +157,8 @@ export async function composeDown(
 
     child.on('error', (err) => {
       clearTimeout(timeout);
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       console.error(`[CasaOS API] Failed to spawn docker compose down for ${appName}:`, err);

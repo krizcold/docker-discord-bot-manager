@@ -3,7 +3,7 @@
  * login (blocked, opened, read back). The manager logs in as MANAGER_DB_ROLE over the container's local socket, so
  * a bot role with NOLOGIN never locks the manager out.
  */
-import { execFile } from 'child_process';
+import { execFileGuarded } from '../docker/processStart';
 import { REPLICATION_ROLE } from './fleetReplication';
 import { FENCE_OWNER_FILE_SQL, parseFenceOwner } from './fleetBackupGuards';
 
@@ -47,7 +47,7 @@ const FENCE_EXEMPT = ['-e', 'PGOPTIONS=-c default_transaction_read_only=off'];
 
 function psql(container: string, role: string, sql: string, exempt = false): Promise<{ ok: true; stdout: string } | DbFailure> {
   return new Promise(resolve => {
-    execFile('docker', ['exec', ...(exempt ? FENCE_EXEMPT : []), container, 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['exec', ...(exempt ? FENCE_EXEMPT : []), container, 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ ok: true, stdout: String(stdout) });
       const text = String(stderr || '') || (err.killed ? `docker did not answer within ${PSQL_TIMEOUT_MS / 1000} s` : err.message);
       const cls = psqlFailureClass(text);
@@ -211,7 +211,7 @@ export async function endBotSessions(t: DbTarget, pauseMs = 1000): Promise<{ ok:
 /** Whether the container runs: null when docker could not say. */
 export function sidecarRunning(container: string): Promise<boolean | null> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', container], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['inspect', '-f', '{{.State.Running}}', container], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve(String(stdout).trim() === 'true');
       resolve(/no such object|no such container/i.test(String(stderr || err.message)) ? false : null);
     });
@@ -221,7 +221,7 @@ export function sidecarRunning(container: string): Promise<boolean | null> {
 /** Docker's state of the container: restarting while its restart policy loops (Running stays true then); null when docker could not say. */
 export function sidecarState(container: string): Promise<'running' | 'restarting' | 'stopped' | null> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}} {{.State.Restarting}}', container], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['inspect', '-f', '{{.State.Running}} {{.State.Restarting}}', container], { timeout: PSQL_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (err) return resolve(/no such object|no such container/i.test(String(stderr || err.message)) ? 'stopped' : null);
       const [running, restarting] = String(stdout).trim().split(/\s+/);
       if (running === 'false' && (restarting === 'true' || restarting === 'false')) return resolve('stopped');

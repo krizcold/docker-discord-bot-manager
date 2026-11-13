@@ -18,7 +18,7 @@
  * verify-full with the cert delivered alongside it.
  */
 
-import { execFile, spawn } from 'child_process';
+import { startProcess, execFileGuarded } from '../docker/processStart';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -92,11 +92,11 @@ async function plainClientsOutsidePool(containerName: string, db: string): Promi
  */
 function ownContainersOutsidePool(projectName: string, sidecarName: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
   return new Promise(resolve => {
-    execFile('docker', ['ps', '-q', '--filter', `label=com.docker.compose.project=${projectName}`], { timeout: EXEC_TIMEOUT_MS }, (psErr, psOut, psStderr) => {
+    execFileGuarded('docker', ['ps', '-q', '--filter', `label=com.docker.compose.project=${projectName}`], { timeout: EXEC_TIMEOUT_MS }, (psErr, psOut, psStderr) => {
       if (psErr) return resolve({ ok: false, error: probeErrorTail(String(psStderr || psErr)) });
       const ids = String(psOut).split('\n').map(line => line.trim()).filter(Boolean);
       if (ids.length === 0) return resolve({ ok: true, addrs: [] });
-      execFile('docker', ['inspect', '-f', '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}', ...ids], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
+      execFileGuarded('docker', ['inspect', '-f', '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}} {{end}}', ...ids], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) return resolve({ ok: false, error: probeErrorTail(String(stderr || err)) });
         const addrs = String(stdout).split('\n').flatMap(line => {
           const [name, ...rest] = line.trim().split(/\s+/);
@@ -111,12 +111,14 @@ function ownContainersOutsidePool(projectName: string, sidecarName: string): Pro
 
 function dbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    const child = spawn('docker', ['exec', ...(stdin !== undefined ? ['-i'] : []), containerName, ...args]);
+    const started = startProcess('docker', ['exec', ...(stdin !== undefined ? ['-i'] : []), containerName, ...args]);
+    if (!started.child) return resolve({ ok: false, stdout: '', stderr: 'docker exec failed' });
+    const child = started.child;
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), EXEC_TIMEOUT_MS);
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
+    child.stdout?.on('data', d => { stdout += d; });
+    child.stderr?.on('data', d => { stderr += d; });
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker exec failed' }); });
     child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
     if (stdin !== undefined) feedStdin(child.stdin, stdin);
@@ -168,7 +170,7 @@ function psqlScript(containerName: string, db: string, sql: string): Promise<{ o
 type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
 function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ running: String(stdout).trim() === 'true' });
       const text = String(stderr || err || '');
       resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });
@@ -232,7 +234,7 @@ function sidecarUrl(instance: InstanceConfig, dbPassword: string): string {
 export function generateCertPair(dir: string, publicHost: string): Promise<{ ok: boolean; error?: string }> {
   const san = isIpAddress(publicHost) ? `IP:${publicHost}` : `DNS:${publicHost}`;
   return new Promise(resolve => {
-    execFile('openssl', [
+    execFileGuarded('openssl', [
       'req', '-new', '-x509', '-days', '3650', '-nodes', '-newkey', 'rsa:2048',
       '-subj', `/CN=${publicHost}`, '-addext', `subjectAltName=${san}`,
       '-keyout', path.join(dir, 'server.key'), '-out', path.join(dir, 'server.crt'),
@@ -700,7 +702,7 @@ function probeEndpoint(instance: InstanceConfig): Promise<{ ok: boolean; error?:
   const url = `postgresql://${instance.fleetDb!.user}@${repl.publicHost}:${repl.hostPort}/${instance.fleetDb!.db}?sslmode=require&connect_timeout=8`;
   // The password rides the docker CLI's environment (`-e NAME` with no value), never its argv.
   return new Promise(resolve => {
-    execFile('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
+    execFileGuarded('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
       { timeout: PROBE_TIMEOUT_MS, env: { ...process.env, PGPASSWORD: dbPassword } }, (err, stdout, stderr) => {
         if (!err && String(stdout).trim() === '1') resolve({ ok: true });
         else resolve({ ok: false, error: redactSecrets(childFailureText(stderr, err) || 'no response', [dbPassword]).split('\n').pop() });

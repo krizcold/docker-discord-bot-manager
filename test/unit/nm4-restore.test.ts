@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const tmp = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -111,6 +111,19 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     },
   };
 });
+
+vi.mock('../../src/instance/dbLogin', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/dbLogin')>();
+  return {
+    ...real,
+    withRole: (args: string[], role: string) => {
+      const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
+      if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
+      return real.withRole(args, role);
+    },
+  };
+});
+afterEach(() => { (globalThis as any).__withRoleCrash = null; });
 
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
@@ -622,8 +635,7 @@ describe('the named rows', () => {
 
 describe('R-NOTICE: a throw past the notice leaves N-PENDING in the registry', () => {
   it.each(['drop', 'pg_restore', 'raise', 'lift'])('throw at %s', async (point) => {
-    if (point === 'raise') claimDb.onRaise = () => { throw new Error('docker crashed at raise'); };
-    else pg.throwAt = point;
+    (globalThis as any).__withRoleCrash = ({ drop: 'DROP DATABASE', pg_restore: 'pg_restore', raise: "setval('smdb_data.claim_seq'", lift: 'ALTER SYSTEM RESET' } as Record<string, string>)[point];
     await restore().catch(() => {});
     expect(registryA().fleetRestoreError.text).toMatch(PENDING);
     expect(containerManager.isBotBusy('a')).toBeNull();

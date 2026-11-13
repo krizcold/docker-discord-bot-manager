@@ -14,7 +14,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { spawn, execFile } from 'child_process';
+import type { ChildProcess } from 'child_process';
+import { startProcess, execFileGuarded } from '../docker/processStart';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
@@ -345,7 +346,7 @@ export function clearClaimFloor(botId: string): void {
 type ContainerState = { running: boolean; error?: undefined } | { running: null; error: string };
 function containerState(containerName: string): Promise<ContainerState> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['inspect', '-f', '{{.State.Running}}', containerName], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve({ running: String(stdout).trim() === 'true' });
       const text = String(stderr || err || '');
       resolve(/no such object|no such container/i.test(text) ? { running: false } : { running: null, error: probeErrorTail(text) });
@@ -364,7 +365,7 @@ function dbDownText(state: ContainerState, stopped: string): string {
 
 function execDocker(args: string[], timeout?: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    execFile('docker', args, { maxBuffer: 4 * 1024 * 1024, ...(timeout ? { timeout } : {}) }, (err, stdout, stderr) => {
+    execFileGuarded('docker', args, { maxBuffer: 4 * 1024 * 1024, ...(timeout ? { timeout } : {}) }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr || (err?.killed ? `docker did not answer within ${(timeout ?? 0) / 1000} s` : '')) });
     });
   });
@@ -1191,16 +1192,13 @@ function dumpOnce(target: DumpTarget, role: string, dir: string, fileName: strin
     let holderClosed = false;
     let onHolderClose: (() => void) | null = null;
     let snapshot: { id: string; inRecovery: boolean; dbBytes: number; dataAt: number | null; counts: Record<string, number> } | null = null;
-    let dump: ReturnType<typeof spawn> | null = null;
+    let dump: ChildProcess | null = null;
     let out: fs.WriteStream | null = null;
     let dumpTimer: ReturnType<typeof setTimeout> | null = null;
 
-    let holder: ReturnType<typeof spawn>;
-    try {
-      holder = spawn('docker', dbLogin.withRole(['exec', '-i', target.containerName, 'psql', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', MANAGER_DB_ROLE, '-d', target.db], role));
-    } catch (err: any) {
-      return resolve({ success: false, error: `Failed to run docker exec: ${err?.message || err}` });
-    }
+    const holderStart = startProcess('docker', dbLogin.withRole(['exec', '-i', target.containerName, 'psql', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', MANAGER_DB_ROLE, '-d', target.db], role));
+    if (!holderStart.child) return resolve({ success: false, error: `Failed to run docker exec: ${holderStart.reason}` });
+    const holder = holderStart.child;
     const fail = (error: string) => {
       if (settled) return;
       settled = true;
@@ -1272,11 +1270,9 @@ function dumpOnce(target: DumpTarget, role: string, dir: string, fileName: strin
 
     const startDump = () => {
       const snap = snapshot!;
-      try {
-        dump = spawn('docker', dbLogin.withRole(['exec', target.containerName, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', `--snapshot=${snap.id}`, target.db], role));
-      } catch (err: any) {
-        return fail(`Failed to run docker exec: ${err?.message || err}`);
-      }
+      const dumpStart = startProcess('docker', dbLogin.withRole(['exec', target.containerName, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', `--snapshot=${snap.id}`, target.db], role));
+      if (!dumpStart.child) return fail(`Failed to run docker exec: ${dumpStart.reason}`);
+      dump = dumpStart.child;
       out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
       let killed = false;
       dumpTimer = setTimeout(() => { killed = true; dump?.kill('SIGKILL'); }, dumpTiming.dumpTimeoutMs);
@@ -1991,13 +1987,12 @@ export function readDumpToc(containerName: string, dumpPath: string): Promise<{ 
       input?.destroy();
       resolve(result);
     };
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn('docker', ['exec', '-i', containerName, 'timeout', '-s', 'KILL', String(tocTiming.inContainerSec), 'pg_restore', '-l']);
-    } catch (err: any) {
-      finish({ ok: false, error: `Failed to run docker exec: ${err?.message || err}` });
+    const started = startProcess('docker', ['exec', '-i', containerName, 'timeout', '-s', 'KILL', String(tocTiming.inContainerSec), 'pg_restore', '-l']);
+    if (!started.child) {
+      finish({ ok: false, error: `Failed to run docker exec: ${started.reason}` });
       return;
     }
+    const child = started.child;
     let stdout = '';
     let stderr = '';
     let killed = false;
@@ -2508,9 +2503,11 @@ async function restoreLocked(
     const inContainerTimeoutSec = Math.floor(DUMP_TIMEOUT_MS / 1000);
     const restoreAs = (role: string) => new Promise<{ success: boolean; error?: string }>(resolve => {
       const restoreStartedAt = Date.now();
-      const child = spawn('docker', dbLogin.withRole(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
+      const started = startProcess('docker', dbLogin.withRole(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', '-i', fleetDb.containerName,
         'timeout', '-s', 'KILL', String(inContainerTimeoutSec),
         'pg_restore', '-U', MANAGER_DB_ROLE, '--exit-on-error', '-d', fleetDb.db], role));
+      if (!started.child) return resolve({ success: false, error: `Failed to run docker exec: ${started.reason}` });
+      const child = started.child;
       const input = fs.createReadStream(dumpPath);
       let stderr = '';
       let killed = false;
@@ -2529,13 +2526,13 @@ async function restoreLocked(
         resolve(result);
       };
 
-      input.pipe(child.stdin);
+      if (child.stdin) input.pipe(child.stdin);
       input.on('error', err => {
         child.kill('SIGKILL');
         finish({ success: false, error: `Failed to read dump file: ${err.message}` });
       });
-      child.stdin.on('error', () => { /* EPIPE when the child dies first; close handles it */ });
-      child.stderr.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
+      child.stdin?.on('error', () => { /* EPIPE when the child dies first; close handles it */ });
+      child.stderr?.on('data', d => { if (stderr.length < 4000) stderr += d.toString(); });
       child.on('error', err => finish({ success: false, error: `Failed to run docker exec: ${err.message}` }));
       child.on('close', code => {
         // 137 = the in-container timeout's KILL; the elapsed guard keeps a

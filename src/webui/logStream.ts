@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import { parseDockerLogLine } from '../docker/dockerClient';
 
 interface SseRes {
@@ -25,7 +25,13 @@ export function pipeContainerLogs(req: SseReq, res: SseRes, containerName: strin
   const args = ['logs', '--timestamps', '--tail', String(lines)];
   if (follow) args.splice(1, 0, '-f');
   args.push(containerName);
-  const logsProcess = spawn('docker', args);
+  const started = startProcess('docker', args);
+  if (!started.child) {
+    send('end', { code: null, error: started.reason });
+    if (res.writable) res.end();
+    return;
+  }
+  const logsProcess = started.child;
 
   const reader = () => {
     let partial = '';
@@ -49,10 +55,10 @@ export function pipeContainerLogs(req: SseReq, res: SseRes, containerName: strin
   };
   const out = reader();
   const err = reader();
-  logsProcess.stdout.setEncoding('utf8');
-  logsProcess.stderr.setEncoding('utf8');
-  logsProcess.stdout.on('data', out.push);
-  logsProcess.stderr.on('data', err.push);
+  logsProcess.stdout?.setEncoding('utf8');
+  logsProcess.stderr?.setEncoding('utf8');
+  logsProcess.stdout?.on('data', out.push);
+  logsProcess.stderr?.on('data', err.push);
 
   let finished = false;
   const finish = (data: { code: number | null; error?: string }) => {

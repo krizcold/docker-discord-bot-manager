@@ -6,7 +6,8 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { execFile, spawn } from 'child_process';
+import { execFile } from 'child_process';
+import { startProcess } from '../docker/processStart';
 import * as containerManager from '../docker/containerManager';
 import { BackupFamily, FleetBackupAlert, FleetBackupTestRecord, FleetBackupTests, InstanceConfig } from '../types';
 import { callAppHook, hasAppHooks } from './appHookClient';
@@ -117,13 +118,10 @@ type Verdict = { passed: true; tables: number; rows: number } | { passed: false;
 function restoreInto(name: string, dumpPath: string): Promise<string | null> {
   return new Promise(resolve => {
     const started = performance.now();
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn('docker', ['exec', '-i', name, 'timeout', '-s', 'KILL', String(testTiming.restoreSec),
-        'pg_restore', '-U', 'postgres', '--no-owner', '--no-privileges', '--exit-on-error', '-d', 'restorecheck']);
-    } catch (err: any) {
-      return resolve(`Failed to run docker exec: ${err?.message || err}`);
-    }
+    const start = startProcess('docker', ['exec', '-i', name, 'timeout', '-s', 'KILL', String(testTiming.restoreSec),
+      'pg_restore', '-U', 'postgres', '--no-owner', '--no-privileges', '--exit-on-error', '-d', 'restorecheck']);
+    if (!start.child) return resolve(`Failed to run docker exec: ${start.reason}`);
+    const child = start.child;
     const input = fs.createReadStream(dumpPath);
     let stderr = '';
     let killed = false;

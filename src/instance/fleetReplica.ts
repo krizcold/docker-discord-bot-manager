@@ -11,7 +11,7 @@
  * keeps endpoints, never credentials.
  */
 
-import { execFile, spawn } from 'child_process';
+import { startProcess, execFileGuarded } from '../docker/processStart';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -220,7 +220,7 @@ function throwIfCancelled(botId: string): void {
 
 function dockerRmForce(name: string): Promise<{ ok: boolean; stderr: string }> {
   return new Promise(resolve => {
-    execFile('docker', ['rm', '-f', name], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
+    execFileGuarded('docker', ['rm', '-f', name], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
       resolve({ ok: !err, stderr: String(stderr || err || '') });
     });
   });
@@ -234,7 +234,7 @@ function rmSettled(result: { ok: boolean; stderr: string }): boolean {
 /** true, false, or null when docker could not say; a destructive step must refuse on null. */
 function containerRunning(name: string): Promise<boolean | null> {
   return new Promise(resolve => {
-    execFile('docker', ['inspect', '--format', '{{.State.Running}}', name], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['inspect', '--format', '{{.State.Running}}', name], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) return resolve(String(stdout).trim() === 'true');
       resolve(/no such object|no such container/i.test(String(stderr || err)) ? false : null);
     });
@@ -336,7 +336,7 @@ function settleCancelledSeed(botId: string, purpose: FleetReplicaSeedPurpose, co
 // inferring absence from an arbitrary error skips a dump gate over real data.
 export function dockerVolumeState(name: string): Promise<'exists' | 'absent' | 'unknown'> {
   return new Promise(resolve => {
-    execFile('docker', ['volume', 'inspect', name], { timeout: READ_TIMEOUT_MS }, (err, _stdout, stderr) => {
+    execFileGuarded('docker', ['volume', 'inspect', name], { timeout: READ_TIMEOUT_MS }, (err, _stdout, stderr) => {
       if (!err) return resolve('exists');
       resolve(String(stderr || '').toLowerCase().includes('no such volume') ? 'absent' : 'unknown');
     });
@@ -353,7 +353,7 @@ function remintedVolumeRefusal(fleetDb: NonNullable<InstanceConfig['fleetDb']>):
   if (!fleetDb.retiringAt) return Promise.resolve(null);
   const began = Date.parse(fleetDb.retiringAt);
   return new Promise(resolve => {
-    execFile('docker', ['volume', 'inspect', '--format', '{{.CreatedAt}}', fleetDb.volume], { timeout: READ_TIMEOUT_MS }, (err, stdout) => {
+    execFileGuarded('docker', ['volume', 'inspect', '--format', '{{.CreatedAt}}', fleetDb.volume], { timeout: READ_TIMEOUT_MS }, (err, stdout) => {
       const created = err ? NaN : Date.parse(String(stdout).trim());
       if (Number.isNaN(created) || Number.isNaN(began)) {
         return resolve(`a removal of this database began at ${fleetDb.retiringAt}, and docker did not say when the volume ${fleetDb.volume} was created, so it cannot be told apart from one made after the removal; try again`);
@@ -375,12 +375,14 @@ async function volExec(volume: string, script: string, stdin?: string, extraMoun
     '-v', `${volume}:${PGDATA}`, ...extraMounts.flatMap(m => ['-v', m]),
     '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script];
   return new Promise(resolve => {
-    const child = spawn('docker', args);
+    const started = startProcess('docker', args);
+    if (!started.child) return resolve({ ok: false, stdout: '', stderr: 'docker run failed' });
+    const child = started.child;
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => { void dockerRmForce(helper).then(() => child.kill('SIGKILL')); }, EXEC_TIMEOUT_MS);
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
+    child.stdout?.on('data', d => { stdout += d; });
+    child.stderr?.on('data', d => { stderr += d; });
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker run failed' }); });
     child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
     if (stdin !== undefined) feedStdin(child.stdin, stdin);
@@ -389,7 +391,7 @@ async function volExec(volume: string, script: string, stdin?: string, extraMoun
 
 function replicaExec(containerName: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
   return new Promise(resolve => {
-    execFile('docker', ['exec', containerName, ...args], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
+    execFileGuarded('docker', ['exec', containerName, ...args], { timeout: EXEC_TIMEOUT_MS }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: String(stdout), stderr: String(stderr || err || '') });
     });
   });
@@ -922,7 +924,7 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
   const hostCertPath = hostCertPathFor(instance.id);
 
   const pulled = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    execFile('docker', ['pull', 'postgres:16-alpine'], { timeout: PULL_TIMEOUT_MS }, (err, _o, stderr) => {
+    execFileGuarded('docker', ['pull', 'postgres:16-alpine'], { timeout: PULL_TIMEOUT_MS }, (err, _o, stderr) => {
       resolve({ ok: !err, stderr: String(stderr || err || '') });
     });
   });
@@ -1606,7 +1608,7 @@ export function reseedStalePrimary(
  */
 async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNullable<InstanceConfig['fleetDb']>, dsn: ParsedDsn): Promise<string | null> {
   const local = await dbLogin.asManager({ container: fleetDb.containerName, user: fleetDb.user }, role => new Promise<{ ok: boolean; out: string }>(resolve => {
-    execFile('docker', dbLogin.withRole(['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-c',
+    execFileGuarded('docker', dbLogin.withRole(['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-c',
       'SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint())'], role),
     { timeout: PROBE_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
   }), r => !r.ok && dbLogin.isMissingManagerRole(r.out));
@@ -1764,7 +1766,7 @@ export async function decommissionFleetDb(
  */
 function instanceBindSources(botId: string): Promise<string[]> {
   return new Promise(resolve => {
-    execFile('docker', ['ps', '-a', '--filter', `label=bot-id=${botId}`, '--format', '{{.Names}}'], { timeout: EXEC_TIMEOUT_MS }, (listErr, listOut) => {
+    execFileGuarded('docker', ['ps', '-a', '--filter', `label=bot-id=${botId}`, '--format', '{{.Names}}'], { timeout: EXEC_TIMEOUT_MS }, (listErr, listOut) => {
       const names = listErr ? [] : String(listOut).split('\n').map(line => line.trim()).filter(Boolean);
       if (!names.length) return resolve([]);
       const format = '{{range .Mounts}}{{if eq .Type "bind"}}{{.Source}}{{println}}{{end}}{{end}}';
@@ -1773,7 +1775,7 @@ function instanceBindSources(botId: string): Promise<string[]> {
       // resolve, and a container that is gone mounts nothing, so that output is
       // complete. A daemon that cannot answer at all prints nothing and the
       // caller falls back on an empty list either way.
-      execFile('docker', ['inspect', '--format', format, ...names], { timeout: EXEC_TIMEOUT_MS }, (_inspectErr, inspectOut) => {
+      execFileGuarded('docker', ['inspect', '--format', format, ...names], { timeout: EXEC_TIMEOUT_MS }, (_inspectErr, inspectOut) => {
         resolve(String(inspectOut)
           .split('\n')
           .map(line => line.trim().replace(/\\/g, '/').replace(/\/+$/, ''))
@@ -1923,7 +1925,7 @@ export async function adoptPromotedReplica(
   // them and they shut out every outside client. The reload before the enable
   // applies the stripped file.
   const fence = await new Promise<{ ok: boolean; stderr: string }>(resolve => {
-    execFile('docker', ['exec', '-u', 'root', rec.containerName, 'sh', '-c', fleetBackup.stripCopiedFenceScript(PGDATA)], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
+    execFileGuarded('docker', ['exec', '-u', 'root', rec.containerName, 'sh', '-c', fleetBackup.stripCopiedFenceScript(PGDATA)], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
       resolve({ ok: !err, stderr: String(stderr || err || '') });
     });
   });

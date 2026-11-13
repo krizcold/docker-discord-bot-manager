@@ -3,7 +3,8 @@
  * Uses Docker CLI for cross-platform compatibility
  */
 
-import { execFile, execFileSync, execSync, spawn } from 'child_process';
+import { execFile, execFileSync, execSync } from 'child_process';
+import { startProcess } from './processStart';
 import { promisify } from 'util';
 import { ContainerInfo, LogEntry } from '../types';
 import { createLineHandler, DockerLogFn } from './outputStream';
@@ -485,18 +486,23 @@ export async function buildImage(
       env.DOCKER_BUILDKIT = '1';
     }
 
-    const child = spawn('docker', args, { env });
+    const started = startProcess('docker', args, { env });
+    if (!started.child) {
+      reject(new Error(started.reason));
+      return;
+    }
+    const child = started.child;
 
     const out = createLineHandler((line, key) => onProgress?.(line, key));
     const err = createLineHandler((line, key) => onProgress?.(line, key));
-    child.stdout.on('data', out.data);
-    child.stderr.on('data', err.data);
+    child.stdout?.on('data', out.data);
+    child.stderr?.on('data', err.data);
 
     child.on('close', (code) => {
       out.flush();
       err.flush();
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       if (code === 0) {
@@ -508,8 +514,8 @@ export async function buildImage(
     });
 
     child.on('error', (err2) => {
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
       reject(err2);
     });
@@ -528,18 +534,23 @@ export async function pullImage(
   console.log(`[Docker] Pulling image: ${imageName}`);
 
   return new Promise((resolve, reject) => {
-    const child = spawn('docker', args);
+    const started = startProcess('docker', args);
+    if (!started.child) {
+      reject(new Error(started.reason));
+      return;
+    }
+    const child = started.child;
 
     const out = createLineHandler((line, key) => onProgress?.(line, key));
     const err = createLineHandler((line, key) => onProgress?.(line, key));
-    child.stdout.on('data', out.data);
-    child.stderr.on('data', err.data);
+    child.stdout?.on('data', out.data);
+    child.stderr?.on('data', err.data);
 
     child.on('close', (code) => {
       out.flush();
       err.flush();
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       if (code === 0) {
@@ -551,8 +562,8 @@ export async function pullImage(
     });
 
     child.on('error', (err2) => {
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
       reject(err2);
     });
@@ -685,7 +696,12 @@ export async function composeUp(
       env.DOCKER_BUILDKIT = '1';
     }
 
-    const child = spawn('docker', args, { env });
+    const started = startProcess('docker', args, { env });
+    if (!started.child) {
+      reject(new Error(started.reason));
+      return;
+    }
+    const child = started.child;
 
     const onLine: DockerLogFn = (line, key) => {
       console.log(`[Compose] ${line}`);
@@ -693,14 +709,14 @@ export async function composeUp(
     };
     const out = createLineHandler(onLine);
     const err = createLineHandler(onLine);
-    child.stdout.on('data', out.data);
-    child.stderr.on('data', err.data);
+    child.stdout?.on('data', out.data);
+    child.stderr?.on('data', err.data);
 
     child.on('close', (code) => {
       out.flush();
       err.flush();
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
 
       if (code === 0) {
@@ -712,8 +728,8 @@ export async function composeUp(
     });
 
     child.on('error', (err2) => {
-      child.stdout.removeAllListeners();
-      child.stderr.removeAllListeners();
+      child.stdout?.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
       reject(err2);
     });

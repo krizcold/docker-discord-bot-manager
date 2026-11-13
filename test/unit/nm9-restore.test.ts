@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const tmp = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -58,6 +58,19 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     },
   };
 });
+
+vi.mock('../../src/instance/dbLogin', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/instance/dbLogin')>();
+  return {
+    ...real,
+    withRole: (args: string[], role: string) => {
+      const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
+      if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
+      return real.withRole(args, role);
+    },
+  };
+});
+afterEach(() => { (globalThis as any).__withRoleCrash = null; });
 
 vi.mock('child_process', async (importOriginal) => {
   const real = await importOriginal<typeof import('child_process')>();
@@ -482,7 +495,7 @@ describe('NM9 XA, XB, XD: a retry after a restart reads the floor from the resto
   };
 
   it.each([
-    ['XA a crash at the raise', () => v3({ onRaise: () => { throw new Error('docker crashed at raise'); } })],
+    ['XA a crash at the raise', () => { v3(); (globalThis as any).__withRoleCrash = "setval('smdb_data.claim_seq'"; }],
     ['XD after A20 (the raise failed)', () => v3({ fail: 'raise' })],
     ['XB after A25 (raised, the generation not written)', () => v3({ fail: 'genwrite' })],
   ] as Array<[string, () => void]>)('%s: the retry raises above the restored copy\'s highest number', async (_n, first) => {
@@ -502,7 +515,8 @@ describe('NM9 XA, XB, XD: a retry after a restart reads the floor from the resto
 
   it('XA after A28: a crash at the cap; the retry finds the restored copy, writes its floor and runs 7.1, not the cap', async () => {
     const loud = quiet();
-    noFloor({ onRaise: () => { throw new Error('docker crashed at the cap'); } });
+    noFloor();
+    (globalThis as any).__withRoleCrash = 'SET expires_up_ms = LEAST(';
     await restore().catch(() => undefined);
     expect(registryA().fleetRestoreError.text).toMatch(/^Restore of old\.dump has not finished/);
     expect(floorFile()).toBeNull();

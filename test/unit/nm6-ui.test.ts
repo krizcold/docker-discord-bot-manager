@@ -115,7 +115,7 @@ describe('UG3: the window titles and the State button', () => {
     const { ctx, els } = load(['showFleetBackups'], () => null, {
       bots: [bot], fleetBackupStored: null,
       fleetBackupListHtml: async () => '', fleetBackupErrorHtml: () => '', renderSeedBanner: noop, renderFleetReplication: noop, renderFleetSwitch: noop,
-      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop,
+      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop, renderConnectionLine: noop,
     });
     await ctx.showFleetBackups('a');
     return els['fleet-backup-content'].innerHTML;

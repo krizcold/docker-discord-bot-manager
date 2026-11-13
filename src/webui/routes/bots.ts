@@ -1842,6 +1842,20 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /** GET /api/bots/:id/fleet-connections - Whether the bot's machines can open more connections than the main accepts. */
+  router.get('/:id/fleet-connections', async (req: Request, res: Response) => {
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json({ success: true, connections: await fleetReplication.connectionReading(bot) });
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   /**
    * GET /api/bots/:id/fleet-replication/join-code - The join code other machines paste (it holds passwords; behind
    * manager auth by design, like the env editor).

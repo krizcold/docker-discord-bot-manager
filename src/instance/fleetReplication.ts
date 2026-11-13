@@ -901,3 +901,46 @@ export async function getJoinCode(instance: InstanceConfig): Promise<{ success: 
   });
   return { success: true, joinCode };
 }
+
+/** Connections one bot process opens to the main at most: data 10, claims 3, sweep 3, two listeners, one short session. */
+export const BOT_PROCESS_CONNECTIONS = 19;
+/** Connections the web UI beside it opens to the main at most: reader 2, requests 2, one listener, one short session. */
+export const WEB_UI_CONNECTIONS = 6;
+
+export function fleetConnectionCount(nodes: Array<{ restartable: boolean; overlap: boolean }>): { count: number; overlap: boolean } {
+  const overlap = nodes.length > 0 && nodes.every(n => n.restartable && n.overlap);
+  const count = nodes.reduce((sum, n) => sum + BOT_PROCESS_CONNECTIONS + (n.restartable ? WEB_UI_CONNECTIONS : 0) + (overlap ? BOT_PROCESS_CONNECTIONS : 0), 0);
+  return { count, overlap };
+}
+
+export type ConnectionReading =
+  | { state: 'none' }
+  | { state: 'unread'; error: string }
+  | { state: 'read'; machines: number; count: number; overlap: boolean; max: number; reserved: number; allowed: number };
+
+const CONNECTION_SETTINGS_SQL = "SELECT current_setting('max_connections') || '|' || current_setting('superuser_reserved_connections') || '|' || coalesce(current_setting('reserved_connections', true), '0') || '|' || (to_regclass('smdb_data.shard_nodes') IS NOT NULL)::text;";
+const SHARD_NODES_SQL = "SELECT coalesce(json_agg(json_build_object('restartable', restartable, 'overlap', reshard_overlap)), '[]') FROM smdb_data.shard_nodes WHERE seen_at > now() - interval '7 days';";
+
+export async function connectionReading(instance: InstanceConfig): Promise<ConnectionReading> {
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb) return { state: 'none' };
+  if ((await containerState(fleetDb.containerName)).running !== true) return { state: 'none' };
+  const unanswered = (r: { stderr: string }): ConnectionReading =>
+    ({ state: 'unread', error: `the database did not answer (${r.stderr.trim().split('\n').pop() || 'no answer'})` });
+  const unparsed: ConnectionReading = { state: 'unread', error: 'the database answered in a form the manager does not read' };
+  const settings = await psql(fleetDb.containerName, fleetDb.db, CONNECTION_SETTINGS_SQL);
+  if (!settings.ok) return unanswered(settings);
+  const m = /^(\d+)\|(\d+)\|(\d+)\|(true|false)$/.exec(settings.stdout.trim());
+  if (!m) return unparsed;
+  if (m[4] === 'false') return { state: 'none' };
+  const rows = await psql(fleetDb.containerName, fleetDb.db, SHARD_NODES_SQL);
+  if (!rows.ok) return unanswered(rows);
+  let nodes: unknown;
+  try { nodes = JSON.parse(rows.stdout.trim()); } catch { return unparsed; }
+  if (!Array.isArray(nodes) || !nodes.every(n => n && typeof n.restartable === 'boolean' && typeof n.overlap === 'boolean')) return unparsed;
+  if (nodes.length === 0) return { state: 'none' };
+  const max = Number(m[1]);
+  const reserved = Number(m[2]) + Number(m[3]);
+  const { count, overlap } = fleetConnectionCount(nodes);
+  return { state: 'read', machines: nodes.length, count, overlap, max, reserved, allowed: max - reserved };
+}

@@ -2592,6 +2592,7 @@
         <h3>Database: ${escapeHtml(bot?.displayName || botId)}</h3>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div id="fleet-state-line"></div><button class="btn btn-secondary btn-small" onclick="showStateWindow(${jsArg(botId)})">State...</button></div>
         <div id="fleet-memory-line" class="env-tip"></div>
+        <div id="fleet-connections-line" class="env-tip"></div>
         <div id="fleet-seed-banner"></div>
         <div id="fleet-backup-error">${fleetBackupErrorHtml(bots.find(b => b.id === botId)?.fleetBackup || fb)}</div>
         <div class="toggle-row" style="margin-bottom:12px;display:flex;align-items:center;gap:10px;">
@@ -2621,6 +2622,7 @@
       renderFleetSwitch(botId);
       refreshStateLine(botId);
       renderMemoryLine(botId);
+      renderConnectionLine(botId);
       if (bots.find(b => b.id === botId)?.fleetBackup !== bot?.fleetBackup) refreshFleetBackupStatus(botId);
     }
 
@@ -3457,6 +3459,27 @@
       const line = document.getElementById('fleet-memory-line');
       if (!line || fleetBackupBotId !== botId) return;
       line.textContent = memoryLineText(res);
+    }
+
+    function connectionLineText(res) {
+      const lead = "Connections: can't confirm that this database accepts every connection the bot can open: ";
+      if (!res) return `${lead}no answer from the manager`;
+      if (!res.success) return `${lead}${res.error}`;
+      const c = res.connections || {};
+      if (c.state === 'unread') return `${lead}${c.error}`;
+      if (c.state !== 'read' || c.count <= c.allowed) return '';
+      const machines = c.machines === 1 ? '1 machine' : `${c.machines} machines`;
+      const tail = c.overlap ? ' (during a reshard beside the running shards)' : '';
+      return `Connections: this bot's ${machines} seen in the last 7 days can open up to ${c.count} connections to this database at once${tail}, more than the ${c.allowed} it accepts (max_connections ${c.max}, less ${c.reserved} that Postgres reserves for superusers and for roles granted pg_use_reserved_connections). A connection past that is refused.`;
+    }
+
+    async function renderConnectionLine(botId) {
+      if (!document.getElementById('fleet-connections-line') || fleetBackupBotId !== botId) return;
+      let res;
+      try { res = await api('GET', `/bots/${botId}/fleet-connections`); } catch (err) { res = null; }
+      const line = document.getElementById('fleet-connections-line');
+      if (!line || fleetBackupBotId !== botId) return;
+      line.textContent = connectionLineText(res);
     }
 
     // ─── Switch and move ───

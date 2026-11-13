@@ -81,7 +81,7 @@ beforeEach(() => {
   r.calls = [];
   fs.writeFileSync(path.join(r.dir, 'instances.json'), JSON.stringify({ instances: {
     a: { id: 'a', sanitizedName: 'a', displayName: 'A', status: 'running', sourceUrl: 'https://example.invalid/x', createdAt: 'x', updatedAt: 'x',
-      fleetDb: { containerName: 'a-pg', user: 'app', db: 'app', volume: 'v' } },
+      fleetDb: { containerName: 'a-pg', user: 'app', db: 'app', volume: 'v', replication: { publicHost: 'h.invalid' } } },
   } }));
 });
 afterAll(() => fs.rmSync(r.dir, { recursive: true, force: true }));

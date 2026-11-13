@@ -2007,6 +2007,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(400).json({ success: false, error: 'joinCode is required' });
         return;
       }
+      const fdb = bot.fleetDb;
+      if (fdb && !fdb.replication && !fdb.replacedBy && !fdb.mainConflict && !(fdb.handover?.mode === 'stream' && fdb.handover.phase === 'stopped')) {
+        res.json({ success: false, error: 'Replication is not enabled on this database, so it cannot rejoin as a copy from a join code; enable it in the Replication section first; nothing was changed' });
+        return;
+      }
       res.json(fleetReplica.reseedStalePrimary(bot, joinCode, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

@@ -242,6 +242,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   });
 
   it('the route passes confirmVolume from the body', async () => {
+    writeRegistry({ fleetDb: { ...primary, replication: { publicHost: 'primary.invalid' } } });
     h.volumes.set(REPLICA_VOL, 'exists');
     const body = { joinCode: codeFor(DSN), publicHost: 'standby.invalid', hostPort: 5440, confirm: true };
     const asked = await call('/:id/fleet-reseed', { params: { id: 'a' }, body });

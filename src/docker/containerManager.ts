@@ -3681,6 +3681,11 @@ async function runningAppContainerId(botId: string, appName: string): Promise<st
   }
 }
 
+/** The running app container's id: null when none runs, undefined when docker could not answer. */
+export function runningAppContainer(instance: InstanceConfig): Promise<string | null | undefined> {
+  return runningAppContainerId(instance.id, instance.sanitizedName);
+}
+
 function containerCountText(ids: string[] | null): string {
   return ids ? `${ids.length} containers` : 'container count unknown: docker did not answer';
 }

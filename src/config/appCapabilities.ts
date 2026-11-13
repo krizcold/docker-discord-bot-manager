@@ -92,7 +92,8 @@ export type AppHookAction =
   | 'notify-owner'
   | 'switch-notice'
   | 'addresses'
-  | 'migrate';
+  | 'migrate'
+  | 'memory';
 
 // Shared by the companion declaration and the guided rows below, so a wizard
 // row can never drift from the declared key it edits.

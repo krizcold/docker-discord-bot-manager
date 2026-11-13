@@ -27,6 +27,7 @@ import * as fleetSwitch from '../../instance/fleetSwitch';
 import * as fleetMove from '../../instance/fleetMove';
 import * as maintenance from '../../instance/maintenance';
 import { memoryReading, readHostMemory } from '../../instance/memoryRoom';
+import { memorySendState } from '../../instance/memorySend';
 import * as migrate from '../../instance/migrate';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
@@ -1012,7 +1013,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.status(404).json({ success: false, error: 'Bot not found' });
         return;
       }
-      res.json({ success: true, memory: memoryReading(await containerManager.getAppMemory(bot), () => readHostMemory()) });
+      const sent = memorySendState(bot.id);
+      res.json({ success: true, memory: memoryReading(await containerManager.getAppMemory(bot), () => readHostMemory()), ...(sent ? { sent } : {}) });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

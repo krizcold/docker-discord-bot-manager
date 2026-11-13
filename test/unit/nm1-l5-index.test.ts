@@ -16,6 +16,7 @@ vi.mock('../../src/instance/fleetBackup', () => ({
 }));
 vi.mock('../../src/instance/fleetReplica', () => ({ parkInterruptedReplicaSeeds: async () => {} }));
 vi.mock('../../src/instance/fleetCopyWatch', () => ({ startFleetCopyWatch: () => {}, stopFleetCopyWatch: () => {} }));
+vi.mock('../../src/instance/memorySend', () => ({ startMemorySend: () => {}, stopMemorySend: () => {} }));
 vi.mock('../../src/instance/fleetSwitch', () => ({ startFleetSwitchTick: () => {}, stopFleetSwitchTick: () => {} }));
 vi.mock('../../src/instance/fleetMove', () => ({}));
 vi.mock('../../src/instance/migrate', () => ({ resumeMigrations: () => {} }));

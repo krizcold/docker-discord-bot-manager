@@ -16,6 +16,7 @@ import { startInstanceUpdater, stopInstanceUpdater } from './instance/instanceUp
 import { startFleetBackupScheduler, stopFleetBackupScheduler, waitForInFlightLanes } from './instance/fleetBackup';
 import { parkInterruptedReplicaSeeds } from './instance/fleetReplica';
 import { startFleetCopyWatch, stopFleetCopyWatch } from './instance/fleetCopyWatch';
+import { startMemorySend, stopMemorySend } from './instance/memorySend';
 import { startFleetSwitchTick, stopFleetSwitchTick } from './instance/fleetSwitch';
 import './instance/fleetMove';
 import { startMaintenanceReconciler, stopMaintenanceReconciler } from './instance/maintenance';
@@ -130,6 +131,7 @@ async function main(): Promise<void> {
   // Start fleet Postgres sidecar backup scheduler
   startFleetBackupScheduler();
   startFleetCopyWatch();
+  startMemorySend();
   startFleetSwitchTick();
 
   // Start Docker<->registry state reconciler (polls only while UI clients are connected)
@@ -150,6 +152,7 @@ function shutdown(signal: string): void {
   stopInstanceUpdater();
   stopFleetBackupScheduler();
   stopFleetCopyWatch();
+  stopMemorySend();
   stopFleetSwitchTick();
   stopMaintenanceReconciler();
   void waitForInFlightLanes(SHUTDOWN_LANE_WAIT_MS).then(lane => {

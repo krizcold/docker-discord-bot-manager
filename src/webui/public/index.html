@@ -3445,8 +3445,9 @@
       if (!res.success) return `${lead}can't confirm: ${res.error || 'the manager refused the reading'}`;
       const m = res.memory || {};
       if (m.running === false) return `${lead}the bot is not running`;
-      if (m.room === true || m.room === false) return `${lead}${m.room ? 'yes' : 'no'}, ${m.freeMb} MB free for ${m.useMb} MB`;
-      return `${lead}can't confirm: ${m.error || 'no reading'}`;
+      const sent = res.sent?.kind === 'no-hook' ? "; this bot's build does not take the reading" : res.sent?.kind === 'failed' ? (res.sent.unknown ? `; can't confirm the bot got it: ${res.sent.error}` : `; the bot did not get it: ${res.sent.error}`) : '';
+      if (m.room === true || m.room === false) return `${lead}${m.room ? 'yes' : 'no'}, ${m.freeMb} MB free for ${m.useMb} MB${sent}`;
+      return `${lead}can't confirm: ${m.error || 'no reading'}${sent}`;
     }
 
     async function renderMemoryLine(botId) {

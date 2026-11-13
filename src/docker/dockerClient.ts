@@ -284,6 +284,16 @@ export async function waitForContainerRunning(containerId: string, timeoutMs = 5
   return false;
 }
 
+/** The container's State.StartedAt, or null when docker did not answer. */
+export async function containerStartedAt(containerId: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('docker', ['inspect', '--format', '{{.State.StartedAt}}', containerId], { timeout: 10000 });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 /** How long every container must stay up, unrestarted, before a start counts as running. */
 export const VERIFY_SETTLE_MS = 3000;
 

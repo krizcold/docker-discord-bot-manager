@@ -17,6 +17,7 @@ vi.mock('../../src/instance/fleetBackup', () => ({
 }));
 vi.mock('../../src/instance/fleetReplica', () => ({ parkInterruptedReplicaSeeds: async () => {} }));
 vi.mock('../../src/instance/fleetCopyWatch', () => ({ startFleetCopyWatch: mark('copy-watch-start'), stopFleetCopyWatch: mark('copy-watch-stop') }));
+vi.mock('../../src/instance/memorySend', () => ({ startMemorySend: () => {}, stopMemorySend: () => {} }));
 vi.mock('../../src/instance/migrate', () => ({ resumeMigrations: () => {} }));
 vi.mock('../../src/instance/maintenance', () => ({ startMaintenanceReconciler: () => {}, stopMaintenanceReconciler: () => {} }));
 vi.mock('../../src/docker/stateReconciler', () => ({ startStateReconciler: mark('state-reconciler-start'), stopStateReconciler: () => {} }));

@@ -2171,8 +2171,10 @@
             <button class="btn btn-secondary btn-small" type="button" onclick="envListAdd(this)">+ Add</button>
           </div>`;
       } else {
+        const bound = (a) => (meta.inputType === 'number' && meta[a] !== undefined && meta[a] !== null ? ` ${a}="${escapeHtml(meta[a])}" data-${a}="${escapeHtml(meta[a])}"` : '');
+        const numAttrs = bound('min') + bound('max') + bound('step') + (meta.inputType === 'number' ? ` data-label="${escapeHtml(label || key)}"` : '');
         valueHtml = `<div class="env-vault-wrapper">
-            <input type="${meta.inputType === 'number' ? 'number' : 'text'}" value="${escapeHtml(value)}" class="env-value" ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
+            <input type="${meta.inputType === 'number' ? 'number' : 'text'}" value="${escapeHtml(value)}" class="env-value"${numAttrs} ${sensitive ? 'data-sensitive="true"' : ''} placeholder="${escapeHtml(placeholder || 'Value')}">
             <button class="env-vault-trigger" onclick="toggleEnvVaultDropdown(this, ${jsArg(key)})" title="Pick from vault" type="button">&#9660;</button>
           </div>`;
       }
@@ -2371,6 +2373,18 @@
       return true;
     }
 
+    function numberBoundsError(input, key) {
+      const ds = input.dataset || {};
+      const wrapper = input.closest ? input.closest('[data-show-key]') : null;
+      if (wrapper && wrapper.style && wrapper.style.display === 'none') return null;
+      const v = String(input.value).trim();
+      if (v === '') return null;
+      const n = Number(v);
+      const bad = (ds.step === '1' && !/^[0-9]+$/.test(v)) || !Number.isFinite(n)
+        || (ds.min !== undefined && n < Number(ds.min)) || (ds.max !== undefined && n > Number(ds.max));
+      return bad ? `${ds.label || key} takes a whole number from ${ds.min}${ds.max !== undefined ? ` to ${ds.max}` : ''}.` : null;
+    }
+
     async function saveEnvEditor() {
       const botId = envEditorBotId;
       const seq = envEditorSeq;
@@ -2378,6 +2392,7 @@
       const rows = document.querySelectorAll('#env-editor-rows .env-row');
       const vars = {};
       const badNumbers = [];
+      const outOfBounds = [];
       const rowKeys = [];
       const rowOrigins = [];
       const renamed = {};
@@ -2392,6 +2407,9 @@
         if (!key || !valueInput) return;
         if (valueInput.validity && valueInput.validity.badInput) { badNumbers.push(key); return; }
         const value = valueInput.value;
+        const bounds = valueInput.dataset && (valueInput.dataset.min !== undefined || valueInput.dataset.max !== undefined)
+          ? numberBoundsError(valueInput, key) : null;
+        if (bounds) { outOfBounds.push(bounds); return; }
         // A blank secret field means "keep the stored value" (it was masked on load).
         // Omit it so the server-side merge preserves the secret; sending the blank
         // would re-encrypt an empty string and wipe the token.
@@ -2409,6 +2427,10 @@
       }
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then save. Nothing was saved.`);
+        return;
+      }
+      if (outOfBounds.length > 0) {
+        showMessage('error', `${outOfBounds.join(' ')} Nothing was saved.`);
         return;
       }
 
@@ -5753,12 +5775,16 @@
       const rows = document.querySelectorAll('#install-env-rows .env-row');
       const vars = {};
       const badNumbers = [];
+      const outOfBounds = [];
       rows.forEach(row => {
         if (row.classList.contains('env-autowired')) return;
         const key = row.querySelector('.env-key').value.trim();
         const valueInput = row.querySelector('.env-value');
         if (!key || !valueInput) return;
         if (valueInput.validity && valueInput.validity.badInput) { badNumbers.push(key); return; }
+        const bounds = valueInput.dataset && (valueInput.dataset.min !== undefined || valueInput.dataset.max !== undefined)
+          ? numberBoundsError(valueInput, key) : null;
+        if (bounds) { outOfBounds.push(bounds); return; }
         const value = valueInput.value.trim();
         // Omit a blank secret (masked on load) so it is never stored as empty.
         if (valueInput.dataset.sensitive === 'true' && value === '') return;
@@ -5766,6 +5792,10 @@
       });
       if (badNumbers.length > 0) {
         showMessage('error', `Not a number: ${badNumbers.join(', ')}. Fix the value, then create. Nothing was created.`);
+        return;
+      }
+      if (outOfBounds.length > 0) {
+        showMessage('error', `${outOfBounds.join(' ')} Nothing was created.`);
         return;
       }
 

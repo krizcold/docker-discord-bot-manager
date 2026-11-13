@@ -37,6 +37,9 @@ export interface EnvFieldMeta {
   groupHelp?: string;
   placeholder?: string;
   inputType?: 'number';
+  min?: number;                                         // number rows: bounds the editor renders and enforces
+  max?: number;
+  step?: number;
   list?: boolean;                                       // dynamic list editor; value = comma-joined entries
   /**
    * What this row IS (stamped server-side from the app's capability record),
@@ -70,8 +73,8 @@ function gatewayFileNote(gateway: GatewayDeploy): string {
 export type WizardEnvVar = DetectedEnvVar & EnvFieldMeta;
 
 function envFieldMeta(v: EnvFieldMeta): EnvFieldMeta {
-  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, inactive } = v;
-  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, list, semantic, inactive };
+  const { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, min, max, step, list, semantic, inactive } = v;
+  return { options, generate, showWhen, requiredWhen, advanced, group, groupHelp, placeholder, inputType, min, max, step, list, semantic, inactive };
 }
 
 // Keys the operator is expected to set on a fresh install, so they always stay

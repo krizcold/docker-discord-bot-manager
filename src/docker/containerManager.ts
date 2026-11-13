@@ -3705,11 +3705,47 @@ export async function appContainerRunning(botId: string): Promise<boolean | null
   return id === undefined ? null : id !== null;
 }
 
+/** Names the reconciler and Stop's gate leave out: the fleet database and the standby, which run alone. */
+function standaloneNames(instance: InstanceConfig): Set<string> {
+  return new Set([instance.fleetDb?.containerName || '', instance.fleetDbReplica?.containerName || ''].filter(Boolean));
+}
+
+const LIVE_STATES = new Set(['running', 'restarting', 'paused']);
+
+/** The bot's containers docker lists as running, restarting or paused, by the reconciler's matching, without the standalone ones. */
+function liveContainers(containers: ContainerInfo[], instance: InstanceConfig): ContainerInfo[] {
+  const skip = standaloneNames(instance);
+  return ownedBotContainers(containers, instance.id, resolveAppName(instance.id)).filter(c => !skip.has(c.name) && LIVE_STATES.has(c.state));
+}
+
+/** One listing of every bot's containers; for a bot, the containers Stop's gate counts. Null when docker did not answer. */
+export async function liveContainersNow(): Promise<((instance: InstanceConfig) => ContainerInfo[]) | null> {
+  const list = await dockerClient.listBotContainersAsync();
+  return list ? (instance: InstanceConfig) => liveContainers(list, instance) : null;
+}
+
+/** Stop's gate: the names of liveContainers; null when docker did not answer. */
+async function liveForStop(instance: InstanceConfig): Promise<string[] | null> {
+  const live = await liveContainersNow();
+  return live ? live(instance).map(c => c.name) : null;
+}
+
+/** The containers Stop's gate counts for this bot (liveForStop); null when docker did not answer or the bot has no record. */
+export async function liveContainerNames(botId: string): Promise<string[] | null> {
+  const instance = getBot(botId);
+  return instance ? liveForStop(instance) : null;
+}
+
 /** The named keys of the running app container's env as docker reads it; absent keys are left out. */
 export async function appContainerEnv(botId: string, keys: string[]): Promise<{ ok: true; env: Record<string, string> } | { ok: false; error: string }> {
   const id = await runningAppContainerId(botId, resolveAppName(botId));
   if (id === undefined) return { ok: false, error: 'docker did not answer' };
   if (id === null) return { ok: false, error: 'the bot container is not running' };
+  return containerEnv(id, keys);
+}
+
+/** The named keys of a container's env as docker inspect reads it; absent keys are left out. */
+export async function containerEnv(id: string, keys: string[]): Promise<{ ok: true; env: Record<string, string> } | { ok: false; error: string }> {
   try {
     const { stdout } = await execAsync(`docker inspect --format "{{json .Config.Env}}" ${id}`, { timeout: 30_000 });
     const list = JSON.parse(stdout.trim());
@@ -4270,10 +4306,10 @@ async function getContainerIdsForBot(botId: string): Promise<string[] | null> {
 
 // ─── Stop ───
 
-/** Stop under the 'stop' op; with seen, a bot whose status is not running is stopped when docker shows its app container running. */
-export async function stopBot(botId: string, opts: { seen?: boolean } = {}): Promise<LaneResult> {
+/** Stop under the 'stop' op; a bot whose status is not running is stopped when docker runs its container. */
+export async function stopBot(botId: string): Promise<LaneResult> {
   return withBotOp(botId, 'stop', async () => {
-    const result = await stopBotImpl(botId, undefined, opts);
+    const result = await stopBotImpl(botId);
     return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
   });
 }
@@ -4291,10 +4327,20 @@ export async function stopBotInOp(botId: string, op: string): Promise<LaneResult
   return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
 }
 
-async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean } = {}): Promise<LaneResult> {
+const STOP_UNSEEN = 'Docker did not say whether the bot runs, so nothing was stopped';
+
+async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
   const instance = getBot(botId);
   if (!instance) return { success: false, error: 'Bot not found' };
-  if (instance.status !== 'running' && !(opts.seen && await appContainerRunning(botId) === true)) return { success: false, error: 'Bot is not running' };
+  let listed: string[] | null = null;
+  if (instance.status !== 'running') {
+    listed = await liveForStop(instance);
+    if (listed === null) return { success: false, error: STOP_UNSEEN };
+    if (listed.length === 0) return { success: false, error: 'Bot is not running' };
+    const line = `[Stop] ${instance.displayName}: the status reads ${instance.status}, but docker runs ${listed.join(', ')}; stopping the bot`;
+    console.log(line);
+    emit?.(line, 'info');
+  }
 
   try {
     updateBotStatus(botId, 'stopping');
@@ -4303,8 +4349,22 @@ async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean 
     const appName = resolveAppName(botId);
     emit?.(`[Stop] Stopping containers (${appName})...`, 'info');
     let downError: string | null = null;
+    let composeDownRan = false;
+    const stopByName = async (names: string[]) => {
+      for (const name of names) {
+        try {
+          await dockerClient.stopContainer(name);
+        } catch (err) {
+          downError = err instanceof Error ? err.message : String(err);
+          console.warn(`[ContainerManager] Failed to stop container ${name}:`, err);
+        }
+      }
+    };
 
-    if (deploymentMode === 'casaos') {
+    if (deploymentMode === 'casaos' && listed && !fs.existsSync(resolveComposePath(botId, appName))) {
+      await stopByName(listed);
+    } else if (deploymentMode === 'casaos') {
+      composeDownRan = true;
       const composePath = resolveComposePath(botId, appName);
       const downResult = await casaosApi.composeDown(
         appName,
@@ -4319,6 +4379,7 @@ async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean 
     } else {
       const composePath = path.join(getBotDir(botId), 'docker-compose.yml');
       if (fs.existsSync(composePath)) {
+        composeDownRan = true;
         try {
           await dockerClient.composeDown(composePath, appName);
         } catch (err) {
@@ -4326,6 +4387,8 @@ async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean 
           console.warn(`[ContainerManager] compose down failed for ${appName}:`, err);
           emit?.(`[Stop] Warning: compose down failed: ${err}`, 'warning');
         }
+      } else if (listed) {
+        await stopByName(listed);
       } else {
         // Fallback: stop tracked containers if the compose file is gone.
         for (const containerId of instance.containerIds || []) {
@@ -4340,7 +4403,17 @@ async function stopBotImpl(botId: string, emit?: EmitFn, opts: { seen?: boolean 
       }
     }
 
-    const survivors = await runningProjectContainerIds(appName);
+    let survivors: string[] | undefined;
+    if (listed) {
+      let after = await liveForStop(instance);
+      if (after && after.length > 0 && composeDownRan) {
+        await stopByName(after);
+        after = await liveForStop(instance);
+      }
+      survivors = after ?? undefined;
+    } else {
+      survivors = await runningProjectContainerIds(appName);
+    }
     if (survivors === undefined && downError !== null) {
       const unrecorded = recordStatusAfterDockerStep(botId, 'running');
       const error = `The stop failed (${downError}) and docker could not confirm whether the containers still run${unrecorded ? `; the status could not be recorded: ${unrecorded}` : ''}`;
@@ -5484,7 +5557,7 @@ export async function syncContainerStates(): Promise<void> {
   const containers = await dockerClient.listBotContainers();
   if (!containers) { console.warn('[Reconciler] Skipped: docker did not answer the container listing'); return; }
 
-  const checked: Record<string, { statusCheckedAt: string; servicesUp: string[] }> = {};
+  const checked: Record<string, ReconcileRead> = {};
   for (const instance of Object.values(registry.instances)) {
     const status = servedStatus(instance).status;
     if (status !== 'running' && status !== 'stopped' && status !== 'error') {
@@ -5497,10 +5570,7 @@ export async function syncContainerStates(): Promise<void> {
     // fleet sidecar or a replica routinely runs ALONE (dumps, re-seeds), and
     // counting one as "the bot" flips the registry to running - which a later
     // stop turns into a compose down that kills the standby a seed fills.
-    const standalone = new Set<string>([
-      instance.fleetDb?.containerName || '',
-      instance.fleetDbReplica?.containerName || '',
-    ]);
+    const standalone = standaloneNames(instance);
     const botContainers = ownedBotContainers(containers, instance.id, appName)
       .filter(c => !standalone.has(c.name));
     const runningContainers = botContainers.filter(c => c.state === 'running');
@@ -5511,7 +5581,11 @@ export async function syncContainerStates(): Promise<void> {
     const appRunning = appService && botContainers.some(c => c.service)
       ? runningContainers.some(c => c.service === appService)
       : runningContainers.length > 0;
-    checked[instance.id] = { statusCheckedAt: new Date().toISOString(), servicesUp: runningContainers.map(c => c.service || c.name) };
+    checked[instance.id] = {
+      statusCheckedAt: new Date().toISOString(),
+      servicesUp: runningContainers.map(c => c.service || c.name),
+      containersLive: liveContainers(containers, instance).map(c => c.service || c.name),
+    };
     reconcileReads.set(instance.id, checked[instance.id]);
 
     if (status === 'running' && runningContainers.length === 0) {
@@ -5535,10 +5609,12 @@ export async function syncContainerStates(): Promise<void> {
   if (broadcastFn && Object.keys(checked).length > 0) broadcastFn('bots:checked', checked);
 }
 
-const reconcileReads = new Map<string, { statusCheckedAt: string; servicesUp: string[] }>();
+type ReconcileRead = { statusCheckedAt: string; servicesUp: string[]; containersLive: string[] };
 
-/** When the reconciler last read this bot's containers from docker and which services were up; null before its first read. */
-export function getReconcileRead(botId: string): { statusCheckedAt: string; servicesUp: string[] } | null {
+const reconcileReads = new Map<string, ReconcileRead>();
+
+/** When the reconciler last read this bot's containers from docker, which services were up and which containers Stop's gate counts; null before its first read. */
+export function getReconcileRead(botId: string): ReconcileRead | null {
   return reconcileReads.get(botId) ?? null;
 }
 

@@ -16,6 +16,8 @@ const d = vi.hoisted(() => {
     head: 'a'.repeat(40),
     exec: [] as string[],
     running: {} as Record<string, string[]>,
+    states: {} as Record<string, Record<string, string>>,
+    listFail: false,
     appEnv: {} as Record<string, Record<string, string>>,
     inspect: [] as Array<Record<string, string>>,
     dbUpFail: null as string | null,
@@ -36,6 +38,13 @@ function appServiceEnv(composePath: string): Record<string, string> {
   const env = services[name]?.environment ?? {};
   if (Array.isArray(env)) return Object.fromEntries(env.map((e: string) => [e.split('=')[0], e.slice(e.indexOf('=') + 1)]));
   return Object.fromEntries(Object.entries(env).map(([k, v]) => [k, String(v)]));
+}
+
+function listing(): any[] | null {
+  if (d.listFail) return null;
+  return Object.entries(d.running).flatMap(([p, services]) => services.map(s => ({
+    id: `${p}-${s}-id`, name: `${p}-${s}`, state: d.states[p]?.[s] ?? 'running', status: '', ports: [], project: p, service: s,
+  })));
 }
 
 vi.mock('child_process', async (importOriginal) => {
@@ -107,7 +116,8 @@ vi.mock('../../src/docker/dockerClient', async (importOriginal) => ({
   },
   composeDown: async (_composePath: string, appName: string) => { d.downs.push(appName); d.running[appName] = []; },
   verifyComposeProjectRunning: async () => ({ allRunning: true, problems: [] }),
-  listBotContainers: async () => [],
+  listBotContainers: async () => listing(),
+  listBotContainersAsync: async () => listing(),
   listContainersByBotId: async () => [],
   listPublishedHostPorts: () => new Map(),
   checkDockerConnection: async () => true,
@@ -198,7 +208,7 @@ async function press(to: 'postgres' | 'file', id = 'b1') {
 beforeEach(() => {
   resetMigrate();
   fastTiming(MIGRATE_TIMING);
-  Object.assign(d, { exec: [], running: {}, appEnv: {}, inspect: [], dbUpFail: null, image: () => 'present', builds: 0, ups: [], downs: [], broadcasts: [] });
+  Object.assign(d, { exec: [], running: {}, states: {}, listFail: false, appEnv: {}, inspect: [], dbUpFail: null, image: () => 'present', builds: 0, ups: [], downs: [], broadcasts: [] });
   fs.rmSync(path.join(d.dir, 'bots'), { recursive: true, force: true });
   fs.rmSync(registryPath(), { force: true });
   fs.mkdirSync(d.repo, { recursive: true });
@@ -773,20 +783,19 @@ describe('the lane against the real start, compose and gates (B-7)', () => {
     await call('delete', '/:id', { id: 'b1' }, {}, { keepData: 'false', confirmFleetData: 'true' });
     expect(m.events).not.toContain('hba-lift');
   });
-  it("B41, a stop that reads docker: a bot stored stopped whose app container docker shows running is stopped with seen", async () => {
+  it("B41 (NM16), a stop reads docker: a bot stored stopped whose app container docker shows running is stopped", async () => {
     await jsonBot('s1');
     expect((await containerManager.stopBot('s1')).success).toBe(true);
     d.running.s1 = ['app'];
-    expect(await containerManager.stopBot('s1')).toEqual({ success: false, error: 'Bot is not running' });
-    expect((await containerManager.stopBot('s1', { seen: true })).success).toBe(true);
+    expect((await containerManager.stopBot('s1')).success).toBe(true);
     expect(d.downs.filter(x => x === 's1')).toHaveLength(2);
     expect(d.running.s1).toEqual([]);
     expect(stored('s1').status).toBe('stopped');
   });
-  it("(pin) B41's scope: with seen, a stored-stopped bot docker shows stopped answers 'Bot is not running'", async () => {
+  it("(pin) B41's scope: a stored-stopped bot docker shows stopped answers 'Bot is not running'", async () => {
     await jsonBot('s1');
     expect((await containerManager.stopBot('s1')).success).toBe(true);
-    expect(await containerManager.stopBot('s1', { seen: true })).toEqual({ success: false, error: 'Bot is not running' });
+    expect(await containerManager.stopBot('s1')).toEqual({ success: false, error: 'Bot is not running' });
     expect(d.downs.filter(x => x === 's1')).toHaveLength(1);
   });
 });

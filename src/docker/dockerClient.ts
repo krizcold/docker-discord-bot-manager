@@ -87,33 +87,42 @@ export function isBuildxAvailable(): boolean {
   }
 }
 
+const BOT_CONTAINER_FORMAT = '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}|{{.Label "com.docker.compose.project"}}|{{.Label "bot-id"}}|{{.Label "com.docker.compose.service"}}';
+
+function parseBotContainers(output: string): ContainerInfo[] {
+  if (!output) return [];
+  return output.split('\n').filter(line => line.trim()).map(line => {
+    const [id, name, state, status, project, botId, service] = line.split('|');
+    return {
+      id,
+      name,
+      state,
+      status,
+      ports: [],
+      ...(project ? { project } : {}),
+      ...(botId ? { botId } : {}),
+      ...(service ? { service } : {})
+    };
+  });
+}
+
 /**
  * List all bot containers managed by this application; null when docker did
  * not answer, which is evidence of nothing.
  */
 export async function listBotContainers(): Promise<ContainerInfo[] | null> {
   try {
-    const output = execDocker([
-      'ps', '-a',
-      '--filter', 'label=managed-by=discord-bot-manager',
-      '--format', '{{.ID}}|{{.Names}}|{{.State}}|{{.Status}}|{{.Label "com.docker.compose.project"}}|{{.Label "bot-id"}}|{{.Label "com.docker.compose.service"}}'
-    ]);
+    return parseBotContainers(execDocker(['ps', '-a', '--filter', 'label=managed-by=discord-bot-manager', '--format', BOT_CONTAINER_FORMAT]));
+  } catch (error) {
+    console.error('[Docker] Failed to list containers:', error);
+    return null;
+  }
+}
 
-    if (!output) return [];
-
-    return output.split('\n').filter(line => line.trim()).map(line => {
-      const [id, name, state, status, project, botId, service] = line.split('|');
-      return {
-        id,
-        name,
-        state,
-        status,
-        ports: [],
-        ...(project ? { project } : {}),
-        ...(botId ? { botId } : {}),
-        ...(service ? { service } : {})
-      };
-    });
+/** listBotContainers through execDockerAsync: the same listing without blocking; null when docker did not answer. */
+export async function listBotContainersAsync(): Promise<ContainerInfo[] | null> {
+  try {
+    return parseBotContainers(await execDockerAsync(['ps', '-a', '--filter', 'label=managed-by=discord-bot-manager', '--format', BOT_CONTAINER_FORMAT]));
   } catch (error) {
     console.error('[Docker] Failed to list containers:', error);
     return null;

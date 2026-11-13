@@ -332,4 +332,13 @@ describe('B07-1 health readers and the status stamp', () => {
     await containerManager.syncContainerStates();
     expect((containerManager as any).getReconcileRead('b1').statusCheckedAt).toBe(read.statusCheckedAt);
   });
+
+  it('(NM16) the read names every container Stop counts, a restarting one included, apart from the services up', async () => {
+    writeRecord({ status: 'running' });
+    h.listing = [app('running'), redis('restarting')];
+    await containerManager.syncContainerStates();
+    const read = (containerManager as any).getReconcileRead('b1');
+    expect(read.containersLive).toEqual(['app', 'redis']);
+    expect(read.servicesUp).toEqual(['app']);
+  });
 });

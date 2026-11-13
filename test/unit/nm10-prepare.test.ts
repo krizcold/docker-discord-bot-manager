@@ -10,7 +10,7 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { laneDone, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { fastTiming, getJob, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, EXTERNAL_URL, FLEET_DB, MG_DB_START, MG_FENCE_F, MG_P_FENCE, MG_SHARER_STILL } from './migrate-fake';
+import { fastTiming, getJob, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, EXTERNAL_URL, FLEET_DB, MG_DB_START, MG_FENCE_F, MG_P_FENCE, MG_SHARER_STILL, MG_SEARCH_CLOSE } from './migrate-fake';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 
@@ -460,12 +460,55 @@ describe('B: round 8 (the step of M5 and B35, M6 order)', () => {
     await press('file');
     expect(closed().text).toBe('The migration did not start: S1 uses the same database and could not be stopped (docker did not say whether it runs). Nothing was copied, and the bot stays in Maintenance. S1 did not start again (docker did not say whether it runs); start it by hand.');
   });
-  it("B41, M5's stop reads docker", async () => {
+  it('B44 (NM16), a sharer whose app is down while a worker of it runs is stopped', async () => {
     seedBot({ postgres: true });
     seedSharer('s1');
+    m.app.s1 = false;
+    m.live.s1 = ['s1-worker'];
     await press('file');
+    expect(m.events.filter(x => x === 'stop-sharer:s1')).toHaveLength(1);
     expect(closed().outcome).toBe('done');
-    expect(m.sharerStopOpts).toEqual([{ seen: true }]);
+  });
+  it('B44 (NM16), the worker survives the stop: F with MG-SHARER-STILL', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    m.app.s1 = false;
+    m.live.s1 = ['s1-worker'];
+    m.sharerStop = { success: false, error: 'Bot is not running' };
+    await press('file');
+    expect(closed().text).toBe(MG_SHARER_STILL('S1'));
+    expect(m.events.filter(x => x === 'stop-sharer:s1')).toHaveLength(1);
+  });
+  it('B46 (NM16), the listing unanswered before the stop: F with MG-SHARER, no stop', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    m.app.s1 = true;
+    m.live.s1 = null;
+    await press('file');
+    expect(closed().text).toBe('The migration did not start: S1 uses the same database and could not be stopped (docker did not say whether it runs). Nothing was copied, and the bot stays in Maintenance.');
+    expect(m.events).not.toContain('stop-sharer:s1');
+  });
+  it('B48 (NM16), a bot the search could not check: F before any hold, stop or line', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    seedSharer('s2');
+    m.sharers = ['s1'];
+    m.unchecked = ['s2'];
+    await press('file');
+    expect(closed().text).toBe(MG_SEARCH_CLOSE('S2'));
+    expect(m.events.some(x => x.startsWith('stop-sharer:'))).toBe(false);
+    expect(m.events.some(x => x.startsWith('hba-'))).toBe(false);
+    expect(m.migrateWrites.some(w => w.rec?.sharers?.includes('s1'))).toBe(false);
+  });
+  it('B48 (NM16), two bots unchecked: the plural clause', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    seedSharer('s2');
+    seedSharer('s3');
+    m.sharers = ['s1'];
+    m.unchecked = ['s2', 's3'];
+    await press('file');
+    expect(closed().text).toBe('The migration did not start: the manager could not read from docker whether S2, S3 use this database, so they could not be checked. Nothing was copied, and the bot stays in Maintenance.');
   });
   it("B35, the step's mark on an outside source: isolated after the sharer's stop and before M6, no line", async () => {
     seedBot({ external: true });

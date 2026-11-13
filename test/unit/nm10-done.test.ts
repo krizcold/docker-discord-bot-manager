@@ -10,7 +10,7 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { laneDone, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { botGet, fastTiming, http, m, resetMigrate, seedBot, seedSharer, FLEET_DB, COMPANION_URL, EXTERNAL_URL, MG_FENCE_BACK_G, MG_FENCE_STRIPPED, MG_FENCE_UNCONFIRMED, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_WHY_RESTARTING, WHY_LIFT_LOCKED } from './migrate-fake';
+import { botGet, fastTiming, http, m, resetMigrate, seedBot, seedSharer, FLEET_DB, COMPANION_URL, EXTERNAL_URL, MG_FENCE_BACK_G, MG_FENCE_STRIPPED, MG_FENCE_UNCONFIRMED, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_SHARERS_UNSURE, MG_WHY_RESTARTING, WHY_LIFT_LOCKED } from './migrate-fake';
 import { fenceWords } from '../../src/instance/maintenance';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
@@ -426,6 +426,31 @@ describe('G: round 6', () => {
     expect(last().outcome).toBe('done');
     expect(last().text).toContain(MG_SHARERS_RUN('S1'));
     expect(last().text).not.toContain(MG_SHARERS_STAY('S1'));
+  });
+  it('G14 (NM16), a worker of a sharer runs at the close: named as running', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    m.bot.getQueue.push(null, () => { m.live.s1 = ['s1-worker']; return botGet(); });
+    await press('file');
+    expect(m.app.s1).toBe(false);
+    expect(last().text).toContain(MG_SHARERS_RUN('S1'));
+    expect(last().text).not.toContain(MG_SHARERS_STAY('S1'));
+  });
+  it('G14 (NM16), docker silent at the close: named unsure', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    m.bot.getQueue.push(null, () => { m.live.s1 = null; return botGet(); });
+    await press('file');
+    expect(last().text).toContain(MG_SHARERS_UNSURE('S1'));
+  });
+  it('G14 (NM16), a held sharer deleted before the close is left out of the done text', async () => {
+    seedBot({ postgres: true });
+    seedSharer('s1');
+    m.bot.getQueue.push(null, () => { delete m.bots.s1; m.live.s1 = null; return botGet(); });
+    await press('file');
+    expect(last().outcome).toBe('done');
+    expect(last().text).not.toMatch(/s1 /i);
+    expect(last().text).not.toContain('old database and');
   });
   it("G21 unconfirmed: done, and G6's stop that answered success drops the tail, so no MG-FENCE-UNCONFIRMED", async () => {
     seedBot({ postgres: true });

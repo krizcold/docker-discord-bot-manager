@@ -210,7 +210,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           autoUpdateInterval: bot.autoUpdateInterval || 86400000,
           autoUpdateHour: bot.autoUpdateHour ?? 4,
           hasDbBackups,
-          ...(containerManager.getReconcileRead(bot.id) ?? { statusCheckedAt: null, servicesUp: null }),
+          ...(containerManager.getReconcileRead(bot.id) ?? { statusCheckedAt: null, servicesUp: null, containersLive: null }),
           // Sidecar backup status (null without a managed fleet DB) and the
           // sampler's cached verdict; changes reach open tabs as bot:health.
           ...botHealth(bot),

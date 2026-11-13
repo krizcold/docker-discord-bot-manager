@@ -38,12 +38,16 @@ export const MG_FENCE_WAIT = (jobId: string | null, why: string) => {
 };
 /** Section 9's round 8 texts. */
 export const MG_NOT_AGAIN = (clause: string, retry?: string) => `The manager did not ask the bot to start the migration again: ${clause}. The bot stays in Maintenance with the migration open; ${retry ?? 'press Migrate to try again'}.`;
-export const MG_SHARER_STILL_C = (name: string) => `${name} uses the same database, and docker still shows its container running after the manager stopped it`;
+export const MG_SHARER_STILL_C = (name: string) => `${name} uses the same database, and docker still shows a container of it running, so the manager could not stop it`;
 export const MG_SHARER_STILL = (name: string) => `The migration did not start: ${MG_SHARER_STILL_C(name)}. Nothing was copied, and the bot stays in Maintenance; press Migrate to stop it again.`;
 export const MG_P_OPEN = (names: string[], repl: string[] = []) => (names.length ? `Following the move the bot was already running, with its database open to other connections; ${names.join(', ')} ${names.length === 1 ? 'uses it, and the manager does not stop it' : 'use it, and the manager does not stop them'}${repl.map(n => `; ${n}'s own managed database has replication on, so this migration does not hold ${n}, and the manager can still start, update or build it`).join('')}` : 'Following the move the bot was already running, with its database open to other connections');
 export const MG_DONE_OPEN = " The bot started this copy itself, and the database stayed open to other connections while it copied; the manager can't confirm that no other bot or program wrote to the database during the copy.";
 export const MG_DONE_UNSURE = " The bot started this copy itself, and the manager's step that stops the other bots on the database and closes it to other connections had begun on this migration without finishing; the manager can't confirm whether the database was closed during the copy, or that no other bot or program wrote to it.";
 const oneBot = (names: string) => !names.includes(', ');
+export const MG_SEARCH_C = (names: string) => oneBot(names) ? `the manager could not read from docker whether ${names} uses this database, so ${names} could not be checked` : `the manager could not read from docker whether ${names} use this database, so they could not be checked`;
+export const MG_SEARCH_CLOSE = (names: string) => `The migration did not start: ${MG_SEARCH_C(names)}. Nothing was copied, and the bot stays in Maintenance.`;
+export const MG_SEARCH_REPOST = (names: string) => `The manager did not ask the bot to start the migration again: ${MG_SEARCH_C(names)}. The bot stays in Maintenance with the migration open; press Migrate to try again.`;
+export const MG_SEARCH_WAIT = (jobId: string, names: string) => `The manager did not go on following migration ${jobId}: ${MG_SEARCH_C(names)}. The bot stays in Maintenance with the migration open; press Migrate to try again.`;
 export const MG_SHARERS_STAY = (names: string) => oneBot(names) ? ` ${names} uses the old database and stays stopped: its data is renamed aside, so that bot cannot load it.` : ` ${names} use the old database and stay stopped: its data is renamed aside, so they cannot load it.`;
 export const MG_SHARERS_RUN = (names: string) => oneBot(names) ? ` ${names} uses the old database and runs: its data is renamed aside, so that bot cannot load it, and that bot's writes to it fail.` : ` ${names} use the old database and run: its data is renamed aside, so they cannot load it, and their writes to it fail.`;
 export const MG_SHARERS_UNSURE = (names: string) => oneBot(names) ? ` ${names} uses the old database, and docker did not say whether it runs: its data is renamed aside, so that bot cannot load it.` : ` ${names} use the old database, and docker did not say whether they run: its data is renamed aside, so they cannot load it.`;
@@ -70,6 +74,7 @@ export interface MigrateFake {
   hold: boolean;
   deleteLane: boolean;
   app: Record<string, boolean | null>;
+  live: Record<string, string[] | null>;
   sidecar: Record<string, boolean | null | 'restarting'>;
   login: { inRecovery: boolean; canLogin: boolean | null; sessions: number };
   loginReadFail: string | null;
@@ -88,8 +93,7 @@ export interface MigrateFake {
   dbReady: boolean;
   stop: { success: boolean; error?: string };
   start: { success: boolean; error?: string; notApplied?: string[] } | ((id: string) => { success: boolean; error?: string; notApplied?: string[] });
-  sharerStop: { success: boolean; error?: string } | ((id: string, opts?: { seen?: boolean }) => { success: boolean; error?: string });
-  sharerStopOpts: any[];
+  sharerStop: { success: boolean; error?: string } | ((id: string) => { success: boolean; error?: string });
   sharerStart: { success: boolean; error?: string } | ((id: string) => { success: boolean; error?: string });
   containerEnv: { ok: true; env: Record<string, string> } | { ok: false; error: string } | null;
   order: { settled: boolean; text: string } | { refused: true; error: string };
@@ -105,6 +109,7 @@ export interface MigrateFake {
   tickOn: string | null;
   sharers: string[];
   liveSharers: string[];
+  unchecked: string[];
   fenceUp: string | null | ((refresh: boolean) => string | null);
   fenceLift: 'lifted' | 'stripped' | 'unconfirmed' | 'gone' | 'unknown' | 'locked';
   bot: {
@@ -128,12 +133,12 @@ export const m: MigrateFake = (g.__migrateFake ??= fresh());
 function fresh(): MigrateFake {
   return {
     bots: {}, env: {}, envStatus: { corrupt: false, undecryptable: [] }, lock: {}, shuttingDown: false, hold: false, deleteLane: false,
-    app: {}, sidecar: {}, login: { inRecovery: false, canLogin: false, sessions: 0 }, loginReadFail: null,
+    app: {}, live: {}, sidecar: {}, login: { inRecovery: false, canLogin: false, sessions: 0 }, loginReadFail: null,
     openResult: { ok: true }, openSticks: true, blockResult: { ok: true }, fence: { ok: true, on: false },
     events: [], migrateWrites: [], failMigrateWrite: () => null, failUpdateBot: null, failSwitch: null, ensure: null,
     attach: { success: true }, dbStart: { success: true }, dbReady: true, stop: { success: true }, start: { success: true },
-    sharerStop: { success: true }, sharerStopOpts: [] as any[], sharerStart: { success: true }, containerEnv: null,
-    order: { settled: true, text: 'The bot is running normally.' }, saveAnswers: [], held: [], notice: null, notices: {}, seed: null, seeds: {}, tickOn: null, sharers: [], liveSharers: [] as string[],
+    sharerStop: { success: true }, sharerStart: { success: true }, containerEnv: null,
+    order: { settled: true, text: 'The bot is running normally.' }, saveAnswers: [], held: [], notice: null, notices: {}, seed: null, seeds: {}, tickOn: null, sharers: [], liveSharers: [] as string[], unchecked: [] as string[],
     fenceUp: null as string | null | ((refresh: boolean) => string | null), fenceLift: 'lifted' as 'lifted' | 'stripped' | 'unconfirmed' | 'gone' | 'unknown' | 'locked',
     kill: null, killSeen: 0, postAt: [],
     bot: { journal: [], script: [{ stage: 'copying' }, { state: 'done', stage: 'switching' }], postQueue: [], getQueue: [], posts: [], gets: 0, down: false, destination: undefined, checks: [], unreadable: null },
@@ -387,6 +392,11 @@ export function cmMock(): Record<string, unknown> {
     }),
     databaseReady: (db: any) => effect(`db-ready:${db.containerName}`, () => { m.events.push(`db-ready:${db.containerName}`); return m.sidecar[db.containerName] === 'restarting' ? false : m.dbReady; }),
     appContainerRunning: async (id: string) => (id in m.app ? m.app[id] : false),
+    liveContainerNames: async (id: string) => {
+      if (id in m.live) return m.live[id];
+      const app = id in m.app ? m.app[id] : false;
+      return app === null ? null : app ? [`${id}-app`] : [];
+    },
     stopBotInOp: (id: string, op: string) => effect(`stop:${op}`, () => {
       m.events.push(`stop:${op}`);
       if (m.stop.success) m.app[id] = false;
@@ -398,12 +408,11 @@ export function cmMock(): Record<string, unknown> {
       if (r.success) m.app[id] = true;
       return r;
     }),
-    stopBot: (id: string, opts?: { seen?: boolean }) => effect(`stop-sharer:${id}`, () => {
+    stopBot: (id: string) => effect(`stop-sharer:${id}`, () => {
       m.events.push(`stop-sharer:${id}`);
-      m.sharerStopOpts.push(opts ?? null);
       if (m.lock[id]) throw new Error(`Operation '${m.lock[id]}' is already in progress for this bot`);
-      const r = typeof m.sharerStop === 'function' ? m.sharerStop(id, opts) : m.sharerStop;
-      if (r.success) m.app[id] = false;
+      const r = typeof m.sharerStop === 'function' ? m.sharerStop(id) : m.sharerStop;
+      if (r.success) { m.app[id] = false; delete m.live[id]; }
       return r;
     }),
     startBot: (id: string) => effect(`start-sharer:${id}`, () => {
@@ -501,7 +510,7 @@ export function fleetBackupMock(real: any): Record<string, unknown> {
     ...fenceMock(),
     shownRestoreNoticeFile: (id: string) => (id in m.notices ? m.notices[id] : m.notice),
     databaseSharers: (inst: any) => [inst, ...m.sharers.map(id => clone(m.bots[id]))],
-    runningDatabaseSharers: async (inst: any) => [inst, ...m.sharers.map(id => clone(m.bots[id])), ...m.liveSharers.map(id => clone(m.bots[id]))],
+    runningDatabaseSharers: async (inst: any) => ({ bots: [inst, ...m.sharers.map(id => clone(m.bots[id])), ...m.liveSharers.map(id => clone(m.bots[id]))], unchecked: m.unchecked.slice() }),
   };
 }
 

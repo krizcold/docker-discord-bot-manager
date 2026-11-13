@@ -10,7 +10,7 @@ vi.mock('../../src/instance/fleetReplica', async (o) => (await import('./migrate
 vi.mock('../../src/instance/fleetSwitch', async () => (await import('./migrate-fake')).fleetSwitchMock());
 
 import { laneDone, resumeMigrations, runMigration, MIGRATE_TIMING } from '../../src/instance/migrate';
-import { fastTiming, getJob, http, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, UNREADABLE, FLEET_DB, MG_DONE_OPEN, MG_DONE_UNSURE, MG_FENCE_WAIT, MG_NOT_AGAIN, MG_P_FENCE, MG_P_OPEN, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_SHARERS_UNSURE } from './migrate-fake';
+import { fastTiming, getJob, http, m, noAnswer, refusal, resetMigrate, seedBot, seedSharer, COMPANION_URL, UNREADABLE, FLEET_DB, MG_DONE_OPEN, MG_DONE_UNSURE, MG_FENCE_WAIT, MG_NOT_AGAIN, MG_P_FENCE, MG_P_OPEN, MG_SHARERS_RUN, MG_SHARERS_STAY, MG_SHARERS_UNSURE, MG_SEARCH_WAIT } from './migrate-fake';
 
 beforeEach(() => { resetMigrate(); fastTiming(MIGRATE_TIMING); });
 
@@ -284,7 +284,6 @@ describe('D: following the job', () => {
     expect(e.indexOf('stop-sharer:s1')).toBeGreaterThan(-1);
     expect(e.indexOf('stop-sharer:s1')).toBeLessThan(e.indexOf('hba-fence'));
     expect(e.indexOf('hba-fence')).toBeLessThan(e.findIndex(x => x.startsWith('POST:')));
-    expect(m.sharerStopOpts).toEqual([{ seen: true }]);
     const w = writes();
     const iso = w.findIndex(r => r.isolated === true);
     expect(iso).toBeGreaterThan(-1);
@@ -399,6 +398,22 @@ describe('D: following the job', () => {
     expect(w[0].sharers).toEqual(['s1']);
     expect(w.slice(0, w.findIndex(r => r.phase === 'finishing')).some(r => JSON.stringify(r.sharers) === '["s1","s2"]')).toBe(true);
     expect(texts).toContain(MG_P_OPEN(['S1', 'S2']));
+  });
+  it('X35 (NM16), a bot the search could not check parks the follow and holds nothing new; the next press goes on', async () => {
+    adoptSeed({ postgres: true });
+    seedSharer('s2');
+    m.sharers = ['s1'];
+    m.unchecked = ['s2'];
+    const mark = m.migrateWrites.length;
+    expect(await runMigration('b1', 'file', 'press')).toEqual({ accepted: true });
+    await laneDone('b1');
+    expect(rec()).toMatchObject({ phase: 'waiting', resumeAt: 'following', text: MG_SEARCH_WAIT('cli-1', 'S2') });
+    expect(m.migrateWrites.slice(mark).some(w => w.rec?.sharers?.includes('s2'))).toBe(false);
+    expect(m.events.some(x => x.startsWith('POST:'))).toBe(false);
+    m.unchecked = [];
+    expect(await runMigration('b1', 'file', 'press')).toEqual({ accepted: true });
+    await laneDone('b1');
+    expect(last()).toMatchObject({ outcome: 'done' });
   });
   it('X27, a found sharer whose own managed database has replication on is named and not held (Q8)', async () => {
     adoptSeed({ postgres: true });

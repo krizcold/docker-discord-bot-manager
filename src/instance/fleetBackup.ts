@@ -20,7 +20,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
-import { InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, JoinAddress } from '../types';
+import { ContainerInfo, InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, JoinAddress } from '../types';
 import {
   ALERT_AFTER_MS, backupDir, COPY_FILE_PREFIX, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, newestScheduled, parseCountLines, parseDumpName,
   ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
@@ -1665,21 +1665,31 @@ export function databaseSharers(instance: InstanceConfig, url: string): Instance
   return sharers;
 }
 
-/** M5's list (B37): databaseSharers, and each running bot whose deployed Database URL names the database, in registry order. */
-export async function runningDatabaseSharers(instance: InstanceConfig, url: string): Promise<InstanceConfig[]> {
+/** M5's list (B37): databaseSharers, and each bot one of whose running containers has a deployed Database URL that names the database, in registry order; unchecked: the ids of the other bots with a Database URL key that docker did not answer for (no listing, or an inspect that failed and no other container of theirs that names the database). */
+export async function runningDatabaseSharers(instance: InstanceConfig, url: string): Promise<{ bots: InstanceConfig[]; unchecked: string[] }> {
   const aliases = sharerAliases(instance, url);
   const ids = new Set(databaseSharers(instance, url).map(b => b.id));
+  const unchecked: string[] = [];
   const all = containerManager.getAllBots();
+  let live: ((b: InstanceConfig) => ContainerInfo[]) | null | undefined;
   for (const b of all) {
     if (ids.has(b.id)) continue;
     const key = findAppCapabilities(b.sourceUrl)?.companionDb?.env.url;
     if (!key) continue;
-    const deployed = await containerManager.appContainerEnv(b.id, [key, 'PGPORT']);
-    if (!deployed.ok) continue;
-    const read = readDatabaseUrl(deployed.env[key] ?? '', deployed.env);
-    if (!read.form && read.addresses.some(a => aliases.has(`${a.host}:${a.port}/${a.db}`))) ids.add(b.id);
+    if (live === undefined) live = await containerManager.liveContainersNow();
+    if (live === null) { unchecked.push(b.id); continue; }
+    let named = false;
+    let failed = false;
+    for (const c of live(b)) {
+      const deployed = await containerManager.containerEnv(c.id, [key, 'PGPORT']);
+      if (!deployed.ok) { failed = true; continue; }
+      const read = readDatabaseUrl(deployed.env[key] ?? '', deployed.env);
+      if (!read.form && read.addresses.some(a => aliases.has(`${a.host}:${a.port}/${a.db}`))) { named = true; break; }
+    }
+    if (named) ids.add(b.id);
+    else if (failed) unchecked.push(b.id);
   }
-  return all.filter(b => ids.has(b.id));
+  return { bots: all.filter(b => ids.has(b.id)), unchecked };
 }
 
 /**
@@ -2312,7 +2322,7 @@ async function restoreLocked(
       if (self && steps.botState === 'maintenance') continue;
       const stop = await asResult(self ? containerManager.stopBotInOp(botId, RESTORE_OP) : containerManager.stopBot(b.id));
       if (!stop.success && stop.error === 'Bot is not running') {
-        // The record says stopped while docker runs it: the containers docker named are stopped by name.
+        // Stop's gate counted none of the containers docker named here (a standby, or ones gone between the reads): they are stopped by name.
         const left = await stopListedContainers(b.id, live);
         steps.stopped.push(b.id);
         if (left !== null) {

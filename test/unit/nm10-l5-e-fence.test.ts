@@ -17,6 +17,9 @@ const h = vi.hoisted(() => {
     addrs: { ok: true, addresses: ['172.18.0.4'] } as { ok: boolean; addresses?: string[]; error?: string },
     deployed: {} as Record<string, Record<string, string>>,
     envAsks: [] as string[],
+    lists: 0,
+    listFail: false,
+    inspectFail: [] as string[],
     calls: [] as string[][],
     settings: { out: '/var/lib/postgresql/data/pg_hba.conf|0|0\n' } as R,
     write: { out: 'fenced\n' } as R,
@@ -48,11 +51,15 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   return {
     ...real,
     appContainerAddresses: async () => h.addrs,
-    appContainerEnv: async (id: string, keys: string[]) => {
-      h.envAsks.push(id);
-      const env = h.deployed[id];
-      if (!env) return { ok: false, error: 'the bot container is not running' };
-      return { ok: true, env: Object.fromEntries(Object.entries(env).filter(([k]) => keys.includes(k))) };
+    liveContainersNow: async () => {
+      h.lists++;
+      return h.listFail ? null : (b: any) => (h.deployed[b.id] ? [{ id: `${b.id}-id`, name: b.id, state: 'running', status: '', ports: [] }] : []);
+    },
+    containerEnv: async (id: string, keys: string[]) => {
+      const bot = id.replace(/-id$/, '');
+      h.envAsks.push(bot);
+      if (h.inspectFail.includes(bot)) return { ok: false, error: 'No such object' };
+      return { ok: true, env: Object.fromEntries(Object.entries(h.deployed[bot] ?? {}).filter(([k]) => keys.includes(k))) };
     },
   };
 });
@@ -108,7 +115,7 @@ const execs = (re: RegExp) => h.calls.filter(c => re.test(c.join(' ')));
 beforeEach(() => {
   writeRegistry([base('a', { fleetDb })]);
   Object.assign(h, {
-    urls: {}, corrupt: [], addrs: { ok: true, addresses: ['172.18.0.4'] }, deployed: {}, envAsks: [], calls: [],
+    urls: {}, corrupt: [], addrs: { ok: true, addresses: ['172.18.0.4'] }, deployed: {}, envAsks: [], lists: 0, listFail: false, inspectFail: [], calls: [],
     settings: { out: `${HBA}|0|0\n` }, write: { out: 'fenced\n' }, reload: { out: 't\n' }, rejects: true, sweeps: [], left: '1\n',
     vol: { out: '' }, lift: { out: '' }, strip: { out: '' }, layers: 'off|0||',
   });
@@ -313,8 +320,41 @@ describe('runningDatabaseSharers', () => {
     writeRegistry([base('a', { fleetDb }), base('b'), base('c'), base('d')]);
     h.deployed.c = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres:5432/app' };
     h.deployed.d = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres/app', PGPORT: '5432' };
-    expect((await runningDatabaseSharers(a(), '')).map(b => b.id)).toEqual(['a', 'b', 'c']);
+    const found = await runningDatabaseSharers(a(), '');
+    expect(found.bots.map(b => b.id)).toEqual(['a', 'b', 'c']);
+    expect(found.unchecked).toEqual([]);
     expect(h.envAsks).toEqual(['c', 'd']);
+    expect(h.lists).toBe(1);
+  });
+  const registry = () => {
+    h.urls.b = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres:5432/app' };
+    writeRegistry([base('a', { fleetDb }), base('b'), base('c'), base('d')]);
+    h.deployed.c = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres:5432/app' };
+    h.deployed.d = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres/app', PGPORT: '5432' };
+  };
+  it('(NM16) with no listing, the bots it could not check are named unchecked', async () => {
+    const { runningDatabaseSharers } = await import('../../src/instance/fleetBackup');
+    registry();
+    h.listFail = true;
+    const found = await runningDatabaseSharers(a(), '');
+    expect(found.bots.map(b => b.id)).toEqual(['a', 'b']);
+    expect(found.unchecked).toEqual(['c', 'd']);
+    expect(h.envAsks).toEqual([]);
+  });
+  it('(NM16) an inspect that fails names its bot unchecked', async () => {
+    const { runningDatabaseSharers } = await import('../../src/instance/fleetBackup');
+    registry();
+    h.inspectFail = ['c'];
+    const found = await runningDatabaseSharers(a(), '');
+    expect(found.bots.map(b => b.id)).toEqual(['a', 'b']);
+    expect(found.unchecked).toEqual(['c']);
+  });
+  it('(NM16) with no candidate the listing is not read', async () => {
+    const { runningDatabaseSharers } = await import('../../src/instance/fleetBackup');
+    h.urls.b = { DATABASE_URL: 'postgresql://u:p@bot-a-postgres:5432/app' };
+    writeRegistry([base('a', { fleetDb }), base('b')]);
+    expect((await runningDatabaseSharers(a(), '')).bots.map(b => b.id)).toEqual(['a', 'b']);
+    expect(h.lists).toBe(0);
   });
 });
 

@@ -15,6 +15,8 @@ const pg = vi.hoisted(() => ({
   events: [] as string[],
   live: {} as Record<string, string[] | null>,
   sticky: '',
+  stopUnseen: false,
+  standalone: {} as Record<string, string[]>,
 }));
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
@@ -37,9 +39,10 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
     runningInstanceContainers: async (id: string) => (id in pg.live ? pg.live[id] : []),
     deployedComposeExists: () => true,
     startFleetDbSidecar: async () => { pg.events.push('sidecar-up'); return { success: true }; },
-    // The real stop refuses an instance whose record is not running.
+    // The real stop's gate: unanswered, or a record not running with nothing docker runs outside its database and standby.
     stopBot: async (id: string) => {
-      if (real.getBot(id)?.status !== 'running') return { success: false, error: 'Bot is not running' };
+      if (pg.stopUnseen) return { success: false, error: 'Docker did not say whether the bot runs, so nothing was stopped' };
+      if (real.getBot(id)?.status !== 'running' && !(pg.live[id] ?? []).some(n => !(pg.standalone[id] ?? []).includes(n))) return { success: false, error: 'Bot is not running' };
       pg.events.push(`stop:${id}`);
       pg.live[id] = [];
       return { success: true };
@@ -128,6 +131,8 @@ beforeEach(() => {
   pg.events.length = 0;
   pg.live = {};
   pg.sticky = '';
+  pg.stopUnseen = false;
+  pg.standalone = {};
   fs.rmSync(DIR, { recursive: true, force: true });
   fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(path.join(DIR, 'old.dump'), 'dump');
@@ -142,23 +147,45 @@ afterAll(() => { fs.rmSync(tmp.dir, { recursive: true, force: true }); });
 const at = (event: string) => pg.events.indexOf(event);
 
 describe('B14-2s: the restore stops what docker runs, whatever the record says', () => {
-  it('stops a sharer whose record says stopped while docker runs it, before the fence, and starts it after', async () => {
+  it('stops a sharer whose record says stopped while docker runs it, before the fence, and starts it after (NM16 C20)', async () => {
     pg.live.w = ['bot-w-app'];
     const r = await fleetBackup.restoreFleetBackup('a', 'old.dump');
     expect(r.error).toBeUndefined();
     expect(r.success).toBe(true);
-    expect(at('docker-stop:bot-w-app')).toBeGreaterThanOrEqual(0);
-    expect(at('docker-stop:bot-w-app')).toBeLessThan(at('fence'));
+    expect(at('stop:w')).toBeGreaterThanOrEqual(0);
+    expect(at('stop:w')).toBeLessThan(at('fence'));
+    expect(pg.events).not.toContain('docker-stop:bot-w-app');
     expect(r.steps.stopped).toEqual(['w']);
     expect(r.steps.restarted).toEqual(['w']);
   });
 
-  it('refuses before the fence when docker still runs a container after the stop (bot-w-sticky survives)', async () => {
-    pg.live.w = ['bot-w-app', 'bot-w-sticky'];
-    pg.sticky = 'bot-w-sticky';
+  it('stops through Stop a sharer whose app is down while another of its containers runs (NM16 C21)', async () => {
+    pg.live.w = ['bot-w-lavalink'];
+    const r = await fleetBackup.restoreFleetBackup('a', 'old.dump');
+    expect(r.error).toBeUndefined();
+    expect(at('stop:w')).toBeGreaterThanOrEqual(0);
+    expect(at('stop:w')).toBeLessThan(at('fence'));
+    expect(pg.events).not.toContain('docker-stop:bot-w-lavalink');
+    expect(r.steps.stopped).toEqual(['w']);
+  });
+
+  it('refuses before the fence when a container the gate does not count survives its stop by name (bot-w-replica)', async () => {
+    pg.standalone.w = ['bot-w-replica'];
+    pg.live.w = ['bot-w-replica'];
+    pg.sticky = 'bot-w-replica';
     const r = await fleetBackup.restoreFleetBackup('a', 'old.dump');
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/bot-w-sticky/);
+    expect(r.error).toMatch(/bot-w-replica/);
+    expect(pg.events).not.toContain('fence');
+    expect(pg.events).not.toContain('drop');
+  });
+
+  it('refuses and undoes when the stop could not read docker (NM16 C22)', async () => {
+    pg.live.w = ['bot-w-app'];
+    pg.stopUnseen = true;
+    const r = await fleetBackup.restoreFleetBackup('a', 'old.dump');
+    expect(r.success).toBe(false);
+    expect(r.error?.startsWith('Could not stop instance w: Docker did not say whether the bot runs, so nothing was stopped')).toBe(true);
     expect(pg.events).not.toContain('fence');
     expect(pg.events).not.toContain('drop');
   });

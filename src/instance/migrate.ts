@@ -402,7 +402,9 @@ const T = {
   unsavedUnknown: (reason: string) => `The migration did not start: the bot did not confirm that it saved every change it holds (${reason}). Nothing was copied, and the bot stays in Maintenance; press Migrate to try again.`,
   cSharerBusy: (name: string, op: string) => `${name} uses the same database and is running '${op}'`,
   cSharer: (name: string, err: string) => `${name} uses the same database and could not be stopped (${err})`,
-  cSharerStill: (name: string) => `${name} uses the same database, and docker still shows its container running after the manager stopped it`,
+  cSharerStill: (name: string) => `${name} uses the same database, and docker still shows a container of it running, so the manager could not stop it`,
+  cUnchecked: (names: string, n: number) => n === 1 ? `the manager could not read from docker whether ${names} uses this database, so ${names} could not be checked` : `the manager could not read from docker whether ${names} use this database, so they could not be checked`,
+  searchWait: (jobId: string, clause: string) => `The manager did not go on following migration ${jobId}: ${clause}. The bot stays in Maintenance with the migration open; press Migrate to try again.`,
   cSharerOpen: (name: string, x: string) => `${name} uses the same database and has its own data migration to ${x} open, so it was not stopped`,
   cSharerShared: (name: string, other: string, x: string) => `${name} uses the same database, and ${other}'s open migration to ${x} already holds it, so it was not stopped`,
   cSharerRepl: (name: string) => `${name} uses the same database, and ${name}'s own managed database has replication on; the manager's check of that database as its fleet's main pauses while this migration holds ${name}, so ${name} was not stopped`,
@@ -913,7 +915,10 @@ class Lane {
   private async isolate(mode: 'close' | 'park'): Promise<Next | null> {
     const no = (r: SharerRefusal): Next => (mode === 'close' ? { go: 'close', text: T.notStarted(r) } : { go: 'park', resumeAt: 'posting', text: T.notReposted(r) });
     const url = (this.env()[this.urlKey()] || '').trim();
-    const found = url ? (await fleetBackup.runningDatabaseSharers(this.fresh(), url)).filter(b => b.id !== this.botId) : [];
+    const search = url ? await fleetBackup.runningDatabaseSharers(this.fresh(), url) : { bots: [], unchecked: [] };
+    const unchecked = search.unchecked.filter(id => id !== this.botId);
+    if (unchecked.length > 0) return no({ clause: T.cUnchecked(this.names(unchecked), unchecked.length) });
+    const found = search.bots.filter(b => b.id !== this.botId);
     const ids = Array.from(new Set([...this.rec.sharers, ...found.map(b => b.id)]));
     if (ids.length > 0) {
       for (const id of ids) {
@@ -928,9 +933,9 @@ class Lane {
         if (!s) continue;
         const op = containerManager.isBotBusy(id);
         if (op) return no({ clause: T.cSharerBusy(s.displayName, op) });
-        const app = await containerManager.appContainerRunning(id);
-        if (app === null) return no({ clause: T.cSharer(s.displayName, 'docker did not say whether it runs') });
-        if (app) {
+        const live = await containerManager.liveContainerNames(id);
+        if (live === null) return no({ clause: T.cSharer(s.displayName, 'docker did not say whether it runs') });
+        if (live.length > 0) {
           const nowOp = containerManager.isBotBusy(id);
           if (nowOp) return no({ clause: T.cSharerBusy(s.displayName, nowOp) });
           const held = this.sharerHeld(containerManager.getBot(id) ?? s);
@@ -938,14 +943,14 @@ class Lane {
           if (!this.rec.sharersStopped.includes(id) && !this.save({ sharersStopped: [...this.rec.sharersStopped, id] })) return this.stop();
           let stopped: { success: boolean; error?: string };
           try {
-            stopped = await containerManager.stopBot(id, { seen: true });
+            stopped = await containerManager.stopBot(id);
           } catch (err) {
             return no({ clause: T.cSharer(s.displayName, errText(err)) });
           }
           if (!stopped.success && stopped.error !== 'Bot is not running') return no({ clause: T.cSharer(s.displayName, stopped.error || 'no reason given') });
-          const after = await containerManager.appContainerRunning(id);
+          const after = await containerManager.liveContainerNames(id);
           if (after === null) return no({ clause: T.cSharer(s.displayName, 'docker did not say whether it runs') });
-          if (after) return no({ clause: T.cSharerStill(s.displayName), retry: T.retryStill });
+          if (after.length > 0) return no({ clause: T.cSharerStill(s.displayName), retry: T.retryStill });
         }
       }
     }
@@ -1186,14 +1191,15 @@ class Lane {
     return app === false ? T.restartStopped : app === null ? T.restartUnknown : '';
   }
 
-  /** G14: the bots in sharers by docker's answer at the close: stopped, running, unanswered. */
+  /** G14: the bots in sharers by the containers Stop's gate counts at the close: none, some, or unanswered. */
   private async sharersText(ids: string[]): Promise<string> {
     const stay: string[] = [];
     const run: string[] = [];
     const unsure: string[] = [];
     for (const id of ids) {
-      const app = await containerManager.appContainerRunning(id);
-      (app === false ? stay : app ? run : unsure).push(id);
+      if (!containerManager.getBot(id)) continue;
+      const live = await containerManager.liveContainerNames(id);
+      (live === null ? unsure : live.length > 0 ? run : stay).push(id);
     }
     return `${stay.length ? T.sharersStay(this.names(stay), stay.length) : ''}${run.length ? T.sharersRun(this.names(run), run.length) : ''}${unsure.length ? T.sharersUnsure(this.names(unsure), unsure.length) : ''}`;
   }
@@ -1646,9 +1652,12 @@ class Lane {
   }
 
   /** X27 (D136): the search at an adoption; every bot found is saved as held (sharers) right after it, except one with a migration of its own open (D135) or with replication on its own managed database (Q8); none is read from docker or stopped. ids: the found bots still in the registry; repl: the found ones left out for replication. */
-  private async adoptSharers(): Promise<{ ids: string[]; repl: string[] } | Next> {
+  private async adoptSharers(phase: Exclude<MigratePhase, 'waiting'>): Promise<{ ids: string[]; repl: string[] } | Next> {
     const url = (this.env()[this.urlKey()] || '').trim();
-    const found = url ? (await fleetBackup.runningDatabaseSharers(this.fresh(), url)).filter(b => b.id !== this.botId) : [];
+    const search = url ? await fleetBackup.runningDatabaseSharers(this.fresh(), url) : { bots: [], unchecked: [] };
+    const unchecked = search.unchecked.filter(id => id !== this.botId);
+    if (unchecked.length > 0) return { go: 'park', resumeAt: phase, text: T.searchWait(this.rec.jobId, T.cUnchecked(this.names(unchecked), unchecked.length)) };
+    const found = search.bots.filter(b => b.id !== this.botId);
     const ids = Array.from(new Set([...this.rec.sharers, ...found.map(b => b.id)]));
     const sharers = ids.filter(id => {
       const s = containerManager.getBot(id);
@@ -1663,7 +1672,7 @@ class Lane {
   private async fenceAtFollow(phase: Exclude<MigratePhase, 'waiting'>, known: 'running' | null): Promise<Next | null> {
     if (this.rec.to === 'file' && this.rec.from === 'postgres' && !this.rec.isolated) {
       if (phase === 'posting') return null;
-      const found = await this.adoptSharers();
+      const found = await this.adoptSharers(phase);
       if ('go' in found) return found;
       if (!this.rec.hbaFence && this.rec.sharersStopped.length === 0) this.progress(T.pOpen(found.ids.map(id => this.names([id])), found.repl.map(id => this.names([id]))));
       return null;

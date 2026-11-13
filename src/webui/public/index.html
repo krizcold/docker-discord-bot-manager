@@ -898,6 +898,13 @@
       const text = age > STATUS_CHECK_STALE_MS ? `status unknown: last checked ${when}` : `last checked ${when}`;
       return `<div class="status-checked" data-bot-id="${escapeHtml(bot.id)}" style="font-size:11px;opacity:.7;text-align:right">${escapeHtml(text + up)}</div>`;
     }
+    function stopIfLiveHtml(bot, d) {
+      if (bot.status === 'running' || !Array.isArray(bot.containersLive) || bot.containersLive.length === 0) return '';
+      return `<button class="btn btn-danger btn-small"${d} onclick="stopBot('${bot.id}')" title="Docker still runs ${escapeHtml(bot.containersLive.join(', '))} for this bot; Stop takes the bot's containers down">Stop</button>`;
+    }
+    function checkedChangesCard(bot, read) {
+      return (bot.containersLive || []).join('\n') !== (read.containersLive || []).join('\n');
+    }
     function redrawStatusChecked() {
       for (const el of document.querySelectorAll('.status-checked[data-bot-id]')) {
         const bot = bots.find(b => b.id === el.dataset.botId);
@@ -1186,10 +1193,16 @@
             if (payload.activeOp || payload.cutOp !== undefined) mergeBotState({ id: payload.id, cutOp: payload.cutOp || null });
             redraw();
             break;
-          case 'bots:checked':
-            for (const [botId, read] of Object.entries(payload || {})) mergeBotState({ id: botId, ...read });
-            redrawStatusChecked();
+          case 'bots:checked': {
+            let cardsChanged = false;
+            for (const [botId, read] of Object.entries(payload || {})) {
+              const known = bots.find(b => b.id === botId);
+              if (known && checkedChangesCard(known, read)) cardsChanged = true;
+              mergeBotState({ id: botId, ...read });
+            }
+            if (cardsChanged) redraw(); else redrawStatusChecked();
             break;
+          }
 
           // Operation success - payload is the full bot object (with activeOp).
           // The terminal popup is SSE-driven now; these only refresh card state.
@@ -1700,6 +1713,7 @@
                     : `<button class="btn ${bot.updateAvailable ? 'btn-primary' : 'btn-secondary'} btn-small"${d} onclick="updateBot('${bot.id}')">Update</button>`) : ''}
                 ` : (bot.hasBeenStarted || bot.lastStartAt) ? `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')"${offStart}>Start</button>
+                  ${stopIfLiveHtml(bot, d)}
                   <button class="btn btn-secondary btn-small"${d} onclick="buildBotImage('${bot.id}')" title="Fetch the source (or pull the image) and rebuild the image and compose without restarting the bot">Build</button>
                   ${showFetch
                     ? `<button class="btn btn-secondary btn-small" onclick="fetchSource('${bot.sourceId}')" title="Check the source for new commits">Fetch</button>`
@@ -1713,6 +1727,7 @@
                   <button class="btn btn-danger btn-small"${d} onclick="deleteBot('${bot.id}')">Delete</button>
                 ` : `
                   <button class="btn btn-success btn-small"${d} onclick="startBot('${bot.id}')"${offStart}>Install &amp; Run</button>
+                  ${stopIfLiveHtml(bot, d)}
                   ${buildLogsBtn}
                   <button class="btn btn-secondary btn-small"${d} onclick="showEnvEditor('${bot.id}')">Env</button>
                   <button class="btn btn-secondary btn-small"${d} onclick="showConfigEditor('${bot.id}')">Config</button>

@@ -121,8 +121,26 @@ export function testDue(last: FleetBackupTestRecord | undefined, now: number, ho
   return last.startedAt < dailyBoundary(now, hour);
 }
 
-/** One `count|"schema"."table"|<n>` line per permanent table, ordered by name; extension members and unlogged tables are left out. */
-export const COUNTS_SQL = "SELECT 'count|' || format('%I.%I', n.nspname, c.relname) || '|' || "
+/** format('%I.%I') with \ as \\, a line feed as \n and a carriage return as \r, so each name stays on one psql line. */
+const ESCAPED_NAME_SQL = "replace(replace(replace(format('%I.%I', n.nspname, c.relname), E'\\\\', E'\\\\\\\\'), E'\\n', E'\\\\n'), E'\\r', E'\\\\r')";
+
+/** The format('%I.%I') text back from ESCAPED_NAME_SQL's form; null when an escape is not one it writes. */
+function unescapeName(text: string): string | null {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch !== '\\') { out += ch; continue; }
+    const next = text[++i];
+    if (next === '\\') out += '\\';
+    else if (next === 'n') out += '\n';
+    else if (next === 'r') out += '\r';
+    else return null;
+  }
+  return out;
+}
+
+/** One `count|"schema"."table"|<n>` line per permanent table (the name escaped as ESCAPED_NAME_SQL writes it), ordered by name; extension members and unlogged tables are left out. */
+export const COUNTS_SQL = "SELECT 'count|' || " + ESCAPED_NAME_SQL + " || '|' || "
   + "(xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', n.nspname, c.relname), false, true, '')))[1]::text "
   + 'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
   + "WHERE c.relkind = 'r' AND c.relpersistence = 'p' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
@@ -131,10 +149,10 @@ export const COUNTS_SQL = "SELECT 'count|' || format('%I.%I', n.nspname, c.relna
   + 'ORDER BY n.nspname, c.relname';
 
 /**
- * One `checksum|"schema"."table"|<md5>` line per table of COUNTS_SQL's selection: the md5 of every row's text form,
- * sorted, so row order and physical layout do not change it.
+ * One `checksum|"schema"."table"|<md5>` line per table of COUNTS_SQL's selection, the name escaped the same way: the md5
+ * of every row's text form, sorted, so row order and physical layout do not change it.
  */
-export const CHECKSUM_SQL = "SELECT 'checksum|' || format('%I.%I', n.nspname, c.relname) || '|' || "
+export const CHECKSUM_SQL = "SELECT 'checksum|' || " + ESCAPED_NAME_SQL + " || '|' || "
   + "(xpath('/row/h/text()', query_to_xml(format('SELECT md5(coalesce(string_agg(md5(t::text), '''' ORDER BY md5(t::text)), '''')) AS h FROM %I.%I t', n.nspname, c.relname), false, true, '')))[1]::text "
   + 'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
   + "WHERE c.relkind = 'r' AND c.relpersistence = 'p' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "
@@ -149,7 +167,7 @@ export function parseChecksumLines(text: string): { ok: true; sums: Record<strin
     const line = raw.replace(/\r$/, '');
     if (!line.startsWith('checksum|')) continue;
     const cut = line.lastIndexOf('|');
-    const name = line.slice('checksum|'.length, cut);
+    const name = unescapeName(line.slice('checksum|'.length, cut));
     const h = line.slice(cut + 1);
     if (!name || !/^[0-9a-f]{32}$/.test(h)) return { ok: false, error: `a table checksum read back as ${line.slice(0, 200)}` };
     sums[name] = h;
@@ -186,7 +204,7 @@ export function parseCountLines(text: string): { ok: true; counts: Record<string
     const line = raw.replace(/\r$/, '');
     if (!line.startsWith('count|')) continue;
     const cut = line.lastIndexOf('|');
-    const name = line.slice('count|'.length, cut);
+    const name = unescapeName(line.slice('count|'.length, cut));
     const n = line.slice(cut + 1);
     if (!name || !/^\d+$/.test(n) || !Number.isSafeInteger(Number(n))) return { ok: false, error: `a table count read back as ${line.slice(0, 200)}` };
     counts[name] = Number(n);

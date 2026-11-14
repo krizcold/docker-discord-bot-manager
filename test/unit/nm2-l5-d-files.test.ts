@@ -82,7 +82,7 @@ describe('NM2 L5 d: due and trim edges', () => {
 
 describe('NM2 L5 d: SQL', () => {
   it('the holder reads the exact snapshot and counts statements', () => {
-    expect(COUNTS_SQL).toBe("SELECT 'count|' || format('%I.%I', n.nspname, c.relname) || '|' || "
+    expect(COUNTS_SQL).toBe("SELECT 'count|' || replace(replace(replace(format('%I.%I', n.nspname, c.relname), E'\\\\', E'\\\\\\\\'), E'\\n', E'\\\\n'), E'\\r', E'\\\\r') || '|' || "
       + "(xpath('/row/c/text()', query_to_xml(format('SELECT count(*) AS c FROM %I.%I', n.nspname, c.relname), false, true, '')))[1]::text "
       + 'FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace '
       + "WHERE c.relkind = 'r' AND c.relpersistence = 'p' AND n.nspname NOT IN ('pg_catalog', 'information_schema') "

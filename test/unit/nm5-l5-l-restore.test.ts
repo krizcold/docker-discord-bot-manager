@@ -255,14 +255,17 @@ const raisedTo = (g: number, machine = 'a') => `VALUES (true, '${machine}', ${g}
 const notice = () => registryA().fleetDb.switchNotice;
 
 import { addressTableSql } from '../../src/instance/fleetReplication';
+import { MANAGER_SESSION_OPTIONS } from '../../src/instance/dbLogin';
 import { cutAddressesSql, GEN_READ_SQL, machineNameOf, OWN_COPIES_READ_SQL, raiseSql, RESTORE_STATE_CLEAR, receiveMarkClearSql } from '../../src/instance/switchSql';
 
 const MOVED = 'moved-2026-10-30T12-00-00-000Z.dump';
 const BROKEN = { pushBroken: { at: '2026-10-30T09:00:00.000Z', safetyDump: 'pre-receive-x.dump' } };
 const REPL = { role: 'replicator', password: 'pw', hostPort: 5434, publicHost: 'main.example', certHost: 'main.example' };
 const EXEMPT = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off'];
-const ON_POSTGRES = ['psql', '-U', 'dbm_admin', '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c'];
-const ON_APP = ['bot-a-postgres', 'psql', '-U', 'dbm_admin', '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+const ON_POSTGRES = ['psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q', '-c'];
+// NM20 R3.3: smdb_manager in the bot's database is dbm_meta's, pinned; the generation write is fence-exempt.
+const PIN = `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`;
+const ON_APP = ['bot-a-postgres', 'psql', '-U', 'dbm_meta', '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
 const callsWith = (part: string) => pg.argv.filter(a => a.join(' ').includes(part));
 const errors = async (run: () => Promise<unknown>) => {
   const seen: string[] = [];
@@ -285,16 +288,16 @@ describe('the restore lane calls psql with the argv it means', () => {
     claimDb.generation = LIVE;
     expect((await restore()).success).toBe(true);
     const reads = pg.argv.filter(a => a[a.length - 1] === GEN_READ_SQL);
-    expect(reads).toEqual([['exec', ...ON_APP, GEN_READ_SQL], ['exec', ...ON_APP, GEN_READ_SQL]]);
+    expect(reads).toEqual([['exec', '-e', PIN, ...ON_APP, GEN_READ_SQL], ['exec', '-e', PIN, ...ON_APP, GEN_READ_SQL]]);
     const write = callsWith('INSERT INTO smdb_manager.generation');
     expect(write).toHaveLength(1);
-    expect(write[0].slice(0, -1)).toEqual([...EXEMPT, ...ON_APP]);
+    expect(write[0].slice(0, -1)).toEqual(['exec', '-e', `${PIN} -c default_transaction_read_only=off`, ...ON_APP]);
   });
   it('a moved- restore reads its own copies outside the exempt session', async () => {
     fs.writeFileSync(path.join(DIR, MOVED), 'dump');
     claimDb.generation = LIVE;
     expect((await restore(MOVED)).success).toBe(true);
-    expect(pg.argv.filter(a => a[a.length - 1] === OWN_COPIES_READ_SQL)).toEqual([['exec', ...ON_APP, OWN_COPIES_READ_SQL]]);
+    expect(pg.argv.filter(a => a[a.length - 1] === OWN_COPIES_READ_SQL)).toEqual([['exec', '-e', PIN, ...ON_APP, OWN_COPIES_READ_SQL]]);
   });
   it('the receive mark is removed on postgres with no id after pushBroken is cleared', async () => {
     writeRegistry({ ...MAINTAINED, fleetDb: { ...primary, ...BROKEN } });
@@ -325,14 +328,14 @@ describe('a generation row that does not parse is quoted trimmed', () => {
   it('the live row before the drop', async () => {
     claimDb.generation = { generation: 'x' as unknown as number, machine: 'm', since: null };
     const r = await restore();
-    expect(r.error).toBe("Could not read the database's generation before the restore, so the restore was refused, and nothing was changed: it answered 'x|m|'");
+    expect(r.error).toBe("Could not read the database's generation before the restore, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): it answered 'x|m|'");
     expect(claimDb.dropSeen).toBe(false);
   });
   it('the restore record the upsert answers', async () => {
     claimDb.generation = LIVE;
     claimDb.restoreState = { pending: false, file: 'p.dump', generation: NaN, machine: 'm', since: null };
     const r = await restore();
-    expect(r.error).toBe("The database's generation could not be kept before the drop, so the restore was refused, and nothing was changed: it answered 'NaN|m|'");
+    expect(r.error).toBe("The database's generation could not be kept before the drop, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): it answered 'NaN|m|'");
     expect(claimDb.dropSeen).toBe(false);
   });
   it('the restored row after the drop', async () => {
@@ -365,13 +368,14 @@ describe('the address rows a moved- restore writes', () => {
     const own = { host: 'main.example', port: 5434 };
     expect(lastWrite()).toBe(raiseSql(machine(), 6, `${cutAddressesSql(own)}${addressTableSql(own.host, own.port, COPY_PEM.trim(), machine(), null)}`));
   });
-  it('with replication and no readable certificate: the generation write is refused with the reason', async () => {
+  it('with replication and no readable certificate: the restore is refused before anything changes (NM20 P1)', async () => {
     fs.writeFileSync(path.join(DIR, MOVED), 'dump');
     writeRegistry({ ...MAINTAINED, fleetDb: { ...primary, replication: REPL } });
     claimDb.generation = LIVE;
     const r = await restore(MOVED);
     expect(r.success).toBe(false);
-    expect(r.error).toContain("The dump was restored, but the generation row could not be written back (this database's certificate could not be read for its address row).");
+    expect(r.error).toBe("This database's certificate could not be read for its address row, so the restore was refused, and nothing was changed: server.crt in the database container did not read as a certificate");
+    expect(claimDb.dropSeen).toBe(false);
     expect(claimDb.genWrites).toEqual([]);
   });
 });

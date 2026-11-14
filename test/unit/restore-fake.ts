@@ -27,7 +27,7 @@ export interface ClaimDb {
   /** The no-floor cap statement's answer. */
   cap: string;
   toc: TocShape;
-  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'cap' | 'toc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear' | 'counts';
+  fail: null | 'login' | 'tables' | 'floor' | 'raise' | 'cap' | 'toc' | 'managerToc' | 'restored' | 'gen' | 'state' | 'genwrite' | 'clear' | 'owncopies' | 'ensure' | 'markclear' | 'counts';
   /** The counts the restored database answers (null: the counts file of the dump the TOC read was fed). */
   restoredCounts: Record<string, number> | null;
   /** When set, the count answers this as its stdout. */
@@ -36,6 +36,10 @@ export interface ClaimDb {
   onCount: (() => void) | null;
   /** When set, the TOC read prints this in place of TOC[toc]. */
   tocText: string | null;
+  /** When set, the `-n smdb_manager` TOC read prints this in place of managerTocOf of the full read's text. */
+  managerTocText: string | null;
+  /** The argv of every TOC read, in order. */
+  tocArgs: string[][];
   /** The file the last TOC read was fed. */
   tocPath: string | null;
   /** The receive mark removals (D62, S23), each its argv joined. */
@@ -67,6 +71,24 @@ export interface ClaimDb {
   onToc: (() => void) | null;
   /** Called when the recreate drops the database, after dropSeen is set. */
   onDrop: (() => void) | null;
+  /** NM20 part 5: what `pg_restore --data-only -n smdb_manager -f -` prints (X1's meta read). */
+  metaText: string;
+  /** The NM20 part 5 steps by name, in order: reset, cert, meta-read, list, meta-tx, pg_restore. */
+  steps5: string[];
+  /** A failing NM20 part 5 step and the stderr it answers. */
+  fail5: null | 'reset' | 'meta-read' | 'list' | 'meta-tx';
+  fail5Text: string;
+  /** The argv of the reset, the meta read, the list write and the meta transaction, and what they were fed. */
+  resetArgs: string[] | null;
+  metaReadArgs: string[] | null;
+  listArgs: string[] | null;
+  listText: string | null;
+  metaTxArgs: string[] | null;
+  metaScript: string | null;
+  /** The argv of each pg_restore that is not a TOC or meta read. */
+  restoreArgs: string[][];
+  /** The server.crt read's answer; null passes the call to the wrapped fake. */
+  cert: string | null;
 }
 
 export interface GenFake { generation: number; machine: string; since: string | null }
@@ -76,7 +98,9 @@ export function freshClaimDb(): ClaimDb {
     login: 'false|false|0', tables: 't|t|t|f|f', floor: '7', raise: 'seq|8\nguild|g1\nguild|g2\n', restoredTables: 't|t|t|f|f', cap: 'clock|1000\nrows|2\ncapped|2\n', toc: 'claims',
     fail: null, failText: null, tocCode: 1, dropSeen: false, recreateArgs: null, raiseSql: [], capSql: [], tocReads: 0, tocInput: 0, loginReads: 0, onRaise: null, onToc: null, onDrop: null,
     generation: null, restoredGeneration: null, restoreState: null, genWrites: [], genEvents: [], ownCopies: '[]', markClears: [],
-    restoredCounts: null, countRaw: null, countReads: 0, onCount: null, tocText: null, tocPath: null,
+    restoredCounts: null, countRaw: null, countReads: 0, onCount: null, tocText: null, tocPath: null, managerTocText: null, tocArgs: [],
+    metaText: '', steps5: [], fail5: null, fail5Text: 'ERROR:  connection reset by peer', resetArgs: null, metaReadArgs: null, listArgs: null, listText: null,
+    metaTxArgs: null, metaScript: null, restoreArgs: [], cert: null,
   };
 }
 
@@ -176,6 +200,16 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
     const sql = args.join(' ');
     const fail = (text: string) => cb(Object.assign(new Error(text), { code: 1 }), '', claimDb.failText ?? `ERROR:  ${text}`);
     if (cmd === 'docker' && args[0] === 'exec') {
+      if (sql.includes('ALLOW_CONNECTIONS true') && sql.includes('RESET ALL')) {
+        claimDb.steps5.push('reset');
+        claimDb.resetArgs = [...args];
+        if (claimDb.fail5 === 'reset') return cb(Object.assign(new Error('reset failed'), { code: 1 }), '', claimDb.fail5Text);
+        return cb(null, '', '');
+      }
+      if (claimDb.cert !== null && args.includes('cat') && args[args.length - 1].endsWith('/server.crt')) {
+        claimDb.steps5.push('cert');
+        return cb(null, claimDb.cert, '');
+      }
       if (sql.includes('NOLOGIN REPLICATION')) {
         claimDb.recreateArgs = [...args];
         if (claimDb.fail === 'ensure') return fail('permission denied to create role');
@@ -244,9 +278,29 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
 
 export const isTocRead = (args: string[]): boolean => args.includes('pg_restore') && args.includes('-l');
 
-function tocChild(): any {
-  claimDb.tocReads++;
-  claimDb.onToc?.();
+const SCHEMA_OWN_LINE = /^\d+; (?:2615 \d+ SCHEMA - smdb_manager |0 0 (?:COMMENT|ACL|SECURITY LABEL) - SCHEMA smdb_manager )[^ ]*$/;
+const PLAIN_MANAGER_LINE = /^\d+; \d+ \d+ (?:[A-Z]+ )+smdb_manager [^ ]+ [^ ]+$/;
+
+/**
+ * pg_restore -l -n smdb_manager of a fixture in the plain forms only: its header and the lines
+ * `<id>; <n> <n> <type words> smdb_manager <name> <owner>`; the schema's own lines are not listed. Any other entry line
+ * that holds smdb_manager throws, since only real pg_restore output can say which schema it is in.
+ */
+export const managerTocOf = (toc: string): string => toc.split('\n').filter(l => {
+  if (!/^\d+;/.test(l)) return l.startsWith(';');
+  if (!l.includes('smdb_manager')) return false;
+  if (SCHEMA_OWN_LINE.test(l)) return false;
+  if (PLAIN_MANAGER_LINE.test(l) && l.split('smdb_manager').length === 2) return true;
+  throw new Error(`managerTocOf cannot tell where this entry is: ${l}; give the row managerTocText from real pg_restore -l -n smdb_manager output`);
+}).join('\n');
+
+function tocChild(args: string[]): any {
+  claimDb.tocArgs.push([...args]);
+  const manager = args.includes('-n');
+  if (!manager) {
+    claimDb.tocReads++;
+    claimDb.onToc?.();
+  }
   const child: any = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
@@ -254,15 +308,67 @@ function tocChild(): any {
   child.stdin.on('data', (d: Buffer) => { claimDb.tocInput += d.length; });
   child.stdin.on('pipe', (src: { path?: unknown }) => { claimDb.tocPath = typeof src.path === 'string' ? src.path : null; });
   child.kill = () => true;
-  const failing = claimDb.fail === 'toc';
+  const failing = claimDb.fail === (manager ? 'managerToc' : 'toc');
+  const full = claimDb.tocText ?? TOC[claimDb.toc];
+  const out = failing ? '' : manager ? claimDb.managerTocText ?? managerTocOf(full) : full;
   setTimeout(() => {
-    child.stdout.end(failing ? '' : claimDb.tocText ?? TOC[claimDb.toc]);
+    child.stdout.end(out);
     child.stderr.end(failing ? 'pg_restore: error: input file does not appear to be a valid archive' : '');
     setTimeout(() => child.emit('close', failing ? claimDb.tocCode : 0), 2);
   }, 2);
   return child;
 }
 
+export const isMetaRead = (args: string[]): boolean => args.includes('pg_restore') && args.includes('--data-only') && args.includes('-f');
+export const isListWrite = (args: string[]): boolean => args.includes('sh') && args.join(' ').includes('/tmp/smdb-restore.list');
+export const isMetaTx = (args: string[]): boolean => args.includes('psql') && args.includes('dbm_meta') && args.includes('-i');
+
+/** A child that reads its stdin to the end, then prints out and exits 0, or prints the failing step's stderr and exits 1. */
+function part5Child(failing: boolean, out: string, fed: (text: string) => void): any {
+  const child: any = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new PassThrough();
+  child.kill = () => true;
+  let text = '';
+  child.stdin.on('data', (d: Buffer) => { text += d.toString(); });
+  child.stdin.on('finish', () => {
+    fed(text);
+    setTimeout(() => {
+      child.stdout.end(failing ? '' : out);
+      child.stderr.end(failing ? claimDb.fail5Text : '');
+      setTimeout(() => child.emit('close', failing ? 1 : 0), 2);
+    }, 2);
+  });
+  return child;
+}
+
+function part5Spawn(args: string[]): any | null {
+  if (isMetaRead(args)) {
+    claimDb.steps5.push('meta-read');
+    claimDb.metaReadArgs = [...args];
+    return part5Child(claimDb.fail5 === 'meta-read', claimDb.metaText, () => { /* the dump */ });
+  }
+  if (isListWrite(args)) {
+    claimDb.steps5.push('list');
+    claimDb.listArgs = [...args];
+    return part5Child(claimDb.fail5 === 'list', '', text => { claimDb.listText = text; });
+  }
+  if (isMetaTx(args)) {
+    claimDb.steps5.push('meta-tx');
+    claimDb.metaTxArgs = [...args];
+    return part5Child(claimDb.fail5 === 'meta-tx', '', text => { claimDb.metaScript = text; });
+  }
+  if (args.includes('pg_restore') && !isTocRead(args)) {
+    claimDb.steps5.push('pg_restore');
+    claimDb.restoreArgs.push([...args]);
+  }
+  return null;
+}
+
 export function withTocFake<F extends SpawnFake>(spawnFake: F): F {
-  return ((cmd: string, args: string[], opts?: any) => (cmd === 'docker' && isTocRead(args) ? tocChild() : spawnFake(cmd, args, opts))) as F;
+  return ((cmd: string, args: string[], opts?: any) => {
+    if (cmd === 'docker' && isTocRead(args)) return tocChild(args);
+    return (cmd === 'docker' ? part5Spawn(args) : null) ?? spawnFake(cmd, args, opts);
+  }) as F;
 }

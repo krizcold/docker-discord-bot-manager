@@ -59,15 +59,17 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   };
 });
 
-vi.mock('../../src/instance/dbLogin', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../src/instance/dbLogin')>();
+// A crash at a docker call: every docker call of the restore starts through processStart (NM20 part 5).
+vi.mock('../../src/docker/processStart', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/docker/processStart')>();
+  const crash = (args: readonly string[]) => {
+    const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
+    if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
+  };
   return {
     ...real,
-    withRole: (args: string[], role: string) => {
-      const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
-      if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
-      return real.withRole(args, role);
-    },
+    startProcess: (cmd: string, args: readonly string[], opts?: any) => { crash(args); return real.startProcess(cmd, args, opts); },
+    execFileGuarded: (cmd: string, args: readonly string[], opts: any, cb: any) => { crash(args); return real.execFileGuarded(cmd, args, opts, cb); },
   };
 });
 afterEach(() => { (globalThis as any).__withRoleCrash = null; });
@@ -193,10 +195,10 @@ const v3 = (over: Record<string, unknown> = {}) => Object.assign(claimDb, { tabl
 const noFloor = (over: Record<string, unknown> = {}) => Object.assign(claimDb, { tables: NONE, restoredTables: V3, toc: 'shards' }, over);
 const floorSql = () => pg.sql.find(s => s.includes('SELECT coalesce(GREATEST(')) ?? '';
 /** The SQL of a docker exec psql call, from its argv joined. */
-const sqlOf = (sent: string) => sent.slice(sent.indexOf(' -c ') + 4);
+const sqlOf = (sent: string) => sent.slice(sent.lastIndexOf(' -c ') + 4);
 const SHARD_RAISE_MARK = 'FROM smdb_data.shard_claims WHERE claim <= ';
 
-const T11 = 'The dump old.dump has no shard claims, but the database has them, so the restore was refused, and nothing was changed: the database has smdb_data.shard_claims and the dump does not, and a bot that keeps its shard claims in the database does not start on data without them; a pre-restore dump is never refused for this, so a restore can be undone with the one it took';
+const T11 = 'The dump old.dump has no shard claims, but the database has them, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the database has smdb_data.shard_claims and the dump does not, and a bot that keeps its shard claims in the database does not start on data without them; a pre-restore dump is never refused for this, so a restore can be undone with the one it took';
 const T12 = 'The dump old.dump has shard claims but no claim clock, so the restore was refused, and nothing was changed: it has smdb_data.shard_claims but no smdb_data.claim_clock, and the bot creates both together';
 const T10 = (error: string) => `The dump was restored, but the restored claim numbers could not be raised above 7 (${error}). The write fence stays on`;
 const T13 = (error: string) => `The dump was restored, but the restored shard claims could not be expired (${error}). The write fence stays on`;
@@ -263,11 +265,11 @@ const ROWS: Row[] = [
   },
   {
     id: 'A7 the live database on term columns: T6', setup: () => v3({ tables: 't|t|f|t|t' }),
-    check: r => refusedAfterFence(r, "The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused, and nothing was changed: smdb_data.guild_ownership has no claim column"),
+    check: r => refusedAfterFence(r, "The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): smdb_data.guild_ownership has no claim column"),
   },
   {
     id: 'A8 the tables probe answers three fields: T7', setup: () => { claimDb.tables = 't|t|t'; },
-    check: r => refusedAfterFence(r, "Could not read the claim numbers before the restore, so the restore was refused, and nothing was changed: the claim probe answered 't|t|t'"),
+    check: r => refusedAfterFence(r, "Could not read the claim numbers before the restore, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the claim probe answered 't|t|t'"),
   },
   {
     id: 'A9 R-T11: live v3, a v2 dump, no pushBroken', setup: () => v3({ toc: 'claims' }),
@@ -279,11 +281,11 @@ const ROWS: Row[] = [
   },
   {
     id: 'A10 live v3, a dump with no claims: T5', setup: () => { v3({ toc: 'none' }); writeDumpMeta(DIR, 'old.dump'); },
-    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
+    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
   {
     id: 'A10e live v3, a dump of a database with no objects: T5', setup: () => { v3({ toc: 'empty' }); writeDumpMeta(DIR, 'old.dump'); },
-    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
+    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
   { id: 'A11 live v2, a dump with the shard tables', setup: () => v3({ tables: V2 }), check: r => { succeeded(r); shardSteps(r, 2, 3); } },
   {
@@ -296,7 +298,7 @@ const ROWS: Row[] = [
   },
   {
     id: 'A14 the floor not written: T9', setup: () => { v3(); fs.mkdirSync(`${FLOOR}.tmp`); },
-    check: r => { expect(r.success).toBe(false); expect(r.error).toMatch(/^The claim floor 7 could not be kept on disk, so the restore was refused, and nothing was changed: /); expect(dropped()).toBe(false); },
+    check: r => { expect(r.success).toBe(false); expect(r.error).toMatch(/^The claim floor 7 could not be kept on disk, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset \(its connection limit, its template and connection flags, its database-level settings and those grants\): /); expect(dropped()).toBe(false); },
   },
   {
     id: 'A15 no floor, a restored database without shard_claims', setup: () => { claimDb.tables = NONE; },
@@ -388,7 +390,7 @@ const ROWS: Row[] = [
       expect(claimDb.raiseSql).toEqual([]);
       expect(claimDb.capSql).toHaveLength(1);
       expect(sqlOf(claimDb.capSql[0])).toBe(fb.claimCapSql());
-      expect(claimDb.capSql[0]).toContain('PGOPTIONS=-c default_transaction_read_only=off');
+      expect(claimDb.capSql[0]).toContain(' -c default_transaction_read_only=off');
       expect(r.steps).toMatchObject({ claimFloor: null, guildsRaised: null, claimRaisedTo: null });
       shardSteps(r, null, 2);
       expect(logs).toContain(L_CAP);
@@ -441,7 +443,7 @@ const ROWS: Row[] = [
   },
   {
     id: 'A40 under pushBroken a dump with no claim numbers that pushBroken does not name: T5 with the pushed floor', setup: () => { brokenPush(); Object.assign(claimDb, { tables: V3, floor: '20', toc: 'none' }); writeDumpMeta(DIR, 'old.dump'); },
-    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 20, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
+    check: r => refusedAfterFence(r, 'The dump old.dump holds no claim numbers, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the bot has used claim numbers up to 20, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'),
   },
 ];
 

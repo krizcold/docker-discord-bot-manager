@@ -69,7 +69,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 vi.mock('../../src/instance/fleetJoin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/fleetJoin')>()),

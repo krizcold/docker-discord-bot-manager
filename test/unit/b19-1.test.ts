@@ -76,7 +76,7 @@ vi.mock('child_process', async (importOriginal) => {
     }, 2);
     return child;
   };
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any) as any);
   const heldSpawn = (await import('./dump-fake')).withDumpHolder(spawn as any);
   return { ...real, execFile: fencedExecFile, spawn: heldSpawn, default: { ...real, execFile: fencedExecFile, spawn: heldSpawn } };
 });
@@ -290,7 +290,7 @@ describe('a running bot on its old URL keeps reaching its database', () => {
     h.failWhen = /IPAddress/;
     const res = await enable();
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/nothing was changed/);
+    expect(res.error).toMatch(/replication was not set up/);
     expect(hbaWrites()).toEqual([]);
     expect(ran(/ROLE replicator/)).toEqual([]);
   });

@@ -33,6 +33,7 @@ import * as path from 'path';
 import { COUNTS_SQL, backupDir, compareCounts, metaTocGaps, parseCountLines } from '../../src/instance/backupFiles';
 import * as dbLogin from '../../src/instance/dbLogin';
 import * as fleetBackup from '../../src/instance/fleetBackup';
+import { provisionedCluster } from './pg-cluster';
 
 const dockerRuns = process.platform !== 'win32' && (() => {
   try {
@@ -48,7 +49,6 @@ const USER = 'app';
 const ADMIN = dbLogin.MANAGER_DB_ROLE;
 const MOVED = 'moved-2026-11-12T10-00-00-000Z.dump';
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 300000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
@@ -58,13 +58,6 @@ const ok = (sql: string, db = 'postgres') => {
   const r = psql(sql, db);
   expect(r.status, r.err).toBe(0);
   return r.out;
-};
-const waitTcp = () => {
-  for (let i = 0; i < 180; i++) {
-    if (run(['exec', NAME, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0) return;
-    pause(500);
-  }
-  throw new Error(`${NAME} did not become ready`);
 };
 const countsOf = (db: string) => {
   const parsed = parseCountLines(`${ok(COUNTS_SQL, db)}\n`);
@@ -110,6 +103,7 @@ const bot = (id: string, db: string) => ({
 const arrange = async (db: string): Promise<{ id: string; file: string }> => {
   const id = `${db}${process.pid}`;
   ok(`CREATE DATABASE ${db} OWNER ${USER}`);
+  ok(`GRANT CONNECT, CREATE ON DATABASE ${db} TO dbm_meta; GRANT CONNECT ON DATABASE ${db} TO dbm_work;`);
   ok(SCHEMA, db);
   h.urls[id] = `postgres://${USER}:pw@${NAME}:5432/${db}`;
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { [id]: bot(id, db) } }));
@@ -121,15 +115,14 @@ const metaOf = (id: string, file: string) => JSON.parse(fs.readFileSync(path.joi
 
 describe.skipIf(!dockerRuns)('NM18 the whole-bot restore compares counts against a real Postgres 16 (Linux with docker)', () => {
   beforeAll(async () => {
-    const started = run(['run', '-d', '--name', NAME, '-e', `POSTGRES_USER=${USER}`, '-e', 'POSTGRES_PASSWORD=pw', '-e', `POSTGRES_DB=${USER}`, 'postgres:16-alpine']);
-    expect(started.status, started.err).toBe(0);
-    waitTcp();
-    expect(await dbLogin.ensureManagerDbRole({ container: NAME, user: USER })).toEqual({ ok: true });
+    // NM20 3.1: the cluster as the compose makes it (dbm_admin first), then provisionRoles.
+    await provisionedCluster({ name: NAME, user: USER, db: USER, password: 'pw' });
     ok(`ALTER ROLE ${USER} NOLOGIN`);
   }, 300000);
 
   afterAll(() => {
     run(['rm', '-f', '-v', NAME]);
+    run(['volume', 'rm', '-f', `${NAME}-data`]);
     fs.rmSync(h.dir, { recursive: true, force: true });
   }, 120000);
 

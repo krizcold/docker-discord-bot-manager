@@ -78,12 +78,12 @@ export function decodeJoinCode(text: string): DecodedJoin {
 }
 
 /**
- * The move code a receiving manager hands out: the join code's fields plus the time-limited receive login. The
- * pushing manager logs in with it to replace the receiver's database.
+ * The move code a receiving manager hands out: the join code's fields plus the two time-limited receive logins. The
+ * pushing manager logs in with them to replace the receiver's database.
  */
-export interface MoveCode extends JoinCode { recv: JoinLogin & { id: string } }
+export interface MoveCode extends JoinCode { recv: JoinLogin & { id: string }; recvMeta: JoinLogin }
 
-export type DecodedMove = { ok: true; code: MoveCode } | { ok: false; why: string };
+export type DecodedMove = { ok: true; code: MoveCode } | { ok: false; why: string; old?: true };
 
 const PUSH_ID_RE = /^[0-9a-f]{24}$/;
 
@@ -93,6 +93,7 @@ export function encodeMoveCode(code: MoveCode): string {
     repl: { user: code.repl.user, password: code.repl.password },
     app: { user: code.app.user, password: code.app.password },
     recv: { user: code.recv.user, password: code.recv.password, id: code.recv.id },
+    recvMeta: { user: code.recvMeta.user, password: code.recvMeta.password },
   };
   return `${MOVE_CODE_PREFIX}${base64url(JSON.stringify(body))}`;
 }
@@ -106,7 +107,10 @@ export function decodeMoveCode(text: string): DecodedMove {
   if (typeof recv === 'string') return { ok: false, why: `it names no valid ${recv}` };
   const id = (body.o.recv as Record<string, unknown>).id;
   if (typeof id !== 'string' || !PUSH_ID_RE.test(id)) return { ok: false, why: 'it names no valid receive id' };
-  return { ok: true, code: { ...fields.code, recv: { ...recv, id } } };
+  if (body.o.recvMeta === undefined || body.o.recvMeta === null) return { ok: false, old: true, why: 'This move code was made before the receive logins had a second login; make a new one with Receive.' };
+  const recvMeta = login(body.o.recvMeta, 'second receive login', true);
+  if (typeof recvMeta === 'string') return { ok: false, why: `it names no valid ${recvMeta}` };
+  return { ok: true, code: { ...fields.code, recv: { ...recv, id }, recvMeta } };
 }
 
 export function isMoveCode(value: string | null | undefined): boolean {

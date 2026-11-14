@@ -8,29 +8,31 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Request } from 'express';
 import * as containerManager from '../docker/containerManager';
+import * as dbLogin from './dbLogin';
 import * as fleetBackup from './fleetBackup';
 import * as fleetJoin from './fleetJoin';
 import * as fleetReplica from './fleetReplica';
 import * as maintenance from './maintenance';
 import { addressTableSql, getJoinCode, REPLICATION_ROLE } from './fleetReplication';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
-import { MANAGER_DB_ROLE } from './dbLogin';
+import { getBotDir } from '../git/repoManager';
 import {
   backupDir, CHECKSUM_SQL, compareChecksums, compareCounts, COUNTS_SQL, parseChecksumLines, parseCountLines, utcText, validateDumpMeta,
 } from './backupFiles';
-import { decodeJoinCode, decodeMoveCode, encodeJoinCode, encodeMoveCode, MoveCode, sqlLiteral } from '../config/joinCode';
+import { decodeJoinCode, decodeMoveCode, encodeJoinCode, encodeMoveCode, JoinLogin, MoveCode, sqlLiteral } from '../config/joinCode';
 import {
   copiesInsertSql, DB_OID_SQL, GEN_READ_SQL, machineNameOf, markIdOf, missingTable, OWN_COPIES_READ_SQL, parseGenRow, pushBrokenOf, raiseSql, RECEIVE_DROP_SQL,
   RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, replicationRoleEnsureSql, SHARD_CAP_DO_SQL,
 } from './switchSql';
 import {
-  adminSql, LaneOutcome, mainAdmission, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
-  switchAdmissionNotice,
+  clusterSql, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
+  SWITCH_TIMING, switchAdmissionNotice, workSql,
 } from './fleetSwitch';
 import { FleetDbReceive, InstanceConfig, JoinAddress } from '../types';
 
 export const MOVE_TIMING = { receiveForMs: 24 * 60 * 60_000, clientMs: 60_000, pushMs: 30 * 60_000, verifyMs: 10 * 60_000, sessionPauseMs: 1_000, endRounds: 3 };
 export const RECEIVE_ROLE = 'smdb_receive';
+export const RECEIVE_META_ROLE = 'smdb_receive_meta';
 const MIN_FREE_BYTES = 512 * 1024 * 1024;
 const NOTHING = '; nothing was changed';
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -55,34 +57,136 @@ function claimSlot(botId: string): LaneOutcome | null {
 
 // ─── O5 Receive ───
 
-const roleScript = (password: string, expires: string) => `DO $$ BEGIN
-IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${RECEIVE_ROLE}') THEN
-  ALTER ROLE ${RECEIVE_ROLE} LOGIN SUPERUSER PASSWORD ${sqlLiteral(password)} VALID UNTIL ${sqlLiteral(expires)};
+const quoteIdent = (name: string) => `"${name.replace(/"/g, '""')}"`;
+const PLAIN_ROLE = 'NOCREATEROLE NOREPLICATION NOBYPASSRLS';
+
+/**
+ * R3.6: both receive logins in one script, plain, until the receive's expiry: smdb_receive with the rights of
+ * dbm_work, smdb_receive_meta with those of dbm_meta and the bot role, which drop, create and grant the database.
+ */
+export function receiveLoginsSql(user: string, password: string, metaPassword: string, expires: string): string {
+  const login = (role: string, attrs: string, pw: string) => `IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+  ALTER ROLE ${role} LOGIN NOSUPERUSER ${attrs} ${PLAIN_ROLE} PASSWORD ${sqlLiteral(pw)} VALID UNTIL ${sqlLiteral(expires)};
+  ALTER ROLE ${role} RESET ALL;
 ELSE
-  CREATE ROLE ${RECEIVE_ROLE} LOGIN SUPERUSER PASSWORD ${sqlLiteral(password)} VALID UNTIL ${sqlLiteral(expires)};
+  CREATE ROLE ${role} LOGIN NOSUPERUSER ${attrs} ${PLAIN_ROLE} PASSWORD ${sqlLiteral(pw)} VALID UNTIL ${sqlLiteral(expires)};
 END IF;
+`;
+  return `DO $$ BEGIN
+${login(RECEIVE_ROLE, 'NOCREATEDB', password)}GRANT ${dbLogin.WORK_LOGIN} TO ${RECEIVE_ROLE};
+${login(RECEIVE_META_ROLE, 'CREATEDB', metaPassword)}GRANT ${dbLogin.META_LOGIN}, ${quoteIdent(user)}, pg_signal_backend TO ${RECEIVE_META_ROLE};
+ALTER ROLE ${RECEIVE_ROLE} SET search_path = pg_catalog, pg_temp;
+ALTER ROLE ${RECEIVE_META_ROLE} SET search_path = pg_catalog, pg_temp;
 END $$;`;
+}
 
 type Failed = { ok: false; error: string };
 const failed = (r: { error?: string; stderr: string }): Failed => ({ ok: false, error: r.error || lastLine(r.stderr) });
 
-/** D54: the receive login takes no new session, its sessions are ended and counted to 0, then it is dropped. */
-async function endReceiveLogin(inst: InstanceConfig): Promise<{ ok: true } | { ok: false; left?: number; error: string }> {
+const RECEIVE_LOGINS = `ARRAY['${RECEIVE_ROLE}', '${RECEIVE_META_ROLE}']`;
+
+/**
+ * Z1 and Q1 step 1, as the superuser on postgres: each receive login that exists opens only the socket (no password)
+ * and loses its own settings; when the bot's database exists, its settings there go and A3's reset runs. Answers
+ * `receive|<logins that exist>|<database exists>`.
+ */
+function receiveResetSql(db: string): string {
+  const name = sqlLiteral(db);
+  const reset = ['ALTER DATABASE %I IS_TEMPLATE false', 'ALTER DATABASE %I ALLOW_CONNECTIONS true', 'ALTER DATABASE %I CONNECTION LIMIT -1', 'ALTER DATABASE %I RESET ALL',
+    `GRANT CONNECT, CREATE ON DATABASE %I TO ${dbLogin.META_LOGIN}`, `GRANT CONNECT ON DATABASE %I TO ${dbLogin.WORK_LOGIN}`]
+    .map(statement => `  EXECUTE pg_catalog.format('${statement}', ${name});`).join('\n');
+  return `DO $$
+DECLARE l text;
+BEGIN
+FOREACH l IN ARRAY ${RECEIVE_LOGINS} LOOP
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = l) THEN
+    EXECUTE pg_catalog.format('ALTER ROLE %I LOGIN PASSWORD NULL', l);
+    EXECUTE pg_catalog.format('ALTER ROLE %I RESET ALL', l);
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = ${name}) THEN
+      EXECUTE pg_catalog.format('ALTER ROLE %I IN DATABASE %I RESET ALL', l, ${name});
+    END IF;
+  END IF;
+END LOOP;
+IF EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = ${name}) THEN
+${reset}
+END IF;
+END $$;
+SELECT 'receive|' || coalesce((SELECT pg_catalog.string_agg(rolname::text, ',' ORDER BY rolname) FROM pg_catalog.pg_roles WHERE rolname = ANY (${RECEIVE_LOGINS})), '')
+  || '|' || (EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = ${name}))::text;
+`;
+}
+
+/** Q1's failure path: every receive login that exists takes no login and has no password. */
+const RECEIVE_CLOSE_SQL = `DO $$
+DECLARE l text;
+BEGIN
+FOREACH l IN ARRAY ${RECEIVE_LOGINS} LOOP
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = l) THEN
+    EXECUTE pg_catalog.format('ALTER ROLE %I NOLOGIN PASSWORD NULL', l);
+  END IF;
+END LOOP;
+END $$;
+`;
+
+/** Y3: what a receive login owns in the bot's database goes to the bot role, and what was granted to it goes. */
+const clearOwnedSql = (login: string, user: string) => `REASSIGN OWNED BY ${login} TO ${quoteIdent(user)};\nDROP OWNED BY ${login};\n`;
+
+type EndFailure = { ok: false; left?: number; once?: true; error: string };
+
+/** One RECEIVE_END_SQL round: the sessions of both logins ended, then the count of those left. */
+async function endRound(t: { container: string; user: string }): Promise<{ ok: true; left: number } | EndFailure> {
+  const ended = await clusterSql(t, RECEIVE_END_SQL);
+  if (!ended.ok) return failed(ended);
+  const left = Number(ended.stdout.trim().split('\n').pop()?.trim() ?? '');
+  return Number.isInteger(left) ? { ok: true, left } : { ok: false, error: 'the count of its sessions did not read' };
+}
+
+/**
+ * Y3 with Z1 and Q1: both receive logins lose their password and settings, their sessions are ended and counted to
+ * 0, each clears what it owns in the bot's database over the socket, then both take no login and are dropped. A
+ * failure at any step leaves both logins closed and answers that failure; the next call starts again.
+ */
+async function endReceiveLogin(inst: InstanceConfig): Promise<{ ok: true } | EndFailure> {
   const db = inst.fleetDb!;
   const t = { container: db.containerName, user: db.user };
-  const nologin = await adminSql(t, 'postgres', RECEIVE_NOLOGIN_SQL);
-  if (!nologin.ok) return failed(nologin);
+  const first = await endSteps(t, db.db);
+  if (first.ok) return first;
+  const close = await clusterSql(t, RECEIVE_CLOSE_SQL);
+  if (!close.ok) return { ...first, error: `${first.error}; closing the logins also failed: ${failed(close).error}` };
+  const round = await clusterSql(t, RECEIVE_END_SQL);
+  if (!round.ok) return { ...first, error: `${first.error}; closing the logins also failed: ${failed(round).error}` };
+  return first;
+}
+
+async function endSteps(t: { container: string; user: string }, botDb: string): Promise<{ ok: true } | EndFailure> {
+  const reset = await clusterSql(t, receiveResetSql(botDb));
+  if (!reset.ok) return failed(reset);
+  const found = /^receive\|([a-z_,]*)\|(true|false)$/.exec(lastLine(reset.stdout));
+  if (!found) return { ok: false, error: `the receive logins read back as ${lastLine(reset.stdout).slice(0, 200)}` };
+  const logins = found[1] ? found[1].split(',') : [];
   let left = 0;
   for (let round = 1; round <= MOVE_TIMING.endRounds; round++) {
     if (round > 1) await new Promise(r => setTimeout(r, MOVE_TIMING.sessionPauseMs));
-    const ended = await adminSql(t, 'postgres', RECEIVE_END_SQL);
-    if (!ended.ok) return failed(ended);
-    left = Number(ended.stdout.trim().split('\n').pop()?.trim() ?? '');
-    if (!Number.isInteger(left)) return { ok: false, error: 'the count of its sessions did not read' };
+    const ended = await endRound(t);
+    if (!ended.ok) return ended;
+    left = ended.left;
     if (left === 0) break;
   }
   if (left > 0) return { ok: false, left, error: `${left} session(s) did not end` };
-  const drop = await adminSql(t, 'postgres', RECEIVE_DROP_SQL);
+  if (found[2] === 'true') {
+    for (const login of [RECEIVE_ROLE, RECEIVE_META_ROLE] as const) {
+      if (!logins.includes(login)) continue;
+      const call = dbLogin.receivePsql(login, t.container, botDb, clearOwnedSql(login, t.user), { stdin: true, exempt: true });
+      const clean = await runGuarded('docker', [...call.args, '-q'], { input: call.input, timeoutMs: SWITCH_TIMING.readMs });
+      if (!clean.ok && !noRow(clean.stderr)) return failed(clean);
+    }
+  }
+  const nologin = await clusterSql(t, RECEIVE_NOLOGIN_SQL);
+  if (!nologin.ok) return failed(nologin);
+  const last = await endRound(t);
+  if (!last.ok) return last;
+  if (last.left > 0) return { ok: false, left: last.left, once: true, error: `${last.left} session(s) did not end` };
+  const drop = await clusterSql(t, RECEIVE_DROP_SQL);
   return drop.ok ? { ok: true } : failed(drop);
 }
 
@@ -92,7 +196,7 @@ const noRow = (stderr: string) => missingTable(stderr) || /database "[^"]*" does
 /** The newest received row of the mark's ids (D53) as `<machine>|<generation>`, '' for none. */
 async function receivedLine(inst: InstanceConfig, r: FleetDbReceive): Promise<{ ok: true; line: string } | Failed> {
   const db = inst.fleetDb!;
-  const got = await adminSql({ container: db.containerName, user: db.user }, db.db, RECEIVED_OF_SQL([r.pushId, ...(r.priorIds ?? [])]));
+  const got = await metaSql({ container: db.containerName, user: db.user }, db.db, RECEIVED_OF_SQL([r.pushId, ...(r.priorIds ?? [])]));
   if (!got.ok) return noRow(got.stderr) ? { ok: true, line: '' } : failed(got);
   return { ok: true, line: got.stdout.trim() };
 }
@@ -101,7 +205,7 @@ async function receivedLine(inst: InstanceConfig, r: FleetDbReceive): Promise<{ 
 async function pushCheck(inst: InstanceConfig): Promise<{ ok: true; broken: boolean; done: string | null } | Failed> {
   const db = inst.fleetDb!;
   const r = db.receive!;
-  const oid = await adminSql({ container: db.containerName, user: db.user }, 'postgres', DB_OID_SQL(db.db));
+  const oid = await clusterSql({ container: db.containerName, user: db.user }, DB_OID_SQL(db.db));
   if (!oid.ok) return failed(oid);
   const oidNow = oid.stdout.trim();
   let done: string | null = null;
@@ -115,12 +219,15 @@ async function pushCheck(inst: InstanceConfig): Promise<{ ok: true; broken: bool
 
 /** The sessions count last logged per bot (RV-LOG-SESS once per change); cleared when the receive ends. */
 const sessionsLogged = new Map<string, number>();
+/** The expiry's end failure last logged per bot (Y3: once per distinct error); cleared when the receive ends. */
+const endErrorLogged = new Map<string, string>();
 
 /** D51: a push of the mark finished: the copies written back, the login ended, receive and pushBroken cleared in one save. */
 async function finishReceive(inst: InstanceConfig, r: FleetDbReceive, line: string): Promise<{ ok: true; machine: string; generation: string } | { ok: false; error: string; saveFailed?: boolean }> {
   const db = inst.fleetDb!;
+  dbLogin.noteLoginFault(db.containerName);
   if (r.copies?.length) {
-    const back = await adminSql({ container: db.containerName, user: db.user }, db.db, copiesInsertSql(r.copies));
+    const back = await metaSql({ container: db.containerName, user: db.user }, db.db, copiesInsertSql(r.copies));
     if (!back.ok) console.warn(`[Switch] ${inst.displayName}: this machine's copies could not be listed again after the push (${back.error || lastLine(back.stderr)}); they register again within an hour`);
   }
   const ended = await endReceiveLogin(inst);
@@ -129,6 +236,7 @@ async function finishReceive(inst: InstanceConfig, r: FleetDbReceive, line: stri
   if (saved) return { ok: false, error: saved, saveFailed: true };
   await clearMarkLogged(inst, markIdOf(r));
   sessionsLogged.delete(inst.id);
+  endErrorLogged.delete(inst.id);
   containerManager.broadcastBotUpdated(inst.id);
   const [machine, generation] = line.split('|');
   console.log(`[Switch] ${inst.displayName}: received the main from ${machine} (generation ${generation}); the receive login is removed`);
@@ -142,14 +250,14 @@ const brokenMark = (r: FleetDbReceive, at: string) => ({ at, safetyDump: r.safet
 /** This machine's copy rows whose slots exist, written back after a push (D49); empty when they cannot be read. */
 async function ownCopies(inst: InstanceConfig): Promise<JoinAddress[]> {
   const db = inst.fleetDb!;
-  const r = await adminSql({ container: db.containerName, user: db.user }, db.db, OWN_COPIES_READ_SQL);
+  const r = await metaSql({ container: db.containerName, user: db.user }, db.db, OWN_COPIES_READ_SQL);
   return r.ok ? fleetJoin.parseAddressRows(r.stdout) : [];
 }
 
 /** D62: the receive mark row of this mark id removed from the cluster's postgres database; the error, or null. */
 async function clearMark(inst: InstanceConfig, markId: string): Promise<string | null> {
   const db = inst.fleetDb!;
-  const r = await adminSql({ container: db.containerName, user: db.user }, 'postgres', receiveMarkClearSql(markId));
+  const r = await clusterSql({ container: db.containerName, user: db.user }, receiveMarkClearSql(markId));
   return r.ok ? null : failed(r).error;
 }
 
@@ -181,7 +289,7 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
   const fence = await switchAdmissionNotice(botId, 'receiving was refused', { skipNotice: true });
   if (fence) return refusal(fence);
   const t = { container: db.containerName, user: db.user };
-  const ensured = await adminSql(t, 'postgres', replicationRoleEnsureSql(REPLICATION_ROLE));
+  const ensured = await clusterSql(t, replicationRoleEnsureSql(REPLICATION_ROLE));
   if (!ensured.ok) return refusal(`The manager could not make sure the replication role exists in this database's cluster (${failed(ensured).error}), and a pushed database that grants to it would not restore${NOTHING}`, 500);
 
   if (prior) {
@@ -212,7 +320,7 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
         releaseFleetBackupBusy(botId);
       }
     }
-    const oid = await adminSql(t, 'postgres', DB_OID_SQL(db.db));
+    const oid = await clusterSql(t, DB_OID_SQL(db.db));
     if (!oid.ok || (!broken && !oid.stdout.trim())) {
       const error = oid.ok ? 'the database is missing' : failed(oid).error;
       return refusal(`The manager could not read this database's identity before receiving (${error}), so it could not tell later whether a push replaced it; the dump ${safetyDump} was kept and nothing else was changed`, 500);
@@ -220,22 +328,22 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
     dbOid = oid.stdout.trim();
     copies = broken?.copies ?? await ownCopies(inst);
   }
-  const join = await getJoinCode(containerManager.getBot(botId) ?? inst);
+  const join = await getJoinCode(containerManager.getBot(botId) ?? inst, { forReceive: true });
   const decoded = join.success && join.joinCode ? decodeJoinCode(join.joinCode) : null;
   if (!decoded || !decoded.ok) {
     const error = join.success ? 'the join code did not decode' : join.error || 'the join code did not decode';
     if (prior) return refusal(`The move code could not be made (${error}), so no new move code was made; the code shown before still works until ${utcText(Date.parse(prior.expiresAt))}.`, 500);
-    return refusal(`The move code could not be made (${error}); the dump ${safetyDump} was kept and nothing else was changed`, 500);
+    return refusal(`The move code could not be made (${error}); the dump ${safetyDump} was kept; receiving was not started`, 500);
   }
   const startedAt = new Date().toISOString();
   const expiresAt = new Date(Date.now() + MOVE_TIMING.receiveForMs).toISOString();
   const pushId = crypto.randomBytes(12).toString('hex');
   const priorIds = prior ? [...(prior.priorIds ?? []), prior.pushId] : [];
   const marked = saveSwitch(botId, { receive: { startedAt: prior?.startedAt ?? startedAt, expiresAt, safetyDump, pushId, priorIds, dbOid, copies } });
-  if (marked) return refusal(`Receiving could not be recorded (${marked}); the dump ${safetyDump} was kept and nothing else was changed`, 500);
+  if (marked) return refusal(`Receiving could not be recorded (${marked}); the dump ${safetyDump} was kept; receiving was not started`, 500);
   const backTail = (back: string | null) => (back ? ` The manager could not put the earlier record back (${back}); a push made with the earlier code is still recognised.` : '');
   const unrecTail = (back: string) => `. The manager could not clear its record of receiving (${back}); press Stop receiving.`;
-  const written = await adminSql(t, 'postgres', receiveMarkSql(priorIds[0] ?? pushId, [...priorIds, pushId], broken ? '' : dbOid));
+  const written = await clusterSql(t, receiveMarkSql(priorIds[0] ?? pushId, [...priorIds, pushId], broken ? '' : dbOid));
   if (!written.ok) {
     const error = failed(written).error;
     const back = saveSwitch(botId, { receive: prior ?? null });
@@ -244,7 +352,8 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
     return refusal(back ? `${lead}${unrecTail(back)}` : `${lead}; nothing else was changed.`, 500);
   }
   const password = crypto.randomBytes(24).toString('base64url');
-  const role = await adminSql(t, 'postgres', roleScript(password, expiresAt));
+  const metaPassword = crypto.randomBytes(24).toString('base64url');
+  const role = await clusterSql(t, receiveLoginsSql(db.user, password, metaPassword, expiresAt));
   if (!role.ok) {
     const error = failed(role).error;
     if (!prior) {
@@ -258,7 +367,7 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
     const back = saveSwitch(botId, { receive: prior });
     return refusal(`The receive login could not be changed (${error}), so no new move code was made; the code shown before still works until ${utcText(Date.parse(prior.expiresAt))}.${backTail(back)}`, 500);
   }
-  const moveCode = encodeMoveCode({ ...decoded.code, recv: { user: RECEIVE_ROLE, password, id: pushId } });
+  const moveCode = encodeMoveCode({ ...decoded.code, recv: { user: RECEIVE_ROLE, password, id: pushId }, recvMeta: { user: RECEIVE_META_ROLE, password: metaPassword } });
   const text = broken
     ? `Paste this move code into Push the main in the other machine's manager within 24 hours. It replaces this machine's database with the pushed one. This database holds a push that did not finish, so no new dump was taken; the dump ${safetyDump}, taken before that push, stays with the backups. The code holds passwords: paste it only into your own managers.`
     : `Paste this move code into Push the main in the other machine's manager within 24 hours. It replaces this machine's database with the pushed one; a dump of this one is kept with the backups (${safetyDump}). The code holds passwords: paste it only into your own managers.`;
@@ -272,7 +381,7 @@ export async function stopReceiving(botId: string): Promise<LaneOutcome> {
   if (!r) return refusal('This database is not waiting to receive a main');
   const ended = await endReceiveLogin(inst);
   if (!ended.ok) {
-    if (ended.left !== undefined) return refusal(`The receive login no longer accepts new sessions, but ${ended.left} of its session(s) did not end after three tries, so receiving was not stopped; press Stop receiving again.`, 500);
+    if (ended.left !== undefined) return refusal(`The receive login no longer accepts new sessions, but ${ended.left} of its session(s) did not end${ended.once ? '' : ' after three tries'}, so receiving was not stopped; press Stop receiving again.`, 500);
     return STOP_FAIL(ended.error);
   }
   const check = await pushCheck(inst);
@@ -285,6 +394,7 @@ export async function stopReceiving(botId: string): Promise<LaneOutcome> {
   const cleared = saveSwitch(botId, { receive: null, ...(check.broken ? { pushBroken: brokenMark(r, new Date().toISOString()) } : {}) });
   if (cleared) return NOT_MARKED(cleared);
   sessionsLogged.delete(botId);
+  endErrorLogged.delete(botId);
   const still = containerManager.getBot(botId)?.fleetDb?.pushBroken;
   if (!check.broken && !still) await clearMarkLogged(inst, markIdOf(r));
   if (check.broken) return { success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: restore the dump ${r.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.` };
@@ -305,9 +415,14 @@ export async function receiveStep(inst: InstanceConfig, now: number): Promise<vo
   if (now < Date.parse(r.expiresAt)) return;
   const ended = await endReceiveLogin(inst);
   if (!ended.ok) {
-    if (ended.left !== undefined && sessionsLogged.get(inst.id) !== ended.left) {
-      sessionsLogged.set(inst.id, ended.left);
-      console.log(`[Switch] ${inst.displayName}: the move code expired, but ${ended.left} session(s) of the receive login did not end; the manager tries again every minute`);
+    if (ended.left !== undefined) {
+      if (sessionsLogged.get(inst.id) !== ended.left) {
+        sessionsLogged.set(inst.id, ended.left);
+        console.log(`[Switch] ${inst.displayName}: the move code expired, but ${ended.left} session(s) of the receive login did not end; the manager tries again every minute`);
+      }
+    } else if (endErrorLogged.get(inst.id) !== ended.error) {
+      endErrorLogged.set(inst.id, ended.error);
+      console.warn(`[Switch] ${inst.displayName}: the move code expired, but the receive login could not be removed (${ended.error}); the manager tries again every minute`);
     }
     return;
   }
@@ -320,6 +435,7 @@ export async function receiveStep(inst: InstanceConfig, now: number): Promise<vo
   if (saveSwitch(inst.id, { receive: null, ...(check.broken ? { pushBroken: brokenMark(r, new Date(now).toISOString()) } : {}) })) return;
   if (!check.broken && !containerManager.getBot(inst.id)?.fleetDb?.pushBroken) await clearMarkLogged(inst, markIdOf(r));
   sessionsLogged.delete(inst.id);
+  endErrorLogged.delete(inst.id);
   containerManager.broadcastBotUpdated(inst.id);
   console.log(check.broken
     ? `[Switch] ${inst.displayName}: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until the dump ${r.safetyDump} is restored or a push finishes; the receive login is removed`
@@ -330,21 +446,64 @@ setReceiveStep(receiveStep);
 
 // ─── O6 Push ───
 
-function recvDsn(code: MoveCode, db: string): string {
-  return `postgresql://${encodeURIComponent(code.recv.user)}@${code.host}:${code.port}/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+/** Which of the move code's two logins a receiver call uses (R3.6). */
+type ReceiverLogin = 'recv' | 'meta';
+const loginOfCode = (code: MoveCode, as: ReceiverLogin): JoinLogin => (as === 'recv' ? code.recv : code.recvMeta);
+
+function recvDsn(code: MoveCode, db: string, as: ReceiverLogin): string {
+  return `postgresql://${encodeURIComponent(loginOfCode(code, as).user)}@${code.host}:${code.port}/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 }
 
-/** psql against the receiver as the receive login, in a throwaway client container; input streams a file when given. */
-async function receiverClient(inst: InstanceConfig, code: MoveCode, pem: string, suffix: string, script: string, args: string[], timeoutMs: number, inputPath?: string) {
-  const mount = `${fleetJoin.ensureProbeCert(inst.id, code.fp, pem)}:/primary-ca.crt:ro`;
-  const name = `${inst.sanitizedName}-fleet-move-${suffix}`;
+interface ClientCall { as: ReceiverLogin; suffix: string; script: string; args: string[]; timeoutMs: number; input?: string; inputPath?: string; mounts?: string[] }
+
+/**
+ * A client tool against the receiver as one of the move code's logins, in a throwaway client container, with the
+ * manager's session pins (U2). Stdin is `input`, or a file streamed in from `inputPath`; both passwords are scrubbed.
+ */
+async function receiverClient(inst: InstanceConfig, code: MoveCode, pem: string, call: ClientCall) {
+  const mounts = [`${fleetJoin.ensureProbeCert(inst.id, code.fp, pem)}:/primary-ca.crt:ro`, ...(call.mounts ?? [])];
+  const name = `${inst.sanitizedName}-fleet-move-${call.suffix}`;
+  const stdin = call.input !== undefined || call.inputPath !== undefined;
   await runGuarded('docker', ['rm', '-f', name], { timeoutMs: 30_000 });
-  const r = await runGuarded('docker', ['run', '--rm', ...(inputPath ? ['-i'] : []), '--name', name, '-e', 'PGPASSWORD', '-v', mount, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script, 'sh', ...args],
-    { timeoutMs, env: { ...process.env, PGPASSWORD: code.recv.password }, ...(inputPath ? { inputPath } : {}) });
+  const r = await runGuarded('docker', ['run', '--rm', ...(stdin ? ['-i'] : []), '--name', name, '-e', 'PGPASSWORD', '-e', `PGOPTIONS=${dbLogin.MANAGER_SESSION_OPTIONS}`,
+    ...mounts.flatMap(m => ['-v', m]), '--entrypoint', 'sh', 'postgres:16-alpine', '-c', call.script, 'sh', ...call.args],
+    { timeoutMs: call.timeoutMs, env: { ...process.env, PGPASSWORD: loginOfCode(code, call.as).password }, ...(call.input !== undefined ? { input: call.input } : {}), ...(call.inputPath ? { inputPath: call.inputPath } : {}) });
   if (!r.ok && r.code === null) await runGuarded('docker', ['rm', '-f', name], { timeoutMs: 30_000 });
-  const scrub = (s: string) => s.split(code.recv.password).join('***');
+  const scrub = (s: string) => [code.recv.password, code.recvMeta.password].reduce((text, p) => text.split(p).join('***'), s);
   return { ...r, stderr: scrub(r.stderr), error: r.error ? scrub(r.error) : r.error };
 }
+
+/** U7: a receive login refused after the pg_restore succeeded. */
+const RECEIVE_REFUSED_RE = new RegExp(`password authentication failed for user "(${RECEIVE_ROLE}|${RECEIVE_META_ROLE})"`);
+
+/** X1 and S2 on the sender: its own dump's smdb_manager rows as the parse wrote them, and the `-L` list of the rest. */
+async function readOwnDump(inst: InstanceConfig, dumpPath: string): Promise<{ ok: true; script: string; list: string } | { ok: false; text: string }> {
+  const container = inst.fleetDb!.containerName;
+  const unread = (error: string) => ({ ok: false as const, text: `The push was refused: this database's dump could not be read (${error}). Nothing was sent; the other machine is unchanged.` });
+  const meta = await fleetBackup.readArchiveMeta(container, dumpPath);
+  if (!meta.ok) {
+    if ('error' in meta) return unread(meta.error);
+    return { ok: false, text: `The push was refused: this database's dump holds smdb_manager rows the manager could not read (${meta.problem}). Nothing was sent; the other machine is unchanged.` };
+  }
+  const { check, cap } = meta.skipped;
+  if (check + cap > 0) console.warn(`[Switch] ${inst.displayName}: left out ${check + cap} row(s) of smdb_manager.addresses from the pushed dump (${check} failed the address check or were over the size limit, ${cap} past the 1000-row cap)`);
+  const toc = await fleetBackup.readDumpToc(container, dumpPath);
+  if (!toc.ok) return unread(toc.error);
+  if (toc.toc.length >= fleetBackup.TOC_MAX_CHARS) return unread('its table of contents is longer than 8 MB, so the restore list made from it could miss an entry');
+  const managerToc = await fleetBackup.readDumpToc(container, dumpPath, 'smdb_manager');
+  if (!managerToc.ok) return unread(managerToc.error);
+  const lists = fleetBackup.restoreLists(toc.toc, managerToc.toc);
+  if (lists.refused !== null) return unread(lists.refused);
+  return { ok: true, script: meta.script, list: lists.other };
+}
+
+/** Y1: the push compares every table but smdb_manager.addresses, whose rows the commit writes anew. */
+function withoutAddresses<T>(rows: Record<string, T>): Record<string, T> {
+  const { 'smdb_manager.addresses': _left, ...rest } = rows;
+  return rest;
+}
+
+const PUSH_LIST = 'push-restore.list';
 
 const LOGIN_RE = /password authentication failed|pg_hba\.conf rejects connection|no pg_hba\.conf entry|is not permitted to log in|role "[^"]*" does not exist|VALID UNTIL|expired/i;
 
@@ -352,7 +511,7 @@ export async function pushMain(botId: string, moveCode: string, confirm: boolean
   const inst = containerManager.getBot(botId);
   if (!inst) return refusal('Bot not found', 404);
   const decoded = decodeMoveCode(moveCode);
-  if (!decoded.ok) return refusal(`This is not a move code: ${decoded.why}`, 400);
+  if (!decoded.ok) return refusal(decoded.old ? decoded.why : `This is not a move code: ${decoded.why}`, 400);
   const code = decoded.code;
   const resume = (h: NonNullable<NonNullable<InstanceConfig['fleetDb']>['handover']>) => h.mode === 'push' && h.host === code.host && h.port === code.port;
   const admission = mainAdmission(inst, { replication: false, noun: 'push', resume });
@@ -403,14 +562,14 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
   if (!cert.ok) return out(refusal(cert.text));
   const pulled = await fleetJoin.ensureClientImage();
   if (pulled) return out(refusal(`${pulled}${NOTHING}`));
-  const sys = await adminSql(t, db.db, 'SELECT system_identifier FROM pg_control_system();');
+  const sys = await clusterSql(t, 'SELECT system_identifier FROM pg_control_system();');
   if (!sys.ok) return out(refusal(`The manager could not read this database's identity (${sys.error || lastLine(sys.stderr)})${NOTHING}`));
   const systemId = lastLine(sys.stdout);
   const probeScript = 'psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
     + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
     + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }';
-  const probe = await receiverClient(inst, code, cert.pem, 'probe', probeScript,
-    [recvDsn(code, 'postgres'), recvDsn(code, code.db), GEN_READ_SQL, `SELECT count(*) FROM smdb_manager.received WHERE push_id = ${sqlLiteral(code.recv.id)}`], MOVE_TIMING.clientMs);
+  const probe = await receiverClient(inst, code, cert.pem, { as: 'meta', suffix: 'probe', script: probeScript, timeoutMs: MOVE_TIMING.clientMs,
+    args: [recvDsn(code, 'postgres', 'meta'), recvDsn(code, code.db, 'meta'), GEN_READ_SQL, `SELECT count(*) FROM smdb_manager.received WHERE push_id = ${sqlLiteral(code.recv.id)}`] });
   if (!probe.ok) {
     const reason = (probe.stderr.trim() ? lastLine(probe.stderr) : '') || probe.error || 'no answer';
     if (LOGIN_RE.test(probe.stderr)) return out(refusal(`${where} refused the move code's login (${reason}): the code expired, receiving was stopped, a newer code replaced it, or a lane on that machine holds a write fence on its database. Check that machine's Database window, then press Receive again there; nothing was changed.`));
@@ -434,63 +593,38 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
   const target = Math.max(own.row?.generation ?? 0, theirGen?.generation ?? 0) + 1;
 
   let file = db.handover?.mode === 'push' ? db.handover.file ?? '' : '';
+  let committedNow = false;
   if (!already) {
+    const reset = await clusterSql(t, dbLogin.databaseResetSql(db.db));
+    if (!reset.ok) return out(refusal(`The push was refused: this database's own settings could not be reset before the dump (${failed(reset).error}). Nothing was sent; the other machine is unchanged.`));
     const dump = await fleetBackup.runFleetDump(inst, 'pre-push-');
     if (!dump.success || !dump.file) return out(refusal(`The dump of this database failed (${dump.error || 'no reason given'}), so nothing was pushed`));
     file = dump.file;
-    const marked = saveSwitch(botId, { handover: { mode: 'push', machine, host: code.host, port: code.port, generation: target, file, phase: 'pushing', at: new Date().toISOString() } });
-    if (marked) return out(refusal(`The push could not be recorded (${marked}); the dump ${file} was kept and nothing was pushed`, 500), file);
-    admit();
-    const fail = (text: string) => {
-      saveSwitch(botId, { handover: { ...containerManager.getBot(botId)!.fleetDb!.handover!, lastError: text } });
-      return out(refusal(text, 500), file);
-    };
     const dumpPath = path.join(backupDir(botId), file);
-    const dbIdent = `"${code.db.replace(/"/g, '""')}"`;
-    const userIdent = `"${db.user.replace(/"/g, '""')}"`;
-    const pushScript = `psql "$1" -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS ${dbIdent.replace(/'/g, "'\\''")} WITH (FORCE)' -c 'CREATE DATABASE ${dbIdent.replace(/'/g, "'\\''")} OWNER ${userIdent.replace(/'/g, "'\\''")}' && pg_restore --exit-on-error --single-transaction -d "$2"`;
-    const pushed = await receiverClient(inst, code, cert.pem, 'push', pushScript, [recvDsn(code, 'postgres'), recvDsn(code, code.db)], MOVE_TIMING.pushMs, dumpPath);
-    if (!pushed.ok) {
-      return fail(`The push to ${machine} failed (${pushed.error || lastLine(pushed.stderr)}). This machine's database is unchanged; ${machine}'s database is incomplete, and its bot stays Off. Press Push again with the same code, or Cancel the push.`);
-    }
-    let meta;
+    const own = await readOwnDump(inst, dumpPath);
+    if (!own.ok) return out(refusal(own.text), file);
+    const listPath = path.join(getBotDir(botId), 'fleet-join', PUSH_LIST);
     try {
-      const parsed = validateDumpMeta(JSON.parse(fs.readFileSync(`${dumpPath}.json`, 'utf-8')));
-      if (!parsed.ok) throw new Error(parsed.error);
-      meta = parsed.meta;
+      fs.mkdirSync(path.dirname(listPath), { recursive: true });
+      fs.writeFileSync(listPath, own.list);
     } catch (err) {
-      return fail(`The pushed copy on ${machine} does not match this database (the counts could not be read (${errText(err)})), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
+      return out(refusal(`The push was refused: the list of the dump's entries could not be written (${errText(err)}). Nothing was sent; the other machine is unchanged.`), file);
     }
-    const counts = await receiverClient(inst, code, cert.pem, 'counts', 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', [recvDsn(code, code.db), COUNTS_SQL], MOVE_TIMING.verifyMs);
-    const theirCounts = counts.ok ? parseCountLines(counts.stdout) : null;
-    if (!theirCounts || !theirCounts.ok) {
-      const why = !counts.ok ? counts.error || lastLine(counts.stderr) : theirCounts && !theirCounts.ok ? theirCounts.error : 'no answer';
-      return fail(`The pushed copy on ${machine} does not match this database (the counts could not be read (${why})), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
+    let failure: ReturnType<typeof out> | null;
+    try {
+      failure = await sendPush(inst, code, cert.pem, { file, dumpPath, target, systemId, metaScript: own.script, admit, listMount: `${containerManager.hostBotDirFor(botId)}/fleet-join/${PUSH_LIST}:${fleetBackup.RESTORE_LIST_PATH}:ro` });
+    } finally {
+      try { fs.rmSync(listPath, { force: true }); } catch { /* the next push writes it again */ }
     }
-    const cmp = compareCounts(meta.counts, theirCounts.counts);
-    if (!cmp.ok) return fail(`The pushed copy on ${machine} does not match this database (counts: ${cmp.text}), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
-    const sums = await checksumsOf(t, db.db);
-    const theirSums = await receiverClient(inst, code, cert.pem, 'sums', 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', [recvDsn(code, code.db), CHECKSUM_SQL], MOVE_TIMING.verifyMs);
-    const parsedTheirs = theirSums.ok ? parseChecksumLines(theirSums.stdout) : null;
-    if (!sums.ok || !parsedTheirs || !parsedTheirs.ok) {
-      const why = !sums.ok ? sums.error : !theirSums.ok ? theirSums.error || lastLine(theirSums.stderr) : parsedTheirs && !parsedTheirs.ok ? parsedTheirs.error : 'no answer';
-      return fail(`The pushed copy on ${machine} does not match this database (the checksums could not be read (${why})), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
-    }
-    const sumCmp = compareChecksums(sums.sums, parsedTheirs.sums);
-    if (!sumCmp.ok) return fail(`The pushed copy on ${machine} does not match this database (checksums: ${sumCmp.text}), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
-
-    const commit = `SET ROLE ${MANAGER_DB_ROLE};\n${raiseSql(code.machine, target, `${addressTableSql(code.host, code.port, cert.pem, code.machine, null)}
-DELETE FROM smdb_manager.addresses WHERE NOT (host = ${sqlLiteral(code.host)} AND port = ${Number(code.port)});
-INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES (${sqlLiteral(code.recv.id)}, ${sqlLiteral(systemId)}, ${sqlLiteral(machineNameOf(inst))}, ${target}) ON CONFLICT (push_id) DO NOTHING;
-${SHARD_CAP_DO_SQL}`)}`;
-    const committed = await receiverClient(inst, code, cert.pem, 'commit', 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', [recvDsn(code, code.db), commit], MOVE_TIMING.clientMs);
-    if (!committed.ok) return fail(`The data reached ${machine} and matched, but ${machine} could not be made the main (${committed.error || lastLine(committed.stderr)}). Press Push again.`);
+    if (failure) return failure;
+    committedNow = true;
   } else {
     admit();
   }
   const prior = containerManager.getBot(botId)?.fleetDb?.handover;
   const { lastError: _cleared, ...kept } = prior?.mode === 'push' ? prior : { mode: 'push' as const, machine, host: code.host, port: code.port, generation: target, file, at: new Date().toISOString(), phase: 'pushing' as const, lastError: undefined };
   const doneError = saveSwitch(botId, { handover: { ...kept, phase: 'done' } });
+  if (committedNow) await lastStep(inst, code, cert.pem);
   const meta = file ? readMeta(path.join(backupDir(botId), file)) : null;
   const checked = meta ? `${meta.tables} tables and ${meta.rows} rows` : 'every table';
   let text = `The database was pushed to ${machine} and checked: ${checked}, with the same counts and checksums on both.`;
@@ -508,6 +642,102 @@ ${SHARD_CAP_DO_SQL}`)}`;
   return { outcome: { success: true, text }, safetyDump: file, stopped };
 }
 
+interface PushPlan { file: string; dumpPath: string; target: number; systemId: string; metaScript: string; listMount: string; admit: () => void }
+
+/**
+ * R3.6 on the receiver, after the push is recorded: the drop, create and grants as smdb_receive_meta; its meta
+ * transaction under SET ROLE dbm_meta on stdin (X1, Z5); smdb_receive's pg_restore of the other entries (S2); the
+ * counts and checksums without smdb_manager.addresses (Y1); the cap as smdb_receive, then the raise as
+ * smdb_receive_meta. Answers the failure, or null once the raise committed.
+ */
+async function sendPush(inst: InstanceConfig, code: MoveCode, pem: string, p: PushPlan): Promise<{ outcome: LaneOutcome; safetyDump: string } | null> {
+  const botId = inst.id;
+  const user = inst.fleetDb!.user;
+  const machine = code.machine;
+  const marked = saveSwitch(botId, { handover: { mode: 'push', machine, host: code.host, port: code.port, generation: p.target, file: p.file, phase: 'pushing', at: new Date().toISOString() } });
+  if (marked) return { outcome: refusal(`The push could not be recorded (${marked}); the dump ${p.file} was kept and nothing was pushed`, 500), safetyDump: p.file };
+  p.admit();
+  const fail = (text: string) => {
+    saveSwitch(botId, { handover: { ...containerManager.getBot(botId)!.fleetDb!.handover!, lastError: text } });
+    return { outcome: refusal(text, 500), safetyDump: p.file };
+  };
+  const why = (r: { error?: string; stderr: string }) => r.error || lastLine(r.stderr);
+  const pushFailed = (r: { error?: string; stderr: string }) => fail(`The push to ${machine} failed (${why(r)}). This machine's database is unchanged; ${machine}'s database is incomplete, and its bot stays Off. Press Push again with the same code, or Cancel the push.`);
+  const loginGone = (r: { ok: boolean; stderr: string }) => !r.ok && RECEIVE_REFUSED_RE.test(r.stderr);
+  const RECVLOGIN = `The push to ${machine} stopped: ${machine} refused the move code's login after the data was sent (code in the pushed database may have changed its password, or the code expired, or receiving was stopped or restarted there). ${machine}'s database is incomplete, and its bot stays Off. On ${machine}, press Receive for a new move code and push with it, or Cancel the push.`;
+  const mismatch = (what: string) => fail(`The pushed copy on ${machine} does not match this database (${what}), so ${machine} was not made the main. Press Push again, or Cancel the push.`);
+
+  const dbIdent = quoteIdent(code.db);
+  const arg = (sql: string) => `'${sql.replace(/'/g, "'\\''")}'`;
+  const createScript = `psql "$1" -v ON_ERROR_STOP=1 -c ${arg(`DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`)} -c ${arg(`CREATE DATABASE ${dbIdent} OWNER ${quoteIdent(user)}`)}`
+    + ` -c ${arg(`GRANT CONNECT, CREATE ON DATABASE ${dbIdent} TO ${dbLogin.META_LOGIN}`)} -c ${arg(`GRANT CONNECT ON DATABASE ${dbIdent} TO ${dbLogin.WORK_LOGIN}`)}`;
+  const created = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'create', script: createScript, args: [recvDsn(code, 'postgres', 'meta')], timeoutMs: MOVE_TIMING.clientMs });
+  if (!created.ok) return pushFailed(created);
+  const metaTx = `SET ROLE ${dbLogin.META_LOGIN};\nBEGIN;\n${fleetBackup.metaTransactionSql(p.metaScript)}COMMIT;\n`;
+  const written = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'meta', script: 'psql "$1" -v ON_ERROR_STOP=1 -q', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.pushMs, input: metaTx });
+  if (!written.ok) return pushFailed(written);
+  const restoreScript = `pg_restore -d "$1" --role="$2" --no-owner --no-privileges --single-transaction --exit-on-error -L ${fleetBackup.RESTORE_LIST_PATH}`;
+  const pushed = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'push', script: restoreScript, args: [recvDsn(code, code.db, 'recv'), user], timeoutMs: MOVE_TIMING.pushMs, inputPath: p.dumpPath, mounts: [p.listMount] });
+  if (!pushed.ok) return pushFailed(pushed);
+
+  let meta;
+  try {
+    const parsed = validateDumpMeta(JSON.parse(fs.readFileSync(`${p.dumpPath}.json`, 'utf-8')));
+    if (!parsed.ok) throw new Error(parsed.error);
+    meta = parsed.meta;
+  } catch (err) {
+    return mismatch(`the counts could not be read (${errText(err)})`);
+  }
+  const read = (suffix: string, sql: string) => receiverClient(inst, code, pem, { as: 'recv', suffix, script: 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', args: [recvDsn(code, code.db, 'recv'), sql], timeoutMs: MOVE_TIMING.verifyMs });
+  const counts = await read('counts', COUNTS_SQL);
+  if (loginGone(counts)) return fail(RECVLOGIN);
+  const theirCounts = counts.ok ? parseCountLines(counts.stdout) : null;
+  if (!theirCounts || !theirCounts.ok) return mismatch(`the counts could not be read (${!counts.ok ? why(counts) : theirCounts && !theirCounts.ok ? theirCounts.error : 'no answer'})`);
+  const cmp = compareCounts(withoutAddresses(meta.counts), withoutAddresses(theirCounts.counts));
+  if (!cmp.ok) return mismatch(`counts: ${cmp.text}`);
+  const sums = await checksumsOf({ container: inst.fleetDb!.containerName, user }, inst.fleetDb!.db);
+  const theirSums = await read('sums', CHECKSUM_SQL);
+  if (loginGone(theirSums)) return fail(RECVLOGIN);
+  const parsedTheirs = theirSums.ok ? parseChecksumLines(theirSums.stdout) : null;
+  if (!sums.ok || !parsedTheirs || !parsedTheirs.ok) {
+    return mismatch(`the checksums could not be read (${!sums.ok ? sums.error : !theirSums.ok ? why(theirSums) : parsedTheirs && !parsedTheirs.ok ? parsedTheirs.error : 'no answer'})`);
+  }
+  const sumCmp = compareChecksums(withoutAddresses(sums.sums), withoutAddresses(parsedTheirs.sums));
+  if (!sumCmp.ok) return mismatch(`checksums: ${sumCmp.text}`);
+
+  const notMain = (r: { error?: string; stderr: string }) => fail(`The data reached ${machine} and matched, but ${machine} could not be made the main (${why(r)}). Press Push again.`);
+  const capped = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'cap', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'recv'), SHARD_CAP_DO_SQL], timeoutMs: MOVE_TIMING.clientMs });
+  if (loginGone(capped)) return fail(RECVLOGIN);
+  if (!capped.ok) return notMain(capped);
+  const commit = `SET ROLE ${dbLogin.META_LOGIN};\n${raiseSql(code.machine, p.target, `${addressTableSql(code.host, code.port, pem, code.machine, null)}
+DELETE FROM smdb_manager.addresses WHERE NOT (host = ${sqlLiteral(code.host)} AND port = ${Number(code.port)});
+INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES (${sqlLiteral(code.recv.id)}, ${sqlLiteral(p.systemId)}, ${sqlLiteral(machineNameOf(inst))}, ${p.target}) ON CONFLICT (push_id) DO NOTHING;
+`)}`;
+  const committed = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'commit', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'meta'), commit], timeoutMs: MOVE_TIMING.clientMs });
+  if (loginGone(committed)) return fail(RECVLOGIN);
+  if (!committed.ok) return notMain(committed);
+  return null;
+}
+
+/**
+ * Y3 and ruling 4, after the commit: each receive login hands what it owns in the pushed database to the bot role and
+ * drops what was granted to it; smdb_receive then loses its password and its other sessions. A failure is logged and
+ * does not fail the push: the receiving machine's end repeats these steps.
+ */
+async function lastStep(inst: InstanceConfig, code: MoveCode, pem: string): Promise<void> {
+  const user = inst.fleetDb!.user;
+  const script = 'psql "$1" -v ON_ERROR_STOP=1 -q';
+  const recv = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'last', script, args: [recvDsn(code, code.db, 'recv')], timeoutMs: MOVE_TIMING.clientMs,
+    input: `${clearOwnedSql(RECEIVE_ROLE, user)}ALTER ROLE ${RECEIVE_ROLE} PASSWORD NULL;\nSELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = '${RECEIVE_ROLE}' AND pid <> pg_catalog.pg_backend_pid();\n` });
+  if (!recv.ok) {
+    console.warn(`[Switch] ${inst.displayName}: the receive login's password could not be removed after the push (${recv.error || lastLine(recv.stderr)}); the receiving machine removes the move code's logins at its own checks of receiving, and until its first check this move code's password still opens them`);
+  }
+  const meta = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'last-meta', script, args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.clientMs, input: clearOwnedSql(RECEIVE_META_ROLE, user) });
+  if (!meta.ok) {
+    console.warn(`[Switch] ${inst.displayName}: what the second receive login owns in the pushed database could not be handed to the bot's role after the push (${meta.error || lastLine(meta.stderr)}); the receiving machine does it when it ends receiving`);
+  }
+}
+
 function readMeta(dumpPath: string) {
   try {
     const parsed = validateDumpMeta(JSON.parse(fs.readFileSync(`${dumpPath}.json`, 'utf-8')));
@@ -519,7 +749,7 @@ function readMeta(dumpPath: string) {
 
 /** The checksum of every table of this database, read here. */
 export async function checksumsOf(t: { container: string; user: string }, db: string): Promise<{ ok: true; sums: Record<string, string> } | { ok: false; error: string }> {
-  const r = await adminSql(t, db, `${CHECKSUM_SQL};`, MOVE_TIMING.verifyMs);
+  const r = await workSql(t, db, `${CHECKSUM_SQL};`, MOVE_TIMING.verifyMs);
   if (!r.ok) return { ok: false, error: r.error || lastLine(r.stderr) };
   const parsed = parseChecksumLines(r.stdout);
   return parsed.ok ? parsed : { ok: false, error: parsed.error };

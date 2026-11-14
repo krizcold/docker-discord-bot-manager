@@ -61,13 +61,20 @@ const intents = () => {
   const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   return { saved, restore: () => { spy.mockRestore(); warn.mockRestore(); } };
 };
+const loginOf = (c: { args: string[] }) => c.args[c.args.indexOf('-U') + 1];
+// NM20 (R3.6): the cap is its own dbm_work call, before the dbm_meta raise that keeps the addresses block.
 const capAfterAddresses = (raise: string) => {
   expect(typeof CAP).toBe('string');
-  expect(count(raise, CAP)).toBe(1);
-  const cap = raise.indexOf(CAP);
-  expect(raise.lastIndexOf("IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN")).toBeLessThan(cap);
-  expect(raise.slice(cap + CAP.length)).toMatch(/^SELECT generation \|\| /);
+  expect(count(raise, CAP)).toBe(0);
+  expect(raise).toContain("IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN");
+  const caps = fake.calls.filter(c => c.input === CAP);
+  expect(caps).toHaveLength(1);
+  expect(loginOf(caps[0])).toBe('dbm_work');
+  const raiseCall = fake.calls.find(c => c.input === raise)!;
+  expect(loginOf(raiseCall)).toBe('dbm_meta');
+  expect(fake.calls.indexOf(caps[0])).toBeLessThan(fake.calls.indexOf(raiseCall));
 };
+const capCalls = () => fake.calls.filter(c => c.input.includes('UPDATE smdb_data.shard_claims'));
 const STEPS = ['hba-block', 'promote', 'raise', 'hba-lift', 'adopt'];
 
 describe('NM9 a take-over over an unchecked mark caps the shard claims (D18)', () => {
@@ -138,6 +145,7 @@ describe('NM9 a take-over over an unchecked mark caps the shard claims (D18)', (
     expect(r.success).toBe(true);
     expect(raises().length).toBeGreaterThan(0);
     for (const raise of raises()) expect(raise).not.toContain('UPDATE smdb_data.shard_claims');
+    expect(capCalls()).toEqual([]);
     expect(seen.saved[0]).toBeTruthy();
     expect(seen.saved[0].unchecked).toBeUndefined();
   });
@@ -155,7 +163,10 @@ describe('NM9 a press that is not a resume caps only by its own mark (D19)', () 
     expect(r1.success).toBe(false);
     expect(stored('c').fleetDbReplica.takeover).toMatchObject({ unchecked: true });
   };
-  const noCap = () => { for (const raise of raises()) expect(raise).not.toContain('UPDATE smdb_data.shard_claims'); };
+  const noCap = () => {
+    for (const raise of raises()) expect(raise).not.toContain('UPDATE smdb_data.shard_claims');
+    expect(capCalls()).toEqual([]);
+  };
 
   it.each([
     ['the promote failed, the mark now checked', () => { fake.dbs['c-pg'].fail.promote = 'ERROR:  promote failed'; }, () => { delete fake.dbs['c-pg'].fail.promote; checkedMark(); }],

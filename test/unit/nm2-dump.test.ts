@@ -44,6 +44,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { docker, resetDocker, callsWith } from './nm2-docker';
 import { holder } from './dump-fake';
+import { MANAGER_SESSION_OPTIONS } from '../../src/instance/dbLogin';
 import { fenceOwners } from './fence-fake';
 import {
   PRIMARY, REPLICA, seedBot, clearRegistry, stored, files, dumps, dumpsDir, putDump, stampText, restartedManager, startedWithTick, tickOnce, localAt, logged,
@@ -260,7 +261,7 @@ describe('NM2 A: the scheduled dump of one family', () => {
     mainBot();
     seedBot({ fleetDbReplica: { ...REPLICA, containerName: 'bot-b-replica', seededAt: NOW - 30 * 86400000 } }, 'b');
     const { run } = await ready();
-    const order = () => pgDumps().map(a => a[1]);
+    const order = () => pgDumps().map(a => a[a.indexOf('pg_dump') - 1]);
     await run();
     expect(order()).toEqual([PRIMARY.containerName, 'bot-b-replica']);
     setNow(NOW + H);
@@ -336,7 +337,7 @@ describe('NM2 A: the scheduled dump of one family', () => {
     expect(stored().fleetBackupAlerts?.['main:dumps']).toBeUndefined();
     const dump = pgDumps()[0];
     expect(dump).toContain('--snapshot=00000003-0000001B-1');
-    expect(holder.spawned[0]).toEqual(['exec', '-i', PRIMARY.containerName, 'psql', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', 'dbm_admin', '-d', PRIMARY.db]);
+    expect(holder.spawned[0]).toEqual(['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`, '-i', PRIMARY.containerName, 'psql', '-U', 'dbm_work', '-d', PRIMARY.db, '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1']);
     expect(holder.stdin[0]).toMatch(/^SET idle_in_transaction_session_timeout = '720s';\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n/);
     expect(holder.stdin[0]).toContain('pg_export_snapshot()');
     expect(holder.stdin[0]).toMatch(/SELECT 'end\|';\nCOMMIT;\n$/);

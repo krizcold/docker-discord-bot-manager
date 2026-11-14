@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   MANAGER_DB_ROLE, blockBotLogin, endBotSessions, ensureManagerDbRole, openBotLogin, readBotLogin,
 } from '../../src/instance/dbLogin';
+import { type Cluster, provisionedCluster } from './pg-cluster';
 
 const dockerRuns = (() => {
   try {
@@ -45,24 +46,20 @@ const login = async (target = t) => {
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM1 the maintenance login against a real Postgres (Linux with docker)', () => {
   let session: ChildProcess | null = null;
+  let cluster: Cluster | undefined;
 
   beforeAll(async () => {
     run(['network', 'create', NET]);
-    const started = run(['run', '-d', '--name', NAME, '--network', NET, '-e', `POSTGRES_USER=${USER}`, '-e', `POSTGRES_PASSWORD=${PASSWORD}`,
-      'postgres:16-alpine', 'postgres', '-c', 'log_error_verbosity=verbose']);
-    expect(started.status, started.err).toBe(0);
-    waitReady(NAME);
-    const r: any = await ensureManagerDbRole(t);
-    expect(r.ok).toBe(true);
+    cluster = await provisionedCluster({ name: NAME, user: USER, db: USER, password: PASSWORD, network: NET, serverArgs: ['-c', 'reserved_connections=4', '-c', 'log_error_verbosity=verbose'] });
   }, 300000);
 
   afterAll(() => {
     session?.kill();
-    run(['rm', '-f', NAME]);
+    cluster?.remove();
     run(['network', 'rm', NET]);
   }, 120000);
 
-  it('1. a NOLOGIN bootstrap superuser is refused over TCP with its password and over the local socket (28000)', () => {
+  it('1. (NM20 3.1) a NOLOGIN bot role, now a plain login, is refused over TCP with its password and over the local socket (28000)', () => {
     expect(asAdmin(`ALTER ROLE "${USER}" NOLOGIN`).status).toBe(0);
     const local = psql(NAME, USER, 'SELECT 1');
     expect(local.status).not.toBe(0);
@@ -113,13 +110,15 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM1 the maintenanc
   }, 300000);
 
   it('6. pg_dump and pg_restore as dbm_admin keep the bot role as owner of the restored objects', () => {
-    expect(asAdmin(`SET ROLE "${USER}"; CREATE TABLE kept (x int); INSERT INTO kept VALUES (7);`, 'botdb').status).toBe(0);
+    // dbm_admin's sessions keep search_path = pg_catalog, pg_temp (NM20 Invariant A), also after SET ROLE, so the table is named in public.
+    const made = asAdmin(`SET ROLE "${USER}"; CREATE TABLE public.kept (x int); INSERT INTO public.kept VALUES (7);`, 'botdb');
+    expect(made.status, made.err).toBe(0);
     expect(run(['exec', NAME, 'pg_dump', '-U', MANAGER_DB_ROLE, '-d', 'botdb', '-Fc', '-f', '/tmp/nm1.dump']).status).toBe(0);
     expect(asAdmin('DROP DATABASE botdb').status).toBe(0);
     expect(asAdmin(`CREATE DATABASE botdb OWNER "${USER}"`).status).toBe(0);
     const restored = run(['exec', NAME, 'pg_restore', '-U', MANAGER_DB_ROLE, '-d', 'botdb', '/tmp/nm1.dump']);
     expect(restored.status, restored.err).toBe(0);
-    expect(asAdmin(`SELECT tableowner || ':' || (SELECT x FROM kept)::text FROM pg_tables WHERE tablename = 'kept'`, 'botdb').out).toBe(`${USER}:7`);
+    expect(asAdmin(`SELECT tableowner || ':' || (SELECT x FROM public.kept)::text FROM pg_tables WHERE tablename = 'kept'`, 'botdb').out).toBe(`${USER}:7`);
   }, 120000);
 
   it('7. pg_isready -U <bot role> exits 0 while the role is NOLOGIN', async () => {

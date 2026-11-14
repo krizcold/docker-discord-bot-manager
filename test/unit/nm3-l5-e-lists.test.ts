@@ -310,7 +310,8 @@ describe('readCopyFacts', () => {
     expect(r).toEqual({ ok: true, facts: { inRecovery: true, streaming: true, systemId: '7001', timeline: 1, lsn: 0x4000000n } });
     expect(h.calls).toHaveLength(1);
     expect(h.calls[0].cmd).toBe('docker');
-    expect(h.calls[0].args.slice(0, 8)).toEqual(['exec', 'b-fleet-postgres-replica', 'psql', '-U', 'dbm_admin', '-d', 'smdb', '-Atc']);
+    // NM20 S1, decide1 G1: the cluster reads run as dbm_admin on postgres.
+    expect(h.calls[0].args.slice(0, 11)).toEqual(['exec', 'b-fleet-postgres-replica', 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
     expect(h.calls[0].opts).toEqual({ timeout: 120_000 });
   });
 
@@ -319,18 +320,19 @@ describe('readCopyFacts', () => {
     expect(await readCopyFacts(rec)).toEqual({ ok: true, facts: { inRecovery: false, streaming: false, systemId: '7001', timeline: 12, lsn: 0x4000000n } });
   });
 
-  it('creates the missing manager role from psql\'s stderr and reads again', async () => {
+  // NM20 R3.3: no asManager, so a missing dbm_admin is one failed read, with no check and no second login.
+  it("a missing manager role is one failed read, and nothing logs in as the bot's role", async () => {
     let first = true;
     h.exec = args => {
-      if (args.includes('-Atc')) {
+      if (args.includes('-c')) {
         if (first) { first = false; return { fail: true, stderr: 'psql: error: FATAL:  role "dbm_admin" does not exist', message: 'Command failed' }; }
         return { stdout: 'true|streaming|7001|1|0/4000000\n' };
       }
       return { stdout: 'true\n' };
     };
-    const r = await readCopyFacts(rec);
-    expect(r.ok).toBe(true);
-    expect(h.calls.filter(c => c.args.includes('-Atc'))).toHaveLength(2);
+    expect(await readCopyFacts(rec)).toEqual({ ok: false, reason: "the copy's database did not answer" });
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0].args[h.calls[0].args.indexOf('-U') + 1]).toBe('dbm_admin');
   });
 
   it('does not retry a failure that is not a missing role', async () => {

@@ -16,8 +16,9 @@ vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ensureManagerDbRole } from '../../src/instance/dbLogin';
+import { MANAGER_DB_ROLE } from '../../src/instance/dbLogin';
 import { getFleetReplicationStatus } from '../../src/instance/fleetReplication';
+import { provisionedCluster } from './pg-cluster';
 
 const dockerRuns = (() => {
   try {
@@ -33,13 +34,12 @@ const MAIN = `${ID}-main`;
 const VOL = `${ID}-main-data`;
 const SLOT = 'fleet_standby_nm6pg';
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 600000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
 const ok = (sql: string) => {
-  const r = run(['exec', '-i', MAIN, 'psql', '-X', '-U', 'smdb', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
+  const r = run(['exec', '-i', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
   expect(r.status, r.err).toBe(0);
   return r.out;
 };
@@ -51,17 +51,8 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM6 slot query aga
   } as any;
 
   beforeAll(async () => {
-    const r = run(['run', '-d', '--name', MAIN, '-v', `${VOL}:/var/lib/postgresql/data`,
-      '-e', 'POSTGRES_USER=smdb', '-e', 'POSTGRES_PASSWORD=app-pw', '-e', 'POSTGRES_DB=smdb', 'postgres:16-alpine']);
-    expect(r.status, r.err).toBe(0);
-    let ready = false;
-    for (let i = 0; i < 240 && !ready; i++) {
-      ready = run(['exec', MAIN, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0;
-      if (!ready) pause(500);
-    }
-    expect(ready).toBe(true);
+    await provisionedCluster({ name: MAIN, user: 'smdb', db: 'smdb', password: 'app-pw' });
     fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { [inst.id]: inst } }));
-    expect(await ensureManagerDbRole({ container: MAIN, user: 'smdb' })).toEqual({ ok: true });
     ok(`SELECT pg_create_physical_replication_slot('${SLOT}', true);`);
   }, 300000);
 

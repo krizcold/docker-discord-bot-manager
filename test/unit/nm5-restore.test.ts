@@ -336,7 +336,7 @@ describe('S2, S3, S5 to S11, S13 to S15: the rest of the restore lane', () => {
     claimDb.fail = 'gen';
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toBe("Could not read the database's generation before the restore, so the restore was refused, and nothing was changed: ERROR:  connection reset by peer");
+    expect(r.error).toBe("Could not read the database's generation before the restore, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): ERROR:  connection reset by peer");
     expect(claimDb.dropSeen).toBe(false);
     expect(claimDb.genEvents).not.toContain('state-upsert');
     expect(claimDb.restoreState).toEqual(PENDING);
@@ -384,7 +384,7 @@ describe('S2, S3, S5 to S11, S13 to S15: the rest of the restore lane', () => {
     claimDb.fail = 'state';
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toBe("The database's generation could not be kept before the drop, so the restore was refused, and nothing was changed: ERROR:  could not write to file");
+    expect(r.error).toBe("The database's generation could not be kept before the drop, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): ERROR:  could not write to file");
     expect(claimDb.dropSeen).toBe(false);
     expect(claimDb.genWrites).toEqual([]);
     expect(fenceOwners.has('bot-a-postgres')).toBe(false);

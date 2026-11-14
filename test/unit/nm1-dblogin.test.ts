@@ -106,41 +106,32 @@ describe('ensureManagerDbRole', () => {
     expect(dk.calls.length).toBe(1);
   });
 
-  it('missing, then created as the bot role, then checked again', async () => {
-    let created = false;
-    dk.answer = (args) => {
-      const sql = args[args.length - 1];
-      if (sql.startsWith('CREATE ROLE')) { created = true; return { stdout: 'CREATE ROLE\n' }; }
-      return created ? { stdout: 'true\n' } : { err: 'exit 2', stderr: MISSING };
-    };
-    expect(await ensureManagerDbRole(t)).toEqual({ ok: true });
+  // NM20 3.3: the ensure checks only; dbm_admin is made by initdb as the first role, never over the bot role.
+  const ROLE_MISSING = "the role dbm_admin does not exist in this database's cluster; the manager creates it only as the first role of a database it creates";
+  it('missing: one check as dbm_admin, no CREATE, and ROLE-MISSING', async () => {
+    dk.answer = (args) => (args[args.length - 1].startsWith('CREATE ROLE') ? { stdout: 'CREATE ROLE\n' } : { err: 'exit 2', stderr: MISSING });
+    expect(await ensureManagerDbRole(t)).toEqual({ ok: false, cls: 'missing-role', error: ROLE_MISSING });
     expect(dk.calls.map(c => [roleOf(c), sqlOf(c)])).toEqual([
-      ['dbm_admin', 'SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user'],
-      ['smdb', 'CREATE ROLE "dbm_admin" WITH SUPERUSER LOGIN'],
       ['dbm_admin', 'SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user'],
     ]);
   });
 
-  it('missing while the bot role is refused login: fails with the reason, nothing cached', async () => {
-    dk.answer = (args) => args[args.length - 1].startsWith('CREATE ROLE')
-      ? { err: 'exit 2', stderr: 'psql: error: FATAL:  role "smdb" is not permitted to log in' }
-      : { err: 'exit 2', stderr: MISSING };
+  it('missing: nothing cached, so the next call checks again', async () => {
+    dk.answer = () => ({ err: 'exit 2', stderr: MISSING });
     const r: any = await ensureManagerDbRole(t);
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/is not permitted to log in/);
+    expect(r.error).toBe(ROLE_MISSING);
     dk.calls = [];
     await ensureManagerDbRole(t);
     expect(dk.calls.length).toBeGreaterThan(0);
   });
 
-  it('an already exists race counts as created', async () => {
+  it('a role that appears between two checks is found by the next check', async () => {
     let n = 0;
-    dk.answer = (args) => {
-      const sql = args[args.length - 1];
-      if (sql.startsWith('CREATE ROLE')) return { err: 'exit 1', stderr: 'ERROR:  role "dbm_admin" already exists' };
-      return n++ === 0 ? { err: 'exit 2', stderr: MISSING } : { stdout: 'true\n' };
-    };
+    dk.answer = () => (n++ === 0 ? { err: 'exit 2', stderr: MISSING } : { stdout: 'true\n' });
+    expect(await ensureManagerDbRole(t)).toMatchObject({ ok: false, cls: 'missing-role' });
     expect(await ensureManagerDbRole(t)).toEqual({ ok: true });
+    expect(dk.calls.some(c => sqlOf(c).startsWith('CREATE'))).toBe(false);
   });
 
   it('a role that is not a superuser fails', async () => {
@@ -212,7 +203,7 @@ describe('stderr classes', () => {
   ])('%s', (stderr, cls) => expect(psqlFailureClass(stderr)).toBe(cls));
 });
 
-describe('F2: a missing dbm_admin is made again and the login retried', () => {
+describe('F2: a missing dbm_admin drops the cached role (NM20 3.3: never made again)', () => {
   const MISSING = 'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "dbm_admin" does not exist';
   it('a missing-role answer drops the cached role, so the next ensure checks again', async () => {
     dk.answer = () => ({ stdout: 'true\n' });
@@ -223,42 +214,27 @@ describe('F2: a missing dbm_admin is made again and the login retried', () => {
     await ensureManagerDbRole(t);
     expect(dk.calls.length).toBeGreaterThan(0);
   });
-  it('blockBotLogin on a container that lost dbm_admin creates it and runs once more', async () => {
+  // NM20 3.3: a container that lost dbm_admin answers the missing role; no CREATE, no login as the bot role. R3.3
+  // removed asManager, so no check follows the failed read.
+  it('blockBotLogin on a container that lost dbm_admin answers the missing role and sends no ALTER', async () => {
     dk.answer = () => ({ stdout: 'true\n' });
     await ensureManagerDbRole(t);
-    let made = false;
-    dk.answer = (args) => {
-      const sql = args[args.length - 1];
-      if (roleOf({ args }) === 'smdb') { made = true; return { stdout: 'CREATE ROLE\n' }; }
-      if (!made) return { err: 'x', stderr: MISSING };
-      return sql.startsWith('SELECT rolsuper') ? { stdout: 'true\n' } : sql.startsWith('ALTER') ? { stdout: '' } : { stdout: 'false|true|0\n' };
-    };
+    dk.answer = (args) => (roleOf({ args }) === 'smdb' ? { stdout: 'CREATE ROLE\n' } : { err: 'x', stderr: MISSING });
     dk.calls = [];
-    expect(await blockBotLogin(t)).toEqual({ ok: true });
-    expect(dk.calls.map(c => [roleOf(c), sqlOf(c)])).toEqual([
-      ['dbm_admin', READ_SQL],
-      ['dbm_admin', 'SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user'],
-      ['smdb', 'CREATE ROLE "dbm_admin" WITH SUPERUSER LOGIN'],
-      ['dbm_admin', 'SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user'],
-      ['dbm_admin', READ_SQL],
-      ['dbm_admin', 'ALTER ROLE "smdb" NOLOGIN'],
-    ]);
-    expect(dk.calls[dk.calls.length - 1].args).toEqual(exemptArgv('dbm_admin', 'ALTER ROLE "smdb" NOLOGIN'));
+    expect(await blockBotLogin(t)).toMatchObject({ ok: false, cls: 'missing-role' });
+    expect(dk.calls.map(c => [roleOf(c), sqlOf(c)])).toEqual([['dbm_admin', READ_SQL]]);
   });
-  it('on a live copy the role cannot be made, so the login runs as the bot role, logged once', async () => {
-    const dbLogin = await import('../../src/instance/dbLogin');
+  // NM20 3.3, R3.3: the copy fallback is gone, so a read never runs as the bot role; the row drives readBotLogin.
+  it('on a live copy without dbm_admin the login runs once as dbm_admin, never as the bot role, and nothing is logged', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     dk.answer = (args) => roleOf({ args }) === 'smdb'
       ? (args[args.length - 1].startsWith('CREATE') ? { err: 'x', stderr: 'ERROR:  cannot execute CREATE ROLE in a read-only transaction' } : { stdout: 'true|false|0\n' })
       : { err: 'x', stderr: MISSING };
-    const run = (role: string) => new Promise<{ ok: boolean; role: string; stderr: string }>(resolve => {
-      const a = dk.answer(['exec', 'b1-fleet-postgres', 'psql', '-U', role, '-c', 'SELECT 1']);
-      resolve({ ok: !a.err, role, stderr: a.stderr ?? '' });
-    });
-    const r1 = await dbLogin.asManager(t, run, r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
-    const r2 = await dbLogin.asManager(t, run, r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
-    expect([r1.role, r1.ok, r2.role, r2.ok]).toEqual(['smdb', true, 'smdb', true]);
-    expect(warn.mock.calls.map(c => c[0])).toEqual(['[Database] b1-fleet-postgres: the role dbm_admin has not reached this live copy from its main yet, so the manager logs in as smdb until it does']);
+    const r1 = await readBotLogin(t);
+    const r2 = await readBotLogin(t);
+    expect([r1.ok, r2.ok]).toEqual([false, false]);
+    expect(dk.calls.map(c => roleOf(c))).toEqual(['dbm_admin', 'dbm_admin']);
+    expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
   it('forgetManagerRole drops the cached role of a removed container', async () => {

@@ -37,7 +37,7 @@ vi.mock('child_process', async (importOriginal) => {
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
     child.kill = () => {};
-    if (args.includes('pg_dump')) h.dumpedFrom.push(args[1]);
+    if (args.includes('pg_dump')) h.dumpedFrom.push(args[args.indexOf('pg_dump') - 1]);
     const fail = args.includes('pg_dump') ? h.dumpFail : null;
     setTimeout(() => {
       child.stdout.end(fail ? '' : 'dump');

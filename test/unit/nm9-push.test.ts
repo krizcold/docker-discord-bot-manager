@@ -33,7 +33,7 @@ import { fake, fakeJoin, freshDb, h, mainFixture, resetHarness, stored, writeReg
 const FILE = 'pre-push-2026-10-28T12-00-00-000Z.dump';
 const SUM = 'checksum|"public"."t"|0123456789abcdef0123456789abcdef';
 const PUSH_ID = '0123456789abcdef01234567';
-const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
+const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
 const PUSH_MARK = { mode: 'push', machine: 'win.example', host: 'win.example', port: 5440, generation: 4, file: FILE, phase: 'pushing', at: '2026-10-28T12:00:00.000Z' };
 const RECEIVED = `INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('${PUSH_ID}', '7001', 'main.example', 4) ON CONFLICT (push_id) DO NOTHING;`;
 const CAP: string = (switchSql as any).SHARD_CAP_DO_SQL;
@@ -65,21 +65,24 @@ beforeEach(() => {
 afterAll(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
 
 const commits = () => fake.calls.filter(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit')).map(c => c.args[c.args.length - 1]);
+const caps = () => fake.calls.filter(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-cap')).map(c => c.args[c.args.length - 1]);
 const count = (text: string, part: string) => text.split(part).length - 1;
 
 describe('NM9 the push caps the receiver\'s shard claims in its commit (D14, D17)', () => {
-  it('H1: the commit holds the cap once, after the received row and before the final SELECT and COMMIT', async () => {
+  // Inverted by NM20 R3.6 (lines 759-761): the cap is its own transaction as smdb_receive, sent before the raise,
+  // which runs as smdb_receive_meta under SET ROLE dbm_meta and holds no cap.
+  it('H1: the cap is sent once on its own before the commit, and the commit holds the received row before the final SELECT and COMMIT', async () => {
     const r = await push('a', CODE);
     expect(r.success).toBe(true);
     expect(typeof CAP).toBe('string');
+    expect(caps()).toEqual([CAP]);
     const [commit] = commits();
-    expect(commit.startsWith('SET ROLE dbm_admin;\nBEGIN;')).toBe(true);
-    expect(count(commit, CAP)).toBe(1);
-    const cap = commit.indexOf(CAP);
-    expect(commit.indexOf(RECEIVED)).toBeGreaterThan(0);
-    expect(cap).toBeGreaterThan(commit.indexOf(RECEIVED));
-    expect(commit.slice(cap + CAP.length)).toMatch(/^SELECT generation \|\| '\|' \|\| machine .*\nCOMMIT;$/);
-    expect(h.events.filter(e => e.startsWith('dump:') || e.startsWith('client:') || e === 'stop-bot:push' || e === 'reseed')).toEqual(['client:probe', 'dump:pre-push-', 'client:push', 'client:counts', 'client:sums', 'client:commit', 'stop-bot:push', 'reseed']);
+    expect(commit.startsWith('SET ROLE dbm_meta;\nBEGIN;')).toBe(true);
+    expect(count(commit, CAP)).toBe(0);
+    const received = commit.indexOf(RECEIVED);
+    expect(received).toBeGreaterThan(0);
+    expect(commit.slice(received + RECEIVED.length)).toMatch(/^\nSELECT generation \|\| '\|' \|\| machine .*\nCOMMIT;$/);
+    expect(h.events.filter(e => e.startsWith('dump:') || e.startsWith('client:') || e === 'stop-bot:push' || e === 'reseed')).toEqual(['client:probe', 'dump:pre-push-', 'client:create', 'client:meta', 'client:push', 'client:counts', 'client:sums', 'client:cap', 'client:commit', 'client:last', 'client:last-meta', 'stop-bot:push', 'reseed']);
   });
 
   it('H4: the commit fails: NM5\'s text, no done phase', async () => {
@@ -87,7 +90,8 @@ describe('NM9 the push caps the receiver\'s shard claims in its commit (D14, D17
     const r = await push('a', CODE);
     expect(r.text).toBe('The data reached win.example and matched, but win.example could not be made the main (ERROR:  permission denied for table shard_claims). Press Push again.');
     expect(stored('a').fleetDb.handover.phase).toBe('pushing');
-    expect(count(commits()[0], CAP)).toBe(1);
+    expect(caps()).toEqual([CAP]);
+    expect(count(commits()[0], CAP)).toBe(0);
   });
 
   it('H5: Push again after H4 sends the commit again, with the cap', async () => {
@@ -97,10 +101,10 @@ describe('NM9 the push caps the receiver\'s shard claims in its commit (D14, D17
     steps.length = 0;
     const again = await push('a', CODE);
     expect(again.success).toBe(true);
-    expect(steps).toEqual(['probe', 'push', 'counts', 'sums', 'commit']);
+    expect(steps).toEqual(['probe', 'create', 'meta', 'push', 'counts', 'sums', 'cap', 'commit', 'last', 'last-meta']);
     const all = commits();
     expect(all).toHaveLength(2);
-    expect(count(all[1], CAP)).toBe(1);
+    expect(caps()).toEqual([CAP, CAP]);
     expect(stored('a').fleetDb.handover.phase).toBe('done');
   });
 

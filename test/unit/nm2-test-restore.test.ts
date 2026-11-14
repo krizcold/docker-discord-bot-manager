@@ -441,7 +441,7 @@ describe('NM2 B: the daily test restore', () => {
     setNow(NOW + H);
     tick();
     await vi.waitFor(() => expect(fb.isTickRunning()).toBe(false), { timeout: 1000 });
-    expect(callsWith('pg_dump').filter(a => a.includes('pg_dump')).map(a => a[1]).sort()).toEqual(['bot-a-postgres', 'bot-b-replica']);
+    expect(callsWith('pg_dump').filter(a => a.includes('pg_dump')).map(a => a[a.indexOf('pg_dump') - 1]).sort()).toEqual(['bot-a-postgres', 'bot-b-replica']);
     expect(callsWith('pg_restore').length).toBe(1);
     await vi.waitFor(() => expect(lastTest()?.result).toBe('failed'), { timeout: 4000 });
   });

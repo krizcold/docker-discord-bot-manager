@@ -1377,6 +1377,9 @@ export function fleetAppContainerName(composeContent: string): string | null {
   }
 }
 
+/** Places only the manager's logins dbm_meta and dbm_work may use, so the bots' connections cannot take every one. */
+const FLEET_POSTGRES_COMMAND = ['postgres', '-c', 'reserved_connections=4'];
+
 /**
  * Inject the manager-provisioned fleet Postgres sidecar into a processed compose.
  * Joins the project's default network AND the shared cross-project network (pcs
@@ -1412,11 +1415,13 @@ export function addFleetPostgresService(
     restart: 'unless-stopped',
     cpu_shares: 10,
     logging: cappedLogging(),
+    // The manager's role is the first role: the bot role (db.user) is made by provisionRoles as a plain login.
     environment: {
-      POSTGRES_USER: db.user,
+      POSTGRES_USER: 'dbm_admin',
       POSTGRES_DB: db.db,
       POSTGRES_PASSWORD: db.password,
     },
+    command: [...FLEET_POSTGRES_COMMAND],
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {
       test: ['CMD-SHELL', `pg_isready -U ${db.user} -d ${db.db}`],
@@ -1523,6 +1528,7 @@ export function addFleetPostgresReplicaService(
     cpu_shares: 10,
     logging: cappedLogging(),
     ...(replica.hostPort ? { ports: [`${replica.hostPort}:5432`] } : {}),
+    command: [...FLEET_POSTGRES_COMMAND],
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],
     healthcheck: {
       // A record stamped before the identity fields checks acceptance only

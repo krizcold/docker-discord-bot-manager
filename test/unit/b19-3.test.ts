@@ -37,7 +37,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 1);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 
 import * as fs from 'fs';

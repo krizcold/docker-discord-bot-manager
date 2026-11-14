@@ -149,7 +149,8 @@ vi.mock('child_process', async (importOriginal) => {
     return child;
   });
   const heldSpawn = (await import('./dump-fake')).withDumpHolder((await import('./restore-fake')).withTocFake(spawn as any));
-  const claimExecFile = (await import('./restore-fake')).withRestoreFakes(execFile as any);
+  // NM20 part 3: provisioning's reads answered first; Enable's fence-line reads go to the spawn fake, as before R3.3.
+  const claimExecFile = (await import('./roles-fake')).rolesExecFile((await import('./restore-fake')).withRestoreFakes(execFile as any) as any, spawn as any, /^(?!.* -c SELECT (count\(\*\) FROM regexp_split_to_table|coalesce\(string_agg\(DISTINCT))/);
   return { ...real, execFile: claimExecFile, spawn: heldSpawn, default: { ...real, execFile: claimExecFile, spawn: heldSpawn } };
 });
 
@@ -470,7 +471,7 @@ describe('B14-2Lb: the pg_hba rewriters refuse while the fence lines are present
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/write fence stands in pg_hba\.conf/);
     expect(r.error).toMatch(/no lane of this manager set its lines; a restore takes them over and lifts them, or remove them by hand/);
-    expect(r.error).toMatch(/nothing was changed/);
+    expect(r.error).toMatch(/replication was not set up, so retry Enable after that/);
     expect(pg.spawned.some(s => s.includes('pg_read_file'))).toBe(true);
     expect(pg.spawned.filter(s => /ALTER SYSTEM|ROLE replicator|pg_hba\.conf\.new|pg_reload_conf/.test(s))).toEqual([]);
     expect(pg.sql.filter(s => /ALTER SYSTEM|pg_reload_conf/.test(s))).toEqual([]);

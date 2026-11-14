@@ -45,16 +45,17 @@ const FILE = 'pre-push-2026-10-28T12-00-00-000Z.dump';
 const MOVE_FILE = 'pre-move-2026-10-28T12-00-00-000Z.dump';
 const SUM = 'checksum|"public"."t"|0123456789abcdef0123456789abcdef';
 const PUSH_ID = '0123456789abcdef01234567';
-const codeFor = (host: string, port: number) => encodeMoveCode({ ...fakeJoin({ host, port, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
+const codeFor = (host: string, port: number) => encodeMoveCode({ ...fakeJoin({ host, port, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
 const CODE = codeFor('win.example', 5440);
 const PUSH_MARK = { mode: 'push', machine: 'win.example', host: 'win.example', port: 5440, generation: 4, file: FILE, phase: 'pushing', at: '2026-10-28T12:00:00.000Z' };
 const S_PUSH = `The database was pushed to win.example and checked: 1 tables and 3 rows, with the same counts and checksums on both. win.example is the main now (generation 4); choose Running in its State window to start the bot there. This machine now rebuilds itself as a copy of win.example; a dump of its database from before the push is kept with the backups (${FILE}).`;
 const S_FILE = `The backup ${MOVE_FILE} is ready and is downloading. Upload it in the other machine's manager (Upload a backup in the bot's Database window), then restore it there with the bot in Maintenance or Off. This bot stays stopped here, with its database login blocked, until you Cancel the move.`;
 const DSN = (db: string) => `postgresql://smdb_receive@win.example:5440/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+const META_DSN = (db: string) => `postgresql://smdb_receive_meta@win.example:5440/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 const DIR = path.join(tmp.dir, 'backups', 'a', 'fleet-postgres');
 const TWO_LINES = 'ERROR:  first\nlast line';
 
-type Step = 'probe' | 'push' | 'counts' | 'sums' | 'commit';
+type Step = 'probe' | 'create' | 'meta' | 'push' | 'counts' | 'sums' | 'cap' | 'commit' | 'last' | 'last-meta';
 let answers: Partial<Record<Step, { code: number; stdout: string; stderr: string }>> = {};
 const steps: Step[] = [];
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
@@ -153,7 +154,7 @@ describe('pushLocked reads before the dump', () => {
     answers.probe = ok(stdout);
     const r = await push('a', CODE);
     expect(r.text).toBe(S_PUSH);
-    expect(steps).toEqual(['probe', 'push', 'counts', 'sums', 'commit']);
+    expect(steps).toEqual(['probe', 'create', 'meta', 'push', 'counts', 'sums', 'cap', 'commit', 'last', 'last-meta']);
   });
   it('a CRLF recovery answer is still read as in recovery', async () => {
     answers.probe = ok('true\r\n2|win.example|\r\n0\r\n');
@@ -181,11 +182,19 @@ describe('pushLocked clients', () => {
     expect(probe.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
       + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
       + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }');
-    expect(probe.rest.slice(0, 2)).toEqual([DSN('postgres'), DSN('app')]);
+    // NM20 R3.6: the probe, the drop and create, the meta rows and the raise run as smdb_receive_meta; the pg_restore
+    // (S2's list), counts, checksums and the cap as smdb_receive.
+    expect(probe.rest.slice(0, 2)).toEqual([META_DSN('postgres'), META_DSN('app')]);
     expect(probe.rest).toHaveLength(4);
+    const created = client('create');
+    expect(created.script).toBe(`psql "$1" -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS "app" WITH (FORCE)' -c 'CREATE DATABASE "app" OWNER "app"' -c 'GRANT CONNECT, CREATE ON DATABASE "app" TO dbm_meta' -c 'GRANT CONNECT ON DATABASE "app" TO dbm_work'`);
+    expect(created.rest).toEqual([META_DSN('postgres')]);
+    const meta = client('meta');
+    expect(meta.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -q');
+    expect(meta.rest).toEqual([META_DSN('app')]);
     const pushed = client('push');
-    expect(pushed.script).toBe(`psql "$1" -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS "app" WITH (FORCE)' -c 'CREATE DATABASE "app" OWNER "app"' && pg_restore --exit-on-error --single-transaction -d "$2"`);
-    expect(pushed.rest).toEqual([DSN('postgres'), DSN('app')]);
+    expect(pushed.script).toBe('pg_restore -d "$1" --role="$2" --no-owner --no-privileges --single-transaction --exit-on-error -L /tmp/smdb-restore.list');
+    expect(pushed.rest).toEqual([DSN('app'), 'app']);
     for (const step of ['counts', 'sums'] as const) {
       const c = client(step);
       expect(c.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"');
@@ -194,9 +203,12 @@ describe('pushLocked clients', () => {
     }
     expect(client('counts').rest[1]).toMatch(/count/);
     expect(client('sums').rest[1]).toMatch(/checksum/);
+    const cap = client('cap');
+    expect(cap.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
+    expect(cap.rest[0]).toBe(DSN('app'));
     const commit = client('commit');
     expect(commit.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
-    expect(commit.rest[0]).toBe(DSN('app'));
+    expect(commit.rest[0]).toBe(META_DSN('app'));
   });
   it('the push fails with two stderr lines: the ERROR line is named, and the mark keeps it as lastError', async () => {
     answers.push = bad(TWO_LINES);
@@ -207,7 +219,7 @@ describe('pushLocked clients', () => {
   it('the dump meta file is gone: the counts could not be read', async () => {
     fs.rmSync(path.join(DIR, `${FILE}.json`));
     expect((await push('a', CODE)).text).toMatch(/^The pushed copy on win\.example does not match this database \(the counts could not be read \(ENOENT.+\)\), so win\.example was not made the main\. Press Push again, or Cancel the push\.$/);
-    expect(steps).toEqual(['probe', 'push']);
+    expect(steps).toEqual(['probe', 'create', 'meta', 'push']);
   });
   it('the counts read fails: its ERROR line is named', async () => {
     answers.counts = bad(TWO_LINES);

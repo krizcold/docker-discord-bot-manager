@@ -82,6 +82,11 @@ vi.mock('../../src/docker/containerManager', () => ({
   },
 }));
 
+// NM20 part 3: the maintenance check provisions through fleetReplication; this file's docker is not faked.
+vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
+  provisionManagedRoles: async () => ({ ok: true, wrote: [] }),
+}));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
   readWriteFence: async () => ({ ok: true, on: false }),

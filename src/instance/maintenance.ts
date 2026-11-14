@@ -467,7 +467,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   const ensureRole = async (): Promise<boolean> => {
     if (roleReady) return true;
     const role = await dbLogin.ensureManagerDbRole(target!);
-    if (!role.ok) { o.dbFail = `the manager's database role ${dbLogin.MANAGER_DB_ROLE} could not be created (${role.error})`; return false; }
+    if (!role.ok) { o.dbFail = `the manager's database role ${dbLogin.MANAGER_DB_ROLE} could not be confirmed (${role.error})`; return false; }
     roleReady = true;
     return true;
   };
@@ -755,6 +755,8 @@ export async function maintenanceStatus(inst: InstanceConfig, driftText: string 
 const drift = new Map<string, string>();
 const unsavedText = new Map<string, string>();
 const loggedDrift = new Map<string, string>();
+/** The provisioning error last logged per container, so each distinct one is logged once. */
+const provisionLogged = new Map<string, string>();
 let reconcilerTimer: NodeJS.Timeout | null = null;
 let passRunning = false;
 let firstPassDone = false;
@@ -776,6 +778,7 @@ export function resetMaintenanceState(): void {
   drift.clear();
   unsavedText.clear();
   loggedDrift.clear();
+  provisionLogged.clear();
   passRunning = false;
   firstPassDone = false;
   dbLogin.resetManagerRoleCache();
@@ -800,6 +803,29 @@ function rerun(inst: InstanceConfig, rec: MaintenanceRecord, mode: 'resumed' | '
     .catch(err => console.error(`[Maintenance] ${inst.displayName}: running the order ${NAME[rec.state]} again failed: ${errText(err)}`));
 }
 
+/**
+ * Each pass: a container whose roles this process confirmed gets the drift read; any other, or one the drift read
+ * drops, is provisioned. A failure is logged once per distinct error. A database waiting for a push, or one a push
+ * left unfinished, is skipped (as ensureMainGeneration skips it): the push makes smdb_manager itself.
+ */
+async function provisionPass(inst: InstanceConfig, target: dbLogin.DbTarget): Promise<void> {
+  if (inst.fleetDb!.receive || inst.fleetDb!.pushBroken) return;
+  const role = await dbLogin.ensureManagerDbRole(target);
+  if (!role.ok) return;
+  const db = inst.fleetDb!.db;
+  if (dbLogin.isRolesConfirmed(target.container) && await dbLogin.checkRolesDrift({ container: target.container, db })) return;
+  // Imported here, so this module adds no import edge to fleetReplication.
+  const r = await (await import('./fleetReplication')).provisionManagedRoles(inst)
+    .catch(err => ({ ok: false as const, cls: 'other' as const, error: errText(err) }));
+  if (r.ok || r.cls === 'in-recovery') {
+    provisionLogged.delete(target.container);
+    return;
+  }
+  if (provisionLogged.get(target.container) === r.error) return;
+  provisionLogged.set(target.container, r.error);
+  console.warn(`[Maintenance] ${inst.displayName}: the database's roles could not be set up: ${r.error}`);
+}
+
 async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<void> {
   const inst = containerManager.getBot(listed.id);
   if (!inst) return;
@@ -813,7 +839,7 @@ async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<voi
   let target: dbLogin.DbTarget | null = null;
   if (kind === 'database' && !dbLogin.botRoleRefusal(inst.fleetDb!.user)) target = { container: inst.fleetDb!.containerName, user: inst.fleetDb!.user };
   const sidecar = target ? await dbLogin.sidecarRunning(target.container) : null;
-  if (first && target && sidecar === true) await dbLogin.ensureManagerDbRole(target);
+  if (target && sidecar === true) await provisionPass(inst, target);
 
   if (!rec.settled) {
     if (first) {

@@ -77,7 +77,7 @@ vi.mock('child_process', async (importOriginal) => {
     }, 2);
     return child;
   };
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any) as any);
   const layeredExecFile = (cmd: string, args: string[], opts: any, cb?: any) => {
     const sql = args.join(' ');
     const done = typeof opts === 'function' ? opts : cb;
@@ -287,11 +287,11 @@ describe('O41: the readers of the mark', () => {
   it("the narrowing's refusal names a migration's lines and that the open migration lifts them", async () => {
     writeRegistry({ migrate: record({ hbaFence: 'migrate:1' }) });
     h.hba = { count: '4', owner: 'migrate:1' };
-    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres', 'smdb')).toContain('it belongs to a migration (started 1970-01-01 00:00 UTC), which lifts it when it ends');
+    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres')).toContain('it belongs to a migration (started 1970-01-01 00:00 UTC), which lifts it when it ends');
   });
   it("O41 with no record, the narrowing's refusal says that migration is no longer open", async () => {
     h.hba = { count: '4', owner: 'migrate:1' };
-    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres', 'smdb')).toContain('it belongs to a migration (started 1970-01-01 00:00 UTC) that is no longer open, so no lane lifts it; a restore takes it over and lifts it, or remove the lines by hand if nothing should hold them');
+    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres')).toContain('it belongs to a migration (started 1970-01-01 00:00 UTC) that is no longer open, so no lane lifts it; a restore takes it over and lifts it, or remove the lines by hand if nothing should hold them');
   });
 });
 

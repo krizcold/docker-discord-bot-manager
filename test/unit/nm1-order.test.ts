@@ -83,6 +83,11 @@ vi.mock('../../src/docker/containerManager', () => ({
   },
 }));
 
+// NM20 part 3: the maintenance check provisions through fleetReplication; this file's docker is not faked.
+vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
+  provisionManagedRoles: async () => ({ ok: true, wrote: [] }),
+}));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
   readWriteFence: async () => ({ ok: true, on: false }),
@@ -241,7 +246,7 @@ describe('order Maintenance, kind database', () => {
   it('M9 dbm_admin missing and cannot be created', async () => {
     h.ensure = { ok: false, cls: 'refused-login', error: 'FATAL:  role "smdb" is not permitted to log in' };
     const r = await order('maintenance');
-    expect(r.text).toBe(F_M_DB("the manager's database role dbm_admin could not be created (FATAL:  role \"smdb\" is not permitted to log in)"));
+    expect(r.text).toBe(F_M_DB("the manager's database role dbm_admin could not be confirmed (FATAL:  role \"smdb\" is not permitted to log in)"));
     expect(r.settled).toBe(false);
   });
   it('M10 database in recovery', async () => {
@@ -342,10 +347,11 @@ describe('order Maintenance, kind database', () => {
     const a = await orderMaintenance('b1', 'maintenance', '', () => {});
     expect(a).toEqual({ accepted: false, status: 409, error: 'A Delete of this instance did not finish, so its containers, image or compose may already be gone; a state change is refused until Delete is run again' });
   });
+  // NM20 S11: the refusal lists every role name the manager uses.
   it('M30 the bot role name is refused: R14', async () => {
     h.inst.fleetDb.user = 'Bad';
     const a = await orderMaintenance('b1', 'maintenance', '', () => {});
-    expect(a).toEqual({ accepted: false, status: 409, error: "The app's database role name Bad cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin and replicator); nothing was changed" });
+    expect(a).toEqual({ accepted: false, status: 409, error: "The app's database role name Bad cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin, dbm_meta, dbm_work, replicator, smdb_receive and smdb_receive_meta); nothing was changed" });
   });
 });
 

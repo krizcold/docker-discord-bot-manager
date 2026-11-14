@@ -15,8 +15,8 @@ vi.mock('child_process', async (importOriginal) => ({
 }));
 
 import {
-  asManager, ensureManagerDbRole, readBotLogin, blockBotLogin, endBotSessions, resetManagerRoleCache, forgetManagerRole,
-  psqlFailureClass, parseBotLogin, isMissingManagerRole, withRole, sidecarRunning,
+  ensureManagerDbRole, readBotLogin, blockBotLogin, endBotSessions, resetManagerRoleCache, forgetManagerRole,
+  psqlFailureClass, parseBotLogin, isMissingManagerRole, sidecarRunning,
 } from '../../src/instance/dbLogin';
 
 const t = { container: 'b1-fleet-postgres', user: 'smdb' };
@@ -44,8 +44,11 @@ describe('parsing and classes', () => {
     expect(isMissingManagerRole('ERROR: something else')).toBe(false);
     expect(isMissingManagerRole(MISSING)).toBe(true);
   });
-  it('withRole swaps the manager role only', () => {
-    expect(withRole(['-U', 'dbm_admin', 'x'], 'smdb')).toEqual(['-U', 'smdb', 'x']);
+  // NM20 3.3, R3.3: withRole is gone; every manager read names dbm_admin, never the bot role.
+  it('a read logs in as dbm_admin only', async () => {
+    dk.answer = () => ({ stdout: 'false|false|0\n' });
+    await readBotLogin(t);
+    expect(dk.calls.map(c => roleOf(c))).toEqual(['dbm_admin']);
   });
 });
 
@@ -93,23 +96,23 @@ describe('the cached role', () => {
     await ensureManagerDbRole(t);
     expect(dk.calls.length).toBe(1);
   });
-  it('asManager drops the cache when its own run reports the role missing', async () => {
+  // NM20 3.3, R3.3: asManager is gone; these two rows drive the check-only form through readBotLogin.
+  it('a read that reports the role missing drops the cache, and the next ensure checks again', async () => {
     dk.answer = () => ({ stdout: 'true\n' });
     await ensureManagerDbRole(t);
+    dk.answer = () => ({ err: 'x', stderr: MISSING });
     dk.calls = [];
-    const runs: string[] = [];
-    let n = 0;
-    const r = await asManager(t, async role => { runs.push(role); return n++ === 0 ? 'gone' : 'fine'; }, x => x === 'gone');
-    expect(r).toBe('fine');
+    expect(await readBotLogin(t)).toMatchObject({ ok: false, cls: 'missing-role' });
+    expect(dk.calls.map(c => roleOf(c))).toEqual(['dbm_admin']);
+    dk.answer = () => ({ stdout: 'true\n' });
+    dk.calls = [];
+    await ensureManagerDbRole(t);
     expect(dk.calls.length).toBe(1);
-    expect(runs).toEqual(['dbm_admin', 'dbm_admin']);
   });
-  it('asManager returns the first answer when the role cannot be made for a reason other than recovery', async () => {
-    dk.answer = () => ({ stdout: 'false\n' });
-    const runs: string[] = [];
-    const r = await asManager(t, async role => { runs.push(role); return 'gone'; }, x => x === 'gone');
-    expect(r).toBe('gone');
-    expect(runs).toEqual(['dbm_admin']);
+  it('a read whose role is missing answers its first failure, with no check and no second login', async () => {
+    dk.answer = () => ({ err: 'x', stderr: MISSING });
+    expect(await readBotLogin(t)).toMatchObject({ ok: false, cls: 'missing-role' });
+    expect(dk.calls.map(c => roleOf(c))).toEqual(['dbm_admin']);
   });
   it('a successful read runs once, with no role check', async () => {
     dk.answer = () => ({ stdout: 'false|false|0\n' });
@@ -129,33 +132,36 @@ describe('the cached role', () => {
   });
 });
 
-describe('the live copy warning', () => {
-  const copy = () => {
+// NM20 3.3: ensureManagerDbRole checks only, so a copy without dbm_admin is never read as the bot role and nothing is logged.
+describe('a live copy without dbm_admin', () => {
+  const copy = async () => {
     dk.answer = args => (roleOf({ args }) === 'dbm_admin' ? { err: 'x', stderr: MISSING } : args[args.length - 1].startsWith('CREATE') ? { err: 'x', stderr: READ_ONLY } : { stdout: 'true|true|0\n' });
-    return readBotLogin(t);
+    const r = await readBotLogin(t);
+    expect(r).toMatchObject({ ok: false, cls: 'missing-role' });
+    expect(dk.calls.every(c => roleOf(c) === 'dbm_admin')).toBe(true);
   };
   const warns = () => vi.spyOn(console, 'warn').mockImplementation(() => {});
-  it('is logged again after resetManagerRoleCache', async () => {
+  it('is not read as the bot role, also after resetManagerRoleCache', async () => {
     const w = warns();
     await copy();
     resetManagerRoleCache();
     await copy();
-    expect(w).toHaveBeenCalledTimes(2);
+    expect(w).not.toHaveBeenCalled();
   });
-  it('is logged again after forgetManagerRole', async () => {
+  it('is not read as the bot role, also after forgetManagerRole', async () => {
     const w = warns();
     await copy();
     forgetManagerRole(t.container);
     await copy();
-    expect(w).toHaveBeenCalledTimes(2);
+    expect(w).not.toHaveBeenCalled();
   });
-  it('is logged again after a login as the manager role worked', async () => {
+  it('is not read as the bot role, also after a login as the manager role worked', async () => {
     const w = warns();
     await copy();
     dk.answer = () => ({ stdout: 'false|true|0\n' });
-    await readBotLogin(t);
+    expect(await readBotLogin(t)).toMatchObject({ ok: true });
     await copy();
-    expect(w).toHaveBeenCalledTimes(2);
+    expect(w).not.toHaveBeenCalled();
   });
 });
 

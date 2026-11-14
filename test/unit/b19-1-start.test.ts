@@ -41,7 +41,7 @@ vi.mock('child_process', async (importOriginal) => {
     }, 2);
     return child;
   };
-  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence(execFile as any), execFileSync, execSync: () => '', spawn };
+  const mod = { ...real, exec, execFile: (await import('./fence-fake')).withFence((await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any) as any), execFileSync, execSync: () => '', spawn };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({

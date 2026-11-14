@@ -87,7 +87,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 3);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any, /pg_authid/);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/docker/containerManager')>();
@@ -160,8 +161,8 @@ const CJ_ABSENT = "the managed database's password is not on record (a join code
 const CJ_LOST = "the managed database's password on record no longer decrypts";
 const PE_ABSENT = (d: string) => `the bot's database password is not on record (${d})`;
 const PE_LOST = "the bot's database password on record no longer decrypts";
-const EN_ABSENT = (d: string) => `The managed database's password is not on record (${d}), so Enable cannot write its address into the Database URL; nothing was changed`;
-const EN_LOST = "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Enable cannot write its address into the Database URL; nothing was changed";
+const EN_ABSENT = (d: string) => `The managed database's password is not on record (${d}), so Enable cannot write its address into the Database URL; replication was not set up`;
+const EN_LOST = "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Enable cannot write its address into the Database URL; replication was not set up";
 const DS_ABSENT = (d: string) => `The managed database's password is not on record (${d}), so Disable cannot set the Database URL back; nothing was disabled`;
 const DS_LOST = "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Disable cannot set the Database URL back; nothing was disabled";
 const VR_ROLE = 'the role smdb does not exist in the database';

@@ -132,11 +132,11 @@ describe('L5 f: Receive', () => {
   });
   it('a join code that does not decode', async () => {
     tmp.join = { success: true, joinCode: 'smdbjoin1.notacode' };
-    expect((await receive('a')).text).toBe(`The move code could not be made (the join code did not decode); the dump ${DUMP} was kept and nothing else was changed`);
+    expect((await receive('a')).text).toBe(`The move code could not be made (the join code did not decode); the dump ${DUMP} was kept; receiving was not started`);
   });
   it('the join code not read, with no error given', async () => {
     tmp.join = { success: false };
-    expect((await receive('a')).text).toBe(`The move code could not be made (the join code did not decode); the dump ${DUMP} was kept and nothing else was changed`);
+    expect((await receive('a')).text).toBe(`The move code could not be made (the join code did not decode); the dump ${DUMP} was kept; receiving was not started`);
   });
   it('Receive again on a mark without priorIds: the new mark lists only the earlier id', async () => {
     off({ fleetDb: { ...(mainFixture().fleetDb as object), receive: { startedAt: '2026-10-30T00:00:00.000Z', expiresAt: '2099-01-01T00:00:00.000Z', safetyDump: DUMP, pushId: 'p1', dbOid: '16384' } } });

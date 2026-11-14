@@ -67,7 +67,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
@@ -205,9 +206,10 @@ describe('the main\'s status and slot drop know the address list', () => {
     ]);
   });
 
-  it('dropFleetSlot deletes that slot\'s rows in the same statement', async () => {
+  it('dropFleetSlot deletes that slot\'s rows as dbm_meta after the drop (NM20 R3.3 split)', async () => {
     expect(await dropFleetSlot(bot(), 'fleet_standby_abc')).toEqual({ success: true });
-    const drop = h.sql[stmtIndex("pg_drop_replication_slot('fleet_standby_abc')")];
+    const drop = h.sql[stmtIndex("pg_drop_replication_slot('fleet_standby_abc')") + 1];
+    expect(drop).toContain('-U dbm_meta -d smdb');
     expect(drop).toContain("EXECUTE format('DELETE FROM smdb_manager.addresses WHERE slot = %L', 'fleet_standby_abc')");
   });
 });

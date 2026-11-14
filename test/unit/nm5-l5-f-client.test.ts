@@ -38,15 +38,20 @@ import * as path from 'path';
 import { encodeMoveCode } from '../../src/config/joinCode';
 import { MOVE_TIMING, push, pushMain } from '../../src/instance/fleetMove';
 import { GEN_READ_SQL } from '../../src/instance/switchSql';
+import { MANAGER_SESSION_OPTIONS } from '../../src/instance/dbLogin';
+import { hostBotDirFor } from '../../src/docker/containerManager';
 import { releaseFleetBackupBusy } from '../../src/instance/fleetBackupGuards';
 import { fake, fakeJoin, freshDb, h, mainFixture, resetHarness, writeRegistry } from './switch-harness';
 
 const FILE = 'pre-push-2026-10-28T12-00-00-000Z.dump';
 const SUM = 'checksum|"public"."t"|0123456789abcdef0123456789abcdef';
 const PUSH_ID = '0123456789abcdef01234567';
-const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
-const DSN = (db: string) => `postgresql://smdb_receive@win.example:5440/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
-const HEAD = (name: string, input: boolean) => ['run', '--rm', ...(input ? ['-i'] : []), '--name', `a-fleet-move-${name}`, '-e', 'PGPASSWORD', '-v', '/host/probe.crt:/primary-ca.crt:ro', '--entrypoint', 'sh', 'postgres:16-alpine', '-c'];
+const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
+const DSN = (db: string, user = 'smdb_receive') => `postgresql://${user}@win.example:5440/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+// NM20 R3.6, U2, S2: every client carries the session pins; the push mounts the restore list too.
+const HEAD = (name: string, input: boolean, mounts: string[] = []) => ['run', '--rm', ...(input ? ['-i'] : []), '--name', `a-fleet-move-${name}`, '-e', 'PGPASSWORD', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`,
+  '-v', '/host/probe.crt:/primary-ca.crt:ro', ...mounts.flatMap(m => ['-v', m]), '--entrypoint', 'sh', 'postgres:16-alpine', '-c'];
+const STEPS = ['probe', 'create', 'meta', 'push', 'counts', 'sums', 'cap', 'commit', 'last', 'last-meta'];
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 
 type Step = 'probe' | 'push' | 'counts' | 'sums' | 'commit';
@@ -92,19 +97,22 @@ describe('L5 f: the receiver client', () => {
   it('the probe and the push: their argv, the password in the env only, the dump on stdin, one docker rm -f each under 30 s', async () => {
     const r = await push('a', CODE);
     expect(r.success).toBe(true);
+    // NM20 R3.6: the probe runs as smdb_receive_meta, the pg_restore as smdb_receive with the bot role's name.
     const probe = runs('probe')[0].args;
-    expect(probe.slice(0, 12)).toEqual(HEAD('probe', false));
-    expect(probe.slice(13)).toEqual(['sh', DSN('postgres'), DSN('app'), GEN_READ_SQL, `SELECT count(*) FROM smdb_manager.received WHERE push_id = '${PUSH_ID}'`]);
+    expect(probe.slice(0, 14)).toEqual(HEAD('probe', false));
+    expect(probe.slice(15)).toEqual(['sh', DSN('postgres', 'smdb_receive_meta'), DSN('app', 'smdb_receive_meta'), GEN_READ_SQL, `SELECT count(*) FROM smdb_manager.received WHERE push_id = '${PUSH_ID}'`]);
     const pushed = runs('push')[0].args;
-    expect(pushed.slice(0, 13)).toEqual(HEAD('push', true));
-    expect(pushed.slice(14)).toEqual(['sh', DSN('postgres'), DSN('app')]);
-    expect(seen.find(s => s.step === 'probe')!.env.PGPASSWORD).toBe('recvpw');
+    const list = `${hostBotDirFor('a')}/fleet-join/push-restore.list:/tmp/smdb-restore.list:ro`;
+    expect(pushed.slice(0, 17)).toEqual(HEAD('push', true, [list]));
+    expect(pushed.slice(18)).toEqual(['sh', DSN('app'), 'app']);
+    expect(seen.find(s => s.step === 'probe')!.env.PGPASSWORD).toBe('metapw');
+    expect(seen.find(s => s.step === 'push')!.env.PGPASSWORD).toBe('recvpw');
     expect(seen.find(s => s.step === 'push')!.input).toBe('PGDMP');
     expect(seen.find(s => s.step === 'probe')!.input).toBe('');
-    for (const name of ['probe', 'push', 'counts', 'sums', 'commit']) {
+    for (const name of STEPS) {
       expect(removals(name), name).toEqual([{ cmd: 'docker', args: ['rm', '-f', `a-fleet-move-${name}`] }]);
     }
-    expect(tmp.rmTimers).toEqual([30_000, 30_000, 30_000, 30_000, 30_000]);
+    expect(tmp.rmTimers).toEqual(STEPS.map(() => 30_000));
   });
   it('a probe with no answer in time: a second docker rm -f under 30 s', async () => {
     MOVE_TIMING.clientMs = 30;

@@ -46,7 +46,7 @@ vi.mock('child_process', async (importOriginal) => {
     } else done(null, { stdout: '', stderr: '' });
   };
   const execFileSync = (_f: string, args: string[]) => (h.deleting ? deleteAnswer(args) : '');
-  const mod = { ...real, exec, execFile, execFileSync, execSync: () => '' };
+  const mod = { ...real, exec, execFile: (await import('./roles-fake')).rolesExecFile(execFile as any), execFileSync, execSync: () => '' };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
@@ -86,7 +86,7 @@ import * as fleetBackup from '../../src/instance/fleetBackup';
 import { logCollectors } from '../../src/build/logCollector';
 
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' };
-const NO_ANSWER = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the manager's own database role is created at its first login instead";
+const NO_ANSWER = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the maintenance check sets up the database's roles at its next pass";
 const ensure = () => (dbLogin as any).ensureManagerDbRole;
 
 const record = (over: Record<string, unknown> = {}) => ({

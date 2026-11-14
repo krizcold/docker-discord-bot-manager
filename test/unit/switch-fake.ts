@@ -294,10 +294,25 @@ export function answerSql(container: string, dbName: string, sql: string): Answe
     if (f) return f;
     return ok(`${d.replayTs}|${d.receiveLsn}|${d.replayLsn}\n`);
   }
+  if (sql.includes('UPDATE smdb_data.shard_claims')) {
+    const f = failing('cap');
+    if (f) return f;
+    return ok();
+  }
+  if (sql.includes("SELECT coalesce((SELECT 'addr|'") && !sql.includes('pg_replication_slots')) {
+    const f = failing('address-read');
+    if (f) return f;
+    if (!d.tables) return err(NO_TABLE('addresses'));
+    const slot = /WHERE slot = '([^']*)'/.exec(sql)![1];
+    const a = d.addresses.find(x => x.slot === slot);
+    return ok(`${a ? `addr|${a.host}|${a.port}|${a.machine}|${a.cert.replace(/\n/g, '~')}` : 'addr|'}\n`);
+  }
   if (sql.includes('FROM pg_replication_slots s LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid WHERE s.slot_name')) {
     d.onSlotRead?.();
     const f = failing('slot-read');
     if (f) return f;
+    // 'slot-read-empty': the read exits 0 with no output.
+    if (d.fail['slot-read-empty'] !== undefined) return ok('');
     const slot = /s\.slot_name = '([^']*)'/.exec(sql)![1];
     const s = d.slots[slot];
     out.push(s ? `${s.active}|${s.state}|${s.replay}` : 'absent');
@@ -315,21 +330,40 @@ export function answerSql(container: string, dbName: string, sql: string): Answe
     return ok(Object.entries(d.slots).map(([slot, s]) => `${slot}|${s.active && s.state === 'streaming'}|${d.addresses.find(a => a.slot === slot)?.machine ?? slot}`).join('\n') + '\n');
   }
   if (sql.includes('pg_control_system()')) return ok(`${d.systemId}\n`);
+  if (sql.includes('IS_TEMPLATE false') && !sql.includes('smdb_receive')) {
+    emit('db-reset');
+    return failing('db-reset') ?? ok();
+  }
+  const cleanOf = /^REASSIGN OWNED BY (smdb_receive(?:_meta)?) TO /.exec(sql);
+  if (cleanOf) {
+    emit(`receive-clean:${cleanOf[1]}`);
+    const f = failing('receive-clean') ?? failing(`receive-clean:${cleanOf[1]}`);
+    if (f) return f;
+    return d.botDbMissing ? err(`psql: error: FATAL:  database "${dbName}" does not exist`) : ok();
+  }
+  const receiveRoles = () => (['smdb_receive', 'smdb_receive_meta'] as const).filter(l => d.roles[l]);
+  if (sql.includes('LOGIN PASSWORD NULL') && sql.includes('smdb_receive')) {
+    const step = sql.includes('NOLOGIN PASSWORD NULL') ? 'receive-close' : 'receive-reset';
+    emit(step);
+    const f = failing(step);
+    if (f) return f;
+    for (const l of receiveRoles()) d.roles[l] = { ...d.roles[l], password: '', canLogin: step === 'receive-reset' };
+    return ok(step === 'receive-reset' ? `receive|${receiveRoles().join(',')}|${!d.botDbMissing}\n` : '');
+  }
   if (sql.includes('smdb_receive')) {
     const step = sql.includes('ALTER ROLE smdb_receive NOLOGIN') ? 'receive-nologin' : sql.includes('pg_terminate_backend') ? 'receive-end' : sql.includes('DROP ROLE') ? 'receive-drop' : 'receive-role';
     emit(step);
     const f = failing(step) ?? failing('role');
     if (f) return f;
-    if (step === 'receive-nologin') { if (d.roles.smdb_receive) d.roles.smdb_receive.canLogin = false; return ok(); }
+    if (step === 'receive-nologin') { for (const l of receiveRoles()) d.roles[l].canLogin = false; return ok(); }
     if (step === 'receive-end') {
       const open = d.sessions.smdb_receive ?? 0;
       const ended = d.pinnedSessions.smdb_receive ? 0 : open;
       d.sessions.smdb_receive = open - ended;
       return ok(`${ended}\n${d.sessions.smdb_receive}\n`);
     }
-    if (step === 'receive-drop') { delete d.roles.smdb_receive; return ok(); }
-    const m = /PASSWORD '([^']*)' VALID UNTIL '([^']*)'/.exec(sql)!;
-    d.roles.smdb_receive = { password: m[1], until: m[2], canLogin: true };
+    if (step === 'receive-drop') { delete d.roles.smdb_receive; delete d.roles.smdb_receive_meta; return ok(); }
+    for (const m of sql.matchAll(/ROLE (smdb_receive(?:_meta)?) [^;]*PASSWORD '([^']*)' VALID UNTIL '([^']*)'/g)) d.roles[m[1]] = { password: m[2], until: m[3], canLogin: true };
     return ok();
   }
   if (sql.startsWith("SELECT 'checksum|'")) {

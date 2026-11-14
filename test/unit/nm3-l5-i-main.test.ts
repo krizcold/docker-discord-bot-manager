@@ -68,7 +68,8 @@ vi.mock('child_process', async (importOriginal) => {
     }, 5);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
@@ -139,7 +140,7 @@ describe('Enable: the address script', () => {
   });
 
   it('with nothing moved the grants lead straight to the insert', () => {
-    expect(addressTableSql('main.invalid', 15432, 'pem', 'main.invalid', null)).toContain('ON smdb_manager.addresses TO replicator;\nINSERT INTO smdb_manager.addresses');
+    expect(addressTableSql('main.invalid', 15432, 'pem', 'main.invalid', null)).toContain('ON smdb_manager.addresses TO replicator;\nGRANT SELECT ON smdb_manager.addresses TO dbm_work;\nINSERT INTO smdb_manager.addresses');
   });
 });
 

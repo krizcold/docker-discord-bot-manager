@@ -14,8 +14,9 @@ vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
-import { ensureManagerDbRole, readRoleVerifier } from '../../src/instance/dbLogin';
+import { MANAGER_DB_ROLE, readRoleVerifier } from '../../src/instance/dbLogin';
 import { scramSha256Verifier, verifierAccepts } from '../../src/config/secretText';
+import { provisionedCluster } from './pg-cluster';
 
 const dockerRuns = (() => {
   try {
@@ -30,13 +31,12 @@ const ID = `nm14pg${process.pid}`;
 const MAIN = `${ID}-main`;
 const VOL = `${ID}-main-data`;
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 600000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
 const ok = (sql: string) => {
-  const r = run(['exec', '-i', MAIN, 'psql', '-X', '-U', 'smdb', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
+  const r = run(['exec', '-i', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
   expect(r.status, r.err).toBe(0);
   return r.out;
 };
@@ -46,16 +46,7 @@ const tcpLogin = (user: string, password: string) =>
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM14 role verifiers against a real Postgres 16 (Linux with docker)', () => {
   beforeAll(async () => {
-    const r = run(['run', '-d', '--name', MAIN, '-v', `${VOL}:/var/lib/postgresql/data`,
-      '-e', 'POSTGRES_USER=smdb', '-e', 'POSTGRES_PASSWORD=app-pw', '-e', 'POSTGRES_DB=smdb', 'postgres:16-alpine']);
-    expect(r.status, r.err).toBe(0);
-    let ready = false;
-    for (let i = 0; i < 240 && !ready; i++) {
-      ready = run(['exec', MAIN, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0;
-      if (!ready) pause(500);
-    }
-    expect(ready).toBe(true);
-    expect(await ensureManagerDbRole({ container: MAIN, user: 'smdb' })).toEqual({ ok: true });
+    await provisionedCluster({ name: MAIN, user: 'smdb', db: 'smdb', password: 'app-pw' });
   }, 300000);
 
   afterAll(() => {
@@ -64,7 +55,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM14 role verifier
     fs.rmSync(h.dir, { recursive: true, force: true });
   }, 120000);
 
-  it('PG0 the bootstrap role: its POSTGRES_PASSWORD is accepted', async () => {
+  it('PG0 (NM20 3.1) the bot role provisionRoles made with the recorded password, which is also POSTGRES_PASSWORD: that password is accepted', async () => {
     const read = await readRoleVerifier({ container: MAIN, user: 'smdb' });
     expect(read.ok).toBe(true);
     if (!read.ok) return;

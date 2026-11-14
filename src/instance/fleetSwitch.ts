@@ -105,10 +105,35 @@ export function runGuarded(cmd: string, args: string[], opts: { input?: string; 
 
 type Target = { container: string; user: string };
 
-/** A psql script on stdin as the manager's role (the bot role on a copy that lacks it yet). */
-export function adminSql(t: Target, db: string, sql: string, timeoutMs = SWITCH_TIMING.readMs): Promise<Guarded> {
-  const args = ['exec', '-i', t.container, 'psql', '-U', MANAGER_DB_ROLE, '-d', db, '-tAq', '-v', 'ON_ERROR_STOP=1'];
-  return dbLogin.asManager(t, role => runGuarded('docker', dbLogin.withRole(args, role), { input: sql, timeoutMs }), r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
+/** One of dbLogin's psql calls as a quiet script on stdin; a failed plain login drops the container from the confirmed set. */
+async function loginSql(t: Target, call: dbLogin.PsqlCall, timeoutMs: number): Promise<Guarded> {
+  const r = await runGuarded('docker', [...call.args, '-q'], { input: call.input, timeoutMs });
+  if (!r.ok && call.login !== MANAGER_DB_ROLE) dbLogin.noteLoginFault(t.container);
+  return r;
+}
+
+/** As dbm_admin on postgres: roles, slots, settings, recovery, and the cluster's receive mark and restore record (S1). */
+export function clusterSql(t: Target, sql: string, timeoutMs = SWITCH_TIMING.readMs): Promise<Guarded> {
+  return loginSql(t, dbLogin.clusterPsql(t.container, sql, { stdin: true }), timeoutMs);
+}
+
+/** As dbm_meta in the bot's database: smdb_manager. */
+export function metaSql(t: Target, db: string, sql: string, timeoutMs = SWITCH_TIMING.readMs): Promise<Guarded> {
+  return loginSql(t, dbLogin.metaPsql(t.container, db, sql, { stdin: true }), timeoutMs);
+}
+
+/** As dbm_work in the bot's database: the bot's own objects. */
+export function workSql(t: Target, db: string, sql: string, timeoutMs = SWITCH_TIMING.readMs): Promise<Guarded> {
+  return loginSql(t, dbLogin.workPsql(t.container, db, sql, { stdin: true }), timeoutMs);
+}
+
+const RLS_REFUSAL_RE = /query would be affected by row-level security policy for table "([^"]+)"/;
+
+/** TK-RLS when psql's stderr, on any line, holds Postgres's row-security refusal; null otherwise. */
+export function rowSecurityRefusal(stderr: string, copy: { container: string; db: string; user: string }): string | null {
+  const table = RLS_REFUSAL_RE.exec(stderr)?.[1];
+  if (!table) return null;
+  return `The copy is promoted, but its shard claims could not be capped: row-level security is forced on smdb_data.${table}, so Take over fails the same way until it is lifted. The generation was not raised, so bots may not choose this copy over the old main, and the bot's login to it stays blocked. The manager has no SQL console; on this machine, run docker exec -it ${copy.container} psql -U dbm_work -d ${copy.db} -c 'SET ROLE "${copy.user}"; ALTER TABLE smdb_data.${table} NO FORCE ROW LEVEL SECURITY'. Then press Take over again.`;
 }
 
 const failText = (r: Guarded) => r.error || errorOf(r.stderr);
@@ -135,14 +160,14 @@ async function hbaProof(t: Target, db: string, want: boolean): Promise<boolean> 
 async function hbaScript(t: Target, script: string): Promise<string | null> {
   const run = await runGuarded('docker', ['exec', '-u', 'root', t.container, 'sh', '-c', script], { timeoutMs: SWITCH_TIMING.readMs });
   if (!run.ok) return failText(run);
-  const reload = await adminSql(t, 'postgres', 'SELECT pg_reload_conf();');
+  const reload = await clusterSql(t, 'SELECT pg_reload_conf();');
   return reload.ok ? null : failText(reload);
 }
 
 /** T-e2 (D35): the bot role refused over TCP on the copy, proven, and its sessions ended; null when in force. */
 async function blockBotOnCopy(t: Target, db: string): Promise<string | null> {
   if (!TAKEOVER_ROLE_RE.test(t.user)) return `the bot's role name ${t.user} is not a plain identifier`;
-  const file = await adminSql(t, 'postgres', "SELECT current_setting('hba_file');");
+  const file = await clusterSql(t, "SELECT current_setting('hba_file');");
   if (!file.ok) return failText(file);
   const hbaFile = lastLine(file.stdout);
   if (hbaFile !== fleetBackup.FENCE_HBA_FILE) return `the database reads its pg_hba from ${hbaFile || 'an unnamed file'}, not ${fleetBackup.FENCE_HBA_FILE}`;
@@ -153,7 +178,7 @@ async function blockBotOnCopy(t: Target, db: string): Promise<string | null> {
   if (!login.ok) return login.error;
   if (login.login.canLogin === true) {
     // A login that began before the reload can still finish within authentication_timeout.
-    const timeout = await adminSql(t, 'postgres', "SELECT setting FROM pg_settings WHERE name = 'authentication_timeout';");
+    const timeout = await clusterSql(t, "SELECT setting FROM pg_settings WHERE name = 'authentication_timeout';");
     const seconds = timeout.ok ? Number(lastLine(timeout.stdout)) : NaN;
     if (!Number.isFinite(seconds)) return `authentication_timeout could not be read (${timeout.ok ? lastLine(timeout.stdout) : failText(timeout)})`;
     await pause(seconds * 1000);
@@ -172,7 +197,7 @@ async function liftBotBlock(t: Target, db: string): Promise<string | null> {
 
 /** The generation row; null when absent. */
 export async function readGeneration(t: Target, db: string): Promise<{ ok: true; row: GenRow | null } | { ok: false; error: string }> {
-  const r = await adminSql(t, db, GEN_READ_SQL);
+  const r = await metaSql(t, db, GEN_READ_SQL);
   if (!r.ok) return missingTable(r.stderr) ? { ok: true, row: null } : { ok: false, error: failText(r) };
   const row = parseGenRow(r.stdout);
   return row === undefined ? { ok: false, error: `the generation read answered '${lastLine(r.stdout)}'` } : { ok: true, row };
@@ -180,7 +205,7 @@ export async function readGeneration(t: Target, db: string): Promise<{ ok: true;
 
 /** The restore record in the cluster's postgres database; null when absent. */
 export async function readRestoreState(t: Target): Promise<{ ok: true; state: RestoreState | null } | { ok: false; error: string }> {
-  const r = await adminSql(t, 'postgres', RESTORE_STATE_READ);
+  const r = await clusterSql(t, RESTORE_STATE_READ);
   if (!r.ok) return missingTable(r.stderr) ? { ok: true, state: null } : { ok: false, error: failText(r) };
   const state = parseRestoreState(r.stdout);
   return state === undefined ? { ok: false, error: `the restore record answered '${lastLine(r.stdout)}'` } : { ok: true, state };
@@ -208,7 +233,7 @@ export async function ensureMainGeneration(botId: string): Promise<void> {
   const t = { container: db.containerName, user: db.user };
   const read = await readGeneration(t, db.db);
   if (read.ok && read.row) return;
-  const r = await adminSql(t, db.db, ensureGenerationSql(machineNameOf(inst)));
+  const r = await metaSql(t, db.db, ensureGenerationSql(machineNameOf(inst)));
   const error = r.ok ? '' : failText(r);
   if (ensureLogged.get(botId) !== error) {
     ensureLogged.set(botId, error);
@@ -530,7 +555,7 @@ async function replayProof(t: Target, db: string, slot: string | undefined, lsn:
   let last: SlotFacts | null = null;
   for (;;) {
     if (slot && SLOT_RE.test(slot)) {
-      const s = await adminSql(t, db, SLOT_READ(slot));
+      const s = await clusterSql(t, SLOT_READ(slot));
       const facts = s.ok ? parseSlot(lastLine(s.stdout)) : null;
       if (facts && facts !== 'absent') {
         last = facts;
@@ -550,7 +575,7 @@ async function replayProof(t: Target, db: string, slot: string | undefined, lsn:
 
 /** The hand-over row's delete and its WAL position; lsn null when the table is missing (nothing to replay). */
 async function deleteHandoverRow(t: Target, db: string): Promise<{ ok: true; lsn: bigint | null } | { ok: false; error: string }> {
-  const del = await adminSql(t, db, DELETE_ROW_SQL);
+  const del = await metaSql(t, db, DELETE_ROW_SQL);
   if (!del.ok) return missingTable(del.stderr) ? { ok: true, lsn: null } : { ok: false, error: failText(del) };
   const lsn = lsnToBigInt(lastLine(del.stdout));
   return lsn === null ? { ok: false, error: `the delete answered '${lastLine(del.stdout)}'` } : { ok: true, lsn };
@@ -593,13 +618,16 @@ async function handOverLocked(botId: string, slot: string, confirm: boolean, adm
   const proven = await provenMaintenance(botId, 'hand-over', confirm);
   if (proven) return proven;
 
-  const read = await adminSql(t, db.db, `${SLOT_READ(slot)}\n${ADDRESS_OF_SLOT(slot)}`);
-  if (!read.ok && !missingTable(read.stderr)) return refusal(`The manager could not read this database's copies (${failText(read)})${NOTHING}`);
-  const lines = read.stdout.trim().split('\n').map(l => l.trim()).filter(Boolean);
-  const slotFacts = parseSlot(lines[0] ?? '');
-  if (slotFacts === null) return refusal(`The manager could not read this database's copies (the slot read answered '${lines[0] ?? ''}')${NOTHING}`);
+  const slotRead = await clusterSql(t, SLOT_READ(slot));
+  if (!slotRead.ok) return refusal(`The manager could not read this database's copies (${failText(slotRead)})${NOTHING}`);
+  const addressRead = await metaSql(t, db.db, ADDRESS_OF_SLOT(slot));
+  if (!addressRead.ok && !missingTable(addressRead.stderr)) return refusal(`The manager could not read this database's copies (${failText(addressRead)})${NOTHING}`);
+  const firstLine = (text: string) => text.split('\n').map(l => l.trim()).find(Boolean) ?? '';
+  const slotLine = firstLine(slotRead.stdout);
+  const slotFacts = parseSlot(slotLine);
+  if (slotFacts === null) return refusal(`The manager could not read this database's copies (the slot read answered '${slotLine}')${NOTHING}`);
   if (slotFacts === 'absent') return refusal(`No copy uses the slot ${slot} any more; reload the Database window and pick a copy that is streaming${NOTHING}`);
-  const address = read.ok ? parseAddress(lines[1] ?? '') : null;
+  const address = addressRead.ok ? parseAddress(firstLine(addressRead.stdout)) : null;
   const machine = address ? machineText(address.machine) : slot;
   if (!slotFacts.active || slotFacts.state !== 'streaming') {
     return refusal(`The copy ${machine} is not streaming from this database now (${slotFacts.active ? slotFacts.state || 'no state' : 'not connected'}), so it cannot prove it holds every change; start it on its machine and try again${NOTHING}`);
@@ -640,7 +668,7 @@ async function handOverLocked(botId: string, slot: string, confirm: boolean, adm
     return refusal(failed ? `${text} Undoing it failed too (${failed}), so the hand-over stays recorded: press Hand over again, or Cancel the hand-over.` : text);
   };
 
-  const row = await adminSql(t, db.db, `BEGIN;
+  const row = await metaSql(t, db.db, `BEGIN;
 ${GENERATION_SCHEMA_SQL}
 DELETE FROM smdb_manager.handover;
 INSERT INTO smdb_manager.handover (slot, machine, generation) VALUES (${sqlLiteral(slot)}, ${sqlLiteral(machine)}, ${target});
@@ -670,7 +698,7 @@ SELECT pg_current_wal_lsn();`);
       const cause = `${login.login.sessions} session(s) of the bot's database role appeared during the hand-over`;
       return undo(`${cause}, ${AGAIN}`, cause, 'The login itself read blocked; this lane did not end those sessions.');
     }
-    const s = await adminSql(t, db.db, SLOT_READ(slot));
+    const s = await clusterSql(t, SLOT_READ(slot));
     const facts = s.ok ? parseSlot(lastLine(s.stdout)) : null;
     if (facts && facts !== 'absent') {
       last = facts;
@@ -759,7 +787,7 @@ export async function cancelMove(botId: string, confirm: boolean): Promise<LaneO
     // X16: a take-over from the row the copy kept writes this generation, so it ties with this database instead of beating it.
     const recorded = saveSwitch(botId, { switchNotice: { generation: g, machine: machineNameOf(inst), since: null, state: 'not-owed' } });
     if (recorded) console.error(`[Switch] ${inst.displayName}: the manager could not record that this cancel owes no switch notice (${recorded}); the bot may post one for generation ${g}`);
-    const raised = await adminSql(t, db.db, raiseSql(machineNameOf(inst), g));
+    const raised = await metaSql(t, db.db, raiseSql(machineNameOf(inst), g));
     if (!raised.ok) return refusal(`This database runs and the hand-over row is deleted here, but its generation could not be raised (${failText(raised)}), so the hand-over is still recorded and the bot's login stays blocked; try again.`);
     raisedTail = ` The copy ${machine} had not received the cancel, so this database now holds generation ${g}, the one a take-over there would write: if ${machine} takes over, each manager blocks the bot's login on its side once it finds the other, until you choose one.`;
   }
@@ -847,7 +875,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
   const rs = await readRestoreState(t);
   const restore = rs.ok ? rs.state : null;
   const restoreClause = restore?.pending ? `: the main was restoring the dump ${restore.file} (started ${whenText(restore.at)}) when this copy last received a change` : '';
-  const exists = await adminSql(t, 'postgres', `SELECT count(*) FROM pg_database WHERE datname = ${sqlLiteral(rec.db)};`);
+  const exists = await clusterSql(t, `SELECT count(*) FROM pg_database WHERE datname = ${sqlLiteral(rec.db)};`);
   if (!exists.ok) return refusal(`The copy's database did not answer (${failText(exists)}); start the instance and try again${NOTHING}`);
   if (lastLine(exists.stdout) === '0') return refusal(`The bot's database is missing on this copy (it replayed the drop of a restore), so there is nothing to take over${restoreClause}${NOTHING}`);
   const facts = await fleetJoin.readCopyFacts(rec);
@@ -858,7 +886,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
   if (inRecovery) {
     const deadline = Date.now() + SWITCH_TIMING.replayWaitMs;
     for (;;) {
-      const r = await adminSql(t, rec.db, TAKEOVER_FACTS_SQL);
+      const r = await clusterSql(t, TAKEOVER_FACTS_SQL);
       const [at, recv, replay] = r.ok ? lastLine(r.stdout).split('|') : ['', '', ''];
       lastAt = at || null;
       const a = lsnToBigInt(recv);
@@ -890,18 +918,18 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
   let unchecked = false;
   if (inRecovery || !intent) {
     const copyDown = (error: string) => refusal(`The copy's database did not answer (${error}); start the instance and try again${NOTHING}`);
-    const read = await adminSql(t, 'postgres', RECEIVE_MARK_READ_SQL);
+    const read = await clusterSql(t, RECEIVE_MARK_READ_SQL);
     if (!read.ok && !missingTable(read.stderr)) return copyDown(failText(read));
     const mark = read.ok ? parseReceiveMark(read.stdout) : null;
     if (mark === undefined) return copyDown(`the receive mark answered '${lastLine(read.stdout)}'`);
     let oidNow = '';
     let received = false;
     if (mark) {
-      const oid = await adminSql(t, 'postgres', DB_OID_SQL(rec.db));
+      const oid = await clusterSql(t, DB_OID_SQL(rec.db));
       if (!oid.ok) return copyDown(failText(oid));
       oidNow = oid.stdout.trim();
       if (oidNow !== mark.dbOid || mark.dbOid === '') {
-        const got = await adminSql(t, rec.db, RECEIVED_OF_SQL(mark.pushIds));
+        const got = await metaSql(t, rec.db, RECEIVED_OF_SQL(mark.pushIds));
         if (!got.ok && !missingTable(got.stderr)) return copyDown(failText(got));
         received = got.ok && got.stdout.trim() !== '';
       }
@@ -910,7 +938,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
     unchecked = v === 'unchecked';
     markWarn = v === 'untouched';
   }
-  const ho = await adminSql(t, rec.db, HANDOVER_READ_SQL);
+  const ho = await metaSql(t, rec.db, HANDOVER_READ_SQL);
   if (!ho.ok && !missingTable(ho.stderr)) return refusal(`The copy's database did not answer (${failText(ho)}); start the instance and try again${NOTHING}`);
   const [hSlot, hGen, hMachine] = ho.ok ? lastLine(ho.stdout).split('|') : [];
   const handover = hSlot && /^\d+$/.test(hGen || '') ? { slot: hSlot, generation: Number(hGen), machine: hMachine || hSlot } : null;
@@ -971,7 +999,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
   if (blocked) return refusal(`The copy was not promoted: the bot's login to it could not be blocked first (${blocked}), and a copy promoted with that login open could be taken for the main before its generation is raised. The copy still follows the main; press Take over again.`);
 
   if (inRecovery) {
-    const pr = await adminSql(t, rec.db, 'SELECT pg_promote(true, 60);', SWITCH_TIMING.promoteMs);
+    const pr = await clusterSql(t, 'SELECT pg_promote(true, 60);', SWITCH_TIMING.promoteMs);
     if (!pr.ok || lastLine(pr.stdout) !== 't') {
       const again = await fleetJoin.readCopyFacts(rec);
       if (!again.ok || again.facts.inRecovery) {
@@ -980,7 +1008,7 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
     }
   }
 
-  const othersRead = await adminSql(t, rec.db, COPIES_READ_SQL(rec.slot));
+  const othersRead = await metaSql(t, rec.db, COPIES_READ_SQL(rec.slot));
   const others: TakeoverTail['others'] = othersRead.ok ? { ok: true, names: copyNames(lastLineOrEmpty(othersRead.stdout)) } : { ok: false, error: failText(othersRead) };
   const oldRow = code ? `
 DO $$ BEGIN
@@ -998,7 +1026,14 @@ END $$;
 `;
   // D18, D19: over an unchecked mark the rows hold the pushing machine's live claims; a resume caps as the press that saved its intent did.
   const capShards = unchecked || (verdict.mode === 'resume' && intent?.unchecked === true);
-  const raised = await adminSql(t, rec.db, raiseSql(machineNameOf(inst), verdict.target, `${oldRow}${capShards ? SHARD_CAP_DO_SQL : ''}`));
+  if (capShards) {
+    const capped = await workSql(t, rec.db, SHARD_CAP_DO_SQL);
+    if (!capped.ok) {
+      return refusal(rowSecurityRefusal(capped.stderr, { container: rec.containerName, db: rec.db, user: rec.user })
+        ?? `The copy is promoted, but its generation could not be raised (${failText(capped)}), so bots may not choose it over the old main. Press Take over again to finish.`);
+    }
+  }
+  const raised = await metaSql(t, rec.db, raiseSql(machineNameOf(inst), verdict.target, oldRow));
   if (!raised.ok) return refusal(`The copy is promoted, but its generation could not be raised (${failText(raised)}), so bots may not choose it over the old main. Press Take over again to finish.`);
   const lifted = await liftBotBlock(t, rec.db);
   if (lifted) return refusal(`This machine's database is the main now (generation ${verdict.target}), but the bot's login to it is still blocked (${lifted}): the line the take-over put in its pg_hba.conf could not be removed. Press Take over again to finish.`);
@@ -1168,7 +1203,7 @@ export async function keepMain(botId: string): Promise<LaneOutcome> {
   let target = mine;
   if (mine <= peerGen) {
     target = peerGen + 1;
-    const raised = await adminSql(t, db.db, raiseSql(machineNameOf(inst), target));
+    const raised = await metaSql(t, db.db, raiseSql(machineNameOf(inst), target));
     if (!raised.ok) return refusal(`The generation could not be raised (${failText(raised)}); nothing was changed`);
   }
   const rec = maintenance.maintenanceOf(containerManager.getBot(botId) ?? inst);
@@ -1200,7 +1235,7 @@ let tickRunning = false;
 /** This main's own copies, as its address list holds them, for the peer check. */
 async function ownPeers(inst: InstanceConfig): Promise<Array<{ host: string; port: number; machine: string; cert: string }>> {
   const db = inst.fleetDb!;
-  const r = await adminSql({ container: db.containerName, user: db.user }, db.db,
+  const r = await metaSql({ container: db.containerName, user: db.user }, db.db,
     `SELECT 'addr|' || host || '|' || port || '|' || machine || '|' || replace(cert, E'\\n', '~') FROM smdb_manager.addresses WHERE slot IS NOT NULL ORDER BY host, port;`);
   if (!r.ok) return [];
   return r.stdout.split('\n').map(l => parseAddress(l.trim())).filter((a): a is NonNullable<ReturnType<typeof parseAddress>> => a !== null);
@@ -1348,7 +1383,7 @@ async function peerCheck(inst: InstanceConfig, now: number): Promise<void> {
   const own = await ownGeneration(t, db.db);
   if (!own.ok) return;
   const mine = own.row?.generation ?? 0;
-  const sys = await adminSql(t, db.db, 'SELECT system_identifier FROM pg_control_system();');
+  const sys = await clusterSql(t, 'SELECT system_identifier FROM pg_control_system();');
   const systemId = sys.ok ? lastLine(sys.stdout) : null;
   if (db.replacedBy) {
     await keepBlocked(inst, 'on a replaced main');
@@ -1358,7 +1393,7 @@ async function peerCheck(inst: InstanceConfig, now: number): Promise<void> {
   if (db.replication) {
     // D50: the copies list a take-over on any copy reads; not while a push may replace this database (D42).
     if (!db.receive && !db.pushBroken) {
-      const sync = await adminSql(t, db.db, COPIES_SYNC_SQL);
+      const sync = await metaSql(t, db.db, COPIES_SYNC_SQL);
       const error = sync.ok ? '' : failText(sync);
       if (syncLogged.get(inst.id) !== error) {
         syncLogged.set(inst.id, error);
@@ -1389,7 +1424,7 @@ async function formerCheck(inst: InstanceConfig, mine: number, systemId: string 
   if (!fm) return;
   const db = inst.fleetDb!;
   if (db.replication) {
-    const listed = await adminSql({ container: db.containerName, user: db.user }, db.db, FORMER_LISTED_SQL(fm.host, fm.port));
+    const listed = await metaSql({ container: db.containerName, user: db.user }, db.db, FORMER_LISTED_SQL(fm.host, fm.port));
     if (listed.ok && Number(lastLine(listed.stdout)) > 0) {
       if (!saveSwitch(inst.id, { formerMain: null })) console.log(`[Switch] ${inst.displayName}: the old main ${fm.machine} is a copy of this database now; the manager no longer checks it as a former main`);
       return;
@@ -1517,7 +1552,7 @@ async function clearRestorePending(inst: InstanceConfig): Promise<void> {
   if (!fence.ok || fence.on) return;
   const login = await dbLogin.readBotLogin(t);
   if (!login.ok || login.login.inRecovery) return;
-  const r = await adminSql(t, 'postgres', RESTORE_STATE_CLEAR);
+  const r = await clusterSql(t, RESTORE_STATE_CLEAR);
   if (!r.ok) console.warn(`[Switch] ${inst.displayName}: the restore record could not be marked finished (${failText(r)})`);
 }
 
@@ -1548,12 +1583,12 @@ const staleMarkRemoved = (name: string) => console.log(`[Switch] ${name}: remove
 
 /** Reads the cluster's receive mark and removes its row by its own mark id while `stale()` holds after the read. */
 async function removeStaleMark(t: Target, stale: () => boolean): Promise<{ ok: true; removed: boolean } | { ok: false; error: string }> {
-  const read = await adminSql(t, 'postgres', RECEIVE_MARK_READ_SQL);
+  const read = await clusterSql(t, RECEIVE_MARK_READ_SQL);
   if (!read.ok) return missingTable(read.stderr) ? { ok: true, removed: false } : { ok: false, error: failText(read) };
   const mark = parseReceiveMark(read.stdout);
   if (mark === undefined) return { ok: false, error: `the receive mark answered '${lastLine(read.stdout)}'` };
   if (!mark || !stale()) return { ok: true, removed: false };
-  const r = await adminSql(t, 'postgres', receiveMarkClearSql(mark.markId));
+  const r = await clusterSql(t, receiveMarkClearSql(mark.markId));
   if (!r.ok) return { ok: false, error: failText(r) };
   return { ok: true, removed: true };
 }
@@ -1774,7 +1809,7 @@ export async function generationView(inst: InstanceConfig): Promise<{ machine: s
 export async function streamingCopies(inst: InstanceConfig): Promise<Array<{ slot: string; machine: string; streaming: boolean }>> {
   const db = inst.fleetDb;
   if (!db?.replication || await dbLogin.sidecarRunning(db.containerName) !== true) return [];
-  const r = await adminSql({ container: db.containerName, user: db.user }, db.db,
+  const r = await metaSql({ container: db.containerName, user: db.user }, db.db,
     `SELECT s.slot_name || '|' || (s.active AND coalesce(r.state, '') = 'streaming')::text || '|' || coalesce((SELECT a.machine FROM smdb_manager.addresses a WHERE a.slot = s.slot_name), s.slot_name)
      FROM pg_replication_slots s LEFT JOIN pg_stat_replication r ON r.pid = s.active_pid WHERE s.slot_type = 'physical' ORDER BY s.slot_name;`);
   if (!r.ok) return [];

@@ -34,6 +34,7 @@ import { COUNTS_SQL, backupDir, compareCounts, parseCountLines } from '../../src
 import * as dbLogin from '../../src/instance/dbLogin';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import { writeDumpMeta } from './restore-fake';
+import { provisionedCluster } from './pg-cluster';
 
 const fb = fleetBackup as any;
 
@@ -60,13 +61,6 @@ const ok = (sql: string, db = 'postgres') => {
   const r = psql(sql, db);
   expect(r.status, r.err).toBe(0);
   return r.out;
-};
-const waitTcp = () => {
-  for (let i = 0; i < 180; i++) {
-    if (run(['exec', NAME, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0) return;
-    pause(500);
-  }
-  throw new Error(`${NAME} did not become ready`);
 };
 const countsOf = (db: string) => {
   const parsed = parseCountLines(`${ok(COUNTS_SQL, db)}\n`);
@@ -102,15 +96,13 @@ const bot = (id: string, db: string) => ({
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM4 the claim floor against a real Postgres 16 (Linux with docker)', () => {
   beforeAll(async () => {
-    const started = run(['run', '-d', '--name', NAME, '-e', `POSTGRES_USER=${USER}`, '-e', 'POSTGRES_PASSWORD=pw', '-e', `POSTGRES_DB=${USER}`, 'postgres:16-alpine']);
-    expect(started.status, started.err).toBe(0);
-    waitTcp();
-    expect(await dbLogin.ensureManagerDbRole({ container: NAME, user: USER })).toEqual({ ok: true });
+    await provisionedCluster({ name: NAME, user: USER, db: USER, password: 'pw' });
     ok(`ALTER ROLE ${USER} NOLOGIN`);
   }, 300000);
 
   afterAll(() => {
     run(['rm', '-f', '-v', NAME]);
+    run(['volume', 'rm', '-f', `${NAME}-data`]);
     fs.rmSync(h.dir, { recursive: true, force: true });
   }, 120000);
 
@@ -208,7 +200,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM4 the claim floo
     const before = countsOf('pg6');
     const r = await fleetBackup.restoreFleetBackup(id, 'v2.dump');
     expect(r.success).toBe(false);
-    expect(r.error).toBe("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused, and nothing was changed: smdb_data.guild_ownership has no claim column");
+    expect(r.error).toBe("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): smdb_data.guild_ownership has no claim column");
     expect(ok("SELECT oid FROM pg_database WHERE datname = 'pg6'")).toBe(oid);
     expect(compareCounts(before, countsOf('pg6')).ok).toBe(true);
     expect(ok('SHOW default_transaction_read_only')).toBe('off');

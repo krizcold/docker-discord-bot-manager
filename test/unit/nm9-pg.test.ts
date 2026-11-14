@@ -39,6 +39,7 @@ import { writeDumpMeta } from './restore-fake';
 import { addressTableSql } from '../../src/instance/fleetReplication';
 import * as fleetSwitch from '../../src/instance/fleetSwitch';
 import * as switchSql from '../../src/instance/switchSql';
+import { provisionedCluster } from './pg-cluster';
 
 const fb = fleetBackup as any;
 const CAP: string = (switchSql as any).SHARD_CAP_DO_SQL;
@@ -56,7 +57,6 @@ const NAME = `nm9-pg-${process.pid}`;
 const USER = 'app';
 const ADMIN = dbLogin.MANAGER_DB_ROLE;
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 300000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
@@ -66,13 +66,6 @@ const ok = (sql: string, db = 'postgres') => {
   const r = psql(sql, db);
   expect(r.status, r.err).toBe(0);
   return r.out;
-};
-const waitTcp = () => {
-  for (let i = 0; i < 180; i++) {
-    if (run(['exec', NAME, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0) return;
-    pause(500);
-  }
-  throw new Error(`${NAME} did not become ready`);
 };
 const countsOf = (db: string) => {
   const parsed = parseCountLines(`${ok(COUNTS_SQL, db)}\n`);
@@ -133,10 +126,7 @@ const KEPT = (db: string) => [ok(OTHER_COLUMNS, db), ok('SELECT * FROM smdb_data
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard claims against a real Postgres 16 (Linux with docker)', () => {
   beforeAll(async () => {
-    const started = run(['run', '-d', '--name', NAME, '-v', `${NAME}-data:/var/lib/postgresql/data`, '-e', `POSTGRES_USER=${USER}`, '-e', 'POSTGRES_PASSWORD=pw', '-e', `POSTGRES_DB=${USER}`, 'postgres:16-alpine']);
-    expect(started.status, started.err).toBe(0);
-    waitTcp();
-    expect(await dbLogin.ensureManagerDbRole({ container: NAME, user: USER })).toEqual({ ok: true });
+    await provisionedCluster({ name: NAME, user: USER, db: USER, password: 'pw' });
     ok(`ALTER ROLE ${USER} NOLOGIN`);
     ok(switchSql.replicationRoleEnsureSql('replicator'));
   }, 300000);
@@ -207,7 +197,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
     expect(seen).toEqual({ pg4v3: { shards: true, clock: true, shape: 'claims' }, pg4v2: { shards: false, clock: false, shape: 'claims' } });
   }, 180000);
 
-  it('PG5 a whole-bot restore of a v3 bot renumbers above the live floor and expires every restored claim', async () => {
+  it('PG5 a whole-bot restore of a v3 bot renumbers above the live floor and expires every restored claim; the manager writes its five tables, smdb_manager.addresses among them (Y1)', async () => {
     const id = `nm9pg5${process.pid}`;
     makeDb('pg5', V3(10000), `SELECT setval('smdb_data.claim_seq', 5); ${row('g3', 3)} ${row('g5', 5)} ${shard(1, 0, 3, 50000)} ${shard(1, 1, 5, 50000)}`);
     register(id, 'pg5');
@@ -232,7 +222,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
     const after = countsOf('pg5');
     const data = (counts: Record<string, number>) => Object.fromEntries(Object.entries(counts).filter(([name]) => name.startsWith('smdb_data.')));
     expect(compareCounts(data(meta.counts), data(after)).text).toBe('');
-    expect(Object.keys(after).filter(name => !name.startsWith('smdb_data.'))).toEqual(['smdb_manager.copies', 'smdb_manager.generation', 'smdb_manager.handover', 'smdb_manager.received']);
+    expect(Object.keys(after).filter(name => !name.startsWith('smdb_data.'))).toEqual(['smdb_manager.addresses', 'smdb_manager.copies', 'smdb_manager.generation', 'smdb_manager.handover', 'smdb_manager.received']);
     expect(after['smdb_manager.generation']).toBe(1);
   }, 300000);
 
@@ -247,7 +237,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
     const shardBefore = ok(SHARDS, 'pg6');
     const r = await fleetBackup.restoreFleetBackup(id, 'v2.dump');
     expect(r.success).toBe(false);
-    expect(r.error).toBe('The dump v2.dump has no shard claims, but the database has them, so the restore was refused, and nothing was changed: the database has smdb_data.shard_claims and the dump does not, and a bot that keeps its shard claims in the database does not start on data without them; a pre-restore dump is never refused for this, so a restore can be undone with the one it took');
+    expect(r.error).toBe('The dump v2.dump has no shard claims, but the database has them, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the database has smdb_data.shard_claims and the dump does not, and a bot that keeps its shard claims in the database does not start on data without them; a pre-restore dump is never refused for this, so a restore can be undone with the one it took');
     expect(ok("SELECT oid FROM pg_database WHERE datname = 'pg6'")).toBe(oid);
     expect(compareCounts(before, countsOf('pg6')).ok).toBe(true);
     expect(ok(SHARDS, 'pg6')).toBe(shardBefore);
@@ -315,10 +305,12 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
   it('PG11b as PG11 for a never-run receiver: its database holds the generation row and the address list', async () => {
     const id = `nm9pg11b${process.pid}`;
     ok(`CREATE DATABASE pg11b OWNER ${USER}`);
+    // R3.2 step 4: provisioning grants the bot's database to the manager's two logins; dbm_meta makes smdb_manager there.
+    ok('GRANT CONNECT, CREATE ON DATABASE pg11b TO dbm_meta; GRANT CONNECT ON DATABASE pg11b TO dbm_work;');
     register(id, 'pg11b');
     await fleetSwitch.ensureMainGeneration(id);
     expect(ok('SELECT generation FROM smdb_manager.generation', 'pg11b')).toBe('1');
-    const enabled = run(['exec', '-i', NAME, 'psql', '-X', '-U', ADMIN, '-d', 'pg11b', '-v', 'ON_ERROR_STOP=1', '-At'], addressTableSql('recv.example', 5432, 'PEM', 'recv.example', null));
+    const enabled = run(['exec', '-i', NAME, 'psql', '-X', '-U', dbLogin.META_LOGIN, '-d', 'pg11b', '-v', 'ON_ERROR_STOP=1', '-At'], addressTableSql('recv.example', 5432, 'PEM', 'recv.example', null));
     expect(enabled.status, enabled.err).toBe(0);
     const P11 = await fleetBackup.runFleetDump(bot(id, 'pg11b') as any, 'pre-receive-');
     expect(P11.success, P11.error).toBe(true);

@@ -32,7 +32,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { certFingerprint, encodeJoinCode, lsnToBigInt } from '../../src/config/joinCode';
 import * as containerManager from '../../src/docker/containerManager';
-import { ensureManagerDbRole } from '../../src/instance/dbLogin';
+import { MANAGER_DB_ROLE } from '../../src/instance/dbLogin';
+import { provisionedCluster } from './pg-cluster';
 import { addressTableSql } from '../../src/instance/fleetReplication';
 import { addressUpsertSql, fetchMainCertificate, mainProbe, readAddresses, readCopyFacts } from '../../src/instance/fleetJoin';
 import { rebuildVerdict, runFleetCopyTick, VerdictCopy, VerdictMain } from '../../src/instance/fleetCopyWatch';
@@ -73,7 +74,7 @@ const run = (args: string[], input?: string, env?: NodeJS.ProcessEnv) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 600000, input, env: env ? { ...process.env, ...env } : process.env });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
-const psql = (container: string, sql: string, user = 'smdb', db = 'smdb') =>
+const psql = (container: string, sql: string, user = MANAGER_DB_ROLE, db = 'smdb') =>
   run(['exec', '-i', container, 'psql', '-X', '-U', user, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
 const waitReady = (container: string) => {
   for (let i = 0; i < 240; i++) {
@@ -114,18 +115,13 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     expect(run(['network', 'create', '--subnet', SUBNET, NET]).status).toBe(0);
     // Docker Desktop cannot bind a published port on the bridge gateway; all interfaces still reach it there.
     const publish = process.env.SMDB_PG_PUBLISH === 'all' ? `${PORT}:5432` : `${gateway}:${PORT}:5432`;
-    const started = run(['run', '-d', '--name', MAIN, '--network', NET, '--ip', MAIN_IP, '-p', publish,
-      '-e', 'POSTGRES_USER=smdb', '-e', `POSTGRES_PASSWORD=${APP_PW}`, '-e', 'POSTGRES_DB=smdb',
-      'postgres:16-alpine', '-c', 'max_slot_wal_keep_size=64MB', '-c', 'max_wal_size=64MB', '-c', 'min_wal_size=32MB']);
-    expect(started.status, started.err).toBe(0);
-    waitReady(MAIN);
+    await provisionedCluster({ name: MAIN, user: 'smdb', db: 'smdb', password: APP_PW, network: NET, dockerArgs: ['--ip', MAIN_IP, '-p', publish],
+      serverArgs: ['-c', 'reserved_connections=4', '-c', 'max_slot_wal_keep_size=64MB', '-c', 'max_wal_size=64MB', '-c', 'min_wal_size=32MB'] });
     for (const f of ['server.crt', 'server.key']) expect(run(['cp', path.join(h.dir, f), `${MAIN}:/var/lib/postgresql/data/${f}`]).status).toBe(0);
     expect(run(['exec', '-u', 'root', MAIN, 'sh', '-c', 'chown postgres:postgres /var/lib/postgresql/data/server.* && chmod 600 /var/lib/postgresql/data/server.key && printf "hostssl replication all 0.0.0.0/0 scram-sha-256\\nhostssl all all 0.0.0.0/0 scram-sha-256\\n" >> /var/lib/postgresql/data/pg_hba.conf']).status).toBe(0);
     expect(psql(MAIN, 'ALTER SYSTEM SET ssl = on;').status).toBe(0);
     expect(psql(MAIN, 'SELECT pg_reload_conf();').status).toBe(0);
     expect(psql(MAIN, `CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${REPL_PW}';`).status).toBe(0);
-    // NM1's manager role, made on the main before any copy is seeded, so every copy has it.
-    expect(await ensureManagerDbRole({ container: MAIN, user: 'smdb' })).toEqual({ ok: true });
     const table = psql(MAIN, addressTableSql(MAIN_IP, 5432, pem.trim(), 'main', null));
     expect(table.status, table.err).toBe(0);
     fs.mkdirSync(path.join(h.dir, 'bots', BOT, 'env'), { recursive: true });
@@ -144,7 +140,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
 
   afterAll(() => {
     for (const c of [MAIN, COPY, COPY2]) run(['rm', '-f', '-v', c]);
-    for (const v of [COPY_VOL, COPY2_VOL]) run(['volume', 'rm', v]);
+    for (const v of [`${MAIN}-data`, COPY_VOL, COPY2_VOL]) run(['volume', 'rm', v]);
     run(['network', 'rm', NET]);
     fs.rmSync(h.dir, { recursive: true, force: true });
   }, 300000);
@@ -210,7 +206,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
   it('L4-2 a stopped copy whose slot passed the bound reads lost through the manager\'s readers, does not stream again, and the verdict is a rebuild', async () => {
     expect(run(['stop', COPY]).status).toBe(0);
     for (let i = 0; i < 40; i++) {
-      expect(psql(MAIN, 'CREATE TABLE IF NOT EXISTS nm3_fill (x text); INSERT INTO nm3_fill SELECT repeat(md5(random()::text), 64) FROM generate_series(1, 5000); SELECT pg_switch_wal();').status).toBe(0);
+      expect(psql(MAIN, 'CREATE TABLE IF NOT EXISTS public.nm3_fill (x text); INSERT INTO public.nm3_fill SELECT repeat(md5(random()::text), 64) FROM generate_series(1, 5000); SELECT pg_switch_wal();').status).toBe(0);
     }
     expect(psql(MAIN, 'CHECKPOINT;').status).toBe(0);
     let state = '';
@@ -232,7 +228,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
   }, 900000);
 
   it('L4-4 pg_dump of the hot standby whose slot is lost succeeds', () => {
-    const dump = run(['exec', COPY, 'pg_dump', '-U', 'smdb', '-Fc', '-f', '/tmp/nm3.dump', 'smdb']);
+    const dump = run(['exec', COPY, 'pg_dump', '-U', MANAGER_DB_ROLE, '-Fc', '-f', '/tmp/nm3.dump', 'smdb']);
     expect(dump.status, dump.err).toBe(0);
   }, 300000);
 
@@ -256,7 +252,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     }
     expect(copy).toMatchObject({ answered: true, inRecovery: true, streaming: true });
     expect(await mainProbe(instance(), code(), pem, SLOT)).toMatchObject({ ok: true, facts: { slot: 'active' } });
-    expect(psql(COPY, 'SELECT count(*) > 0 FROM nm3_fill;').out).toBe('t');
+    expect(psql(COPY, 'SELECT count(*) > 0 FROM public.nm3_fill;').out).toBe('t');
   }, 1200000);
 
   const botModules = process.env.SMDB_BOT_NODE_MODULES;
@@ -297,7 +293,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     expect(psql(COPY, 'CHECKPOINT;').status).toBe(0);
     const copy2 = await copyVerdict(COPY2);
     expect(copy2).toMatchObject({ answered: true, inRecovery: true, timeline: 1 });
-    const ident = run(['exec', COPY, 'psql', '-X', '-U', 'smdb', '-d', 'dbname=smdb replication=true', '-Atc', 'IDENTIFY_SYSTEM']);
+    const ident = run(['exec', COPY, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'dbname=smdb replication=true', '-Atc', 'IDENTIFY_SYSTEM']);
     expect(ident.status, ident.err).toBe(0);
     const [systemId, timeline, xlogpos] = ident.out.split('|');
     expect(Number(timeline)).toBe(2);

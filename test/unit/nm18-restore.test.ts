@@ -395,17 +395,17 @@ const ROWS: Row[] = [
     check: r => atToc(r, `7 table(s) do not fit its table of contents: ${[1, 2, 3, 4, 5].map(i => `smdb_data.x${i}: no table in the dump`).join('; ')}, and 2 more`),
   },
   {
-    id: 'Q17 a TOC at the read cap skips the check, and the comparison catches the table',
+    id: 'Q17 a TOC at the read cap is refused before the fence: the restore list made from it could miss an entry (NM20 S2)',
     setup: () => {
       claimDb.tocText = `${TOC.claims};`.padEnd(fleetBackup.TOC_MAX_CHARS - 1, 'x') + '\n';
       writeDumpMeta(DIR, 'old.dump', { ...COUNTS_OF.claims, 'smdb_data.extra': 1 });
       claimDb.restoredCounts = COUNTS_OF.claims;
     },
     check: r => {
-      expect(logs.warn).toContain('[FleetBackup] The table of contents of old.dump is longer than 8 MB, so its counts file was checked only after the restore');
-      expect(dropped()).toBe(true);
-      expect(r.steps.counts).toEqual({ result: 'differ', tables: 2, rows: 3, text: '1 table(s) differ from the counts recorded when the backup was taken: smdb_data.extra: missing after the restore' });
       expect(r.success).toBe(false);
+      expect(r.error).toBe('The table of contents of the dump old.dump is longer than 8 MB, so the restore was refused, and nothing was changed: the restore list made from it could miss an entry');
+      expect(dropped()).toBe(false);
+      expect(r.steps.counts).toBeNull();
     },
   },
   {
@@ -600,16 +600,16 @@ describe('NM18 Q28: a lift that does not end lifted after a difference', () => {
 });
 
 describe('NM18 named rows', () => {
-  it('R-COUNT-ORDER: the count runs after pg_restore, before the raise and the lift, as the manager role in an ordinary session', async () => {
+  it('R-COUNT-ORDER: the count runs after pg_restore, before the raise and the lift, as dbm_work in an ordinary session (NM20 R3.6)', async () => {
     const r = await restore();
     expect(r.success).toBe(true);
     const order = pg.events.filter(e => ['pg_restore', 'count', 'raise', 'lift'].includes(e));
     expect(order).toEqual(['pg_restore', 'count', 'raise', 'lift']);
     expect(pg.countArgs).toHaveLength(1);
     const argv = pg.countArgs[0];
-    expect(argv[argv.indexOf('-U') + 1]).toBe(MANAGER_DB_ROLE);
+    expect(argv[argv.indexOf('-U') + 1]).toBe('dbm_work');
     expect(argv[argv.indexOf('-d') + 1]).toBe('app');
-    expect(argv.join(' ')).not.toContain('PGOPTIONS');
+    expect(argv.join(' ')).not.toContain('default_transaction_read_only');
   });
 
   it('R-COUNT-ORDER: two dumps with different counts files each match their own', async () => {

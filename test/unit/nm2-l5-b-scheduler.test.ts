@@ -381,7 +381,7 @@ describe('NM2 L5 b: the tick', () => {
     mainBot();
     seedBot({ fleetDbReplica: { ...REPLICA, containerName: 'bot-b-replica', seededAt: NOW - 30 * 86400000 } }, 'b');
     seedBot({ fleetDbReplica: { ...REPLICA, containerName: 'bot-c-replica', seededAt: NOW - 30 * 86400000 } }, 'c');
-    const order = () => pgDumps().map(a => a[1]);
+    const order = () => pgDumps().map(a => a[a.indexOf('pg_dump') - 1]);
     await run();
     expect(order()).toEqual([PRIMARY.containerName, 'bot-b-replica', 'bot-c-replica']);
     setNow(NOW + H);

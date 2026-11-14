@@ -30,7 +30,7 @@ vi.mock('child_process', async (importOriginal) => {
     setImmediate(() => { child.stdout.emit('data', out); child.emit('close', 0); });
     return child;
   };
-  const mod = { ...real, execFile, spawn };
+  const mod = { ...real, execFile: (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any), spawn };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));

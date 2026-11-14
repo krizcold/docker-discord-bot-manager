@@ -20,6 +20,7 @@ const BOT = `nm2pg${process.pid}`;
 const STANDBY_BOT = `nm2pgs${process.pid}`;
 const USER = 'app';
 const DB = 'app';
+const ADMIN = 'dbm_admin';
 
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
@@ -82,15 +83,15 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
     dbLogin = await import('../../src/instance/dbLogin');
   });
 
-  beforeAll(() => {
-    const started = run(['run', '-d', '--name', NAME, '-e', `POSTGRES_USER=${USER}`, '-e', 'POSTGRES_PASSWORD=pw', '-e', `POSTGRES_DB=${DB}`, 'postgres:16-alpine']);
-    expect(started.status, started.err).toBe(0);
-    waitTcp(NAME);
+  beforeAll(async () => {
+    const { provisionedCluster } = await import('./pg-cluster');
+    await provisionedCluster({ name: NAME, user: USER, db: DB, password: 'pw' });
     expect(psql(NAME, 'CREATE SCHEMA smdb_data; CREATE TABLE smdb_data."guild|list" (id int); INSERT INTO smdb_data."guild|list" SELECT generate_series(1, 50); CREATE TABLE public.t (x int); INSERT INTO public.t VALUES (1), (2); CREATE UNLOGGED TABLE public.scratch (x int); INSERT INTO public.scratch VALUES (9);').status).toBe(0);
   }, 300000);
 
   afterAll(() => {
     run(['rm', '-f', '-v', NAME]);
+    run(['volume', 'rm', '-f', `${NAME}-data`]);
     run(['rm', '-f', '-v', THROWAWAY]);
     run(['volume', 'rm', THROWAWAY]);
     run(['rm', '-f', '-v', `smdb-testrestore-${BOT}`]);
@@ -108,14 +109,15 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
     expect(holder.counts['public.t']).toBe(2);
     expect(holder.counts['smdb_data."guild|list"']).toBe(50);
     expect(holder.counts['public.scratch']).toBeUndefined();
-    expect(psql(NAME, 'CREATE DATABASE r1', 'postgres').status).toBe(0);
+    expect(psql(NAME, `CREATE DATABASE r1 OWNER ${USER}`, 'postgres', ADMIN).status).toBe(0);
     const restored = run(['exec', NAME, 'pg_restore', '-U', USER, '--no-owner', '--no-privileges', '--exit-on-error', '-d', 'r1', '/tmp/r1.dump']);
     expect(restored.status, restored.err).toBe(0);
     expect(compareCounts(holder.counts, countsOf(NAME, 'r1')).ok).toBe(true);
   }, 300000);
 
   // R2 and R3 run only when SMDB_PG_STANDBY names a hot standby of the main in SMDB_PG_MAIN (built by the main session,
-  // the standby with max_standby_streaming_delay = 1s), whose bootstrap role is SMDB_PG_USER and database SMDB_PG_DB.
+  // the standby with max_standby_streaming_delay = 1s), the main made as pg-cluster.ts makes one, with the bot role
+  // SMDB_PG_USER and the database SMDB_PG_DB.
   const standby = process.env.SMDB_PG_STANDBY;
   const main = process.env.SMDB_PG_MAIN;
   const sUser = process.env.SMDB_PG_USER || 'smdb';
@@ -134,7 +136,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
     expect(holder.counts['public.nm2_unlogged']).toBeUndefined();
     run(['cp', `${standby}:/tmp/r2.dump`, '/tmp/nm2-r2.dump']);
     run(['cp', '/tmp/nm2-r2.dump', `${NAME}:/tmp/r2.dump`]);
-    expect(psql(NAME, 'CREATE DATABASE r2', 'postgres').status).toBe(0);
+    expect(psql(NAME, `CREATE DATABASE r2 OWNER ${USER}`, 'postgres', ADMIN).status).toBe(0);
     const restored = run(['exec', NAME, 'pg_restore', '-U', USER, '--no-owner', '--no-privileges', '--exit-on-error', '-d', 'r2', '/tmp/r2.dump']);
     expect(restored.status, restored.err).toBe(0);
     expect(psql(NAME, 'SELECT count(*) FROM nm2_unlogged', 'r2').out).toBe('0');
@@ -169,14 +171,10 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
     expect(meta.counts['public.nm2_logged']).toBe(7);
   }, 300000);
 
-  it.skipIf(!standby || !main)('R10 runFleetDump on the standby after dbm_admin is dropped on the main and the drop replayed: the bot-role fallback dumps', async () => {
-    expect(psql(main!, 'DROP ROLE IF EXISTS dbm_admin', sDb, sUser).status).toBe(0);
-    let left = '1';
-    for (let i = 0; i < 40 && left !== '0'; i++) {
-      pause(250);
-      left = psql(standby!, "SELECT count(*) FROM pg_roles WHERE rolname = 'dbm_admin'", sDb, sUser).out;
-    }
-    expect(left).toBe('0');
+  it.skipIf(!standby || !main)('R10 (NM20 3.3) dbm_admin is the first role, which the bot role cannot drop, and runFleetDump on the standby dumps as dbm_admin with no fallback to the bot role', async () => {
+    const drop = psql(main!, 'DROP ROLE IF EXISTS dbm_admin', sDb, sUser);
+    expect(drop.status).not.toBe(0);
+    expect(drop.err).toMatch(/permission denied/);
     const warned: string[] = [];
     const spy = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { warned.push(a.map(String).join(' ')); });
     try {
@@ -185,10 +183,8 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
       expect(fs.existsSync(path.join(backupDir(`${STANDBY_BOT}f`), `${r.file}.json`))).toBe(true);
     } finally {
       spy.mockRestore();
-      dbLogin.forgetManagerRole(main!);
-      await dbLogin.ensureManagerDbRole({ container: main!, user: sUser });
     }
-    expect(warned.join('\n')).toContain(`the role dbm_admin has not reached this live copy from its main yet, so the manager logs in as ${sUser}`);
+    expect(warned.join('\n')).not.toContain('so the manager logs in as');
   }, 300000);
 
   it('R4 the throwaway: TCP readiness waits for the final server, and a dump restores with --no-owner --no-privileges with matching counts', async () => {
@@ -230,7 +226,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM2 the dump snaps
     const meta = JSON.parse(fs.readFileSync(path.join(dir, `${r7File}.json`), 'utf-8'));
     expect(meta).toMatchObject({ file: r7File, family: 'main', kind: 'safety', inRecovery: false });
     expect(run(['cp', path.join(dir, r7File), `${NAME}:/tmp/r7.dump`]).status).toBe(0);
-    expect(psql(NAME, 'CREATE DATABASE r7', 'postgres').status).toBe(0);
+    expect(psql(NAME, `CREATE DATABASE r7 OWNER ${USER}`, 'postgres', ADMIN).status).toBe(0);
     const restored = run(['exec', NAME, 'pg_restore', '-U', USER, '--no-owner', '--no-privileges', '--exit-on-error', '-d', 'r7', '/tmp/r7.dump']);
     expect(restored.status, restored.err).toBe(0);
     expect(compareCounts(meta.counts, countsOf(NAME, 'r7')).ok).toBe(true);

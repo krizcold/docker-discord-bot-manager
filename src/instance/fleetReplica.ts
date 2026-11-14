@@ -21,7 +21,6 @@ import * as envManager from '../env/manager';
 import * as fleetBackup from './fleetBackup';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
-import { MANAGER_DB_ROLE } from './dbLogin';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
@@ -398,9 +397,9 @@ function replicaExec(containerName: string, args: string[]): Promise<{ ok: boole
   });
 }
 
-/** replicaExec for args that log in as MANAGER_DB_ROLE: a missing role is made, or on a live copy the bot role logs in. */
-function managerReplicaExec(containerName: string, user: string, args: string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return dbLogin.asManager({ container: containerName, user }, role => replicaExec(containerName, dbLogin.withRole(args, role)), r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
+/** replicaExec of psql as dbm_admin on the postgres database. */
+function managerReplicaExec(containerName: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return replicaExec(containerName, dbLogin.clusterPsql(containerName, sql).args.slice(2));
 }
 
 type ParsedDsn = PrimaryLogin;
@@ -513,11 +512,11 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
     status.lastError = status.lastError || 'standby record predates identity stamping; retire and re-provision the standby';
     return status;
   }
-  const probe = await managerReplicaExec(rec.containerName, rec.user, ['psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc',
+  const probe = await managerReplicaExec(rec.containerName,
     `SELECT pg_is_in_recovery(),
             (SELECT status FROM pg_stat_wal_receiver LIMIT 1),
             (pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()),
-            COALESCE(EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::text, '');`]);
+            COALESCE(EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp())::text, '');`);
   if (probe.ok) {
     const [inRec, recv, caught, lag] = probe.stdout.trim().split('|');
     const rawLag = lag ? Number(lag) : null;
@@ -1185,7 +1184,7 @@ async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCe
  */
 async function copyHeld(rec: FleetDbReplicaRecord): Promise<'standby' | 'promoted' | 'unknown' | 'unanswered' | 'no-identity'> {
   if (rec.user && rec.db) {
-    const probe = await managerReplicaExec(rec.containerName, rec.user, ['psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', 'SELECT pg_is_in_recovery();']);
+    const probe = await managerReplicaExec(rec.containerName, 'SELECT pg_is_in_recovery();');
     const answer = probe.ok ? probe.stdout.trim().split('|')[0] : '';
     if (answer === 't') return 'standby';
     if (answer === 'f') return 'promoted';
@@ -1608,11 +1607,10 @@ export function reseedStalePrimary(
  * an identity that could not be read on either side. Null when the two match.
  */
 async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNullable<InstanceConfig['fleetDb']>, dsn: ParsedDsn): Promise<string | null> {
-  const local = await dbLogin.asManager({ container: fleetDb.containerName, user: fleetDb.user }, role => new Promise<{ ok: boolean; out: string }>(resolve => {
-    execFileGuarded('docker', dbLogin.withRole(['exec', fleetDb.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', fleetDb.db, '-tA', '-c',
-      'SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint())'], role),
-    { timeout: PROBE_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
-  }), r => !r.ok && dbLogin.isMissingManagerRole(r.out));
+  const local = await new Promise<{ ok: boolean; out: string }>(resolve => {
+    execFileGuarded('docker', dbLogin.clusterPsql(fleetDb.containerName, 'SELECT (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint())').args,
+      { timeout: PROBE_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
+  });
   const [localId, localTl] = local.ok ? local.out.trim().split('|') : ['', ''];
   if (!/^\d+$/.test(localId) || !/^\d+$/.test(localTl)) {
     return `this database's identity could not be read (${local.out.trim().split('\n').pop() || 'no answer'}), so it cannot be compared with the pasted primary's`;
@@ -2003,10 +2001,10 @@ export async function adoptPromotedReplica(
   // way would refuse that write outright. ALTER SYSTEM itself writes no WAL, so
   // it can always run, and the reload is what actually lifts a live wedge.
   for (const setting of ['primary_conninfo', 'primary_slot_name', 'synchronous_standby_names', 'default_transaction_read_only']) {
-    const reset = await managerReplicaExec(rec.containerName, rec.user, ['psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', `ALTER SYSTEM RESET ${setting};`]);
+    const reset = await managerReplicaExec(rec.containerName, `ALTER SYSTEM RESET ${setting};`);
     if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${reset.stderr.trim().split('\n').pop()}`);
   }
-  const reload = await managerReplicaExec(rec.containerName, rec.user, ['psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', 'SELECT pg_reload_conf();']);
+  const reload = await managerReplicaExec(rec.containerName, 'SELECT pg_reload_conf();');
   if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${reload.stderr.trim().split('\n').pop()}`);
   if (alone) return { success: true, restartRequired: true, alone: true, flipped: true, addresses: await sendAddresses(instance.id) };
 

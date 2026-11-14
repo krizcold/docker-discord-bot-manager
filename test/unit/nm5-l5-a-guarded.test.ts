@@ -44,7 +44,7 @@ vi.mock('child_process', async (importOriginal) => {
   return { ...real, spawn, execFile, default: { ...real, spawn, execFile } };
 });
 
-import { adminSql, readGeneration, readRestoreState, runGuarded } from '../../src/instance/fleetSwitch';
+import { clusterSql, readGeneration, readRestoreState, runGuarded } from '../../src/instance/fleetSwitch';
 
 const uncaught: unknown[] = [];
 process.on('uncaughtException', e => { uncaught.push(e); });
@@ -117,25 +117,28 @@ describe('the error line of a failed psql (errorOf)', () => {
   });
 });
 
-describe('adminSql', () => {
+// NM20 part 6: adminSql is gone (R3.3); its postgres sites run through clusterSql, as dbm_admin on postgres only.
+describe('clusterSql', () => {
   it('runs psql on stdin as the manager role with the exact argv', async () => {
     sp.queue = [{ stdout: ['ok\n'] }];
-    const r = await adminSql(T, 'app', 'SELECT 1;');
+    const r = await clusterSql(T, 'SELECT 1;');
     expect(r.ok).toBe(true);
-    expect(sp.calls[0].args).toEqual(['exec', '-i', 'c-pg', 'psql', '-U', 'dbm_admin', '-d', 'app', '-tAq', '-v', 'ON_ERROR_STOP=1']);
+    expect(sp.calls[0].args).toEqual(['exec', '-i', 'c-pg', 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q']);
     expect(sp.calls[0].input).toBe('SELECT 1;<end>');
     expect(sp.calls).toHaveLength(1);
     expect(sp.exec).toEqual([]);
   });
-  it('a missing manager role is made and the script runs once more', async () => {
+  // Inverted by R3.3 (no asManager): a missing dbm_admin is one failed call, with no role made and no second run.
+  it('a missing manager role is one failed call', async () => {
     sp.queue = [{ code: 2, stderr: ['psql: error: FATAL:  role "dbm_admin" does not exist\n'] }, { stdout: ['done\n'] }];
-    const r = await adminSql({ container: 'c-pg-2', user: 'app' }, 'app', 'SELECT 1;');
-    expect(r).toMatchObject({ ok: true, stdout: 'done\n' });
-    expect(sp.calls).toHaveLength(2);
+    const r = await clusterSql({ container: 'c-pg-2', user: 'app' }, 'SELECT 1;');
+    expect(r).toMatchObject({ ok: false, error: 'FATAL:  role "dbm_admin" does not exist' });
+    expect(sp.calls).toHaveLength(1);
+    expect(sp.exec).toEqual([]);
   });
   it('another failure is answered without a second run', async () => {
     sp.queue = [{ code: 1, stderr: ['ERROR:  syntax error\n'] }, { stdout: ['done\n'] }];
-    const r = await adminSql({ container: 'c-pg-3', user: 'app' }, 'app', 'SELEC 1;');
+    const r = await clusterSql({ container: 'c-pg-3', user: 'app' }, 'SELEC 1;');
     expect(r).toMatchObject({ ok: false, error: 'ERROR:  syntax error' });
     expect(sp.calls).toHaveLength(1);
     expect(sp.exec).toEqual([]);

@@ -43,7 +43,7 @@ vi.mock('child_process', async (importOriginal) => {
     });
     return child;
   };
-  const mod = { ...real, execFile, spawn };
+  const mod = { ...real, execFile: (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any), spawn };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
@@ -114,7 +114,8 @@ describe('CN2: connectionReading', () => {
   });
   it('unread: a psql fails with no stderr', async () => {
     h.nodes = { code: 1, out: '', err: '' };
-    expect(await connectionReading(inst)).toEqual({ state: 'unread', error: 'the database did not answer (no answer)' });
+    // NM20 R3.3: the read runs through dbLogin.runCall, which names the exit code when psql printed nothing.
+    expect(await connectionReading(inst)).toEqual({ state: 'unread', error: 'the database did not answer (the command exited with code 1)' });
   });
   it('unread: settings output that does not parse', async () => {
     h.settings.out = 'garbage\n';

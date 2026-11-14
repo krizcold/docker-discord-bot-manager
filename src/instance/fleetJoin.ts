@@ -13,7 +13,6 @@ import * as crypto from 'crypto';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import * as dbLogin from './dbLogin';
-import { MANAGER_DB_ROLE } from './dbLogin';
 import { getBotDir } from '../git/repoManager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { dataPlace } from './dataPlace';
@@ -340,7 +339,7 @@ export function primarySql(instance: InstanceConfig, code: JoinCode, pem: string
   return dockerRm(name).then(() => runPrimaryClient(name, login, [mount], 'psql', [seedDsnFor(login), '-v', 'ON_ERROR_STOP=1', '-Atc', sql], CLIENT_TIMEOUT_MS));
 }
 
-function validAddress(row: unknown): JoinAddress | null {
+export function validAddress(row: unknown): JoinAddress | null {
   if (!row || typeof row !== 'object') return null;
   const r = row as Record<string, unknown>;
   if (typeof r.host !== 'string' || !HOST_RE.test(r.host)) return null;
@@ -589,10 +588,9 @@ export async function readCopyFacts(rec: { containerName: string; user?: string;
   const sql = `SELECT pg_is_in_recovery()::text, COALESCE((SELECT status FROM pg_stat_wal_receiver LIMIT 1), ''),
     (SELECT system_identifier FROM pg_control_system()), (SELECT timeline_id FROM pg_control_checkpoint()),
     COALESCE(GREATEST(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn())::text, pg_current_wal_lsn()::text)`;
-  const args = ['exec', rec.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', rec.db, '-Atc', sql];
-  const r = await dbLogin.asManager({ container: rec.containerName, user: rec.user }, role => new Promise<{ ok: boolean; out: string }>(resolve => {
-    execFileGuarded('docker', dbLogin.withRole(args, role), { timeout: COPY_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
-  }), x => !x.ok && dbLogin.isMissingManagerRole(x.out));
+  const r = await new Promise<{ ok: boolean; out: string }>(resolve => {
+    execFileGuarded('docker', dbLogin.clusterPsql(rec.containerName, sql).args, { timeout: COPY_TIMEOUT_MS }, (err, stdout, stderr) => resolve({ ok: !err, out: err ? String(stderr || err.message) : String(stdout) }));
+  });
   if (!r.ok) return { ok: false, reason: "the copy's database did not answer" };
   const [rec_, status, systemId, timeline, lsnText] = r.out.trim().split('|');
   const lsn = lsnToBigInt(lsnText);

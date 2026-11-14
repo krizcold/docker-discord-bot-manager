@@ -282,7 +282,7 @@ describe('N: NM10 against NM5', () => {
       const events = h.events.length;
       expect(await handOver('a', 'slot_c', false)).toMatchObject({ success: false, text: 'Replication is not enabled on this database, so no copy follows it; enable it and add a live copy first; nothing was changed' });
       expect(await receive('a')).toMatchObject({ success: false, text: 'Replication is not enabled, so the other machine has no address to push to; enable it first; nothing was changed' });
-      const code = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: '0123456789abcdef01234567' } } as any);
+      const code = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: '0123456789abcdef01234567' }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
       const FILES = 'This bot keeps its data in files, so the manager cannot hold its database in maintenance';
       expect(await push('a', code)).toMatchObject({ success: false, text: `The push was refused and nothing was changed: ${FILES}` });
       expect(await moveOutByFile('a')).toMatchObject({ success: false, text: `The move was refused and nothing was changed: ${FILES}` });

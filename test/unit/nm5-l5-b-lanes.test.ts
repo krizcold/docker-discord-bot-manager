@@ -107,8 +107,10 @@ describe('the copies read', () => {
     fake.dbs['a-pg'].slots.slot_c.active = 'maybe' as any;
     expect((await go()).text).toBe(`The manager could not read this database's copies (the slot read answered 'maybe|streaming|0/5000000')${NOTHING}`);
   });
+  // NM20 (decide1 G1, G2): the slot is read as dbm_admin and the address as dbm_meta, in two reads.
   it('a read that answers nothing, its table missing', async () => {
-    fake.dbs['a-pg'].fail['slot-read'] = 'ERROR:  relation "smdb_manager.addresses" does not exist';
+    fake.dbs['a-pg'].fail['slot-read-empty'] = '';
+    fake.dbs['a-pg'].fail['address-read'] = 'ERROR:  relation "smdb_manager.addresses" does not exist';
     expect((await go()).text).toBe(`The manager could not read this database's copies (the slot read answered '')${NOTHING}`);
   });
   it('an active slot with no state reads no state', async () => {
@@ -133,8 +135,10 @@ describe('the copies read', () => {
     expect(r.success).toBe(true);
     expect(r.text.startsWith('The main database on this machine is stopped, and the live copy on slot_c holds every change it had.')).toBe(true);
   });
+  // NM20 (decide1 G1, G2): a line after the slot line no longer reaches the address read, which answers no address here.
   it('a line after the slot line that is not an address line counts as no address', async () => {
     fake.dbs['a-pg'].slots.slot_c.replay = '0/5000000\nnode|copy.example|5434|copy.example|pem';
+    fake.dbs['a-pg'].addresses[0].host = '';
     const r = await go();
     expect(r.success).toBe(false);
     expect(r.text).toMatch(/^The copy slot_c did not reach this database's position/);

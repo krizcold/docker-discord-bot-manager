@@ -112,15 +112,17 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   };
 });
 
-vi.mock('../../src/instance/dbLogin', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../src/instance/dbLogin')>();
+// A crash at a docker call: every docker call of the restore starts through processStart (NM20 part 5).
+vi.mock('../../src/docker/processStart', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../src/docker/processStart')>();
+  const crash = (args: readonly string[]) => {
+    const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
+    if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
+  };
   return {
     ...real,
-    withRole: (args: string[], role: string) => {
-      const mark = (globalThis as any).__withRoleCrash as string | null | undefined;
-      if (mark && args.join(' ').includes(mark)) { (globalThis as any).__withRoleCrash = null; throw new Error(`docker crashed at ${mark}`); }
-      return real.withRole(args, role);
-    },
+    startProcess: (cmd: string, args: readonly string[], opts?: any) => { crash(args); return real.startProcess(cmd, args, opts); },
+    execFileGuarded: (cmd: string, args: readonly string[], opts: any, cb: any) => { crash(args); return real.execFileGuarded(cmd, args, opts, cb); },
   };
 });
 afterEach(() => { (globalThis as any).__withRoleCrash = null; });
@@ -394,14 +396,14 @@ const ROWS: Row[] = [
   },
   { id: 'C27 fence not applied', setup: () => { pg.fenceFails = true; }, check: r => { expect(r.error).toMatch(/^Could not fence the database for the restore: /); expect(dropped()).toBe(false); expect(r.steps.restarted).toEqual(['w']); } },
   { id: 'C28 exists probe fails', setup: () => { pg.existsFails = true; }, check: r => { afterFenceRefusal(r); expect(r.error).toBe('Could not check the database before the restore, so the restore was refused, and nothing was changed: ERROR:  the database system is starting up'); } },
-  { id: 'C29 safety dump fails', setup: () => { pg.dumpCode = 1; }, check: r => { afterFenceRefusal(r); expect(r.error).toMatch(/^Pre-restore dump failed, restore refused, and nothing was changed: /); } },
+  { id: 'C29 safety dump fails', setup: () => { pg.dumpCode = 1; }, check: r => { afterFenceRefusal(r); expect(r.error).toMatch(/^Pre-restore dump failed, restore refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset \(its connection limit, its template and connection flags, its database-level settings and those grants\): /); } },
   {
     id: 'C30 claim probe fails', setup: () => { claimDb.fail = 'floor'; },
-    check: r => { afterFenceRefusal(r); expect(r.error).toBe('Could not read the claim numbers before the restore, so the restore was refused, and nothing was changed: ERROR:  connection reset by peer'); },
+    check: r => { afterFenceRefusal(r); expect(r.error).toBe('Could not read the claim numbers before the restore, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): ERROR:  connection reset by peer'); },
   },
   {
     id: 'C31 live schema on terms', setup: () => { claimDb.tables = 't|t|f|f|f'; },
-    check: r => { afterFenceRefusal(r); expect(r.error).toBe("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused, and nothing was changed: smdb_data.guild_ownership has no claim column"); },
+    check: r => { afterFenceRefusal(r); expect(r.error).toBe("The bot's database numbers its saves by term, which this manager no longer reads, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): smdb_data.guild_ownership has no claim column"); },
   },
   {
     id: 'C32 neither table nor sequence, file floor', setup: () => { claimDb.tables = 'f|f|f|f|f'; fs.writeFileSync(FLOOR, '{"claim":4}'); claimDb.raise = 'seq|5\n'; },
@@ -419,7 +421,7 @@ const ROWS: Row[] = [
   },
   {
     id: 'C34 dump without claims, floor known', setup: () => { claimDb.toc = 'none'; writeDumpMeta(DIR, 'old.dump'); },
-    check: r => { afterFenceRefusal(r); expect(r.error).toBe('The dump old.dump holds no claim numbers, so the restore was refused, and nothing was changed: the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'); },
+    check: r => { afterFenceRefusal(r); expect(r.error).toBe('The dump old.dump holds no claim numbers, so the restore was refused; only the database\'s own settings and its grants to dbm_meta and dbm_work were reset (its connection limit, its template and connection flags, its database-level settings and those grants): the bot has used claim numbers up to 7, and without smdb_data.claim_seq in the dump a process that ran before the restore could save over the restored data'); },
   },
   {
     id: 'C35 dump without claims, no floor', setup: () => { claimDb.toc = 'none'; claimDb.tables = 'f|f|f|f|f'; writeDumpMeta(DIR, 'old.dump'); },
@@ -427,11 +429,11 @@ const ROWS: Row[] = [
   },
   {
     id: 'C36 floor not written', setup: () => { fs.mkdirSync(`${FLOOR}.tmp`); },
-    check: r => { afterFenceRefusal(r); expect(r.error).toMatch(/^The claim floor 7 could not be kept on disk, so the restore was refused, and nothing was changed: .*; free space under .* and retry \(this manager holds the number in memory until it restarts\)$/); },
+    check: r => { afterFenceRefusal(r); expect(r.error).toMatch(/^The claim floor 7 could not be kept on disk, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset \(its connection limit, its template and connection flags, its database-level settings and those grants\): .*; free space under .* and retry \(this manager holds the number in memory until it restarts\)$/); },
   },
   {
     id: 'C37 a sharer started outside', setup: () => { pg.at.dump = () => { pg.live.w = ['bot-w-app']; }; },
-    check: r => { expect(r.success).toBe(false); expect(r.error).toMatch(/^An instance sharing the database was started outside the manager during the restore, so the restore was refused, and nothing was changed: bot-w-app runs now/); expect(dropped()).toBe(false); },
+    check: r => { expect(r.success).toBe(false); expect(r.error).toMatch(/^An instance sharing the database was started outside the manager during the restore, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset \(its connection limit, its template and connection flags, its database-level settings and those grants\): bot-w-app runs now/); expect(dropped()).toBe(false); },
   },
   {
     id: 'C38 docker does not answer at P16', setup: () => { pg.at.dump = () => { pg.live.w = null; }; },
@@ -493,7 +495,7 @@ const ROWS: Row[] = [
       expect(r.steps.claimFloor).toBe(7);
       expect(r.steps.guildsRaised).toEqual(['g1', 'g2']);
       expect(r.steps.claimRaisedTo).toBe(8);
-      expect(claimDb.raiseSql[0]).toContain('PGOPTIONS=-c default_transaction_read_only=off');
+      expect(claimDb.raiseSql[0]).toContain(' -c default_transaction_read_only=off');
     },
   },
   {
@@ -636,7 +638,7 @@ describe('the named rows', () => {
 
 describe('R-NOTICE: a throw past the notice leaves N-PENDING in the registry', () => {
   it.each(['drop', 'pg_restore', 'raise', 'lift'])('throw at %s', async (point) => {
-    (globalThis as any).__withRoleCrash = ({ drop: 'DROP DATABASE', pg_restore: 'pg_restore', raise: "setval('smdb_data.claim_seq'", lift: 'ALTER SYSTEM RESET' } as Record<string, string>)[point];
+    (globalThis as any).__withRoleCrash = ({ drop: 'DROP DATABASE', pg_restore: '--no-owner', raise: "setval('smdb_data.claim_seq'", lift: 'ALTER SYSTEM RESET' } as Record<string, string>)[point];
     await restore().catch(() => {});
     expect(registryA().fleetRestoreError.text).toMatch(PENDING);
     expect(containerManager.isBotBusy('a')).toBeNull();

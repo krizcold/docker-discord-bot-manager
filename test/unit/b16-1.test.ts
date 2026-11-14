@@ -158,7 +158,7 @@ describe('R6-J14 and R39-J3: the restore keeps the claim floor or refuses', () =
     expect(r.steps.claimRaisedTo).toBe(10);
     expect(r.steps.claimFloor).toBe(9);
     const raise = claimDb.raiseSql[0];
-    expect(raise).toContain('PGOPTIONS=-c default_transaction_read_only=off');
+    expect(raise).toContain(' -c default_transaction_read_only=off');
     expect(raise).toContain('SET claim = 10');
     expect(raise).toContain('WHERE claim <= 9');
     expect(at('raise')).toBeGreaterThan(at('pg_restore'));
@@ -170,7 +170,7 @@ describe('R6-J14 and R39-J3: the restore keeps the claim floor or refuses', () =
     fs.mkdirSync(`${FLOOR}.tmp`);
     const r = await restore();
     expect(r.success).toBe(false);
-    expect(r.error).toMatch(/The claim floor 7 could not be kept on disk, so the restore was refused, and nothing was changed/);
+    expect(r.error).toMatch(/The claim floor 7 could not be kept on disk, so the restore was refused; only the database's own settings and its grants to dbm_meta and dbm_work were reset \(its connection limit, its template and connection flags, its database-level settings and those grants\)/);
     expect(pg.events).not.toContain('drop');
     expect(at('lift')).toBeGreaterThan(at('fence'));
     expect(r.steps.restarted).toEqual(['w']);

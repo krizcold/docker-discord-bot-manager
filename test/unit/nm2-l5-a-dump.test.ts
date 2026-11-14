@@ -247,12 +247,13 @@ describe('NM2 L5 a: the attempts', () => {
     expect(holder.spawned.length).toBe(1);
   });
 
-  it('a missing manager role is made and the dump runs once more', async () => {
+  it('a missing login fails the dump once: no role is made and nothing runs again (NM20 R3.3)', async () => {
     docker.overrides.push({ match: a => a.join(' ').includes('rolsuper'), answer: { ok: true, stdout: 'true\n' } });
-    holder.failQueue = ['psql: error: connection to server failed: FATAL:  role "dbm_admin" does not exist'];
+    holder.failQueue = ['psql: error: connection to server failed: FATAL:  role "dbm_work" does not exist'];
     const { result } = await dumpNow();
-    expect(result).toStrictEqual({ success: true, file: NAME });
-    expect(holder.spawned.length).toBe(2);
+    expect(result).toStrictEqual({ success: false, error: 'the dump\'s snapshot and table counts could not be taken (psql: error: connection to server failed: FATAL:  role "dbm_work" does not exist)' });
+    expect(holder.spawned.length).toBe(1);
+    expect(docker.calls.filter(a => a.join(' ').includes('rolsuper'))).toEqual([]);
   });
 
   it('three conflicts are a failure', async () => {

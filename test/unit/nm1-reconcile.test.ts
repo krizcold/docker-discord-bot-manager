@@ -44,6 +44,11 @@ vi.mock('../../src/docker/containerManager', () => ({
   stopBotInOp: async () => { h.events.push('stop'); h.app = false; return { success: true }; },
   startFleetDbSidecar: async () => { h.events.push('db-up'); h.sidecar = true; return { success: true }; },
 }));
+// NM20 part 3: the maintenance check provisions through fleetReplication; this file's docker is not faked.
+vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
+  provisionManagedRoles: async () => ({ ok: true, wrote: [] }),
+}));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/instance/dbLogin')>()),
   readWriteFence: async () => ({ ok: true, on: false }),
@@ -154,7 +159,8 @@ describe('maintenance reconciler', () => {
     await pass();
     h.readFail = 'no answer'; h.events = [];
     await pass();
-    expect(h.events.filter(e => e !== 'read')).toEqual([]);
+    // NM20 R3.4: every pass confirms dbm_admin before it provisions.
+    expect(h.events.filter(e => e !== 'read')).toEqual(['ensure']);
     expect(getMaintenanceDrift('b1')).not.toBeNull();
   });
   it('C9 registry broken: the pass is skipped', async () => {

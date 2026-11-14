@@ -66,7 +66,7 @@ vi.mock('child_process', async (importOriginal) => {
     if (answer !== undefined && typeof answer !== 'string') throw new Error(answer.stderr);
     return answer ?? '';
   };
-  const mod = { ...real, exec, execFile, execFileSync, execSync: () => '', spawn: (await import('./dump-fake')).withDumpHolder(spawn as any) };
+  const mod = { ...real, exec, execFile: (await import('./roles-fake')).rolesExecFile(execFile as any), execFileSync, execSync: () => '', spawn: (await import('./dump-fake')).withDumpHolder(spawn as any) };
   return { ...mod, default: mod };
 });
 vi.mock('../../src/casaos/detector', async (importOriginal) => ({
@@ -132,6 +132,18 @@ const expectManagerLogins = () => {
   expect(roles.every(r => r === 'dbm_admin')).toBe(true);
 };
 
+/** NM20 R3.3: every login is one of the manager's three, and dbm_admin reaches only the postgres database. */
+const expectManagerLoginsOf = (...want: string[]) => {
+  const calls = h.calls.filter(a => a[0] === 'exec' && a.some(x => x === 'psql' || x === 'pg_dump' || x === 'pg_restore') && a.includes('-U'));
+  expect(calls.length).toBeGreaterThan(0);
+  for (const a of calls) {
+    const role = a[a.indexOf('-U') + 1];
+    expect(['dbm_admin', 'dbm_meta', 'dbm_work']).toContain(role);
+    if (role === 'dbm_admin') expect(a[a.indexOf('-d') + 1]).toBe('postgres');
+  }
+  for (const role of want) expect(calls.some(a => a[a.indexOf('-U') + 1] === role), role).toBe(true);
+};
+
 beforeEach(() => {
   h.calls.length = 0;
   h.shell.length = 0;
@@ -150,10 +162,11 @@ afterAll(() => {
 });
 
 describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
-  it('runFleetDump runs pg_dump as dbm_admin', async () => {
+  it('runFleetDump runs pg_dump and its snapshot holder as dbm_work (NM20 R3.6)', async () => {
     await fleetBackup.runFleetDump({ id: 'b1', fleetDb } as any);
     expect(h.calls.some(a => a.includes('pg_dump'))).toBe(true);
-    expectManagerLogins();
+    expect(logins().every(r => r === 'dbm_work')).toBe(true);
+    expectManagerLoginsOf('dbm_work');
   });
 
   it('fenceLayers reads the fence as dbm_admin', async () => {
@@ -166,12 +179,13 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     expectManagerLogins();
   });
 
-  it('probeClaims reads the claim numbers as dbm_admin', async () => {
+  it('probeClaims reads the claim numbers as dbm_work (NM20 R3.6)', async () => {
     await fleetBackup.probeClaims(fleetDb);
-    expectManagerLogins();
+    expect(logins().every(r => r === 'dbm_work')).toBe(true);
+    expectManagerLoginsOf('dbm_work');
   });
 
-  it('raiseClaims reads the tables and writes the claim numbers as dbm_admin', async () => {
+  it('raiseClaims reads the tables and writes the claim numbers as dbm_work (NM20 R3.6)', async () => {
     h.answer = args => {
       const sql = args.join(' ');
       if (sql.includes("to_regclass('smdb_data.claim_seq')")) return 't|t|t|f|f\n';
@@ -180,11 +194,12 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     };
     expect(await fleetBackup.raiseClaims(fleetDb, 3)).toEqual({ ok: true, seq: 4, guilds: [] });
     expect(h.calls.some(a => a.some(x => x.includes('setval')))).toBe(true);
-    expectManagerLogins();
+    expect(logins().every(r => r === 'dbm_work')).toBe(true);
+    expectManagerLoginsOf('dbm_work');
   });
 
   it("fleetReplication's enable path reads the fence lines as dbm_admin", async () => {
-    await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
+    await fenceLinesRefusal(fleetDb.containerName);
     expectManagerLogins();
   });
 
@@ -211,6 +226,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     h.answer = args => {
       const sql = args.join(' ');
       if (args.includes('pg_restore') && args.includes('-l')) return TOC.claims;
+      if (args.includes('pg_restore') && args.includes('--data-only')) return '';
       if (args.includes('pg_restore')) return pgRestore;
       if (args.includes('pg_dump')) return 'dump';
       if (args[0] === 'inspect') return 'true\n';
@@ -232,7 +248,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     ];
   };
 
-  it("restoreFleetBackup's recreate and pg_restore log in as dbm_admin, and the new database stays owned by the bot role", async () => {
+  it("restoreFleetBackup's recreate logs in as dbm_admin and its pg_restore as dbm_work (NM20 R3.6), and the new database stays owned by the bot role", async () => {
     const spies = arrangeRestore('');
     try {
       const r = await fleetBackup.restoreFleetBackup('b1', 'old.dump');
@@ -243,10 +259,10 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     const recreate = h.calls.find(a => a.some(x => x.startsWith('CREATE DATABASE')))!;
     expect(recreate[recreate.indexOf('-U') + 1]).toBe('dbm_admin');
     expect(recreate).toContain(`CREATE DATABASE "${fleetDb.db}" OWNER "${fleetDb.user}"`);
-    expect(loginOf('--exit-on-error')).toBe('dbm_admin');
-    expect(loginOf("setval('smdb_data.claim_seq'")).toBe('dbm_admin');
+    expect(loginOf('--exit-on-error')).toBe('dbm_work');
+    expect(loginOf("setval('smdb_data.claim_seq'")).toBe('dbm_work');
     expect(loginOf('127.0.0.1')).toBe('dbm_admin');
-    expectManagerLogins();
+    expectManagerLoginsOf('dbm_admin', 'dbm_meta', 'dbm_work');
   });
 
   it('a failed pg_restore ends the surviving sessions as dbm_admin', async () => {
@@ -258,7 +274,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       spies.forEach(s => s.mockRestore());
     }
     expect(loginOf('count(pg_terminate_backend(pid))')).toBe('dbm_admin');
-    expectManagerLogins();
+    expectManagerLoginsOf('dbm_admin');
   });
 
   it("the start's stuck-fence check reads the copy's recovery and the saved fence setting as dbm_admin", async () => {
@@ -333,7 +349,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     }
     expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.lastError).toMatch(/is not a copy of this one/);
     expect(loginOf('pg_control_system()')).toBe('dbm_admin');
-    expectManagerLogins();
+    expectManagerLoginsOf('dbm_admin');
   });
 
   it("adoptPromotedReplica's reset and reload, and the enable after it (psql and psqlScript), log in as dbm_admin", async () => {
@@ -355,10 +371,17 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
     }
     expect(loginOf('SELECT pg_reload_conf();')).toBe('dbm_admin');
     expect(loginOf('FROM pg_roles WHERE rolname')).toBe('dbm_admin');
-    const script = h.calls.find(a => a[0] === 'exec' && a.includes('-At') && a.includes('psql'));
+    // NM20 R3.3: the replication role's script goes on stdin through clusterPsql.
+    const script = h.calls.find(a => a[0] === 'exec' && a.includes('-i') && a.includes('psql') && a.includes('postgres'));
     expect(script, 'psqlScript').toBeDefined();
     expect(script![script!.indexOf('-U') + 1]).toBe('dbm_admin');
-    expectManagerLogins();
+    // NM20 R3.3: statements on smdb_manager (Enable's schema read, and its address table on stdin) run as dbm_meta; the rest as dbm_admin.
+    const calls = h.calls.filter(a => a[0] === 'exec' && a.includes('psql') && a.includes('-U'));
+    expect(calls.length).toBeGreaterThan(0);
+    for (const a of calls) {
+      const login = a[a.indexOf('-U') + 1];
+      expect(login === 'dbm_admin' || (login === 'dbm_meta' && (a.includes('-i') || a.join(' ').includes('smdb_manager'))), a.join(' ')).toBe(true);
+    }
   });
 });
 
@@ -474,12 +497,12 @@ describe('N4: the database is still starting after compose up', () => {
     expect(h.shell.filter(c => c.includes('pg_isready')).length).toBeGreaterThan(1);
     expect(ensure).not.toHaveBeenCalled();
     expect(r.warning).not.toContain("can't confirm the database has no write fence");
-    expect(r.warning).toContain("The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the manager's own database role is created at its first login instead");
+    expect(r.warning).toContain("The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the maintenance check sets up the database's roles at its next pass");
   });
 });
 
 describe('round 3: the wait for the database after Start', () => {
-  const NO_ANSWER = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the manager's own database role is created at its first login instead";
+  const NO_ANSWER = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the maintenance check sets up the database's roles at its next pass";
   const arrange = () => {
     const appDir = path.join(h.dir, 'DATA', 'AppData', 'casaos', 'apps', 'bot1');
     fs.mkdirSync(appDir, { recursive: true });

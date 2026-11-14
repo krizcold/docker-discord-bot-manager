@@ -15,8 +15,8 @@ vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ensureManagerDbRole } from '../../src/instance/dbLogin';
 import { connectionReading } from '../../src/instance/fleetReplication';
+import { provisionedCluster } from './pg-cluster';
 
 const dockerRuns = (() => {
   try {
@@ -31,7 +31,6 @@ const ID = `nm13pg${process.pid}`;
 const MAIN = `${ID}-main`;
 const VOL = `${ID}-main-data`;
 
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 600000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
@@ -74,17 +73,8 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM13 connection re
   } as any;
 
   beforeAll(async () => {
-    const r = run(['run', '-d', '--name', MAIN, '-v', `${VOL}:/var/lib/postgresql/data`,
-      '-e', 'POSTGRES_USER=smdb', '-e', 'POSTGRES_PASSWORD=app-pw', '-e', 'POSTGRES_DB=smdb', 'postgres:16-alpine']);
-    expect(r.status, r.err).toBe(0);
-    let ready = false;
-    for (let i = 0; i < 240 && !ready; i++) {
-      ready = run(['exec', MAIN, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0;
-      if (!ready) pause(500);
-    }
-    expect(ready).toBe(true);
+    await provisionedCluster({ name: MAIN, user: 'smdb', db: 'smdb', password: 'app-pw' });
     fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { [inst.id]: inst } }));
-    expect(await ensureManagerDbRole({ container: MAIN, user: 'smdb' })).toEqual({ ok: true });
   }, 300000);
 
   afterAll(() => {
@@ -97,10 +87,10 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM13 connection re
     expect(await connectionReading(inst)).toEqual({ state: 'none' });
   });
 
-  it('PG2 the rows of the last 7 days against max_connections 100 less 3 reserved', async () => {
+  it('PG2 (NM20 S8) the rows of the last 7 days against max_connections 100 less 3 superuser and 4 reserved_connections places', async () => {
     ok(SHARD_NODES_DDL);
     ok(row('n1', true, true, 'now()') + row('n2', true, true, "now() - interval '1 day'") + row('n3', true, true, "now() - interval '6 days'")
       + row('old', false, false, "now() - interval '8 days'"));
-    expect(await connectionReading(inst)).toEqual({ state: 'read', machines: 3, count: 132, overlap: true, max: 100, reserved: 3, allowed: 97 });
+    expect(await connectionReading(inst)).toEqual({ state: 'read', machines: 3, count: 132, overlap: true, max: 100, reserved: 7, allowed: 93 });
   });
 });

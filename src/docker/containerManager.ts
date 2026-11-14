@@ -1346,9 +1346,11 @@ export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: b
   } catch (err) {
     return { success: false, error: String(err) };
   }
+  const deadline = Date.now() + START_DB_READY.deadlineMs;
   for (let attempt = 0; attempt < 30; attempt++) {
     try {
-      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -U "${fleetDb.user}" -d "${fleetDb.db}"`);
+      // Over TCP: the image's first-start server listens on the socket only, before POSTGRES_DB exists.
+      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -h 127.0.0.1 -U "${fleetDb.user}" -d "${fleetDb.db}"`);
     } catch {
       await new Promise(resolve => setTimeout(resolve, 1000));
       continue;
@@ -1356,7 +1358,7 @@ export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: b
     // Imported here: dbLogin reaches this module through fleetReplication.
     const role = await (await import('../instance/dbLogin')).ensureManagerDbRole({ container: fleetDb.containerName, user: fleetDb.user });
     if (!role.ok) console.warn(`[ContainerManager] ${botId}: the manager's database role dbm_admin could not be confirmed: ${role.error}`);
-    else await (await import('../instance/fleetSwitch')).ensureMainGeneration(botId);
+    else if (await provisionAtStart(botId, deadline)) await (await import('../instance/fleetSwitch')).ensureMainGeneration(botId);
     return { success: true };
   }
   return { success: false, error: 'database did not become ready within 30 seconds' };
@@ -1387,6 +1389,42 @@ export async function stopFleetDbSidecar(botId: string): Promise<LaneResult> {
 
 export const START_DB_READY = { deadlineMs: 30_000, tryMs: 5_000, pauseMs: 1000 };
 
+/** A provisioning failure a later try within the start may clear: a step that failed, a missing database, a confirm. */
+function provisionMayPass(error: string, fleetDb: { user: string; db: string }): boolean {
+  const { user, db } = fleetDb;
+  const steps = ['reading the roles', `setting up dbm_meta, dbm_work and the settings of ${db}`, 'creating the schema smdb_manager as dbm_meta',
+    "reading dbm_admin's password verifier", `creating the role ${user}`, `removing superuser rights from ${user}`,
+    `setting the role memberships and giving ${db} to ${user}`, "removing dbm_admin's password"];
+  return error === `the database ${db} does not exist in this container`
+    || error.startsWith('the roles did not read back as set (')
+    || steps.some(step => error.startsWith(`${step} failed (`));
+}
+
+/**
+ * provisionRoles at a start, tried again after 1 s until `deadline` for a failure a later try may clear; any other
+ * failure, or the last, is logged. True when the roles are set up or the database is a live copy.
+ */
+async function provisionAtStart(botId: string, deadline: number): Promise<boolean> {
+  // Imported here: fleetReplication imports this module.
+  const fleetReplication = await import('../instance/fleetReplication');
+  for (;;) {
+    const instance = getBot(botId);
+    if (!instance?.fleetDb) return false;
+    const r = await fleetReplication.provisionManagedRoles(instance)
+      .catch(err => ({ ok: false as const, cls: 'other' as const, error: err instanceof Error ? err.message : String(err) }));
+    if (r.ok || r.cls === 'in-recovery') return true;
+    if ('rolesSet' in r && r.rolesSet) {
+      console.warn(`[ContainerManager] ${botId}: the database's roles could not be set up: ${r.error}`);
+      return true;
+    }
+    if (!provisionMayPass(r.error, instance.fleetDb) || deadline - Date.now() <= START_DB_READY.pauseMs) {
+      console.warn(`[ContainerManager] ${botId}: the database's roles could not be set up: ${r.error}`);
+      return false;
+    }
+    await new Promise(resolve => setTimeout(resolve, START_DB_READY.pauseMs));
+  }
+}
+
 /** Whether the database answers pg_isready before START_DB_READY's deadline; each try is cut at tryMs. */
 export async function databaseReady(fleetDb: { containerName: string; user: string; db: string }): Promise<boolean> {
   const deadline = Date.now() + START_DB_READY.deadlineMs;
@@ -1394,7 +1432,7 @@ export async function databaseReady(fleetDb: { containerName: string; user: stri
     const left = deadline - Date.now();
     if (left <= 0) return false;
     try {
-      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -U "${fleetDb.user}" -d "${fleetDb.db}"`, { timeout: Math.min(START_DB_READY.tryMs, left) });
+      await execAsync(`docker exec "${fleetDb.containerName}" pg_isready -h 127.0.0.1 -U "${fleetDb.user}" -d "${fleetDb.db}"`, { timeout: Math.min(START_DB_READY.tryMs, left) });
       return true;
     } catch {
       if (deadline - Date.now() <= START_DB_READY.pauseMs) return false;
@@ -3911,15 +3949,17 @@ async function startBotImpl(botId: string, migrateLane = false): Promise<LaneRes
       }
     }
     const startedDb = getBot(botId)?.fleetDb;
+    const deadline = Date.now() + START_DB_READY.deadlineMs;
     const dbReady = startedDb ? await databaseReady(startedDb) : false;
     if (startedDb && dbReady) {
       // Imported here: dbLogin reaches this module through fleetReplication.
       const role = await (await import('../instance/dbLogin')).ensureManagerDbRole({ container: startedDb.containerName, user: startedDb.user })
         .catch(err => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }));
       if (!role.ok) console.warn(`[ContainerManager] ${botId}: the manager's database role dbm_admin could not be confirmed after the start: ${role.error}`);
+      else await provisionAtStart(botId, deadline);
     }
     if (startedDb && !dbReady) {
-      const noAnswer = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the manager's own database role is created at its first login instead";
+      const noAnswer = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the maintenance check sets up the database's roles at its next pass";
       logCollectors.get(botId).addLog(`[Start] ${noAnswer}`, 'warning');
       result.warning = result.warning ? `${result.warning}; ${noAnswer}` : noAnswer;
     } else if (getBot(botId)?.fleetDb) {

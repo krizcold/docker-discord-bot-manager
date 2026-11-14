@@ -37,7 +37,8 @@ vi.mock('child_process', async (importOriginal) => {
     setTimeout(() => { child.stdout.end(''); child.stderr.end(''); setTimeout(() => child.emit('close', 0), 1); }, 1);
     return child;
   };
-  return { ...real, execFile, spawn, default: { ...real, execFile, spawn } };
+  const routed = (await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any, /pg_authid/);
+  return { ...real, execFile: routed, spawn, default: { ...real, execFile: routed, spawn } };
 });
 vi.mock('../../src/env/manager', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/env/manager')>();

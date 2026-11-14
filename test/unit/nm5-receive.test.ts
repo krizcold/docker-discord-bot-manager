@@ -73,7 +73,9 @@ describe('O5 Receive', () => {
     const pw = code.ok ? code.code.recv.password : '';
     expect(fake.dbs['a-pg'].roles.smdb_receive.password).toBe(pw);
     for (const c of fake.calls) expect(c.args.join(' ')).not.toContain(pw);
-    expect(roleCalls()[0].input).toContain('LOGIN SUPERUSER PASSWORD');
+    // NM20 R3.6 (D8 reversed): both receive logins are plain.
+    expect(roleCalls()[0].input).toContain('LOGIN NOSUPERUSER');
+    expect(roleCalls()[0].input).not.toMatch(/(^|[^O])SUPERUSER/);
     expect(stored('a').fleetDb.receive).toMatchObject({ safetyDump: 'pre-receive-2026-10-28T12-00-00-000Z.dump' });
     expect(h.events).toContain('dump:pre-receive-');
   });
@@ -97,7 +99,7 @@ describe('O5 Receive', () => {
   });
   it('V5: the mark write throws: the dump kept, nothing else', async () => {
     h.failSwitchWrite = 'ENOSPC';
-    expect((await receive('a')).text).toBe('Receiving could not be recorded (ENOSPC); the dump pre-receive-2026-10-28T12-00-00-000Z.dump was kept and nothing else was changed');
+    expect((await receive('a')).text).toBe('Receiving could not be recorded (ENOSPC); the dump pre-receive-2026-10-28T12-00-00-000Z.dump was kept; receiving was not started');
     expect(roleCalls()).toEqual([]);
   });
   it('V6: the role script fails: the mark cleared, then the receive mark row removed by its id', async () => {
@@ -145,7 +147,7 @@ describe('O5 Receive', () => {
     const saves = trackSaves();
     const r = await receive('a');
     saves.restore();
-    expect(r).toMatchObject({ success: false, status: 500, text: `The move code could not be made (${error}); the dump pre-receive-2026-10-28T12-00-00-000Z.dump was kept and nothing else was changed` });
+    expect(r).toMatchObject({ success: false, status: 500, text: `The move code could not be made (${error}); the dump pre-receive-2026-10-28T12-00-00-000Z.dump was kept; receiving was not started` });
     expect(saves.patches).toEqual([]);
     expect(h.events).toContain('dump:pre-receive-');
     expect(h.events).not.toContain('mark-write');
@@ -183,14 +185,16 @@ describe('O5 Receive', () => {
     const r = await stopReceive('a');
     saves.restore();
     expect(r).toEqual({ success: true, text: 'Receiving stopped; the move code no longer works.' });
-    expect(steps()).toEqual(['receive-nologin', 'receive-end', 'receive-drop', 'oid-read', 'received-read', 'save', 'mark-clear']);
+    // NM20 Z1: the sessions are ended and counted before the cleanup, and once more after NOLOGIN.
+    expect(steps()).toEqual(['receive-end', 'receive-nologin', 'receive-end', 'receive-drop', 'oid-read', 'received-read', 'save', 'mark-clear']);
     expect(saves.patches).toEqual([{ receive: null }]);
     expect(fake.dbs['a-pg'].roles.smdb_receive).toBeUndefined();
     expect(stored('a').fleetDb.receive).toBeUndefined();
   });
   it('V10: the drop fails: the mark kept', async () => {
     await receive('a');
-    fake.dbs['a-pg'].fail.role = 'ERROR:  role "smdb_receive" cannot be dropped';
+    // NM20 Z1, Q1: the fake's 'role' key also failed the closing round that now follows a failure; only the drop fails here.
+    fake.dbs['a-pg'].fail['receive-drop'] = 'ERROR:  role "smdb_receive" cannot be dropped';
     expect((await stopReceive('a')).text).toBe('The receive login could not be removed (ERROR:  role "smdb_receive" cannot be dropped); try again.');
     expect(stored('a').fleetDb.receive).toBeDefined();
   });
@@ -301,7 +305,7 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
     const saves = trackSaves();
     await step(Date.now());
     saves.restore();
-    expect(steps()).toEqual(['received-read', 'copies-insert', 'receive-nologin', 'receive-end', 'receive-drop', 'save', 'mark-clear']);
+    expect(steps()).toEqual(['received-read', 'copies-insert', 'receive-end', 'receive-nologin', 'receive-end', 'receive-drop', 'save', 'mark-clear']);
     expect(saves.patches).toEqual([{ receive: null, pushBroken: null }]);
     expect(fake.dbs['a-pg'].addresses).toEqual([ROW]);
   });
@@ -312,7 +316,7 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
     const saves = trackSaves();
     await step();
     saves.restore();
-    expect(steps()).toEqual(['received-read', 'receive-nologin', 'receive-end', 'receive-drop', 'oid-read', 'received-read', 'save']);
+    expect(steps()).toEqual(['received-read', 'receive-end', 'receive-nologin', 'receive-end', 'receive-drop', 'oid-read', 'received-read', 'save']);
     expect(saves.patches).toEqual([{ receive: null }]);
     expect(stored('a').fleetDb.pushBroken).toEqual(BROKEN);
   });
@@ -460,7 +464,8 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
     h.events.length = 0;
     const r = await stopReceive('a');
     expect(r).toMatchObject({ success: false, status: 500, text: 'The receive login no longer accepts new sessions, but 1 of its session(s) did not end after three tries, so receiving was not stopped; press Stop receiving again.' });
-    expect(h.events.filter(e => e === 'receive-end')).toHaveLength(3);
+    // NM20 Q1: three rounds, then the closing round of the failure path.
+    expect(h.events.filter(e => e === 'receive-end')).toHaveLength(4);
     expect(d.roles.smdb_receive.canLogin).toBe(false);
     expect(h.events).not.toContain('receive-drop');
     expect(stored('a').fleetDb.receive).toBeDefined();
@@ -484,10 +489,15 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
     expect(stored('a').fleetDb.receive).toBeDefined();
     expect(d.roles.smdb_receive.canLogin).toBe(false);
   });
-  it.each(['receive-nologin', 'receive-end', 'receive-drop'])('V38: the step %s fails: RV-STOPFAIL on Stop, nothing on N-c, the mark kept', async (failing) => {
+  // NM20 Q1: a failed session round also fails the closing round that follows it, and its error follows the first.
+  it.each([
+    ['receive-nologin', ''],
+    ['receive-end', '; closing the logins also failed: ERROR:  canceling statement due to lock timeout'],
+    ['receive-drop', ''],
+  ])('V38: the step %s fails: RV-STOPFAIL on Stop, nothing on N-c, the mark kept', async (failing, tail) => {
     await receive('a');
     fake.dbs['a-pg'].fail[failing] = 'ERROR:  canceling statement due to lock timeout';
-    expect(await stopReceive('a')).toMatchObject({ success: false, status: 500, text: 'The receive login could not be removed (ERROR:  canceling statement due to lock timeout); try again.' });
+    expect(await stopReceive('a')).toMatchObject({ success: false, status: 500, text: `The receive login could not be removed (ERROR:  canceling statement due to lock timeout${tail}); try again.` });
     expect(stored('a').fleetDb.receive).toBeDefined();
     await step();
     expect(stored('a').fleetDb.receive).toBeDefined();

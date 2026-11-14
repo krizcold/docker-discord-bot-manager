@@ -16,6 +16,11 @@ vi.mock('../../src/env/manager', async (o) => ({
   getEnvVarsWithStatus: (id: string) => ({ vars: { ...(h.env[id] || {}) }, undecryptable: [], encrypted: [], corrupt: false }),
   getEnvVars: (id: string) => ({ ...(h.env[id] || {}) }),
 }));
+// NM20 part 3: the maintenance check provisions through fleetReplication; this file's docker is not faked.
+vi.mock('../../src/instance/fleetReplication', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/instance/fleetReplication')>()),
+  provisionManagedRoles: async () => ({ ok: true, wrote: [] }),
+}));
 vi.mock('../../src/instance/dbLogin', async (o) => ({
   ...(await o<typeof import('../../src/instance/dbLogin')>()),
   sidecarRunning: async () => true,

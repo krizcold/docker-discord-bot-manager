@@ -160,14 +160,14 @@ describe('the move code', () => {
   it('300 seeded codes round trip', () => {
     for (let i = 0; i < 300; i++) {
       const id = Array.from({ length: 24 }, () => '0123456789abcdef'[rnd() % 16]).join('');
-      const code = { ...fakeJoin({ host: `h${tame(5)}.example`, port: 1 + (rnd() % 65535), machine: `m ${tame(6)}` }), recv: { user: 'smdb_receive', password: tame(32), id } };
+      const code = { ...fakeJoin({ host: `h${tame(5)}.example`, port: 1 + (rnd() % 65535), machine: `m ${tame(6)}` }), recv: { user: 'smdb_receive', password: tame(32), id }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } };
       const text = encodeMoveCode(code);
       expect(isMoveCode(text)).toBe(true);
       expect(decodeMoveCode(text)).toEqual({ ok: true, code });
     }
   });
   it('a code without the receive id, or with a malformed one, is refused (D41)', () => {
-    const base = { ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' } };
+    const base = { ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } };
     const enc = (o: Record<string, unknown>) => `smdbmove1.${Buffer.from(JSON.stringify(o)).toString('base64url')}`;
     expect(decodeMoveCode(enc(base))).toEqual({ ok: true, code: base });
     for (const id of [undefined, '', '0123456789abcdef0123456', '0123456789ABCDEF01234567', '0123456789abcdef012345678', 'g123456789abcdef01234567', 7]) {
@@ -175,7 +175,7 @@ describe('the move code', () => {
     }
   });
   it('each rejected field', () => {
-    const base = { ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' } };
+    const base = { ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } };
     const enc = (o: Record<string, unknown>) => `smdbmove1.${Buffer.from(JSON.stringify(o)).toString('base64url')}`;
     expect(decodeMoveCode(enc({ ...base, recv: undefined }))).toEqual({ ok: false, why: 'it names no valid receive' });
     expect(decodeMoveCode(enc({ ...base, recv: { user: 'a b', password: 'p' } }))).toEqual({ ok: false, why: 'it names no valid receive user' });
@@ -187,7 +187,7 @@ describe('the move code', () => {
   it('a join code is not a move code, and back', () => {
     const join = encodeJoinCode(fakeJoin());
     expect(decodeMoveCode(join)).toEqual({ ok: false, why: 'it does not start with smdbmove1.' });
-    const move = encodeMoveCode({ ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' } });
+    const move = encodeMoveCode({ ...fakeJoin(), recv: { user: 'smdb_receive', password: 'p', id: '0123456789abcdef01234567' }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } });
     expect(decodeJoinCode(move)).toEqual({ ok: false, why: 'it does not start with smdbjoin1.' });
   });
 });

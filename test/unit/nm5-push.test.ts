@@ -34,8 +34,8 @@ const NOTHING = '; nothing was changed';
 const FILE = 'pre-push-2026-10-28T12-00-00-000Z.dump';
 const SUM = 'checksum|"public"."t"|0123456789abcdef0123456789abcdef';
 const PUSH_ID = '0123456789abcdef01234567';
-const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
-const OTHER = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', app: { user: 'other', password: 'x' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
+const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
+const OTHER = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', app: { user: 'other', password: 'x' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
 const PUSH_MARK = { mode: 'push', machine: 'win.example', host: 'win.example', port: 5440, generation: 4, file: FILE, phase: 'pushing', at: '2026-10-28T12:00:00.000Z' };
 
 type Step = 'probe' | 'push' | 'counts' | 'sums' | 'commit';
@@ -70,7 +70,7 @@ describe('O6 Push', () => {
   it('P1: dump, intent, drop and restore, counts, checksums, commit, done, stop, rejoin', async () => {
     const r = await push('a', CODE);
     expect(r.text).toBe(`The database was pushed to win.example and checked: 1 tables and 3 rows, with the same counts and checksums on both. win.example is the main now (generation 4); choose Running in its State window to start the bot there. This machine now rebuilds itself as a copy of win.example; a dump of its database from before the push is kept with the backups (${FILE}).`);
-    expect(h.events.filter(e => e.startsWith('dump:') || e.startsWith('client:') || e === 'stop-bot:push' || e === 'reseed')).toEqual(['client:probe', 'dump:pre-push-', 'client:push', 'client:counts', 'client:sums', 'client:commit', 'stop-bot:push', 'reseed']);
+    expect(h.events.filter(e => e.startsWith('dump:') || e.startsWith('client:') || e === 'stop-bot:push' || e === 'reseed')).toEqual(['client:probe', 'dump:pre-push-', 'client:create', 'client:meta', 'client:push', 'client:counts', 'client:sums', 'client:cap', 'client:commit', 'client:last', 'client:last-meta', 'stop-bot:push', 'reseed']);
     expect(stored('a').fleetDb.handover).toMatchObject({ mode: 'push', phase: 'done', generation: 4, file: FILE });
     expect(h.reseedCalls[0].opts).toEqual({ dumpDone: true, safetyDump: FILE });
     const commit = fake.calls.find(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit'))!;
@@ -80,7 +80,7 @@ describe('O6 Push', () => {
   });
   it.each([
     ['not a move code', 'smdbjoin1.xyz', /^This is not a move code: /],
-    ['own address', encodeMoveCode({ ...fakeJoin({ host: 'main.example', port: 5433 }), recv: { user: 'smdb_receive', password: 'p', id: PUSH_ID } } as any), new RegExp(`^That move code is for this machine's own database${NOTHING}$`)],
+    ['own address', encodeMoveCode({ ...fakeJoin({ host: 'main.example', port: 5433 }), recv: { user: 'smdb_receive', password: 'p', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any), new RegExp(`^That move code is for this machine's own database${NOTHING}$`)],
     ['owner role differs', OTHER, new RegExp(`^The other machine's database role is other, not app, so the pushed tables would have no owner there${NOTHING}$`)],
   ])('P2: %s', async (_n, code, text) => {
     expect((await push('a', code as string)).text).toMatch(text);
@@ -229,7 +229,7 @@ describe('P15, P18: a push cut after the intent', () => {
     steps.length = 0;
     const again = await push('a', CODE);
     expect(again.success).toBe(true);
-    expect(steps).toEqual(['probe', 'push', 'counts', 'sums', 'commit']);
+    expect(steps).toEqual(['probe', 'create', 'meta', 'push', 'counts', 'sums', 'cap', 'commit', 'last', 'last-meta']);
     expect(stored('a').fleetDb.handover).toMatchObject({ mode: 'push', phase: 'done', generation: 4 });
   });
 });
@@ -266,7 +266,7 @@ describe('P23, P24: the received row of this push id (D41)', () => {
     };
     const r = await push('a', CODE);
     expect(r.success).toBe(true);
-    expect(steps).toEqual(['probe', 'push', 'counts', 'sums', 'commit']);
+    expect(steps).toEqual(['probe', 'create', 'meta', 'push', 'counts', 'sums', 'cap', 'commit', 'last', 'last-meta']);
     expect(h.events).toContain('dump:pre-push-');
     expect(rows.has(PUSH_ID)).toBe(true);
     expect(h.reseedCalls[0].opts).toEqual({ dumpDone: true, safetyDump: FILE });
@@ -285,11 +285,13 @@ describe('G20: Push and Move out by file while pushBroken stands', () => {
   });
 });
 
+// Inverted by NM20 R3.6 and S3: the raise runs as smdb_receive_meta under SET ROLE dbm_meta, never as dbm_admin.
 describe('P25 (D59): the commit runs as the manager role', () => {
-  it('the commit script starts with SET ROLE dbm_admin, before the raise', async () => {
+  it('the commit script starts with SET ROLE dbm_meta, before the raise', async () => {
     expect((await push('a', CODE)).success).toBe(true);
     const commit = fake.calls.find(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit'))!;
     const script = commit.args[commit.args.length - 1];
-    expect(script.startsWith('SET ROLE dbm_admin;\nBEGIN;')).toBe(true);
+    expect(script.startsWith('SET ROLE dbm_meta;\nBEGIN;')).toBe(true);
+    expect(script).not.toContain('dbm_admin');
   });
 });

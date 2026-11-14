@@ -20,6 +20,7 @@ import { fenceMigrateSource, liftMigrateFence } from '../../src/instance/fleetBa
 import { readDatabaseUrl } from '../../src/config/databaseUrl';
 import { ensureGenerationSql, GEN_READ_SQL, parseGenRow } from '../../src/instance/switchSql';
 import { appContainerEnv, appContainerRunning, getBot } from '../../src/docker/containerManager';
+import { provisionedCluster } from './pg-cluster';
 
 const dockerRuns = (() => {
   try {
@@ -45,23 +46,18 @@ const run = (args: string[], input?: string) => {
   const r = spawnSync('docker', args, { encoding: 'utf-8', timeout: 600000, input });
   return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
 };
-const ok = (sql: string) => {
-  const r = run(['exec', '-i', PG, 'psql', '-X', '-U', 'smdb', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
+const ok = (sql: string, role = MANAGER_DB_ROLE) => {
+  const r = run(['exec', '-i', PG, 'psql', '-X', '-U', role, '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1'], sql);
   expect(r.status, r.err).toBe(0);
   return r.out;
 };
 const target = { container: PG, user: 'bot' };
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM10 against a real Postgres 16 and container (Linux with docker)', () => {
-  beforeAll(() => {
+  beforeAll(async () => {
     const n = run(['network', 'create', NET]);
     expect(n.status, n.err).toBe(0);
-    const r = run(['run', '-d', '--name', PG, '--network', NET, '-v', `${PG_VOL}:/var/lib/postgresql/data`, '-e', 'POSTGRES_USER=smdb', '-e', 'POSTGRES_PASSWORD=pw', '-e', 'POSTGRES_DB=smdb', 'postgres:16-alpine']);
-    expect(r.status, r.err).toBe(0);
-    for (let i = 0; i < 240; i++) {
-      if (run(['exec', PG, 'pg_isready', '-U', 'smdb', '-d', 'smdb']).status === 0) break;
-      pause(500);
-    }
+    await provisionedCluster({ name: PG, user: 'smdb', db: 'smdb', password: 'pw', network: NET });
     const a = run(['run', '-d', '--name', APP, '--network', NET, '--label', `com.docker.compose.project=${ID}`, '--label', 'com.docker.compose.service=app',
       '-e', 'DATA_BACKEND=postgres', '-e', 'DATA_BACKEND_URL=postgresql://smdb:pw@x-fleet-postgres:5432/smdb', '-e', 'OTHER=1', 'postgres:16-alpine', 'sleep', '600']);
     expect(a.status, a.err).toBe(0);
@@ -84,11 +80,11 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM10 against a rea
     fs.rmSync(h.dir, { recursive: true, force: true });
   });
 
-  it('PG1 a new companion: its role and database answer, dbm_admin is made, and the generation row is written', async () => {
+  it('PG1 (NM20 3.1, 3.3) a new companion: its role and database answer, dbm_admin is its first role and the check finds it, and the generation row is written', async () => {
     expect(run(['exec', PG, 'pg_isready', '-U', 'smdb', '-d', 'smdb']).status).toBe(0);
     expect(await ensureManagerDbRole({ container: PG, user: 'smdb' })).toEqual({ ok: true });
-    expect(ok(`SELECT rolname FROM pg_roles WHERE rolname = '${MANAGER_DB_ROLE}'`)).toBe(MANAGER_DB_ROLE);
-    ok(ensureGenerationSql('machine-a'));
+    expect(ok('SELECT rolname FROM pg_roles WHERE oid = 10')).toBe(MANAGER_DB_ROLE);
+    ok(ensureGenerationSql('machine-a'), 'dbm_meta');
     expect(parseGenRow(ok(GEN_READ_SQL))).toMatchObject({ generation: 1, machine: 'machine-a' });
   });
 
@@ -242,7 +238,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM10 against a rea
 
   it('PG8 (B39) an enabled subscription: the fence refuses before any write, and writes once the subscription is gone', async () => {
     const sql = (text: string) => {
-      const r = run(['exec', PG, 'psql', '-U', 'smdb', '-d', 'smdb', '-c', text]);
+      const r = run(['exec', PG, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-c', text]);
       expect(r.status, r.err).toBe(0);
     };
     try {
@@ -257,9 +253,9 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM10 against a rea
       expect(ownerLines('migrate:3').length).toBeGreaterThan(0);
       expect(await liftMigrateFence(FLEET_DB, 'migrate:3')).toEqual({ result: 'lifted' });
     } finally {
-      run(['exec', PG, 'psql', '-U', 'smdb', '-d', 'smdb', '-c', 'ALTER SUBSCRIPTION nm10s DISABLE']);
-      run(['exec', PG, 'psql', '-U', 'smdb', '-d', 'smdb', '-c', 'ALTER SUBSCRIPTION nm10s SET (slot_name = NONE)']);
-      run(['exec', PG, 'psql', '-U', 'smdb', '-d', 'smdb', '-c', 'DROP SUBSCRIPTION IF EXISTS nm10s']);
+      run(['exec', PG, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-c', 'ALTER SUBSCRIPTION nm10s DISABLE']);
+      run(['exec', PG, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-c', 'ALTER SUBSCRIPTION nm10s SET (slot_name = NONE)']);
+      run(['exec', PG, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'smdb', '-c', 'DROP SUBSCRIPTION IF EXISTS nm10s']);
     }
   }, 120_000);
 

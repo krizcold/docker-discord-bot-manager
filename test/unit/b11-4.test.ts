@@ -191,7 +191,7 @@ describe('R28-J9: a failed restore keeps its own notice', () => {
     await fb.restoreFleetBackup('a', OLD);
     const text = fb.getFleetRestoreError('a') || '';
     expect(text).not.toContain('partial restore');
-    expect(text).toContain('may be missing, or unchanged if the drop itself failed');
+    expect(text).toContain('may be missing or empty, or unchanged if the drop itself failed');
   });
 });
 

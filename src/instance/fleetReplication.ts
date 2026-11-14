@@ -31,7 +31,6 @@ import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets
 import { feedStdin } from '../docker/childStdin';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
-import { MANAGER_DB_ROLE } from './dbLogin';
 import { certFingerprint, encodeJoinCode, machineText, splitBackendUrls, sqlLiteral } from '../config/joinCode';
 import { AddressesOutcome, sendAddresses } from './fleetJoin';
 import { hasHostParam, namesDatabaseOf, readDatabaseUrl, URL_FORM } from '../config/databaseUrl';
@@ -77,8 +76,8 @@ function admittedWithoutTls(addr: string): boolean {
 }
 
 /** The addresses of live TCP clients without TLS that the narrowed pg_hba would refuse on their next connection. */
-async function plainClientsOutsidePool(containerName: string, db: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
-  const read = await psql(containerName, db,
+async function plainClientsOutsidePool(containerName: string): Promise<{ ok: true; addrs: string[] } | { ok: false; error: string }> {
+  const read = await clusterSql(containerName,
     `SELECT COALESCE(string_agg(DISTINCT host(a.client_addr), ' '), '') FROM pg_stat_activity a JOIN pg_stat_ssl s ON s.pid = a.pid WHERE a.client_addr IS NOT NULL AND NOT s.ssl;`);
   if (!read.ok) return { ok: false, error: read.stderr.trim() };
   const addrs = read.stdout.trim().split(/\s+/).filter(a => a !== '' && /^[0-9A-Fa-f:.]+$/.test(a) && !admittedWithoutTls(a));
@@ -125,32 +124,28 @@ function dbExec(containerName: string, args: string[], stdin?: string): Promise<
   });
 }
 
-/** The bot role of the managed database in this container, from the registry; '' when none names it. */
-function botRoleOf(containerName: string): string {
-  try {
-    return containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName)?.fleetDb?.user ?? '';
-  } catch {
-    return '';
-  }
+/** Roles, slots, server settings and the pg_stat views, as the superuser on the postgres database. */
+function clusterSql(containerName: string, sql: string, stdin = false): Promise<dbLogin.CallResult> {
+  return dbLogin.runCall(containerName, dbLogin.clusterPsql(containerName, sql, { stdin }));
 }
 
-/** dbExec for args that log in as MANAGER_DB_ROLE: a missing role is made and the call runs once more. */
-function managerDbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return dbLogin.asManager({ container: containerName, user: botRoleOf(containerName) },
-    role => dbExec(containerName, dbLogin.withRole(args, role), stdin), r => !r.ok && dbLogin.isMissingManagerRole(r.stderr));
+/** smdb_manager in the bot's database, as dbm_meta. */
+function metaSql(containerName: string, db: string, sql: string, stdin = false): Promise<dbLogin.CallResult> {
+  return dbLogin.runCall(containerName, dbLogin.metaPsql(containerName, db, sql, { stdin }));
 }
 
-function psql(containerName: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return managerDbExec(containerName, ['psql', '-U', MANAGER_DB_ROLE, '-d', db, '-v', 'ON_ERROR_STOP=1', '-Atc', sql]);
+/** The bot's own data in its database, as dbm_work. */
+function workSql(containerName: string, db: string, sql: string): Promise<dbLogin.CallResult> {
+  return dbLogin.runCall(containerName, dbLogin.workPsql(containerName, db, sql));
 }
 
 /** Why pg_hba.conf must not be rewritten now: a lane's write fence stands in it, or that could not be read. Null when it may be. */
-export async function fenceLinesRefusal(containerName: string, db: string): Promise<string | null> {
-  const read = await psql(containerName, db, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
+export async function fenceLinesRefusal(containerName: string): Promise<string | null> {
+  const read = await clusterSql(containerName, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
   const count = read.ok ? read.stdout.trim() : '';
   if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
   if (Number(count) === 0) return null;
-  const owners = await psql(containerName, db, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
+  const owners = await clusterSql(containerName, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
   const owner = owners.ok ? fleetBackupGuards.parseFenceOwner(owners.stdout) : null;
   const holder = containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName);
   const whose = !owners.ok ? 'whose lane set it could not be read'
@@ -159,11 +154,6 @@ export async function fenceLinesRefusal(containerName: string, db: string): Prom
     : holder?.migrate?.hbaFence === owner ? `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)}, which lifts it when it ends`
     : `it belongs to ${fleetBackupGuards.fenceOwnerText(owner)} that is no longer open, so no lane lifts it; a restore takes it over and lifts it, or remove the lines by hand if nothing should hold them`;
   return `a write fence stands in pg_hba.conf (lines ending in ${fleetBackupGuards.WRITE_FENCE_MARK}); ${whose}`;
-}
-
-/** SQL on stdin, for a statement that must stay out of every command line. */
-function psqlScript(containerName: string, db: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return managerDbExec(containerName, ['psql', '-U', MANAGER_DB_ROLE, '-d', db, '-v', 'ON_ERROR_STOP=1', '-At'], sql);
 }
 
 /** running true or false as docker says it; null with docker's error when docker could not be asked. */
@@ -208,6 +198,110 @@ export function fleetDbShape(fleetDb: InstanceConfig['fleetDb'] | null | undefin
   return JSON.stringify(rest);
 }
 
+/** The distinct passwords of the stored Database URL's addresses, those naming the managed database first. */
+function urlPasswords(instance: InstanceConfig, urlKey: string | undefined): string[] {
+  const fleetDb = instance.fleetDb;
+  const value = fleetDb && urlKey ? (envManager.getEnvVars(instance.id)[urlKey] || '').trim() : '';
+  const named: string[] = [];
+  const others: string[] = [];
+  for (const entry of value === '' ? [] : splitBackendUrls(value)) {
+    const pw = urlPassword(entry);
+    if (!pw) continue;
+    const first = readDatabaseUrl(entry).addresses[0];
+    (first && namesDatabaseOf(first, fleetDb!) ? named : others).push(pw);
+  }
+  return [...new Set([...named, ...others])];
+}
+
+/**
+ * What provisionRoles needs for the managed database: the recorded password, and when none is recorded, the Database
+ * URL's passwords (none when the env store does not read).
+ */
+export function provisionTarget(instance: InstanceConfig): dbLogin.ProvisionTarget | null {
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb) return null;
+  const read = managedDbPassword(instance);
+  let candidates: string[] = [];
+  if (!read.ok) {
+    const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
+    try {
+      if (urlKey && !urlStoreRefusal(instance.id, urlKey)) candidates = urlPasswords(instance, urlKey);
+    } catch {
+      candidates = [];
+    }
+  }
+  const shape = fleetDbShape(fleetDb);
+  const recordUnchanged = () => {
+    const now = containerManager.getBot(instance.id)?.fleetDb;
+    return !!now && fleetDbShape(now) === shape && !now.password;
+  };
+  return { container: fleetDb.containerName, user: fleetDb.user, db: fleetDb.db, botId: instance.id, password: read.ok ? read.password : null, candidates, recordUnchanged };
+}
+
+/** A4-2: why dbm_admin keeps its password when the fill found none for the bot's role. */
+export function adminKeptText(user: string, read: Exclude<PasswordRead, { ok: true }>): string {
+  if (read.why === 'lost') return `${dbLogin.MANAGER_DB_ROLE} keeps its password because the bot's database password on record no longer decrypts`;
+  return `${dbLogin.MANAGER_DB_ROLE} keeps its password because no password is on record for the role ${user}${read.detail ? ` (${read.detail})` : ''}`;
+}
+
+const reservedLogged = new Set<string>();
+
+/** provisionRoles for the bot's managed database; a container that reserves too few connections is logged once. */
+export async function provisionManagedRoles(instance: InstanceConfig, opts: { reread?: boolean; extra?: string } = {}): Promise<dbLogin.ProvisionResult> {
+  const t = provisionTarget(instance);
+  if (!t) return { ok: false, cls: 'other', error: 'This instance hosts no managed fleet database' };
+  let r = await dbLogin.provisionRoles(t, { reread: opts.reread });
+  // dbm_admin kept its password while the record lacks the bot's (V3): record it from the Database URL, then step 8.
+  if (r.ok && t.password === null && !dbLogin.isRolesConfirmed(t.container)) {
+    const filled = await managedDbPasswordFilled(instance, { extra: opts.extra, record: false });
+    if (!filled.ok) return { ok: false, cls: 'other', error: adminKeptText(t.user, filled), rolesSet: true };
+    if (!t.recordUnchanged!()) {
+      return { ok: false, cls: 'other', error: `the bot's database record changed while its roles were set up, so the password the role ${t.user} accepts was not recorded; the next check reads the new record`, rolesSet: true };
+    }
+    let why: string | null = null;
+    try {
+      if (!containerManager.updateInstanceFleetDbPassword(instance.id, filled.password)) why = "the bot's record is no longer in the registry";
+    } catch (err) {
+      why = err instanceof Error ? err.message : String(err);
+    }
+    if (why !== null) {
+      return { ok: false, cls: 'other', error: `the role ${t.user} was created, but its password could not be recorded (${redactSecrets(why, [filled.password])}); it is recorded at the next check`, rolesSet: true };
+    }
+    r = await dbLogin.provisionRoles({ ...t, password: filled.password, candidates: [] }, { reread: true });
+  }
+  if (r.ok && r.reserved !== undefined && r.reserved < 4 && !reservedLogged.has(t.container)) {
+    reservedLogged.add(t.container);
+    console.warn(`[Database] ${t.container}: reserved_connections is ${r.reserved}, below the 4 the manager's logins need; the next start after a build recreates the database container with it`);
+  }
+  return r;
+}
+
+const adminPasswordLeft = () => `the roles did not read back as set (${dbLogin.MANAGER_DB_ROLE} still has a password)`;
+
+/**
+ * Invariant A after NM14's fill: a container left out of the confirmed set (dbm_admin kept its password while the
+ * record lacked the bot's) is provisioned again from the record the fill wrote, and must confirm before a code or an
+ * Enable goes on.
+ */
+async function confirmedAfterFill(instance: InstanceConfig): Promise<dbLogin.ProvisionResult> {
+  const container = instance.fleetDb!.containerName;
+  if (dbLogin.isRolesConfirmed(container)) return { ok: true, wrote: [] };
+  const again = await provisionManagedRoles(containerManager.getBot(instance.id) ?? instance, { reread: true });
+  if (again.ok && !dbLogin.isRolesConfirmed(container)) return { ok: false, cls: 'other', error: adminPasswordLeft() };
+  return again;
+}
+
+/** Receive's code while a push is pending: a read only (provisioning would race the push), refused while dbm_admin has a password. */
+async function adminPasswordRefusal(instance: InstanceConfig): Promise<dbLogin.ProvisionResult> {
+  const { containerName, user, db } = instance.fleetDb!;
+  const read = await dbLogin.runCall(containerName, dbLogin.clusterPsql(containerName, dbLogin.rolesReadSql(user, db)));
+  if (!read.ok) return { ok: false, cls: 'other', error: `reading the roles failed (${read.error})` };
+  const roles = dbLogin.parseRolesRead(read.stdout);
+  if (!roles) return { ok: false, cls: 'other', error: `the database's roles read back as ${read.stdout.trim().slice(0, 200)}` };
+  if (roles.recovery) return { ok: false, cls: 'in-recovery' };
+  return roles.adminPassword ? { ok: false, cls: 'other', error: adminPasswordLeft() } : { ok: true, wrote: [] };
+}
+
 const FILL_NOURL = 'the Database URL holds no password to check';
 const fillUnread = (why: string) => `the password in the Database URL could not be checked against the database: ${why}`;
 
@@ -223,16 +317,7 @@ export async function managedDbPasswordFilled(instance: InstanceConfig, opts: { 
   const urlKey = findAppCapabilities(instance.sourceUrl)?.companionDb?.env.url;
   const unreadStore = urlKey ? urlStoreRefusal(instance.id, urlKey) : null;
   if (unreadStore) return { ok: false, why: 'absent', detail: fillUnread(unreadStore) };
-  const value = urlKey ? (envManager.getEnvVars(instance.id)[urlKey] || '').trim() : '';
-  const named: string[] = [];
-  const others: string[] = [];
-  for (const entry of value === '' ? [] : splitBackendUrls(value)) {
-    const pw = urlPassword(entry);
-    if (!pw) continue;
-    const first = readDatabaseUrl(entry).addresses[0];
-    (first && namesDatabaseOf(first, fleetDb) ? named : others).push(pw);
-  }
-  const fromUrl = [...new Set([...named, ...others])];
+  const fromUrl = urlPasswords(instance, urlKey);
   const extra = opts.extra || '';
   const candidates = [...new Set([...fromUrl, ...(extra ? [extra] : [])])];
   if (candidates.length === 0) return { ok: false, why: 'absent', detail: FILL_NOURL };
@@ -448,8 +533,14 @@ async function enableInLane(
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
   }
-  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
-  if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; nothing was changed, so retry Enable after that` };
+  const rolesRefusal = (r: dbLogin.ProvisionResult) => (r.ok ? null : {
+    success: false as const,
+    error: `Enable was refused: the database's roles could not be set up (${r.cls === 'in-recovery' ? 'the database is a live copy in recovery, which takes its roles from its main' : r.error}); replication was not set up`,
+  });
+  const refusedRoles = rolesRefusal(await provisionManagedRoles(instance, { extra: opts.dbPassword }));
+  if (refusedRoles) return refusedRoles;
+  const fenced = await fenceLinesRefusal(fleetDb.containerName);
+  if (fenced) return { success: false, error: `Enable rewrites pg_hba.conf, but ${fenced}; replication was not set up, so retry Enable after that` };
   const kept = keptUrlWhat(instance, dbEnv.url);
   let dbPassword: string | null = null;
   if (!kept) {
@@ -459,11 +550,13 @@ async function enableInLane(
     const read = await managedDbPasswordFilled(instance, { extra: opts.dbPassword, record: true });
     if (!read.ok) {
       return { success: false, error: read.why === 'lost'
-        ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Enable cannot write its address into the Database URL; nothing was changed"
-        : `The managed database's password is not on record (${read.detail}), so Enable cannot write its address into the Database URL; nothing was changed` };
+        ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so Enable cannot write its address into the Database URL; replication was not set up"
+        : `The managed database's password is not on record (${read.detail}), so Enable cannot write its address into the Database URL; replication was not set up` };
     }
     dbPassword = read.password;
   }
+  const refusedAgain = rolesRefusal(await confirmedAfterFill(instance));
+  if (refusedAgain) return refusedAgain;
   // An existing posture whose password reads empty is a key-loss scrub, not an
   // absent credential: minting a fresh one here would silently rotate the
   // fleet's replication credential and break every standby at its next
@@ -473,14 +566,14 @@ async function enableInLane(
   }
   const recordAtStart = fleetDbShape(fleetDb);
 
-  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.db);
-  if (!live.ok) return { success: false, error: `could not read which clients connect without TLS (nothing was changed): ${live.error}` };
+  const live = await plainClientsOutsidePool(fleetDb.containerName);
+  if (!live.ok) return { success: false, error: `could not read which clients connect without TLS (replication was not set up): ${live.error}` };
   // With a record, the bot already got the TLS URL at a start since, or its
   // addresses are in keptPlain; only a start may drop a kept line.
   let own: string[] = [];
   if (!fleetDb.replication) {
     const containers = await ownContainersOutsidePool(instance.sanitizedName, fleetDb.containerName);
-    if (!containers.ok) return { success: false, error: `could not read the addresses of this instance's containers (nothing was changed): ${containers.error}` };
+    if (!containers.ok) return { success: false, error: `could not read the addresses of this instance's containers (replication was not set up): ${containers.error}` };
     own = containers.addrs;
   }
   const plain = { addrs: [...new Set([...live.addrs, ...(fleetDb.replication?.keptPlain ?? fleetDb.keptPlain ?? []), ...own])].sort() };
@@ -496,41 +589,41 @@ async function enableInLane(
   });
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
-  const exists = await psql(fleetDb.containerName, fleetDb.db, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
+  const exists = await clusterSql(fleetDb.containerName, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
   if (!exists.ok) return failed(`database setup failed: ${exists.stderr.trim()}`);
   // The verifier, never the password, and outside a DO block: a failing
   // statement inside one is echoed whole in the CONTEXT line, which the
   // quiet session settings do not hold back.
   const verifier = scramSha256Verifier(password);
   const verb = exists.stdout.trim() === '0' ? 'CREATE' : 'ALTER';
-  const setup = await psqlScript(fleetDb.containerName, fleetDb.db,
-    `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`);
+  const setup = await clusterSql(fleetDb.containerName,
+    `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`, true);
   if (!setup.ok) return failed(`database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}`);
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
-  const ssl = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM SET ssl = on;');
+  const ssl = await clusterSql(fleetDb.containerName, 'ALTER SYSTEM SET ssl = on;');
   if (!ssl.ok) return failed(`enabling ssl failed: ${ssl.stderr.trim()}`);
   // Restart-only setting (no re-initdb): makes pg_rewind possible on every
   // cluster that has ever run enable (reopened ruling R6).
-  const hints = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM SET wal_log_hints = on;');
+  const hints = await clusterSql(fleetDb.containerName, 'ALTER SYSTEM SET wal_log_hints = on;');
   if (!hints.ok) return failed(`enabling wal_log_hints failed: ${hints.stderr.trim()}`);
-  const keep = await psql(fleetDb.containerName, fleetDb.db, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
+  const keep = await clusterSql(fleetDb.containerName, `ALTER SYSTEM SET max_slot_wal_keep_size = '${keepMb}MB';`);
   if (!keep.ok) return failed(`setting the WAL retention bound failed: ${keep.stderr.trim()}`);
-  const asyncOnly = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
+  const asyncOnly = await clusterSql(fleetDb.containerName, 'ALTER SYSTEM RESET synchronous_standby_names;');
   if (!asyncOnly.ok) return failed(`resetting synchronous replication failed: ${asyncOnly.stderr.trim()}`);
 
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
     `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
-  const reload = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
+  const reload = await clusterSql(fleetDb.containerName, 'SELECT pg_reload_conf();');
   if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
 
   const ownCert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
   if (!ownCert.ok) return failed(`setting up the address list failed: the server certificate could not be read (${probeErrorTail(ownCert.stderr)})`);
   const previous = fleetDb.replication;
   const moved = previous && (previous.publicHost !== host || previous.hostPort !== port) ? { host: previous.publicHost, port: previous.hostPort } : null;
-  const addresses = await psqlScript(fleetDb.containerName, fleetDb.db, addressTableSql(host, port, ownCert.stdout.trim(), machineText(host), moved));
+  const addresses = await metaSql(fleetDb.containerName, fleetDb.db, addressTableSql(host, port, ownCert.stdout.trim(), machineText(host), moved), true);
   if (!addresses.ok) return failed(`setting up the address list failed: ${redactSecrets(addresses.stderr.trim(), [password])}`);
 
   const replication: FleetDbReplication = {
@@ -619,7 +712,7 @@ async function disableInLane(
     return { success: false, error: dbDownText(dbState, 'Database container is not running - start the instance first so the replication slot can be dropped (a leaked slot retains WAL forever)') };
   }
 
-  const streaming = await psql(fleetDb.containerName, fleetDb.db,
+  const streaming = await clusterSql(fleetDb.containerName,
     `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND active;`);
   if (!streaming.ok) {
     return { success: false, error: `could not read the replication slots (nothing was disabled): ${streaming.stderr.trim()}` };
@@ -629,7 +722,7 @@ async function disableInLane(
   }
   // A seed's base backup and a stream without a slot hold no active slot,
   // and revoking the login would cut them off mid-copy.
-  const senders = await psql(fleetDb.containerName, fleetDb.db,
+  const senders = await clusterSql(fleetDb.containerName,
     `SELECT COALESCE(string_agg(COALESCE(host(client_addr), 'a local socket'), ', ' ORDER BY client_addr), '') FROM pg_stat_replication WHERE usename = '${REPLICATION_ROLE}';`);
   if (!senders.ok) {
     return { success: false, error: `could not read the replication connections (nothing was disabled): ${senders.stderr.trim()}` };
@@ -656,15 +749,15 @@ async function disableInLane(
   // would wedge this database's next write (B6 map F18). Separate
   // calls, for the reason the enable above records: ALTER SYSTEM refuses to run
   // inside the implicit transaction a multi-statement psql -c wraps its input in.
-  const relax = await psql(fleetDb.containerName, fleetDb.db, 'ALTER SYSTEM RESET synchronous_standby_names;');
+  const relax = await clusterSql(fleetDb.containerName, 'ALTER SYSTEM RESET synchronous_standby_names;');
   if (!relax.ok) {
     return { success: false, error: `could not relax the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relax.stderr.trim()}` };
   }
-  const relaxed = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
+  const relaxed = await clusterSql(fleetDb.containerName, 'SELECT pg_reload_conf();');
   if (!relaxed.ok) {
     return { success: false, error: `could not reload after relaxing the synchronous posture, so the Disable did not finish; press Disable replication again to finish it: ${relaxed.stderr.trim()}` };
   }
-  const drop = await psql(fleetDb.containerName, fleetDb.db, `
+  const drop = await clusterSql(fleetDb.containerName, `
     DO $$ DECLARE s record; BEGIN
       FOR s IN SELECT slot_name FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}') AND NOT active LOOP
         PERFORM pg_drop_replication_slot(s.slot_name);
@@ -673,7 +766,7 @@ async function disableInLane(
   if (!drop.ok) {
     return { success: false, error: `slot drop failed, so the Disable did not finish; press Disable replication again to finish it: ${drop.stderr.trim()}` };
   }
-  const left = await psql(fleetDb.containerName, fleetDb.db,
+  const left = await clusterSql(fleetDb.containerName,
     `SELECT COALESCE(string_agg(slot_name, ', ' ORDER BY slot_name), '') FROM pg_replication_slots WHERE starts_with(slot_name, '${FLEET_SLOT_PREFIX}');`);
   if (!left.ok) {
     return { success: false, error: `could not confirm the replication slots are gone, so the Disable did not finish; press Disable replication again to finish it: ${left.stderr.trim()}` };
@@ -681,7 +774,7 @@ async function disableInLane(
   if (left.stdout.trim() !== '') {
     return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then press Disable replication again to finish it` };
   }
-  const revoke = await psql(fleetDb.containerName, fleetDb.db, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
+  const revoke = await clusterSql(fleetDb.containerName, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
   if (!revoke.ok) {
     return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
   }
@@ -721,16 +814,16 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const keptPlain = repl ? repl.keptPlain : fleetDb?.keptPlain;
   if (!fleetDb || !keptPlain?.length) return null;
   const notNarrowed = 'the database still admits non-TLS connections from the addresses Enable kept, and the next start tries again';
-  const fenced = await fenceLinesRefusal(fleetDb.containerName, fleetDb.db);
+  const fenced = await fenceLinesRefusal(fleetDb.containerName);
   if (fenced) return `pg_hba was not narrowed: ${fenced}; ${notNarrowed}`;
-  const live = await plainClientsOutsidePool(fleetDb.containerName, fleetDb.db);
+  const live = await plainClientsOutsidePool(fleetDb.containerName);
   if (!live.ok) return `Could not read which clients connect to the database without TLS (${live.error}), so ${notNarrowed}`;
   const plain = { addrs: live.addrs.filter(a => keptPlain.includes(a)) };
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
     `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
   if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
-  const reload = await psql(fleetDb.containerName, fleetDb.db, 'SELECT pg_reload_conf();');
+  const reload = await clusterSql(fleetDb.containerName, 'SELECT pg_reload_conf();');
   if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;
   try {
     if (repl) {
@@ -835,7 +928,7 @@ export async function getFleetReplicationStatus(
   if (dbState.running === null) status.probeError = dbState.error;
   if (dbState.running !== true) return status;
 
-  const probe = await psql(fleetDb.containerName, fleetDb.db,
+  const probe = await clusterSql(fleetDb.containerName,
     `SELECT current_setting('ssl'),
             (SELECT json_agg(json_build_object(
                'clientAddr', client_addr::text,
@@ -886,7 +979,7 @@ export async function getFleetReplicationStatus(
         }));
       }
     } catch { /* no slots */ }
-    const listed = await psql(fleetDb.containerName, fleetDb.db, ADDRESS_BY_SLOT_SQL);
+    const listed = await metaSql(fleetDb.containerName, fleetDb.db, ADDRESS_BY_SLOT_SQL);
     if (listed.ok) {
       try {
         const rows = JSON.parse(listed.stdout.trim() || '[]');
@@ -920,20 +1013,24 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
   }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) return { success: false, error: dbDownText(dbState, 'Database container is not running') };
-  const result = await psql(fleetDb.containerName, fleetDb.db, `
+  const result = await clusterSql(fleetDb.containerName, `
     DO $$ DECLARE s record; BEGIN
       SELECT active INTO s FROM pg_replication_slots WHERE slot_name = '${slot}';
       IF NOT FOUND THEN RAISE EXCEPTION 'no slot named ${slot}'; END IF;
       IF s.active THEN RAISE EXCEPTION 'a standby is streaming on ${slot}; stop or remove it first'; END IF;
       PERFORM pg_drop_replication_slot('${slot}');
+    END $$;`);
+  const errorOf = (stderr: string) => {
+    const lines = stderr.trim().split('\n');
+    return (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').replace(/^ERROR:\s*/, '');
+  };
+  if (!result.ok) return { success: false, error: errorOf(result.stderr) };
+  const row = await metaSql(fleetDb.containerName, fleetDb.db, `DO $$ BEGIN
       IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
         EXECUTE format('DELETE FROM smdb_manager.addresses WHERE slot = %L', '${slot}');
       END IF;
     END $$;`);
-  if (!result.ok) {
-    const lines = result.stderr.trim().split('\n');
-    return { success: false, error: (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').replace(/^ERROR:\s*/, '') };
-  }
+  if (!row.ok) return { success: false, error: `the slot ${slot} was dropped, but its row in the address list could not be removed (${errorOf(row.stderr)})` };
   return { success: true };
 }
 
@@ -950,6 +1047,7 @@ CREATE TABLE IF NOT EXISTS smdb_manager.addresses (
   updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (host, port));
 GRANT USAGE ON SCHEMA smdb_manager TO ${REPLICATION_ROLE};
 GRANT SELECT, INSERT, UPDATE, DELETE ON smdb_manager.addresses TO ${REPLICATION_ROLE};
+GRANT SELECT ON smdb_manager.addresses TO ${dbLogin.WORK_LOGIN};
 ${drop}INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES (${sqlLiteral(host)}, ${Number(port)}, NULL, ${sqlLiteral(certPem)}, ${sqlLiteral(machine)})
   ON CONFLICT (host, port) DO UPDATE SET slot = NULL, cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = now();
 `;
@@ -958,11 +1056,19 @@ ${drop}INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALU
 /**
  * The join code another machine's manager pastes: this database's address, its certificate fingerprint, the
  * replication login and the bot's database login. The code holds passwords; the route sits behind manager auth.
+ * While the database waits for a push or a push left it unfinished, nothing is provisioned (a push makes
+ * smdb_manager itself): Receive's own code is made without it, and any other caller is refused.
  */
-export async function getJoinCode(instance: InstanceConfig): Promise<{ success: boolean; error?: string; joinCode?: string }> {
+export async function getJoinCode(instance: InstanceConfig, opts: { forReceive?: boolean } = {}): Promise<{ success: boolean; error?: string; joinCode?: string }> {
   const fleetDb = instance.fleetDb;
   const repl = fleetDb?.replication;
   if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled, so there is no join code.' };
+  const pushPending = !!(fleetDb.receive || fleetDb.pushBroken);
+  if (pushPending && !opts.forReceive) {
+    return { success: false, error: fleetDb.receive
+      ? 'This machine is receiving a bot; make the join code after the push ends (nothing was changed)'
+      : `A push into this database did not finish; restore the dump ${fleetDb.pushBroken!.safetyDump} or receive a push again, then make the join code (nothing was changed)` };
+  }
   if (repl.disablingSince) return { success: false, error: 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it' };
   if (!repl.password) {
     return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to make a new one; every other machine then needs the new join code.' };
@@ -971,6 +1077,12 @@ export async function getJoinCode(instance: InstanceConfig): Promise<{ success: 
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'The database container is not running, so its certificate cannot be read for the join code') };
   }
+  const rolesRefusal = (r: dbLogin.ProvisionResult) => (r.ok ? null : { success: false, error: r.cls === 'in-recovery'
+    ? "This database is a live copy, so it makes no join code; copy the code from the main's manager"
+    : `The bot's database login could not be confirmed as limited to its own database (${r.error}), so no join code was made` });
+  const roles = pushPending ? await adminPasswordRefusal(instance) : await provisionManagedRoles(instance, { reread: true });
+  const refusedRoles = rolesRefusal(roles);
+  if (refusedRoles) return refusedRoles;
   const cert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
   if (!cert.ok) return { success: false, error: `The database's certificate could not be read, so no join code was made: ${probeErrorTail(cert.stderr)}` };
   let fp: string;
@@ -984,6 +1096,10 @@ export async function getJoinCode(instance: InstanceConfig): Promise<{ success: 
     return { success: false, error: app.why === 'lost'
       ? "The managed database's password on record no longer decrypts (the manager's encryption key changed or was lost), so no join code was made; restore the key"
       : `The managed database's password is not on record (${app.detail}), so no join code was made` };
+  }
+  if (!pushPending) {
+    const refusedAgain = rolesRefusal(await confirmedAfterFill(instance));
+    if (refusedAgain) return refusedAgain;
   }
   const appPassword = app.password;
   const joinCode = encodeJoinCode({
@@ -1025,12 +1141,12 @@ export async function connectionReading(instance: InstanceConfig): Promise<Conne
   const unanswered = (r: { stderr: string }): ConnectionReading =>
     ({ state: 'unread', error: `the database did not answer (${r.stderr.trim().split('\n').pop() || 'no answer'})` });
   const unparsed: ConnectionReading = { state: 'unread', error: 'the database answered in a form the manager does not read' };
-  const settings = await psql(fleetDb.containerName, fleetDb.db, CONNECTION_SETTINGS_SQL);
+  const settings = await workSql(fleetDb.containerName, fleetDb.db, CONNECTION_SETTINGS_SQL);
   if (!settings.ok) return unanswered(settings);
   const m = /^(\d+)\|(\d+)\|(\d+)\|(true|false)$/.exec(settings.stdout.trim());
   if (!m) return unparsed;
   if (m[4] === 'false') return { state: 'none' };
-  const rows = await psql(fleetDb.containerName, fleetDb.db, SHARD_NODES_SQL);
+  const rows = await workSql(fleetDb.containerName, fleetDb.db, SHARD_NODES_SQL);
   if (!rows.ok) return unanswered(rows);
   let nodes: unknown;
   try { nodes = JSON.parse(rows.stdout.trim()); } catch { return unparsed; }

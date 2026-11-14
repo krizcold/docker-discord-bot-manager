@@ -75,7 +75,7 @@ vi.mock('child_process', async (importOriginal) => {
     }, 2);
     return child;
   };
-  const fencedExecFile = (await import('./fence-fake')).withFence(execFile as any);
+  const fencedExecFile = (await import('./fence-fake')).withFence((await import('./roles-fake')).rolesExecFile(execFile as any, spawn as any) as any);
   const layeredExecFile = (cmd: string, args: string[], opts: any, cb?: any) => {
     const sql = args.join(' ');
     const done = typeof opts === 'function' ? opts : cb;
@@ -174,7 +174,7 @@ afterAll(() => {
 
 
 const PRIVATE = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
-const NO_PASSWORD = "The managed database's password is not on record (the Database URL holds no password to check), so Enable cannot write its address into the Database URL; nothing was changed";
+const NO_PASSWORD = "The managed database's password is not on record (the Database URL holds no password to check), so Enable cannot write its address into the Database URL; replication was not set up";
 const NO_PASSWORD_D = "The managed database's password is not on record (the Database URL holds no password to check), so Disable cannot set the Database URL back; nothing was disabled";
 const dropRecordPassword = () => {
   const file = path.join(h.dir, 'instances.json');
@@ -195,13 +195,13 @@ describe('fenceLinesRefusal names the lane that owns the lines', () => {
     writeRegistry({ migrate: record({ hbaFence: 'migrate:1' }) });
     addBot2();
     h.hba = { count: '4', owner: 'migrate:1' };
-    expect(await fleetReplication.fenceLinesRefusal('bot2-fleet-postgres', 'smdb')).toBe(
+    expect(await fleetReplication.fenceLinesRefusal('bot2-fleet-postgres')).toBe(
       `a write fence stands in pg_hba.conf (lines ending in ${WRITE_FENCE_MARK}`
       + '); it belongs to a migration (started 1970-01-01 00:00 UTC) that is no longer open, so no lane lifts it; a restore takes it over and lifts it, or remove the lines by hand if nothing should hold them');
   });
   it("a restore's lines name the restore, which lifts them when it finishes", async () => {
     h.hba = { count: '4', owner: 'restore:5' };
-    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres', 'smdb')).toBe(
+    expect(await fleetReplication.fenceLinesRefusal('bot1-fleet-postgres')).toBe(
       `a write fence stands in pg_hba.conf (lines ending in ${WRITE_FENCE_MARK}); it belongs to a restore (started 1970-01-01 00:00 UTC), and that lane lifts it when it finishes`);
   });
 });

@@ -46,7 +46,7 @@ import { fake, fakeJoin, freshDb, h, mainFixture, resetHarness, writeRegistry } 
 const FILE = 'pre-push-2026-10-28T12-00-00-000Z.dump';
 const SUM = 'checksum|"public"."t"|0123456789abcdef0123456789abcdef';
 const PUSH_ID = '0123456789abcdef01234567';
-const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID } } as any);
+const CODE = encodeMoveCode({ ...fakeJoin({ host: 'win.example', port: 5440, machine: 'win.example', db: 'app', app: { user: 'app', password: 'apppw' } }), recv: { user: 'smdb_receive', password: 'recvpw', id: PUSH_ID }, recvMeta: { user: 'smdb_receive_meta', password: 'metapw' } } as any);
 const DSN = (db: string) => `postgresql://smdb_receive@win.example:5440/${db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 const HEAD = (name: string, input: boolean) => ['run', '--rm', ...(input ? ['-i'] : []), '--name', `a-fleet-move-${name}`, '-e', 'PGPASSWORD', '-v', '/host/probe.crt:/primary-ca.crt:ro', '--entrypoint', 'sh', 'postgres:16-alpine', '-c'];
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });

@@ -429,9 +429,9 @@ describe('m3 key bar', () => {
     expect(keyLines('Q Quit', 75)).toEqual(['Q Quit']);
   });
 
-  it('keeps the bar on one line at 100 columns', async () => {
+  it('keeps the bar on one line at 110 columns', async () => {
     const f = base();
-    const v = await start(f, { rows: 24 });
+    const v = await start(f, { rows: 24, columns: 110 });
     await v.press(ENTER);
     await v.until('Name mybot');
     expect(keyBar(v.frame())).toMatch(/S Start {2}R Restart.*Q Quit/);

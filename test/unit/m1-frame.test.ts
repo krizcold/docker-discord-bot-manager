@@ -98,7 +98,7 @@ describe('m1 bot list', () => {
     v.unmount();
     const b = await start(twoBots(), undefined, true);
     await b.press('\r');
-    expect(keyBar(b.frame())).toMatch(/G Build logs {2}H Hand-off {2}Esc Back/);
+    expect(b.frame().split('\n').slice(-3, -1).join(' ')).toMatch(/G Build logs {2}T State {2}H Hand-off\s.*Esc Back/);
     await b.press('h');
     expect(b.onHandOff).toHaveBeenCalledWith({ screen: 'bot', index: 0, botId: 'b1' });
     b.unmount();
@@ -111,7 +111,7 @@ describe('m1 bot screen', () => {
     await v.press('\r');
     const f = v.frame();
     expect(f).toContain('Name         mybot');
-    expect(keyBar(f)).toMatch(/S Stop {2}R Restart {2}B Build {2}U Update {2}L Logs {2}G Build logs {2}Esc Back {2}Q Quit/);
+    expect(keyBar(f)).toMatch(/S Stop {2}R Restart {2}B Build {2}U Update {2}L Logs {2}G Build logs {2}T State {2}Esc Back {2}Q Quit/);
     expect(keyBar(f)).not.toMatch(/Install|Database|Files/);
     v.unmount();
   });
@@ -221,7 +221,7 @@ describe('m1 progress and logs', () => {
     await v.until('The build finished. Bot status: stopped.');
     expect(keyBar(v.frame())).toMatch(/Up\/Down Scroll {2}End Follow {2}Esc Back {2}Q Quit/);
     await v.press(ESC);
-    expect(keyBar(v.frame())).toContain('P Progress');
+    expect(v.frame().split('\n').slice(-3, -1).join(' ')).toContain('P Progress');
     v.unmount();
   });
 

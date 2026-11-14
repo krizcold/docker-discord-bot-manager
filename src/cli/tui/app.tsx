@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type * as Ink from 'ink';
 import {
   ActionKind, Bot, botName, buildFrameLine, buildLogPath, Container, containerFrameLine, containerLogPath, listContainers, StreamLines,
@@ -6,6 +6,9 @@ import {
 import { isForwardDelete } from './field';
 import { clock, copyText, dataText, lastBackupText, listHeader, listRow, statusText, updateText } from './format';
 import { ConfigEditor, ConfigExit, ConfigOptions } from './configedit';
+import { DatabaseExit, DatabaseOptions, DatabaseScreen } from './database';
+import { databaseBadges, hasDatabaseScreen, heldWarningText, hostDataRoot, orphanLines, startOffRefusal, stateName, timeIn } from './dbtext';
+import { StateExit, StateOptions, StateScreen } from './statescreen';
 import { EditRequest } from './editbody';
 import { EditorExit, EditorOptions, EnvEditor } from './envedit';
 import { InstallWizard, WizardExit, WizardOptions, wrap } from './install';
@@ -14,7 +17,7 @@ import { VaultExit, VaultOptions, VaultScreen } from './vaultscreen';
 
 export type InkApi = typeof Ink;
 
-export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault';
+export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault' | 'database' | 'state';
 
 export interface FrameState {
   screen: Screen;
@@ -39,6 +42,8 @@ export interface AppProps {
   envOptions?: EditorOptions;
   configOptions?: ConfigOptions;
   vaultOptions?: VaultOptions;
+  databaseOptions?: DatabaseOptions;
+  stateOptions?: StateOptions;
 }
 
 export interface View {
@@ -122,9 +127,15 @@ const HANDOFF_KEY = 'H Hand-off';
 
 const KIND_LABEL: Record<ActionKind, string> = { start: 'Start', stop: 'Stop', restart: 'Restart', build: 'Build', update: 'Update' };
 
-function confirmText(kind: ActionKind, name: string): string[] {
-  if (kind === 'stop') return [`Stop ${name}?`, '', 'The bot goes offline until it is started again.'];
-  return [`Restart ${name}?`, '', 'The bot goes offline while its containers restart.'];
+// The held warning (index.html:3740) joins the question when the bot holds changes it could not save.
+function confirmText(kind: ActionKind, bot: Bot): string[] {
+  const name = botName(bot);
+  const action = kind === 'stop' ? 'stop' : kind === 'update' ? 'update' : 'restart';
+  const warning = heldWarningText(bot, action);
+  const head = kind === 'stop' ? [`Stop ${name}?`, '', 'The bot goes offline until it is started again.']
+    : kind === 'update' ? [`Update ${name}?`, '', 'The bot is recreated from its source.']
+      : [`Restart ${name}?`, '', 'The bot goes offline while its containers restart.'];
+  return warning ? [...head, '', warning] : head;
 }
 
 function waitingText(kind: ActionKind, name: string): string {
@@ -149,14 +160,16 @@ function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean):
     if (bot.sourceType !== 'docker-image') keys.push('U Update');
   }
   if (hasRun) keys.push('P Progress');
-  keys.push('L Logs', 'G Build logs', ...(canEditEnv(bot, busy) ? ['E Env', 'C Config'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
+  keys.push('L Logs', 'G Build logs', ...(hasDatabaseScreen(bot) ? ['D Database'] : []), 'T State', ...(canEditEnv(bot, busy) ? ['E Env', 'C Config'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
   return keys.join('  ');
 }
 
 export function createApp(ink: InkApi) {
   const { Box, Text, useApp, useInput, useStdin, useStdout } = ink;
 
-  return function App({ machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions, envOptions, configOptions, vaultOptions, onEdit }: AppProps) {
+  return function App({
+    machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions, envOptions, configOptions, vaultOptions, databaseOptions, stateOptions, onEdit,
+  }: AppProps) {
     const { exit } = useApp();
     const { stdout } = useStdout();
     const { internal_eventEmitter: inputEvents } = useStdin();
@@ -166,6 +179,8 @@ export function createApp(ink: InkApi) {
     const editor = { get current() { return held.env ?? null; }, set current(v: EnvEditor | null) { held.env = v ?? undefined; } };
     const configEd = { get current() { return held.config ?? null; }, set current(v: ConfigEditor | null) { held.config = v ?? undefined; } };
     const vault = { get current() { return held.vault ?? null; }, set current(v: VaultScreen | null) { held.vault = v ?? undefined; } };
+    const database = { get current() { return held.database ?? null; }, set current(v: DatabaseScreen | null) { held.database = v ?? undefined; } };
+    const stateScreen = { get current() { return held.state ?? null; }, set current(v: StateScreen | null) { held.state = v ?? undefined; } };
 
     // Registered before useInput's listener, so the raw sequence of each key is known when useInput runs.
     useEffect(() => {
@@ -294,8 +309,61 @@ export function createApp(ink: InkApi) {
       setState((s) => ({ ...s, screen: 'list', notice: undefined }));
     };
 
-    useInput((input, key) => {
+    // An outcome reaches the shared notice with its bot's name: it may land while another bot's screen is open.
+    const reportFor = (botId: string) => (result: { text: string }) => {
+      const b = session.bot(botId);
+      session.notice = `${b ? botName(b) : botId}: ${result.text}`;
+      session.changed();
+      void session.refresh();
+    };
+
+    const openState = (botId: string, from: 'bot' | 'database') => {
+      stateScreen.current?.close();
+      stateScreen.current = new StateScreen(session.client, () => session.changed(), botId, session, reportFor(botId), from, { timeZone: databaseOptions?.timeZone, ...stateOptions });
+      stateScreen.current.open();
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'state', notice: undefined }));
+    };
+
+    const afterState = (out: StateExit) => {
+      if (!out) return;
+      const from = stateScreen.current?.from ?? 'bot';
+      stateScreen.current?.close();
+      stateScreen.current = null;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      setScroll(0);
+      setState((s) => ({ ...s, screen: from === 'database' && database.current ? 'database' : 'bot', notice: undefined }));
+    };
+
+    const afterDatabase = (out: DatabaseExit) => {
+      if (!out) return;
+      if ('state' in out) {
+        if (database.current) openState(database.current.botId, 'database');
+        return;
+      }
+      database.current?.close();
+      database.current = null;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: undefined }));
+    };
+
+    const onInput = (input: string, key: Ink.Key) => {
       const k = input.toLowerCase();
+      if (state.screen === 'state') {
+        afterState(stateScreen.current ? stateScreen.current.key(input, key, isForwardDelete(raw.current)) : { leave: true });
+        return;
+      }
+      if (state.screen === 'database') {
+        afterDatabase(database.current ? database.current.key(input, key) : { leave: true });
+        return;
+      }
       if (state.screen === 'vault') {
         const out = vault.current ? vault.current.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
         if (out instanceof Promise) void out.then(afterVault);
@@ -324,7 +392,7 @@ export function createApp(ink: InkApi) {
       }
       if (state.screen === 'confirm') {
         if (k === 'y' && state.kind) act(state.kind);
-        else go({ screen: 'bot', notice: `Cancelled: ${bot ? botName(bot) : 'the bot'} was not ${state.kind === 'stop' ? 'stopped' : 'restarted'}.` });
+        else go({ screen: 'bot', notice: `Cancelled: ${bot ? botName(bot) : 'the bot'} was not ${state.kind === 'stop' ? 'stopped' : state.kind === 'update' ? 'updated' : 'restarted'}.` });
         return;
       }
       if (k === 'q') {
@@ -377,7 +445,13 @@ export function createApp(ink: InkApi) {
         return;
       }
       if (state.screen !== 'bot' || !bot) return;
-      if (k === 'l') go({ screen: 'containers', pick: 0 });
+      if (k === 't') openState(bot.id, 'bot');
+      else if (k === 'd' && hasDatabaseScreen(bot)) {
+        database.current?.close();
+        database.current = new DatabaseScreen(session.client, () => session.changed(), bot.id, session, databaseOptions, reportFor(bot.id));
+        database.current.open();
+        go({ screen: 'database' });
+      } else if (k === 'l') go({ screen: 'containers', pick: 0 });
       else if (k === 'g') go({ screen: 'buildlogs' });
       else if (k === 'p' && run) go({ screen: 'action', kind: run.kind });
       else if (k === 'e') {
@@ -398,11 +472,19 @@ export function createApp(ink: InkApi) {
       else if (session.busy(bot.id)) return;
       else if (k === 's') {
         if (bot.status === 'running' || bot.status === 'starting') go({ screen: 'confirm', kind: 'stop' });
+        else if (startOffRefusal(bot)) go({ notice: startOffRefusal(bot) });
         else act('start');
       } else if (k === 'r') go({ screen: 'confirm', kind: 'restart' });
       else if (k === 'b') act('build');
-      else if (k === 'u' && bot.sourceType !== 'docker-image') act('update');
-    });
+      else if (k === 'u' && bot.sourceType !== 'docker-image') {
+        if (heldWarningText(bot, 'update')) go({ screen: 'confirm', kind: 'update' });
+        else act('update');
+      }
+    };
+    // Ink registers a new handler after each commit; a key read in that gap would reach the previous screen's handler.
+    const onInputRef = useRef(onInput);
+    onInputRef.current = onInput;
+    useInput(useCallback((input: string, key: Ink.Key) => onInputRef.current(input, key), []));
 
     const listKeys = (rows: boolean) =>
       [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install', 'V Vault'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
@@ -421,6 +503,14 @@ export function createApp(ink: InkApi) {
         if (vault.current) return vault.current.view(innerWidth(size.columns), room);
         return { body: ['The vault is not open.'], keys: 'Esc Back  Q Quit', notice };
       }
+      if (state.screen === 'state') {
+        if (stateScreen.current) return stateScreen.current.view(innerWidth(size.columns), room, notice);
+        return { body: ['The state screen is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'database') {
+        if (database.current) return database.current.view(innerWidth(size.columns), room, notice);
+        return { body: ['The database screen is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
       if (state.screen === 'config') {
         if (configEd.current) return configEd.current.view(innerWidth(size.columns), room);
         return { body: ['The config editor is not open.'], keys: 'Esc Back  Q Quit', notice };
@@ -429,12 +519,15 @@ export function createApp(ink: InkApi) {
       if (state.screen === 'list') {
         if (readFailed) return { body: [readFailed], keys: listKeys(false), notice };
         if (session.list.readAt === null) return { body: ['Reading the bot list.'], keys: listKeys(false), notice };
-        if (bots.length === 0) return { body: ['No bots on this manager.'], keys: listKeys(false), notice };
-        const first = Math.max(0, Math.min(index - (room - 2), bots.length - (room - 1)));
-        const shown = bots.slice(first, first + room - 1);
+        const orphans = orphanLines(session.orphans, hostDataRoot(databaseOptions?.env ?? process.env)).flatMap((l) => wrap(l, innerWidth(size.columns)));
+        const below = orphans.length ? ['', ...orphans] : [];
+        if (bots.length === 0) return { body: ['No bots on this manager.', ...below], keys: listKeys(false), notice };
+        const rowRoom = Math.max(room - below.length, 2);
+        const first = Math.max(0, Math.min(index - (rowRoom - 2), bots.length - (rowRoom - 1)));
+        const shown = bots.slice(first, first + rowRoom - 1);
         const t = now();
         return {
-          body: [listHeader(innerWidth(size.columns)), ...shown.map((b, i) => listRow(b, first + i === index, t, innerWidth(size.columns)))],
+          body: [listHeader(innerWidth(size.columns)), ...shown.map((b, i) => listRow(b, first + i === index, t, innerWidth(size.columns))), ...below],
           highlight: index - first + 1,
           keys: listKeys(true),
           notice,
@@ -447,19 +540,28 @@ export function createApp(ink: InkApi) {
         const body = [
           ['Name', name],
           ['Status', statusText(bot)],
+          ['State', stateName(bot.maintenance?.state)],
           ['Data', dataText(bot, true)],
           ['Copy', copyText(bot)],
           ['Last backup', lastBackupText(bot, t, true)],
           ['Update', updateText(bot)],
         ].flatMap(([label, value]) => fieldLines(label, value, innerWidth(size.columns)));
         if (readFailed) body.push('', readFailed, `The values above were read at ${clock(session.list.readAt ?? t)}.`);
+        // A route's text can be longer than the notice line; it goes under the values, whole, before the badge lines.
+        const longNotice = !!notice && notice.length > innerWidth(size.columns);
+        if (longNotice) body.push('', ...wrap(notice!, innerWidth(size.columns)));
+        const badges = databaseBadges(bot, timeIn(databaseOptions?.timeZone));
+        if (badges.length) body.push('');
+        for (const b of badges) {
+          body.push(`${b.danger ? '! ' : ''}${b.text}`);
+          for (const part of b.title.split('\n')) if (part) body.push(...wrap(part, innerWidth(size.columns), '  '));
+        }
         const keys = botKeys(bot, session.busy(bot.id), !!run, canHandOff);
-        // A save's route text can be longer than the notice line; it goes under the values, whole.
-        if (notice && notice.length > innerWidth(size.columns)) return { body: [...body, '', ...wrap(notice, innerWidth(size.columns))], keys };
+        if (longNotice) return { body, keys };
         return { body, keys, notice };
       }
       if (state.screen === 'confirm' && state.kind) {
-        return { body: confirmText(state.kind, name), keys: `Y ${KIND_LABEL[state.kind]}  any other key Cancel` };
+        return { body: confirmText(state.kind, bot).flatMap((l) => (l ? wrap(l, innerWidth(size.columns)) : [''])), keys: `Y ${KIND_LABEL[state.kind]}  any other key Cancel` };
       }
       if (state.screen === 'action') {
         if (!run) return { body: ['No action has run on this bot in this session.'], keys: 'Esc Back  Q Quit' };

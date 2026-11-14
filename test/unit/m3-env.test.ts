@@ -79,7 +79,7 @@ describe('m3 env editor: opening and reading', () => {
     const v = await start(f);
     await v.press(ENTER);
     await v.until('Name mybot');
-    expect(keyBar(v.frame())).toMatch(/G Build logs {2}E Env {2}C Config {2}Esc Back/);
+    expect(v.frame().split('\n').slice(-3, -1).join(' ')).toMatch(/G Build logs {2}T State {2}E Env\s+C Config\s+Esc Back/);
     await v.press('e');
     await v.until('Environment Variables: mybot');
     expect(f.paths()).toContain('GET /api/bots/b1/env');

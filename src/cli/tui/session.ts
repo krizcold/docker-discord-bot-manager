@@ -1,13 +1,19 @@
 import { Client } from '../client';
 import type { ConfigEditor } from './configedit';
+import type { DatabaseScreen } from './database';
 import type { EnvEditor } from './envedit';
 import type { InstallWizard } from './install';
+import type { StateScreen } from './statescreen';
 import type { VaultScreen } from './vaultscreen';
 import {
-  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, StreamLines, stopBot,
+  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, Outcome, readOrphanBackups,
+  StreamLines, stopBot,
 } from './api';
 
 export const LIST_EVERY_MS = 5000;
+const ORPHAN_LIMIT_MS = 15_000;
+
+export type OrphanRead = Outcome<{ folders?: Array<{ id: string; dumps: number | null; folder: string }> }>;
 
 export interface ListState {
   bots: Bot[];
@@ -29,7 +35,11 @@ export class Session {
   runs = new Map<string, ActionRun>();
   notice: string | null = null;
   /** The open install form and editors, kept here so they outlive the remount after a hand-off. */
-  held: { install?: InstallWizard; env?: EnvEditor; config?: ConfigEditor; vault?: VaultScreen } = {};
+  held: { install?: InstallWizard; env?: EnvEditor; config?: ConfigEditor; vault?: VaultScreen; database?: DatabaseScreen; state?: StateScreen } = {};
+  /** The dump folders of removed bots, read after each successful list read as the page's loadOrphanBackups does. */
+  orphans: OrphanRead | null = null;
+  /** The Database screen's call running per bot, so a screen opened again during a held restore waits for it. */
+  dbBusy = new Map<string, { text: string; escape: boolean }>();
   version = 0;
   private listeners = new Set<() => void>();
   private timer: NodeJS.Timeout | null = null;
@@ -62,6 +72,8 @@ export class Session {
     this.timer = null;
     for (const a of this.aborts) a.abort();
     this.aborts.clear();
+    this.held.database?.close();
+    this.held.state?.close();
   }
 
   async refresh(): Promise<void> {
@@ -70,12 +82,23 @@ export class Session {
     try {
       const bots = await listBots(this.client);
       this.list = { bots, readAt: this.now(), error: null };
+      void this.readOrphans();
     } catch (err) {
       this.list = { ...this.list, error: err instanceof Error ? err.message : String(err) };
     } finally {
       this.reading = false;
       this.changed();
     }
+  }
+
+  private orphanSeq = 0;
+
+  private async readOrphans(): Promise<void> {
+    const seq = ++this.orphanSeq;
+    const r = await readOrphanBackups(this.client, ORPHAN_LIMIT_MS);
+    if (seq !== this.orphanSeq) return;
+    this.orphans = r;
+    this.changed();
   }
 
   bot(id: string | undefined): Bot | undefined {

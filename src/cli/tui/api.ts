@@ -7,19 +7,105 @@ export interface Bot {
   status?: string;
   sourceType?: string;
   activeOp?: string | null;
-  fleetDb?: { replication?: unknown } | null;
-  fleetDbReplica?: { copyCleared?: boolean } | null;
+  fleetDb?: FleetDbView | null;
+  fleetDbReplica?: { copyCleared?: boolean; takeover?: unknown } | null;
   fleetDbReplicaSeed?: { phase?: string } | null;
   dataPlace?: 'json' | 'outside' | null;
-  fleetBackup?: { main?: BackupFamilyStatus | null; copy?: BackupFamilyStatus | null } | null;
+  fleetBackup?: FleetBackupStatus | null;
+  fleetWorker?: boolean;
+  hasDbBackups?: boolean;
+  appHooks?: boolean;
+  maintenance?: { state?: string; message?: string; settled?: boolean; orderedAt?: string; lastError?: string | null; held?: Held | null } | null;
+  maintenanceDrift?: string | null;
+  fenceStuck?: string | null;
+  migrate?: MigrateRecordView | null;
+  migrateLast?: MigrateLastView | null;
   updateAvailable?: boolean;
   updateCantConfirm?: string;
   behindBy?: number;
 }
 
+/** The bot's last answer about the changes it holds (src/types/index.ts:399). */
+export interface Held {
+  state?: string;
+  guilds?: number;
+  files?: number;
+  note?: string;
+}
+
+/** An open migration record (src/types/index.ts:419), as the list route and GET migrate carry it. */
+export interface MigrateRecordView {
+  to?: string;
+  phase?: string;
+  text?: string;
+  openedAt?: string | number;
+}
+
+/** The last migration's outcome (src/types/index.ts:447). */
+export interface MigrateLastView {
+  to?: string;
+  outcome?: string;
+  text?: string;
+  at?: string;
+}
+
+export interface BackupAlert {
+  text?: string;
+  since?: number;
+  dm?: string;
+  dmAt?: number;
+  dmError?: string;
+  dmPlace?: string;
+  dmNote?: string;
+  dmRepeat?: boolean;
+}
+
+export interface BackupTest {
+  file?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  result?: string;
+  text?: string;
+  tables?: number;
+  rows?: number;
+}
+
+/** One family of fleetBackupStatus (src/instance/fleetBackup.ts:1535). */
 export interface BackupFamilyStatus {
+  family?: 'main' | 'copy';
+  enabled?: boolean;
+  hour?: number;
+  paused?: boolean;
+  lastFile?: string | null;
   lastAt?: number | null;
+  dataAt?: number | null;
+  lastError?: string | null;
+  failingSince?: number | null;
   listError?: string | null;
+  skip?: 'scope' | 'seed' | null;
+  test?: BackupTest | null;
+  alerts?: { dumps?: BackupAlert | null; test?: BackupAlert | null };
+}
+
+/** fleetBackupStatus (src/instance/fleetBackup.ts:1549), carried by every bot of the list. */
+export interface FleetBackupStatus {
+  enabled?: boolean;
+  hour?: number;
+  scoped?: boolean | null;
+  restoreError?: string | null;
+  restoreErrorAt?: string | null;
+  main?: BackupFamilyStatus | null;
+  copy?: BackupFamilyStatus | null;
+}
+
+/** The switch records of a bot's fleetDb as the list route sends them (src/types/index.ts:61 to 66). */
+export interface FleetDbView {
+  replication?: { publicHost?: string; hostPort?: number } | null;
+  handover?: { mode?: string; phase?: string; machine?: string; host?: string; at?: string; lastCheck?: string } | null;
+  receive?: { expiresAt?: string } | null;
+  replacedBy?: { machine?: string; generation?: number } | null;
+  mainConflict?: { machine?: string; blockError?: string } | null;
+  pushBroken?: { at?: string; safetyDump?: string } | null;
 }
 
 export type ActionKind = 'start' | 'stop' | 'restart' | 'build' | 'update';
@@ -300,10 +386,11 @@ export type Outcome<T> = { ok: true; value: T } | { ok: false; text: string } | 
 
 type Body = Record<string, unknown>;
 
-async function call(client: Client, method: string, path: string, body?: unknown): Promise<Outcome<Body>> {
+async function call(client: Client, method: string, path: string, body?: unknown, limitMs?: number): Promise<Outcome<Body>> {
   let res: CliResponse;
   try {
-    res = await client.request(method, path, body === undefined ? {} : { body });
+    const sent = client.request(method, path, body === undefined ? {} : { body });
+    res = limitMs === undefined ? await sent : await withinLimit(sent, limitMs);
   } catch (err) {
     return { ok: null, text: why(err) };
   }
@@ -311,6 +398,24 @@ async function call(client: Client, method: string, path: string, body?: unknown
   // The page reads a reply it cannot parse as no answer (index.html:1388): what the manager did is unknown.
   if (!b || typeof b !== 'object') return { ok: null, text: `the reply was not JSON, HTTP ${res.status}` };
   return { ok: true, value: b };
+}
+
+// Client.request sets no time limit; a reply that comes later than the limit is dropped.
+function withinLimit<T>(sent: Promise<T>, limitMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`the manager did not answer within ${limitMs % 1000 === 0 ? `${limitMs / 1000} s` : `${limitMs} ms`}`)), limitMs);
+    timer.unref?.();
+    sent.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 const bare = (text: string): string => text.replace(/[.\s]+$/, '');
@@ -739,4 +844,291 @@ export async function removeDeletedEntry(client: Client, groupId: string, key: s
 /** DELETE /api/vault/deleted-group/:id, a removed bot's whole group. */
 export async function removeDeletedGroup(client: Client, groupId: string): Promise<Outcome<Answer>> {
   return call(client, 'DELETE', `/api/vault/deleted-group/${encodeURIComponent(groupId)}`);
+}
+
+type Read<T> = Promise<Outcome<T>>;
+
+// A refusal's text is the route's error, or '' when it named none (the caller words that case).
+async function read<T>(client: Client, path: string, limitMs: number): Read<T> {
+  const r = await call(client, 'GET', path, undefined, limitMs);
+  if (r.ok !== true) return r;
+  if (r.value.success !== true) return { ok: false, text: bodyError(r.value, '') };
+  return { ok: true, value: r.value as T };
+}
+
+export interface BackupEntry {
+  file: string;
+  size: number;
+  mtime: number;
+  kind?: string;
+  family?: string;
+  takenAt?: number;
+  tables?: number | null;
+  rows?: number | null;
+}
+
+/** GET /api/bots/:id/fleet-backups (bots.ts:1722): the dumps newest first; removed is set for a removed bot's folder. */
+export function readFleetBackups(client: Client, botId: string, limitMs: number): Read<{ backups?: BackupEntry[]; removed?: boolean }> {
+  return read(client, `/api/bots/${botId}/fleet-backups`, limitMs);
+}
+
+/** GET /api/bots/fleet/orphan-backups (bots.ts:1704): dump folders whose bot was removed. */
+export function readOrphanBackups(client: Client, limitMs: number): Read<{ folders?: Array<{ id: string; dumps: number | null; folder: string }> }> {
+  return read(client, '/api/bots/fleet/orphan-backups', limitMs);
+}
+
+export interface MaintenanceInfo {
+  state?: string;
+  message?: string;
+  settled?: boolean;
+  kind?: string | null;
+  orderedAt?: string;
+  lastError?: string | null;
+  summary?: string;
+  held?: Held | null;
+}
+
+/** GET /api/bots/:id/maintenance (bots.ts:528), src/instance/maintenance.ts:734. */
+export function readMaintenance(client: Client, botId: string, limitMs: number): Read<MaintenanceInfo> {
+  return read(client, `/api/bots/${botId}/maintenance`, limitMs);
+}
+
+export interface MemoryAnswer {
+  memory?: { running?: boolean | null; room?: boolean | null; useMb?: number | null; freeMb?: number | null; error?: string };
+  sent?: { kind?: string; unknown?: boolean; error?: string };
+}
+
+/** GET /api/bots/:id/memory (bots.ts:1009), src/instance/memoryRoom.ts:23. */
+export function readMemory(client: Client, botId: string, limitMs: number): Read<MemoryAnswer> {
+  return read(client, `/api/bots/${botId}/memory`, limitMs);
+}
+
+export interface ConnectionsAnswer {
+  connections?: { state?: string; error?: string; machines?: number; count?: number; overlap?: boolean; max?: number; reserved?: number; allowed?: number };
+}
+
+/** GET /api/bots/:id/fleet-connections (bots.ts:1847), src/instance/fleetReplication.ts:1013. */
+export function readConnections(client: Client, botId: string, limitMs: number): Read<ConnectionsAnswer> {
+  return read(client, `/api/bots/${botId}/fleet-connections`, limitMs);
+}
+
+export interface ReplicationSlot {
+  slot: string;
+  fleet?: boolean;
+  walStatus?: string;
+  active?: boolean;
+  retainedBytes?: number | null;
+  clientAddr?: string | null;
+  state?: string | null;
+  replayLagSeconds?: number | null;
+  behindBytes?: number | null;
+  machine?: string | null;
+}
+
+export interface ReplicationStatus {
+  enabled?: boolean;
+  disablingSince?: string;
+  publicHost?: string;
+  hostPort?: number;
+  live?: { sslOn?: boolean; slots?: ReplicationSlot[]; slotWalKeep?: string };
+  reachability?: { ok?: boolean; unchecked?: boolean; error?: string; ageSeconds?: number };
+  probeError?: string;
+}
+
+/** GET /api/bots/:id/fleet-replication (bots.ts:1832), src/instance/fleetReplication.ts:751. */
+export function readReplication(client: Client, botId: string, limitMs: number): Read<{ replication?: ReplicationStatus }> {
+  return read(client, `/api/bots/${botId}/fleet-replication`, limitMs);
+}
+
+export interface SeedView {
+  startedAt?: number;
+  phase?: string;
+  purpose?: string;
+  auto?: boolean;
+  cause?: string;
+  forSeconds?: number;
+  cancelable?: boolean;
+  cancelRequested?: boolean;
+  lastError?: string;
+  safetyDump?: string;
+  pinsUnretired?: string[];
+}
+
+export interface ReplicaStatus {
+  present?: boolean;
+  provisioning?: SeedView;
+  parkedSeed?: SeedView;
+  pinsWarning?: string;
+  seedNote?: string;
+  rebuiltShown?: boolean;
+  lastError?: string;
+  probeError?: string;
+  record?: { publicHost?: string; hostPort?: number; primaryHost?: string; primaryPort?: number };
+  live?: { running?: boolean; inRecovery?: boolean | null; receiverStatus?: string | null; caughtUp?: boolean | null; replayLagSeconds?: number | null; clockSkewSeconds?: number };
+}
+
+export interface ReplicaAnswer {
+  replica?: ReplicaStatus | null;
+  copyBackup?: BackupFamilyStatus | null;
+  join?: { host?: string; port?: number; machine?: string; codeUnreadable?: boolean; addressesError?: string | null } | null;
+  rebuild?: { kind?: string | null; text?: string | null; alerts?: Record<string, { outcome?: string | null }>; rebuilt?: string | null } | null;
+}
+
+/** GET /api/bots/:id/fleet-replica (bots.ts:1954), src/instance/fleetReplica.ts:417 and fleetCopyWatch.ts:381 and :406. */
+export function readReplica(client: Client, botId: string, limitMs: number): Read<ReplicaAnswer> {
+  return read(client, `/api/bots/${botId}/fleet-replica`, limitMs);
+}
+
+export interface SwitchAnswer {
+  lines?: string[];
+  takeover?: unknown;
+  generation?: { machine?: string; generation?: number; since?: string | null; error?: string } | null;
+}
+
+/** GET /api/bots/:id/fleet-switch (bots.ts:2067), src/instance/fleetSwitch.ts:1652 and :1762. */
+export function readSwitch(client: Client, botId: string, limitMs: number): Read<SwitchAnswer> {
+  return read(client, `/api/bots/${botId}/fleet-switch`, limitMs);
+}
+
+export interface MigrateView {
+  hidden?: boolean;
+  to?: string | null;
+  refusal?: string | null;
+  destination?: string | null;
+  companion?: boolean;
+  sharers?: string[];
+  record?: MigrateRecordView | null;
+  last?: MigrateLastView | null;
+  fenced?: boolean;
+}
+
+/** GET /api/bots/:id/migrate (bots.ts:542), src/instance/migrate.ts:764. */
+export function readMigrate(client: Client, botId: string, limitMs: number): Read<MigrateView> {
+  return read(client, `/api/bots/${botId}/migrate`, limitMs);
+}
+
+/** POST /api/bots/:id/migrate {to} (bots.ts:556): accepted with an opId no event carries; progress comes as bot:migrate. */
+export async function startMigration(client: Client, botId: string, to: string): Promise<Outcome<Body>> {
+  const r = await call(client, 'POST', `/api/bots/${botId}/migrate`, { to });
+  if (r.ok !== true) return r;
+  if (r.value.success !== true) return { ok: false, text: bodyError(r.value, '') };
+  return r;
+}
+
+export const STATE_WAIT_MS = 5 * 60_000;
+
+/**
+ * PUT /api/bots/:id/maintenance {state, message} (bots.ts:571), judged by the bot:maintenance event that carries the
+ * request's opId (bots.ts:582): settled is done, not settled is a failure. onAccepted runs once the route accepted.
+ */
+export async function orderState(
+  client: Client,
+  bot: Bot,
+  state: string,
+  message: string,
+  waitMs: number,
+  onAccepted?: () => void,
+): Promise<ActionResult> {
+  const name = botName(bot);
+  let phase: 'connecting' | 'sent' | 'refused' | 'accepted' = 'connecting';
+  let ended = false;
+  try {
+    const outcome = await waitForEvent(client, { successTypes: ['bot:maintenance'], failTypes: [], timeoutMs: waitMs }, async () => {
+      phase = 'sent';
+      const r = await call(client, 'PUT', `/api/bots/${bot.id}/maintenance`, { state, message });
+      if (r.ok !== true) throw new Error(r.text);
+      const b = r.value as { success?: boolean; opId?: unknown; error?: unknown };
+      if (ended) throw new Error('the wait had already ended');
+      if (b.success !== true) {
+        phase = 'refused';
+        throw new Error(typeof b.error === 'string' && b.error ? b.error : 'the manager gave no reason');
+      }
+      phase = 'accepted';
+      if (typeof b.opId !== 'string') throw new Error('the manager accepted the change but named no operation to follow');
+      onAccepted?.();
+      return b.opId;
+    }).finally(() => {
+      ended = true;
+    });
+    const d = outcome.event.data as { settled?: unknown; text?: unknown } | null;
+    const text = typeof d?.text === 'string' && d.text ? d.text : d?.settled === true ? `The state of ${name} changed.` : `The state change of ${name} did not finish; the manager gave no reason.`;
+    return { ok: d?.settled === true, text };
+  } catch (err) {
+    const reason = why(err);
+    if (phase === 'connecting') return { ok: false, text: `Could not reach the manager (${reason}), so the state of ${name} was not changed.` };
+    if (phase === 'refused') return { ok: false, text: reason };
+    if (phase === 'sent') return { ok: null, text: 'No answer from the manager; the state change may still be running. Check its state before trying again.' };
+    const tail = err instanceof WaitTimeoutError ? '; it may still be running' : '';
+    return { ok: null, text: `can't confirm the state change of ${name}: ${reason}${tail}.` };
+  }
+}
+
+export interface BackupConfigAnswer {
+  success?: boolean;
+  error?: string;
+  fleetBackup?: { enabled?: unknown; hour?: unknown } | null;
+}
+
+/** PUT /api/bots/:id/fleet-backup-config {enabled?, hour?, expected} (bots.ts:1654): 409 carries the stored settings. */
+export async function saveBackupConfig(client: Client, botId: string, body: Record<string, unknown>): Promise<Outcome<BackupConfigAnswer>> {
+  const r = await call(client, 'PUT', `/api/bots/${botId}/fleet-backup-config`, body);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as BackupConfigAnswer };
+}
+
+export interface RestorePreview {
+  success?: boolean;
+  error?: string;
+  instances?: Array<{ id: string; displayName: string; running: boolean | null }>;
+}
+
+/** GET /api/bots/:id/fleet-backups/restore-preview (bots.ts:1760), previewFleetRestore (fleetBackup.ts:1703). */
+export async function readRestorePreview(client: Client, botId: string, limitMs: number): Promise<Outcome<RestorePreview>> {
+  const r = await call(client, 'GET', `/api/bots/${botId}/fleet-backups/restore-preview`, undefined, limitMs);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as RestorePreview };
+}
+
+export interface RestoreSteps {
+  restored?: boolean;
+  preRestoreDump?: string | null;
+  guildsRaised?: unknown[];
+  claimRaisedTo?: number;
+  claimFloor?: number;
+  shardClaimsRaised?: number;
+  shardClaimsExpired?: number;
+  counts?: { result?: string; tables?: number; rows?: number; text?: string } | null;
+  botState?: string;
+  stopped?: unknown[];
+  restarted?: unknown[];
+  generation?: number;
+}
+
+export interface RestoreAnswer {
+  success?: boolean;
+  error?: string;
+  steps?: RestoreSteps;
+  warning?: string;
+  note?: string;
+}
+
+/** POST /api/bots/:id/fleet-backups/restore {file} (bots.ts:1779): held until the restore ends, so no time limit. */
+export async function restoreBackup(client: Client, botId: string, file: string): Promise<Outcome<RestoreAnswer>> {
+  const r = await call(client, 'POST', `/api/bots/${botId}/fleet-backups/restore`, { file });
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as RestoreAnswer };
+}
+
+/** DELETE /api/bots/:id/fleet-backups/restore-error?at= (bots.ts:1746), dismissShownRestoreNotice (fleetBackup.ts:128). */
+export async function dismissRestoreNotice(client: Client, botId: string, at: string): Promise<Outcome<{ success?: boolean; error?: string; dismissed?: boolean }>> {
+  const r = await call(client, 'DELETE', `/api/bots/${botId}/fleet-backups/restore-error?at=${encodeURIComponent(at)}`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as { success?: boolean; error?: string; dismissed?: boolean } };
+}
+
+/** POST /api/bots/:id/fleet-db/decommission (bots.ts:1817), decommissionFleetDb (fleetReplica.ts:1664). */
+export async function decommissionDb(client: Client, botId: string): Promise<Outcome<{ success?: boolean; error?: string; dumpFile?: string; warning?: string }>> {
+  const r = await call(client, 'POST', `/api/bots/${botId}/fleet-db/decommission`, {});
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as { success?: boolean; error?: string; dumpFile?: string; warning?: string } };
 }

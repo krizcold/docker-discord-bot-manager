@@ -1,4 +1,5 @@
 import { Client } from '../client';
+import type { CodeField, CodeShown } from './codes';
 import type { ConfigEditor } from './configedit';
 import type { DatabaseScreen } from './database';
 import type { EnvEditor } from './envedit';
@@ -6,11 +7,14 @@ import type { InstallWizard } from './install';
 import type { StateScreen } from './statescreen';
 import type { VaultScreen } from './vaultscreen';
 import {
-  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, Outcome, readOrphanBackups,
+  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, Outcome, readOrphanBackups, readReplica,
   StreamLines, stopBot,
 } from './api';
 
 export const LIST_EVERY_MS = 5000;
+
+/** followLostProvisioning (index.html:3258): 20 reads of the copy's state, 3 s apart. */
+export const LOST_CHECK = { reads: 20, everyMs: 3000 };
 const ORPHAN_LIMIT_MS = 15_000;
 
 export type OrphanRead = Outcome<{ folders?: Array<{ id: string; dumps: number | null; folder: string }> }>;
@@ -40,11 +44,19 @@ export class Session {
   orphans: OrphanRead | null = null;
   /** The Database screen's call running per bot, so a screen opened again during a held restore waits for it. */
   dbBusy = new Map<string, { text: string; escape: boolean }>();
+  /** The code field that has focus: it takes the keys first and receives a bracketed paste. */
+  codeFocus: CodeField | null = null;
+  /** The bots whose last provision or re-seed got no answer and are being read again (the page's provisionChecking). */
+  lostChecks = new Set<string>();
+  lostCheck = { ...LOST_CHECK };
+  /** A move code per bot that was made while its code screen could not open; dropped when that screen opens. */
+  moveCodes = new Map<string, CodeShown>();
   version = 0;
   private listeners = new Set<() => void>();
   private timer: NodeJS.Timeout | null = null;
   private reading = false;
   private aborts = new Set<AbortController>();
+  private stopped = false;
 
   constructor(readonly client: Client, private now: () => number = Date.now) {}
 
@@ -68,12 +80,52 @@ export class Session {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     for (const a of this.aborts) a.abort();
     this.aborts.clear();
     this.held.database?.close();
     this.held.state?.close();
+    this.codeFocus = null;
+    this.moveCodes.clear();
+  }
+
+  /**
+   * followLostProvisioning (index.html:3258): reads the copy's state until a seed run or a stopped one shows, or the
+   * reads run out; `end` gets true when one showed, false when none did. One check per bot at a time.
+   */
+  async followLost(botId: string, limitMs: number, end: (started: boolean) => void): Promise<void> {
+    if (this.lostChecks.has(botId)) return;
+    this.lostChecks.add(botId);
+    this.changed();
+    void this.refresh();
+    try {
+      for (let i = 0; i < this.lostCheck.reads; i++) {
+        const r = await readReplica(this.client, botId, limitMs);
+        if (this.stopped) return;
+        const rep = r.ok === true ? r.value.replica : null;
+        if (rep && (rep.provisioning || rep.parkedSeed)) {
+          void this.refresh();
+          end(true);
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, this.lostCheck.everyMs);
+          t.unref?.();
+        });
+        if (this.stopped) return;
+      }
+      end(false);
+    } finally {
+      this.lostChecks.delete(botId);
+      this.changed();
+    }
+  }
+
+  focusCode(f: CodeField | null): void {
+    this.codeFocus = f;
+    this.changed();
   }
 
   async refresh(): Promise<void> {

@@ -190,8 +190,10 @@ describe('m4 the three layouts', () => {
     await v.until('The copy on yundera (slot smdb_copy_a): streaming, caught up, replay lag 0.4s');
     await v.until('Move This database is the main: contabo, generation 3 since 2026-11-01 12:30 UTC.');
     expect(new Set(gets(f))).toEqual(new Set(['maintenance', 'memory', 'fleet-connections', 'fleet-replica', 'fleet-backups', 'fleet-replication', 'fleet-switch']));
-    expect(keyBar(v.frame())).toContain('Up/Down Backup');
-    expect(flat(v.frame())).not.toMatch(/Cancel|X Dismiss|Enable|Disable replication|Join code|Hand over/);
+    // With J Join code the bar takes two lines.
+    expect(v.frame().split('\n').slice(-4, -1).join(' ')).toContain('Up/Down Backup');
+    expect(flat(v.frame())).toContain('J Join code');
+    expect(flat(v.frame())).not.toMatch(/Cancel|X Dismiss|Enable|Disable replication|Hand over/);
   });
 
   it('Down moves the host path to the next row; a dump without a counts file says so', async () => {
@@ -490,8 +492,9 @@ describe('m4 the layout at 80 and 100 columns', () => {
       for (const l of lines) expect(l.length).toBeLessThanOrEqual(columns - 1);
       expect(flat(v.frame())).toContain('/var/lib/casaos/AppData/discordbotmanager/data/');
       expect(flat(v.frame())).toContain('0f8fad5b-d9cb-469f-a165-70867728950e/');
-      expect(keyBar(v.frame())).toContain('Esc Back');
-      expect(v.frame().split('\n').slice(-4, -1).join(' ')).toContain('PgUp/PgDn Scroll');
+      // With A Actions the bar takes three lines at 80 columns.
+      expect(v.frame().split('\n').slice(-5, -1).join(' ')).toContain('Esc Back');
+      expect(v.frame().split('\n').slice(-5, -1).join(' ')).toContain('PgUp/PgDn Scroll');
       await v.press('\u001B[6~');
       await v.until('Replication');
       for (const l of v.frame().split('\n')) expect(l.length).toBeLessThanOrEqual(columns - 1);

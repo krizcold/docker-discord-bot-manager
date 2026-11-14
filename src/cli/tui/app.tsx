@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type * as Ink from 'ink';
 import {
   ActionKind, Bot, botName, buildFrameLine, buildLogPath, Container, containerFrameLine, containerLogPath, listContainers, StreamLines,
 } from './api';
 import { isForwardDelete } from './field';
 import { clock, copyText, dataText, lastBackupText, listHeader, listRow, statusText, updateText } from './format';
+import { codeScreen, CodeShown, PASTE_OFF, PASTE_ON, PasteReader } from './codes';
 import { ConfigEditor, ConfigExit, ConfigOptions } from './configedit';
 import { DatabaseExit, DatabaseOptions, DatabaseScreen } from './database';
+import { Dialog } from './dialog';
 import { databaseBadges, hasDatabaseScreen, heldWarningText, hostDataRoot, orphanLines, startOffRefusal, stateName, timeIn } from './dbtext';
 import { StateExit, StateOptions, StateScreen } from './statescreen';
 import { EditRequest } from './editbody';
@@ -17,7 +19,7 @@ import { VaultExit, VaultOptions, VaultScreen } from './vaultscreen';
 
 export type InkApi = typeof Ink;
 
-export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault' | 'database' | 'state';
+export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault' | 'database' | 'state' | 'code';
 
 export interface FrameState {
   screen: Screen;
@@ -44,6 +46,8 @@ export interface AppProps {
   vaultOptions?: VaultOptions;
   databaseOptions?: DatabaseOptions;
   stateOptions?: StateOptions;
+  /** Writes a terminal mode sequence (bracketed paste on and off); Ink's stdout by default. */
+  writeMode?: (sequence: string) => void;
 }
 
 export interface View {
@@ -169,11 +173,17 @@ export function createApp(ink: InkApi) {
 
   return function App({
     machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions, envOptions, configOptions, vaultOptions, databaseOptions, stateOptions, onEdit,
+    writeMode,
   }: AppProps) {
     const { exit } = useApp();
     const { stdout } = useStdout();
     const { internal_eventEmitter: inputEvents } = useStdin();
     const raw = useRef<string | undefined>(undefined);
+    // False for a bracketed paste's markers and text: no key inside a paste acts.
+    const rawKey = useRef(true);
+    const paste = useRef(new PasteReader());
+    // The code on the code screen; it lives only while that screen shows, never in the Session.
+    const codeShown = useRef<CodeShown | null>(null);
     const held = session.held;
     const wizard = { get current() { return held.install ?? null; }, set current(v: InstallWizard | null) { held.install = v ?? undefined; } };
     const editor = { get current() { return held.env ?? null; }, set current(v: EnvEditor | null) { held.env = v ?? undefined; } };
@@ -186,6 +196,13 @@ export function createApp(ink: InkApi) {
     useEffect(() => {
       const onRaw = (data: string) => {
         raw.current = data;
+        const r = paste.current.read(data);
+        rawKey.current = r.key;
+        const focus = session.codeFocus;
+        if (r.text && focus) {
+          focus.add(r.text);
+          session.changed();
+        }
       };
       inputEvents?.on('input', onRaw);
       return () => {
@@ -194,10 +211,33 @@ export function createApp(ink: InkApi) {
     }, [inputEvents]);
     useSyncExternalStore(session.subscribe, session.snapshot);
     const [state, setState] = useState<FrameState>(initial ?? { screen: 'list', index: 0 });
+    const stateRef = useRef(state);
+    stateRef.current = state;
     const [size, setSize] = useState({ columns: stdout.columns || 80, rows: stdout.rows || 24 });
     const [scroll, setScroll] = useState(0);
+    const [quitting, setQuitting] = useState(false);
+    useEffect(() => {
+      if (quitting) exit();
+    }, [quitting]);
     const [containers, setContainers] = useState<{ list: Container[] | null; error: string | null }>({ list: null, error: null });
     const stream = useRef<StreamLines>({ lines: [], end: null });
+    // The open stop, restart or update question.
+    const confirmDialog = useRef<Dialog | null>(null);
+
+    // Bracketed paste is on only while a code field has focus, so a paste elsewhere stays plain keys.
+    const write = useRef(writeMode ?? ((sequence: string) => void stdout.write(sequence)));
+    const pasteOn = useRef(false);
+    const codeFocused = !!session.codeFocus && state.screen !== 'code';
+    useEffect(() => {
+      if (codeFocused === pasteOn.current) return;
+      pasteOn.current = codeFocused;
+      write.current(codeFocused ? PASTE_ON : PASTE_OFF);
+    }, [codeFocused]);
+    useEffect(() => () => {
+      if (!pasteOn.current) return;
+      pasteOn.current = false;
+      write.current(PASTE_OFF);
+    }, []);
 
     useEffect(() => {
       const onResize = () => setSize({ columns: stdout.columns || 80, rows: stdout.rows || 24 });
@@ -234,6 +274,13 @@ export function createApp(ink: InkApi) {
     const go = (next: Partial<FrameState>) => {
       setScroll(0);
       setState({ ...state, notice: undefined, ...next });
+    };
+
+    const askConfirm = (kind: ActionKind) => {
+      if (!bot) return;
+      const b = bot;
+      confirmDialog.current = new Dialog([], (inner) => confirmText(kind, b).flatMap((l) => (l ? wrap(l, inner) : [''])), `Y ${KIND_LABEL[kind]}`, () => act(kind));
+      go({ screen: 'confirm', kind });
     };
 
     const act = (kind: ActionKind) => {
@@ -338,6 +385,15 @@ export function createApp(ink: InkApi) {
       setState((s) => ({ ...s, screen: from === 'database' && database.current ? 'database' : 'bot', notice: undefined }));
     };
 
+    // A code read lands later; it opens only while the screen that asked is still the one shown.
+    const openCode = (asker: DatabaseScreen, shown: CodeShown): boolean => {
+      if (database.current !== asker || stateRef.current.screen !== 'database') return false;
+      codeShown.current = shown;
+      setScroll(0);
+      setState((s) => (s.screen === 'database' ? { ...s, screen: 'code', notice: undefined } : s));
+      return true;
+    };
+
     const afterDatabase = (out: DatabaseExit) => {
       if (!out) return;
       if ('state' in out) {
@@ -356,12 +412,43 @@ export function createApp(ink: InkApi) {
 
     const onInput = (input: string, key: Ink.Key) => {
       const k = input.toLowerCase();
+      // Before the paste gate: an unfinished paste or a held escape start must not keep the operator in. A pasted Ctrl+C
+      // arrives inside a longer input and does not match.
+      if (key.ctrl && k === 'c') {
+        // The terminal keeps the last frame after the exit, so a code on screen is replaced by a frame without it first.
+        if (state.screen === 'code') {
+          codeShown.current = null;
+          setState((s) => ({ ...s, screen: database.current ? 'database' : 'bot', notice: undefined }));
+          setQuitting(true);
+        } else exit();
+        return;
+      }
+      if (!rawKey.current) return;
+      // Only Esc acts on the code screen: Q or a hand-off would leave the code in the terminal's scrollback.
+      if (state.screen === 'code') {
+        if (key.escape) {
+          codeShown.current = null;
+          setScroll(0);
+          setState((s) => ({ ...s, screen: database.current ? 'database' : 'bot', notice: undefined }));
+        }
+        return;
+      }
+      const focus = session.codeFocus;
+      if (focus) {
+        const out = focus.key(input, key);
+        if (out) {
+          if (out === 'enter') focus.hooks.onEnter?.();
+          if (out === 'escape') focus.hooks.onEscape?.();
+          session.changed();
+          return;
+        }
+      }
       if (state.screen === 'state') {
         afterState(stateScreen.current ? stateScreen.current.key(input, key, isForwardDelete(raw.current)) : { leave: true });
         return;
       }
       if (state.screen === 'database') {
-        afterDatabase(database.current ? database.current.key(input, key) : { leave: true });
+        afterDatabase(database.current ? database.current.key(input, key, isForwardDelete(raw.current)) : { leave: true });
         return;
       }
       if (state.screen === 'vault') {
@@ -391,7 +478,14 @@ export function createApp(ink: InkApi) {
         return;
       }
       if (state.screen === 'confirm') {
-        if (k === 'y' && state.kind) act(state.kind);
+        const d = confirmDialog.current;
+        const out = d ? d.key(input, key) : 'cancel';
+        if (out === null) {
+          session.changed();
+          return;
+        }
+        confirmDialog.current = null;
+        if (out === 'yes' && d) d.run();
         else go({ screen: 'bot', notice: `Cancelled: ${bot ? botName(bot) : 'the bot'} was not ${state.kind === 'stop' ? 'stopped' : state.kind === 'update' ? 'updated' : 'restarted'}.` });
         return;
       }
@@ -448,8 +542,9 @@ export function createApp(ink: InkApi) {
       if (k === 't') openState(bot.id, 'bot');
       else if (k === 'd' && hasDatabaseScreen(bot)) {
         database.current?.close();
-        database.current = new DatabaseScreen(session.client, () => session.changed(), bot.id, session, databaseOptions, reportFor(bot.id));
-        database.current.open();
+        const screen: DatabaseScreen = new DatabaseScreen(session.client, () => session.changed(), bot.id, session, databaseOptions, reportFor(bot.id), (shown) => openCode(screen, shown));
+        database.current = screen;
+        screen.open();
         go({ screen: 'database' });
       } else if (k === 'l') go({ screen: 'containers', pick: 0 });
       else if (k === 'g') go({ screen: 'buildlogs' });
@@ -471,13 +566,13 @@ export function createApp(ink: InkApi) {
       }
       else if (session.busy(bot.id)) return;
       else if (k === 's') {
-        if (bot.status === 'running' || bot.status === 'starting') go({ screen: 'confirm', kind: 'stop' });
+        if (bot.status === 'running' || bot.status === 'starting') askConfirm('stop');
         else if (startOffRefusal(bot)) go({ notice: startOffRefusal(bot) });
         else act('start');
-      } else if (k === 'r') go({ screen: 'confirm', kind: 'restart' });
+      } else if (k === 'r') askConfirm('restart');
       else if (k === 'b') act('build');
       else if (k === 'u' && bot.sourceType !== 'docker-image') {
-        if (heldWarningText(bot, 'update')) go({ screen: 'confirm', kind: 'update' });
+        if (heldWarningText(bot, 'update')) askConfirm('update');
         else act('update');
       }
     };
@@ -560,9 +655,7 @@ export function createApp(ink: InkApi) {
         if (longNotice) return { body, keys };
         return { body, keys, notice };
       }
-      if (state.screen === 'confirm' && state.kind) {
-        return { body: confirmText(state.kind, bot).flatMap((l) => (l ? wrap(l, innerWidth(size.columns)) : [''])), keys: `Y ${KIND_LABEL[state.kind]}  any other key Cancel` };
-      }
+      if (state.screen === 'confirm' && confirmDialog.current) return confirmDialog.current.view(innerWidth(size.columns), room);
       if (state.screen === 'action') {
         if (!run) return { body: ['No action has run on this bot in this session.'], keys: 'Esc Back  Q Quit' };
         const head = [`${KIND_LABEL[run.kind]} ${run.name}`, ''];
@@ -588,6 +681,23 @@ export function createApp(ink: InkApi) {
       const lines = [...s.lines, ...(s.end ? ['', s.end.text] : [])];
       return { body: [head, '', ...scrollWindow(lines, room - 2, scroll)], keys: SCROLL_KEYS };
     };
+    const codeView = state.screen === 'code' && codeShown.current ? codeScreen(codeShown.current, size.columns, size.rows) : null;
+    // A held move code leaves the Session only once a frame has drawn it whole.
+    useLayoutEffect(() => {
+      const shown = codeShown.current;
+      if (!codeView?.whole || !shown?.onWhole) return;
+      const done = shown.onWhole;
+      shown.onWhole = undefined;
+      done();
+    });
+    if (state.screen === 'code') {
+      const lines = codeView ? codeView.lines : ['The code is no longer shown.', '', 'Esc Close'];
+      return (
+        <Box flexDirection="column">
+          {lines.map((line, i) => <Text key={i}>{line}</Text>)}
+        </Box>
+      );
+    }
     let view = buildView(fullRoom);
     const extraKeys = keyLines(view.keys, innerWidth(size.columns)).length - 1;
     if (extraKeys > 0) view = buildView(fullRoom - extraKeys);

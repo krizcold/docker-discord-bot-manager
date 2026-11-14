@@ -8,7 +8,7 @@ export interface Bot {
   sourceType?: string;
   activeOp?: string | null;
   fleetDb?: FleetDbView | null;
-  fleetDbReplica?: { copyCleared?: boolean; takeover?: unknown } | null;
+  fleetDbReplica?: { copyCleared?: boolean; takeover?: unknown; slot?: string } | null;
   fleetDbReplicaSeed?: { phase?: string } | null;
   dataPlace?: 'json' | 'outside' | null;
   fleetBackup?: FleetBackupStatus | null;
@@ -101,8 +101,8 @@ export interface FleetBackupStatus {
 /** The switch records of a bot's fleetDb as the list route sends them (src/types/index.ts:61 to 66). */
 export interface FleetDbView {
   replication?: { publicHost?: string; hostPort?: number } | null;
-  handover?: { mode?: string; phase?: string; machine?: string; host?: string; at?: string; lastCheck?: string } | null;
-  receive?: { expiresAt?: string } | null;
+  handover?: { mode?: string; phase?: string; machine?: string; host?: string; at?: string; lastCheck?: string; file?: string } | null;
+  receive?: { expiresAt?: string; safetyDump?: string } | null;
   replacedBy?: { machine?: string; generation?: number } | null;
   mainConflict?: { machine?: string; blockError?: string } | null;
   pushBroken?: { at?: string; safetyDump?: string } | null;
@@ -960,6 +960,7 @@ export interface ReplicaStatus {
   parkedSeed?: SeedView;
   pinsWarning?: string;
   seedNote?: string;
+  seedNoteStartedAt?: number;
   rebuiltShown?: boolean;
   lastError?: string;
   probeError?: string;
@@ -983,11 +984,182 @@ export interface SwitchAnswer {
   lines?: string[];
   takeover?: unknown;
   generation?: { machine?: string; generation?: number; since?: string | null; error?: string } | null;
+  /** streamingCopies (fleetSwitch.ts:1774): this main's copies and whether each streams now. */
+  copies?: Array<{ slot?: string; machine?: string; streaming?: boolean }>;
 }
 
 /** GET /api/bots/:id/fleet-switch (bots.ts:2067), src/instance/fleetSwitch.ts:1652 and :1762. */
 export function readSwitch(client: Client, botId: string, limitMs: number): Read<SwitchAnswer> {
   return read(client, `/api/bots/${botId}/fleet-switch`, limitMs);
+}
+
+/** How a lane route ended for the screen (laneRoute, bots.ts:2046 to :2064; startLane, fleetSwitch.ts:393). */
+export type LaneResult =
+  | { kind: 'no-stream'; text: string }
+  | { kind: 'lost'; text: string }
+  | { kind: 'refused'; text: string }
+  | { kind: 'question'; text: string; confirmFlag?: string }
+  | { kind: 'done'; text: string; moveCode?: string; file?: string }
+  | { kind: 'ended'; ok: boolean; text: string; file?: string }
+  | { kind: 'unconfirmed'; text: string };
+
+const limitText = (ms: number) => (ms % 60_000 === 0 ? `${ms / 60_000} min` : ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`);
+const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+export const lanePath = (botId: string, route: string): string => `/api/bots/${botId}/${route}`;
+
+/**
+ * One lane route: /ws opens first, the request goes out, and an accepted lane is judged by the bot:switch frame that
+ * carries the answer's opId (bots.ts:2040 to :2043). Frames that come before the answer are kept until it names the
+ * opId. The request has no time limit; the wait for the frame has `limitMs`.
+ */
+export async function laneCall(
+  client: Client, botId: string, method: string, path: string, body: unknown,
+  opts: { op: string; limitMs: number; onAccepted?: () => void },
+): Promise<LaneResult> {
+  const kept: Array<Record<string, unknown>> = [];
+  let onFrame: ((d: Record<string, unknown>) => void) | null = null;
+  let onLost: ((reason: string) => void) | null = null;
+  let lostWhy: string | null = null;
+  const ws: { conn: { close: () => void } | null } = { conn: null };
+  const failed = await new Promise<string | null>((resolve) => {
+    let opened = false;
+    try {
+      ws.conn = client.openWs(
+        (msg) => {
+          const d = msg.data;
+          if (msg.type !== 'bot:switch' || !d || typeof d !== 'object' || Array.isArray(d)) return;
+          const frame = d as Record<string, unknown>;
+          if (frame.id !== botId) return;
+          if (onFrame) onFrame(frame);
+          else kept.push(frame);
+        },
+        () => {
+          if (opened) return;
+          opened = true;
+          resolve(null);
+        },
+        (reason) => {
+          if (!opened) {
+            opened = true;
+            resolve(reason);
+            return;
+          }
+          lostWhy = reason;
+          onLost?.(reason);
+        },
+      );
+    } catch (err) {
+      resolve(why(err));
+    }
+  });
+  const closeWs = () => {
+    try {
+      ws.conn?.close();
+    } catch {
+      // A channel that failed to open has nothing to close.
+    }
+  };
+  if (failed !== null) {
+    closeWs();
+    return { kind: 'no-stream', text: `The manager's event stream did not open (${failed}), so nothing was sent.` };
+  }
+  try {
+    const r = await call(client, method, path, body);
+    if (r.ok !== true) return { kind: 'lost', text: r.text };
+    const b = r.value;
+    if (b.success !== true) {
+      if (b.needsConfirm === true) return { kind: 'question', text: str(b.error), ...(str(b.confirmFlag) ? { confirmFlag: str(b.confirmFlag) } : {}) };
+      return { kind: 'refused', text: str(b.error) };
+    }
+    const opId = str(b.opId);
+    if (!opId) return { kind: 'done', text: str(b.text), ...(str(b.moveCode) ? { moveCode: str(b.moveCode) } : {}), ...(str(b.file) ? { file: str(b.file) } : {}) };
+    opts.onAccepted?.();
+    const unconfirmed = (reason: string): LaneResult => ({
+      kind: 'unconfirmed', text: `Can't confirm the ${opts.op}: ${reason}; it may still be running. The Move lines show what stands.`,
+    });
+    return await new Promise<LaneResult>((resolve) => {
+      const judge = (d: Record<string, unknown>) => resolve({ kind: 'ended', ok: d.success === true, text: str(d.text), ...(str(d.file) ? { file: str(d.file) } : {}) });
+      const early = kept.find((d) => d.opId === opId);
+      if (early) {
+        judge(early);
+        return;
+      }
+      if (lostWhy !== null) {
+        resolve(unconfirmed(`the event stream closed (${lostWhy})`));
+        return;
+      }
+      const timer = setTimeout(() => resolve(unconfirmed(`no result came within ${limitText(opts.limitMs)}`)), opts.limitMs);
+      timer.unref?.();
+      onFrame = (d) => {
+        if (d.opId !== opId) return;
+        clearTimeout(timer);
+        judge(d);
+      };
+      onLost = (reason) => {
+        clearTimeout(timer);
+        resolve(unconfirmed(`the event stream closed (${reason})`));
+      };
+    });
+  } finally {
+    closeWs();
+  }
+}
+
+/** POST /api/bots/:id/fleet-reseed (bots.ts:2010): `{replaced: true}` answers rejoinComposed (fleetSwitch.ts:1498); a code goes to reseedStalePrimary (fleetReplica.ts:1426). No time limit. */
+export function rejoinCopy(client: Client, botId: string, body: { replaced: true } | ProvisionBody): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-reseed`, body);
+}
+
+/** POST /api/bots/:id/fleet-replication (bots.ts:1919): enable or update with a host, or disable; no time limit. */
+export function setReplication(
+  client: Client, botId: string, body: { enabled: true; publicHost: string; hostPort?: number; slotWalKeepMb?: number } | { enabled: false },
+): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-replication`, body);
+}
+
+/** DELETE /api/bots/:id/fleet-replication/slots/:slot (bots.ts:1900), dropFleetSlot (fleetReplication.ts:915). */
+export function dropReplicationSlot(client: Client, botId: string, slot: string): Promise<Outcome<Body>> {
+  return call(client, 'DELETE', `/api/bots/${botId}/fleet-replication/slots/${encodeURIComponent(slot)}`);
+}
+
+/** DELETE /api/bots/:id/fleet-replica/seed (bots.ts:2226), cancelReplicaSeed (fleetReplica.ts:2086). */
+export function cancelSeed(
+  client: Client, botId: string, body: { startedAt: number; parked: boolean; committed?: boolean; confirm?: boolean },
+): Promise<Outcome<Body>> {
+  return call(client, 'DELETE', `/api/bots/${botId}/fleet-replica/seed`, body);
+}
+
+/** POST /api/bots/:id/fleet-join (bots.ts:1878), joinFleet (src/instance/fleetJoin.ts:722); no time limit. */
+export function joinFleet(client: Client, botId: string, joinCode: string): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-join`, { joinCode });
+}
+
+export type ProvisionBody = { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string };
+
+/** POST /api/bots/:id/fleet-replica (bots.ts:1978), provisionFleetReplica (src/instance/fleetReplica.ts:825); no time limit. */
+export function provisionReplica(client: Client, botId: string, body: ProvisionBody): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-replica`, body);
+}
+
+/** DELETE /api/bots/:id/fleet-replica (bots.ts:2198), removeFleetReplica (src/instance/fleetReplica.ts:1215); no time limit. */
+export function removeReplica(client: Client, botId: string, body?: { confirmPromoted: true }): Promise<Outcome<Body>> {
+  return call(client, 'DELETE', `/api/bots/${botId}/fleet-replica`, body);
+}
+
+/** POST /api/bots/:id/fleet-replica/reseed (bots.ts:2270), reseedStandby (src/instance/fleetReplica.ts:2314); no time limit. */
+export function reseedCopy(client: Client, botId: string, body: { confirm?: true }): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-replica/reseed`, body);
+}
+
+/** POST /api/bots/:id/fleet-replica/finish-retire (bots.ts:2249), finishPinsRetire (src/instance/fleetReplica.ts:1358); no time limit. */
+export function finishRetire(client: Client, botId: string): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-replica/finish-retire`);
+}
+
+/** GET /api/bots/:id/fleet-replication/join-code (bots.ts:1864), getJoinCode (src/instance/fleetReplication.ts:962). */
+export function readJoinCode(client: Client, botId: string, limitMs: number): Read<{ joinCode?: string }> {
+  return read(client, `/api/bots/${botId}/fleet-replication/join-code`, limitMs);
 }
 
 export interface MigrateView {

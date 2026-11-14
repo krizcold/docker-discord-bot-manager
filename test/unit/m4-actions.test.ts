@@ -337,7 +337,7 @@ describe('m4 bringing a dump in', () => {
     const v = await openDb(routes(fake()));
     const text = flat(v.frame());
     expect(text.split('A dump from elsewhere').length - 1).toBe(1);
-    expect(text).toContain('A dump from elsewhere: copy it into /srv/smdb/data/backups/b1/fleet-postgres on the host. It restores when its counts file <name>.dump.json is copied beside it, or when it is named moved-<anything>.dump, which restores it as a move: this machine becomes the bot\'s main.');
+    expect(text).toContain('A dump from elsewhere: copy it into /srv/smdb/data/backups/b1/fleet-postgres on the host. It restores when its counts file <name>.dump.json is copied beside it under the name it was written with: the counts file names its dump, and one renamed to fit another dump is refused. A dump named moved-<anything>.dump restores without a counts file, as a move: this machine becomes the bot\'s main.');
     expect(text).toContain('Copy it under a name that does not end in .dump (for example <name>.part) and rename it once the copy is complete');
     expect(text).toContain('older than 48 hours (hourly) or 30 days (daily) is deleted at the next trim.');
   });

@@ -462,7 +462,7 @@ export function replicationLines(r: Outcome<{ replication?: ReplicationStatus }>
 // renderFleetSwitch (:3577) and switchPanelHtml (:3592): the Move lines; every button is M5's.
 export function switchLines(bot: Bot, r: Outcome<SwitchAnswer> | null): DbLine[] {
   if (!r) return [];
-  if (r.ok === null) return [err(`No answer from the manager (${r.text}); the move lines are not shown. Retrying.`)];
+  if (r.ok === null) return [err(`No answer from the manager (${r.text}); the move controls are not shown. Retrying.`)];
   if (r.ok === false) return [err(retryingText('Could not read the move state', r))];
   const view = r.value;
   const lines = (view.lines || []).map(tip);
@@ -495,6 +495,28 @@ export function hostPathLines(root: string | null, botId: string, file: string, 
     `Dump: ${file}`,
     ...(hasCounts ? [`Counts file: ${file}.json`, 'Copy both files to keep the counts check.'] : [`Counts file: ${file}.json could not be read.`]),
   ];
+}
+
+const MOVE_OUT_HEAD = (file: string) => `The backup ${file} is ready and is downloading.`;
+const MOVE_OUT_HEAD_END = 'with the bot in Maintenance or Off.';
+
+/**
+ * moveOutFleet's text (fleetMove.ts:551) with where the backup is on this host instead of the page's download (plan
+ * section 5, owner question M4 Q1 option (a)): its sentence up to "with the bot in Maintenance or Off." becomes the
+ * file and the moved- name; the rest of the route's text is kept. A text that starts otherwise is kept whole after the
+ * host path lines. The counts file is not copied: it names its own dump (fleetBackup.ts:1231), readRestoreMeta reads only
+ * <dump>.json (:2075), refuses one that names another dump (:2089) and restores a moved- dump without one (:2078).
+ */
+export function moveOutText(root: string | null, botId: string, file: string, text: string): string {
+  const paths = hostPathLines(root, botId, file, true).slice(0, 2).join('; ');
+  const end = text.indexOf(MOVE_OUT_HEAD_END);
+  if (!text.startsWith(MOVE_OUT_HEAD(file)) || end < 0) return `${paths}. ${text}`;
+  const stem = file.replace(/^pre-move-/, '').replace(/\.dump$/, '');
+  const rest = text.slice(end + MOVE_OUT_HEAD_END.length).trim();
+  return `The backup ${file} is ready. ${paths}. Copy only the dump to the other machine's backups folder for that bot, under a name that `
+    + `does not end in .dump (for example moved-${stem}.part), then rename it moved-${stem}.dump there and restore it with the bot in `
+    + `Maintenance or Off. Do not copy its counts file ${file}.json: it names ${file}, so a copy renamed to match the moved- dump is `
+    + `refused, and a moved- dump restores without one.${rest ? ` ${rest}` : ''}`;
 }
 
 // loadOrphanBackups (:1491), with the host folder.
@@ -607,7 +629,7 @@ export const RESTORE_TIP = 'Restoring a backup rewinds every guild\'s data on th
 /** How a dump from elsewhere is brought in (owner question M4 Q1, option (a)): copied into the backups folder. */
 export function copyInText(root: string | null, botId: string): string {
   const where = root ? `${root}/${backupFolder(botId)} on the host` : `${backupFolder(botId)} in the manager's data folder`;
-  return `A dump from elsewhere: copy it into ${where}. It restores when its counts file <name>.dump.json is copied beside it, or when it is named moved-<anything>.dump, which restores it as a move: this machine becomes the bot's main. Copy it under a name that does not end in .dump (for example <name>.part) and rename it once the copy is complete: this screen lists every .dump file, and a restore of a file still being copied fails after the database was dropped (the safety dump is kept). A copied dump named hourly-<time>.dump or daily-<time>.dump whose time is older than 48 hours (hourly) or 30 days (daily) is deleted at the next trim.`;
+  return `A dump from elsewhere: copy it into ${where}. It restores when its counts file <name>.dump.json is copied beside it under the name it was written with: the counts file names its dump, and one renamed to fit another dump is refused. A dump named moved-<anything>.dump restores without a counts file, as a move: this machine becomes the bot's main. Copy it under a name that does not end in .dump (for example <name>.part) and rename it once the copy is complete: this screen lists every .dump file, and a restore of a file still being copied fails after the database was dropped (the safety dump is kept). A copied dump named hourly-<time>.dump or daily-<time>.dump whose time is older than 48 hours (hourly) or 30 days (daily) is deleted at the next trim.`;
 }
 
 // saveFleetBackupConfig's outcomes (:3910).

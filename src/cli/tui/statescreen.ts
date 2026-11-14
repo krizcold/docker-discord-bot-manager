@@ -5,6 +5,7 @@ import {
   heldLineText, heldWarningText, KIND_NOTES, migrateAcceptedText, migrateConfirmText, migrateName, migrateRecordLines, stateLineFor, stateName, timeIn,
   When,
 } from './dbtext';
+import { Dialog, DialogKey } from './dialog';
 import { editField, Field, field, FieldKey, showField } from './field';
 import { wrap } from './install';
 
@@ -47,7 +48,7 @@ export class StateScreen {
   message: Field = field();
   busy: string | null = null;
   pending = false;
-  confirm: { lines: string[]; yes: string; run: () => void } | null = null;
+  confirm: Dialog | null = null;
   notice: string | null = null;
   progress: string[] = [];
   wsError: string | null = null;
@@ -156,12 +157,21 @@ export class StateScreen {
     return !!this.mview && !this.mview.hidden && !!this.mview.to;
   }
 
-  key(input: string, key: FieldKey & { escape?: boolean }, forwardDelete = false): StateExit {
+  private dialog(lines: string[], yes: string, run: () => void): Dialog {
+    return new Dialog([`State: ${botName(this.bot())}`, ''], (inner) => lines.flatMap((l) => wrap(l, inner)), yes, run);
+  }
+
+  key(input: string, key: FieldKey & DialogKey & { escape?: boolean }, forwardDelete = false): StateExit {
     if (this.confirm) {
       const c = this.confirm;
-      this.confirm = null;
-      if (input.toLowerCase() === 'y') c.run();
-      else this.say('Cancelled: nothing was sent.');
+      const out = c.key(input, key);
+      if (out === 'yes') {
+        this.confirm = null;
+        c.run();
+      } else if (out === 'cancel') {
+        this.confirm = null;
+        this.say('Cancelled: nothing was sent.');
+      } else this.changed();
       return undefined;
     }
     if (this.busy) return undefined;
@@ -211,7 +221,7 @@ export class StateScreen {
     }
     const warning = this.choice === 'off' ? heldWarningText(bot, 'off') : '';
     if (warning) {
-      this.confirm = { lines: [warning], yes: 'Y Off', run: () => this.send() };
+      this.confirm = this.dialog([warning], 'Y Off', () => this.send());
       this.changed();
       return;
     }
@@ -262,7 +272,7 @@ export class StateScreen {
       return;
     }
     if (!view.record) {
-      this.confirm = { lines: [migrateConfirmText(bot, view)], yes: 'Y Migrate', run: () => void this.post(view) };
+      this.confirm = this.dialog([migrateConfirmText(bot, view)], 'Y Migrate', () => void this.post(view));
       this.changed();
       return;
     }
@@ -336,9 +346,7 @@ export class StateScreen {
   }
 
   private screen(inner: number, room: number, notice: string | undefined): StateView {
-    if (this.confirm) {
-      return { body: [`State: ${botName(this.bot())}`, '', ...this.confirm.lines.flatMap((l) => wrap(l, inner))], keys: `${this.confirm.yes}  any other key Cancel`, notice };
-    }
+    if (this.confirm) return { ...this.confirm.view(inner, room), notice };
     const all = this.lines(inner);
     const at = Math.max(all.findIndex((l) => l.focus), 0);
     const first = Math.max(0, Math.min(at - Math.floor(room / 2), all.length - room));

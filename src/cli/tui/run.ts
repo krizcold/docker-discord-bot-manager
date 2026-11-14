@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import os from 'os';
 import { createElement } from 'react';
 import { createApp, FrameState, InkApi } from './app';
+import { PASTE_OFF } from './codes';
 import { importEsm } from './esm';
 import { Client } from '../client';
 import { Session } from './session';
@@ -27,6 +28,7 @@ export function handOffCommand(env: NodeJS.ProcessEnv = process.env): string | u
 
 // The terminal leaves the frame for a child with inherited stdio; Ctrl+C belongs to the child meanwhile.
 async function suspended<T>(modes: ScreenModes, banner: string, run: () => Promise<T>): Promise<T> {
+  process.stdout.write(PASTE_OFF);
   process.stdout.write(modes.leave + SHOW_CURSOR + banner);
   const ignore = () => {};
   process.on('SIGINT', ignore);
@@ -64,7 +66,10 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
   const App = createApp(ink);
   const machine = os.hostname() || 'this machine';
   const modes = screenModes();
-  const restore = () => process.stdout.write(SHOW_CURSOR + modes.leave);
+  const restore = () => {
+    process.stdout.write(PASTE_OFF);
+    process.stdout.write(SHOW_CURSOR + modes.leave);
+  };
   process.once('exit', restore);
   process.stdout.write(modes.enter);
   const session = new Session(client);
@@ -91,7 +96,7 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
             instance?.unmount();
           },
         }),
-        { exitOnCtrlC: true, patchConsole: false },
+        { exitOnCtrlC: false, patchConsole: false },
       );
       try {
         await instance.waitUntilExit();

@@ -200,6 +200,9 @@ describe('m4 fix 1: the notice (C2, A1, A2)', () => {
     await v.press('d');
     await v.until(`> ${FILE1}`);
     await v.press(ENTER);
+    // At 24 rows the question scrolls: Y is offered once its last line has been on screen.
+    await v.until('Down More');
+    for (const end = Date.now() + WAIT_MS; Date.now() < end && !flat(v.frame()).includes('Y Restore');) await v.press('\u001B[6~');
     await v.until('Y Restore');
     await v.press('y', ESC);
     await v.until('Name mybot');

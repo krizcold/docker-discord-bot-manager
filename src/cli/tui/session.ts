@@ -1,4 +1,8 @@
 import { Client } from '../client';
+import type { ConfigEditor } from './configedit';
+import type { EnvEditor } from './envedit';
+import type { InstallWizard } from './install';
+import type { VaultScreen } from './vaultscreen';
 import {
   ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, StreamLines, stopBot,
 } from './api';
@@ -24,6 +28,8 @@ export class Session {
   list: ListState = { bots: [], readAt: null, error: null };
   runs = new Map<string, ActionRun>();
   notice: string | null = null;
+  /** The open install form and editors, kept here so they outlive the remount after a hand-off. */
+  held: { install?: InstallWizard; env?: EnvEditor; config?: ConfigEditor; vault?: VaultScreen } = {};
   version = 0;
   private listeners = new Set<() => void>();
   private timer: NodeJS.Timeout | null = null;

@@ -5,12 +5,16 @@ import {
 } from './api';
 import { isForwardDelete } from './field';
 import { clock, copyText, dataText, lastBackupText, listHeader, listRow, statusText, updateText } from './format';
-import { InstallWizard, WizardExit, WizardOptions } from './install';
+import { ConfigEditor, ConfigExit, ConfigOptions } from './configedit';
+import { EditRequest } from './editbody';
+import { EditorExit, EditorOptions, EnvEditor } from './envedit';
+import { InstallWizard, WizardExit, WizardOptions, wrap } from './install';
 import { Session } from './session';
+import { VaultExit, VaultOptions, VaultScreen } from './vaultscreen';
 
 export type InkApi = typeof Ink;
 
-export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install';
+export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault';
 
 export interface FrameState {
   screen: Screen;
@@ -27,9 +31,14 @@ export interface AppProps {
   session: Session;
   initial?: FrameState;
   onHandOff: (state: FrameState) => void;
+  /** Hands the terminal to the editor for a config body; the frame is drawn again at `state` afterwards. */
+  onEdit?: (state: FrameState, request: EditRequest) => void;
   canHandOff?: boolean;
   now?: () => number;
   wizardOptions?: WizardOptions;
+  envOptions?: EditorOptions;
+  configOptions?: ConfigOptions;
+  vaultOptions?: VaultOptions;
 }
 
 export interface View {
@@ -56,13 +65,29 @@ export function frameLines(machine: string, view: View, columns: number, rows: n
   const inner = width - 4;
   const titleText = `+ Bot Manager - ${machine} `;
   const top = fit(titleText + '-'.repeat(Math.max(width - titleText.length - 1, 0)), width - 1) + '+';
-  const room = bodyRows(rows);
+  const keys = keyLines(view.keys, inner);
+  const room = bodyRows(rows) - (keys.length - 1);
   const body = view.body.slice(0, room);
   while (body.length < room) body.push('');
   body.push(view.notice ?? '');
-  body.push(view.keys);
+  body.push(...keys);
   const bottom = '+' + '-'.repeat(width - 2) + '+';
   return [top, ...body.map((line) => `| ${fit(line, inner)} |`), bottom];
+}
+
+/** The key bar in lines of the inner width, broken between keys; each line past the first takes a body line. */
+export function keyLines(keys: string, inner: number): string[] {
+  const lines: string[] = [];
+  let line = '';
+  for (const k of keys.split('  ')) {
+    const next = line ? `${line}  ${k}` : k;
+    if (line && next.length > inner) {
+      lines.push(line);
+      line = k;
+    } else line = next;
+  }
+  lines.push(line);
+  return lines;
 }
 
 export function innerWidth(columns: number): number {
@@ -112,6 +137,11 @@ function waitingText(kind: ActionKind, name: string): string {
   }[kind];
 }
 
+// The page offers Env and Config on a bot that is not running and has no operation in flight.
+export function canEditEnv(bot: Bot, busy: boolean): boolean {
+  return !busy && !bot.activeOp && !['running', 'building', 'starting', 'stopping'].includes(bot.status ?? '');
+}
+
 function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean): string {
   const keys: string[] = [];
   if (!busy) {
@@ -119,19 +149,23 @@ function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean):
     if (bot.sourceType !== 'docker-image') keys.push('U Update');
   }
   if (hasRun) keys.push('P Progress');
-  keys.push('L Logs', 'G Build logs', ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
+  keys.push('L Logs', 'G Build logs', ...(canEditEnv(bot, busy) ? ['E Env', 'C Config'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
   return keys.join('  ');
 }
 
 export function createApp(ink: InkApi) {
   const { Box, Text, useApp, useInput, useStdin, useStdout } = ink;
 
-  return function App({ machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions }: AppProps) {
+  return function App({ machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions, envOptions, configOptions, vaultOptions, onEdit }: AppProps) {
     const { exit } = useApp();
     const { stdout } = useStdout();
     const { internal_eventEmitter: inputEvents } = useStdin();
     const raw = useRef<string | undefined>(undefined);
-    const wizard = useRef<InstallWizard | null>(null);
+    const held = session.held;
+    const wizard = { get current() { return held.install ?? null; }, set current(v: InstallWizard | null) { held.install = v ?? undefined; } };
+    const editor = { get current() { return held.env ?? null; }, set current(v: EnvEditor | null) { held.env = v ?? undefined; } };
+    const configEd = { get current() { return held.config ?? null; }, set current(v: ConfigEditor | null) { held.config = v ?? undefined; } };
+    const vault = { get current() { return held.vault ?? null; }, set current(v: VaultScreen | null) { held.vault = v ?? undefined; } };
 
     // Registered before useInput's listener, so the raw sequence of each key is known when useInput runs.
     useEffect(() => {
@@ -193,13 +227,23 @@ export function createApp(ink: InkApi) {
       go({ screen: 'action', kind });
     };
 
-    const room = bodyRows(size.rows);
+    const fullRoom = bodyRows(size.rows);
     const run = state.botId ? session.runs.get(state.botId) : undefined;
     // Install is offered once the manager has answered the list read.
     const canInstall = !session.list.error && session.list.readAt !== null;
 
-    const afterWizard = (out: WizardExit) => {
+    const handEdit = (request: EditRequest) => {
+      if (onEdit) onEdit({ ...state, notice: undefined }, request);
+      else request.done({ ok: false, text: 'No editor can be opened here; the body was not changed.' });
+    };
+
+    // An edit opens only for the form that asked, while it is still the open one.
+    const afterWizard = (out: WizardExit, asker?: InstallWizard | null) => {
       if (!out) return;
+      if ('edit' in out) {
+        if (asker === undefined || wizard.current === asker) handEdit(out.edit);
+        return;
+      }
       if ('quit' in out) {
         exit();
         return;
@@ -210,11 +254,71 @@ export function createApp(ink: InkApi) {
       if (out.installed) void session.refresh();
     };
 
+    const afterEditor = (out: EditorExit) => {
+      if (!out) return;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      editor.current = null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: out.notice }));
+      if (out.saved) void session.refresh();
+    };
+
+    const afterConfig = (out: ConfigExit, asker?: ConfigEditor | null) => {
+      if (!out) return;
+      if ('edit' in out) {
+        if (asker === undefined || configEd.current === asker) handEdit(out.edit);
+        return;
+      }
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      configEd.current = null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: out.notice }));
+      if (out.saved) void session.refresh();
+    };
+
+    const afterVault = (out: VaultExit) => {
+      if (!out) return;
+      vault.current?.close();
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      vault.current = null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'list', notice: undefined }));
+    };
+
     useInput((input, key) => {
       const k = input.toLowerCase();
+      if (state.screen === 'vault') {
+        const out = vault.current ? vault.current.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
+        if (out instanceof Promise) void out.then(afterVault);
+        else afterVault(out);
+        return;
+      }
+      if (state.screen === 'config') {
+        const asker = configEd.current;
+        const out = asker ? asker.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
+        if (out instanceof Promise) void out.then((r) => afterConfig(r, asker));
+        else afterConfig(out);
+        return;
+      }
+      if (state.screen === 'env') {
+        const out = editor.current ? editor.current.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
+        if (out instanceof Promise) void out.then(afterEditor);
+        else afterEditor(out);
+        return;
+      }
       if (state.screen === 'install') {
-        const out = wizard.current ? wizard.current.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
-        if (out instanceof Promise) void out.then(afterWizard);
+        const asker = wizard.current;
+        const out = asker ? asker.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
+        if (out instanceof Promise) void out.then((r) => afterWizard(r, asker));
         else afterWizard(out);
         return;
       }
@@ -251,6 +355,12 @@ export function createApp(ink: InkApi) {
           go({ screen: 'install' });
           return;
         }
+        if (k === 'v' && canInstall) {
+          vault.current = new VaultScreen(session.client, () => session.changed(), vaultOptions);
+          void vault.current.load();
+          go({ screen: 'vault' });
+          return;
+        }
         if (bots.length === 0) return;
         if (key.upArrow) go({ index: (index + bots.length - 1) % bots.length });
         else if (key.downArrow) go({ index: (index + 1) % bots.length });
@@ -270,6 +380,21 @@ export function createApp(ink: InkApi) {
       if (k === 'l') go({ screen: 'containers', pick: 0 });
       else if (k === 'g') go({ screen: 'buildlogs' });
       else if (k === 'p' && run) go({ screen: 'action', kind: run.kind });
+      else if (k === 'e') {
+        if (bot.status === 'running') go({ notice: 'Stop the bot to edit environment variables.' });
+        else if (canEditEnv(bot, session.busy(bot.id))) {
+          editor.current = new EnvEditor(session.client, () => session.changed(), bot.id, botName(bot), envOptions);
+          void editor.current.open();
+          go({ screen: 'env' });
+        }
+      } else if (k === 'c') {
+        if (bot.status === 'running') go({ notice: 'Stop the bot to edit config files.' });
+        else if (canEditEnv(bot, session.busy(bot.id))) {
+          configEd.current = new ConfigEditor(session.client, () => session.changed(), bot.id, botName(bot), configOptions);
+          void configEd.current.open();
+          go({ screen: 'config' });
+        }
+      }
       else if (session.busy(bot.id)) return;
       else if (k === 's') {
         if (bot.status === 'running' || bot.status === 'starting') go({ screen: 'confirm', kind: 'stop' });
@@ -280,13 +405,25 @@ export function createApp(ink: InkApi) {
     });
 
     const listKeys = (rows: boolean) =>
-      [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
+      [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install', 'V Vault'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
 
-    const view = ((): View => {
+    const buildView = (room: number): View => {
       const notice = state.notice ?? session.notice ?? undefined;
       if (state.screen === 'install') {
         if (wizard.current) return wizard.current.view(innerWidth(size.columns), room);
         return { body: ['Install is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'env') {
+        if (editor.current) return editor.current.view(innerWidth(size.columns), room);
+        return { body: ['The environment editor is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'vault') {
+        if (vault.current) return vault.current.view(innerWidth(size.columns), room);
+        return { body: ['The vault is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'config') {
+        if (configEd.current) return configEd.current.view(innerWidth(size.columns), room);
+        return { body: ['The config editor is not open.'], keys: 'Esc Back  Q Quit', notice };
       }
       const readFailed = session.list.error ? `can't read the bot list: ${session.list.error}` : null;
       if (state.screen === 'list') {
@@ -316,7 +453,10 @@ export function createApp(ink: InkApi) {
           ['Update', updateText(bot)],
         ].flatMap(([label, value]) => fieldLines(label, value, innerWidth(size.columns)));
         if (readFailed) body.push('', readFailed, `The values above were read at ${clock(session.list.readAt ?? t)}.`);
-        return { body, keys: botKeys(bot, session.busy(bot.id), !!run, canHandOff), notice };
+        const keys = botKeys(bot, session.busy(bot.id), !!run, canHandOff);
+        // A save's route text can be longer than the notice line; it goes under the values, whole.
+        if (notice && notice.length > innerWidth(size.columns)) return { body: [...body, '', ...wrap(notice, innerWidth(size.columns))], keys };
+        return { body, keys, notice };
       }
       if (state.screen === 'confirm' && state.kind) {
         return { body: confirmText(state.kind, name), keys: `Y ${KIND_LABEL[state.kind]}  any other key Cancel` };
@@ -345,7 +485,10 @@ export function createApp(ink: InkApi) {
       const head = state.screen === 'buildlogs' ? `Build log of ${name}` : `Logs of ${state.container ?? ''}`;
       const lines = [...s.lines, ...(s.end ? ['', s.end.text] : [])];
       return { body: [head, '', ...scrollWindow(lines, room - 2, scroll)], keys: SCROLL_KEYS };
-    })();
+    };
+    let view = buildView(fullRoom);
+    const extraKeys = keyLines(view.keys, innerWidth(size.columns)).length - 1;
+    if (extraKeys > 0) view = buildView(fullRoom - extraKeys);
 
     const lines = frameLines(machine, view, size.columns, size.rows);
     const marked = view.highlight === undefined ? -1 : view.highlight + 1;

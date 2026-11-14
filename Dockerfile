@@ -30,7 +30,7 @@ FROM node:20-alpine
 # `RUN --mount=...`; without it those builds fall back to the legacy builder
 # and fail. openssl generates the fleet database's pinned replication certs
 # (the postgres:16-alpine sidecar has no openssl CLI of its own).
-RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git openssl
+RUN apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git openssl nano
 
 # Trust any repository we operate on (bind-mounted source repos may have
 # mismatched UIDs after CasaOS post-deploy chown). Scoped to this image only.

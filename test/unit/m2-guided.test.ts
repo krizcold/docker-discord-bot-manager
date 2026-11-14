@@ -132,8 +132,8 @@ async function openForm(f: Fake) {
   return { ...view, frame, press, until };
 }
 
-// Tabs from the name field: CLIENT_ID key and value, the file, then the form in order.
-const AT = { token: 4, serverId: 5, admins: 6, color: 7, language: 8, prefix: 9, slash: 10, maximum: 11, categories: 12, logs: 13 };
+// Tabs from the name field: CLIENT_ID key and value, the file line, its path, Writable and body, then the form in order.
+const AT = { token: 7, serverId: 8, admins: 9, color: 10, language: 11, prefix: 12, slash: 13, maximum: 14, categories: 15, logs: 16 };
 const tabs = (n: number) => Array(n).fill(TAB);
 const serializeCalls = (f: Fake) => f.calls.filter((c) => c.path === '/api/config/serialize').map((c) => c.body as Serialized);
 const keyBar = (frame: string) => frame.split('\n').at(-2) ?? '';
@@ -169,7 +169,7 @@ describe('m2 guided form', () => {
     await v.press(TAB);
     await tick(60);
     expect(serializeCalls(f)).toEqual([{ format: 'json', body: BODY, ops: [{ path: 'prefix', value: '!ticket ?' }] }]);
-    await v.press(...tabs(20), ENTER);
+    await v.press(...tabs(30), ENTER);
     await v.until('Bot instance coolbot (b9) created.');
     const put = f.calls.find((c) => c.path === '/api/bots/b9/config')!.body as { files: Array<{ body: string }> };
     expect(put.files[0].body).toContain('"prefix": "!ticket ?"');
@@ -241,7 +241,7 @@ describe('m2 guided round trips', () => {
     const v = await openForm(f);
     await v.press(...tabs(AT.prefix), '?', TAB);
     await v.until('A form change was not written to the file: Internal error');
-    await v.press(...tabs(20), ENTER);
+    await v.press(...tabs(30), ENTER);
     await v.until('A form change could not be written into its file (see the warning on the file). Nothing was saved.');
     expect(installs(f)).toEqual([]);
     expect(serializeCalls(f).length).toBe(2);
@@ -259,7 +259,7 @@ describe('m2 guided round trips', () => {
     await v.until('Could not apply: prefix; the file was not changed there');
     await v.until('This change could not be written to the file.');
     expect(f.paths()).toContain('POST /api/config/parse');
-    await v.press(...tabs(20), ENTER);
+    await v.press(...tabs(30), ENTER);
     await v.until('A form change could not be written into its file');
     expect(installs(f)).toEqual([]);
     v.unmount();
@@ -297,7 +297,7 @@ describe('m2 erasure confirm', () => {
     await tick(60);
     await v.until('Bot Token (From env) Set TOKEN as an environment variable for this bot.');
     expect(serializeCalls(f).flatMap((c) => c.ops)).toEqual([{ path: 'tokenFromENV', value: true }, { path: 'token', value: '' }]);
-    await v.press(...tabs(20), ENTER);
+    await v.press(...tabs(30), ENTER);
     await v.until('Saving clears the value stored in the file for: Bot Token (now read from TOKEN). Continue?');
     expect(keyBar(v.frame())).toContain('Y Continue');
     return v;

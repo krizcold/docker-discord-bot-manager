@@ -164,6 +164,8 @@ export class GuidedBlock {
     readonly format: string,
     parsed: unknown,
     private body: { get: () => string; set: (b: string) => void },
+    /** The page's lock for a stored file that no longer decrypts: the form stays paused until the body is entered again. */
+    private undecryptable: string | null = null,
   ) {
     let tokenPath: string | null = null;
     walkFields(manifest.sections, (f) => {
@@ -174,6 +176,10 @@ export class GuidedBlock {
     if (parsed == null && body.get().trim()) {
       this.formLocked = true;
       this.parseError = PAUSED;
+    }
+    if (undecryptable) {
+      this.formLocked = true;
+      this.parseError = undecryptable;
     }
   }
 
@@ -246,12 +252,15 @@ export class GuidedBlock {
   async reparse(): Promise<void> {
     const r = await parseConfigBody(this.client, this.format, this.body.get());
     const a = r.ok === true ? r.value : null;
-    if (a && a.success === true && a.ok === true) {
+    if (a && a.success === true && a.ok === true && this.undecryptable && !this.body.get().trim()) {
+      this.formLocked = true;
+      this.parseError = this.undecryptable;
+    } else if (a && a.success === true && a.ok === true) {
       this.parsed = a.data ?? {};
       this.parseError = null;
       this.formLocked = false;
       this.validateAll();
-    } else this.parseError = a && a.success === true ? PAUSED : 'Could not refresh the form; showing earlier values';
+    } else this.parseError = a && a.success === true ? this.undecryptable ?? PAUSED : 'Could not refresh the form; showing earlier values';
     this.changed();
   }
 

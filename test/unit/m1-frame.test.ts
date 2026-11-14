@@ -59,7 +59,7 @@ describe('m1 bot list', () => {
     expect(f.split('\n')[0].startsWith('+ Bot Manager - box1 -')).toBe(true);
     expect(f).toMatch(/Bots\s+Status\s+Data\s+Copy\s+Last backup/);
     expect(f).toMatch(/> mybot\s+running\s+-\s+-\s+-/);
-    expect(keyBar(f)).toMatch(/^\| Enter Open {2}I Install {2}Q Quit\s+\|$/);
+    expect(keyBar(f)).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}Q Quit\s+\|$/);
     await v.press(DOWN);
     expect(selectedRow(v.frame())).toBe('imgbot');
     v.unmount();
@@ -92,7 +92,7 @@ describe('m1 bot list', () => {
 
   it('hands off from the list and the bot screen with their state when a command is named', async () => {
     const v = await start(twoBots(), undefined, true);
-    expect(keyBar(v.frame())).toMatch(/^\| Enter Open {2}I Install {2}H Hand-off {2}Q Quit\s+\|$/);
+    expect(keyBar(v.frame())).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}H Hand-off {2}Q Quit\s+\|$/);
     await v.press(DOWN, 'h');
     expect(v.onHandOff).toHaveBeenCalledWith({ screen: 'list', index: 1 });
     v.unmount();

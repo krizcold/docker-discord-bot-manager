@@ -4,8 +4,11 @@ import {
   addSource, ConfigFileBody, defaultBotName, EnvHint, fetchSource, installBot, InstallStep, isImageSource, listSources, NameCheck,
   readSourceEnvs, recoverEnvs, Source, SourceEnvs, sourceName, validateName,
 } from './api';
+import { ConfigFileList } from './configfiles';
+import { EditRequest } from './editbody';
 import { editField, Field, field, FieldKey, showField } from './field';
-import { GuidedBlock, Manifest } from './guided';
+import { GuidedBlock } from './guided';
+import { VaultPicker } from './vaultpick';
 
 export type InstallScreen = 'sources' | 'addsource' | 'details' | 'detecterror' | 'form' | 'installing';
 
@@ -19,8 +22,8 @@ export interface WizardView {
 
 export type WizardKey = FieldKey & { shift?: boolean };
 
-/** What a key asks of the frame: quit, or leave Install for the bot list with a notice. */
-export type WizardExit = { quit: true } | { leave: true; notice?: string; installed?: boolean } | undefined;
+/** What a key asks of the frame: quit, leave Install for the bot list with a notice, or hand the terminal to the editor. */
+export type WizardExit = { quit: true } | { leave: true; notice?: string; installed?: boolean } | { edit: EditRequest } | undefined;
 
 interface EnvRow {
   id: number;
@@ -29,16 +32,10 @@ interface EnvRow {
   value: Field;
   /** The page's data-sensitive: a blank value is left out of the save. */
   sensitive: boolean;
-  /** Shown as asterisks: the page leaves it out of the form, or the route marks it sensitive. */
+  /** Shown as asterisks: the page leaves it out of the form, the route marks it sensitive, or it came from the vault. */
   mask: boolean;
-}
-
-interface ConfigRow {
-  path: string;
-  body: string;
-  enabled: boolean;
-  reuseOff: boolean;
-  guided: GuidedBlock | null;
+  /** The page's vault button: text and number rows from the route's hints, and the generic token row. */
+  vault: boolean;
 }
 
 type NameState =
@@ -60,6 +57,7 @@ export interface WizardOptions {
   pollTries?: number;
   secret?: () => string;
   flushMs?: number;
+  now?: () => number;
 }
 
 const KEY_WIDTH = 26;
@@ -74,7 +72,7 @@ function namePreview(name: string): string {
   return name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'unnamed';
 }
 
-function wrap(text: string, width: number, indent = ''): string[] {
+export function wrap(text: string, width: number, indent = ''): string[] {
   const room = Math.max(width - indent.length, 10);
   const out: string[] = [];
   let rest = text;
@@ -93,7 +91,7 @@ function sameUrl(a: string | undefined, b: string): boolean {
   return norm(a) === norm(b);
 }
 
-function matches(equals: string | string[], value: string): boolean {
+export function matches(equals: string | string[], value: string): boolean {
   return (Array.isArray(equals) ? equals : String(equals).split(',')).includes(value);
 }
 
@@ -120,7 +118,7 @@ export class InstallWizard {
   loadingEnvs = false;
   rows: EnvRow[] = [];
   imageNote = false;
-  configs: ConfigRow[] = [];
+  readonly cfg: ConfigFileList;
   focus = 'name';
   scanning = false;
   createdBotId: string | null = null;
@@ -134,8 +132,11 @@ export class InstallWizard {
   private readonly flushMs: number;
   confirm: { text: string; run: () => Promise<WizardExit> } | null = null;
   private installingSeq: number | null = null;
+  readonly picker: VaultPicker;
 
   constructor(private client: Client, private changed: () => void, opts: WizardOptions = {}) {
+    this.picker = new VaultPicker(client, changed, (text) => this.say(text), opts.now);
+    this.cfg = new ConfigFileList(client, changed, (text) => this.say(text), 'install', opts.flushMs ?? 10_000);
     this.pollMs = opts.pollMs ?? 2500;
     this.pollTries = opts.pollTries ?? 48;
     this.secret = opts.secret ?? (() => randomBytes(32).toString('hex'));
@@ -274,19 +275,15 @@ export class InstallWizard {
     this.imageNote = false;
     if (hints.length > 0) for (const h of hints) this.rows.push(this.hintRow(h));
     else if (isImageSource(this.source)) this.imageNote = true;
-    else this.rows.push(this.plainRow('DISCORD_TOKEN', '', { key: 'DISCORD_TOKEN', label: 'Discord Bot Token', required: true }, true));
+    else this.rows.push(this.plainRow('DISCORD_TOKEN', '', { key: 'DISCORD_TOKEN', label: 'Discord Bot Token', required: true }, true, true));
     for (const row of this.rows) {
       if (row.hint?.generate && !row.value.text.trim()) row.value = field(this.secret());
     }
-    this.configs = (Array.isArray(envs.configFiles) ? envs.configFiles : []).map((cf) => {
-      const row: ConfigRow = { path: cf.inContainerPath, body: cf.rawBody || '', enabled: true, reuseOff: false, guided: null };
-      if (cf.manifest && typeof cf.manifest === 'object') {
-        const m = cf.manifest as Manifest;
-        row.guided = new GuidedBlock(this.client, this.changed, m, m.format || cf.format || 'json', cf.parsed, { get: () => row.body, set: (b) => { row.body = b; } });
-      }
-      return row;
-    });
-    for (const cf of this.configs) cf.guided?.validateAll();
+    // The page builds the wizard's cards with no saved mode, on, and the repo's mode when the route knows it.
+    this.cfg.set((Array.isArray(envs.configFiles) ? envs.configFiles : []).map((cf) => ({
+      path: cf.inContainerPath, body: cf.rawBody || '', enabled: true, manifest: cf.manifest, format: cf.format, parsed: cf.parsed,
+      ...(cf.repoReadOnly !== undefined ? { repoReadOnly: cf.repoReadOnly } : {}),
+    })));
     this.focus = 'name';
   }
 
@@ -298,11 +295,23 @@ export class InstallWizard {
       const hit = h.options.find((o) => String(o.value) === value) || h.options.find((o) => String(o.value).trim().toLowerCase() === norm);
       value = hit ? String(hit.value) : value !== '' ? value : String(h.options[0].value);
     }
-    return { id: this.nextRow++, hint: h, key: field(h.key), value: field(value), sensitive: !!h.sensitive, mask: !!h.sensitive };
+    const vault = !(h.options && h.options.length) && !h.list && !h.autoWired && !h.inactive;
+    return { id: this.nextRow++, hint: h, key: field(h.key), value: field(value), sensitive: !!h.sensitive, mask: !!h.sensitive, vault };
   }
 
-  private plainRow(key: string, value: string, hint: EnvHint | null = null, mask = false): EnvRow {
-    return { id: this.nextRow++, hint, key: field(key), value: field(value), sensitive: false, mask };
+  private plainRow(key: string, value: string, hint: EnvHint | null = null, mask = false, vault = false): EnvRow {
+    return { id: this.nextRow++, hint, key: field(key), value: field(value), sensitive: false, mask, vault };
+  }
+
+  // toggleEnvVaultDropdown with the key the row was built with; the pick goes in as setEnvInputValue puts it.
+  private pickInto(row: EnvRow): void {
+    const key = row.hint?.key ?? row.key.text.trim();
+    void this.picker.open(key, (value) => {
+      if (!this.rows.includes(row)) return;
+      row.value = field(value);
+      row.mask = true;
+      this.changed();
+    });
   }
 
   private rowValue(key: string): string {
@@ -322,11 +331,7 @@ export class InstallWizard {
   private focusables(): string[] {
     const out = ['name'];
     for (const row of this.rows) if (this.editable(row) && this.shown(row)) out.push(`k${row.id}`, `v${row.id}`);
-    this.configs.forEach((cf, i) => {
-      out.push(`c${i}`);
-      if (cf.guided) for (const l of cf.guided.walk(80)) for (const id of l.ids ?? []) out.push(`g${i}:${id}`);
-    });
-    out.push('install');
+    out.push(...this.cfg.focusables(), 'addcf', 'install');
     return out;
   }
 
@@ -341,15 +346,8 @@ export class InstallWizard {
     this.changed();
   }
 
-  private guidedFocus(): { block: GuidedBlock; sub: string } | null {
-    const m = /^g(\d+):(.*)$/.exec(this.focus);
-    const block = m ? this.configs[Number(m[1])]?.guided : null;
-    return m && block ? { block, sub: m[2] } : null;
-  }
-
   private leaveGuided(): void {
-    const g = this.guidedFocus();
-    if (g) g.block.leave(g.sub);
+    this.cfg.leave(this.focus);
   }
 
   private focusedRow(): EnvRow | undefined {
@@ -389,7 +387,7 @@ export class InstallWizard {
 
   // setInstallConfigReuse: over a kept data folder the template files start off.
   private setConfigReuse(reuse: boolean): void {
-    for (const cf of this.configs) {
+    for (const cf of this.cfg.files) {
       if (reuse && cf.enabled && !cf.reuseOff) {
         cf.enabled = false;
         cf.reuseOff = true;
@@ -573,7 +571,7 @@ export class InstallWizard {
       return undefined;
     }
     // guidedReadyToSave: every form change must be in its file, and a value the save would clear is confirmed first.
-    const blocks = this.configs.map((cf) => cf.guided).filter((b): b is GuidedBlock => !!b);
+    const blocks = this.cfg.blocks();
     for (const b of blocks) for (const sub of Object.keys(b.drafts)) b.leave(sub);
     let ready = true;
     for (const b of blocks) if (!(await b.flushForSave(this.flushMs))) ready = false;
@@ -599,9 +597,7 @@ export class InstallWizard {
   }
 
   private async send(name: string, vars: Record<string, string>): Promise<WizardExit> {
-    const configFiles: ConfigFileBody[] = this.configs
-      .filter((cf) => cf.path.trim() && (cf.body.trim() || !cf.enabled))
-      .map((cf) => ({ path: cf.path.trim(), body: cf.body, enabled: cf.enabled }));
+    const configFiles: ConfigFileBody[] = this.cfg.collect();
     const source = this.source!;
     this.screen = 'installing';
     this.steps = { create: 'waiting', env: 'waiting', config: 'waiting' };
@@ -692,6 +688,11 @@ export class InstallWizard {
   }
 
   private formKey(input: string, key: WizardKey, forwardDelete: boolean): WizardExit | Promise<WizardExit> {
+    if (this.cfg.waiting) return undefined;
+    if (this.picker.active) {
+      this.picker.key(key);
+      return undefined;
+    }
     if (this.confirm) {
       const run = this.confirm.run;
       this.confirm = null;
@@ -716,10 +717,10 @@ export class InstallWizard {
       return undefined;
     }
     const c = key.ctrl ? input.toLowerCase() : '';
-    const guided = this.guidedFocus();
-    if (guided) {
+    if (this.cfg.guidedFocus(this.focus)) {
       const before = this.focusables();
-      if (guided.block.key(guided.sub, input, key, forwardDelete)) {
+      const out = this.cfg.key(this.focus, input, key, forwardDelete);
+      if (out && 'done' in out) {
         const after = this.focusables();
         if (!after.includes(this.focus)) {
           const at = before.indexOf(this.focus);
@@ -731,6 +732,29 @@ export class InstallWizard {
       }
       if (key.return) this.moveFocus(1);
       else if (c === 'f') void this.scan();
+      return undefined;
+    }
+    if (this.focus === 'addcf') {
+      if (key.return) {
+        this.focus = this.cfg.add();
+        this.changed();
+      }
+      return undefined;
+    }
+    if (this.cfg.owns(this.focus) && c === 'd') {
+      const list = this.focusables();
+      const at = list.indexOf(this.focus);
+      this.cfg.remove(this.focus);
+      const after = this.focusables();
+      const prev = list.slice(0, Math.max(at, 0)).reverse().find((f) => after.includes(f) && !/^[pwbg]/.test(f));
+      this.focus = prev ?? after[0];
+      this.changed();
+      return undefined;
+    }
+    if (this.cfg.owns(this.focus) && !c) {
+      const out = this.cfg.key(this.focus, input, key, forwardDelete);
+      if (out && 'next' in out) this.moveFocus(1);
+      else if (out && 'edit' in out) return out.edit.then((edit) => (edit ? { edit } : undefined));
       return undefined;
     }
     const row = this.focusedRow();
@@ -753,12 +777,12 @@ export class InstallWizard {
         this.rows = this.rows.filter((r) => r !== row);
         const after = this.focusables();
         this.focus = after[Math.min(Math.max(at - 1, 0), after.length - 1)];
-      } else if (/^c\d+$/.test(this.focus)) {
-        const i = Number(this.focus.slice(1));
-        this.configs.splice(i, 1);
-        this.focus = this.configs.length ? `c${Math.min(i, this.configs.length - 1)}` : 'install';
       }
       this.changed();
+      return undefined;
+    }
+    if (c === 'p' && row?.vault && this.focus.startsWith('v')) {
+      this.pickInto(row);
       return undefined;
     }
     if (c === 'g' && row?.hint?.generate) {
@@ -778,14 +802,6 @@ export class InstallWizard {
     }
     if (this.focus === 'install') {
       if (key.return) return this.install();
-      return undefined;
-    }
-    if (/^c\d+$/.test(this.focus)) {
-      const cf = this.configs[Number(this.focus.slice(1))];
-      if (cf && input === ' ') {
-        cf.enabled = !cf.enabled;
-        this.changed();
-      } else if (key.return) this.moveFocus(1);
       return undefined;
     }
     if (key.return) {
@@ -868,6 +884,8 @@ export class InstallWizard {
           notice,
         };
       case 'form':
+        if (this.picker.active) return { ...this.picker.view(inner, room), notice };
+        if (this.cfg.waiting) return { ...this.formView(inner, room, undefined), keys: 'Waiting for the manager', notice: this.cfg.waiting };
         return this.formView(inner, room, notice);
     }
   }
@@ -991,24 +1009,13 @@ export class InstallWizard {
     if (this.rows.length === 0 && !this.imageNote) push('  No variables. Ctrl+N adds one.');
     push('');
     push('Config files');
-    if (this.reuseOn() && this.configs.length) {
+    for (const t of wrap('Config files this bot reads, prefilled from its template. Tweak them here before installing; each is delivered into the container and persists across updates.', inner, '  ')) push(t);
+    if (this.reuseOn() && this.cfg.files.length) {
       for (const t of wrap('A data folder kept under this name may hold edited copies of these files, so they start off and the kept copies stay. Turn a file on only after moving its kept copy away: a build keeps a file it did not deliver and stops, naming it.', inner, '  ')) push(t);
     }
-    if (this.configs.length === 0) push('  None.');
-    this.configs.forEach((cf, i) => {
-      const lines = cf.body ? cf.body.split('\n').length : 0;
-      push(`  [${cf.enabled ? 'x' : ' '}] ${cf.path}  (${lines} line${lines === 1 ? '' : 's'} from the repo template)`.slice(0, inner), { focus: `c${i}` });
-      if (cf.guided) {
-        const prefix = `g${i}:`;
-        const sub = this.focus.startsWith(prefix) ? this.focus.slice(prefix.length) : undefined;
-        for (const l of cf.guided.walk(inner, sub)) {
-          push(l.text.slice(0, inner), {
-            ...(l.ids ? { focus: l.ids.map((id) => prefix + id).join('|') } : {}),
-            ...(l.col !== undefined && sub !== undefined && l.ids?.includes(sub) ? { col: l.col } : {}),
-          });
-        }
-      }
-    });
+    if (this.cfg.files.length === 0) push('  None.');
+    all.push(...this.cfg.lines(inner, this.focus));
+    push('  Add config file', { focus: 'addcf' });
     push('');
     push('  Install', { focus: 'install' });
 
@@ -1031,11 +1038,12 @@ export class InstallWizard {
     const scan = isImageSource(this.source) ? 'Ctrl+F Inspect' : 'Ctrl+F Scan';
     if (this.focus === 'name') return ['Tab Next', 'Ctrl+R Default name', ...(this.envsOffered() ? ['Ctrl+L Load envs'] : []), 'Esc Back'].join('  ');
     if (this.focus === 'install') return 'Enter Install  Up Previous  Esc Back';
-    if (/^c\d+$/.test(this.focus)) return 'Space On/off  Ctrl+D Remove  Tab Next  Esc Back';
-    const guided = this.guidedFocus();
-    if (guided) return [guided.block.keysFor(guided.sub), 'Tab Next', 'Esc Back'].filter(Boolean).join('  ');
+    if (this.focus === 'addcf') return 'Enter Add config file  Tab Next  Esc Back';
+    if (this.cfg.owns(this.focus)) return [this.cfg.keys(this.focus), 'Tab Next', 'Esc Back'].filter(Boolean).join('  ');
     const choose = this.focus.startsWith('v') && row?.hint?.options?.length ? ['Left/Right Choose'] : [];
-    return [...choose, 'Tab Next', 'Ctrl+N Add', 'Ctrl+D Remove', ...(row?.hint?.generate ? ['Ctrl+G Generate'] : []), scan, 'Esc Back'].join('  ');
+    // Ctrl+G is named on the line under a generate row, so the bar keeps to 75 columns with the vault key.
+    const vault = this.focus.startsWith('v') && row?.vault ? ['Ctrl+P Vault'] : [];
+    return [...choose, 'Tab Next', ...vault, 'Ctrl+N Add', 'Ctrl+D Remove', scan, 'Esc Back'].join('  ');
   }
 }
 

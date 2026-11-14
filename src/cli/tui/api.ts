@@ -547,3 +547,196 @@ export async function validateDiscordId(
 ): Promise<Outcome<DiscordCheck>> {
   return call(client, 'POST', '/api/discord/validate', check);
 }
+
+/** One row of GET /api/bots/:id/env (buildBotEnvList): a stored secret comes back blank. */
+export interface EditorVar extends EnvHint {
+  value?: string;
+  isSet?: boolean;
+  undecryptable?: boolean;
+  semantic?: string;
+}
+
+export interface BotEnv {
+  success?: boolean;
+  error?: string;
+  vars?: EditorVar[];
+  tokenVarName?: string;
+  missing?: string[];
+  undecryptable?: string[];
+  storeBroken?: boolean;
+  corruptCopies?: string[];
+  secretKeyProblem?: string | null;
+}
+
+// The same route as `dbm env get`.
+export async function readBotEnv(client: Client, botId: string): Promise<Outcome<BotEnv>> {
+  const r = await call(client, 'GET', `/api/bots/${botId}/env`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as BotEnv };
+}
+
+export interface EnvSave {
+  vars: Record<string, string>;
+  removed?: string[];
+  renamed?: Record<string, string>;
+}
+
+export interface EnvSaveAnswer {
+  success?: boolean;
+  error?: string;
+  removed?: string[];
+  stillStored?: string[];
+  notApplied?: boolean;
+  warning?: string;
+}
+
+// The route `dbm env set` calls, with the env editor's body (the keys it removes and renames too).
+export async function saveBotEnv(client: Client, botId: string, body: EnvSave): Promise<Outcome<EnvSaveAnswer>> {
+  const r = await call(client, 'PUT', `/api/bots/${botId}/env`, body);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as EnvSaveAnswer };
+}
+
+export interface DbCheck {
+  success?: boolean;
+  ok?: boolean;
+  error?: string;
+  hint?: string;
+  notTested?: boolean;
+}
+
+/** POST /api/bots/:id/validate-db, the env editor's test of a new database URL. */
+export async function validateDb(client: Client, botId: string, url: string): Promise<Outcome<DbCheck>> {
+  const r = await call(client, 'POST', `/api/bots/${botId}/validate-db`, { url });
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as DbCheck };
+}
+
+export interface VaultValue {
+  key: string;
+  value: string;
+  source: string;
+}
+
+// The same route as `dbm vault values`.
+export async function vaultValues(client: Client): Promise<Outcome<VaultValue[]>> {
+  const r = await call(client, 'GET', '/api/vault/all-values');
+  if (r.ok !== true) return r;
+  if (r.value.success !== true) return { ok: false, text: bodyError(r.value, 'the manager gave no reason') };
+  if (!Array.isArray(r.value.values)) return { ok: false, text: 'the answer held no vault values' };
+  return { ok: true, value: r.value.values as VaultValue[] };
+}
+
+/** One file of GET /api/bots/:id/config (buildBotConfigList, with the guided manifest and parse). */
+export interface BotConfigFile {
+  path: string;
+  body?: string;
+  readOnly?: boolean;
+  repoReadOnly?: boolean;
+  enabled?: boolean;
+  bodyUndecryptable?: boolean;
+  inactive?: string;
+  fromTemplate?: boolean;
+  manifest?: unknown;
+  format?: string;
+  parsed?: unknown;
+}
+
+export interface BotConfig {
+  success?: boolean;
+  error?: string;
+  files?: BotConfigFile[];
+  storeBroken?: boolean;
+  corruptCopies?: string[];
+  secretKeyProblem?: string | null;
+}
+
+// The same route as `dbm config get`.
+export async function readBotConfig(client: Client, botId: string): Promise<Outcome<BotConfig>> {
+  const r = await call(client, 'GET', `/api/bots/${botId}/config`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as BotConfig };
+}
+
+export interface ConfigSaveAnswer {
+  success?: boolean;
+  error?: string;
+  needsUpdate?: boolean;
+  mountsUnknown?: boolean;
+}
+
+// The same route and body as `dbm config set`.
+export async function saveBotConfig(client: Client, botId: string, files: ConfigFileBody[]): Promise<Outcome<ConfigSaveAnswer>> {
+  const r = await call(client, 'PUT', `/api/bots/${botId}/config`, { files });
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as ConfigSaveAnswer };
+}
+
+export interface VaultGroupEntry {
+  key: string;
+  value: string;
+  masked: string;
+  hidden?: boolean;
+}
+
+export interface VaultGroup {
+  id: string;
+  name: string;
+  type: 'instance' | 'standalone' | 'deleted';
+  deletedAt?: number;
+  entries: VaultGroupEntry[];
+}
+
+export interface VaultList {
+  success?: boolean;
+  error?: string;
+  groups?: VaultGroup[];
+  vaultBroken?: boolean;
+  vaultError?: string;
+  corruptCopies?: string[];
+  secretKeyProblem?: string | null;
+}
+
+export interface Answer {
+  success?: boolean;
+  error?: string;
+  warning?: string;
+  notApplied?: boolean;
+}
+
+// The same route as `dbm vault list`.
+export async function readVault(client: Client): Promise<Outcome<VaultList>> {
+  const r = await call(client, 'GET', '/api/vault');
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as VaultList };
+}
+
+// The route `dbm vault set` calls, with the page's hidden flag.
+export async function addVaultEntry(client: Client, key: string, value: string, hidden: boolean): Promise<Outcome<Answer>> {
+  return call(client, 'POST', '/api/vault/standalone', { key, value, hidden });
+}
+
+// The route `dbm vault update` calls; the page also sends newKey for a rename and leaves out an empty value.
+export async function updateVaultEntry(client: Client, key: string, body: { newKey?: string; value?: string }): Promise<Outcome<Answer>> {
+  return call(client, 'PUT', `/api/vault/standalone/${encodeURIComponent(key)}`, body);
+}
+
+// The same route as `dbm vault rm`.
+export async function removeVaultEntry(client: Client, key: string): Promise<Outcome<Answer>> {
+  return call(client, 'DELETE', `/api/vault/standalone/${encodeURIComponent(key)}`);
+}
+
+/** PUT /api/vault/deleted/:key?groupId=, an entry kept from a removed bot. */
+export async function updateDeletedEntry(client: Client, groupId: string, key: string, body: { newKey?: string; value?: string }): Promise<Outcome<Answer>> {
+  return call(client, 'PUT', `/api/vault/deleted/${encodeURIComponent(key)}?groupId=${encodeURIComponent(groupId)}`, body);
+}
+
+/** DELETE /api/vault/deleted/:key?groupId=. */
+export async function removeDeletedEntry(client: Client, groupId: string, key: string): Promise<Outcome<Answer>> {
+  return call(client, 'DELETE', `/api/vault/deleted/${encodeURIComponent(key)}?groupId=${encodeURIComponent(groupId)}`);
+}
+
+/** DELETE /api/vault/deleted-group/:id, a removed bot's whole group. */
+export async function removeDeletedGroup(client: Client, groupId: string): Promise<Outcome<Answer>> {
+  return call(client, 'DELETE', `/api/vault/deleted-group/${encodeURIComponent(groupId)}`);
+}

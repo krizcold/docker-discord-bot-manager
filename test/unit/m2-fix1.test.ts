@@ -100,8 +100,8 @@ async function openForm(f: Fake, rows = 90) {
   return { ...view, frame, press, until };
 }
 
-// From the name field: CLIENT_ID key and value, the file, token, server, admins, admin 0, admin 1, prefix, Install.
-const AT = { token: 4, admins: 6, admin0: 7, prefix: 9, install: 10 };
+// From the name field: CLIENT_ID key and value, the file line, path, Writable, body, token, server, admins, admin 0, admin 1, prefix, Add config file, Install.
+const AT = { token: 7, admins: 9, admin0: 10, prefix: 12, install: 14 };
 const posts = (f: Fake) => f.paths().filter((p) => p === 'POST /api/bots').length;
 
 function slowSerialize(f: Fake): Fake {

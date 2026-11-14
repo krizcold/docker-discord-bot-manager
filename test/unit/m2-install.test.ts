@@ -72,13 +72,14 @@ async function openForm(f: Fake) {
   return v;
 }
 
-// From the name field: the token's key and value, the client id's key and value, the config file, Install.
-const TO_INSTALL = [TAB, TAB, TAB, TAB, TAB, TAB];
+// From the name field: the token's key and value, the client id's key and value, the config file's line, path,
+// Writable and body, Add config file, Install.
+const TO_INSTALL = Array(10).fill(TAB) as string[];
 
 describe('m2 sources screen', () => {
   it('I opens Install from the bot list, the bar shows it, and Esc comes back', async () => {
     const v = await start(base());
-    expect(keyBar(v.frame())).toMatch(/^\| I Install {2}Q Quit\s+\|$/);
+    expect(keyBar(v.frame())).toMatch(/^\| I Install {2}V Vault {2}Q Quit\s+\|$/);
     await v.press('i');
     await v.until('Sources');
     const f = v.frame();
@@ -422,8 +423,9 @@ describe('m2 install', () => {
       await v.press(TAB, TAB, 'tok', ...TO_INSTALL.slice(2), ENTER);
       await v.until(text);
       expect(v.frames.map(flat).join(' ')).not.toContain('Bot instance coolbot (b9) created');
-      expect(v.frame()).toMatch(/Name\s+\[coolbot/);
       expect(keyBar(v.frame())).toContain('Enter Install');
+      await v.press(...Array(12).fill(UP));
+      expect(v.frame()).toMatch(/Name\s+\[coolbot/);
       v.unmount();
     });
   }
@@ -447,11 +449,11 @@ describe('m2 install', () => {
       configFiles: [],
     }));
     const v = await openForm(f);
-    await v.press(TAB, TAB, '40', TAB, ENTER);
+    await v.press(TAB, TAB, '40', TAB, TAB, ENTER);
     await v.until('Shard count takes a whole number from 1 to 16. Nothing was created.');
-    await v.press(UP, BACKSPACE, BACKSPACE, 'many', TAB, ENTER);
+    await v.press(UP, UP, BACKSPACE, BACKSPACE, 'many', TAB, TAB, ENTER);
     await v.until('Not a number: SHARDS. Fix the value, then create. Nothing was created.');
-    await v.press(UP, UP, UP, ...Array(8).fill(BACKSPACE), TAB, TAB, TAB, ENTER);
+    await v.press(UP, UP, UP, UP, ...Array(8).fill(BACKSPACE), TAB, TAB, TAB, TAB, ENTER);
     await v.until('Name is required.');
     expect(f.paths().filter((p) => !p.startsWith('GET'))).toEqual([]);
     v.unmount();

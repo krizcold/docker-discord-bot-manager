@@ -23,7 +23,13 @@ export interface Bot {
   updateAvailable?: boolean;
   updateCantConfirm?: string;
   behindBy?: number;
+  hasBeenStarted?: boolean;
+  lastStartAt?: number;
+  publicUrl?: string;
+  webAuth?: WebAuthMode;
 }
+
+export type WebAuthMode = 'auto' | 'managed' | 'public';
 
 /** The bot's last answer about the changes it holds (src/types/index.ts:399). */
 export interface Held {
@@ -156,16 +162,22 @@ function why(err: unknown): string {
 }
 
 export async function listBots(client: Client): Promise<Bot[]> {
+  return (await readBotList(client)).bots;
+}
+
+/** GET /api/bots (bots.ts:153): the bots and, when the manager could decide it, the deployment mode (bots.ts:242). */
+export async function readBotList(client: Client): Promise<{ bots: Bot[]; deploymentMode: string | null }> {
   let res: CliResponse;
   try {
     res = await client.request('GET', '/api/bots');
   } catch (err) {
     throw new Error(why(err));
   }
-  const body = res.body as { success?: boolean; bots?: unknown } | null;
+  const body = res.body as { success?: boolean; bots?: unknown; deploymentMode?: unknown } | null;
   if (!res.ok || !body || typeof body !== 'object' || body.success === false) throw new Error(errorText(res));
   if (!Array.isArray(body.bots)) throw new Error('the answer held no bot list');
-  return body.bots as Bot[];
+  const mode = typeof body.deploymentMode === 'string' && body.deploymentMode ? body.deploymentMode : null;
+  return { bots: body.bots as Bot[], deploymentMode: mode };
 }
 
 const VERB: Record<ActionKind, string> = { start: 'start', stop: 'stop', restart: 'restart', build: 'build', update: 'update' };
@@ -387,17 +399,21 @@ export type Outcome<T> = { ok: true; value: T } | { ok: false; text: string } | 
 type Body = Record<string, unknown>;
 
 async function call(client: Client, method: string, path: string, body?: unknown, limitMs?: number): Promise<Outcome<Body>> {
+  return (await send(client, method, path, body, limitMs)).outcome;
+}
+
+async function send(client: Client, method: string, path: string, body?: unknown, limitMs?: number): Promise<{ status: number | null; outcome: Outcome<Body> }> {
   let res: CliResponse;
   try {
     const sent = client.request(method, path, body === undefined ? {} : { body });
     res = limitMs === undefined ? await sent : await withinLimit(sent, limitMs);
   } catch (err) {
-    return { ok: null, text: why(err) };
+    return { status: null, outcome: { ok: null, text: why(err) } };
   }
   const b = res.body as Body | null;
   // The page reads a reply it cannot parse as no answer (index.html:1388): what the manager did is unknown.
-  if (!b || typeof b !== 'object') return { ok: null, text: `the reply was not JSON, HTTP ${res.status}` };
-  return { ok: true, value: b };
+  if (!b || typeof b !== 'object') return { status: res.status, outcome: { ok: null, text: `the reply was not JSON, HTTP ${res.status}` } };
+  return { status: res.status, outcome: { ok: true, value: b } };
 }
 
 // Client.request sets no time limit; a reply that comes later than the limit is dropped.
@@ -421,6 +437,275 @@ function withinLimit<T>(sent: Promise<T>, limitMs: number): Promise<T> {
 const bare = (text: string): string => text.replace(/[.\s]+$/, '');
 const failed = (b: Body): boolean => b.success !== true;
 const bodyError = (b: Body, fallback: string): string => (typeof b.error === 'string' && b.error ? b.error : fallback);
+
+// The same route as `dbm bots containers` (bots.ts:928); the fallback is the page's (index.html:5364).
+export async function readContainers(client: Client, botId: string, limitMs: number): Promise<Outcome<Container[]>> {
+  const r = await call(client, 'GET', `/api/bots/${botId}/containers`, undefined, limitMs);
+  if (r.ok !== true) return r;
+  if (failed(r.value)) return { ok: false, text: bodyError(r.value, 'Could not read the containers from docker') };
+  if (!Array.isArray(r.value.containers)) return { ok: null, text: 'the answer held no container list' };
+  return { ok: true, value: r.value.containers as Container[] };
+}
+
+export interface FsEntry {
+  name: string;
+  isDir: boolean;
+}
+
+export interface FsListing {
+  path: string;
+  entries: FsEntry[];
+}
+
+export interface FsFile {
+  path: string;
+  body: string;
+  eol: 'lf' | 'crlf';
+}
+
+/**
+ * A files route's answer. `unsure` is a write the route could not confirm: `unconfirmed` (terminal.ts:390), or a
+ * container operation stopped at its bound (terminal.ts:1251, :1276), which carries no flag of its own.
+ */
+export type FsAnswer<T> =
+  | { ok: true; value: T }
+  | { ok: false; text: string; exists?: boolean }
+  | { ok: 'unsure'; text: string }
+  | { ok: null; text: string };
+
+const STOPPED_AT_BOUND = /^The (delete of .+|rename) was stopped after \d+ s[;,]/;
+
+const fsQuery = (target: string, path: string): string => `target=${encodeURIComponent(target)}&path=${encodeURIComponent(path)}`;
+
+function fsAnswer(r: Outcome<Body>, fallback: string): FsAnswer<Body> {
+  if (r.ok !== true) return r;
+  const b = r.value;
+  if (b.success === true) return { ok: true, value: b };
+  const text = bodyError(b, '');
+  if (b.unconfirmed === true || STOPPED_AT_BOUND.test(text)) return { ok: 'unsure', text: text || fallback };
+  return { ok: false, text: text || fallback, ...(b.exists === true ? { exists: true } : {}) };
+}
+
+/** GET /api/bots/:id/fs/list (bots.ts:1464, terminal.ts:1145); the fallback is the page's (index.html:5493). */
+export async function fsList(client: Client, botId: string, target: string, path: string, limitMs: number): Promise<FsAnswer<FsListing>> {
+  const r = fsAnswer(await call(client, 'GET', `/api/bots/${botId}/fs/list?${fsQuery(target, path)}`, undefined, limitMs), 'Failed to list');
+  if (r.ok !== true) return r;
+  const { path: at, entries } = r.value;
+  if (typeof at !== 'string' || !Array.isArray(entries)) return { ok: null, text: 'the answer held no listing' };
+  const rows = (entries as Array<Partial<FsEntry> | null>)
+    .filter((e): e is Partial<FsEntry> & { name: string } => !!e && typeof e.name === 'string' && e.name !== '')
+    .map((e) => ({ name: e.name, isDir: e.isDir === true }));
+  return { ok: true, value: { path: at, entries: rows } };
+}
+
+/** GET /api/bots/:id/fs/read (bots.ts:1473, terminal.ts:1164); the fallback is the page's (index.html:5541). */
+export async function fsRead(client: Client, botId: string, target: string, path: string, limitMs: number): Promise<FsAnswer<FsFile>> {
+  const r = fsAnswer(await call(client, 'GET', `/api/bots/${botId}/fs/read?${fsQuery(target, path)}`, undefined, limitMs), 'Cannot open file');
+  if (r.ok !== true) return r;
+  const { path: at, body, eol } = r.value;
+  if (typeof body !== 'string') return { ok: null, text: 'the answer held no file body' };
+  return { ok: true, value: { path: typeof at === 'string' ? at : path, body, eol: eol === 'crlf' ? 'crlf' : 'lf' } };
+}
+
+/** PUT /api/bots/:id/fs/write (bots.ts:1482, terminal.ts:1183). Writes have no time limit. */
+export async function fsWrite(client: Client, botId: string, body: { target: string; path: string; body: string; eol: 'lf' | 'crlf' }): Promise<FsAnswer<Body>> {
+  return fsAnswer(await call(client, 'PUT', `/api/bots/${botId}/fs/write`, body), 'Not saved');
+}
+
+/** POST /api/bots/:id/fs/create (bots.ts:1496, terminal.ts:1212). */
+export async function fsCreate(client: Client, botId: string, target: string, path: string): Promise<FsAnswer<Body>> {
+  return fsAnswer(await call(client, 'POST', `/api/bots/${botId}/fs/create`, { target, path }), 'Failed to create file');
+}
+
+/** POST /api/bots/:id/fs/mkdir (bots.ts:1507, terminal.ts:1226). */
+export async function fsMkdir(client: Client, botId: string, target: string, path: string): Promise<FsAnswer<Body>> {
+  return fsAnswer(await call(client, 'POST', `/api/bots/${botId}/fs/mkdir`, { target, path }), 'Failed to create folder');
+}
+
+/** POST /api/bots/:id/fs/delete (bots.ts:1518, terminal.ts:1239): `removed` says whether anything was there. */
+export async function fsDelete(client: Client, botId: string, target: string, path: string): Promise<FsAnswer<{ removed: boolean }>> {
+  const r = fsAnswer(await call(client, 'POST', `/api/bots/${botId}/fs/delete`, { target, path }), 'Failed to delete');
+  if (r.ok !== true) return r;
+  return { ok: true, value: { removed: r.value.removed === true } };
+}
+
+/** POST /api/bots/:id/fs/rename (bots.ts:1529, terminal.ts:1258): `overwrite` is sent only after the operator's own Y. */
+export async function fsRename(client: Client, botId: string, body: { target: string; from: string; to: string; overwrite?: true }): Promise<FsAnswer<Body>> {
+  return fsAnswer(await call(client, 'POST', `/api/bots/${botId}/fs/rename`, body), 'Failed to rename');
+}
+
+export type DeleteFlag = 'confirmPromoted' | 'confirmFleetData';
+
+/** The success body of DELETE /api/bots/:id (bots.ts:516 to :521). */
+export interface DeleteDone {
+  vaulted: boolean;
+  envDeleted: boolean;
+  keptDataDir?: string;
+  dbDumpsKept?: { count: number; folder: string };
+  keptReplicaVolume?: string;
+}
+
+export type DeleteAnswer =
+  | { ok: true; value: DeleteDone }
+  | { ok: 'question'; text: string; flag: DeleteFlag }
+  | { ok: false; text: string }
+  | { ok: null; text: string };
+
+/**
+ * DELETE /api/bots/:id (bots.ts:390), as `dbm bots delete` and the page's confirmDeleteBot (index.html:2077) send it;
+ * no time limit. A question (instanceRemovalRefusal, fleetReplica.ts:1283) names the one flag that answers it.
+ */
+export async function deleteBot(client: Client, botId: string, keepData: boolean, keepEnv: boolean, flags: DeleteFlag[]): Promise<DeleteAnswer> {
+  const query = `keepData=${keepData}&keepEnv=${keepEnv}${flags.map((f) => `&${f}=true`).join('')}`;
+  const r = await call(client, 'DELETE', `/api/bots/${encodeURIComponent(botId)}?${query}`);
+  if (r.ok !== true) return r;
+  const b = r.value;
+  if (b.success !== true) {
+    const text = bodyError(b, 'Failed to remove bot');
+    if (b.needsConfirm === true && (b.confirmFlag === 'confirmPromoted' || b.confirmFlag === 'confirmFleetData')) return { ok: 'question', text, flag: b.confirmFlag };
+    return { ok: false, text };
+  }
+  const dumps = b.dbDumpsKept as { count?: unknown; folder?: unknown } | undefined;
+  return {
+    ok: true,
+    value: {
+      vaulted: b.vaulted === true,
+      envDeleted: b.envDeleted === true,
+      ...(typeof b.keptDataDir === 'string' && b.keptDataDir ? { keptDataDir: b.keptDataDir } : {}),
+      ...(dumps && typeof dumps.count === 'number' && typeof dumps.folder === 'string' ? { dbDumpsKept: { count: dumps.count, folder: dumps.folder } } : {}),
+      ...(typeof b.keptReplicaVolume === 'string' && b.keptReplicaVolume ? { keptReplicaVolume: b.keptReplicaVolume } : {}),
+    },
+  };
+}
+
+/** PUT /api/bots/:id/web-auth (bots.ts:2298); no time limit. The fallback is the page's (index.html:1971). */
+export async function setWebAuth(client: Client, botId: string, mode: WebAuthMode): Promise<Outcome<Body>> {
+  const r = await call(client, 'PUT', `/api/bots/${encodeURIComponent(botId)}/web-auth`, { mode });
+  if (r.ok !== true) return r;
+  if (failed(r.value)) return { ok: false, text: bodyError(r.value, 'Failed to set web auth mode') };
+  return r;
+}
+
+/** The record of the last manager update (LastUpdate, selfUpdate.ts:42). */
+export interface ManagerLastUpdate {
+  opId?: string;
+  state?: string;
+  target?: string;
+  message?: string;
+  at?: string;
+}
+
+/** GET /api/manager/version (manager.ts:17): ManagerVersion (selfUpdate.ts:55 to :73) with `success`. */
+export interface ManagerVersion {
+  supported?: boolean;
+  bootId?: string;
+  reason?: string;
+  currentCommit?: string;
+  stamped?: boolean;
+  repoCommit?: string;
+  checked?: boolean;
+  fetchError?: string;
+  updateAvailable?: boolean;
+  behindBy?: number;
+  buildStale?: boolean;
+  stackPending?: boolean;
+  updateInProgress?: boolean;
+  lastUpdate?: ManagerLastUpdate | null;
+}
+
+/** The route runs git fetch for up to 30 s (selfUpdate.ts:394); the read waits longer than that. */
+export const VERSION_READ_MS = 45_000;
+
+export function readManagerVersion(client: Client, limitMs: number): Read<ManagerVersion> {
+  return read<ManagerVersion>(client, '/api/manager/version', limitMs);
+}
+
+/** POST /api/manager/update (manager.ts:33): `{success, opId, message}` (:58), or a refusal, `inProgress` on a running update (:39, :54). No time limit. */
+export function postManagerUpdate(client: Client): Promise<Outcome<Body>> {
+  return call(client, 'POST', '/api/manager/update');
+}
+
+/** /ws for the manager's update frames (manager.ts:60 to :78); `opened` settles with null once it is open, or the reason it did not open. */
+export function openManagerStream(
+  client: Client, onFrame: (type: string, data: Record<string, unknown>) => void, onLost: (reason: string) => void,
+): { opened: Promise<string | null>; close: () => void } {
+  let conn: { close: () => void } | null = null;
+  let opened = false;
+  let settle: (v: string | null) => void = () => undefined;
+  const result = new Promise<string | null>((resolve) => {
+    settle = resolve;
+  });
+  try {
+    conn = client.openWs(
+      (msg) => {
+        const d = msg.data;
+        if (!msg.type.startsWith('manager:') || !d || typeof d !== 'object' || Array.isArray(d)) return;
+        onFrame(msg.type, d as Record<string, unknown>);
+      },
+      () => {
+        if (opened) return;
+        opened = true;
+        settle(null);
+      },
+      (reason) => {
+        if (!opened) {
+          opened = true;
+          settle(reason);
+          return;
+        }
+        onLost(reason);
+      },
+    );
+  } catch (err) {
+    opened = true;
+    settle(why(err));
+  }
+  return {
+    opened: result,
+    close: () => {
+      try {
+        conn?.close();
+      } catch {
+        // A channel that failed to open has nothing to close.
+      }
+    },
+  };
+}
+
+/** GET /api/system/deployment (bots.ts:2469): getDeploymentInfo (detector.ts:198). */
+export interface DeploymentInfo {
+  mode?: string;
+  casaosAvailable?: boolean;
+  autoDetected?: boolean;
+  forcedByEnv?: boolean;
+}
+
+export function readDeployment(client: Client, limitMs: number): Read<DeploymentInfo> {
+  return read<DeploymentInfo>(client, '/api/system/deployment', limitMs);
+}
+
+export type DeploymentAnswer =
+  | { kind: 'set'; info: DeploymentInfo }
+  | { kind: 'refused'; text: string }
+  | { kind: 'unsure'; text: string };
+
+const NOT_SAVED = 'The deployment mode could not be saved';
+
+/**
+ * PUT /api/system/deployment (bots.ts:2478); no time limit. Only the 409 of a forced mode (detector.ts:170) and the 500
+ * that names an unsaved mode (bots.ts:2492) say nothing changed; the 500 after a saved mode (:2494 to :2497) and every
+ * other refusal leave the mode unknown.
+ */
+export async function setDeployment(client: Client, mode: 'casaos' | 'docker'): Promise<DeploymentAnswer> {
+  const { status, outcome } = await send(client, 'PUT', '/api/system/deployment', { mode });
+  if (outcome.ok !== true) return { kind: 'unsure', text: outcome.text };
+  const b = outcome.value;
+  if (b.success === true) return { kind: 'set', info: b as DeploymentInfo };
+  const error = typeof b.error === 'string' ? b.error : '';
+  if (status === 409 && error) return { kind: 'refused', text: error };
+  if (status === 500 && error.startsWith(NOT_SAVED)) return { kind: 'refused', text: error };
+  return { kind: 'unsure', text: error || `HTTP ${status}` };
+}
 
 // The same route and body as `dbm sources list`.
 export async function listSources(client: Client): Promise<Source[]> {

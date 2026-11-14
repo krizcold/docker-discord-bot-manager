@@ -3,12 +3,16 @@ import type { CodeField, CodeShown } from './codes';
 import type { ConfigEditor } from './configedit';
 import type { DatabaseScreen } from './database';
 import type { EnvEditor } from './envedit';
+import type { DeleteScreen } from './botdelete';
+import type { FilesBusy, FilesScreen } from './files';
 import type { InstallWizard } from './install';
+import type { ManagerFollow, ManagerReads, ManagerScreen } from './manager';
 import type { StateScreen } from './statescreen';
 import type { VaultScreen } from './vaultscreen';
+import type { WebAuthScreen } from './webauth';
 import {
-  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, listBots, Outcome, readOrphanBackups, readReplica,
-  StreamLines, stopBot,
+  ActionKind, ActionResult, Bot, botName, buildFrameLine, buildLogPath, followStream, lifecycleAction, Outcome, readBotList, readOrphanBackups, readReplica,
+  StreamLines, stopBot, VERSION_READ_MS,
 } from './api';
 
 export const LIST_EVERY_MS = 5000;
@@ -25,6 +29,13 @@ export interface ListState {
   error: string | null;
 }
 
+/** A bot delete that ended: its text, and the first list read that started after it, which tells whether the bot is gone. */
+export interface DeleteOutcome {
+  name: string;
+  text: string;
+  listSeq: number;
+}
+
 export interface ActionRun {
   kind: ActionKind;
   botId: string;
@@ -37,9 +48,35 @@ export interface ActionRun {
 export class Session {
   list: ListState = { bots: [], readAt: null, error: null };
   runs = new Map<string, ActionRun>();
+  /** The newest deployment mode a list read carried; kept when a later read has none, as the page's loadBots does (index.html:1469). */
+  deploymentMode: string | null = null;
   notice: string | null = null;
   /** The open install form and editors, kept here so they outlive the remount after a hand-off. */
-  held: { install?: InstallWizard; env?: EnvEditor; config?: ConfigEditor; vault?: VaultScreen; database?: DatabaseScreen; state?: StateScreen } = {};
+  held: { install?: InstallWizard; env?: EnvEditor; config?: ConfigEditor; vault?: VaultScreen; database?: DatabaseScreen; state?: StateScreen; files?: FilesScreen; delete?: DeleteScreen; webAuth?: WebAuthScreen; manager?: ManagerScreen } = {};
+  /** The version and deployment reads the Manager screen shows (manager.ts). */
+  manager: ManagerReads = {
+    version: { reading: false, value: null, error: null },
+    deployment: { reading: false, value: null, error: null },
+    versionSeq: 0,
+    deploySeq: 0,
+    joinPending: false,
+    versionRead: null,
+  };
+  /** The manager update this session started or joined; Esc and a reopened screen keep it. */
+  managerFollow: ManagerFollow | null = null;
+  /** The deployment mode a PUT is setting, so a second Y sends nothing until it answers. */
+  deploymentBusy: string | null = null;
+  managerTimes = { pollMs: 5000, limitMs: 15 * 60_000, readMs: VERSION_READ_MS, deployReadMs: 15_000 };
+  /** The bot delete running per bot: a second Y, a reopened dialog or another key sends nothing until it answers. */
+  deleting = new Map<string, string>();
+  /** The last delete outcome per bot. */
+  deleteOutcomes = new Map<string, DeleteOutcome>();
+  /** The web login change running per bot. */
+  webAuthBusy = new Map<string, string>();
+  /** Counts list reads that answered, so a read that started before an outcome is not taken as the one after it. */
+  listSeq = 0;
+  /** The file write running per bot (the Files screen's guard), so a reopened screen sends nothing until it answers. */
+  filesBusy = new Map<string, FilesBusy>();
   /** The dump folders of removed bots, read after each successful list read as the page's loadOrphanBackups does. */
   orphans: OrphanRead | null = null;
   /** The Database screen's call running per bot, so a screen opened again during a held restore waits for it. */
@@ -59,6 +96,14 @@ export class Session {
   private stopped = false;
 
   constructor(readonly client: Client, private now: () => number = Date.now) {}
+
+  clock(): number {
+    return this.now();
+  }
+
+  get isStopped(): boolean {
+    return this.stopped;
+  }
 
   subscribe = (fn: () => void): (() => void) => {
     this.listeners.add(fn);
@@ -87,6 +132,11 @@ export class Session {
     this.aborts.clear();
     this.held.database?.close();
     this.held.state?.close();
+    this.held.files?.close();
+    this.held.delete?.close();
+    this.held.webAuth?.close();
+    this.held.manager?.close();
+    this.managerFollow?.stop();
     this.codeFocus = null;
     this.moveCodes.clear();
   }
@@ -131,19 +181,54 @@ export class Session {
   async refresh(): Promise<void> {
     if (this.reading) return;
     this.reading = true;
+    const seq = ++this.listStarts;
     try {
-      const bots = await listBots(this.client);
+      const { bots, deploymentMode } = await readBotList(this.client);
       this.list = { bots, readAt: this.now(), error: null };
+      if (deploymentMode) this.deploymentMode = deploymentMode;
+      this.listSeq = seq;
       void this.readOrphans();
     } catch (err) {
       this.list = { ...this.list, error: err instanceof Error ? err.message : String(err) };
     } finally {
       this.reading = false;
       this.changed();
+      if (this.rereadQueued) {
+        this.rereadQueued = false;
+        void this.refresh();
+      }
     }
   }
 
   private orphanSeq = 0;
+  private listStarts = 0;
+  // A delete or web login outcome needs a read that starts after it; one already running started before.
+  private rereadQueued = false;
+
+  /** An outcome that reaches the shared notice with its bot's name; the list is read again after it. */
+  report(name: string, text: string): void {
+    this.notice = `${name}: ${text}`;
+    this.changed();
+    this.reread();
+  }
+
+  /** A list read that starts after now; one already running is followed by another. */
+  reread(): void {
+    if (this.reading) this.rereadQueued = true;
+    else void this.refresh();
+  }
+
+  /** A delete's outcome, kept per bot; a read that starts after it tells whether the bot is gone. */
+  endDelete(botId: string, name: string, text: string): void {
+    this.deleteOutcomes.set(botId, { name, text, listSeq: this.listStarts + 1 });
+    this.report(name, text);
+  }
+
+  /** True once a list read that started after this bot's delete ended no longer lists the bot. */
+  deletedGone(botId: string): boolean {
+    const out = this.deleteOutcomes.get(botId);
+    return !!out && this.listSeq >= out.listSeq && !this.list.error && !this.bot(botId);
+  }
 
   private async readOrphans(): Promise<void> {
     const seq = ++this.orphanSeq;
@@ -157,7 +242,14 @@ export class Session {
     return id === undefined ? undefined : this.list.bots.find((b) => b.id === id);
   }
 
+  /** Why nothing may be sent on this bot now: its delete is running. Every screen that sends on a bot asks this. */
+  sendBlock(botId: string): string | null {
+    const name = this.deleting.get(botId);
+    return name === undefined ? null : `The delete of ${name} is running, so nothing was sent.`;
+  }
+
   busy(botId: string): boolean {
+    if (this.deleting.has(botId)) return true;
     const run = this.runs.get(botId);
     return !!run && run.result === null;
   }

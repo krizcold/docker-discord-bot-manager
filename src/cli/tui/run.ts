@@ -6,7 +6,9 @@ import { PASTE_OFF } from './codes';
 import { importEsm } from './esm';
 import { Client } from '../client';
 import { Session } from './session';
+import { startRead } from './manager';
 import { editBody, editorCommand, EditRequest, EditResult } from './editbody';
+import { runShell, shellBanner, ShellDeps } from './shell';
 
 const SHOW_CURSOR = '\x1b[?25h';
 
@@ -49,6 +51,11 @@ function handOff(command: string, modes: ScreenModes): Promise<string | undefine
   }));
 }
 
+/** The shell hand-off: docker exec in a bot container with the terminal's stdio; the result is the frame's notice. */
+export function shellHandOff(container: string, modes: ScreenModes, deps: ShellDeps = {}): Promise<string | undefined> {
+  return suspended(modes, shellBanner(container, process.stdout.columns || 80), () => runShell(container, deps));
+}
+
 /** The config body hand-off: the editor on a private copy of the body, then the outcome goes back to the form. */
 export async function editHandOff(request: EditRequest, modes: ScreenModes, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   let result: EditResult;
@@ -74,12 +81,13 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
   process.stdout.write(modes.enter);
   const session = new Session(client);
   session.start();
+  void startRead(session);
   const command = handOffCommand();
 
   let state: FrameState = { screen: 'list', index: 0 };
   try {
     for (;;) {
-      const outcome: { next?: FrameState; edit?: EditRequest } = {};
+      const outcome: { next?: FrameState; edit?: EditRequest; shell?: string } = {};
       let instance: ReturnType<InkApi['render']> | null = null;
       instance = ink.render(
         createElement(App, {
@@ -95,6 +103,11 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
             outcome.edit = request;
             instance?.unmount();
           },
+          onShell: (s, container) => {
+            outcome.next = s;
+            outcome.shell = container;
+            instance?.unmount();
+          },
         }),
         { exitOnCtrlC: false, patchConsole: false },
       );
@@ -107,6 +120,12 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
         state = outcome.next;
         process.stdin.pause();
         await editHandOff(outcome.edit, modes);
+        continue;
+      }
+      if (outcome.shell !== undefined && outcome.next) {
+        state = outcome.next;
+        process.stdin.pause();
+        state = { ...state, notice: await shellHandOff(outcome.shell, modes) };
         continue;
       }
       if (!outcome.next || command === undefined) break;

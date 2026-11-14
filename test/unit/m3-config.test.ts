@@ -429,9 +429,10 @@ describe('m3 key bar', () => {
     expect(keyLines('Q Quit', 75)).toEqual(['Q Quit']);
   });
 
-  it('keeps the bar on one line at 110 columns', async () => {
+  // The stopped bot's bar, X Delete included, is 113 characters.
+  it('keeps the bar on one line at 120 columns', async () => {
     const f = base();
-    const v = await start(f, { rows: 24, columns: 110 });
+    const v = await start(f, { rows: 24, columns: 120 });
     await v.press(ENTER);
     await v.until('Name mybot');
     expect(keyBar(v.frame())).toMatch(/S Start {2}R Restart.*Q Quit/);

@@ -79,7 +79,7 @@ const TO_INSTALL = Array(10).fill(TAB) as string[];
 describe('m2 sources screen', () => {
   it('I opens Install from the bot list, the bar shows it, and Esc comes back', async () => {
     const v = await start(base());
-    expect(keyBar(v.frame())).toMatch(/^\| I Install {2}V Vault {2}Q Quit\s+\|$/);
+    expect(keyBar(v.frame())).toMatch(/^\| I Install {2}V Vault {2}M Manager {2}Q Quit\s+\|$/);
     await v.press('i');
     await v.until('Sources');
     const f = v.frame();

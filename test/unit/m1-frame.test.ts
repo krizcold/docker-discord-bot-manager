@@ -59,7 +59,7 @@ describe('m1 bot list', () => {
     expect(f.split('\n')[0].startsWith('+ Bot Manager - box1 -')).toBe(true);
     expect(f).toMatch(/Bots\s+Status\s+Data\s+Copy\s+Last backup/);
     expect(f).toMatch(/> mybot\s+running\s+-\s+-\s+-/);
-    expect(keyBar(f)).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}Q Quit\s+\|$/);
+    expect(keyBar(f)).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}M Manager {2}Q Quit\s+\|$/);
     await v.press(DOWN);
     expect(selectedRow(v.frame())).toBe('imgbot');
     v.unmount();
@@ -92,13 +92,13 @@ describe('m1 bot list', () => {
 
   it('hands off from the list and the bot screen with their state when a command is named', async () => {
     const v = await start(twoBots(), undefined, true);
-    expect(keyBar(v.frame())).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}H Hand-off {2}Q Quit\s+\|$/);
+    expect(keyBar(v.frame())).toMatch(/^\| Enter Open {2}I Install {2}V Vault {2}M Manager {2}H Hand-off {2}Q Quit\s+\|$/);
     await v.press(DOWN, 'h');
     expect(v.onHandOff).toHaveBeenCalledWith({ screen: 'list', index: 1 });
     v.unmount();
     const b = await start(twoBots(), undefined, true);
     await b.press('\r');
-    expect(b.frame().split('\n').slice(-3, -1).join(' ')).toMatch(/G Build logs {2}T State {2}H Hand-off\s.*Esc Back/);
+    expect(b.frame().split('\n').slice(-3, -1).join(' ')).toMatch(/G Build logs {2}T State {2}O Console {2}F Files\s.*H Hand-off\s.*Esc Back/);
     await b.press('h');
     expect(b.onHandOff).toHaveBeenCalledWith({ screen: 'bot', index: 0, botId: 'b1' });
     b.unmount();
@@ -106,21 +106,24 @@ describe('m1 bot list', () => {
 });
 
 describe('m1 bot screen', () => {
-  it('offers Stop for a running git bot and no Install, Database or Files keys', async () => {
+  it('offers Stop for a running git bot and no Install or Database keys', async () => {
     const v = await start(twoBots());
     await v.press('\r');
     const f = v.frame();
     expect(f).toContain('Name         mybot');
-    expect(keyBar(f)).toMatch(/S Stop {2}R Restart {2}B Build {2}U Update {2}L Logs {2}G Build logs {2}T State {2}Esc Back {2}Q Quit/);
-    expect(keyBar(f)).not.toMatch(/Install|Database|Files/);
+    const bar = f.split('\n').slice(-3, -1).map((l) => l.replace(/^\| /, '').replace(/\s*\|$/, '').trim()).join('  ');
+    expect(bar).toMatch(/S Stop {2}R Restart {2}B Build {2}U Update {2}L Logs {2}G Build logs {2}T State {2}O Console {2}F Files {2}Esc Back {2}Q Quit/);
+    expect(bar).not.toMatch(/Install|Database/);
     v.unmount();
   });
 
   it('offers Start and no Update for a stopped image bot', async () => {
     const v = await start(twoBots());
     await v.press(DOWN, '\r');
-    expect(keyBar(v.frame())).toMatch(/S Start {2}R Restart {2}B Build {2}L Logs/);
-    expect(keyBar(v.frame())).not.toContain('U Update');
+    // The stopped bot's bar wraps after X Delete at this width; both lines are read.
+    const bar = v.frame().split('\n').slice(-3, -1).join('  ');
+    expect(bar).toMatch(/S Start {2}R Restart {2}B Build {2}L Logs/);
+    expect(bar).not.toContain('U Update');
     v.unmount();
   });
 

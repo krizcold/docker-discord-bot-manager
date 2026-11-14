@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react';
 import type * as Ink from 'ink';
 import {
-  ActionKind, Bot, botName, buildFrameLine, buildLogPath, Container, containerFrameLine, containerLogPath, listContainers, StreamLines,
+  ActionKind, Bot, botName, buildFrameLine, buildLogPath, Container, containerFrameLine, containerLogPath, listContainers, readContainers, StreamLines,
 } from './api';
+import { runningContainers } from './shell';
+import { DeleteExit, DeleteScreen } from './botdelete';
+import { WebAuthExit, WebAuthScreen } from './webauth';
 import { isForwardDelete } from './field';
 import { clock, copyText, dataText, lastBackupText, listHeader, listRow, statusText, updateText } from './format';
 import { codeScreen, CodeShown, PASTE_OFF, PASTE_ON, PasteReader } from './codes';
@@ -13,13 +16,15 @@ import { databaseBadges, hasDatabaseScreen, heldWarningText, hostDataRoot, orpha
 import { StateExit, StateOptions, StateScreen } from './statescreen';
 import { EditRequest } from './editbody';
 import { EditorExit, EditorOptions, EnvEditor } from './envedit';
+import { FilesExit, FilesOptions, FilesScreen } from './files';
 import { InstallWizard, WizardExit, WizardOptions, wrap } from './install';
+import { ManagerExit, ManagerScreen } from './manager';
 import { Session } from './session';
 import { VaultExit, VaultOptions, VaultScreen } from './vaultscreen';
 
 export type InkApi = typeof Ink;
 
-export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault' | 'database' | 'state' | 'code';
+export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install' | 'env' | 'config' | 'vault' | 'database' | 'state' | 'code' | 'shell' | 'files' | 'delete' | 'webauth' | 'manager';
 
 export interface FrameState {
   screen: Screen;
@@ -38,6 +43,10 @@ export interface AppProps {
   onHandOff: (state: FrameState) => void;
   /** Hands the terminal to the editor for a config body; the frame is drawn again at `state` afterwards. */
   onEdit?: (state: FrameState, request: EditRequest) => void;
+  /** Hands the terminal to a shell in the named container; the frame is drawn again at `state` afterwards. */
+  onShell?: (state: FrameState, container: string) => void;
+  shellOptions?: { readLimitMs?: number };
+  filesOptions?: FilesOptions;
   canHandOff?: boolean;
   now?: () => number;
   wizardOptions?: WizardOptions;
@@ -129,6 +138,10 @@ const SCROLL_KEYS = 'Up/Down Scroll  End Follow  Esc Back  Q Quit';
 // Offered only when DBM_TUI_CHECK_HANDOFF names a command (the terminal check).
 const HANDOFF_KEY = 'H Hand-off';
 
+// The route waits up to 10 s for docker ps (dockerClient.ts:782) before its 503.
+const SHELL_READ_MS = 20_000;
+const sentence = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
+
 const KIND_LABEL: Record<ActionKind, string> = { start: 'Start', stop: 'Stop', restart: 'Restart', build: 'Build', update: 'Update' };
 
 // The held warning (index.html:3740) joins the question when the bot holds changes it could not save.
@@ -157,14 +170,27 @@ export function canEditEnv(bot: Bot, busy: boolean): boolean {
   return !busy && !bot.activeOp && !['running', 'building', 'starting', 'stopping'].includes(bot.status ?? '');
 }
 
-function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean): string {
+// The page offers Files on a running bot and on one started before (index.html:1709, :1726).
+export function canBrowseFiles(bot: Bot): boolean {
+  return bot.status === 'running' || !!bot.hasBeenStarted || !!bot.lastStartAt;
+}
+
+// The page offers Delete on a bot that is not running and not busy (index.html:1551, :1727, :1734).
+export function canDelete(bot: Bot, busy: boolean): boolean {
+  return canEditEnv(bot, busy);
+}
+
+// Screens without a held object of their own: a bot removed by a delete sends them to the list.
+const BOT_FRAMES: Screen[] = ['bot', 'delete', 'webauth', 'confirm', 'action', 'containers', 'logs', 'buildlogs', 'shell'];
+
+function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean, deleting: boolean): string {
   const keys: string[] = [];
   if (!busy) {
     keys.push(bot.status === 'running' || bot.status === 'starting' ? 'S Stop' : 'S Start', 'R Restart', 'B Build');
     if (bot.sourceType !== 'docker-image') keys.push('U Update');
   }
   if (hasRun) keys.push('P Progress');
-  keys.push('L Logs', 'G Build logs', ...(hasDatabaseScreen(bot) ? ['D Database'] : []), 'T State', ...(canEditEnv(bot, busy) ? ['E Env', 'C Config'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
+  keys.push('L Logs', 'G Build logs', ...(hasDatabaseScreen(bot) ? ['D Database'] : []), 'T State', ...(bot.status === 'running' ? ['O Console'] : []), ...(canBrowseFiles(bot) ? ['F Files'] : []), ...(bot.publicUrl ? ['W Web login'] : []), ...(canEditEnv(bot, busy) ? ['E Env', 'C Config'] : []), ...(canDelete(bot, busy) && !deleting ? ['X Delete'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Esc Back', 'Q Quit');
   return keys.join('  ');
 }
 
@@ -173,7 +199,7 @@ export function createApp(ink: InkApi) {
 
   return function App({
     machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions, envOptions, configOptions, vaultOptions, databaseOptions, stateOptions, onEdit,
-    writeMode,
+    writeMode, onShell, shellOptions, filesOptions,
   }: AppProps) {
     const { exit } = useApp();
     const { stdout } = useStdout();
@@ -191,6 +217,10 @@ export function createApp(ink: InkApi) {
     const vault = { get current() { return held.vault ?? null; }, set current(v: VaultScreen | null) { held.vault = v ?? undefined; } };
     const database = { get current() { return held.database ?? null; }, set current(v: DatabaseScreen | null) { held.database = v ?? undefined; } };
     const stateScreen = { get current() { return held.state ?? null; }, set current(v: StateScreen | null) { held.state = v ?? undefined; } };
+    const filesScreen = { get current() { return held.files ?? null; }, set current(v: FilesScreen | null) { held.files = v ?? undefined; } };
+    const deleteScreen = { get current() { return held.delete ?? null; }, set current(v: DeleteScreen | null) { held.delete = v ?? undefined; } };
+    const webAuthScreen = { get current() { return held.webAuth ?? null; }, set current(v: WebAuthScreen | null) { held.webAuth = v ?? undefined; } };
+    const managerScreen = { get current() { return held.manager ?? null; }, set current(v: ManagerScreen | null) { held.manager = v ?? undefined; } };
 
     // Registered before useInput's listener, so the raw sequence of each key is known when useInput runs.
     useEffect(() => {
@@ -223,6 +253,16 @@ export function createApp(ink: InkApi) {
     const stream = useRef<StreamLines>({ lines: [], end: null });
     // The open stop, restart or update question.
     const confirmDialog = useRef<Dialog | null>(null);
+    // The containers read O or R started; its answer acts only while the screen that asked still shows that bot.
+    const shellRead = useRef<{ botId: string; from: Screen; token: number } | null>(null);
+    const shellSeq = useRef(0);
+    const shellPick = useRef<{ botId: string; list: Container[] } | null>(null);
+    // Set once the frame handed the terminal to a shell: no key acts in the gap before the frame unmounts.
+    const leaving = useRef(false);
+    useEffect(() => {
+      const r = shellRead.current;
+      if (r && (r.botId !== state.botId || r.from !== state.screen)) shellRead.current = null;
+    }, [state.screen, state.botId]);
 
     // Bracketed paste is on only while a code field has focus, so a paste elsewhere stays plain keys.
     const write = useRef(writeMode ?? ((sequence: string) => void stdout.write(sequence)));
@@ -246,6 +286,22 @@ export function createApp(ink: InkApi) {
         stdout.off('resize', onResize);
       };
     }, [stdout]);
+
+    // A delete or web login outcome ends its screen through the Session; the frame then shows the bot screen.
+    useEffect(() => {
+      if ((state.screen === 'delete' && !deleteScreen.current) || (state.screen === 'webauth' && !webAuthScreen.current)) {
+        setScroll(0);
+        setState((s) => ({ ...s, screen: 'bot', notice: undefined }));
+      }
+    });
+    // A bot the delete removed: once a list read after the outcome no longer lists it, the frame goes to the list.
+    useEffect(() => {
+      if (state.botId && BOT_FRAMES.includes(state.screen) && session.deletedGone(state.botId)) {
+        confirmDialog.current = null;
+        setScroll(0);
+        setState((s) => ({ ...s, screen: 'list', botId: undefined, notice: undefined }));
+      }
+    });
 
     const bot = session.bot(state.botId);
     const bots = session.list.error ? [] : session.list.bots;
@@ -274,6 +330,54 @@ export function createApp(ink: InkApi) {
     const go = (next: Partial<FrameState>) => {
       setScroll(0);
       setState({ ...state, notice: undefined, ...next });
+    };
+
+    const openShell = (container: string) => {
+      if (leaving.current) return;
+      if (!onShell) {
+        setState((s) => ({ ...s, notice: 'No shell can be opened here.' }));
+        return;
+      }
+      leaving.current = true;
+      shellRead.current = null;
+      onShell({ ...stateRef.current, screen: 'bot', notice: undefined }, container);
+    };
+
+    const readShell = (b: Bot, from: 'bot' | 'shell') => {
+      if (shellRead.current || leaving.current) return;
+      const token = ++shellSeq.current;
+      shellRead.current = { botId: b.id, from, token };
+      const name = botName(b);
+      setState((s) => ({ ...s, notice: `Reading the containers of ${name}.` }));
+      void readContainers(session.client, b.id, shellOptions?.readLimitMs ?? SHELL_READ_MS).then((r) => {
+        if (shellRead.current?.token !== token) return;
+        shellRead.current = null;
+        const s = stateRef.current;
+        if (leaving.current || s.botId !== b.id || s.screen !== from) return;
+        if (r.ok !== true) {
+          setState((x) => ({ ...x, notice: `Could not list the containers of ${name}: ${sentence(r.text)}` }));
+          return;
+        }
+        const running = runningContainers(r.value);
+        const none = `${name} has no running containers.`;
+        if (from === 'bot') {
+          if (running.length === 0) setState((x) => ({ ...x, notice: none }));
+          else if (running.length === 1) openShell(running[0].name);
+          else {
+            shellPick.current = { botId: b.id, list: running };
+            setScroll(0);
+            setState((x) => ({ ...x, screen: 'shell', pick: 0, container: running[0].name, notice: undefined }));
+          }
+          return;
+        }
+        shellPick.current = { botId: b.id, list: running };
+        // A row that moved under the cursor is not the one the operator picked: Enter waits for Up or Down.
+        setState((x) => {
+          const pick = Math.min(x.pick ?? 0, Math.max(running.length - 1, 0));
+          const same = x.container !== undefined && running[pick]?.name === x.container;
+          return { ...x, pick, container: same ? x.container : undefined, notice: running.length === 0 ? none : undefined };
+        });
+      });
     };
 
     const askConfirm = (kind: ActionKind) => {
@@ -385,6 +489,120 @@ export function createApp(ink: InkApi) {
       setState((s) => ({ ...s, screen: from === 'database' && database.current ? 'database' : 'bot', notice: undefined }));
     };
 
+    // A file read lands later; nano opens only while this Files screen is the one shown.
+    const openFiles = (b: Bot) => {
+      filesScreen.current?.close();
+      const screen: FilesScreen = new FilesScreen(session.client, () => session.changed(), b.id, session, (request) => {
+        if (filesScreen.current !== screen || stateRef.current.screen !== 'files' || leaving.current) return false;
+        if (!onEdit) return false;
+        onEdit({ ...stateRef.current, notice: undefined }, request);
+        return true;
+      }, (text) => reportFor(b.id)({ text }), filesOptions);
+      filesScreen.current = screen;
+      screen.open();
+      go({ screen: 'files' });
+    };
+
+    // X: the dialog names the bot this screen was opened for, never a list row.
+    const askDelete = (b: Bot) => {
+      const name = botName(b);
+      if (session.deleting.has(b.id)) {
+        // In the Session, so the outcome that lands later replaces it.
+        session.notice = `The delete of ${name} is still running; waiting for the manager.`;
+        go({});
+        return;
+      }
+      if (b.status === 'running') {
+        go({ notice: `Stop ${name} to remove it.` });
+        return;
+      }
+      if (!canDelete(b, session.busy(b.id))) {
+        go({ notice: `${name} is busy, so it cannot be removed now.` });
+        return;
+      }
+      deleteScreen.current?.close();
+      const screen = new DeleteScreen(session, b.id, b);
+      screen.open();
+      deleteScreen.current = screen;
+      go({ screen: 'delete' });
+    };
+
+    const afterDelete = (out: DeleteExit) => {
+      if (!out) return;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      const d = deleteScreen.current;
+      if (d && d.stage !== 'sending') {
+        d.close();
+        deleteScreen.current = null;
+      }
+      if (out.shared) session.notice = out.notice ?? null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: out.shared ? undefined : out.notice }));
+    };
+
+    const openWebAuth = (b: Bot) => {
+      if (!b.publicUrl) {
+        go({ notice: `${botName(b)} has no public URL, so it has no web login to set.` });
+        return;
+      }
+      if (session.webAuthBusy.has(b.id)) {
+        session.notice = `The web login change of ${botName(b)} is still running; waiting for the manager.`;
+        go({});
+        return;
+      }
+      webAuthScreen.current?.close();
+      const screen = new WebAuthScreen(session, b.id, b);
+      screen.open();
+      webAuthScreen.current = screen;
+      go({ screen: 'webauth' });
+    };
+
+    const afterWebAuth = (out: WebAuthExit) => {
+      if (!out) return;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      if (out.shared) session.notice = out.notice ?? null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: out.shared ? undefined : out.notice }));
+    };
+
+    const openManager = () => {
+      managerScreen.current?.close();
+      const screen = new ManagerScreen(session);
+      managerScreen.current = screen;
+      screen.open();
+      go({ screen: 'manager' });
+    };
+
+    const afterManager = (out: ManagerExit) => {
+      if (!out) return;
+      managerScreen.current?.close();
+      managerScreen.current = null;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'list', notice: undefined }));
+    };
+
+    const afterFiles = (out: FilesExit) => {
+      if (!out) return;
+      filesScreen.current?.close();
+      filesScreen.current = null;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'bot', notice: undefined }));
+    };
+
     // A code read lands later; it opens only while the screen that asked is still the one shown.
     const openCode = (asker: DatabaseScreen, shown: CodeShown): boolean => {
       if (database.current !== asker || stateRef.current.screen !== 'database') return false;
@@ -411,6 +629,7 @@ export function createApp(ink: InkApi) {
     };
 
     const onInput = (input: string, key: Ink.Key) => {
+      if (leaving.current) return;
       const k = input.toLowerCase();
       // Before the paste gate: an unfinished paste or a held escape start must not keep the operator in. A pasted Ctrl+C
       // arrives inside a longer input and does not match.
@@ -442,6 +661,26 @@ export function createApp(ink: InkApi) {
           session.changed();
           return;
         }
+      }
+      if (state.screen === 'delete') {
+        const d = deleteScreen.current;
+        if (d && d.botId === state.botId) afterDelete(d.key(input, key));
+        else afterDelete({ leave: true });
+        return;
+      }
+      if (state.screen === 'webauth') {
+        const w = webAuthScreen.current;
+        if (w && w.botId === state.botId) afterWebAuth(w.key(input, key));
+        else afterWebAuth({ leave: true });
+        return;
+      }
+      if (state.screen === 'manager') {
+        afterManager(managerScreen.current ? managerScreen.current.key(input, key) : { leave: true });
+        return;
+      }
+      if (state.screen === 'files') {
+        afterFiles(filesScreen.current ? filesScreen.current.key(input, key, isForwardDelete(raw.current)) : { leave: true });
+        return;
       }
       if (state.screen === 'state') {
         afterState(stateScreen.current ? stateScreen.current.key(input, key, isForwardDelete(raw.current)) : { leave: true });
@@ -517,6 +756,10 @@ export function createApp(ink: InkApi) {
           go({ screen: 'install' });
           return;
         }
+        if (k === 'm' && canInstall) {
+          openManager();
+          return;
+        }
         if (k === 'v' && canInstall) {
           vault.current = new VaultScreen(session.client, () => session.changed(), vaultOptions);
           void vault.current.load();
@@ -538,8 +781,31 @@ export function createApp(ink: InkApi) {
         else if (key.return) go({ screen: 'logs', container: list[pick].name, pick });
         return;
       }
+      if (state.screen === 'shell') {
+        if (!bot) return;
+        if (k === 'r') {
+          readShell(bot, 'shell');
+          return;
+        }
+        const list = shellPick.current?.botId === bot.id ? shellPick.current.list : [];
+        if (list.length === 0) return;
+        const pick = Math.min(state.pick ?? 0, list.length - 1);
+        if (key.upArrow || key.downArrow) {
+          const next = key.upArrow ? (pick + list.length - 1) % list.length : (pick + 1) % list.length;
+          go({ pick: next, container: list[next].name });
+        } else if (key.return && state.container !== undefined && list[pick]?.name === state.container) openShell(state.container);
+        return;
+      }
       if (state.screen !== 'bot' || !bot) return;
       if (k === 't') openState(bot.id, 'bot');
+      else if (k === 'f') {
+        if (canBrowseFiles(bot)) openFiles(bot);
+        else go({ notice: `${botName(bot)} has never been started, so it has no files to browse yet.` });
+      } else if (k === 'o') {
+        if (bot.status !== 'running') go({ notice: 'Start the bot to open a console.' });
+        else readShell(bot, 'bot');
+      } else if (k === 'w') openWebAuth(bot);
+      else if (k === 'x') askDelete(bot);
       else if (k === 'd' && hasDatabaseScreen(bot)) {
         database.current?.close();
         const screen: DatabaseScreen = new DatabaseScreen(session.client, () => session.changed(), bot.id, session, databaseOptions, reportFor(bot.id), (shown) => openCode(screen, shown));
@@ -582,10 +848,10 @@ export function createApp(ink: InkApi) {
     useInput(useCallback((input: string, key: Ink.Key) => onInputRef.current(input, key), []));
 
     const listKeys = (rows: boolean) =>
-      [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install', 'V Vault'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
+      [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install', 'V Vault', 'M Manager'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
 
     const buildView = (room: number): View => {
-      const notice = state.notice ?? session.notice ?? undefined;
+      let notice = state.notice ?? session.notice ?? undefined;
       if (state.screen === 'install') {
         if (wizard.current) return wizard.current.view(innerWidth(size.columns), room);
         return { body: ['Install is not open.'], keys: 'Esc Back  Q Quit', notice };
@@ -602,6 +868,22 @@ export function createApp(ink: InkApi) {
         if (stateScreen.current) return stateScreen.current.view(innerWidth(size.columns), room, notice);
         return { body: ['The state screen is not open.'], keys: 'Esc Back  Q Quit', notice };
       }
+      if (state.screen === 'delete') {
+        if (deleteScreen.current) return { ...deleteScreen.current.view(innerWidth(size.columns), room), notice };
+        return { body: ['The delete dialog is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'webauth') {
+        if (webAuthScreen.current) return { ...webAuthScreen.current.view(innerWidth(size.columns), room), notice };
+        return { body: ['The web login picker is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'manager') {
+        if (managerScreen.current) return managerScreen.current.view(innerWidth(size.columns), room, notice);
+        return { body: ['The Manager screen is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
+      if (state.screen === 'files') {
+        if (filesScreen.current) return filesScreen.current.view(innerWidth(size.columns), room, notice);
+        return { body: ['The Files screen is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
       if (state.screen === 'database') {
         if (database.current) return database.current.view(innerWidth(size.columns), room, notice);
         return { body: ['The database screen is not open.'], keys: 'Esc Back  Q Quit', notice };
@@ -615,6 +897,10 @@ export function createApp(ink: InkApi) {
         if (readFailed) return { body: [readFailed], keys: listKeys(false), notice };
         if (session.list.readAt === null) return { body: ['Reading the bot list.'], keys: listKeys(false), notice };
         const orphans = orphanLines(session.orphans, hostDataRoot(databaseOptions?.env ?? process.env)).flatMap((l) => wrap(l, innerWidth(size.columns)));
+        // A notice longer than the notice line (a delete's outcome) goes under the rows, whole.
+        const longNotice = !!notice && notice.length > innerWidth(size.columns);
+        if (longNotice) orphans.unshift(...wrap(notice!, innerWidth(size.columns)), ...(orphans.length ? [''] : []));
+        if (longNotice) notice = undefined;
         const below = orphans.length ? ['', ...orphans] : [];
         if (bots.length === 0) return { body: ['No bots on this manager.', ...below], keys: listKeys(false), notice };
         const rowRoom = Math.max(room - below.length, 2);
@@ -651,9 +937,40 @@ export function createApp(ink: InkApi) {
           body.push(`${b.danger ? '! ' : ''}${b.text}`);
           for (const part of b.title.split('\n')) if (part) body.push(...wrap(part, innerWidth(size.columns), '  '));
         }
-        const keys = botKeys(bot, session.busy(bot.id), !!run, canHandOff);
+        const keys = botKeys(bot, session.busy(bot.id), !!run, canHandOff, session.deleting.has(bot.id));
         if (longNotice) return { body, keys };
         return { body, keys, notice };
+      }
+      if (state.screen === 'shell') {
+        const w = innerWidth(size.columns);
+        const list = shellPick.current?.botId === bot.id ? shellPick.current.list : [];
+        const head = [...wrap(`Open a shell in a container of ${name}`, w), ''];
+        const longNotice = !!notice && notice.length > w;
+        const tail = longNotice ? ['', ...wrap(notice!, w)] : [];
+        const shownNotice = longNotice ? undefined : notice;
+        if (list.length === 0) return { body: [...head, `${name} has no running containers.`, ...tail], keys: 'R Read again  Esc Back  Q Quit', notice: shownNotice };
+        const pick = Math.min(state.pick ?? 0, list.length - 1);
+        const picked = state.container !== undefined && list[pick]?.name === state.container;
+        const rows: string[] = [];
+        let at = 0;
+        let atLines = 1;
+        list.forEach((c, i) => {
+          const lines = wrap(`${c.name}  ${c.status || c.state}`, w, '  ');
+          if (i === pick) {
+            at = rows.length;
+            atLines = lines.length;
+            if (picked) lines[0] = '>' + lines[0].slice(1);
+          }
+          rows.push(...lines);
+        });
+        const rowRoom = Math.max(room - head.length - tail.length, 1);
+        const start = at + atLines > rowRoom ? at : 0;
+        return {
+          body: [...head, ...rows.slice(start, start + rowRoom), ...tail],
+          highlight: picked ? head.length + at - start : undefined,
+          keys: [...(picked ? ['Enter Open shell'] : []), 'Up/Down Pick', 'R Read again', 'Esc Back', 'Q Quit'].join('  '),
+          notice: shownNotice,
+        };
       }
       if (state.screen === 'confirm' && confirmDialog.current) return confirmDialog.current.view(innerWidth(size.columns), room);
       if (state.screen === 'action') {

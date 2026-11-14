@@ -68,6 +68,8 @@ export interface BotSource {
   list: { bots: unknown[]; readAt: number | null; error: string | null };
   /** The running Database screen call per bot; it outlives the screen that started it. */
   dbBusy?: Map<string, { text: string; escape: boolean }>;
+  /** A text when nothing may be sent on the bot (the Session's, while its delete runs). */
+  sendBlock?(botId: string): string | null;
   /** The code field that has focus, and the call that gives it focus; a screen without them routes the field's keys itself. */
   codeFocus?: CodeField | null;
   focusCode?(f: CodeField | null): void;
@@ -282,6 +284,11 @@ export class DatabaseScreen {
   /** Runs one call with the keys waiting; the outcome goes to the notice and the bot list is read again. */
   private async act(text: string, escape: boolean, call: (busy: { text: string; escape: boolean }) => Promise<Said | Asked>): Promise<void> {
     if (this.busy) return;
+    const block = this.source.sendBlock?.(this.botId);
+    if (block) {
+      this.say(block);
+      return;
+    }
     const mine = { text, escape };
     this.busy = mine;
     this.notice = null;

@@ -231,6 +231,11 @@ export class StateScreen {
   private send(): void {
     const bot = this.bot();
     const name = botName(bot);
+    const block = this.source.sendBlock?.(this.botId);
+    if (block) {
+      this.say(block);
+      return;
+    }
     this.busy = `Asked the manager to set ${name} to ${stateName(this.choice)}.`;
     this.notice = null;
     this.changed();
@@ -280,6 +285,11 @@ export class StateScreen {
   }
 
   private async post(view: MigrateView): Promise<void> {
+    const block = this.source.sendBlock?.(this.botId);
+    if (block) {
+      this.say(block);
+      return;
+    }
     this.busy = 'Starting the migration.';
     this.changed();
     const r = await startMigration(this.client, this.botId, view.to ?? '');

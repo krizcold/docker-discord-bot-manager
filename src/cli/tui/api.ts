@@ -265,3 +265,285 @@ export async function followStream(
   }
   onChange();
 }
+
+export interface Source {
+  id: string;
+  url?: string;
+  branch?: string;
+  composeName?: string | null;
+  sourceType?: string;
+  imageRef?: string;
+  isCloned?: boolean;
+  cloneError?: string | null;
+}
+
+/** The page's getRepoName: the last path part of a git URL, without .git or credentials. */
+export function repoName(url: string | undefined): string | null {
+  if (!url) return null;
+  const match = url.replace(/\/\/([^@]+)@/, '//').match(/\/([^/]+?)(?:\.git)?$/);
+  return match ? match[1] : url;
+}
+
+export function sourceName(source: Source): string {
+  return source.composeName || repoName(source.url) || source.imageRef || source.url || source.id;
+}
+
+export function defaultBotName(source: Source | undefined): string {
+  return source ? source.composeName || repoName(source.url) || 'My Bot' : 'My Bot';
+}
+
+export function isImageSource(source: Source | undefined): boolean {
+  return !!source && source.sourceType === 'docker-image';
+}
+
+export type Outcome<T> = { ok: true; value: T } | { ok: false; text: string } | { ok: null; text: string };
+
+type Body = Record<string, unknown>;
+
+async function call(client: Client, method: string, path: string, body?: unknown): Promise<Outcome<Body>> {
+  let res: CliResponse;
+  try {
+    res = await client.request(method, path, body === undefined ? {} : { body });
+  } catch (err) {
+    return { ok: null, text: why(err) };
+  }
+  const b = res.body as Body | null;
+  // The page reads a reply it cannot parse as no answer (index.html:1388): what the manager did is unknown.
+  if (!b || typeof b !== 'object') return { ok: null, text: `the reply was not JSON, HTTP ${res.status}` };
+  return { ok: true, value: b };
+}
+
+const bare = (text: string): string => text.replace(/[.\s]+$/, '');
+const failed = (b: Body): boolean => b.success !== true;
+const bodyError = (b: Body, fallback: string): string => (typeof b.error === 'string' && b.error ? b.error : fallback);
+
+// The same route and body as `dbm sources list`.
+export async function listSources(client: Client): Promise<Source[]> {
+  const r = await call(client, 'GET', '/api/sources');
+  if (r.ok !== true) throw new Error(r.text);
+  if (failed(r.value)) throw new Error(bodyError(r.value, 'the manager gave no reason'));
+  if (!Array.isArray(r.value.sources)) throw new Error('the answer held no source list');
+  return r.value.sources as Source[];
+}
+
+// The same route and body as `dbm sources add`; the page sends main when the branch is left blank.
+export async function addSource(client: Client, url: string, branch: string): Promise<Outcome<Source>> {
+  const r = await call(client, 'POST', '/api/sources', { url, branch: branch || 'main' });
+  if (r.ok !== true) return r;
+  if (failed(r.value)) return { ok: false, text: bodyError(r.value, 'Failed to add source') };
+  return { ok: true, value: r.value.source as Source };
+}
+
+export interface FetchAnswer {
+  hasUpdates?: boolean;
+  copyError?: string;
+}
+
+// The same route as `dbm sources fetch`; for a source that is not cloned yet the fetch clones it.
+export async function fetchSource(client: Client, id: string): Promise<Outcome<FetchAnswer>> {
+  const r = await call(client, 'POST', `/api/sources/${id}/fetch`);
+  if (r.ok !== true) return r;
+  if (failed(r.value)) return { ok: false, text: bodyError(r.value, 'Fetch failed') };
+  return { ok: true, value: r.value as FetchAnswer };
+}
+
+export interface EnvHint {
+  key: string;
+  displayLabel?: string;
+  label?: string;
+  description?: string;
+  defaultValue?: string;
+  required?: boolean;
+  sensitive?: boolean;
+  autoWired?: boolean;
+  inactive?: string;
+  options?: Array<{ value: string; label?: string }>;
+  generate?: boolean;
+  showWhen?: { key: string; equals: string | string[] };
+  requiredWhen?: { key: string; equals: string | string[] };
+  advanced?: boolean;
+  group?: string;
+  groupHelp?: string;
+  placeholder?: string;
+  inputType?: 'number';
+  min?: number;
+  max?: number;
+  step?: number;
+  list?: boolean;
+}
+
+export interface ConfigHint {
+  inContainerPath: string;
+  rawBody?: string;
+  manifest?: unknown;
+  format?: string;
+  parsed?: unknown;
+  repoReadOnly?: boolean;
+}
+
+export interface SourceEnvs {
+  success?: boolean;
+  error?: string;
+  vars?: EnvHint[];
+  configFiles?: ConfigHint[];
+  interactiveSetup?: { reason?: string; advice?: string } | null;
+  sourceScan?: { scanned: number; total: number } | null;
+  imageReady?: boolean;
+  pullError?: string;
+  inspectError?: string;
+}
+
+/** GET /api/sources/:id/envs as the page reads it; scan runs the source-code scan, inspect pulls and inspects an image. */
+export async function readSourceEnvs(client: Client, id: string, mode?: 'scan' | 'inspect'): Promise<Outcome<SourceEnvs>> {
+  const query = mode === 'scan' ? '?scan=true' : mode === 'inspect' ? '?inspect=true' : '';
+  const r = await call(client, 'GET', `/api/sources/${id}/envs${query}`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as SourceEnvs };
+}
+
+export interface NameCheck {
+  valid?: boolean;
+  errors?: string[];
+  success?: boolean;
+  error?: string;
+  sanitizedName?: string;
+  displayName?: string;
+  adjusted?: boolean;
+  conflicts?: string[];
+  reuseAvailable?: boolean;
+  keptSource?: string | null;
+  envsAvailable?: boolean | 'unknown';
+}
+
+function nameQuery(name: string, sourceId: string | undefined): string {
+  return `name=${encodeURIComponent(name)}${sourceId ? `&sourceId=${encodeURIComponent(sourceId)}` : ''}`;
+}
+
+/** GET /api/validate-name, the page's live name check. */
+export async function validateName(client: Client, name: string, sourceId: string | undefined): Promise<Outcome<NameCheck>> {
+  const r = await call(client, 'GET', `/api/validate-name?${nameQuery(name, sourceId)}`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as NameCheck };
+}
+
+export interface RecoveredEnvs {
+  success?: boolean;
+  error?: string;
+  envs?: Array<{ key: string; value: string; sensitive?: boolean; source?: string }>;
+  vaultBroken?: boolean;
+}
+
+/** GET /api/recover-envs, the page's Load envs. */
+export async function recoverEnvs(client: Client, name: string, sourceId: string | undefined): Promise<Outcome<RecoveredEnvs>> {
+  const r = await call(client, 'GET', `/api/recover-envs?${nameQuery(name, sourceId)}`);
+  if (r.ok !== true) return r;
+  return { ok: true, value: r.value as RecoveredEnvs };
+}
+
+export interface ConfigFileBody {
+  path: string;
+  body: string;
+  readOnly?: boolean;
+  enabled: boolean;
+}
+
+export interface InstallPlan {
+  sourceId: string;
+  name: string;
+  vars: Record<string, string>;
+  configFiles: ConfigFileBody[];
+}
+
+export type InstallStep = 'create' | 'env' | 'config';
+
+export interface InstallResult {
+  ok: boolean | null;
+  text: string;
+  /** The bot this install created, kept so a retry never creates a second one. */
+  botId: string | null;
+}
+
+/**
+ * doInstall's calls in its order: POST /api/bots (as `dbm bots create --source`), PUT env (as `dbm env set`) when a
+ * value is set, PUT config (as `dbm config set`) when there are files. A retry passes the bot an earlier run created.
+ */
+export async function installBot(
+  client: Client,
+  plan: InstallPlan,
+  createdId: string | null,
+  onStep: (step: InstallStep, state: 'running' | 'done' | 'skipped') => void,
+): Promise<InstallResult> {
+  let botId = createdId;
+  if (!botId) {
+    onStep('create', 'running');
+    const r = await call(client, 'POST', '/api/bots', { sourceId: plan.sourceId, displayName: plan.name });
+    if (r.ok === null) return { ok: null, botId: null, text: `can't confirm the bot was created: the manager did not answer (${r.text}). Check the bot list before trying again.` };
+    if (r.ok === false) return { ok: false, botId: null, text: `Could not create the bot: ${bare(r.text)}. Nothing was created.` };
+    if (failed(r.value)) return { ok: false, botId: null, text: `Could not create the bot: ${bare(bodyError(r.value, 'Failed to create instance'))}. Nothing was created.` };
+    const made = r.value.bot as { id?: unknown } | undefined;
+    if (!made || typeof made.id !== 'string') return { ok: null, botId: null, text: "can't confirm the bot was created: the answer named no bot. Check the bot list before trying again." };
+    botId = made.id;
+    onStep('create', 'done');
+  } else {
+    onStep('create', 'skipped');
+  }
+  const label = `${plan.name} (${botId})`;
+  const warnings: string[] = [];
+  const save = async (step: 'env' | 'config', what: string, path: string, body: unknown): Promise<InstallResult | null> => {
+    onStep(step, 'running');
+    const r = await call(client, 'PUT', path, body);
+    if (r.ok === null) return { ok: null, botId, text: `The bot ${label} was created, but can't confirm its ${what} were saved: the manager did not answer (${r.text}).` };
+    const error = r.ok === false ? r.text : failed(r.value) ? bodyError(r.value, 'unknown error') : null;
+    if (error !== null) return { ok: false, botId, text: `The bot ${label} was created; its ${what} were not saved: ${bare(error)}.` };
+    if (r.ok && typeof r.value.warning === 'string' && r.value.warning) warnings.push(r.value.warning);
+    onStep(step, 'done');
+    return null;
+  };
+  if (Object.values(plan.vars).some((v) => v)) {
+    const stop = await save('env', 'environment variables', `/api/bots/${botId}/env`, { vars: plan.vars });
+    if (stop) return stop;
+  } else {
+    onStep('env', 'skipped');
+  }
+  if (plan.configFiles.length > 0) {
+    const stop = await save('config', 'config files', `/api/bots/${botId}/config`, { files: plan.configFiles });
+    if (stop) return stop;
+  } else {
+    onStep('config', 'skipped');
+  }
+  const warning = warnings.length ? ` Warning: ${warnings.join(' ')}` : '';
+  return { ok: true, botId, text: `Bot instance ${label} created. Open it in the bot list and press S to install and run it.${warning}` };
+}
+
+export interface ConfigOp {
+  path: string;
+  value?: unknown;
+  remove?: boolean;
+  insert?: boolean;
+}
+
+/** POST /api/config/parse, the guided form's raw body to values. */
+export async function parseConfigBody(client: Client, format: string, body: string): Promise<Outcome<{ success?: boolean; ok?: boolean; data?: unknown; error?: string }>> {
+  return call(client, 'POST', '/api/config/parse', { format, body });
+}
+
+/** POST /api/config/serialize, the guided form's changes written into the raw body. */
+export async function serializeConfigBody(client: Client, format: string, body: string, ops: ConfigOp[]): Promise<Outcome<{ success?: boolean; body?: unknown; skipped?: unknown; error?: string }>> {
+  return call(client, 'POST', '/api/config/serialize', { format, body, ops });
+}
+
+export interface DiscordCheck {
+  success?: boolean;
+  status?: string;
+  name?: string;
+  resolvedKind?: string;
+  reason?: string;
+  error?: string;
+}
+
+/** POST /api/discord/validate, the guided form's id check; the token goes only into the request body. */
+export async function validateDiscordId(
+  client: Client, check: { token: string; kind: string; id: string; guildId?: unknown },
+): Promise<Outcome<DiscordCheck>> {
+  return call(client, 'POST', '/api/discord/validate', check);
+}

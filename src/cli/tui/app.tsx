@@ -3,12 +3,14 @@ import type * as Ink from 'ink';
 import {
   ActionKind, Bot, botName, buildFrameLine, buildLogPath, Container, containerFrameLine, containerLogPath, listContainers, StreamLines,
 } from './api';
+import { isForwardDelete } from './field';
 import { clock, copyText, dataText, lastBackupText, listHeader, listRow, statusText, updateText } from './format';
+import { InstallWizard, WizardExit, WizardOptions } from './install';
 import { Session } from './session';
 
 export type InkApi = typeof Ink;
 
-export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs';
+export type Screen = 'list' | 'bot' | 'confirm' | 'action' | 'containers' | 'logs' | 'buildlogs' | 'install';
 
 export interface FrameState {
   screen: Screen;
@@ -27,11 +29,14 @@ export interface AppProps {
   onHandOff: (state: FrameState) => void;
   canHandOff?: boolean;
   now?: () => number;
+  wizardOptions?: WizardOptions;
 }
 
 export interface View {
   body: string[];
   highlight?: number;
+  /** The text cursor of a focused field: a body line and a column in it. */
+  cursor?: { line: number; col: number };
   keys: string;
   notice?: string;
 }
@@ -119,11 +124,25 @@ function botKeys(bot: Bot, busy: boolean, hasRun: boolean, canHandOff: boolean):
 }
 
 export function createApp(ink: InkApi) {
-  const { Box, Text, useApp, useInput, useStdout } = ink;
+  const { Box, Text, useApp, useInput, useStdin, useStdout } = ink;
 
-  return function App({ machine, session, initial, onHandOff, canHandOff = false, now = Date.now }: AppProps) {
+  return function App({ machine, session, initial, onHandOff, canHandOff = false, now = Date.now, wizardOptions }: AppProps) {
     const { exit } = useApp();
     const { stdout } = useStdout();
+    const { internal_eventEmitter: inputEvents } = useStdin();
+    const raw = useRef<string | undefined>(undefined);
+    const wizard = useRef<InstallWizard | null>(null);
+
+    // Registered before useInput's listener, so the raw sequence of each key is known when useInput runs.
+    useEffect(() => {
+      const onRaw = (data: string) => {
+        raw.current = data;
+      };
+      inputEvents?.on('input', onRaw);
+      return () => {
+        inputEvents?.off('input', onRaw);
+      };
+    }, [inputEvents]);
     useSyncExternalStore(session.subscribe, session.snapshot);
     const [state, setState] = useState<FrameState>(initial ?? { screen: 'list', index: 0 });
     const [size, setSize] = useState({ columns: stdout.columns || 80, rows: stdout.rows || 24 });
@@ -176,9 +195,29 @@ export function createApp(ink: InkApi) {
 
     const room = bodyRows(size.rows);
     const run = state.botId ? session.runs.get(state.botId) : undefined;
+    // Install is offered once the manager has answered the list read.
+    const canInstall = !session.list.error && session.list.readAt !== null;
+
+    const afterWizard = (out: WizardExit) => {
+      if (!out) return;
+      if ('quit' in out) {
+        exit();
+        return;
+      }
+      wizard.current = null;
+      setScroll(0);
+      setState((s) => ({ ...s, screen: 'list', notice: out.notice }));
+      if (out.installed) void session.refresh();
+    };
 
     useInput((input, key) => {
       const k = input.toLowerCase();
+      if (state.screen === 'install') {
+        const out = wizard.current ? wizard.current.key(input, key, isForwardDelete(raw.current)) : { leave: true as const };
+        if (out instanceof Promise) void out.then(afterWizard);
+        else afterWizard(out);
+        return;
+      }
       if (state.screen === 'confirm') {
         if (k === 'y' && state.kind) act(state.kind);
         else go({ screen: 'bot', notice: `Cancelled: ${bot ? botName(bot) : 'the bot'} was not ${state.kind === 'stop' ? 'stopped' : 'restarted'}.` });
@@ -206,6 +245,12 @@ export function createApp(ink: InkApi) {
         return;
       }
       if (state.screen === 'list') {
+        if (k === 'i' && canInstall) {
+          wizard.current = new InstallWizard(session.client, () => session.changed(), wizardOptions);
+          wizard.current.open();
+          go({ screen: 'install' });
+          return;
+        }
         if (bots.length === 0) return;
         if (key.upArrow) go({ index: (index + bots.length - 1) % bots.length });
         else if (key.downArrow) go({ index: (index + 1) % bots.length });
@@ -234,10 +279,15 @@ export function createApp(ink: InkApi) {
       else if (k === 'u' && bot.sourceType !== 'docker-image') act('update');
     });
 
-    const listKeys = (rows: boolean) => [...(rows ? ['Enter Open'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
+    const listKeys = (rows: boolean) =>
+      [...(rows ? ['Enter Open'] : []), ...(canInstall ? ['I Install'] : []), ...(canHandOff ? [HANDOFF_KEY] : []), 'Q Quit'].join('  ');
 
     const view = ((): View => {
       const notice = state.notice ?? session.notice ?? undefined;
+      if (state.screen === 'install') {
+        if (wizard.current) return wizard.current.view(innerWidth(size.columns), room);
+        return { body: ['Install is not open.'], keys: 'Esc Back  Q Quit', notice };
+      }
       const readFailed = session.list.error ? `can't read the bot list: ${session.list.error}` : null;
       if (state.screen === 'list') {
         if (readFailed) return { body: [readFailed], keys: listKeys(false), notice };
@@ -299,10 +349,18 @@ export function createApp(ink: InkApi) {
 
     const lines = frameLines(machine, view, size.columns, size.rows);
     const marked = view.highlight === undefined ? -1 : view.highlight + 1;
+    const cursorRow = view.cursor === undefined ? -1 : view.cursor.line + 1;
+    const cursorAt = view.cursor === undefined ? -1 : Math.min(view.cursor.col + 2, lines[0].length - 3);
     return (
       <Box flexDirection="column">
         {lines.map((line, i) =>
-          i === marked ? (
+          i === cursorRow ? (
+            <Text key={i}>
+              {line.slice(0, cursorAt)}
+              <Text inverse>{line.charAt(cursorAt)}</Text>
+              {line.slice(cursorAt + 1)}
+            </Text>
+          ) : i === marked ? (
             <Text key={i}>
               {line.slice(0, 2)}
               <Text inverse>{line.slice(2, line.length - 2)}</Text>

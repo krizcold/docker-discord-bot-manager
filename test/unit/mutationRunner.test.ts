@@ -396,7 +396,7 @@ describe('the gate', () => {
     expect(gate).toContain('const changedFiles = () => [...new Set(mutated().map(target => target.file))];');
     expect(gate).toContain('mutate: mutatePatterns(mutated())');
     // The run with no mutant after the reruns makes their spans, with their time limits, bound above their budget.
-    expect(gate).toContain('await stryker({ dir, mutate: [...new Set(on.map(spanOf))], alone: true, extra: { ...PASSES.a2, dryRunOnly: true, dryRunTimeoutMinutes: 60 } });');
+    expect(gate).toContain('await stryker({ dir, mutate: [...new Set(on.map(spanOf))], alone: true, extra: { ...PASSES.a2, dryRunOnly: true, dryRunTimeoutMinutes: CONTROL_DRY_RUN_MINUTES } });');
     expect(gate).toContain('const results = await pass({ dir, mutate: [...new Set(on.map(spanOf))], keys: on.map(recordKey),');
     // ... handed the very mutants the reruns ran on.
     expect(gate).toContain("await passOn('a2', 'a2', confirmA, PASSES.a2);");

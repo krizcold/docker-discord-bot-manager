@@ -12,7 +12,7 @@ import { fileURLToPath } from 'url';
 import { pastBudget } from './control.mjs';
 import { PACKAGE_LOCKS, treeChanges, treePrint } from './tree.mjs';
 import { canonicalName, fileOf as nameOf, keyOf } from './keys.mjs';
-import { COMMON, PASSES } from './passes.mjs';
+import { COMMON, CONTROL_DRY_RUN_MINUTES, PASSES } from './passes.mjs';
 
 /**
  * @typedef {import('./ranges.mjs').Location} Location
@@ -343,9 +343,8 @@ async function control(on, timed) {
   console.log('L5: the same tests once with no mutant, to check the machine after pass a2');
   let failed = '';
   try {
-    // Bound by an hour, above the budget any rerun had (four times its own run with no mutant, which ran under
-    // Stryker's five minutes, plus a minute), so the budget, not the bound, judges the time.
-    await stryker({ dir, mutate: [...new Set(on.map(spanOf))], alone: true, extra: { ...PASSES.a2, dryRunOnly: true, dryRunTimeoutMinutes: 60 } });
+    // Bound above any rerun's budget, so the budget, not the bound, judges the time.
+    await stryker({ dir, mutate: [...new Set(on.map(spanOf))], alone: true, extra: { ...PASSES.a2, dryRunOnly: true, dryRunTimeoutMinutes: CONTROL_DRY_RUN_MINUTES } });
     if (timed) failed = pastBudget(path.join(reportDir, 'a2'), out, PASSES.a2);
   } catch (error) {
     if (error instanceof PassError) throw error;

@@ -90,11 +90,11 @@ export class Client {
   sse(
     path: string,
     onFrame: (frame: { event: string; data: unknown }) => void,
-    opts: { timeoutMs?: number } = {},
+    opts: { timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<'end' | 'timeout'> {
     return new Promise((resolve, reject) => {
       const req = http.request(
-        { host: this.target.host, port: this.target.port, method: 'GET', path, headers: { Accept: 'text/event-stream' } },
+        { host: this.target.host, port: this.target.port, method: 'GET', path, headers: { Accept: 'text/event-stream' }, signal: opts.signal },
         (res) => {
           if ((res.statusCode || 0) >= 400) {
             reject(new Error(`SSE ${path} returned ${res.statusCode}`));

@@ -37,7 +37,9 @@ Global flags:
 async function main(): Promise<void> {
   const { positionals, flags } = parseArgs(process.argv.slice(2));
 
-  if (flags.help || positionals.length === 0) {
+  const tui = positionals.length === 0 && !flags.help && process.stdin.isTTY === true && process.stdout.isTTY === true;
+
+  if (!tui && (flags.help || positionals.length === 0)) {
     process.stdout.write(HELP);
     process.exit(positionals.length === 0 ? EXIT_USAGE : 0);
   }
@@ -48,6 +50,13 @@ async function main(): Promise<void> {
   } catch (err) {
     if (err instanceof LoopbackError) fail(err.message, EXIT_USAGE);
     throw err;
+  }
+
+  if (tui) {
+    const { runTui } = await import('./tui/run');
+    await runTui(client);
+    // An action still waiting on the manager holds its event channel open; quitting does not wait for it.
+    process.exit(0);
   }
 
   await dispatch(client, positionals, flags);

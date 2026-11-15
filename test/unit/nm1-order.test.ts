@@ -351,7 +351,7 @@ describe('order Maintenance, kind database', () => {
   it('M30 the bot role name is refused: R14', async () => {
     h.inst.fleetDb.user = 'Bad';
     const a = await orderMaintenance('b1', 'maintenance', '', () => {});
-    expect(a).toEqual({ accepted: false, status: 409, error: "The app's database role name Bad cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin, dbm_meta, dbm_work, replicator, smdb_receive and smdb_receive_meta); nothing was changed" });
+    expect(a).toEqual({ accepted: false, status: 409, error: "The app's database role name Bad cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin, dbm_meta, dbm_work, smdb_join, smdb_copies, smdb_minter, smdb_receive and smdb_receive_meta, and must not start with smdb_copy_); nothing was changed" });
   });
 });
 

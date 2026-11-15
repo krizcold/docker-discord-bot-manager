@@ -77,11 +77,12 @@ vi.mock('child_process', async (importOriginal) => {
     if (f !== undefined) return { code: 1, out: '', err: f };
     const r = h.reply(p);
     if (r !== undefined) return { code: 0, out: r, err: '' };
+    if (sql.includes("'copyroles|'")) return { code: 0, out: 'copyroles|ok\n', err: '' };
     if (sql.includes("'owner|'")) return { code: 0, out: 'owner|dbm_meta|ok\n', err: '' };
     if (sql.includes("'drift|'")) return { code: 0, out: 'drift|0|0|0\n', err: '' };
     if (sql.includes("'v|'")) return { code: 0, out: 'missing\n', err: '' };
     if (sql.includes('pg_read_file')) return { code: 0, out: '0\n', err: '' };
-    if (sql.includes("FROM pg_roles WHERE rolname = 'replicator'")) return { code: 0, out: '1\n', err: '' };
+    if (sql.includes("FROM pg_roles WHERE rolname = 'smdb_join'")) return { code: 0, out: '1\n', err: '' };
     if (sql.includes("current_setting('max_connections')")) return { code: 0, out: '100|3|4|true\n', err: '' };
     if (sql.includes('smdb_data.shard_nodes')) return { code: 0, out: '[{"restartable":true,"overlap":false}]\n', err: '' };
     if (sql.includes("current_setting('ssl')")) return { code: 0, out: 'on|||4096MB\n', err: '' };
@@ -179,6 +180,7 @@ import { reconcileMaintenance, resetMaintenanceState } from '../../src/instance/
 import { decodeJoinCode } from '../../src/config/joinCode';
 import { scramSha256Verifier } from '../../src/config/secretText';
 import { logCollectors } from '../../src/build/logCollector';
+import { LOGINS_READ_SQL, copyLogin } from '../../src/instance/switchSql';
 
 const C = 'bot1-fleet-postgres';
 const U = 'smdb';
@@ -208,27 +210,31 @@ const PUSH_BROKEN = { at: '2026-11-14T00:00:00.000Z', safetyDump: 'pre.dump' };
 const LANE_NOANSWER = "The database did not answer within 30 seconds of the start, so the manager could not check it for a write fence yet; the maintenance check sets up the database's roles at its next pass";
 const failScript1 = () => { h.fail = p => (p.sql.includes('ALTER ROLE dbm_admin SET search_path') ? READ_ONLY : undefined); };
 
+// Enable makes this machine's own login from the bot's id, which is a uuid in production.
+const ENABLE_ID = '6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b';
+let botId = 'b1';
 const record = (over: Record<string, unknown> = {}) => ({
-  id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
+  id: botId, sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
   sourceType: 'docker-image', imageRef: 'example/bot:1', sourceUrl: 'https://example.invalid/fake/bot', envVars: {}, containerIds: [], fleetDb,
   createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...over,
 });
-const writeRegistry = (b1: Record<string, unknown>) => fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { b1 } }));
+const writeRegistry = (b1: Record<string, unknown>) => fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { [botId]: b1 } }));
 const arrange = (over: Record<string, unknown> = {}) => {
   const appDir = path.join(h.dir, 'DATA', 'AppData', 'casaos', 'apps', 'bot1');
   fs.mkdirSync(appDir, { recursive: true });
   fs.writeFileSync(path.join(appDir, 'docker-compose.yml'), `name: bot1\nservices:\n  fleet-postgres:\n    container_name: ${C}\n    image: postgres:16\n`);
-  const botDir = path.join(h.dir, 'bots', 'b1');
+  const botDir = path.join(h.dir, 'bots', botId);
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   fs.writeFileSync(path.join(botDir, 'docker-compose.yml'), 'name: bot1\nservices:\n  app:\n    image: example/bot:1\n');
   writeRegistry(record(over));
 };
-const bot = () => containerManager.getBot('b1')!;
+const bot = () => containerManager.getBot(botId)!;
 
 let warned: string[] = [];
 beforeEach(() => {
   h.shell = []; h.psql = []; h.other = []; h.events = []; h.roles = []; h.notReady = false; h.running = 'true';
   h.fail = () => undefined; h.reply = () => undefined; h.env = { DATABASE_URL: '' }; h.saveFails = '';
+  botId = 'b1';
   Object.assign(containerManager.START_DB_READY, { deadlineMs: 30_000, tryMs: 5_000, pauseMs: 1000 });
   ensure().mockReset();
   ensure().mockImplementation(async () => { h.events.push('ensure'); return { ok: true }; });
@@ -522,6 +528,7 @@ describe('getJoinCode (C27 to C30, L5, ruling 5)', () => {
 
 describe('Enable (EN-ROLES, L4, ruling 5)', () => {
   beforeEach(() => {
+    botId = ENABLE_ID;
     arrange({ fleetDb: { ...fleetDb, replication } });
     h.env = { DATABASE_URL: `postgresql://${U}:${encodeURIComponent(PW)}@${C}:5432/${DB}?sslmode=no-verify` };
   });
@@ -571,8 +578,9 @@ describe('Enable (EN-ROLES, L4, ruling 5)', () => {
     const where = (needle: string) => h.psql.filter(p => p.sql.includes(needle)).map(p => `${p.login}@${p.db}${p.pins ? '+pins' : ''}${p.stdin ? '+stdin' : ''}`);
     expect(where('pg_read_file')).toEqual(['dbm_admin@postgres']);
     expect(where('pg_stat_ssl')).toEqual(['dbm_admin@postgres']);
-    expect(where("rolname = 'replicator'")).toEqual(['dbm_admin@postgres']);
-    expect(where('ROLE replicator WITH REPLICATION LOGIN')).toEqual(['dbm_admin@postgres+stdin']);
+    expect(where("rolname = 'smdb_join'")).toEqual(['dbm_admin@postgres']);
+    expect(where(`rolname = '${copyLogin(ENABLE_ID)}'`)).toEqual(['dbm_admin@postgres']);
+    expect(where('ROLE smdb_join LOGIN')).toEqual(['dbm_admin@postgres+stdin']);
     expect(where('ALTER SYSTEM')).toEqual(Array(4).fill('dbm_admin@postgres'));
     expect(where('pg_reload_conf')).toEqual(['dbm_admin@postgres']);
     expect(where('CREATE TABLE IF NOT EXISTS smdb_manager.addresses')).toEqual(['dbm_meta@smdb+pins+stdin']);
@@ -581,8 +589,9 @@ describe('Enable (EN-ROLES, L4, ruling 5)', () => {
 });
 
 describe('the addresses table grants SELECT to dbm_work (Linux PG finding c, 2026-11-13)', () => {
-  it("addressTableSql grants it beside the replication login's grants", () => {
-    expect(fleetReplication.addressTableSql('h', 1, 'pem', 'm', null)).toContain('GRANT SELECT, INSERT, UPDATE, DELETE ON smdb_manager.addresses TO replicator;\nGRANT SELECT ON smdb_manager.addresses TO dbm_work;\n');
+  it("addressTableSql grants it beside the machine logins' group, SELECT only (NM22 3.4)", () => {
+    expect(fleetReplication.addressTableSql('h', 1, 'pem', 'm')).toContain('GRANT SELECT ON smdb_manager.addresses TO smdb_copies, dbm_work;\n');
+    expect(fleetReplication.addressTableSql('h', 1, 'pem', 'm')).not.toMatch(/GRANT (INSERT|UPDATE|DELETE|SELECT, INSERT)/);
   });
 });
 
@@ -612,10 +621,12 @@ describe('A2-1, Invariant A: no join code, move code or Enable while dbm_admin k
   });
 
   it('Enable: no replication change while dbm_admin keeps its password; set up once the second provisioning confirms', async () => {
+    botId = ENABLE_ID;
+    arrange({ fleetDb: { ...fleetDb, password: undefined, replication } });
     const enable = () => fleetReplication.enableFleetReplication(bot(), 'main.invalid', 15432, 4096, { offerAddresses: false });
     h.roles = [ADMIN_PW, ADMIN_PW, ADMIN_PW, ADMIN_PW];
     expect(await enable()).toEqual({ success: false, error: EN_ROLES(PV_CONFIRM_PW) });
-    expect(h.psql.some(p => p.sql.includes('ALTER SYSTEM') || p.sql.includes('ROLE replicator WITH REPLICATION LOGIN'))).toBe(false);
+    expect(h.psql.some(p => p.sql.includes('ALTER SYSTEM') || p.sql.includes('ROLE smdb_join LOGIN'))).toBe(false);
     h.psql = [];
     h.roles = [ADMIN_PW, SET_UP_READ];
     expect((await enable()).success).toBe(true);
@@ -633,6 +644,8 @@ describe('A2-1, Invariant A: no join code, move code or Enable while dbm_admin k
   });
 
   it('A3-2: V3 with a Database URL Enable keeps: Enable confirms and goes on', async () => {
+    botId = ENABLE_ID;
+    arrange({ fleetDb: { ...fleetDb, password: undefined, replication } });
     h.env = { DATABASE_URL: `postgresql://x:other-pw@elsewhere.invalid:5432/other,postgresql://${U}:${URL_PW}@${C}:5432/${DB}` };
     h.roles = [ADMIN_PW, ADMIN_PW, ADMIN_PW];
     const r = await fleetReplication.enableFleetReplication(bot(), 'main.invalid', 15432, 4096, { offerAddresses: false });
@@ -782,7 +795,8 @@ describe("fleetReplication's other statements by login (R3.3, R4)", () => {
   it('getFleetReplicationStatus: the probe as dbm_admin on postgres, the address rows as dbm_meta', async () => {
     const s = await fleetReplication.getFleetReplicationStatus(bot(), { probeEndpoint: false });
     expect(s.live?.sslOn).toBe(true);
-    expect(logins()).toEqual(['dbm_admin@postgres', 'dbm_meta@smdb+pins']);
+    expect(logins()).toEqual(['dbm_admin@postgres', 'dbm_meta@smdb+pins', 'dbm_admin@postgres']);
+    expect(h.psql[2].sql).toBe(LOGINS_READ_SQL);
   });
 
   it('dropFleetSlot splits the slot drop (dbm_admin on postgres) from the address delete (dbm_meta)', async () => {

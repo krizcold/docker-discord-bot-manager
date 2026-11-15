@@ -228,9 +228,9 @@ describe('parseBotLogin fails closed', () => {
 
 describe('botRoleRefusal', () => {
   // NM20 S11: the refusal lists every role name the manager uses.
-  const R14 = (u: string) => `The app's database role name ${u} cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin, dbm_meta, dbm_work, replicator, smdb_receive and smdb_receive_meta); nothing was changed`;
+  const R14 = (u: string) => `The app's database role name ${u} cannot be used by the maintenance tool (it must be a plain lower-case name other than dbm_admin, dbm_meta, dbm_work, smdb_join, smdb_copies, smdb_minter, smdb_receive and smdb_receive_meta, and must not start with smdb_copy_); nothing was changed`;
   it.each(['smdb', 'bot_1', '_x', 'a'.repeat(63)])('accepts %s', (u) => expect(botRoleRefusal(u)).toBeNull());
-  it.each(['dbm_admin', 'replicator', 'Smdb', '1bot', 'a-b', 'a"b', "a'b", '', 'a'.repeat(64), 'smdb; DROP'])('refuses %j', (u) => expect(botRoleRefusal(u)).toBe(R14(u)));
+  it.each(['dbm_admin', 'smdb_join', 'Smdb', '1bot', 'a-b', 'a"b', "a'b", '', 'a'.repeat(64), 'smdb; DROP'])('refuses %j', (u) => expect(botRoleRefusal(u)).toBe(R14(u)));
 });
 
 describe('maintenanceOf', () => {

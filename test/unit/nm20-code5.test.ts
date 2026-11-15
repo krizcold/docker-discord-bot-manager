@@ -303,7 +303,7 @@ describe('the restore in its final order (Part 5)', () => {
     expect(script.startsWith('BEGIN;\nCREATE SCHEMA smdb_manager;\nGRANT USAGE ON SCHEMA smdb_manager TO PUBLIC, dbm_work;\nALTER DEFAULT PRIVILEGES IN SCHEMA smdb_manager GRANT SELECT ON TABLES TO dbm_work;\n')).toBe(true);
     expect(script).toContain(GENERATION_SCHEMA_SQL);
     expect(script).toContain('CREATE TABLE IF NOT EXISTS smdb_manager.addresses');
-    expect(script).not.toContain('INSERT INTO smdb_manager.addresses');
+    expect(script).not.toContain('INSERT INTO smdb_manager.addresses (');
     expect(script).toContain("INSERT INTO smdb_manager.generation (one_row, machine, generation, since) VALUES (true, 'main.example', 3, '2026-11-13 11:32:24.265756+00'::timestamptz);");
     expect(script.endsWith('GRANT SELECT ON ALL TABLES IN SCHEMA smdb_manager TO dbm_work;\nCOMMIT;\n')).toBe(true);
     expect(script.match(/^COMMIT;$/gm)).toHaveLength(1);
@@ -374,7 +374,7 @@ describe('the restore in its final order (Part 5)', () => {
     expect(h.slice(0, 5)).toEqual(['exec', '-e', PINNED, '-i', C]);
     expect(h).toEqual(expect.arrayContaining(['psql', '-U', 'dbm_work', '-d', 'app', '-X', '-q']));
     const dump = pg.spawned.find(a => a.includes('pg_dump'))!;
-    expect(dump).toEqual(['exec', '-e', PINNED, C, 'pg_dump', '-U', 'dbm_work', '-d', 'app', '-Fc', '--snapshot=00000003-0000001B-1']);
+    expect(dump).toEqual(['exec', '-e', PINNED, C, 'pg_dump', '-U', 'dbm_work', '-d', 'app', '-Fc', '-B', '--snapshot=00000003-0000001B-1']);
   });
 
   it('RS4: pg_restore refused as dbm_work fails with its message, the fence kept', async () => {
@@ -451,8 +451,8 @@ describe('the meta read before the notice and the fence (Y4, P1)', () => {
     expect(claimDb.steps5.filter(s => s === 'cert')).toHaveLength(1);
     expect(claimDb.steps5.indexOf('cert')).toBeLessThan(claimDb.steps5.indexOf('reset'));
     expect(claimDb.genWrites).toHaveLength(1);
-    expect(claimDb.genWrites[0]).toContain(addressTableSql('main.example', 5433, CERT, 'main.example', null));
-    expect(claimDb.genWrites[0]).not.toContain('DELETE FROM smdb_manager.addresses');
+    expect(claimDb.genWrites[0]).toContain(addressTableSql('main.example', 5433, CERT, 'main.example'));
+    expect(claimDb.genWrites[0].replace(addressTableSql('main.example', 5433, CERT, 'main.example'), '')).not.toContain('DELETE FROM smdb_manager.addresses');
   });
 });
 
@@ -468,7 +468,7 @@ describe('Y1: addresses rows never refuse a restore', () => {
     expect(r.error).toBeUndefined();
     expect(r.success).toBe(true);
     expect(r.steps.counts?.result).toBe('matched');
-    expect(claimDb.metaScript!.match(/INSERT INTO smdb_manager\.addresses/g)).toHaveLength(1000);
+    expect(claimDb.metaScript!.match(/INSERT INTO smdb_manager\.addresses \(/g)).toHaveLength(1000);
     expect(logs).toContain('[Restore] Bot A: left out 203 row(s) of smdb_manager.addresses from old.dump (3 failed the address check or were over the size limit, 200 past the 1000-row cap)');
   });
 

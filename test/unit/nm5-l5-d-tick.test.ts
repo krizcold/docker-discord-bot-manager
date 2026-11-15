@@ -19,7 +19,7 @@ vi.mock('child_process', async (o) => {
     const entry = f.calls[f.calls.length - 1];
     if ((globalThis as { __dAddrExit1?: boolean }).__dAddrExit1) {
       const emit = c.emit.bind(c);
-      c.emit = (ev: string, ...a: unknown[]) => (ev === 'close' && entry?.input.includes("SELECT 'addr|'") && entry.input.includes('WHERE slot IS NOT NULL') ? emit('close', 1) : emit(ev, ...a));
+      c.emit = (ev: string, ...a: unknown[]) => (ev === 'close' && entry?.input.includes("SELECT 'addr|'") && entry.input.includes("AND a.slot <> '") ? emit('close', 1) : emit(ev, ...a));
     }
     return c;
   };
@@ -51,7 +51,7 @@ import * as fleetReplica from '../../src/instance/fleetReplica';
 import { COPY_PEM, fake, freshDb, h, mainFixture, resetHarness, stored, writeRegistry } from './switch-harness';
 import { fakeJoinCode } from './join-fake';
 
-const PEER = { host: 'copy.example', port: 5434, slot: 'slot_c', machine: 'copy.example', cert: COPY_PEM };
+const PEER = { host: 'copy.example', port: 5434, slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'copy.example', cert: COPY_PEM };
 const NO_REPL = { containerName: 'a-pg', user: 'app', db: 'app', volume: 'a-pgdata' };
 const withDb = (extra: Record<string, unknown> = {}, inst: Record<string, unknown> = {}) => writeRegistry({ a: mainFixture({ fleetDb: { ...mainFixture().fleetDb as object, ...extra }, ...inst }) });
 const writable = (g: number, sys = '7001', receiveMark: boolean | null = false) => () => ({ kind: 'writable', systemId: sys, timeline: 2, gen: { generation: g, machine: 'copy.example', since: '2026-10-28T14:00:00Z' }, receiveMark }) as any;
@@ -432,7 +432,7 @@ describe('N-d: peerCheck', () => {
     expect(h.events).not.toContain('block');
   });
   it('a main without replication probes no copy from its address list', async () => {
-    writeRegistry({ a: mainFixture({ fleetDb: { ...NO_REPL, formerMain: { code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'slot_c', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: 'x' } } }) });
+    writeRegistry({ a: mainFixture({ fleetDb: { ...NO_REPL, formerMain: { code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: 'x' } } }) });
     await switchTick(now);
     expect(probes('copy.example')).toBe(0);
     expect(h.events).not.toContain('copies-sync');
@@ -452,7 +452,7 @@ describe('N-d: peerCheck', () => {
 });
 
 describe('N50 to N60: formerCheck', () => {
-  const FORMER = (over: Record<string, unknown> = {}) => ({ code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'slot_c', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
+  const FORMER = (over: Record<string, unknown> = {}) => ({ code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
   const old = (g: number) => (host: string) => (host === 'old.example'
     ? { kind: 'writable', systemId: '7001', timeline: 3, gen: { generation: g, machine: 'old.example', since: null }, receiveMark: false }
     : { kind: 'unreachable', reason: 'connection refused' }) as any;
@@ -538,7 +538,7 @@ describe('N50 to N60: formerCheck', () => {
 });
 
 describe('N-e: rejoinCheck', () => {
-  const MARK = { mode: 'stream', phase: 'stopped', slot: 'slot_c', machine: 'copy.example', host: 'copy.example', port: 5434, cert: COPY_PEM, generation: 4, at: '2026-10-30T09:00:00.000Z' };
+  const MARK = { mode: 'stream', phase: 'stopped', slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'copy.example', host: 'copy.example', port: 5434, cert: COPY_PEM, generation: 4, at: '2026-10-30T09:00:00.000Z' };
   const handedOver = (mark: Record<string, unknown> = MARK) => writeRegistry({ a: mainFixture({ fleetDb: { ...(mainFixture().fleetDb as object), handover: mark } }) });
   beforeEach(() => {
     fake.dbs['a-pg'] = freshDb();

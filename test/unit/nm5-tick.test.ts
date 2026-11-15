@@ -37,7 +37,7 @@ import { COPY_PEM, fake, freshDb, h, mainFixture, resetHarness, stored, writeReg
 import { COPY_FP, FIXTURE_FP, fakeJoinCode } from './join-fake';
 import * as fleetJoin from '../../src/instance/fleetJoin';
 
-const PEER = { host: 'copy.example', port: 5434, slot: 'slot_c', machine: 'copy.example', cert: COPY_PEM };
+const PEER = { host: 'copy.example', port: 5434, slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'copy.example', cert: COPY_PEM };
 const withDb = (extra: Record<string, unknown> = {}, inst: Record<string, unknown> = {}) => writeRegistry({ a: mainFixture({ fleetDb: { ...mainFixture().fleetDb as object, ...extra }, ...inst }) });
 const writable = (g: number, sys = '7001') => () => ({ kind: 'writable', systemId: sys, timeline: 2, gen: { generation: g, machine: 'copy.example', since: '2026-10-28T14:00:00Z' }, receiveMark: false }) as any;
 let now = Date.parse('2026-10-28T15:00:00Z');
@@ -468,7 +468,7 @@ describe('S13: N-f marks a finished restore within one tick', () => {
 });
 
 describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old main kept (round 1)', () => {
-  const FORMER = (over: Record<string, unknown> = {}) => ({ code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'slot_c', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
+  const FORMER = (over: Record<string, unknown> = {}) => ({ code: fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' }), slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
   const at = (host: string, p: () => any) => (h2: string) => (h2 === host ? p() : { kind: 'unreachable', reason: 'connection refused' });
   const spyOn = (level: 'log' | 'warn') => { const seen: string[] = []; return Object.assign(vi.spyOn(console, level).mockImplementation((m: unknown) => { seen.push(String(m)); }), { seen }); };
   const logs = () => spyOn('log');
@@ -489,10 +489,10 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
   });
 
   it('V11, V22, V24: the received row of this push id ends receiving: the copies written back, pushBroken cleared, one save', async () => {
-    const rows = [{ host: 'copy.example', port: 5434, slot: 'slot_c', cert: COPY_PEM, machine: 'copy.example' }];
+    const rows = [{ host: 'copy.example', port: 5434, slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', cert: COPY_PEM, machine: 'copy.example' }];
     withDb({ receive: { ...RECV, copies: rows }, pushBroken: { at: 'x', safetyDump: 'pre-receive-old.dump' } });
     fake.dbs['a-pg'].addresses = [];
-    fake.dbs['a-pg'].slots = { slot_c: { active: true, state: 'streaming', replay: '0/5000000' } };
+    fake.dbs['a-pg'].slots = { fleet_standby_cccccccccccccccccccccccccccccccc: { active: true, state: 'streaming', replay: '0/5000000' } };
     fake.dbs['a-pg'].received.push({ pushId: RECV.pushId, from: '9', machine: 'win.local', generation: 6 });
     const spy = vi.spyOn(containerManager, 'updateInstanceFleetDbSwitch');
     const log = logs();
@@ -501,12 +501,12 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
     spy.mockRestore();
     log.mockRestore();
     expect(calls).toEqual([{ receive: null, pushBroken: null }]);
-    expect(fake.dbs['a-pg'].addresses).toEqual([{ host: 'copy.example', port: 5434, slot: 'slot_c', cert: COPY_PEM, machine: 'copy.example' }]);
+    expect(fake.dbs['a-pg'].addresses).toEqual([{ host: 'copy.example', port: 5434, slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', cert: COPY_PEM, machine: 'copy.example' }]);
     expect(stored('a').fleetDb.pushBroken).toBeUndefined();
     expect(lines(log)).toContain('[Switch] A: received the main from win.local (generation 6); the receive login is removed');
   });
   it('V25: the copies write fails: logged, and receiving still ends', async () => {
-    withDb({ receive: { ...RECV, copies: [{ host: 'copy.example', port: 5434, slot: 'slot_c', cert: COPY_PEM, machine: 'copy.example' }] } });
+    withDb({ receive: { ...RECV, copies: [{ host: 'copy.example', port: 5434, slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', cert: COPY_PEM, machine: 'copy.example' }] } });
     fake.dbs['a-pg'].fail['copies-insert'] = 'ERROR:  relation "smdb_manager.addresses" does not exist';
     fake.dbs['a-pg'].received.push({ pushId: RECV.pushId, from: '9', machine: 'win.local', generation: 6 });
     const warn = warns();
@@ -609,7 +609,7 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
     await switchTick(now);
     expect(stored('a').fleetDb.mainConflict).toMatchObject({ machine: 'old.example', host: 'old.example', port: 5500, generation: 3 });
   });
-  it('N53: formerMain lower with replication: this machine registered on it with formerMain.slot, logged once per change', async () => {
+  it('N53: formerMain lower with replication: this machine registered on it (the slot comes from its login, NM22 R9), logged once per change', async () => {
     withDb({ formerMain: FORMER() });
     h.peer = at('old.example', () => ({ kind: 'writable', systemId: '7001', timeline: 3, gen: { generation: 2, machine: 'old.example', since: null } })) as any;
     const log = logs();
@@ -617,8 +617,8 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
     await switchTick(now + 6 * 60_000);
     log.mockRestore();
     expect(h.registerCalls).toEqual([
-      { host: 'old.example', port: 5500, row: { host: 'main.example', port: 5433, slot: 'slot_c', cert: COPY_PEM, machine: 'main.example' } },
-      { host: 'old.example', port: 5500, row: { host: 'main.example', port: 5433, slot: 'slot_c', cert: COPY_PEM, machine: 'main.example' } },
+      { host: 'old.example', port: 5500, row: { host: 'main.example', port: 5433, cert: COPY_PEM, machine: 'main.example' } },
+      { host: 'old.example', port: 5500, row: { host: 'main.example', port: 5433, cert: COPY_PEM, machine: 'main.example' } },
     ]);
     expect(lines(log).filter(l => l === "[Switch] A: the old main old.example runs again as a main; this machine's address was added to its copy list")).toHaveLength(1);
     expect(stored('a').fleetDb.formerMain).toBeDefined();
@@ -634,11 +634,11 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
     expect(stored('a').fleetDb.replacedBy).toBeUndefined();
   });
   it('N55: the copies list is synced before the probes; a failure is logged once per change and the probes go on', async () => {
-    fake.dbs['a-pg'].slots = { slot_c: { active: true, state: 'streaming', replay: '0/5000000', client: '10.0.0.2' } };
+    fake.dbs['a-pg'].slots = { fleet_standby_cccccccccccccccccccccccccccccccc: { active: true, state: 'streaming', replay: '0/5000000', client: '10.0.0.2' } };
     await switchTick(now);
     const all = fake.calls.map(c => c.input);
     expect(all.findIndex(x => x.includes('INSERT INTO smdb_manager.copies AS c'))).toBeGreaterThanOrEqual(0);
-    expect(fake.dbs['a-pg'].copies).toEqual([{ slot: 'slot_c', machine: 'copy.example', client: '10.0.0.2' }]);
+    expect(fake.dbs['a-pg'].copies).toEqual([{ slot: 'fleet_standby_cccccccccccccccccccccccccccccccc', machine: 'copy.example', client: '10.0.0.2' }]);
     expect(h.events.indexOf('copies-sync')).toBeLessThan(h.events.indexOf('probe:copy.example'));
     fake.dbs['a-pg'].fail['copies-sync'] = 'ERROR:  cannot execute INSERT in a read-only transaction';
     const warn = warns();
@@ -652,8 +652,8 @@ describe('N45 to N56 and V19 to V25 (the tick): receiving, two mains, the old ma
 
 describe('N57 to N61 (D56): the old main kept, and a certificate it registered since', () => {
   const OLD_CODE = fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example', fp: FIXTURE_FP });
-  const FORMER = (over: Record<string, unknown> = {}) => ({ code: OLD_CODE, slot: 'slot_o', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
-  const ROW = { host: 'old.example', port: 5500, slot: 'slot_o', machine: 'old.example', cert: COPY_PEM };
+  const FORMER = (over: Record<string, unknown> = {}) => ({ code: OLD_CODE, slot: 'fleet_standby_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', machine: 'old.example', host: 'old.example', port: 5500, generation: 2, at: '2026-10-28T12:00:00.000Z', ...over });
+  const ROW = { host: 'old.example', port: 5500, slot: 'fleet_standby_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', machine: 'old.example', cert: COPY_PEM };
   const FP_FAIL = { ok: false, kind: 'fingerprint', reason: 'the server shows fingerprint 0f0f, not 53c2', text: 'x' };
   /** The old main shows COPY_PEM now: a code naming its fingerprint reads it, the kept code fails on the fingerprint. */
   const certByFp = () => {
@@ -681,7 +681,7 @@ describe('N57 to N61 (D56): the old main kept, and a certificate it registered s
   });
   it('N58: the old main is listed as this main\'s copy: formerMain cleared before any probe with its code, logged', async () => {
     fake.dbs['a-pg'].addresses = [ROW];
-    fake.dbs['a-pg'].slots = { slot_o: { active: true, state: 'streaming', replay: '0/5000000' } };
+    fake.dbs['a-pg'].slots = { fleet_standby_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee: { active: true, state: 'streaming', replay: '0/5000000' } };
     withDb({ formerMain: FORMER() });
     const cert = certByFp();
     const log = seen();
@@ -720,10 +720,10 @@ describe('N57 to N61 (D56): the old main kept, and a certificate it registered s
     expect(switchView(stored('a')).lines).toContain("The manager can't check the old main old.example: the join code kept from it does not read (it no longer decrypts or decodes). If old.example runs again as a main, choose Off for the bot in its manager.");
     withDb({ formerMain: FORMER({ code: '' }), replacedBy: { machine: 'old.example', host: 'old.example', port: 5500, generation: 5, own: 3, since: null, at: 'x', cert: COPY_PEM } });
     const { rejoinComposed } = await import('../../src/instance/fleetSwitch');
-    expect(rejoinComposed('a')).toMatchObject({ success: true });
+    expect(await rejoinComposed('a')).toMatchObject({ success: true });
   });
   it('N61: N-e checks a stream mark whose target is at the old main\'s host and port with the certificate it shows: composed, no rejoinError', async () => {
-    withDb({ formerMain: FORMER(), handover: { mode: 'stream', phase: 'stopped', slot: 'slot_o', machine: 'old.example', host: 'old.example', port: 5500, cert: COPY_PEM, generation: 4, at: '2026-10-28T12:00:00.000Z' } });
+    withDb({ formerMain: FORMER(), handover: { mode: 'stream', phase: 'stopped', slot: 'fleet_standby_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', machine: 'old.example', host: 'old.example', port: 5500, cert: COPY_PEM, generation: 4, at: '2026-10-28T12:00:00.000Z' } });
     h.sidecar['a-pg'] = false;
     h.peer = old(3);
     const cert = certByFp();

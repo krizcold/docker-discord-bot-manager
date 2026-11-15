@@ -38,7 +38,7 @@ import { metaPsql, workArgs, workPsql } from '../../src/instance/dbLogin';
 import * as fleetBackup from '../../src/instance/fleetBackup';
 import { checksumsOf } from '../../src/instance/fleetMove';
 import { addressTableSql } from '../../src/instance/fleetReplication';
-import { raiseSql, replicationRoleEnsureSql } from '../../src/instance/switchSql';
+import { copyGroupEnsureSql, raiseSql } from '../../src/instance/switchSql';
 import { type Cluster, docker, dockerRuns, provisionedCluster } from './pg-cluster';
 import { writeDumpMeta } from './restore-fake';
 
@@ -134,7 +134,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 part 5: the w
 
   beforeAll(async () => {
     main = await provisionedCluster({ name: `${ID}-main`, user: U, db: U, password: PW });
-    admin(replicationRoleEnsureSql('replicator'));
+    admin(copyGroupEnsureSql());
     admin(`ALTER ROLE ${U} NOLOGIN`);
   }, 300000);
 
@@ -149,7 +149,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 part 5: the w
 ALTER DEFAULT PRIVILEGES IN SCHEMA smdb_manager GRANT SELECT ON TABLES TO dbm_work;
 COMMENT ON SCHEMA smdb_manager IS 'the manager''s own';
 ${raiseSql('main.example', 2)}
-${addressTableSql('main.example', 5433, 'cert', 'main.example', null)}`, 'pg7src'));
+${addressTableSql('main.example', 5433, 'cert', 'main.example')}`, 'pg7src'));
     ok(docker(['exec', main.name, 'sh', '-c', `pg_dump -U dbm_work -Fc -d pg7src > /tmp/pg7.dump`]));
     const toc = ok(docker(['exec', main.name, 'pg_restore', '-l', '/tmp/pg7.dump']));
     console.log(`[nm20-pg5] pg_restore -l of the PG7 dump:\n${toc}`);

@@ -135,7 +135,10 @@ describe('N: NM10 against NM5', () => {
     settle();
     await refused('file', `A push into this database did not finish, so it may hold no data or data no one checked; restore the dump ${DUMP} or receive a push again before migrating; nothing was changed`);
   });
+  // NM22 R5: the tick probes only rows of a machine login's slot.
+  const machineSlotRow = () => { fake.dbs['a-pg'].addresses = fake.dbs['a-pg'].addresses.map(a => ({ ...a, slot: `fleet_standby_${'c'.repeat(32)}` })); };
   it('N3 a replacedBy mark written by the tick\'s peer check refuses MG-SWITCH-R, before A32', async () => {
+    machineSlotRow();
     h.peer = writable(4);
     await switchTick(Date.now());
     expect(stored('a').fleetDb.replacedBy).toMatchObject({ machine: 'copy.example', generation: 4, own: 3 });
@@ -143,6 +146,7 @@ describe('N: NM10 against NM5', () => {
     await refused('file', 'copy.example replaced this database as the main; rejoin this machine as a copy before migrating; nothing was changed');
   });
   it('N3 a mainConflict mark written by the tick\'s peer check refuses MG-SWITCH-C', async () => {
+    machineSlotRow();
     h.peer = writable(3);
     await switchTick(Date.now());
     expect(stored('a').fleetDb.mainConflict).toMatchObject({ machine: 'copy.example', generation: 3 });

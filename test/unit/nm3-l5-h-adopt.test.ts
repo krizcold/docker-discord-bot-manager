@@ -16,6 +16,7 @@ const h = vi.hoisted(() => {
     enableOpts: [] as unknown[],
     hooks: false,
     facts: {} as Record<string, unknown>,
+    conninfo: '',
   };
 });
 
@@ -35,6 +36,7 @@ vi.mock('child_process', async (importOriginal) => {
     else if (args[0] === 'exec' && line.includes('smdb-write-fence')) {
       setImmediate(() => h.stripFails ? done(new Error('exit 1'), '', 'sed: cannot rename pg_hba.conf: Read-only file system\n') : done(null, '', ''));
     } else if (args[0] === 'exec' && line.includes('pg_is_in_recovery(),')) setImmediate(() => done(null, h.probe, ''));
+    else if (args[0] === 'exec' && line.includes("grep '^primary_conninfo'")) setImmediate(() => done(null, h.conninfo, ''));
     else setImmediate(() => done(null, '', ''));
     const child: any = new EventEmitter();
     child.stdin = new PassThrough();
@@ -110,6 +112,7 @@ beforeEach(() => {
   h.enableOpts = [];
   h.hooks = false;
   h.facts = {};
+  h.conninfo = '';
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(h.dir, 'bots', 'b1', 'env'), { recursive: true });
   writeRegistry({ fleetDbReplica: { ...REPLICA } });
@@ -132,5 +135,38 @@ describe('the adopt of a promoted copy', () => {
       success: false, error: 'This copy was set up without an address for other machines, so it cannot become their main. A machine that cannot open a port can be the main only when it runs alone.',
     });
     expect(h.enabled).toBe(0);
+  });
+});
+
+describe('NM22 X4: the adopt records this machine\'s own login and gives the join login a new password', () => {
+  const conninfo = (user: string, password: string) => `primary_conninfo = 'user=${user} password=${password} host=primary.invalid port=5433 sslmode=verify-full sslrootcert=/var/lib/postgresql/data/primary-ca.crt require_auth=scram-sha-256 application_name=fleet_standby_b1'\n`;
+  const posture = () => bot().fleetDb!.replication!;
+
+  it('the copy\'s own login from primary_conninfo is saved when none is stored', async () => {
+    h.conninfo = conninfo('smdb_copy_b1', 'Copy-Own-Secret-01');
+    expect((await fleetReplica.adoptPromotedReplica(bot())).success).toBe(true);
+    expect(bot().fleetLogin).toEqual({ password: 'Copy-Own-Secret-01' });
+    expect(JSON.parse(fs.readFileSync(path.join(h.dir, 'instances.json'), 'utf-8')).instances.b1.fleetLogin.password).not.toContain('Copy-Own-Secret-01');
+    expect(posture()).toMatchObject({ role: 'smdb_join', hostPort: 5440, publicHost: 'standby.invalid', certHost: 'standby.invalid' });
+    expect(posture().password).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    expect(posture().password).not.toBe('Copy-Own-Secret-01');
+  });
+
+  it('a stored password is kept', async () => {
+    writeRegistry({ fleetDbReplica: { ...REPLICA }, fleetLogin: { password: envManager.encrypt('Kept-Own-Secret-01') } });
+    h.conninfo = conninfo('smdb_copy_b1', 'Copy-Own-Secret-01');
+    expect((await fleetReplica.adoptPromotedReplica(bot())).success).toBe(true);
+    expect(bot().fleetLogin).toEqual({ password: 'Kept-Own-Secret-01' });
+  });
+
+  it.each([
+    ['another login', conninfo('replicator', 'Old-Shared-Secret-01')],
+    ['no readable primary_conninfo', ''],
+  ])('%s: nothing is saved, and the posture still holds the join login with a new password', async (_n, line) => {
+    h.conninfo = line;
+    expect((await fleetReplica.adoptPromotedReplica(bot())).success).toBe(true);
+    expect(bot().fleetLogin).toBeUndefined();
+    expect(posture()).toMatchObject({ role: 'smdb_join', certHost: 'standby.invalid' });
+    expect(posture().password).toMatch(/^[A-Za-z0-9_-]{32}$/);
   });
 });

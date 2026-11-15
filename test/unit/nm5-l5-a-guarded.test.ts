@@ -81,7 +81,7 @@ describe('runGuarded', () => {
   it('a child silent past the timeout is killed and answers the exact reason', async () => {
     sp.queue = [{ hang: true }];
     const r = await runGuarded('docker', ['ps'], { timeoutMs: 1500 });
-    expect(r).toEqual({ ok: false, code: null, stdout: '', stderr: '', error: 'no answer within 2 seconds' });
+    expect(r).toEqual({ ok: false, code: null, stdout: '', stderr: '', error: 'no answer within 2 seconds', timedOut: true });
     expect(sp.calls[0].kills).toEqual(['SIGKILL']);
   });
   it('keeps stdout at the first chunk that reaches 1,000,000 characters and stderr at 8000', async () => {

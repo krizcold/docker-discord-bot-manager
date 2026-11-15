@@ -18,11 +18,11 @@ import * as maintenance from './maintenance';
 import { callAppHook, capabilityRefusal } from './appHookClient';
 import { notifyOwner } from './backupCheck';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
-import { managedDbPassword } from './fleetReplication';
+import { machineLoginsTickRuns, managedDbPassword } from './fleetReplication';
 import { certFingerprint, decodeJoinCode, encodeJoinCode, JoinCode, lsnToBigInt, machineText, sqlLiteral } from '../config/joinCode';
 import { DM_RETRY_MS, utcText } from './backupFiles';
 import {
-  COPIES_READ_SQL, COPIES_SYNC_SQL, DB_OID_SQL, ensureGenerationSql, FORMER_LISTED_SQL, GEN_READ_SQL, GENERATION_SCHEMA_SQL, GenRow, generationBefore, HANDOVER_READ_SQL, machineNameOf, missingTable, moveModeText,
+  BLOCKED_SESSIONS_SQL, closedCount, COPIES_READ_SQL, COPIES_SYNC_SQL, COPY_LOGIN_RE, copyLogin, copySlot, DB_OID_SQL, FOREIGN_READ_SQL, ForeignStream, LOBJ_SWEEP_SQL, NEW_LOGINS_READ_SQL, parseForeignStreams, parseRemoveBlock, REMOVE_BLOCK_SQL, TAINTED_SLOT_SQL, ensureGenerationSql, FORMER_LISTED_SQL, GEN_READ_SQL, GENERATION_SCHEMA_SQL, GenRow, generationBefore, HANDOVER_READ_SQL, machineNameOf, missingTable, moveModeText,
   parseGenRow, parseReceiveMark, parseRestoreState, raiseSql, RECEIVE_MARK_READ_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkVerdict, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, RestoreState, TAKEOVER_ROLE_RE,
   SHARD_CAP_DO_SQL, takeoverBlockScript, takeoverLiftScript,
 } from './switchSql';
@@ -55,7 +55,8 @@ const NOTHING = '; nothing was changed';
 
 // ─── Process starts ───
 
-export type Guarded = { ok: boolean; code: number | null; stdout: string; stderr: string; error?: string };
+/** `timedOut`: the call ended on its time limit, so what the server did is not known. */
+export type Guarded = { ok: boolean; code: number | null; stdout: string; stderr: string; error?: string; timedOut?: true };
 
 /**
  * One process start, guarded for Node 24's fork faults: a synchronous throw (ENOMEM) and a child with no stdio that
@@ -82,7 +83,7 @@ export function runGuarded(cmd: string, args: string[], opts: { input?: string; 
     if (opts.timeoutMs) {
       timer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* gone */ }
-        finish({ ok: false, code: null, stdout, stderr, error: `no answer within ${Math.round(opts.timeoutMs! / 1000)} seconds` });
+        finish({ ok: false, code: null, stdout, stderr, error: `no answer within ${Math.round(opts.timeoutMs! / 1000)} seconds`, timedOut: true });
       }, opts.timeoutMs);
     }
     child.stdout?.on('data', d => { if (stdout.length < 1_000_000) stdout += d; });
@@ -369,8 +370,9 @@ export function rejoinDue(mark: FleetDbHandover | undefined, probe: fleetJoin.Pe
 /** A join code for another database of this bot, from its registered address and this machine's own logins. */
 export function composeJoinCode(instance: InstanceConfig, target: { host: string; port: number; cert: string; machine: string }): { ok: true; text: string; code: JoinCode } | { ok: false; error: string } {
   const db = instance.fleetDb;
-  const repl = db?.replication;
-  if (!db || !repl || !repl.password) return { ok: false, error: "this machine's replication login is not stored" };
+  if (!db) return { ok: false, error: 'this instance holds no main database' };
+  const own = instance.fleetLogin?.password;
+  if (!own) return { ok: false, error: "this machine's own login to the other databases is not stored" };
   const app = managedDbPassword(instance);
   if (!app.ok) {
     return { ok: false, error: app.why === 'lost' ? "the managed database's password on record no longer decrypts" : "the managed database's password is not on record (a join code or Enable records it from a Database URL whose password this database accepts)" };
@@ -378,7 +380,7 @@ export function composeJoinCode(instance: InstanceConfig, target: { host: string
   const password = app.password;
   let fp: string;
   try { fp = certFingerprint(target.cert); } catch { return { ok: false, error: 'the registered certificate does not read' }; }
-  const code: JoinCode = { v: 1, host: target.host, port: target.port, db: db.db, fp, machine: machineText(target.machine), repl: { user: repl.role, password: repl.password }, app: { user: db.user, password } };
+  const code: JoinCode = { v: 1, host: target.host, port: target.port, db: db.db, fp, machine: machineText(target.machine), repl: { user: copyLogin(instance.id), password: own }, app: { user: db.user, password } };
   return { ok: true, text: encodeJoinCode(code), code };
 }
 
@@ -1013,17 +1015,10 @@ async function takeOverLocked(botId: string, confirm: boolean, confirmUnchecked:
 
   const othersRead = await metaSql(t, rec.db, COPIES_READ_SQL(rec.slot));
   const others: TakeoverTail['others'] = othersRead.ok ? { ok: true, names: copyNames(lastLineOrEmpty(othersRead.stdout)) } : { ok: false, error: failText(othersRead) };
-  const oldRow = code ? `
+  const oldRow = `
 DO $$ BEGIN
 IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
-  EXECUTE format('DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = %L AND port = ${Number(code.port)}', ${sqlLiteral(code.host)});
-  DELETE FROM smdb_manager.addresses WHERE slot IS NOT NULL;
-END IF;
-END $$;
-` : `
-DO $$ BEGIN
-IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
-  DELETE FROM smdb_manager.addresses WHERE slot IS NOT NULL;
+  DELETE FROM smdb_manager.addresses;
 END IF;
 END $$;
 `;
@@ -1235,13 +1230,158 @@ let tickTimer: NodeJS.Timeout | null = null;
 let firstTimer: NodeJS.Timeout | null = null;
 let tickRunning = false;
 
-/** This main's own copies, as its address list holds them, for the peer check. */
+/** R5: the rows ownPeers probes. */
+export function ownPeersSql(ownSlot: string): string {
+  if (!SLOT_RE.test(ownSlot)) throw new Error(`${ownSlot} is not a slot name`);
+  return `SELECT 'addr|' || a.host || '|' || a.port || '|' || a.machine || '|' || replace(a.cert, E'\\n', '~')
+FROM smdb_manager.addresses a
+WHERE a.slot ~ '^fleet_standby_[0-9a-f]{32}$' AND a.slot <> '${ownSlot}'
+  AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_auth_members m ON m.member = r.oid
+              WHERE r.rolname = 'smdb_copy_' || pg_catalog.substr(a.slot, 15) AND r.rolcanlogin
+                AND m.roleid = pg_catalog.to_regrole('smdb_copies'))
+ORDER BY a.host, a.port;`;
+}
+
+/** This main's own copies, as its address list holds them, for the peer check: rows of member logins with LOGIN, the own slot left out (R5). */
 async function ownPeers(inst: InstanceConfig): Promise<Array<{ host: string; port: number; machine: string; cert: string }>> {
   const db = inst.fleetDb!;
-  const r = await metaSql({ container: db.containerName, user: db.user }, db.db,
-    `SELECT 'addr|' || host || '|' || port || '|' || machine || '|' || replace(cert, E'\\n', '~') FROM smdb_manager.addresses WHERE slot IS NOT NULL ORDER BY host, port;`);
+  const r = await metaSql({ container: db.containerName, user: db.user }, db.db, ownPeersSql(copySlot(inst.id)));
   if (!r.ok) return [];
   return r.stdout.split('\n').map(l => parseAddress(l.trim())).filter((a): a is NonNullable<ReturnType<typeof parseAddress>> => a !== null);
+}
+
+/** R3's failures and unread lines, logged once per distinct text; keyed by bot and step. */
+const loginsLogged = new Map<string, string>();
+const unreadLogged = new Map<string, Set<string>>();
+/** The members of smdb_copies seen since the manager started, per bot (W15). */
+const knownLogins = new Map<string, Set<string>>();
+
+function stepError(inst: InstanceConfig, step: string, what: string, error: string): void {
+  const key = `${inst.id}:${step}`;
+  if ((loginsLogged.get(key) ?? '') === error) return;
+  loginsLogged.set(key, error);
+  if (error) console.warn(`[Switch] ${inst.displayName}: ${what} (${error}); the manager tries again every 5 minutes`);
+}
+
+/** R25: the database that still holds this machine's own login's password, when one does. */
+function ownPasswordHolder(inst: InstanceConfig): string | null {
+  const db = inst.fleetDb;
+  const handover = db?.handover?.mode === 'stream' ? db.handover.machine : undefined;
+  return db?.replacedBy?.machine ?? db?.mainConflict?.machine ?? db?.formerMain?.machine ?? handover ?? null;
+}
+
+/** R3 step 1b's answer as the two fragments of the log line; null when its last line is not one of the two forms. */
+function taintedFragments(out: string, blockEnded = false): { stream: string; slot: string } | null {
+  const lines = out.split('\n').map(l => l.trim()).filter(Boolean);
+  const last = lines.pop();
+  if (last !== 'slot|kept' && last !== 'slot|dropped') return null;
+  if (lines.length > 1 || (lines.length === 1 && lines[0] !== 'true' && lines[0] !== 'false')) return null;
+  const ended = lines[0];
+  const stream = ended === 'true' ? 'was ended' : ended === 'false' ? 'could not be ended, and the next check tries again'
+    : blockEnded ? 'was ended when the login was blocked' : 'had already ended';
+  const slot = last === 'slot|dropped' ? 'was dropped, so its machine rebuilds its copy'
+    : ended === 'false' ? 'was kept, since the stream on it still runs'
+    : 'was kept because its machine streams on it again; if that copy stops following, re-seed it on its machine';
+  return { stream, slot };
+}
+
+/** R3 step 1 for one line: a machine login other than this machine's is blocked first; then the stream ends and the slot goes. */
+async function foreignStream(inst: InstanceConfig, t: Target, s: ForeignStream): Promise<void> {
+  const bot = inst.displayName;
+  const own = copyLogin(inst.id);
+  const machine = COPY_LOGIN_RE.test(s.user) && s.user !== own;
+  let blockEnded = false;
+  if (machine) {
+    const blocked = await clusterSql(t, REMOVE_BLOCK_SQL(s.user));
+    if (!blocked.ok && blocked.timedOut && !blocked.stdout.includes('blocked|')) {
+      console.warn(`[Switch] ${bot}: a stream on the slot ${s.slot} by ${s.user} was not handled: the manager can't confirm the login was blocked (${blocked.error}); the next check tries again`);
+      return;
+    }
+    const answer = blocked.ok ? parseRemoveBlock(blocked.stdout) : null;
+    if (!answer || answer.state !== 'blocked') {
+      // Under -q a committed block and a failed one print alike; only the 'again' state is known to have failed.
+      const said = answer?.state === 'again' ? `blocking the login failed (a check after the block found it undone (${answer.line}))`
+        : `the manager can't confirm the login was blocked (${!answer ? failText(blocked) : 'no blocked line came back'})`;
+      console.warn(`[Switch] ${bot}: a stream on the slot ${s.slot} by ${s.user} was not handled: ${said}; the next check tries again`);
+      return;
+    }
+    blockEnded = closedCount(blocked.stdout) > 0;
+  }
+  const tainted = await clusterSql(t, TAINTED_SLOT_SQL(s.slot));
+  const f = tainted.ok ? taintedFragments(tainted.stdout, blockEnded) : null;
+  const slotWhat = `the stream on the slot ${s.slot} by ${s.user} could not be ended and its slot could not be dropped`;
+  if (!f) {
+    stepError(inst, `tainted:${s.slot}`, slotWhat, tainted.ok ? `the answer was not in the form the manager reads: ${lastLine(tainted.stdout)}` : failText(tainted));
+    return;
+  }
+  stepError(inst, `tainted:${s.slot}`, slotWhat, '');
+  if (machine) {
+    console.warn(`[Switch] ${bot}: the login ${s.user} streamed on the slot ${s.slot}, which belongs to another machine. The login is now blocked (it cannot log in, and other machines stop listing its machine within an hour); its stream ${f.stream}; the slot ${f.slot}. Remove the login in the Database window.`);
+  } else if (s.user === own) {
+    const holder = ownPasswordHolder(inst);
+    const tail = holder
+      ? ` New join code keeps this password while the database on ${holder} still holds it for this machine; until then this check ends such streams every 5 minutes.`
+      : " Press New join code to give this machine's own login a new password.";
+    console.warn(`[Switch] ${bot}: this machine's own login ${own} streamed on the slot ${s.slot}, which belongs to another machine, so its password is known outside this manager. Its stream ${f.stream}; the slot ${f.slot}.${tail}`);
+  } else {
+    console.warn(`[Switch] ${bot}: the role ${s.user} streamed on the slot ${s.slot}, which belongs to a machine login. Its stream ${f.stream}; the slot ${f.slot}. It is not a machine login, so it was not blocked.`);
+  }
+}
+
+/** 3.8 as R3 gives it: on a main with replication, as dbm_admin on postgres, every tick. */
+export async function machineLoginsCheck(inst: InstanceConfig, t: Target): Promise<void> {
+  const bot = inst.displayName;
+  const foreign = await clusterSql(t, FOREIGN_READ_SQL);
+  stepError(inst, 'foreign', "the streams on the machines' slots could not be read", foreign.ok ? '' : failText(foreign));
+  if (foreign.ok) {
+    const { streams, unread } = parseForeignStreams(foreign.stdout);
+    const logged = unreadLogged.get(inst.id) ?? new Set<string>();
+    unreadLogged.set(inst.id, logged);
+    for (const line of unread) {
+      if (logged.has(line)) continue;
+      logged.add(line);
+      console.warn(`[Switch] ${bot}: a line of the streams on the machines' slots is not in the form the manager reads (${line})`);
+    }
+    for (const s of streams) await foreignStream(inst, t, s);
+  }
+
+  const sessions = await clusterSql(t, BLOCKED_SESSIONS_SQL);
+  stepError(inst, 'sessions', 'the open sessions of blocked machine logins could not be checked', sessions.ok ? '' : failText(sessions));
+  if (sessions.ok) {
+    for (const line of sessions.stdout.split('\n')) {
+      const m = /^(smdb_copy_[0-9a-f]{32})\|(true|false)$/.exec(line.trim());
+      if (!m) continue;
+      console.warn(m[2] === 'true'
+        ? `[Switch] ${bot}: ended an open session of the blocked login ${m[1]}`
+        : `[Switch] ${bot}: an open session of the blocked login ${m[1]} could not be ended; the next check tries again`);
+    }
+  }
+
+  const lobj = await clusterSql(t, LOBJ_SWEEP_SQL);
+  stepError(inst, 'lobj', 'the large objects in the postgres database could not be checked', lobj.ok ? '' : failText(lobj));
+  if (lobj.ok) {
+    for (const line of lobj.stdout.split('\n')) {
+      const m = /^(.+)\|(\d+)$/.exec(line.trim());
+      if (!m || m[1] === 'unlinked') continue;
+      console.warn(`[Switch] ${bot}: removed ${m[2]} large objects that ${m[1]} made in the postgres database; the manager keeps none there`);
+    }
+  }
+
+  const members = await clusterSql(t, NEW_LOGINS_READ_SQL);
+  stepError(inst, 'members', 'the machine logins could not be read', members.ok ? '' : failText(members));
+  if (members.ok) {
+    const names = lastLineOrEmpty(members.stdout).split(',').map(n => n.trim()).filter(Boolean);
+    const known = knownLogins.get(inst.id);
+    if (!known) {
+      knownLogins.set(inst.id, new Set(names));
+      return;
+    }
+    for (const name of names) {
+      if (known.has(name)) continue;
+      known.add(name);
+      console.log(`[Switch] ${bot}: a machine got a login with the join code: ${name}`);
+    }
+  }
 }
 
 const replacedDm = (inst: InstanceConfig, r: FleetDbReplaced) => ({
@@ -1395,13 +1535,14 @@ async function peerCheck(inst: InstanceConfig, now: number): Promise<void> {
   if (db.mainConflict) await keepBlocked(inst, 'while two mains stand');
   if (db.replication) {
     // D50: the copies list a take-over on any copy reads; not while a push may replace this database (D42).
-    if (!db.receive && !db.pushBroken) {
+    if (machineLoginsTickRuns(db)) {
       const sync = await metaSql(t, db.db, COPIES_SYNC_SQL);
       const error = sync.ok ? '' : failText(sync);
       if (syncLogged.get(inst.id) !== error) {
         syncLogged.set(inst.id, error);
         if (error) console.warn(`[Switch] ${inst.displayName}: the list of this database's copies could not be written (${error}); the manager tries again every 5 minutes`);
       }
+      await machineLoginsCheck(inst, t);
     }
     for (const peer of await ownPeers(inst)) {
       const probe = await probeTarget(inst, peer);
@@ -1471,7 +1612,7 @@ async function formerCheck(inst: InstanceConfig, mine: number, systemId: string 
   // The reach: the old main's own check then finds this machine and blocks its bot there.
   const own = await fleetJoin.readCopyCert(inst.fleetDb!.containerName);
   const error = own
-    ? await fleetJoin.registerAddress(inst, decoded.code, cert.pem, { host: repl.publicHost, port: repl.hostPort, slot: fm.slot, cert: own, machine: machineNameOf(inst) })
+    ? await fleetJoin.registerAddress(inst, decoded.code, cert.pem, { host: repl.publicHost, port: repl.hostPort, cert: own, machine: machineNameOf(inst) })
     : "this database's certificate could not be read";
   const outcome = error ?? '';
   if (formerLogged.get(inst.id) !== outcome) {
@@ -1504,7 +1645,7 @@ async function rejoinCheck(inst: InstanceConfig, now: number): Promise<void> {
   }
   const p = probe.verdict;
   if (p?.kind === 'login-refused') {
-    saveSwitch(inst.id, { handover: { ...h, rejoinError: `${machine} refused this machine's replication login (${p.reason}). Copy ${machine}'s join code and paste it into Rejoin as a copy.` } });
+    saveSwitch(inst.id, { handover: { ...h, rejoinError: `${machine} refused this machine's own login (${p.reason}). Copy ${machine}'s join code and paste it into Rejoin as a copy.` } });
     return;
   }
   if (!rejoinDue(h, p, now, null)) {
@@ -1525,7 +1666,7 @@ async function rejoinNow(inst: InstanceConfig, h: FleetDbHandover, now: number):
   if (!composed.ok) return { success: false, error: composed.error };
   console.log(`[Switch] ${inst.displayName}: ${machine} is the main now (generation ${h.generation}); rebuilding this machine's database as its copy after a dump of it`);
   const repl = inst.fleetDb?.replication;
-  const r = fleetReplica.reseedStalePrimary(inst, composed.text, repl?.publicHost, repl?.hostPort, false);
+  const r = await fleetReplica.reseedStalePrimary(inst, composed.text, repl?.publicHost, repl?.hostPort, false);
   if (!r.success) {
     saveSwitch(inst.id, { handover: { ...h, rejoinTriedAt: now, rejoinError: `Rejoining ${machine} as a copy did not start: ${r.error}. The manager tries again in 30 minutes, or press Rejoin as a copy.` } });
   }
@@ -1533,7 +1674,7 @@ async function rejoinNow(inst: InstanceConfig, h: FleetDbHandover, now: number):
 }
 
 /** The operator's Rejoin of a replaced main or a handed-over one: the code composed from the recorded target. */
-export function rejoinComposed(botId: string): { success: boolean; error?: string; started?: boolean } {
+export async function rejoinComposed(botId: string): Promise<{ success: boolean; error?: string; started?: boolean }> {
   const inst = containerManager.getBot(botId);
   if (!inst?.fleetDb) return { success: false, error: 'This instance holds no main database to rebuild' };
   const t = inst.fleetDb.replacedBy ?? inst.fleetDb.mainConflict ?? (inst.fleetDb.handover?.mode === 'stream' ? inst.fleetDb.handover : null);
@@ -1541,7 +1682,7 @@ export function rejoinComposed(botId: string): { success: boolean; error?: strin
   const composed = peerCode(inst, { host: t.host, port: t.port, cert: t.cert, machine: t.machine || t.host });
   if (!composed.ok) return { success: false, error: `The join code could not be composed (${composed.error}); paste the main's join code instead` };
   const repl = inst.fleetDb.replication;
-  return fleetReplica.reseedStalePrimary(inst, composed.text, repl?.publicHost, repl?.hostPort, false);
+  return await fleetReplica.reseedStalePrimary(inst, composed.text, repl?.publicHost, repl?.hostPort, false);
 }
 
 /** N-f: the restore record's pending flag cleared on a main that holds no notice and no read-only layer. */
@@ -1686,6 +1827,9 @@ export function resetSwitchState(): void {
   offLogged.clear();
   syncLogged.clear();
   formerLogged.clear();
+  loginsLogged.clear();
+  unreadLogged.clear();
+  knownLogins.clear();
   staleMarkLogged.clear();
   tickRunning = false;
 }

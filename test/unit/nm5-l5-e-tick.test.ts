@@ -62,25 +62,25 @@ beforeEach(() => {
 afterAll(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
 
 describe('L5 e: rejoinComposed', () => {
-  it('a bot without a main database: refused with the exact error', () => {
+  it('a bot without a main database: refused with the exact error', async () => {
     writeRegistry({ a: mainFixture({ fleetDb: undefined }) });
-    expect(rejoinComposed('a')).toEqual({ success: false, error: 'This instance holds no main database to rebuild' });
+    expect(await rejoinComposed('a')).toEqual({ success: false, error: 'This instance holds no main database to rebuild' });
   });
-  it('a push move recorded with an address is no rejoin target', () => {
+  it('a push move recorded with an address is no rejoin target', async () => {
     withDb({ handover: { ...MARK, mode: 'push' } });
-    expect(rejoinComposed('a')).toEqual({ success: false, error: 'No main is recorded to rejoin; paste its join code instead' });
+    expect(await rejoinComposed('a')).toEqual({ success: false, error: 'No main is recorded to rejoin; paste its join code instead' });
     expect(tmp.reseedArgs).toEqual([]);
   });
-  it('a stream hand-over is the target, and the re-seed is not pre-confirmed', () => {
+  it('a stream hand-over is the target, and the re-seed is not pre-confirmed', async () => {
     withDb({ handover: MARK });
-    expect(rejoinComposed('a')).toEqual({ success: true, started: true });
+    expect(await rejoinComposed('a')).toEqual({ success: true, started: true });
     expect(tmp.reseedArgs).toHaveLength(1);
     expect(tmp.reseedArgs[0].slice(2, 5)).toEqual(['main.example', 5433, false]);
   });
-  it('a code that cannot be composed: refused naming why', () => {
+  it('a code that cannot be composed: refused naming why', async () => {
     const { replication: _r, ...noRepl } = MAIN;
-    writeRegistry({ a: mainFixture({ fleetDb: { ...noRepl, handover: MARK } }) });
-    expect(rejoinComposed('a')).toEqual({ success: false, error: "The join code could not be composed (this machine's replication login is not stored); paste the main's join code instead" });
+    writeRegistry({ a: mainFixture({ fleetDb: { ...noRepl, handover: MARK }, fleetLogin: undefined }) });
+    expect(await rejoinComposed('a')).toEqual({ success: false, error: "The join code could not be composed (this machine's own login to the other databases is not stored); paste the main's join code instead" });
   });
 });
 

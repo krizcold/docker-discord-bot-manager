@@ -52,7 +52,7 @@ describe('copiesInsertSql', () => {
 
 describe('the receive mark', () => {
   it('counts the mark rows', () => {
-    expect(RECEIVE_MARK_COUNT_SQL).toBe('SELECT count(*) FROM smdb_manager.receive_mark');
+    expect(RECEIVE_MARK_COUNT_SQL).toBe('SELECT pg_catalog.count(*) FROM smdb_manager.receive_mark');
   });
 
   it('clears every row when no mark id is named', () => {

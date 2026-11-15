@@ -224,10 +224,10 @@ describe('B04-2n: the host-port collision checks refuse while the registry canno
     expect(res.error).toMatch(/Host port 5440 is already used by "Bot 2"/);
   });
 
-  it('the stale-primary re-seed refuses with a can\'t-confirm answer and calls no docker', () => {
+  it('the stale-primary re-seed refuses with a can\'t-confirm answer and calls no docker', async () => {
     h.bots = [worker({ fleetDb: FLEET_DB })];
     h.fault = FAULT;
-    const res = reseedStalePrimary(h.bots[0], codeFor(DSN), 'standby.invalid', 5440);
+    const res = await reseedStalePrimary(h.bots[0], codeFor(DSN), 'standby.invalid', 5440);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/Host port 5440 cannot be confirmed free/);
     expect(res.error).toContain('instances.json');

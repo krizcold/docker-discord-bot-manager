@@ -80,6 +80,7 @@ const REPLICA = {
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), fleetDbReplica: REPLICA, ...over,
 } } }, null, 2));
 const bot = () => containerManager.getBot('b')!;
@@ -378,6 +379,6 @@ describe('NM3 L5 g: more of the automatic run', () => {
     fleetReplica.startAutoRebuild(bot(), 'absent', async () => true);
     await settled();
     const s = await fleetReplica.getFleetReplicaStatus(bot());
-    expect(s.seedNote).toMatch(/ The owner was sent a Discord message\. The copy runs, but its address could not be added to the main's list \(ERROR: {2}denied\); the manager tries again every hour\.$/);
+    expect(s.seedNote).toMatch(/ The owner was sent a Discord message\. The copy runs, but its address could not be added to the main's list \(ERROR: {2}denied\)\. The manager tries again every hour\.$/);
   });
 });

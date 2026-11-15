@@ -31,11 +31,11 @@ import { probeErrorTail, redactSecrets } from '../config/secretText';
 import * as fleetReplica from './fleetReplica';
 import * as dbLogin from './dbLogin';
 import { MANAGER_DB_ROLE } from './dbLogin';
-import { addressTableSql, REPLICATION_ROLE } from './fleetReplication';
+import { addressTableSql } from './fleetReplication';
 import { parseAddressRows, readCopyCert, validAddress } from './fleetJoin';
 import {
-  copiesInsertSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
-  raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
+  ADDRESS_DDL_SQL, COPY_GROUP, copiesInsertSql, copyGroupEnsureSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
+  raiseSql, receiveMarkClearSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
 } from './switchSql';
 import { readDatabaseUrl } from '../config/databaseUrl';
 import * as maintenance from './maintenance';
@@ -474,11 +474,11 @@ export const FENCE_PGDATA = path.posix.dirname(FENCE_HBA_FILE);
 /** How long the fence waits for the reloaded pg_hba to refuse a TCP connection, and the gap between probes. */
 export const fenceTiming = { probeDeadlineMs: 15_000, probeGapMs: 250 };
 
-/** The fence's pg_hba lines: the managed replication role over TLS (only when ssl is on), then a reject for every other TCP client. */
+/** The fence's pg_hba lines: the machine logins' replication over TLS (only when ssl is on), then a reject for every other TCP client. */
 function fenceHbaLines(ssl: boolean, owner: string): string[] {
   const tail = `${FENCE_OWNER_TAG}${owner} ${WRITE_FENCE_MARK}`;
   return [
-    ...(ssl ? [`hostssl replication ${REPLICATION_ROLE} all scram-sha-256 ${tail}`] : []),
+    ...(ssl ? [`hostssl replication +${COPY_GROUP} all scram-sha-256 ${tail}`] : []),
     `host replication all all reject ${tail}`,
     `host all all all reject ${tail}`,
   ];
@@ -660,14 +660,14 @@ async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
 }
 
 /**
- * Ends every client session and every walsender but the managed role's physical ones; with admitted, every TCP session
+ * Ends every client session and every walsender but the machine logins' physical ones; with admitted, every TCP session
  * from an address not in it, and with keepRole, leaves that role's client sessions open. The reason when one did not
  * end, else null.
  */
 async function sweepSessions(db: RestoreFleetDb, admitted?: string[], keepRole?: string): Promise<string | null> {
   const where = admitted
     ? `pid <> pg_backend_pid() AND client_addr IS NOT NULL AND backend_type IN ('client backend', 'walsender') AND host(client_addr) NOT IN (${admitted.map(a => `'${a}'`).join(', ')})${keepRole ? ` AND (backend_type = 'walsender' OR usename IS DISTINCT FROM '${keepRole.replace(/'/g, "''")}')` : ''}`
-    : `pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM '${REPLICATION_ROLE}' AND datname IS NULL)))`;
+    : `pid <> pg_backend_pid() AND (backend_type = 'client backend' OR (backend_type = 'walsender' AND NOT (datname IS NULL AND EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = usesysid AND m.roleid = pg_catalog.to_regrole('${COPY_GROUP}')))))`;
   const sweep = await execDocker(psqlArgs(db, `SELECT pid, pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE ${where}`));
   if (!sweep.ok) return `the open sessions could not be ended (${lastLine(sweep.stderr)})`;
   const kept = sweep.stdout.split('\n').map(l => l.trim().split('|')).filter(([pid, ended]) => /^\d+$/.test(pid) && ended !== 't').map(([pid]) => pid);
@@ -1286,7 +1286,7 @@ ${dumpErr}`);
 
     const startDump = () => {
       const snap = snapshot!;
-      const dumpStart = startProcess('docker', dbLogin.workArgs(target.containerName, target.db, 'pg_dump', ['-Fc', `--snapshot=${snap.id}`]));
+      const dumpStart = startProcess('docker', dbLogin.workArgs(target.containerName, target.db, 'pg_dump', ['-Fc', '-B', `--snapshot=${snap.id}`]));
       if (!dumpStart.child) return fail(`Failed to run docker exec: ${dumpStart.reason}`);
       dump = dumpStart.child;
       out = fs.createWriteStream(tmpPath, { mode: PRIVATE_FILE_MODE });
@@ -2075,12 +2075,16 @@ export const RESTORE_LIST_PATH = '/tmp/smdb-restore.list';
 const TOC_ENTRY_NUMBER = /^(\d+);/;
 // The schema's own entry, comment, ACL and label: their namespace is empty, so pg_restore -n lists none of them.
 const MANAGER_SCHEMA_OWN = /^\d+; (?:2615 \d+ SCHEMA - smdb_manager |0 0 (?:COMMENT|ACL|SECURITY LABEL) - SCHEMA smdb_manager )/;
+// pg_restore prints the type right after the two catalog numbers, so no name reaches that place.
+const LARGE_OBJECT_DATA = /^\d+; \d+ \d+ BLOBS? /;
+const LARGE_OBJECT_OWN = /^\d+; 0 0 (?:COMMENT|ACL|SECURITY LABEL) - LARGE OBJECT \d+ /;
 
 /**
  * S2, X1: the `-L` list of the dbm_work restore, made from `pg_restore -l` (toc) and `pg_restore -l -n smdb_manager`
- * (managerToc). It leaves out the entries managerToc lists and the schema's own entries; every other line stays as it
- * is. `refused` is the detail of the refusal of the dump: an entry managerToc lists that toc lacks, or a line that
- * starts as one of the schema's own entries and holds a space past its owner's place. Both callers refuse on it.
+ * (managerToc). It leaves out the entries managerToc lists, the schema's own entries and the large objects' entries;
+ * every other line stays as it is. `refused` is the detail of the refusal of the dump: an entry managerToc lists that
+ * toc lacks, or a line that starts as one of the schema's own entries or a large object's comment, ACL or label and
+ * holds a space past its owner's place. Both callers refuse on it.
  */
 export function restoreLists(toc: string, managerToc: string): { other: string; refused: string | null } {
   const idsOf = (text: string) => text.split('\n').flatMap(line => TOC_ENTRY_NUMBER.exec(line)?.[1] ?? []);
@@ -2092,7 +2096,12 @@ export function restoreLists(toc: string, managerToc: string): { other: string; 
   const other = toc.split('\n').filter(line => {
     const n = TOC_ENTRY_NUMBER.exec(line);
     if (!n) return true;
-    if (manager.has(n[1])) return false;
+    if (manager.has(n[1]) || LARGE_OBJECT_DATA.test(line)) return false;
+    const lo = LARGE_OBJECT_OWN.exec(line);
+    if (lo) {
+      if (line.slice(lo[0].length).includes(' ')) refused ??= `entry ${n[1]} of its table of contents cannot be told apart from a large object's entry`;
+      return false;
+    }
     const own = MANAGER_SCHEMA_OWN.exec(line);
     if (!own) return true;
     if (line.slice(own[0].length).includes(' ')) refused ??= `entry ${n[1]} of its table of contents cannot be told apart from the manager's own schema smdb_manager`;
@@ -2224,10 +2233,9 @@ function rowSecurityDumpText(found: RowSecurityTable, t: { containerName: string
     + `The manager has no SQL console; on this machine, run docker exec -it ${t.containerName} psql -U ${dbLogin.WORK_LOGIN} -d ${t.db} -c '${sql}', then restore again`;
 }
 
-/** The addresses table's DDL and the replication login's grants on it, without this machine's row. */
+/** The addresses table and its two functions, without this machine's row. */
 function addressDdlSql(): string {
-  const sql = addressTableSql('', 0, '', '', null);
-  return sql.slice(0, sql.indexOf('INSERT INTO smdb_manager.addresses'));
+  return ADDRESS_DDL_SQL;
 }
 
 /**
@@ -2848,7 +2856,7 @@ async function restoreLocked(
     // Physical walsenders are not connected to any database, so a streaming
     // standby just replays the swap.
     const dbIdent = `"${fleetDb.db.replace(/"/g, '""')}"`;
-    const recreate = await execDocker([...dbLogin.clusterPsql(fleetDb.containerName, replicationRoleEnsureSql(REPLICATION_ROLE), { exempt: true }).args,
+    const recreate = await execDocker([...dbLogin.clusterPsql(fleetDb.containerName, copyGroupEnsureSql(), { exempt: true }).args,
       '-c', `DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`,
       '-c', `CREATE DATABASE ${dbIdent} OWNER "${fleetDb.user.replace(/"/g, '""')}"`,
       '-c', databaseGrantsSql(fleetDb.db)]);
@@ -3144,7 +3152,7 @@ async function writeRestoredGeneration(instance: InstanceConfig, fleetDb: Restor
   if (restored === undefined) return { ok: false, error: read.ok ? `the restored row read back as '${read.stdout.trim()}'` : lastLine(read.stderr) };
   const machine = machineNameOf(instance);
   const target = generationAfterRestore(before, restored, machine, new Date().toISOString());
-  const own = repl && cert ? addressTableSql(repl.publicHost, repl.hostPort, cert, machine, null) : '';
+  const own = repl && cert ? addressTableSql(repl.publicHost, repl.hostPort, cert, machine) : '';
   let sql: string;
   if (kind === 'ordinary') {
     try {

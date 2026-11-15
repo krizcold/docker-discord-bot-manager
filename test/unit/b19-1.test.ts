@@ -35,7 +35,7 @@ vi.mock('child_process', async (importOriginal) => {
   const answer = (text: string): { out: string; code: number } => {
     if (/^test -f \S*server\.crt$/.test(text)) return { out: '', code: h.certPresent ? 0 : 1 };
     if (text.includes('pg_stat_ssl')) return { out: `${h.plainClients}\n`, code: 0 };
-    if (text.includes('FROM pg_stat_replication WHERE usename')) return { out: `${h.senders}\n`, code: 0 };
+    if (text.includes('FROM pg_stat_replication r WHERE')) return { out: `${h.senders}\n`, code: 0 };
     if (text.includes('FROM pg_roles')) return { out: '0\n', code: 0 };
     return { out: '', code: 0 };
   };
@@ -89,7 +89,7 @@ import * as fleetBackupGuards from '../../src/instance/fleetBackupGuards';
 import * as fleetReplication from '../../src/instance/fleetReplication';
 import { enableFleetReplication, disableFleetReplication } from '../../src/instance/fleetReplication';
 
-const botDir = path.join(h.dir, 'bots', 'b1');
+const botDir = path.join(h.dir, 'bots', 'b1b1b1b1-0000-4000-8000-000000000001');
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'primary.invalid', certHost: 'primary.invalid', slotWalKeepMb: 4096 };
@@ -97,8 +97,8 @@ const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', ho
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({
     instances: {
-      b1: {
-        id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
+      'b1b1b1b1-0000-4000-8000-000000000001': {
+        id: 'b1b1b1b1-0000-4000-8000-000000000001', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: { DATA_BACKEND: 'postgres' },
         fleetDb,
@@ -109,7 +109,7 @@ const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   }));
 };
 
-const bot = () => containerManager.getBot('b1')!;
+const bot = () => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!;
 const enable = () => enableFleetReplication(bot(), 'primary.invalid', 15432);
 const ran = (re: RegExp) => h.calls.filter(c => re.test(`${c.args.join(' ')}\n${c.stdin}`));
 const hbaWrites = () => h.calls.filter(c => c.args.join(' ').includes('pg_hba.conf'));
@@ -118,7 +118,7 @@ beforeEach(() => {
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
   h.calls.length = 0;
   h.certPresent = true;
   h.plainClients = '';
@@ -146,12 +146,12 @@ describe('the replication lane is serialized per instance', () => {
     expect(second.success).toBe(false);
     expect(second.error).toMatch(/Enable is refused until it finishes \(nothing was changed\)/);
     expect(firstRes.success).toBe(true);
-    expect(ran(/ROLE replicator/).length).toBe(1);
+    expect(ran(/ROLE smdb_join/).length).toBe(1);
   });
 
   it('refuses Enable while another lane holds the instance (a seed, a start)', async () => {
     let release!: () => void;
-    const held = containerManager.withExternalBotOp('b1', 'replica-seed', () => new Promise<void>(r => { release = r; }));
+    const held = containerManager.withExternalBotOp('b1b1b1b1-0000-4000-8000-000000000001', 'replica-seed', () => new Promise<void>(r => { release = r; }));
     const res = await enable();
     release();
     await held;
@@ -161,7 +161,7 @@ describe('the replication lane is serialized per instance', () => {
   });
 
   it('refuses Enable and Disable while a backup or restore holds the busy slot', async () => {
-    expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);
+    expect(fleetBackupGuards.claimFleetBackupBusy('b1b1b1b1-0000-4000-8000-000000000001')).toBe(true);
     try {
       const res = await enable();
       expect(res.success).toBe(false);
@@ -171,12 +171,12 @@ describe('the replication lane is serialized per instance', () => {
       expect(off.success).toBe(false);
       expect(h.calls).toEqual([]);
     } finally {
-      fleetBackupGuards.releaseFleetBackupBusy('b1');
+      fleetBackupGuards.releaseFleetBackupBusy('b1b1b1b1-0000-4000-8000-000000000001');
     }
   });
 });
 
-describe('Disable counts every walsender of the replication role', () => {
+describe('Disable counts every walsender of a machine login (NM22 R4)', () => {
   it('refuses while a replication connection holds no active slot', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
     h.senders = '10.0.0.9';
@@ -292,22 +292,22 @@ describe('a running bot on its old URL keeps reaching its database', () => {
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/replication was not set up/);
     expect(hbaWrites()).toEqual([]);
-    expect(ran(/ROLE replicator/)).toEqual([]);
+    expect(ran(/ROLE smdb_join/)).toEqual([]);
   });
 
   it('writes the narrowed pg_hba when no client is outside the pool', async () => {
     h.plainClients = '172.20.0.5';
     const res = await enable();
     expect(res.plainClientsKept).toBeUndefined();
-    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent('smdb'));
     expect(bot().fleetDb!.replication!.keptPlain).toBeUndefined();
   });
 
   it('narrows at the next start once the kept client no longer connects without TLS', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, keptPlain: ['10.5.0.7'] } } });
-    const warning = await fleetReplication.narrowKeptPlainHba('b1');
+    const warning = await fleetReplication.narrowKeptPlainHba('b1b1b1b1-0000-4000-8000-000000000001');
     expect(warning).toBeNull();
-    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent('smdb'));
     expect(ran(/pg_reload_conf/).length).toBe(1);
     expect(bot().fleetDb!.replication!.keptPlain).toBeUndefined();
     expect(bot().fleetDb!.replication!.password).toBe(replication.password);
@@ -316,7 +316,7 @@ describe('a running bot on its old URL keeps reaching its database', () => {
   it('keeps the line and says so while the client still connects without TLS', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, keptPlain: ['10.5.0.7'] } } });
     h.plainClients = '10.5.0.7';
-    const warning = await fleetReplication.narrowKeptPlainHba('b1');
+    const warning = await fleetReplication.narrowKeptPlainHba('b1b1b1b1-0000-4000-8000-000000000001');
     expect(warning).toMatch(/still connect to the database without TLS/);
     expect(hbaWrites()[0].stdin).toMatch(/10\.5\.0\.7\/32/);
     expect(bot().fleetDb!.replication!.keptPlain).toEqual(['10.5.0.7']);
@@ -325,21 +325,21 @@ describe('a running bot on its old URL keeps reaching its database', () => {
   it('never adds a non-TLS line for an address Enable did not keep', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, keptPlain: ['10.5.0.7'] } } });
     h.plainClients = '10.9.9.9';
-    const warning = await fleetReplication.narrowKeptPlainHba('b1');
+    const warning = await fleetReplication.narrowKeptPlainHba('b1b1b1b1-0000-4000-8000-000000000001');
     expect(warning).toBeNull();
-    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent('smdb'));
   });
 });
 
 describe('Enable re-reads the record before writing it', () => {
   it('refuses to write when another request changed the record while it ran', async () => {
     h.onRun = (text) => {
-      if (text.includes('ALTER SYSTEM SET ssl')) containerManager.updateInstanceFleetDbReplication('b1', { ...replication, publicHost: 'other.invalid' });
+      if (text.includes('ALTER SYSTEM SET ssl')) containerManager.updateInstanceFleetDbReplication('b1b1b1b1-0000-4000-8000-000000000001', { ...replication, publicHost: 'other.invalid' });
     };
     const res = await enable();
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/record changed while this Enable ran/);
     expect(bot().fleetDb!.replication!.publicHost).toBe('other.invalid');
-    expect(envManager.getEnvVars('b1').DATA_BACKEND_URL).toBe(dbUrl);
+    expect(envManager.getEnvVars('b1b1b1b1-0000-4000-8000-000000000001').DATA_BACKEND_URL).toBe(dbUrl);
   });
 });

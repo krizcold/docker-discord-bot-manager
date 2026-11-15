@@ -1,5 +1,5 @@
 // provisionRoles' reads as a set-up cluster answers them (NM20 part 3: Enable, the join code, the start and the
-// maintenance check now provision first), for the docker fakes of rows that drive those callers. routed() also sends
+// maintenance check now provision first), and the join code's COPY_ROLES_READ_SQL after an Enable (NM22), for the docker fakes of rows that drive those callers. routed() also sends
 // psql calls that execFile now makes (fleetReplication's statements go through dbLogin.runCall) to the file's spawn
 // fake, which answered them when they went through spawn.
 import { EventEmitter } from 'events';
@@ -12,6 +12,7 @@ export function rolesReadAnswer(text: string): string | null {
   if (text.includes('pg_catalog.pg_is_in_recovery()::text,')) return `${SET_UP_ROLES_READ}\n`;
   if (text.includes("'owner|'")) return 'owner|dbm_meta|ok\n';
   if (text.includes("'drift|'")) return 'drift|0|0|0\n';
+  if (text.includes("'copyroles|'")) return 'copyroles|ok\n';
   return null;
 }
 

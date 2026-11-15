@@ -13,7 +13,7 @@ import { composeJoinCode, dmDue, formerVerdict, heldVerdict, noticeDue, noticeSt
 import { addressesState } from '../../src/instance/fleetJoin';
 import {
   ensureGenerationSql, GENERATION_SCHEMA_SQL, generationAfterRestore, generationBefore, GenRow, parseGenRow, parseRestoreState, pushBrokenOf, raiseSql,
-  markIdOf, parseReceiveMark, receiveMarkClearSql, receiveMarkSql, receiveMarkVerdict, replicationRoleEnsureSql, restoreStateUpsertSql,
+  markIdOf, parseReceiveMark, receiveMarkClearSql, receiveMarkSql, receiveMarkVerdict, copyGroupEnsureSql, restoreStateUpsertSql,
 } from '../../src/instance/switchSql';
 import { decodeJoinCode, decodeMoveCode, encodeJoinCode, encodeMoveCode, isMoveCode } from '../../src/config/joinCode';
 import { compareChecksums, parseChecksumLines } from '../../src/instance/backupFiles';
@@ -323,11 +323,11 @@ describe('formerVerdict over recovery x system id x generation order (D45)', () 
   });
 });
 
-describe('replicationRoleEnsureSql (D59)', () => {
-  it('makes the role NOLOGIN only when it is missing, with no password', () => {
-    const sql = replicationRoleEnsureSql('replicator');
+describe('copyGroupEnsureSql (D59, NM22 3.10)', () => {
+  it('makes the group NOLOGIN only when it is missing, with no password', () => {
+    const sql = copyGroupEnsureSql();
     expect(sql).toContain('IF NOT EXISTS');
-    expect(sql).toContain('CREATE ROLE replicator NOLOGIN');
+    expect(sql).toContain('CREATE ROLE smdb_copies NOLOGIN');
     expect(sql).not.toMatch(/LOGIN PASSWORD/);
   });
 });

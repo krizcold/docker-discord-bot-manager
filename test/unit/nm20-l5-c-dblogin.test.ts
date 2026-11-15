@@ -167,7 +167,7 @@ describe('runCall', () => {
     const p = runCall(C, clusterPsql(C, 'SELECT 1', { stdin: true }), 500);
     await vi.advanceTimersByTimeAsync(600);
     expect(kills).toBe(1);
-    expect(await p).toEqual({ ok: false, stdout: '', stderr: 'docker did not answer within 0.5 s', error: 'docker did not answer within 0.5 s' });
+    expect(await p).toEqual({ ok: false, stdout: '', stderr: 'docker did not answer within 0.5 s', error: 'docker did not answer within 0.5 s', timedOut: true });
 
     kills = 0;
     closeNow = true;

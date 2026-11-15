@@ -89,6 +89,13 @@ export const docker = {
   basebackupFail: '',
   wipeFail: '',
   statusProbe: 't|streaming|t|0.5' as string | null,
+  /** The mint's answer: its last stdout line, or with `fail` set, psql's stderr and exit 1. */
+  mint: { out: 'created', fail: '' },
+  /** Every docker call (exec and spawn), and each spawn's PGPASSWORD, SMDB_COPY_VERIFIER and stdin. */
+  calls: [] as string[][],
+  spawns: [] as Array<{ args: string[]; env: { PGPASSWORD?: string; SMDB_COPY_VERIFIER?: string }; stdin: string }>,
+  /** Spawn events that never end by themselves; the client's kill ends them with exit 137. */
+  hang: [] as string[],
 };
 
 export function resetDocker(): void {
@@ -99,10 +106,11 @@ export function resetDocker(): void {
     copy: 'true|streaming|7001|1|0/4000000', copyCert: COPY_PEM, mainCertExec: FIXTURE_PEM,
     imagePresent: true, pullFail: '', running: 'true', volumeExists: false,
     slotFail: '', seedProbe: 'f', basebackupFail: '', wipeFail: '', statusProbe: 't|streaming|t|0.5',
+    mint: { out: 'created', fail: '' }, calls: [], spawns: [], hang: [],
   });
 }
 
-type Answer = { code: number; stdout: string; stderr: string };
+type Answer = { code: number; stdout: string; stderr: string; event?: string };
 const ok = (stdout = ''): Answer => ({ code: 0, stdout, stderr: '' });
 const fail = (stderr: string): Answer => ({ code: 1, stdout: '', stderr });
 
@@ -141,23 +149,27 @@ function execAnswer(cmd: string, args: string[]): Answer {
   return ok();
 }
 
-function spawnAnswer(args: string[]): Answer {
+function spawnAnswer(args: string[], stdin = ''): Answer {
   const text = args.join(' ');
+  if (args[0] === 'run' && stdin.includes('smdb_manager.add_copy_login(')) {
+    docker.events.push('mint');
+    return { ...(docker.mint.fail ? fail(docker.mint.fail) : ok(`${docker.mint.out}\n`)), event: 'mint' };
+  }
   if (args[0] === 'run' && text.includes('IDENTIFY_SYSTEM') && args.includes('sh')) {
     docker.events.push('main-probe');
     const m = docker.main;
-    if (m.fail) return fail(m.fail);
-    return ok(`${m.systemId}|${m.timeline}|${m.lsn}|\n${m.inRecovery}|${m.slot}\n`);
+    if (m.fail) return { ...fail(m.fail), event: 'main-probe' };
+    return { ...ok(`${m.systemId}|${m.timeline}|${m.lsn}|\n${m.inRecovery}|${m.slot}\n`), event: 'main-probe' };
   }
   if (args[0] === 'run' && text.includes('FROM smdb_manager.addresses a')) {
     docker.events.push('address-read');
     return docker.addressFail ? fail(docker.addressFail) : ok(`${JSON.stringify(docker.addresses)}\n`);
   }
-  if (args[0] === 'run' && text.includes('INSERT INTO smdb_manager.addresses')) {
+  if (args[0] === 'run' && (text.includes('smdb_manager.set_copy_address(') || text.includes('INSERT INTO smdb_manager.addresses'))) {
     docker.events.push('register');
-    return docker.registerFail ? fail(docker.registerFail) : ok();
+    return docker.registerFail ? fail(docker.registerFail) : ok('\n');
   }
-  if (args[0] === 'run' && text.includes('DELETE FROM smdb_manager.addresses')) {
+  if (args[0] === 'run' && (text.includes('smdb_manager.drop_copy_address()') || text.includes('DELETE FROM smdb_manager.addresses'))) {
     docker.events.push('unregister');
     return docker.unregisterFail ? fail(docker.unregisterFail) : ok();
   }
@@ -178,17 +190,22 @@ function spawnAnswer(args: string[]): Answer {
   return ok();
 }
 
-function child(answer: Answer): any {
+function child(answerOf: (stdin: string) => Answer): any {
   const c: any = new EventEmitter();
   c.stdout = new PassThrough();
   c.stderr = new PassThrough();
   c.stdin = new PassThrough();
-  c.stdin.resume();
-  c.kill = () => true;
+  let stdin = '';
+  c.stdin.on('data', (d: Buffer) => { stdin += d; });
+  let closed = false;
+  const close = (code: number) => { if (!closed) { closed = true; c.emit('close', code); } };
+  c.kill = () => { setTimeout(() => { c.stdout.end(); c.stderr.end(); close(137); }, 1); return true; };
   setTimeout(() => {
+    const answer = answerOf(stdin);
+    if (answer.event && docker.hang.includes(answer.event)) return;
     c.stdout.end(answer.stdout);
     c.stderr.end(answer.stderr);
-    setTimeout(() => c.emit('close', answer.code), 2);
+    setTimeout(() => close(answer.code), 2);
   }, 2);
   return c;
 }
@@ -197,11 +214,17 @@ function child(answer: Answer): any {
 export function childProcessMock(real: typeof import('child_process')): Record<string, unknown> {
   const execFile = (cmd: string, args: string[], optsOrCb: unknown, maybeCb?: unknown) => {
     const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as ((err: Error | null, stdout: string, stderr: string) => void) | undefined;
+    if (cmd === 'docker') docker.calls.push(args);
     const a = execAnswer(cmd, args);
     setTimeout(() => cb?.(a.code === 0 ? null : Object.assign(new Error(a.stderr), { code: a.code }), a.stdout, a.stderr), 1);
     return new EventEmitter();
   };
-  const spawn = (_cmd: string, args: string[]) => child(spawnAnswer(args));
+  const spawn = (_cmd: string, args: string[], opts?: { env?: Record<string, string | undefined> }) => {
+    docker.calls.push(args);
+    const record = { args, env: { PGPASSWORD: opts?.env?.PGPASSWORD, SMDB_COPY_VERIFIER: opts?.env?.SMDB_COPY_VERIFIER }, stdin: '' };
+    docker.spawns.push(record);
+    return child(stdin => { record.stdin = stdin; return spawnAnswer(args, stdin); });
+  };
   const exec = (_cmd: string, opts: any, cb?: any) => {
     const done = typeof opts === 'function' ? opts : cb;
     done?.(null, { stdout: '', stderr: '' });

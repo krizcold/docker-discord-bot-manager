@@ -145,7 +145,7 @@ const bot = () => containerManager.getBot('b1')!;
 const waitFor = async (cond: () => boolean): Promise<void> => {
   for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 10));
 };
-const slotDropped = (): boolean => h.spawns.some(a => a.join(' ').includes('SELECT pg_drop_replication_slot(slot_name)'));
+const slotDropped = (): boolean => h.spawns.some(a => a.join(' ').includes('SELECT pg_catalog.pg_drop_replication_slot(slot_name)'));
 
 beforeEach(async () => {
   await waitFor(() => containerManager.isBotBusy('b1') === null);
@@ -232,10 +232,10 @@ describe('B22-2s: a seed whose first record write is refused frees what its call
     expect(bot().fleetDbReplicaSeed).toBeUndefined();
   });
 
-  it('a stale-primary re-seed answers that the seed did not start and frees the backup slot', () => {
+  it('a stale-primary re-seed answers that the seed did not start and frees the backup slot', async () => {
     writeRegistry({ status: 'stopped', fleetDb: { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data' } });
     h.refuseFirst = true;
-    const res = reseedStalePrimary(bot(), codeFor(DSN), 'standby.invalid', 5440, true);
+    const res = await reseedStalePrimary(bot(), codeFor(DSN), 'standby.invalid', 5440, true);
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/^The seed did not start: its record could not be saved/);
     expect(fleetBackupGuards.claimFleetBackupBusy('b1')).toBe(true);

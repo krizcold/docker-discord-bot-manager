@@ -101,7 +101,7 @@ export function stored(id: string): any {
 }
 
 export function mainFixture(over: Record<string, unknown> = {}): Record<string, unknown> {
-  return { fleetDb: { ...MAIN }, maintenance: { ...SETTLED }, ...over };
+  return { fleetDb: { ...MAIN }, maintenance: { ...SETTLED }, fleetLogin: { password: 'ownpass' }, ...over };
 }
 
 export function copyFixture(over: Record<string, unknown> = {}): Record<string, unknown> {

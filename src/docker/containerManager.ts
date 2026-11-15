@@ -23,7 +23,7 @@ import {
   FleetJoinRecord, MigrateLast, MigrateRecord,
 } from '../types';
 import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
-import { switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
+import { copyLogin, switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
 import type { AppMemory } from '../instance/memoryRoom';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -229,6 +229,9 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   if (inst.fleetDb?.formerMain) {
     inst.fleetDb.formerMain.code = decryptRecordSecret(inst.id, 'fleetDb.formerMain.code', inst.fleetDb.formerMain.code) ?? '';
   }
+  if (inst.fleetLogin) {
+    inst.fleetLogin.password = decryptRecordSecret(inst.id, 'fleetLogin.password', inst.fleetLogin.password, 'restore the key; a Join or Re-seed instead makes a new password, which the main accepts only after its operator removes this machine\'s login there') ?? '';
+  }
 }
 
 function encryptedOrStashed(instId: string, field: string, plain: string | undefined): string | undefined {
@@ -244,7 +247,7 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
 
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
-  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetDb?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code];
+  const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetDb?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code, inst.fleetLogin?.password];
   for (const text of [inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code]) {
     const joined = text ? decodeJoinCode(text) : null;
     if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
@@ -318,6 +321,9 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   if (out.fleetJoin) {
     out.fleetJoin = { ...out.fleetJoin, code: encryptedOrStashed(inst.id, 'fleetJoin.code', out.fleetJoin.code) ?? '' };
   }
+  if (out.fleetLogin) {
+    out.fleetLogin = { ...out.fleetLogin, password: encryptedOrStashed(inst.id, 'fleetLogin.password', out.fleetLogin.password) ?? '' };
+  }
   return out;
 }
 
@@ -347,6 +353,9 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   }
   if (out.fleetJoin) {
     out.fleetJoin = { ...out.fleetJoin, code: '' };
+  }
+  if (out.fleetLogin) {
+    out.fleetLogin = { password: '' };
   }
   return out;
 }
@@ -1093,6 +1102,18 @@ export function updateInstanceFleetJoin(botId: string, join: FleetJoinRecord | n
   if (!instance) throw new Error('the bot is no longer in the registry');
   if (join) instance.fleetJoin = join;
   else delete instance.fleetJoin;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+}
+
+/** Set or clear the password of this machine's own login to the main. Throws when the registry cannot be saved. */
+export function updateInstanceFleetLogin(botId: string, login: { password: string } | null): void {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (login) instance.fleetLogin = { password: login.password };
+  else delete instance.fleetLogin;
   instance.updatedAt = new Date().toISOString();
   saveRegistry(registry);
 }
@@ -2391,8 +2412,8 @@ async function performDockerCleanup(appName: string, composePath: string): Promi
   return { failures };
 }
 
-export async function deleteBot(botId: string, keepData: boolean = false, keepEnv: boolean = true, confirmFleetData = false, confirmPromoted = false): Promise<boolean> {
-  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData, keepEnv, confirmFleetData, confirmPromoted));
+export async function deleteBot(botId: string, keepData: boolean = false, keepEnv: boolean = true, confirmFleetData = false, confirmPromoted = false, notes: string[] = []): Promise<boolean> {
+  return withBotOp(botId, 'delete', () => deleteBotImpl(botId, keepData, keepEnv, confirmFleetData, confirmPromoted, notes));
 }
 
 /**
@@ -2574,7 +2595,47 @@ function recordProjectVolumes(instance: InstanceConfig, declared: string[] | nul
   else instance.projectVolumes = [...new Set([...(instance.projectVolumes ?? []), ...declared])];
 }
 
-async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean, confirmFleetData: boolean, confirmPromoted: boolean): Promise<boolean> {
+/**
+ * R10, R24, R37, R46, R48: a copy's own row taken off the main's list as its login, and DEL-LOGIN for each database
+ * that holds this machine's login. The notes are for the operator; nothing here is a local remnant.
+ */
+async function joinedLoginNotes(instance: InstanceConfig): Promise<string[]> {
+  const notes: string[] = [];
+  const replica = instance.fleetDbReplica;
+  if (replica?.publicHost) {
+    const fleetJoin = await import('../instance/fleetJoin');
+    const code = fleetJoin.storedJoin(instance);
+    let reason: string | null;
+    if (!code) reason = 'the stored join code no longer decodes';
+    else if (!fleetJoin.copyLoginOf(instance, code)) reason = 'no login to the main was stored for it';
+    else {
+      try {
+        const cert = await fleetJoin.mainCertificate(code);
+        reason = cert.ok ? await fleetJoin.deleteAddress(instance, code, cert.pem) : cert.reason;
+      } catch (err) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+    }
+    if (reason) notes.push(`This machine's address could not be taken off the main's list (${reason}).`);
+  }
+  const holders: Array<{ host: string; port: number }> = [];
+  if (replica?.primaryHost && replica.primaryPort) holders.push({ host: replica.primaryHost, port: replica.primaryPort });
+  else if (instance.fleetJoin) holders.push({ host: instance.fleetJoin.host, port: instance.fleetJoin.port });
+  const db = instance.fleetDb;
+  for (const r of [db?.formerMain, db?.replacedBy, db?.mainConflict, db?.handover?.mode === 'stream' ? db.handover : undefined]) {
+    if (r?.host && r.port) holders.push({ host: r.host, port: r.port });
+  }
+  const login = copyLogin(instance.id);
+  const named = new Set<string>();
+  for (const { host, port } of holders) {
+    if (named.has(`${host}:${port}`)) continue;
+    named.add(`${host}:${port}`);
+    notes.push(`This machine's login ${login} stays on the database at ${host}:${port} until that database's operator removes it in its Database window, which also drops its slot and any row left.`);
+  }
+  return notes;
+}
+
+async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean, confirmFleetData: boolean, confirmPromoted: boolean, notes: string[]): Promise<boolean> {
   const instance = getBot(botId);
   if (!instance) return false;
   const refusal = await (await import('../instance/fleetReplica')).instanceRemovalRefusal(instance, keepData, confirmFleetData, confirmPromoted);
@@ -2700,6 +2761,7 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
   // prefixed, so step 3 misses it) and a leftover would block any same-name
   // reinstall from provisioning. Deleting the standby also orphans the
   // PRIMARY's replication slot, which retains WAL over there - warn loudly.
+  notes.push(...await joinedLoginNotes(instance));
   if (instance.fleetDbReplica) {
     await rmContainerTolerant(instance.fleetDbReplica.containerName, failures);
     if (!keepData) {
@@ -2707,7 +2769,7 @@ async function deleteBotImpl(botId: string, keepData: boolean, keepEnv: boolean,
       if (shared) failures.push(`replica volume ${instance.fleetDbReplica.volume} kept: ${shared}`);
       else if (!dockerClient.removeVolume(instance.fleetDbReplica.volume)) failures.push(`replica volume ${instance.fleetDbReplica.volume}: docker volume rm reported failure`);
     }
-    console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps replication slot ${instance.fleetDbReplica.slot}, which retains WAL until it is dropped there (its Database modal lists the slot with a Drop action once nothing streams on it)`);
+    console.warn(`[ContainerManager] Instance ${botId} hosted a database standby: the PRIMARY at ${instance.fleetDbReplica.primaryHost}:${instance.fleetDbReplica.primaryPort} keeps replication slot ${instance.fleetDbReplica.slot}, which retains WAL until it is dropped there (its Database modal lists the slot with a Drop action once nothing streams on it). Its login ${copyLogin(instance.id)} stays on the main until the main's operator removes it there.`);
   }
 
   // 3c. Derived-name helpers run UNCONDITIONALLY: a helper can outlive its

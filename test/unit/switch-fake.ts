@@ -37,8 +37,10 @@ export interface FakeDb {
   promote: 't' | 'f' | 'error';
   /** A step name (see the answer function) mapped to the stderr it fails with. */
   fail: Record<string, string>;
+  /** A failing step's exit code when it is not 1 (psql exits 2 when its connection is lost). */
+  failCodes?: Record<string, number>;
   roles: Record<string, { password: string; until: string; canLogin?: boolean }>;
-  /** The cluster's other role names (replicationRoleEnsureSql adds to it). */
+  /** The cluster's other role names (copyGroupEnsureSql adds to it). */
   clusterRoles: string[];
   /** Open sessions per role; RECEIVE_END_SQL ends them unless the role is pinned. */
   sessions: Record<string, number>;
@@ -55,6 +57,18 @@ export interface FakeDb {
   receiveMark: { markId: string; pushIds: string[]; dbOid: string } | null;
   /** false: the receive_mark table does not exist. */
   markTable: boolean;
+  /** The lines FOREIGN_READ_SQL prints (`<slot>|<user>|<pid>`). */
+  foreign: string[];
+  /** REMOVE_BLOCK_SQL's last line per login; `blocked|true|true|true` when unset. */
+  blockAnswer: Record<string, string>;
+  /** TAINTED_SLOT_SQL's output per slot; `true` then `slot|dropped` when unset. */
+  tainted: Record<string, string>;
+  /** The lines BLOCKED_SESSIONS_SQL prints (`<login>|<true or false>`). */
+  blockedSessions: string[];
+  /** LOBJ_SWEEP_SQL's owner lines (`<owner>|<n>`); the sweep unlinks them all. */
+  lobj: string[];
+  /** The members of smdb_copies with LOGIN; null: every machine login an address row names. */
+  members: string[] | null;
 }
 
 export function freshDb(over: Partial<FakeDb> = {}): FakeDb {
@@ -62,7 +76,8 @@ export function freshDb(over: Partial<FakeDb> = {}): FakeDb {
     generation: { generation: 3, machine: 'main.example', since: '2026-10-28T10:00:00Z' }, tables: true, handover: null, received: [], addresses: [],
     copies: [], dbOid: '16384', deleteLsn: null, beforeAnswer: null, restoreState: null, readOnly: false, recovery: false, botDbMissing: false, slots: {}, currentLsn: '0/5000000', receiveLsn: '0/5000000',
     replayLsn: '0/5000000', replayTs: '2026-10-28T11:00:00Z', systemId: '7001', promote: 't', fail: {}, roles: {}, clusterRoles: ['app', 'dbm_admin', 'replicator'], sessions: {}, pinnedSessions: {}, onSlotRead: null,
-    hbaFileBlock: false, hbaLive: false, hbaFile: '/var/lib/postgresql/data/pg_hba.conf', authTimeout: '0', receiveMark: null, markTable: true, ...over,
+    hbaFileBlock: false, hbaLive: false, hbaFile: '/var/lib/postgresql/data/pg_hba.conf', authTimeout: '0', receiveMark: null, markTable: true,
+    foreign: [], blockAnswer: {}, tainted: {}, blockedSessions: [], lobj: [], members: null, ...over,
   };
 }
 
@@ -78,6 +93,7 @@ export function resetFake(): void {
   fake.onEvent = null;
 }
 
+const MACHINE_SLOT = /^fleet_standby_([0-9a-f]{32})$/;
 const NO_TABLE = (t: string) => `ERROR:  relation "smdb_manager.${t}" does not exist`;
 const lsnNum = (l: string) => { const [a, b] = l.split('/'); return (BigInt(`0x${a}`) << 32n) + BigInt(`0x${b}`); };
 const genLine = (g: GenFake | null) => (g ? `${g.generation}|${g.machine}|${g.since ?? ''}` : '0||');
@@ -90,8 +106,49 @@ const err = (stderr: string): Answer => ({ code: 1, stdout: '', stderr });
 export function answerSql(container: string, dbName: string, sql: string): Answer {
   const d = fake.dbs[container];
   if (!d) return err(`Error response from daemon: No such container: ${container}`);
-  const failing = (step: string) => (d.fail[step] !== undefined ? err(d.fail[step]) : null);
+  const failing = (step: string) => (d.fail[step] !== undefined ? { ...err(d.fail[step]), code: d.failCodes?.[step] ?? 1 } : null);
   const out: string[] = [];
+  const memberLogins = () => d.members ?? d.addresses.map(a => (a.slot ? MACHINE_SLOT.exec(a.slot)?.[1] : undefined)).filter((x): x is string => !!x).map(x => `smdb_copy_${x}`);
+  if (sql.includes("r.usename IS DISTINCT FROM 'smdb_copy_'")) {
+    emit('foreign-read');
+    return failing('foreign-read') ?? ok(d.foreign.map(l => `${l}\n`).join(''));
+  }
+  const blockOf = /REVOKE smdb_copies FROM %I GRANTED BY %I', '(smdb_copy_[0-9a-f]{32})'/.exec(sql);
+  if (blockOf) {
+    emit(`block:${blockOf[1]}`);
+    return failing('block') ?? ok(`committing\n${d.blockAnswer[blockOf[1]] ?? 'blocked|true|true|true'}\n`);
+  }
+  const taintedOf = /SELECT 'slot\|' \|\| coalesce\(\(SELECT 'kept' FROM pg_catalog\.pg_replication_slots WHERE slot_name = '([^']*)'/.exec(sql);
+  if (taintedOf) {
+    emit(`tainted:${taintedOf[1]}`);
+    return failing('tainted') ?? ok(`${d.tainted[taintedOf[1]] ?? 'true\nslot|dropped'}\n`);
+  }
+  if (sql.includes('a.client_addr IS NOT NULL')) {
+    emit('blocked-sessions');
+    return failing('blocked-sessions') ?? ok(d.blockedSessions.map(l => `${l}\n`).join(''));
+  }
+  if (sql.includes('pg_catalog.pg_largeobject_metadata')) {
+    emit('lobj');
+    const f = failing('lobj');
+    if (f) return f;
+    const lines = d.lobj;
+    d.lobj = [];
+    return ok(`${lines.map(l => `${l}\n`).join('')}unlinked|${lines.reduce((s, l) => s + Number(l.split('|').pop()), 0)}\n`);
+  }
+  if (sql.includes('string_agg(m.member::regrole::text')) {
+    emit('new-logins');
+    return failing('new-logins') ?? ok(`${memberLogins().join(',')}\n`);
+  }
+  const ownSlot = /AND a\.slot <> '([^']*)'/.exec(sql);
+  if (ownSlot && sql.includes("SELECT 'addr|'")) {
+    emit('own-peers');
+    const f = failing('own-peers');
+    if (f) return f;
+    const members = memberLogins();
+    return ok(d.addresses.filter(a => a.slot !== null && MACHINE_SLOT.test(a.slot) && a.slot !== ownSlot[1] && members.includes(`smdb_copy_${MACHINE_SLOT.exec(a.slot)![1]}`))
+      .sort((x, y) => x.host.localeCompare(y.host) || x.port - y.port)
+      .map(a => `addr|${a.host}|${a.port}|${a.machine}|${a.cert.replace(/\n/g, '~')}\n`).join(''));
+  }
   if (sql.includes('INSERT INTO smdb_manager.receive_mark')) {
     emit('mark-write');
     const f = failing('mark-write');
@@ -157,7 +214,7 @@ export function answerSql(container: string, dbName: string, sql: string): Answe
     }
     if (!sql.includes('INSERT INTO smdb_manager.generation')) return ok();
   }
-  if (sql.includes('CREATE ROLE') && sql.includes('NOLOGIN REPLICATION')) {
+  if (sql.includes('CREATE ROLE') && (sql.includes('NOLOGIN REPLICATION') || sql.includes('CREATE ROLE smdb_copies NOLOGIN'))) {
     emit('role-ensure');
     const f = failing('role-ensure');
     if (f) return f;
@@ -265,6 +322,7 @@ export function answerSql(container: string, dbName: string, sql: string): Answe
     if (!d.generation || d.generation.generation < target) d.generation = { generation: target, machine: m[1], since: '2026-10-28T13:00:00Z' };
     d.handover = null;
     if (sql.includes('DELETE FROM smdb_manager.addresses WHERE slot IS NOT NULL')) d.addresses = d.addresses.filter(a => a.slot === null);
+    if (sql.includes('  DELETE FROM smdb_manager.addresses;\n')) d.addresses = [];
     const old = /host = %L AND port = (\d+)', '([^']*)'\)/.exec(sql);
     if (old) d.addresses = d.addresses.filter(a => !(a.slot === null && a.host === old[2] && a.port === Number(old[1])));
     return ok(`${genLine(d.generation)}\n`);

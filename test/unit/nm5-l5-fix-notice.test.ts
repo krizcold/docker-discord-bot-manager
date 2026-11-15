@@ -205,7 +205,7 @@ describe('L5 fix: the held restore notice across a stale-primary re-seed', () =>
   it('a failed retire keeps the notice the registry could not save', async () => {
     await holdNotice();
     tmp.retireFail = true;
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
     await finished();
     expect(containerManager.getBot('a')?.fleetDb).toBeTruthy();
     expect(fleetBackup.getFleetRestoreError('a')).toContain('a manager restart drops it');
@@ -214,7 +214,7 @@ describe('L5 fix: the held restore notice across a stale-primary re-seed', () =>
 
   it('a retire that succeeds forgets the held notice, so a database record written back shows none', async () => {
     await holdNotice();
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
     await finished();
     const reg = readReg();
     expect(reg.instances.a.fleetDb).toBeUndefined();

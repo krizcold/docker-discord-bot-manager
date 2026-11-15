@@ -41,6 +41,7 @@ vi.mock('../../src/docker/containerManager', async (importOriginal) => {
   };
 });
 
+import * as envManager from '../../src/env/manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as containerManager from '../../src/docker/containerManager';
@@ -59,6 +60,7 @@ const REPLICA = {
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), fleetDbReplica: REPLICA, ...over,
 } } }, null, 2));
 const bot = () => containerManager.getBot('b')!;
@@ -104,7 +106,7 @@ describe('O8: Re-seed from the stored join', () => {
     ['C77 a copy that is not running', () => { docker.statusProbe = null; docker.running = 'false'; }, 'The standby container is not running, so it cannot be verified as an unpromoted copy; start the instance if it is stopped, and press Build on its card, then Apply (or Start if the instance is stopped), if a stopped re-seed took the standby service out of its compose'],
     ['C78 an unreachable main (T-15)', () => { certSource.fetch = async () => ({ ok: false, reason: 'timeout' }); }, "Can't reach the main at main.invalid:15432 (timeout); nothing was changed. The main's machine must accept connections on that port. A machine that cannot open a port can be the main only when it runs alone."],
     ['C78 another certificate (T-16)', () => { certSource.fetch = async () => ({ ok: true, pem: COPY_PEM, fp: 'a'.repeat(64) }); }, `The database at main.invalid:15432 shows a certificate with fingerprint ${'a'.repeat(16)}..., not the ${FIXTURE_FP.slice(0, 16)}... in the join code, so the manager did not trust it; nothing was changed. Copy a new join code from the main's manager. If the main's certificate did not change, something else answers at that address.`],
-    ['C78 a refused login (T-17)', () => { docker.main.fail = 'psql: error: FATAL:  no pg_hba.conf entry for replication connection'; }, "The main at main.invalid:15432 refused the join code's login (FATAL:  no pg_hba.conf entry for replication connection); nothing was changed. Replication may have been disabled there, or its password changed: copy a new join code from the main's manager."],
+    ['C78 a refused login (T-17)', () => { docker.main.fail = 'psql: error: FATAL:  no pg_hba.conf entry for replication connection'; }, "The main at main.invalid:15432 refused this machine's login (FATAL:  no pg_hba.conf entry for replication connection); nothing was changed. Replication may have been disabled there, or the main's operator removed this machine's login: join again with the main's current join code."],
     ['C78 a main in recovery (T-18)', () => { docker.main.inRecovery = true; }, 'The database at main.invalid:15432 follows another database itself, so it cannot be joined; copy the join code from the manager of the machine that holds the main database.'],
     ['C78 another system id (T-43)', () => { docker.main.systemId = '9999'; }, 'The main in the join code (system id 9999) is not the database this copy was made from (system id 7001), so nothing was changed. To follow that database, remove this copy and add a new one.'],
     ['C81 the backup slot is held', () => { fleetBackupGuards.claimFleetBackupBusy('b'); }, "A dump, restore or replication change is running on this instance's database, so the re-seed was refused and nothing was changed; wait for it to finish, then re-seed again"],

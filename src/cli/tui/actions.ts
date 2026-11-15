@@ -27,7 +27,9 @@ export type ActionRow =
   | { kind: 'stopreceive'; label: string; safetyDump: string }
   | { kind: 'moveout'; label: string }
   | { kind: 'push'; label: string }
-  | { kind: 'showcode'; label: string };
+  | { kind: 'showcode'; label: string }
+  | { kind: 'remove-login'; label: string; login: string }
+  | { kind: 'renew-code'; label: string };
 
 /** The screen's newest reads the rows are built from; a read that failed or has not landed offers nothing. */
 export interface ActionReads {
@@ -147,6 +149,11 @@ function mainRows(reads: ActionReads): ActionRow[] {
   for (const s of (live && live.slots) || []) {
     if (s.fleet && !s.active) rows.push({ kind: 'drop', label: `Drop slot ${s.slot}${s.machine ? ` (the copy on ${s.machine})` : ''}`, slot: s.slot });
   }
+  // Remove on every machine login but this machine's own (renderFleetReplication's Machine logins list).
+  for (const l of (live && live.logins) || []) {
+    if (!l.own) rows.push({ kind: 'remove-login', label: `Remove the login ${l.login}${l.machine ? ` (${l.machine})` : ''}`, login: l.login });
+  }
+  rows.push({ kind: 'renew-code', label: 'New join code' });
   // Disable replication (:2920).
   rows.push({ kind: 'disable', label: 'Disable replication' });
   return rows;
@@ -249,10 +256,41 @@ export function dropOutcome(slot: string, r: Outcome<{ success?: boolean; error?
   return r.value.success === true ? { ok: true, text: `Slot ${slot} dropped` } : { ok: false, text: r.value.error || 'Failed to drop the slot' };
 }
 
+export interface LoginAnswer {
+  success?: boolean;
+  error?: string;
+  text?: string;
+  needsConfirm?: boolean;
+}
+
+// removeMachineLogin (index.html): the server's text, whatever the answer.
+export function removeLoginOutcome(login: string, r: Outcome<LoginAnswer>): Said {
+  if (r.ok === null) return { ok: null, text: noAnswerText('login removal', r.text) };
+  if (r.ok === false) return { ok: false, text: r.text || `The login ${login} was not removed` };
+  if (r.value.success === true) return { ok: true, text: r.value.text || `Removed the login ${login}` };
+  return { ok: false, text: r.value.error || `The login ${login} was not removed` };
+}
+
+// renewJoinCode (index.html): RENEW-ASK.
+export const RENEW_QUESTION = [
+  'Make a new join code?',
+  'The current code stops adding machines at once, and its open sessions on this database are ended. This machine\'s own login also gets a new password. Machines that joined already keep their own logins.',
+];
+
+export function renewOutcome(r: Outcome<LoginAnswer>): Said {
+  if (r.ok === null) return { ok: null, text: noAnswerText('join code renewal', r.text) };
+  if (r.ok === false) return { ok: false, text: r.text || 'The join code was not renewed' };
+  if (r.value.success === true) return { ok: true, text: r.value.text || 'Made a new join code.' };
+  return { ok: false, text: r.value.error || 'The join code was not renewed' };
+}
+
+/** RENEW-NOCODE (R47): the renewal stands, and the read of the new code failed. */
+export const renewNoCodeText = (done: string, reason: string) => `${done} But the code could not be shown: ${reason}`;
+
 // disableFleetReplication (:3024).
 export const DISABLE_QUESTION = [
   'Disable replication?',
-  'Refused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the replication login is revoked at once; the published port closes at the next restart, and a database URL that names this database is set back to its private form then.',
+  'Refused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the join login and every machine\'s login are closed at once; the published port closes at the next restart, and a database URL that names this database is set back to its private form then.',
 ];
 
 export function disableOutcome(r: Outcome<ReplicationAnswer>): Said {

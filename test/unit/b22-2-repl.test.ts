@@ -90,8 +90,8 @@ const REPLICA = {
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({
     instances: {
-      b1: {
-        id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
+      'b1b1b1b1-0000-4000-8000-000000000001': {
+        id: 'b1b1b1b1-0000-4000-8000-000000000001', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: { DATA_BACKEND: 'postgres' },
         createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
@@ -100,7 +100,7 @@ const writeRegistry = (extra: Record<string, unknown> = {}): void => {
     },
   }));
 };
-const bot = () => containerManager.getBot('b1')!;
+const bot = () => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!;
 
 beforeEach(() => {
   h.refuseEnv = false;
@@ -109,7 +109,7 @@ beforeEach(() => {
   h.exec = 'f|||\n';
   h.conninfo = '';
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
-  fs.mkdirSync(path.join(h.dir, 'bots', 'b1', 'env'), { recursive: true });
+  fs.mkdirSync(path.join(h.dir, 'bots', 'b1b1b1b1-0000-4000-8000-000000000001', 'env'), { recursive: true });
 });
 
 afterAll(() => {
@@ -119,11 +119,11 @@ afterAll(() => {
 describe('R42-J3: a Disable whose closing writes are refused names what changed and Disable again', () => {
   it('answers success:false with the real state', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl });
+    envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl });
     h.refuseEnv = true;
     const res = await disableFleetReplication(bot());
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/slots are dropped and the replication login is revoked/);
+    expect(res.error).toMatch(/slots are dropped and the join login and the machines' logins are closed/);
     expect(res.error).toMatch(/ENOSPC/);
     expect(res.error).toMatch(/press Disable replication again to finish it/);
     expect(bot().fleetDb?.replication?.disablingSince).toBeTypeOf('string');
@@ -134,7 +134,7 @@ describe('R42-J3: an adopt whose env or record write is refused changes nothing'
   for (const [label, conninfo] of [['without', ''], ['with', "primary_conninfo = 'host=primary.invalid port=5433 user=replicator password=Repl-Secret-0123456789 sslmode=verify-full'\n"]] as const) {
     it(`a refused env write leaves the standby a standby, ${label} the replicator credential in the copy`, async () => {
       writeRegistry({ fleetDbReplica: { ...REPLICA } });
-      envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl });
+      envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl });
       h.conninfo = conninfo;
       h.refuseEnv = true;
       const res = await adoptPromotedReplica(bot());
@@ -149,14 +149,14 @@ describe('R42-J3: an adopt whose env or record write is refused changes nothing'
 
   it('a refused record flip puts the env store back, with the replicator credential in the copy', async () => {
     writeRegistry({ fleetDbReplica: { ...REPLICA } });
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl });
+    envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl });
     h.conninfo = "primary_conninfo = 'host=primary.invalid port=5433 user=replicator password=Repl-Secret-0123456789 sslmode=verify-full'\n";
     h.refuseFlip = true;
     const res = await adoptPromotedReplica(bot());
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/record could not be written \(ENOSPC.*not adopted; nothing was changed/);
     expect(bot().fleetDb).toBeUndefined();
-    expect(envManager.getEnvVars('b1').DATA_BACKEND_URL).toBe(dbUrl);
+    expect(envManager.getEnvVars('b1b1b1b1-0000-4000-8000-000000000001').DATA_BACKEND_URL).toBe(dbUrl);
   });
 
   it('lets Enable recover the password from a fallback when the manager env holds no URL', async () => {
@@ -177,10 +177,10 @@ describe('R43-J1: a re-seed whose pins retire was refused offers Finish retire',
 
   it('removes every pin still stored and says what the node is now', async () => {
     writeRegistry({ fleetDbReplicaSeed: seed() });
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl, DATA_BACKEND: 'postgres', OTHER: 'kept' });
+    envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl, DATA_BACKEND: 'postgres', OTHER: 'kept' });
     const res = await fleetReplica.finishPinsRetire(bot());
     expect(res.success).toBe(true);
-    const stored = envManager.getEnvVars('b1');
+    const stored = envManager.getEnvVars('b1b1b1b1-0000-4000-8000-000000000001');
     expect(stored.DATA_BACKEND_URL).toBeUndefined();
     expect(stored.DATA_BACKEND).toBeUndefined();
     expect(stored.OTHER).toBe('kept');
@@ -190,12 +190,12 @@ describe('R43-J1: a re-seed whose pins retire was refused offers Finish retire',
 
   it('tries every key and names the ones it could not retire', async () => {
     writeRegistry({ fleetDbReplicaSeed: seed() });
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl, DATA_BACKEND: 'postgres' });
+    envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl, DATA_BACKEND: 'postgres' });
     h.refuseDelete = 'DATA_BACKEND_URL';
     const res = await fleetReplica.finishPinsRetire(bot());
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/DATA_BACKEND_URL/);
-    expect(envManager.getEnvVars('b1').DATA_BACKEND).toBeUndefined();
+    expect(envManager.getEnvVars('b1b1b1b1-0000-4000-8000-000000000001').DATA_BACKEND).toBeUndefined();
     expect(bot().fleetDbReplicaSeed?.pinsUnretired).toEqual(['DATA_BACKEND_URL']);
   });
 });

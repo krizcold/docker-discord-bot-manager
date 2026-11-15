@@ -3,7 +3,7 @@ import {
   ActionResult, BackupEntry, Bot, botName, decommissionDb, dismissRestoreNotice, FleetBackupStatus, Outcome, readConnections, readFleetBackups,
   cancelSeed, dropReplicationSlot, finishRetire, joinFleet, provisionReplica, ProvisionBody, readJoinCode, readMaintenance, readMemory, readReplica, readReplication,
   readRestorePreview, readSwitch, removeReplica, ReplicationStatus, reseedCopy, restoreBackup, saveBackupConfig, setReplication,
-  laneCall, lanePath, LaneResult, rejoinCopy,
+  laneCall, lanePath, LaneResult, rejoinCopy, removeMachineLogin, renewJoinCode,
 } from './api';
 import {
   ActionRow, actionRows, boundOutcome, SeedCancelAnswer, boundReadFailure, DISABLE_QUESTION, disableOutcome, dropOutcome, dropQuestion, EnableForm, enableOutcome,
@@ -11,7 +11,8 @@ import {
   NO_SEED_TEXT, PROVISION_ROUNDS, provisionOutcome, provisionQuestion, removeOutcome, removeQuestion, RESEED_QUESTION, reseedOutcome, retireOutcome,
   handOverQuestion, keepQuestion, LANE_LIMIT_MS, LANE_NOT_CONFIRMED, LaneOp, laneOutcome, rejoinOutcome, rejoinQuestion, STALE_QUESTION, STALE_RUNNING,
   STALE_TIP, staleOutcome, takeOverQuestion, workingText, MOVE_CODE_SHOWN_TEXT, MOVE_OUT_QUESTION, moveCodeReadyText, newCodeQuestion, PUSH_LIMIT_MS,
-  pushQuestion, receiveQuestion, joinedFirst, cancelQuestion, stopReceiveQuestion,
+  pushQuestion, receiveQuestion, joinedFirst, cancelQuestion, stopReceiveQuestion, LoginAnswer, removeLoginOutcome, RENEW_QUESTION, renewNoCodeText,
+  renewOutcome,
 } from './actions';
 import { CodeField, CodeShown, JOIN_CODE_NOTES, joinCodeFailure } from './codes';
 import { Dialog } from './dialog';
@@ -397,12 +398,51 @@ export class DatabaseScreen {
       return;
     }
     if (r.ok === true && r.value.joinCode) {
-      const bot = this.bot();
       this.changed();
-      this.showCode({ title: `Join code of ${bot ? botName(bot) : this.botId}`, code: r.value.joinCode, notes: JOIN_CODE_NOTES });
+      this.showCode(this.joinCodeShown(r.value.joinCode, r.value.note));
       return;
     }
     this.say(joinCodeFailure(r.ok === true ? { ok: false, text: '' } : r));
+  }
+
+  // The join code's note (R43) goes under the code, in the same view.
+  private joinCodeShown(code: string, note?: string): CodeShown {
+    const bot = this.bot();
+    return { title: `Join code of ${bot ? botName(bot) : this.botId}`, code, notes: note ? [...JOIN_CODE_NOTES, note] : JOIN_CODE_NOTES };
+  }
+
+  // renewJoinCode (index.html): the renewal, then one read of the new code for the code screen. A renewal that stands
+  // with no code shown is one line, RENEW-NOCODE (R47); the note joins the renewal's line (R43).
+  private renewCode(): void {
+    void this.act('Making a new join code.', true, async () => {
+      const said = renewOutcome(await renewJoinCode(this.client, this.botId) as Outcome<LoginAnswer>);
+      if (said.ok !== true) return said;
+      const r = await readJoinCode(this.client, this.botId, this.limitMs);
+      if (r.ok !== true || !r.value.joinCode) {
+        const reason = r.ok === null ? `the manager did not answer (${r.text})` : (r.ok === false && r.text) || 'No join code was made';
+        return { ok: false, text: renewNoCodeText(said.text, reason) };
+      }
+      if (this.closed || this.showCode(this.joinCodeShown(r.value.joinCode, r.value.note)) !== true) {
+        return { ok: false, text: renewNoCodeText(said.text, 'the Database screen was closed before the code came; press J on it to show the code') };
+      }
+      return { ok: true, text: r.value.note ? `${said.text} ${r.value.note}` : said.text };
+    });
+  }
+
+  // removeMachineLogin (index.html): the first call never confirms; a streaming login's RM-CONFIRM comes from the server.
+  private removeLogin(login: string, confirm: boolean): void {
+    void this.act(`Removing the login ${login}.`, true, async () => {
+      const r = await removeMachineLogin(this.client, this.botId, login, confirm);
+      const v = r.ok === true ? (r.value as LoginAnswer) : null;
+      if (!confirm && v && v.success !== true && v.needsConfirm === true) {
+        const q = v.error || `Remove the login ${login}?`;
+        return {
+          ask: () => this.ask([q], 'Y Remove', () => this.removeLogin(login, true), 'Cancelled: nothing was removed.'),
+          lost: { ok: false, text: `Nothing was removed: the manager asked to confirm after the Database screen was closed (${q}).` },
+        };
+      }
+      return removeLoginOutcome(login, r as Outcome<LoginAnswer>);
+    });
   }
 
   /** The rows of the Actions list, built from the bot and this screen's newest reads. */
@@ -726,6 +766,14 @@ export class DatabaseScreen {
       this.ask(DISABLE_QUESTION, 'Y Disable', () => {
         void this.act('Disabling replication.', true, async () => disableOutcome(await setReplication(this.client, this.botId, { enabled: false })));
       });
+      return;
+    }
+    if (row.kind === 'remove-login') {
+      this.removeLogin(row.login, false);
+      return;
+    }
+    if (row.kind === 'renew-code') {
+      this.ask(RENEW_QUESTION, 'Y Make a new code', () => this.renewCode(), 'Cancelled: no new join code was made.');
       return;
     }
     if (row.kind === 'join' || row.kind === 'add') {

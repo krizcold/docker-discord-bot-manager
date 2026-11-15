@@ -54,7 +54,8 @@ const SMDB = 'https://example.invalid/fake/super-modular-discord-bot';
 const REGISTRY = path.join(h.dir, 'instances.json');
 const base = (over: Record<string, unknown> = {}) => ({
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
-  envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...over,
+  envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') }, ...over,
 });
 const REPLICA = {
   containerName: 'b-fleet-postgres-replica', volume: 'b-fleet-postgres-replica-data', slot: 'fleet_standby_b',
@@ -155,7 +156,7 @@ describe('O3: every refused phase changes nothing (C15 to C29)', () => {
     ['C19 unreachable (T-15)', () => { certSource.fetch = async () => ({ ok: false, reason: 'connect ECONNREFUSED' }); }, fakeJoinCode(), "Can't reach the main at main.invalid:15432 (connect ECONNREFUSED); nothing was changed. The main's machine must accept connections on that port. A machine that cannot open a port can be the main only when it runs alone."],
     ['C19 another certificate (T-16)', () => { certSource.fetch = async () => ({ ok: true, pem: COPY_PEM, fp: COPY_FP }); }, fakeJoinCode(), `The database at main.invalid:15432 shows a certificate with fingerprint ${COPY_FP.slice(0, 16)}..., not the ${FIXTURE_FP.slice(0, 16)}... in the join code, so the manager did not trust it; nothing was changed. Copy a new join code from the main's manager. If the main's certificate did not change, something else answers at that address.`],
     ['C20 the image pull fails', () => { docker.imagePresent = false; docker.pullFail = 'toomanyrequests: rate limit'; }, fakeJoinCode(), 'could not pull postgres:16-alpine: toomanyrequests: rate limit'],
-    ['C21 the login is refused (T-17)', () => { docker.main.fail = 'psql: error: FATAL:  password authentication failed for user "replicator"'; }, fakeJoinCode(), 'The main at main.invalid:15432 refused the join code\'s login (FATAL:  password authentication failed for user "replicator"); nothing was changed. Replication may have been disabled there, or its password changed: copy a new join code from the main\'s manager.'],
+    ['C21 the login is refused (T-17, NM22 L15)', () => { docker.main.fail = 'psql: error: FATAL:  password authentication failed for user "smdb_copy_b"'; }, fakeJoinCode(), 'The main at main.invalid:15432 refused this machine\'s login (FATAL:  password authentication failed for user "smdb_copy_b"); nothing was changed. Replication may have been disabled there, or the main\'s operator removed this machine\'s login: join again with the main\'s current join code.'],
     ['C21 the main follows another (T-18)', () => { docker.main.inRecovery = true; }, fakeJoinCode(), 'The database at main.invalid:15432 follows another database itself, so it cannot be joined; copy the join code from the manager of the machine that holds the main database.'],
     ['C22 a copy of another database (T-19)', () => { writeRegistry({ fleetDbReplica: REPLICA }); docker.copy = 'true|streaming|9999|1|0/1'; }, fakeJoinCode(), 'This join code is for a different database (system id 7001) from the copy on this machine (system id 9999); nothing was changed. Remove the copy first to follow that database.'],
     ['C22 a copy that does not answer (T-20)', () => { writeRegistry({ fleetDbReplica: REPLICA }); docker.copy = null; }, fakeJoinCode(), "The copy on this machine did not answer, so the manager can't confirm it belongs to the database in this join code; nothing was changed. Start the instance and try again."],

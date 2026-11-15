@@ -228,7 +228,7 @@ describe("NM1 L5: reseedStalePrimary's identity read", () => {
       vi.spyOn(containerManager, 'retireFleetDbSidecar').mockImplementation(async () => ({ success: true }) as any),
     ];
     try {
-      const r = fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
+      const r = await fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'),
         'standby.invalid', 5440, true);
       expect(r.success, r.error).toBe(true);
       await vi.waitFor(() => expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked).toBe(true), { timeout: 5000 });
@@ -292,11 +292,13 @@ describe('NM1 L5: the SQL fleetReplication sends', () => {
   const PSQL = ['exec', fleetDb.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
   const psqlCall = (sql: string) => h.calls.find(a => a.includes('psql') && a[a.length - 1] === sql);
 
-  it('enable sets wal_log_hints and the WAL retention bound, reloads, and makes the replication role through psql -At on stdin', async () => {
-    writeInstance({ status: 'running', fleetDb: { ...fleetDb, replication } });
+  it('enable sets wal_log_hints and the WAL retention bound, reloads, and makes the join and machine logins through psql -At on stdin', async () => {
+    // NM22: Enable makes this machine's own login from the instance id, so the instance has a uuid id as the manager gives it.
+    const id = 'b1b1b1b1-0000-4000-8000-000000000001';
+    writeInstances({ [id]: { status: 'running', fleetDb: { ...fleetDb, replication } } });
     h.env = { DATABASE_URL: `postgres://${fleetDb.user}:pw@${fleetDb.containerName}:5432/${fleetDb.db}` };
     h.answer = answerWith(args => (args.some(x => x.includes('regexp_split_to_table')) ? '0\n' : base(args)));
-    const r = await enableFleetReplication(containerManager.getBot('b1')!, 'primary.invalid', 15432, 2048);
+    const r = await enableFleetReplication(containerManager.getBot(id)!, 'primary.invalid', 15432, 2048);
     expect(r.success, r.error).toBe(true);
     for (const sql of ['ALTER SYSTEM SET wal_log_hints = on;', "ALTER SYSTEM SET max_slot_wal_keep_size = '2048MB';", 'SELECT pg_reload_conf();']) {
       expect(psqlCall(sql), sql).toEqual([...PSQL, sql]);

@@ -111,7 +111,7 @@ describe('B19-1h: the start lane narrows the lines a Disable left on the databas
     const r = await containerManager.startBot('b1');
     expect(r.success).toBe(true);
     expect(hbaWrites().length).toBe(1);
-    expect(hbaWrites()[0].stdin).toBe(pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(pgHbaContent('smdb'));
     expect(containerManager.getBot('b1')!.fleetDb!.keptPlain).toBeUndefined();
     expect(containerManager.getBot('b1')!.fleetDb!.replication).toBeUndefined();
   }, 20000);

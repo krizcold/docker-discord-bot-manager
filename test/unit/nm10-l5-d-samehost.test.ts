@@ -166,7 +166,7 @@ describe('the stale-primary re-seed: its own host on another port', () => {
   beforeEach(() => writeRegistry({ status: 'stopped', fleetDbReplica: undefined, fleetJoin: undefined, fleetDb: STALE }));
 
   it('is not taken for its own join code', async () => {
-    const r = fleetReplica.reseedStalePrimary(bot(), codeFor('postgresql://replicator:pw@self.invalid:5439/smdb'), 'standby.invalid', 5441);
+    const r = await fleetReplica.reseedStalePrimary(bot(), codeFor('postgresql://replicator:pw@self.invalid:5439/smdb'), 'standby.invalid', 5441);
     expect(r.error).not.toBe(OWN_CODE);
     expect(r.needsConfirm).toBeUndefined();
     await idle();

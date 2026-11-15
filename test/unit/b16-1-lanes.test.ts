@@ -71,7 +71,7 @@ describe('R13-J15: lanes in flight refused by the shutdown name the shutdown', (
     const results = [
       await enableFleetReplication(bot(), 'standby.invalid', 5433),
       await disableFleetReplication(bot()),
-      reseedStalePrimary(bot(), codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true }),
+      await reseedStalePrimary(bot(), codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true }),
       await decommissionFleetDb('b1'),
     ];
     for (const r of results) {

@@ -171,11 +171,12 @@ export interface FleetDbTakeover {
 
 // Replication posture for the managed sidecar (PLAN_REPLICATION.md Stage 1).
 // Present = the database is exposed (published port, TLS required off-host) and
-// carries a replication role; every standby mints its own physical slot on it
-// (PLAN_REPLICATION 20.19 F1), so no slot is recorded here.
+// carries the join login smdb_join, which a joining manager uses only to mint its
+// own machine login; every copy streams as its own machine login on its own
+// slot, so no slot is recorded here.
 export interface FleetDbReplication {
-  role: string;                        // replication login role, e.g. 'replicator'
-  password: string;                    // same trust domain as the URL mirror in this registry
+  role: string;                        // the join login, 'smdb_join'
+  password: string;                    // the join login's password; same trust domain as the URL mirror in this registry
   hostPort: number;                    // published host port (container 5432)
   publicHost: string;                  // operator-provided host workers/replicas dial
   certHost: string;                    // host the pinned cert names; differing publicHost forces regeneration
@@ -259,6 +260,19 @@ export interface JoinAddress {
   slot: string | null;
   cert: string;
   machine: string;
+}
+
+/** One machine login on a main, as the Database window lists it (3.11, R4). */
+export interface MachineLoginStatus {
+  login: string;
+  own: boolean;                        // this machine's own login
+  member: boolean;                     // in smdb_copies; false = blocked, not removed yet
+  canLogin: boolean;
+  slot: string | null;
+  slotState: 'active' | 'kept' | 'lost' | 'absent';
+  machine: string | null;              // the machine name of its address row
+  address: string | null;              // host:port of its address row
+  client: string | null;               // the address streaming on its slot
 }
 
 // The main this instance joined with a join code. The code itself is a record secret (encrypted at rest); the
@@ -372,6 +386,7 @@ export interface InstanceConfig {
   fleetBackupAlerts?: Record<string, FleetBackupAlert>; // standing backup alerts by <family>:<dumps|test>
   fleetBackupStarts?: Partial<Record<BackupFamily, number>>; // when the scheduler first found each family to back up
   fleetJoin?: FleetJoinRecord;         // the main this instance joined with a join code
+  fleetLogin?: { password: string };   // this machine's own login (smdb_copy_<id>) on every database of its lineage; never leaves this manager
   fleetCopyAlerts?: Record<string, FleetBackupAlert>; // the owner's messages about this machine's copy, by held|stopped|rebuilt
 
   // Detection (for git source)

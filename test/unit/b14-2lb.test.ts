@@ -233,7 +233,7 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
     const once = fs.readFileSync(file, 'utf8');
     runSh(fleetBackup.fenceHbaScript(true, OWNER, shPath(file)));
     expect(fs.readFileSync(file, 'utf8')).toBe(once);
-    expect(once).toBe(`hostssl replication replicator all scram-sha-256 # smdb-fence-owner=${OWNER} # smdb-write-fence\n`
+    expect(once).toBe(`hostssl replication +smdb_copies all scram-sha-256 # smdb-fence-owner=${OWNER} # smdb-write-fence\n`
       + `host replication all all reject # smdb-fence-owner=${OWNER} # smdb-write-fence\nhost all all all reject # smdb-fence-owner=${OWNER} # smdb-write-fence\n` + MANAGED);
     expect(fs.existsSync(`${file}.fence`)).toBe(false);
   });
@@ -294,7 +294,7 @@ describe('B14-2Lb: the fence refuses every outside connection', () => {
     await fleetBackup.applyWriteFence(primary, OWNER, 'any');
     const sweep = pg.sql.find(s => s.includes('pg_terminate_backend(pid, 5000)'))!;
     expect(sweep).toContain("backend_type = 'client backend'");
-    expect(sweep).toContain("backend_type = 'walsender' AND NOT (usename IS NOT DISTINCT FROM 'replicator' AND datname IS NULL)");
+    expect(sweep).toContain("backend_type = 'walsender' AND NOT (datname IS NULL AND EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = usesysid AND m.roleid = pg_catalog.to_regrole('smdb_copies'))))");
   });
 
   it('a session that did not end refuses the fence; one that ended meanwhile does not', async () => {

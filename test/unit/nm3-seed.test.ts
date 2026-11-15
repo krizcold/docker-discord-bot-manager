@@ -54,6 +54,7 @@ const REGISTRY = path.join(h.dir, 'instances.json');
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), ...over,
 } } }, null, 2));
 const bot = () => containerManager.getBot('b')!;
@@ -123,7 +124,7 @@ describe('O5: a live copy from the stored join', () => {
     provisionFleetReplica(bot(), 'copy.invalid', 15433);
     const after = await settled();
     expect(after.fleetDbReplicaSeed).toBeUndefined();
-    expect((await getFleetReplicaStatus(after)).seedNote).toBe("The copy runs, but its address could not be added to the main's list (ERROR:  permission denied for table addresses); the manager tries again every hour.");
+    expect((await getFleetReplicaStatus(after)).seedNote).toBe("The copy runs, but its address could not be added to the main's list (ERROR:  permission denied for table addresses). The manager tries again every hour.");
   });
 
   it('C47: a refused env write finishes the seed with T-24', async () => {

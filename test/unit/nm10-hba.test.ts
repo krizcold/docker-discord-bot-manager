@@ -37,7 +37,7 @@ vi.mock('child_process', async (importOriginal) => {
   const answer = (text: string): { out: string; code: number } => {
     if (/^test -f \S*server\.crt$/.test(text)) return { out: '', code: 0 };
     if (text.includes('pg_stat_ssl')) return { out: '\n', code: 0 };
-    if (text.includes('FROM pg_stat_replication WHERE usename')) return { out: '\n', code: 0 };
+    if (text.includes('FROM pg_stat_replication r WHERE')) return { out: '\n', code: 0 };
     if (text.includes('FROM pg_roles')) return { out: '0\n', code: 0 };
     if (text.includes('string_agg(DISTINCT')) return { out: `${h.hba.owner}\n`, code: 0 };
     if (text.includes('count(*)') && text.includes('pg_read_file')) return { out: `${h.hba.count}\n`, code: 0 };
@@ -116,7 +116,7 @@ import { fenceMigrateSource, fenceStartWarning, liftMigrateFence, liftMigrateFen
 import { createBotRoutes } from '../../src/webui/routes/bots';
 import { runOnDataDir, FENCED_HBA, MANAGED_HBA, ownedFencedHba } from './fence-fake';
 
-const botDir = path.join(h.dir, 'bots', 'b1');
+const botDir = path.join(h.dir, 'bots', 'b1b1b1b1-0000-4000-8000-000000000001');
 const dbUrl = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb';
 const fleetDb = { containerName: 'bot1-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'bot1-fleet-postgres-data', password: 'Db-Secret-0123456789' };
 const OUTSIDE = 'postgresql://u:secret@db.example.test:5432/app';
@@ -125,8 +125,8 @@ const record = (over: Record<string, unknown> = {}) => ({ to: 'file', from: 'pos
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({
     instances: {
-      b1: {
-        id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
+      'b1b1b1b1-0000-4000-8000-000000000001': {
+        id: 'b1b1b1b1-0000-4000-8000-000000000001', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: { DATA_BACKEND: 'postgres' },
         fleetDb,
@@ -137,10 +137,10 @@ const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   }));
 };
 
-const bot = () => containerManager.getBot('b1')!;
+const bot = () => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!;
 const enable = () => enableFleetReplication(bot(), 'primary.invalid', 15432);
 const ran = (re: RegExp) => h.calls.filter(c => re.test(`${c.args.join(' ')}\n${c.stdin}`));
-const storedUrl = () => envManager.getEnvVars('b1').DATA_BACKEND_URL;
+const storedUrl = () => envManager.getEnvVars('b1b1b1b1-0000-4000-8000-000000000001').DATA_BACKEND_URL;
 
 const router = createBotRoutes({ clients: new Set() } as any);
 const call = async (method: 'get' | 'put' | 'post' | 'delete', routePath: string, params: Record<string, string>, body: unknown = {}): Promise<{ status: number; body: any }> => {
@@ -153,7 +153,7 @@ const call = async (method: 'get' | 'put' | 'post' | 'delete', routePath: string
   await layer.route.stack[layer.route.stack.length - 1].handle({ params, query: {}, body, headers: {} }, res);
   return { status: res.statusCode, body: res.body };
 };
-const putUrl = (url: string) => call('put', '/:id/env', { id: 'b1' }, { vars: { DATA_BACKEND_URL: url } });
+const putUrl = (url: string) => call('put', '/:id/env', { id: 'b1b1b1b1-0000-4000-8000-000000000001' }, { vars: { DATA_BACKEND_URL: url } });
 
 const KEPT_E = (what: string) => `The Database URL was kept as it is: it names ${what}, not this bot's managed database, so the bot goes on using it; Enable writes the managed database's address only when the Database URL is blank or names that database.`;
 const KEPT_D = (what: string) => `The Database URL was kept as it is: it names ${what}, not this bot's managed database, and Disable sets it back only when it names that database.`;
@@ -162,7 +162,7 @@ beforeEach(() => {
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
   h.calls.length = 0;
   h.hba = { count: '0', owner: '' };
   h.layers = null;
@@ -190,7 +190,7 @@ describe('W2: Enable and Disable keep a Database URL that names another database
     expect(r.urlKept).toBe(KEPT_D('db.example.test:5432/app'));
     expect(storedUrl()).toBe(OUTSIDE);
     expect(bot().fleetDb!.replication).toBeUndefined();
-    expect(ran(/ALTER ROLE replicator NOLOGIN/).length).toBeGreaterThan(0);
+    expect(ran(/ALTER ROLE smdb_join NOLOGIN/).length).toBeGreaterThan(0);
   });
   it('O39 Disable over a URL in a form keeps it and names the form', async () => {
     expect((await enable()).success).toBe(true);
@@ -268,18 +268,18 @@ describe('O41: the readers of the mark', () => {
   it("the start's warning skips the lines of the bot's own open migration", async () => {
     writeRegistry({ migrate: record({ hbaFence: 'migrate:1' }) });
     h.layers = 'off|4||migrate:1';
-    expect(await fenceStartWarning('b1')).toBeNull();
+    expect(await fenceStartWarning('b1b1b1b1-0000-4000-8000-000000000001')).toBeNull();
   });
   it("(pin) the start's warning names a restore's lines", async () => {
     writeRegistry({ migrate: record({ hbaFence: 'migrate:1' }) });
     h.layers = 'off|4||restore:5';
-    const w = await fenceStartWarning('b1');
+    const w = await fenceStartWarning('b1b1b1b1-0000-4000-8000-000000000001');
     expect(w).toMatch(/refuses every connection but the manager's/);
     expect(w).toContain('a restore (started 1970-01-01 00:00 UTC)');
   });
   it("with no record, the start's warning names a migration's lines as a migration's", async () => {
     h.layers = 'off|4||migrate:1';
-    const w = await fenceStartWarning('b1');
+    const w = await fenceStartWarning('b1b1b1b1-0000-4000-8000-000000000001');
     expect(w).toContain('a migration (started 1970-01-01 00:00 UTC)');
     expect(w).toContain('no open migration holds it, so a restore of a dump into this database lifts it');
     expect(w).not.toContain('running that lane again lifts it');
@@ -350,7 +350,7 @@ describe('round 7: the fence write, the lift and Enable and Disable', () => {
   });
   const PRIVATE = 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres:5432/smdb?sslmode=no-verify';
   it("O44 Enable over a PGPORT form naming the managed container writes the managed database's address", async () => {
-    expect((await call('put', '/:id/env', { id: 'b1' }, { vars: { DATA_BACKEND_URL: 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres/smdb', PGPORT: '5432' } })).status).toBe(200);
+    expect((await call('put', '/:id/env', { id: 'b1b1b1b1-0000-4000-8000-000000000001' }, { vars: { DATA_BACKEND_URL: 'postgresql://smdb:Db-Secret-0123456789@bot1-fleet-postgres/smdb', PGPORT: '5432' } })).status).toBe(200);
     const r: any = await enable();
     expect(r.success).toBe(true);
     expect(r.urlKept).toBeUndefined();
@@ -367,7 +367,7 @@ describe('round 7: the fence write, the lift and Enable and Disable', () => {
   it('O45 a second outside URL saved during Enable: the kept text names the URL read at the write', async () => {
     expect((await putUrl(OUTSIDE)).status).toBe(200);
     let done = false;
-    h.during = (t) => { if (/replicator/.test(t) && !done) { done = true; envManager.setEnvVars('b1', { DATA_BACKEND_URL: 'postgresql://u:p@db2.example.test:5432/app2' }); } };
+    h.during = (t) => { if (/smdb_join/.test(t) && !done) { done = true; envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: 'postgresql://u:p@db2.example.test:5432/app2' }); } };
     const r: any = await enable();
     expect(r.success).toBe(true);
     expect(r.urlKept).toBe(KEPT_E('db2.example.test:5432/app2'));
@@ -377,7 +377,7 @@ describe('round 7: the fence write, the lift and Enable and Disable', () => {
     expect((await enable()).success).toBe(true);
     expect((await putUrl(OUTSIDE)).status).toBe(200);
     let done = false;
-    h.during = (t) => { if (/replicator/.test(t) && !done) { done = true; envManager.setEnvVars('b1', { DATA_BACKEND_URL: dbUrl }); } };
+    h.during = (t) => { if (/smdb_join/.test(t) && !done) { done = true; envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND_URL: dbUrl }); } };
     const r: any = await disableFleetReplication(bot());
     expect(r.success).toBe(true);
     expect(r.urlKept).toBe('The Database URL was kept as it is: it changed while Disable ran, and Disable sets back only the value it read when it started.');

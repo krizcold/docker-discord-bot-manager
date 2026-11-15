@@ -74,7 +74,7 @@ describe('O6 Push', () => {
     expect(stored('a').fleetDb.handover).toMatchObject({ mode: 'push', phase: 'done', generation: 4, file: FILE });
     expect(h.reseedCalls[0].opts).toEqual({ dumpDone: true, safetyDump: FILE });
     const commit = fake.calls.find(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit'))!;
-    expect(commit.args.join(' ')).toContain(`INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('${PUSH_ID}', '7001', 'main.example', 4) ON CONFLICT (push_id) DO NOTHING`);
+    expect(commit.input).toContain(`INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('${PUSH_ID}', '7001', 'main.example', 4) ON CONFLICT (push_id) DO NOTHING`);
     const probe = fake.calls.find(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-probe'))!;
     expect(probe.args[probe.args.length - 1]).toBe(`SELECT count(*) FROM smdb_manager.received WHERE push_id = '${PUSH_ID}'`);
   });
@@ -251,7 +251,7 @@ describe('P23, P24: the received row of this push id (D41)', () => {
   });
   it('P24: a target that holds an older push of this database (another push id) is pushed in full', async () => {
     const rows = new Set<string>(['aaaaaaaaaaaaaaaaaaaaaaaa']);
-    fake.run = (args) => {
+    fake.run = (args, _env, input) => {
       const name = args[args.indexOf('--name') + 1];
       const step = name.split('-fleet-move-')[1] as Step;
       steps.push(step);
@@ -261,7 +261,7 @@ describe('P23, P24: the received row of this push id (D41)', () => {
         const id = /push_id = '([0-9a-f]+)'/.exec(args[args.length - 1])?.[1];
         return ok(`false\n2|win.example|2026-11-01T00:00:00Z\n${(id ? rows.has(id) : rows.size > 0) ? 1 : 0}\n`);
       }
-      if (step === 'commit') rows.add(/VALUES \('([0-9a-f]+)'/.exec(args.join(' '))![1]);
+      if (step === 'commit') rows.add(/VALUES \('([0-9a-f]+)'/.exec(input)![1]);
       return answers[step] ?? ok();
     };
     const r = await push('a', CODE);
@@ -290,7 +290,8 @@ describe('P25 (D59): the commit runs as the manager role', () => {
   it('the commit script starts with SET ROLE dbm_meta, before the raise', async () => {
     expect((await push('a', CODE)).success).toBe(true);
     const commit = fake.calls.find(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit'))!;
-    const script = commit.args[commit.args.length - 1];
+    const script = commit.input;
+    expect(commit.args).toContain('-i');
     expect(script.startsWith('SET ROLE dbm_meta;\nBEGIN;')).toBe(true);
     expect(script).not.toContain('dbm_admin');
   });

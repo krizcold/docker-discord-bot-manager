@@ -9,7 +9,6 @@ import { execFileGuarded, startProcess } from '../docker/processStart';
 import { feedStdin } from '../docker/childStdin';
 import * as containerManager from '../docker/containerManager';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, redactSecrets, scramSha256Verifier, verifierAccepts } from '../config/secretText';
-import { REPLICATION_ROLE } from './fleetReplication';
 import { FENCE_OWNER_FILE_SQL, parseFenceOwner } from './fleetBackupGuards';
 
 export const MANAGER_DB_ROLE = 'dbm_admin';
@@ -19,7 +18,7 @@ export const RECEIVE_LOGINS = ['smdb_receive', 'smdb_receive_meta'] as const;
 export type ReceiveLogin = (typeof RECEIVE_LOGINS)[number];
 export type ManagerLogin = typeof MANAGER_DB_ROLE | typeof META_LOGIN | typeof WORK_LOGIN | ReceiveLogin;
 
-const PSQL_TIMEOUT_MS = 30_000;
+export const PSQL_TIMEOUT_MS = 30_000;
 
 export interface DbTarget { container: string; user: string }
 export interface BotLogin { inRecovery: boolean; canLogin: boolean | null; sessions: number }
@@ -28,12 +27,16 @@ export type DbFailure = { ok: false; cls: PsqlClass; error: string };
 export type DbResult = { ok: true } | DbFailure;
 
 const PLAIN_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+/** The replication roles of a main (switchSql's JOIN_LOGIN, COPY_GROUP, MINTER), written here so dbLogin imports no instance module. */
+const COPY_ROLE_NAMES = ['smdb_join', 'smdb_copies', 'smdb_minter'];
+const COPY_LOGIN_PREFIX = 'smdb_copy_';
+const COPY_LOGIN_NAME = /^smdb_copy_[0-9a-f]{32}$/;
 
 /** The R14 refusal for a bot role name the tool cannot use, or null. */
 export function botRoleRefusal(user: string): string | null {
-  const taken: string[] = [MANAGER_DB_ROLE, META_LOGIN, WORK_LOGIN, REPLICATION_ROLE, ...RECEIVE_LOGINS];
-  if (PLAIN_NAME.test(user) && !taken.includes(user)) return null;
-  return `The app's database role name ${user} cannot be used by the maintenance tool (it must be a plain lower-case name other than ${taken.slice(0, -1).join(', ')} and ${taken[taken.length - 1]}); nothing was changed`;
+  const taken: string[] = [MANAGER_DB_ROLE, META_LOGIN, WORK_LOGIN, ...COPY_ROLE_NAMES, ...RECEIVE_LOGINS];
+  if (PLAIN_NAME.test(user) && !taken.includes(user) && !user.startsWith(COPY_LOGIN_PREFIX)) return null;
+  return `The app's database role name ${user} cannot be used by the maintenance tool (it must be a plain lower-case name other than ${taken.slice(0, -1).join(', ')} and ${taken[taken.length - 1]}, and must not start with ${COPY_LOGIN_PREFIX}); nothing was changed`;
 }
 
 /** Exactly `<recovery>|<canlogin or missing>|<sessions>`; anything else is null, so a garbled answer never reads as blocked. */
@@ -63,6 +66,12 @@ export const MANAGER_SESSION_OPTIONS = '-c search_path=pg_catalog,pg_temp -c loc
 
 const FENCE_EXEMPT_OPTION = '-c default_transaction_read_only=off';
 
+/**
+ * The session options of every session of a machine login or the join login (R18): the manager's, with the read-only
+ * default off and the session acting as its login. plpgsql.variable_conflict is left out: only a superuser may set it (R33).
+ */
+export const COPY_SESSION_OPTIONS = `${MANAGER_SESSION_OPTIONS.replace(' -c plpgsql.variable_conflict=error', '')} ${FENCE_EXEMPT_OPTION} -c role=none`;
+
 /** The session option a lane's own write runs under while a write fence holds the read-only default. */
 const FENCE_EXEMPT = ['-e', `PGOPTIONS=${FENCE_EXEMPT_OPTION}`];
 
@@ -79,8 +88,9 @@ GRANT CONNECT ON DATABASE ${d} TO ${WORK_LOGIN};
 }
 
 export interface CallOpts { exempt?: boolean; stdin?: boolean }
+export type MachineLogin = `smdb_copy_${string}`;
 /** A docker argv (without `docker`) and, for a script, the SQL it reads on stdin. */
-export interface PsqlCall { login: ManagerLogin; args: string[]; input?: string }
+export interface PsqlCall { login: ManagerLogin | MachineLogin; args: string[]; input?: string }
 
 /**
  * The docker exec environment and the login of one manager call. The superuser connects only to the postgres
@@ -120,13 +130,20 @@ export function receivePsql(login: ReceiveLogin, container: string, db: string, 
   return psqlCall(login, container, db, sql, opts);
 }
 
+/** psql as a machine login over the container's socket, in the bot's database: Remove's step 5b (R4, R18). */
+export function loginPsql(login: string, container: string, db: string, sql: string): PsqlCall {
+  if (!COPY_LOGIN_NAME.test(login)) throw new Error(`${login} is not a machine login name`);
+  return { login: login as MachineLogin, args: ['exec', '-e', `PGOPTIONS=${COPY_SESSION_OPTIONS}`, container, 'psql', '-U', login, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql] };
+}
+
 /** A client tool as dbm_work in the bot's database; `args` follow the login. */
 export function workArgs(container: string, db: string, tool: 'psql' | 'pg_dump' | 'pg_restore', args: string[], opts: CallOpts = {}): string[] {
   const { env, conn } = argvFor(WORK_LOGIN, db, opts);
   return ['exec', ...env, ...(opts.stdin ? ['-i'] : []), container, tool, ...conn, ...args];
 }
 
-export type CallResult = { ok: true; stdout: string; stderr: string } | { ok: false; stdout: string; stderr: string; error: string };
+/** `timedOut`: the call ended on its own time limit, so what the server did is not known. */
+export type CallResult = { ok: true; stdout: string; stderr: string } | { ok: false; stdout: string; stderr: string; error: string; timedOut?: true };
 
 /** Runs a call; a failed call of a plain login drops the container from the confirmed set (noteLoginFault). */
 export function runCall(container: string, call: PsqlCall, timeoutMs = PSQL_TIMEOUT_MS): Promise<CallResult> {
@@ -135,7 +152,7 @@ export function runCall(container: string, call: PsqlCall, timeoutMs = PSQL_TIME
       if (ok) return resolve({ ok: true, stdout, stderr });
       if (call.login === META_LOGIN || call.login === WORK_LOGIN) noteLoginFault(container);
       const text = stderr || (timedOut ? `docker did not answer within ${timeoutMs / 1000} s` : startError || 'docker exec failed');
-      resolve({ ok: false, stdout, stderr: text, error: lastLine(text) });
+      resolve({ ok: false, stdout, stderr: text, error: lastLine(text), ...(timedOut ? { timedOut: true as const } : {}) });
     };
     if (call.input === undefined) {
       execFileGuarded('docker', call.args, { timeout: timeoutMs }, (err, stdout, stderr) => {

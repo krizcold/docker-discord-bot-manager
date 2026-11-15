@@ -149,7 +149,7 @@ describe('decommissioning the database', () => {
 describe('re-seeding a stale primary', () => {
   it('keeps the unedited-pins warning past a Dismiss of the parked seed', async () => {
     unwritableCompose();
-    const started = reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true });
+    const started = await reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true, { dumpDone: true });
     expect(started).toMatchObject({ success: true });
     for (let i = 0; i < 200 && !containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked; i++) await new Promise((r) => setTimeout(r, 10));
     const parked = containerManager.getBot('b1')!;

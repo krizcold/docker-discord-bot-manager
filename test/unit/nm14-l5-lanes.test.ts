@@ -222,9 +222,9 @@ describe('L5: the fill and the probe', () => {
   it('a record changed while Disable revokes the login: the refusal, nothing written', async () => {
     writeRegistry({ fleetDb: record('present', { replication: replication() }) });
     setUrl(sidecar(REC_PW));
-    h.onText = (text) => { if (text.includes('ALTER ROLE replicator NOLOGIN')) editRecord(db => { db.retiringAt = '2026-11-12T00:00:00.000Z'; }); };
+    h.onText = (text) => { if (text.includes('ALTER ROLE smdb_join NOLOGIN')) editRecord(db => { db.retiringAt = '2026-11-12T00:00:00.000Z'; }); };
     const ds = await disableFleetReplication(bot());
-    expect(ds).toEqual({ success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the replication login is revoked. Check the Replication section, then press Disable replication again to finish it" });
+    expect(ds).toEqual({ success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the join login and the machines' logins are closed. Check the Replication section, then press Disable replication again to finish it" });
     expect(rawRecord().replication).toBeDefined();
   });
   it('a kept unchecked answer stays unchecked and gives its age in seconds', async () => {
@@ -243,19 +243,24 @@ describe('L5: the adopt\'s candidates', () => {
     primaryHost: 'primary.invalid', primaryPort: 5433, publicHost: 'standby.invalid', hostPort: 5440, certHost: 'standby.invalid',
     user: 'smdb', db: 'smdb',
   };
-  const writeB1 = () => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b1: {
-    id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running', sourceType: 'git',
+  // The adopt ends in Enable, which makes this machine's own login from the bot's id (a uuid in production).
+  const ADOPT_ID = '3c9e1d2a-5b6f-4a70-9e81-2d3c4b5a6f70';
+  let id = 'b1';
+  beforeEach(() => { id = 'b1'; });
+  const writeB1 = () => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { [id]: {
+    id, sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', fleetDbReplica: { ...REPLICA },
   } } }));
-  const b1 = () => containerManager.getBot('b1')!;
+  const b1 = () => containerManager.getBot(id)!;
   const botEnv = (text: string) => {
-    fs.mkdirSync(path.join(h.dir, 'bots', 'b1', 'data'), { recursive: true });
-    fs.writeFileSync(path.join(h.dir, 'bots', 'b1', 'data', '.env'), text);
+    fs.mkdirSync(path.join(h.dir, 'bots', id, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(h.dir, 'bots', id, 'data', '.env'), text);
   };
   const fileUrl = (pw: string) => `postgresql://smdb:${pw}@bot1-fleet-postgres:5432/smdb`;
 
   it('a URL line with no password is passed over for a later one', async () => {
+    id = ADOPT_ID;
     writeB1();
     botEnv(`DATA_BACKEND_URL=postgresql://smdb@bot1-fleet-postgres:5432/smdb\nDATA_BACKEND_URL=${fileUrl(ROLE_PW)}\n`);
     const r = await adoptPromotedReplica(b1());
@@ -263,6 +268,7 @@ describe('L5: the adopt\'s candidates', () => {
     expect(b1().fleetDb?.password).toBe(ROLE_PW);
   });
   it('a URL naming another database is still tried', async () => {
+    id = ADOPT_ID;
     writeB1();
     botEnv(`DATA_BACKEND_URL=postgresql://smdb:${ROLE_PW}@elsewhere.invalid:5432/smdb\n`);
     const r = await adoptPromotedReplica(b1());

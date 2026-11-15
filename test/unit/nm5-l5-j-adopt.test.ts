@@ -151,10 +151,11 @@ describe('the adopt answers', () => {
     });
   });
 
-  it('a seed credential of another role is not filed', async () => {
+  it('NM22 X4: a seed credential of another role is not filed; the posture holds the join login with a new password', async () => {
     h.conninfo = "primary_conninfo = 'user=other password=pw host=primary.invalid'\n";
     expect((await adoptPromotedReplica(bot())).success).toBe(true);
-    expect(h.adoptedWith).toEqual([undefined]);
+    expect(h.adoptedWith).toEqual([{ role: 'smdb_join', password: expect.stringMatching(/^[A-Za-z0-9_-]{32}$/), hostPort: REPLICA.hostPort, publicHost: REPLICA.publicHost, certHost: REPLICA.certHost }]);
+    expect(bot().fleetLogin).toBeUndefined();
   });
 
   it('the password comes from the bot env file when the manager env has no URL', async () => {

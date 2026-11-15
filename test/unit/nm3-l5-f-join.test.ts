@@ -62,7 +62,8 @@ const SMDB = 'https://example.invalid/fake/super-modular-discord-bot';
 const REGISTRY = path.join(h.dir, 'instances.json');
 const base = (over: Record<string, unknown> = {}) => ({
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
-  envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...over,
+  envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') }, ...over,
 });
 const REPLICA = {
   containerName: 'b-fleet-postgres-replica', volume: 'b-fleet-postgres-replica-data', slot: 'fleet_standby_b',

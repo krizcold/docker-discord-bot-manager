@@ -24,7 +24,7 @@ import { peerProbe } from '../../src/instance/fleetJoin';
 import {
   COPIES_READ_SQL, COPIES_SYNC_SQL, DB_OID_SQL, ensureGenerationSql, GEN_READ_SQL, pushBrokenOf, GENERATION_SCHEMA_SQL, generationAfterRestore, generationBefore, parseGenRow, parseRestoreState, parseRestoreStateBefore, raiseSql,
   missingTable, parseReceiveMark, RECEIVE_DROP_SQL, RECEIVE_END_SQL, RECEIVE_MARK_COUNT_SQL, RECEIVE_MARK_READ_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql,
-  replicationRoleEnsureSql, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, restoreStateBackSql, restoreStateUpsertSql, takeoverBlockScript, takeoverLiftScript,
+  copyGroupEnsureSql, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, restoreStateBackSql, restoreStateUpsertSql, takeoverBlockScript, takeoverLiftScript,
 } from '../../src/instance/switchSql';
 import { provisionedCluster } from './pg-cluster';
 
@@ -142,7 +142,8 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM5 switch and mov
     await startPg(MAIN, MAIN_IP, ['-p', publishOf(PORT)]);
     tls(MAIN);
     ok(MAIN, `CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${REPL_PW}'; CREATE ROLE bot LOGIN PASSWORD '${BOT_PW}'; GRANT CONNECT ON DATABASE smdb TO bot;`);
-    ok(MAIN, addressTableSql(MAIN_IP, 5432, pem.trim(), 'main', null));
+    ok(MAIN, copyGroupEnsureSql(), 'postgres');
+    ok(MAIN, addressTableSql(MAIN_IP, 5432, pem.trim(), 'main'));
     ok(MAIN, ensureGenerationSql('main'));
     ok(MAIN, 'CREATE TABLE public.t (id int PRIMARY KEY, v text); ALTER TABLE public.t OWNER TO smdb; INSERT INTO public.t SELECT g, md5(g::text) FROM generate_series(1, 50) g;');
     ok(MAIN, `SELECT pg_create_physical_replication_slot('${SLOT}');`);
@@ -372,11 +373,11 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM5 switch and mov
   it('PG4 and PG5 the push: the replication role ensured NOLOGIN, a receive login over verify-full, drop, create and restore, counts and checksums equal, the commit as the manager role and its received rows; an expired login refused; the receive login ended and dropped', async () => {
     await startPg(RECV, RECV_IP);
     tls(RECV);
-    // PG-2 (D59): the receiver never had the replication role; Receive makes it NOLOGIN before the push.
-    expect(ok(RECV, "SELECT count(*) FROM pg_roles WHERE rolname = 'replicator'", 'postgres')).toBe('0');
-    ok(RECV, replicationRoleEnsureSql('replicator'), 'postgres');
-    ok(RECV, replicationRoleEnsureSql('replicator'), 'postgres');
-    expect(ok(RECV, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'replicator'", 'postgres')).toBe('false');
+    // PG-2 (D59, NM22 3.10): the receiver never had smdb_copies; Receive makes it NOLOGIN before the push.
+    expect(ok(RECV, "SELECT count(*) FROM pg_roles WHERE rolname = 'smdb_copies'", 'postgres')).toBe('0');
+    ok(RECV, copyGroupEnsureSql(), 'postgres');
+    ok(RECV, copyGroupEnsureSql(), 'postgres');
+    expect(ok(RECV, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb_copies'", 'postgres')).toBe('false');
     const until1 = new Date(Date.now() + 3600_000).toISOString();
     ok(RECV, `CREATE ROLE smdb_receive LOGIN SUPERUSER PASSWORD 'recvpw' VALID UNTIL '${until1}';`, 'postgres');
     ok(RECV, ensureGenerationSql('recv'));
@@ -390,7 +391,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM5 switch and mov
     const pushed = run(['run', '--rm', '-i', '--network', NET, '-e', 'PGPASSWORD', '-v', `${certFile}:/primary-ca.crt:ro`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script, 'sh', dsn('postgres'), dsn('smdb')],
       fs.readFileSync(path.join(h.dir, 'push.dump')), { PGPASSWORD: 'recvpw' });
     expect(pushed.status, pushed.err).toBe(0);
-    expect(ok(RECV, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'replicator'", 'postgres')).toBe('false');
+    expect(ok(RECV, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb_copies'", 'postgres')).toBe('false');
     const oidAfter = ok(RECV, DB_OID_SQL('smdb'), 'postgres');
     expect(oidAfter).toMatch(/^\d+$/);
     expect(oidAfter).not.toBe(oidBefore);
@@ -405,7 +406,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM5 switch and mov
     ok(RECV, 'DROP TABLE IF EXISTS smdb_manager.addresses, smdb_manager.received;');
     const PUSH = '0123456789abcdef01234567';
     const PUSH2 = 'fedcba9876543210fedcba98';
-    const commitOf = (id: string, g: number) => `SET ROLE ${MANAGER_DB_ROLE};\n${raiseSql('recv', g, `${addressTableSql(RECV_IP, 5432, pem.trim(), 'recv', null)}
+    const commitOf = (id: string, g: number) => `SET ROLE ${MANAGER_DB_ROLE};\n${raiseSql('recv', g, `${addressTableSql(RECV_IP, 5432, pem.trim(), 'recv')}
 DELETE FROM smdb_manager.addresses WHERE NOT (host = '${RECV_IP}' AND port = 5432);
 INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('${id}', '1', 'copy', ${g}) ON CONFLICT (push_id) DO NOTHING;
 `)}`;
@@ -452,11 +453,11 @@ INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, genera
     until('the read-only setting is loaded', () => ok(R13, 'SHOW default_transaction_read_only', 'postgres') === 'on', 30);
     const EXEMPT = ['-e', 'PGOPTIONS=-c default_transaction_read_only=off'];
     const recreate = run(['exec', ...EXEMPT, R13, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1',
-      '-c', replicationRoleEnsureSql('replicator'), '-c', 'DROP DATABASE IF EXISTS "smdb" WITH (FORCE)', '-c', 'CREATE DATABASE "smdb" OWNER "smdb"']);
+      '-c', copyGroupEnsureSql(), '-c', 'DROP DATABASE IF EXISTS "smdb" WITH (FORCE)', '-c', 'CREATE DATABASE "smdb" OWNER "smdb"']);
     expect(recreate.status, recreate.err).toBe(0);
     const restored = run(['exec', '-i', ...EXEMPT, R13, 'pg_restore', '-U', MANAGER_DB_ROLE, '--exit-on-error', '-d', 'smdb'], fs.readFileSync(path.join(h.dir, 'pg13.dump')));
     expect(restored.status, restored.err).toBe(0);
-    expect(ok(R13, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'replicator'", 'postgres')).toBe('false');
+    expect(ok(R13, "SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb_copies'", 'postgres')).toBe('false');
     const tcp = () => run(['exec', '-e', 'PGPASSWORD=r13pw', R13, 'psql', '-X', '-h', '127.0.0.1', '-U', 'replicator', '-d', 'smdb', '-tAc', 'SELECT 1']);
     const replication = () => run(['exec', '-e', 'PGPASSWORD=r13pw', R13, 'psql', '-X', '-d', 'host=127.0.0.1 user=replicator dbname=smdb replication=database', '-c', 'IDENTIFY_SYSTEM']);
     for (const r of [tcp(), replication()]) {

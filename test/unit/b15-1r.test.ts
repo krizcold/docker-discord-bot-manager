@@ -163,7 +163,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   it('asks, naming the volume, and dumps, retires and clears nothing', async () => {
     writeRegistry({ fleetDbReplicaKept: { volume: REPLICA_VOL, removedAt: '2026-10-20T00:00:00.000Z', held: 'promoted' } });
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = start();
+    const res = await start();
     expect(res).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
     expect(res.error).toMatch(/bota-fleet-postgres-replica-data already exists/);
     expect(res.error).toMatch(/Remove replica left it on 2026-10-20.*promoted/);
@@ -175,7 +175,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
 
   it('runs once the confirm names the volume', async () => {
     h.volumes.set(REPLICA_VOL, 'exists');
-    expect(start({ confirmVolume: REPLICA_VOL })).toMatchObject({ success: true, started: true });
+    expect(await start({ confirmVolume: REPLICA_VOL })).toMatchObject({ success: true, started: true });
     await settled();
     expect(h.events).toContain('dump');
     expect(h.events).toContain('retire');
@@ -183,14 +183,14 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
     expect(h.events.indexOf('retire')).toBeLessThan(h.events.indexOf('wipe'));
   });
 
-  it('a confirm naming another volume does not answer the question', () => {
+  it('a confirm naming another volume does not answer the question', async () => {
     h.volumes.set(REPLICA_VOL, 'exists');
-    expect(start({ confirmVolume: 'other-volume' })).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
+    expect(await start({ confirmVolume: 'other-volume' })).toMatchObject({ success: false, needsConfirm: true, confirmVolume: REPLICA_VOL });
   });
 
   it('refuses with can\'t confirm when docker does not answer, and starts nothing', async () => {
     h.volumes.set(REPLICA_VOL, 'unknown');
-    const res = start({ confirmVolume: REPLICA_VOL });
+    const res = await start({ confirmVolume: REPLICA_VOL });
     expect(res.success).toBe(false);
     expect(res.needsConfirm).toBeUndefined();
     expect(res.error).toMatch(/can't confirm/);
@@ -202,7 +202,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   it('refuses a volume another instance declares outright, confirm or not', async () => {
     writeRegistry({}, { b: { id: 'b', displayName: 'Bot B', status: 'stopped', projectVolumes: [REPLICA_VOL] } });
     h.volumes.set(REPLICA_VOL, 'exists');
-    const res = start({ confirmVolume: REPLICA_VOL });
+    const res = await start({ confirmVolume: REPLICA_VOL });
     expect(res.success).toBe(false);
     expect(res.needsConfirm).toBeUndefined();
     expect(res.error).toMatch(/Bot B/);
@@ -211,7 +211,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   });
 
   it('a volume that appears after the request stops the run before the dump and the retire', async () => {
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     h.volumes.set(REPLICA_VOL, 'exists');
     const parked = await settled();
     expect(parked.fleetDbReplicaSeed?.lastError).toMatch(/nothing was destroyed: The replica volume bota-fleet-postgres-replica-data already exists/);
@@ -224,7 +224,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
 
   it('a volume that appears after the retire stops the run before the wipe, saying the stale database was retired', async () => {
     h.onRetire = () => { h.volumes.set(REPLICA_VOL, 'exists'); };
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const parked = await settled();
     expect(h.events).toContain('retire');
     expect(h.events).not.toContain('wipe');
@@ -233,7 +233,7 @@ describe('B15-1r: the stale-primary re-seed asks before it clears an existing re
   });
 
   it('docker not answering at the run stops it before the dump', async () => {
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     h.volumes.set(REPLICA_VOL, 'unknown');
     const parked = await settled();
     expect(parked.fleetDbReplicaSeed?.lastError).toMatch(/docker did not say whether the replica volume bota-fleet-postgres-replica-data exists, so nothing was destroyed/);

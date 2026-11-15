@@ -150,7 +150,7 @@ describe('m5 the Actions list on the Database screen', () => {
     await v.press('a');
     await v.until('Actions: mybot');
     const body = flat(v.frame());
-    expect(body).toContain('> Cancel the seed Apply the 4096 MB WAL bound Drop slot smdb_copy_b (the copy on hetzner) Disable replication');
+    expect(body).toContain('> Cancel the seed Apply the 4096 MB WAL bound Drop slot smdb_copy_b (the copy on hetzner) New join code Disable replication');
     expect(bars(v.frame())).toContain('Up/Down Choose  Enter Take  Esc Back');
     await v.press(DOWN, DOWN);
     expect(v.frame()).toContain('> Drop slot smdb_copy_b');

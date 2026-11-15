@@ -155,7 +155,7 @@ describe('m5 the Move rows', () => {
   const PART5 = ['receive', 'stopreceive', 'newcode', 'moveout', 'push'];
   const part4 = (rows: ReturnType<typeof actionRows>) => rows.filter((r) => !PART5.includes(r.kind));
   const labels = (fleetDb: Record<string, unknown>, s: unknown = sw(), status = 'stopped') => part4(actionRows('main', { replication: repl, switch: s as never }, mainLaneBot(fleetDb, { status }) as Bot))
-    .map((r) => r.label).filter((l) => l !== 'Disable replication');
+    .map((r) => r.label).filter((l) => l !== 'Disable replication' && l !== 'New join code');
 
   it('offers Hand over per streaming copy, with the slot its press sends', () => {
     const rows = actionRows('main', { switch: sw({ copies: [copyOf('yundera'), copyOf('hetzner', false), { slot: 'smdb_copy_x', streaming: true }] }) as never }, mainLaneBot() as Bot);
@@ -192,8 +192,8 @@ describe('m5 the Move rows', () => {
     const fdb = { handover: { mode: 'stream', phase: 'stopped', machine: 'yundera', host: 'y' }, mainConflict: { machine: 'yundera' } };
     expect(labels(fdb, { ok: false, text: 'Bot not found' })).toEqual([]);
     expect(labels(fdb, { ok: null, text: 'the manager did not answer within 15 s' })).toEqual([]);
-    expect(actionRows('main', { replication: repl }, mainLaneBot(fdb) as Bot).map((r) => r.label)).toEqual(['Disable replication']);
-    expect(actionRows('main', { replication: repl }, mainBot() as Bot).map((r) => r.label)).toEqual(['Disable replication']);
+    expect(actionRows('main', { replication: repl }, mainLaneBot(fdb) as Bot).map((r) => r.label)).toEqual(['New join code', 'Disable replication']);
+    expect(actionRows('main', { replication: repl }, mainBot() as Bot).map((r) => r.label)).toEqual(['New join code', 'Disable replication']);
   });
 
   it('the copy layout offers Take over from a switch read (:3596) or a promoted copy (:3207), once', () => {
@@ -478,12 +478,12 @@ describe('m5 a failed switch read', () => {
     const f = mainRoutes({ bot: mainLaneBot({ mainConflict: undefined }), switch: () => sw });
     const v = await toDb(f, { db: { everyMs: 200 } });
     await v.until('the move controls are not shown');
-    expect(db(v).actionRows().map((r) => r.label)).toEqual(['Disable replication']);
+    expect(db(v).actionRows().map((r) => r.label)).toEqual(['New join code', 'Disable replication']);
     sw = switchBody({ generation: { error: 'connect ECONNREFUSED' }, copies: [copyOf('yundera')] });
     await v.until("Can't confirm this database's generation: connect ECONNREFUSED");
     await v.untilFn(() => db(v).actionRows().some((r) => r.kind === 'handover'));
     sw = { status: 404, ok: false, body: { success: false, error: 'Bot not found' } };
     await v.until('Could not read the move state (Bot not found); retrying.');
-    expect(db(v).actionRows().map((r) => r.label)).toEqual(['Disable replication']);
+    expect(db(v).actionRows().map((r) => r.label)).toEqual(['New join code', 'Disable replication']);
   });
 });

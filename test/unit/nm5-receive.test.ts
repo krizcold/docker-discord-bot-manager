@@ -505,7 +505,7 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
   it('V39: the replication role ensure fails: RV-REPLROLE, no dump, nothing changed', async () => {
     fake.dbs['a-pg'].fail['role-ensure'] = 'ERROR:  permission denied to create role';
     const r = await receive('a');
-    expect(r).toMatchObject({ success: false, status: 500, text: "The manager could not make sure the replication role exists in this database's cluster (ERROR:  permission denied to create role), and a pushed database that grants to it would not restore; nothing was changed" });
+    expect(r).toMatchObject({ success: false, status: 500, text: "The manager could not make sure the group of the machines' logins (smdb_copies) exists in this database's cluster (ERROR:  permission denied to create role), and a pushed database that grants to it would not restore; nothing was changed" });
     expect(h.events).not.toContain('dump:pre-receive-');
     expect(stored('a').fleetDb.receive).toBeUndefined();
   });
@@ -513,8 +513,8 @@ describe('Round 2 (D51 to D54, D59): Receive, Receive again, Stop receiving and 
     fake.dbs['a-pg'].clusterRoles = ['app', 'dbm_admin'];
     await receive('a');
     expect(h.events.indexOf('role-ensure')).toBeLessThan(h.events.indexOf('dump:pre-receive-'));
-    expect(fake.dbs['a-pg'].clusterRoles).toContain('replicator');
-    const ensure = fake.calls.find(c => c.input.includes('NOLOGIN REPLICATION'))!;
+    expect(fake.dbs['a-pg'].clusterRoles).toContain('smdb_copies');
+    const ensure = fake.calls.find(c => c.input.includes('CREATE ROLE smdb_copies NOLOGIN'))!;
     expect(ensure.args[ensure.args.indexOf('-d') + 1]).toBe('postgres');
     h.events.length = 0;
     await receive('a');

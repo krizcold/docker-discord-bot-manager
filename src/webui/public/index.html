@@ -2093,7 +2093,8 @@
         if (res.dbDumpsKept) msg += `; its ${res.dbDumpsKept.count} database ${res.dbDumpsKept.count === 1 ? 'dump stays' : 'dumps stay'} in the manager's ${res.dbDumpsKept.folder} folder`;
         if (!keepEnv) msg += res.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
         else if (res.vaulted) msg += '; environment values copied to the vault';
-        showMessage('success', msg);
+        if (res.warning) msg += '. ' + res.warning;
+        showMessage(res.warning ? 'warning' : 'success', msg);
       } catch (err) {
         if (err && err.noAnswer) showNoAnswer('delete');
         else showMessage('error', `Can't confirm the delete: ${err && err.message ? err.message : err}`);
@@ -2834,7 +2835,7 @@
       try { res = await api('GET', `/bots/${botId}/fleet-replication`); } catch (err) { res = null; }
       if (!body.isConnected || fleetBackupBotId !== botId || seq !== renderFleetReplication.seq) return;
       if (res && res.success && res.replication && res.replication.enabled) {
-        const tick = () => { if (seq !== renderFleetReplication.seq || !body.isConnected) return; if (panelHasEntry(body)) setTimeout(tick, 3000); else renderFleetReplication(botId); };
+        const tick = () => { if (seq !== renderFleetReplication.seq || !body.isConnected) return; if (panelHasEntry(body) || body.querySelector('#fleet-join-code-shown textarea')) setTimeout(tick, 3000); else renderFleetReplication(botId); };
         setTimeout(tick, 3000);
       }
       if (!res || !res.success) {
@@ -2899,18 +2900,30 @@
       // listed whether or not a standby of this primary is attached.
       const slotsHtml = !live ? '' : fleetSlotsHtml
         + otherSlots.map(s => `<div class="env-tip">Slot <b>${escapeHtml(s.slot)}</b> (not a fleet copy): ${escapeHtml(s.walStatus)}${s.active ? ', active' : ''}</div>`).join('');
+      const loginState = l => !l.member ? 'blocked, not removed yet'
+        : !l.canLogin ? 'closed (replication was disabled)'
+        : l.slotState === 'active' ? (l.client ? `streaming from ${l.client}` : 'streaming')
+        : l.slotState === 'absent' ? 'no slot' : 'not connected';
+      const loginsHtml = !live ? ''
+        : !Array.isArray(live.logins) ? '<div class="env-tip" style="color:var(--warning);">The machine logins could not be read.</div>'
+        : '<div class="env-tip" style="margin-top:6px;"><b>Machine logins</b></div>' + live.logins.map(l => {
+            const removeBtn = l.own ? '' : ` <button class="btn btn-secondary btn-small" onclick="removeMachineLogin('${botId}', ${jsArg(l.login)})" title="Block this login, end its sessions, drop its slot and take its address off the list">Remove</button>`;
+            return `<div class="env-tip">${escapeHtml(l.machine || 'no address listed')} (${escapeHtml(l.login)})${l.own ? ' (this machine)' : ''}: ${escapeHtml(loginState(l))}${removeBtn}</div>`;
+          }).join('');
       const keepTip = live && live.slotWalKeep === '-1'
         ? ` - <span style="color:var(--warning)">WAL retention UNBOUNDED</span> <button class="btn btn-secondary btn-small" onclick="applyFleetReplBound('${botId}')">Apply 4096 MB bound</button>`
         : live && live.slotWalKeep ? ` - WAL bound ${escapeHtml(live.slotWalKeep)}` : '';
       body.innerHTML = `
         <div class="env-tip">Replication endpoint <b>${escapeHtml(r.publicHost)}:${r.hostPort}</b> (TLS required off this machine)${live ? (live.sslOn ? '' : ' - <span style="color:var(--warning)">ssl not active yet, restart the instance</span>') : r.probeError ? ` - <span style="color:var(--warning)">could not read the database (${escapeHtml(r.probeError)})</span>` : ' - <span style="color:var(--text-muted)">database not running</span>'}${keepTip}</div>
-        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the replication login may be revoked, the copies' slots dropped). Press Disable replication to finish it.</div>` : ''}
+        ${r.disablingSince ? `<div class="error-message">A Disable of replication started on ${escapeHtml(new Date(r.disablingSince).toLocaleString())} did not finish: some of its steps may already have run (the join login and the machines' logins may be closed, the copies' slots dropped). Press Disable replication to finish it.</div>` : ''}
         ${reachHtml}
         ${slotsHtml}
+        ${loginsHtml}
         <div style="margin-top:6px;">
           <div class="env-tip">Join code: other machines paste it to use this database (a live copy, shards, or both). It holds this database's address, its certificate fingerprint and two passwords.</div>
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-small" onclick="copyJoinCode('${botId}')">Copy join code</button>
+            <button class="btn btn-secondary btn-small" onclick="renewJoinCode('${botId}')">New join code</button>
             <button class="btn btn-secondary btn-small" onclick="showJoinCode('${botId}')">Show</button>
             <button class="btn btn-secondary btn-small" onclick="hideJoinCode()">Hide</button>
           </div>
@@ -3022,7 +3035,7 @@
     }
 
     async function disableFleetReplication(botId) {
-      if (!confirm('Disable replication?\n\nRefused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the replication login is revoked at once; the published port closes at the next restart, and a database URL that names this database is set back to its private form then.')) return;
+      if (!confirm('Disable replication?\n\nRefused while a copy streams or a seed copies this database, or while a backup or restore runs. Otherwise the inactive copies\' slots are dropped and the join login and every machine\'s login are closed at once; the published port closes at the next restart, and a database URL that names this database is set back to its private form then.')) return;
       const btn = document.getElementById('fleet-repl-disable');
       if (btn) btn.disabled = true;
       try {
@@ -3046,31 +3059,75 @@
       if (fleetBackupBotId === botId) renderFleetSwitch(botId);
     }
 
+    // Shows no message: each caller puts the answer, and the note with it, into its one message.
     async function fetchJoinCode(botId) {
       let res = null;
-      try { res = await api('GET', `/bots/${botId}/fleet-replication/join-code`); } catch (err) { showNoAnswer('join code'); return null; }
-      if (!res || !res.success || !res.joinCode) { showMessage('error', (res && res.error) || 'No join code was made'); return null; }
-      return res.joinCode;
+      try { res = await api('GET', `/bots/${botId}/fleet-replication/join-code`); } catch (err) { return { error: 'the manager did not answer', noAnswer: true }; }
+      if (!res || !res.success || !res.joinCode) return { error: (res && res.error) || 'No join code was made' };
+      return { code: res.joinCode, note: res.note || '' };
     }
 
     async function copyJoinCode(botId) {
-      const code = await fetchJoinCode(botId);
-      if (!code) return;
+      const got = await fetchJoinCode(botId);
+      if (got.error) { if (got.noAnswer) showNoAnswer('join code'); else showMessage('error', got.error); return; }
       try {
         if (!navigator.clipboard) throw new Error('no clipboard');
-        await navigator.clipboard.writeText(code);
+        await navigator.clipboard.writeText(got.code);
       } catch (err) {
         showMessage('error', 'The join code could not be copied to the clipboard; press Show and copy it by hand.');
         return;
       }
-      showMessage('success', 'Join code copied. It holds database passwords: paste it only into your own managers.');
+      showMessage(got.note ? 'warning' : 'success', 'Join code copied. It holds database passwords: paste it only into your own managers.' + (got.note ? ' ' + got.note : ''));
     }
 
     async function showJoinCode(botId) {
-      const code = await fetchJoinCode(botId);
+      const got = await fetchJoinCode(botId);
+      if (got.error) { if (got.noAnswer) showNoAnswer('join code'); else showMessage('error', got.error); return; }
       const el = document.getElementById('fleet-join-code-shown');
-      if (!code || !el) return;
-      el.innerHTML = `<textarea readonly rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;">${escapeHtml(code)}</textarea>`;
+      if (el) el.innerHTML = `<textarea readonly rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;">${escapeHtml(got.code)}</textarea>`;
+      if (got.note) showMessage('warning', got.note);
+    }
+
+    async function renewJoinCode(botId) {
+      if (!confirm('Make a new join code? The current code stops adding machines at once, and its open sessions on this database are ended. This machine\'s own login also gets a new password. Machines that joined already keep their own logins.')) return;
+      let res;
+      try {
+        res = await api('POST', `/bots/${botId}/fleet-replication/join-code/renew`, {});
+      } catch (err) {
+        showNoAnswer('join code renewal');
+        renderFleetReplication(botId);
+        return;
+      }
+      if (!res || !res.success) {
+        showMessage('error', (res && res.error) || 'The join code was not renewed');
+        return;
+      }
+      const got = await fetchJoinCode(botId);
+      if (got.error) {
+        showMessage('error', `${res.text} But the code could not be shown: ${got.error}`);
+      } else {
+        const el = document.getElementById('fleet-join-code-shown');
+        if (el) el.innerHTML = `<textarea readonly rows="3" style="width:100%;font-family:monospace;font-size:0.7rem;">${escapeHtml(got.code)}</textarea>`;
+        showMessage(got.note ? 'warning' : 'success', res.text + (got.note ? ' ' + got.note : ''));
+      }
+    }
+
+    // A needsConfirm answer (the login streams now) asks its question and repeats with confirm.
+    async function removeMachineLogin(botId, login) {
+      const url = `/bots/${botId}/fleet-replication/logins/${encodeURIComponent(login)}`;
+      try {
+        let res = await api('DELETE', url, { confirm: false });
+        if (res && !res.success && res.needsConfirm) {
+          if (!confirm(res.error)) { showMessage('info', 'Nothing was removed'); return; }
+          res = await api('DELETE', url, { confirm: true });
+        }
+        if (res && res.success) showMessage('success', res.text);
+        else showMessage('error', (res && res.error) || `The login ${login} was not removed`);
+      } catch (err) {
+        showNoAnswer('login removal');
+      } finally {
+        renderFleetReplication(botId);
+      }
     }
 
     function hideJoinCode() {

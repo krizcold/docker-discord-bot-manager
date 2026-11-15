@@ -208,10 +208,10 @@ describe('L5 c: Take over', () => {
     expect((await takeOverMain('c')).text).toContain('The main at main.invalid:15432 did not answer (the join code stored here cannot be read, so the main was not checked).');
   });
 
-  it('no join code: the raise drops the copy rows only', async () => {
+  it('no join code: the raise drops every row, the old main row included (NM22 R10)', async () => {
     writeRegistry({ c: copyFixture({ fleetJoin: undefined }) });
     expect((await takeOverMain('c')).success).toBe(true);
-    expect(fake.dbs['c-pg'].addresses.map(a => a.host)).toEqual(['main.invalid']);
+    expect(fake.dbs['c-pg'].addresses.map(a => a.host)).toEqual([]);
   });
 
   it('the certificate read fails: its reason in the warning', async () => {

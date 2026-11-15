@@ -33,6 +33,26 @@ async function simple(ctx: Ctx, method: string, path: string, body?: unknown, hu
   emit(res, ctx.flags, human);
 }
 
+// confirmDeleteBot's text (index.html:2089 to :2097) for a delete that succeeded; emit calls this for any answer, so
+// anything else is printed as JSON and emit's error line follows.
+function deleteHuman(body: unknown, keepData: boolean, keepEnv: boolean): void {
+  const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  if (b.success !== true) {
+    printJson(body);
+    return;
+  }
+  const dumps = b.dbDumpsKept as { count?: unknown; folder?: unknown } | undefined;
+  let msg = !keepData ? 'Bot removed'
+    : typeof b.keptDataDir === 'string' && b.keptDataDir ? `Bot removed; its data stays in ${b.keptDataDir}, and a new install does not reuse that folder`
+      : 'Bot removed (data preserved)';
+  if (typeof b.keptReplicaVolume === 'string' && b.keptReplicaVolume) msg += `; the replica volume ${b.keptReplicaVolume} that Remove replica kept was not deleted`;
+  if (dumps && typeof dumps.count === 'number') msg += `; its ${dumps.count} database ${dumps.count === 1 ? 'dump stays' : 'dumps stay'} in the manager's ${String(dumps.folder)} folder`;
+  if (!keepEnv) msg += b.envDeleted === true ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
+  else if (b.vaulted === true) msg += '; environment values copied to the vault';
+  if (typeof b.warning === 'string' && b.warning) msg += `. ${b.warning}`;
+  process.stdout.write(`${msg}\n`);
+}
+
 /**
  * Lifecycle POST. Without --wait it reports that the manager accepted the operation,
  * never that it finished. With --wait it blocks on the terminal WS event of this op.
@@ -272,7 +292,9 @@ const HANDLERS: Record<string, Handler> = {
     if (c.flags['confirm-fleet-data']) q.push('confirmFleetData=true');
     if (c.flags['confirm-promoted']) q.push('confirmPromoted=true');
     if (c.flags['no-keep-env']) q.push('keepEnv=false');
-    return simple(c, 'DELETE', `/api/bots/${id}${q.length ? '?' + q.join('&') : ''}`);
+    const keepData = !c.flags['delete-data'];
+    const keepEnv = !c.flags['no-keep-env'];
+    return simple(c, 'DELETE', `/api/bots/${id}${q.length ? '?' + q.join('&') : ''}`, undefined, (b) => deleteHuman(b, keepData, keepEnv));
   },
   'bots check-updates': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/updates`),
   'bots containers': (c) => simple(c, 'GET', `/api/bots/${need(c, 0, 'id')}/containers`),

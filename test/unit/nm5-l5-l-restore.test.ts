@@ -366,7 +366,7 @@ describe('the address rows a moved- restore writes', () => {
     const r = await restore(MOVED);
     expect(r.success).toBe(true);
     const own = { host: 'main.example', port: 5434 };
-    expect(lastWrite()).toBe(raiseSql(machine(), 6, `${cutAddressesSql(own)}${addressTableSql(own.host, own.port, COPY_PEM.trim(), machine(), null)}`));
+    expect(lastWrite()).toBe(raiseSql(machine(), 6, `${cutAddressesSql(own)}${addressTableSql(own.host, own.port, COPY_PEM.trim(), machine())}`));
   });
   it('with replication and no readable certificate: the restore is refused before anything changes (NM20 P1)', async () => {
     fs.writeFileSync(path.join(DIR, MOVED), 'dump');

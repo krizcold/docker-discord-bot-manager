@@ -130,22 +130,26 @@ const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', v
 let portSeq = 20000;
 const replication = () => ({ role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: portSeq++, publicHost: 'main.invalid', certHost: 'main.invalid', slotWalKeepMb: 4096 });
 const REGISTRY = path.join(h.dir, 'instances.json');
+// Enable makes this machine's own login from the bot's id, which is a uuid in production.
+const MAIN_ID = '8d2f4b6a-1c3e-4a5b-9d7f-0e1a2b3c4d5e';
+let ID = 'm';
+const OWN_LOGIN = { password: 'Own-Login-Pw-0123456789' };
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
-  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { m: {
-    id: 'm', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
+  fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { [ID]: {
+    id: ID, sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...extra,
   } } }));
 };
 const editRecord = (fn: (db: any) => void): void => {
   const reg = JSON.parse(fs.readFileSync(REGISTRY, 'utf-8'));
-  fn(reg.instances.m.fleetDb);
+  fn(reg.instances[ID].fleetDb);
   fs.writeFileSync(REGISTRY, JSON.stringify(reg));
 };
-const rawRecord = () => JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances.m.fleetDb;
-const bot = () => containerManager.getBot('m')!;
-const setUrl = (url: string) => envManager.setEnvVars('m', { DATA_BACKEND_URL: url });
-const urlNow = () => envManager.getEnvVars('m').DATA_BACKEND_URL;
+const rawRecord = () => JSON.parse(fs.readFileSync(REGISTRY, 'utf-8')).instances[ID].fleetDb;
+const bot = () => containerManager.getBot(ID)!;
+const setUrl = (url: string) => envManager.setEnvVars(ID, { DATA_BACKEND_URL: url });
+const urlNow = () => envManager.getEnvVars(ID).DATA_BACKEND_URL;
 const sidecar = (pw: string) => `postgresql://smdb:${encodeURIComponent(pw)}@m-fleet-postgres:5432/smdb?sslmode=no-verify`;
 const record = (state: 'present' | 'absent' | 'lost', extra: Record<string, unknown> = {}) =>
   ({ ...fleetDb, ...(state === 'present' ? { password: REC_PW } : state === 'lost' ? { password: BAD_BLOB } : {}), ...extra });
@@ -173,12 +177,14 @@ const logs: string[] = [];
 beforeEach(() => {
   h.sql = []; h.running = 'true'; h.cert = FIXTURE_PEM; h.authid = `v|${VERIFIER}`; h.authidFail = ''; h.authidReads = 0;
   h.exec = 'f|||\n'; h.runs = []; h.openssl = 0; h.onText = null; h.refuseSave = false;
+  ID = 'm';
   logs.length = 0;
   for (const level of ['log', 'warn', 'error'] as const) {
     vi.spyOn(console, level).mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
   }
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(h.dir, 'bots', 'm', 'env'), { recursive: true });
+  fs.mkdirSync(path.join(h.dir, 'bots', MAIN_ID, 'env'), { recursive: true });
   fs.mkdirSync(path.join(h.dir, 'bots', 'b1', 'env'), { recursive: true });
 });
 afterEach(() => { vi.restoreAllMocks(); });
@@ -227,13 +233,14 @@ describe('C1 to C12: the join code, the composed code and the probe read the rec
       expect((await getJoinCode(bot())).joinCode).toBe((await getJoinCode(bot())).joinCode);
     });
     it('C6 to C8: the composed code', () => {
-      writeRegistry({ fleetDb: record('present', { replication: replication() }) });
+      const own = { fleetLogin: { password: 'own-machine-pw' } };
+      writeRegistry({ fleetDb: record('present', { replication: replication() }), ...own });
       const ok = composeJoinCode(bot(), target);
       expect(ok.ok && ok.code.app).toEqual({ user: 'smdb', password: REC_PW });
       expect(ok.ok && ok.text).not.toContain('OUTSIDEPW');
-      writeRegistry({ fleetDb: record('absent', { replication: replication() }) });
+      writeRegistry({ fleetDb: record('absent', { replication: replication() }), ...own });
       expect(composeJoinCode(bot(), target)).toEqual({ ok: false, error: CJ_ABSENT });
-      writeRegistry({ fleetDb: record('lost', { replication: replication() }) });
+      writeRegistry({ fleetDb: record('lost', { replication: replication() }), ...own });
       expect(composeJoinCode(bot(), target)).toEqual({ ok: false, error: CJ_LOST });
       expect(h.authidReads).toBe(0);
     });
@@ -277,6 +284,7 @@ describe('T5: for any outside password p and recorded q the join code holds q an
 
 describe('C13 to C17: Enable and Disable write the recorded password', () => {
   it('C13: an outside URL is kept by Enable and Disable with no password read', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent') });
     setUrl(OUTSIDE_URL);
     const en = await enableFleetReplication(bot(), 'main.invalid', 15432);
@@ -288,6 +296,7 @@ describe('C13 to C17: Enable and Disable write the recorded password', () => {
     expect(h.authidReads).toBe(0);
   });
   it.each([['blank', ''], ['the managed database', MANAGED_URL]])('C14, C15: URL %s: Enable and Disable write the recorded password', async (_n, url) => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('present') });
     if (url) setUrl(url);
     expect((await enableFleetReplication(bot(), 'main.invalid', 15432)).success).toBe(true);
@@ -298,6 +307,7 @@ describe('C13 to C17: Enable and Disable write the recorded password', () => {
     expect(h.authidReads).toBe(0);
   });
   it('C16: no record password, the caller\'s password accepted: written and recorded', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent') });
     const en = await enableFleetReplication(bot(), 'main.invalid', 15432, undefined, { dbPassword: ROLE_PW });
     expect(en.success).toBe(true);
@@ -347,6 +357,8 @@ describe('V4: Enable and Disable refuse on a broken store or an undecryptable UR
     expect(JSON.parse(fs.readFileSync(storeFile, 'utf-8')).encrypted.DATA_BACKEND_URL).toBe(BAD_BLOB);
   });
   it('C17a-3: another key that no longer decrypts does not stop Enable or Disable', async () => {
+    ID = MAIN_ID;
+    const storeFile = path.join(h.dir, 'bots', ID, 'env', 'storage.json');
     writeRegistry({ fleetDb: record('present') });
     setUrl(MANAGED_URL);
     const store = JSON.parse(fs.readFileSync(storeFile, 'utf-8'));
@@ -401,7 +413,7 @@ describe('V1: the fill records only a password the role accepts', () => {
     ['V1-6: an md5 password', 'v|md5abcdef0123456789abcdef01234567', '', VR_FORM],
     ['V1-7: the read fails', '', 'psql: error: connection to server failed', 'psql: error: connection to server failed'],
   ])('%s', async (_n, authid, fail, why) => {
-    writeRegistry({ fleetDb: record('absent', { replication: replication() }) });
+    writeRegistry({ fleetDb: record('absent', { replication: replication() }), fleetLogin: OWN_LOGIN });
     setUrl(MANAGED_URL);
     h.authid = authid; h.authidFail = fail;
     const before = fs.readFileSync(REGISTRY, 'utf-8');
@@ -478,6 +490,7 @@ describe('W2: the mismatch text names what was tried', () => {
 
 describe('W1: the lanes compare the record without its password', () => {
   it('W1-1: Enable fills and runs to its end', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent') });
     setUrl(MANAGED_URL);
     const en = await enableFleetReplication(bot(), 'main.invalid', 15432);
@@ -494,12 +507,13 @@ describe('W1: the lanes compare the record without its password', () => {
     expect(urlNow()).toBe(sidecar(ROLE_PW));
   });
   it('W1-3: a password recorded while Enable runs is no change', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent') });
     setUrl(OUTSIDE_URL);
     const outcomes: unknown[] = [];
-    h.onText = (text) => { if (text.startsWith('openssl')) outcomes.push(containerManager.updateInstanceFleetDbPassword('m', ROLE_PW)?.id); };
+    h.onText = (text) => { if (text.startsWith('openssl')) outcomes.push(containerManager.updateInstanceFleetDbPassword(ID, ROLE_PW)?.id); };
     const en = await enableFleetReplication(bot(), 'main.invalid', 15432);
-    expect(outcomes).toEqual(['m']);
+    expect(outcomes).toEqual([ID]);
     expect(en.success).toBe(true);
     expect(bot().fleetDb?.replication?.hostPort).toBe(15432);
   });
@@ -507,7 +521,7 @@ describe('W1: the lanes compare the record without its password', () => {
     writeRegistry({ fleetDb: record('absent', { replication: replication() }) });
     setUrl(OUTSIDE_URL);
     const outcomes: unknown[] = [];
-    h.onText = (text) => { if (text.includes('ALTER ROLE replicator NOLOGIN')) outcomes.push(containerManager.updateInstanceFleetDbPassword('m', ROLE_PW)?.id); };
+    h.onText = (text) => { if (text.includes('ALTER ROLE smdb_join NOLOGIN')) outcomes.push(containerManager.updateInstanceFleetDbPassword('m', ROLE_PW)?.id); };
     const ds = await disableFleetReplication(bot());
     expect(outcomes).toEqual(['m']);
     expect(ds.success).toBe(true);
@@ -515,12 +529,13 @@ describe('W1: the lanes compare the record without its password', () => {
     expect(bot().fleetDb?.password).toBe(ROLE_PW);
   });
   it('W1-5a: another writer during Enable\'s fill: the existing refusal, nothing written', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent') });
     setUrl(MANAGED_URL);
     h.onText = (text) => { if (text.includes('pg_authid')) editRecord(db => { db.retiringAt = '2026-11-12T00:00:00.000Z'; }); };
     const en = await enableFleetReplication(bot(), 'main.invalid', 15432);
     expect(en.success).toBe(false);
-    expect(en.error).toBe("The instance's database record changed while this Enable ran, so the record and the database URL were not written; the database already has the replication role, ssl, the WAL settings, the server certificate (a new one) and the managed pg_hba. Check the Replication section, then press Enable again");
+    expect(en.error).toBe("The instance's database record changed while this Enable ran, so the record and the database URL were not written; the database already has the join login, this machine's own login, ssl, the WAL settings, the server certificate (a new one) and the managed pg_hba. Check the Replication section, then press Enable again");
     expect(rawRecord().replication).toBeUndefined();
     expect(rawRecord().password).toBeUndefined();
     expect(urlNow()).toBe(MANAGED_URL);
@@ -536,6 +551,7 @@ describe('W1: the lanes compare the record without its password', () => {
     expect(rawRecord().password).toBeUndefined();
   });
   it('W1-5c: another field changed after the fill: the existing refusal', async () => {
+    ID = MAIN_ID;
     writeRegistry({ fleetDb: record('absent', { replication: replication() }) });
     setUrl(MANAGED_URL);
     h.onText = (text) => { if (text.includes('ALTER SYSTEM SET ssl = on')) editRecord(db => { db.replication.hostPort = 1; }); };
@@ -631,24 +647,29 @@ describe('V3: the adopt records a password the copy\'s role accepts', () => {
     user: 'smdb', db: 'smdb',
   };
   const REG_B1 = path.join(h.dir, 'instances.json');
-  const writeB1 = (extra: Record<string, unknown> = {}) => fs.writeFileSync(REG_B1, JSON.stringify({ instances: { b1: {
-    id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running', sourceType: 'git',
+  // The adopt ends in Enable, which makes this machine's own login from the bot's id (a uuid in production).
+  const ADOPT_ID = '5e7a9c1b-3d4f-4b60-8c2d-4e6f8a0b1c2d';
+  let id = 'b1';
+  beforeEach(() => { id = 'b1'; });
+  const writeB1 = (extra: Record<string, unknown> = {}) => fs.writeFileSync(REG_B1, JSON.stringify({ instances: { [id]: {
+    id, sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', fleetDbReplica: { ...REPLICA }, ...extra,
   } } }));
-  const b1 = () => containerManager.getBot('b1')!;
+  const b1 = () => containerManager.getBot(id)!;
   const botEnvFile = (url: string) => {
-    fs.mkdirSync(path.join(h.dir, 'bots', 'b1', 'data'), { recursive: true });
-    fs.writeFileSync(path.join(h.dir, 'bots', 'b1', 'data', '.env'), `DATA_BACKEND_URL=${url}\n`);
+    fs.mkdirSync(path.join(h.dir, 'bots', id, 'data'), { recursive: true });
+    fs.writeFileSync(path.join(h.dir, 'bots', id, 'data', '.env'), `DATA_BACKEND_URL=${url}\n`);
   };
   const appEnvFile = path.posix.join(path.join(h.dir, 'bots', 'b1', 'data'), '.env');
-  const b1Url = () => envManager.getEnvVars('b1').DATA_BACKEND_URL;
+  const b1Url = () => envManager.getEnvVars(id).DATA_BACKEND_URL;
   const fileUrl = (pw: string) => `postgresql://smdb:${pw}@bot1-fleet-postgres:5432/smdb`;
   const adoptedUrl = (pw: string) => `postgresql://smdb:${encodeURIComponent(pw)}@bot1-fleet-postgres-replica:5432/smdb?sslmode=no-verify`;
 
   it('V3-1: the join code\'s password, accepted, goes into the record and the URL', async () => {
+    id = ADOPT_ID;
     writeB1({ fleetJoin: fakeJoinRecord({}, { app: { user: 'smdb', password: ROLE_PW } }) });
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: `postgresql://smdb:${OTHER_PW}@primary.invalid:5433/smdb` });
+    envManager.setEnvVars(id, { DATA_BACKEND_URL: `postgresql://smdb:${OTHER_PW}@primary.invalid:5433/smdb` });
     const r = await adoptPromotedReplica(b1());
     expect(r.success).toBe(true);
     expect(b1().fleetDb?.password).toBe(ROLE_PW);
@@ -656,6 +677,7 @@ describe('V3: the adopt records a password the copy\'s role accepts', () => {
     expect(h.authidReads).toBe(1);
   });
   it('V3-2: the join code\'s rejected, the bot env file\'s accepted', async () => {
+    id = ADOPT_ID;
     writeB1({ fleetJoin: fakeJoinRecord({}, { app: { user: 'smdb', password: OTHER_PW } }) });
     botEnvFile(fileUrl(ROLE_PW));
     const r = await adoptPromotedReplica(b1());
@@ -693,8 +715,9 @@ describe('V3: the adopt records a password the copy\'s role accepts', () => {
     expect(b1Url()).toBeUndefined();
   });
   it('V3-6: an outside URL in the manager env is rejected, the file\'s accepted', async () => {
+    id = ADOPT_ID;
     writeB1();
-    envManager.setEnvVars('b1', { DATA_BACKEND_URL: 'postgresql://smdb:OUTSIDEPW@db.example.test:5432/smdb' });
+    envManager.setEnvVars(id, { DATA_BACKEND_URL: 'postgresql://smdb:OUTSIDEPW@db.example.test:5432/smdb' });
     botEnvFile(fileUrl(ROLE_PW));
     const r = await adoptPromotedReplica(b1());
     expect(r.success).toBe(true);

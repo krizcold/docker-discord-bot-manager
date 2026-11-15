@@ -91,7 +91,7 @@ describe('the exact argv and SQL of each function', () => {
       const r: any = await fn({ container: 'c', user: 'dbm_admin' });
       expect(r.ok).toBe(false);
     }
-    const r: any = await endBotSessions({ container: 'c', user: 'replicator' }, 0);
+    const r: any = await endBotSessions({ container: 'c', user: 'smdb_join' }, 0);
     expect(r.ok).toBe(false);
     expect(dk.calls).toEqual([]);
   });

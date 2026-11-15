@@ -52,7 +52,7 @@ describe('O4 the old main rejoins as a copy', () => {
     log.mockRestore();
     expect(h.reseedCalls).toHaveLength(1);
     const code = decodeJoinCode(h.reseedCalls[0].code);
-    expect(code.ok && { host: code.code.host, port: code.code.port, machine: code.code.machine, repl: code.code.repl.user }).toEqual({ host: 'copy.example', port: 5434, machine: 'copy.example', repl: 'replicator' });
+    expect(code.ok && { host: code.code.host, port: code.code.port, machine: code.code.machine, repl: code.code.repl.user }).toEqual({ host: 'copy.example', port: 5434, machine: 'copy.example', repl: 'smdb_copy_a' });
     expect(logs).toContain("[Switch] A: copy.example is the main now (generation 4); rebuilding this machine's database as its copy after a dump of it");
   });
   it('J2: another certificate: no rejoin, rejoinError J-FP', async () => {
@@ -64,7 +64,7 @@ describe('O4 the old main rejoins as a copy', () => {
   it('J3: the composed login refused: J-LOGIN', async () => {
     h.peer = () => ({ kind: 'login-refused', reason: 'password authentication failed' }) as any;
     await switchTick(now);
-    expect(stored('a').fleetDb.handover.rejoinError).toBe("copy.example refused this machine's replication login (password authentication failed). Copy copy.example's join code and paste it into Rejoin as a copy.");
+    expect(stored('a').fleetDb.handover.rejoinError).toBe("copy.example refused this machine's own login (password authentication failed). Copy copy.example's join code and paste it into Rejoin as a copy.");
   });
   it.each([
     ['J4 unreachable', () => ({ kind: 'unreachable', reason: 'connection timed out' }), 'connection timed out'],
@@ -85,9 +85,9 @@ describe('O4 the old main rejoins as a copy', () => {
     await switchTick(now + 31 * 60_000);
     expect(h.reseedCalls).toHaveLength(2);
   });
-  it('J8: the operator Rejoin of a replaced main composes the code from replacedBy', () => {
+  it('J8: the operator Rejoin of a replaced main composes the code from replacedBy', async () => {
     writeRegistry({ a: mainFixture({ fleetDb: { ...(mainFixture().fleetDb as object), replacedBy: { machine: 'copy.example', host: 'copy.example', port: 5434, generation: 5, own: 4, since: null, at: 'x', cert: COPY_PEM } } }) });
-    expect(rejoinComposed('a')).toMatchObject({ success: true });
+    expect(await rejoinComposed('a')).toMatchObject({ success: true });
     const code = decodeJoinCode(h.reseedCalls[0].code);
     expect(code.ok && code.code.host).toBe('copy.example');
   });
@@ -101,34 +101,34 @@ describe('O4 the old main rejoins as a copy', () => {
 });
 
 describe('J13, J14: Rejoin composed from a tie, and from the old main kept (round 1)', () => {
-  it('J13: mainConflict and no replacedBy: the code is composed from the conflict', () => {
+  it('J13: mainConflict and no replacedBy: the code is composed from the conflict', async () => {
     writeRegistry({ a: mainFixture({ fleetDb: { ...(mainFixture().fleetDb as object), mainConflict: { machine: 'b.example', host: 'b.example', port: 5440, generation: 3, at: 'x', cert: COPY_PEM } } }) });
-    expect(rejoinComposed('a')).toMatchObject({ success: true });
+    expect(await rejoinComposed('a')).toMatchObject({ success: true });
     const code = decodeJoinCode(h.reseedCalls[0].code);
     expect(code.ok && { host: code.code.host, port: code.code.port, machine: code.code.machine }).toEqual({ host: 'b.example', port: 5440, machine: 'b.example' });
   });
-  it("J14: the target's host and port are formerMain's: the code is formerMain.code itself, on a main without replication", () => {
+  it("J14: the target's host and port are formerMain's: the code is formerMain.code itself, on a main without replication", async () => {
     const former = fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example', fp: COPY_FP });
     writeRegistry({ a: mainFixture({ fleetDb: {
       containerName: 'a-pg', user: 'app', db: 'app', volume: 'a-pgdata',
       formerMain: { code: former, slot: 'slot_c', machine: 'old.example', host: 'old.example', port: 5500, generation: 3, at: 'x' },
       replacedBy: { machine: 'old.example', host: 'old.example', port: 5500, generation: 5, own: 4, since: null, at: 'x', cert: COPY_PEM },
     } }) });
-    expect(rejoinComposed('a')).toMatchObject({ success: true });
+    expect(await rejoinComposed('a')).toMatchObject({ success: true });
     expect(h.reseedCalls[0].code).toBe(former);
   });
   it.each([
     ['a recorded certificate of another fingerprint', fakeJoinCode({ host: 'old.example', port: 5500, machine: 'old.example' })],
     ['a code that does not decode', ''],
-  ])("J15 (D56): the target at formerMain's host and port with %s: composed from the recorded certificate", (_n, former) => {
+  ])("J15 (D56): the target at formerMain's host and port with %s: composed from the recorded certificate", async (_n, former) => {
     writeRegistry({ a: mainFixture({ fleetDb: {
       ...(mainFixture().fleetDb as object),
       formerMain: { code: former, slot: 'slot_c', machine: 'old.example', host: 'old.example', port: 5500, generation: 3, at: 'x' },
       replacedBy: { machine: 'old.example', host: 'old.example', port: 5500, generation: 5, own: 4, since: null, at: 'x', cert: COPY_PEM },
     } }) });
-    expect(rejoinComposed('a')).toMatchObject({ success: true });
+    expect(await rejoinComposed('a')).toMatchObject({ success: true });
     const code = decodeJoinCode(h.reseedCalls[0].code);
-    expect(code.ok && { host: code.code.host, port: code.code.port, fp: code.code.fp, repl: code.code.repl.user }).toEqual({ host: 'old.example', port: 5500, fp: COPY_FP, repl: 'replicator' });
+    expect(code.ok && { host: code.code.host, port: code.code.port, fp: code.code.fp, repl: code.code.repl.user }).toEqual({ host: 'old.example', port: 5500, fp: COPY_FP, repl: 'smdb_copy_a' });
     expect(h.reseedCalls[0].code).not.toBe(former);
   });
   it("J16 (D64): the target is writable at the mark's generation, and its cluster holds a receive mark: no rejoin, J-RECEIVING", async () => {

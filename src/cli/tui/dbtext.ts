@@ -1,7 +1,7 @@
 import * as path from 'path';
 import {
   BackupAlert, BackupConfigAnswer, BackupFamilyStatus, Bot, ConnectionsAnswer, FleetBackupStatus, Held, MemoryAnswer, MigrateView, Outcome, RestoreAnswer,
-  RestorePreview, ReplicaAnswer, ReplicationStatus, SeedView,
+  MachineLogin, RestorePreview, ReplicaAnswer, ReplicationStatus, SeedView,
   SwitchAnswer,
 } from './api';
 
@@ -449,13 +449,21 @@ export function replicationLines(r: Outcome<{ replication?: ReplicationStatus }>
       return tip(`${who}: streaming${lagText}${warn ? ' - a take-over by it now would lose that much' : ''}${retain}`);
     });
   const slotLines: DbLine[] = !live ? [] : [...fleetSlotLines, ...otherSlots.map((s) => tip(`Slot ${s.slot} (not a fleet copy): ${s.walStatus}${s.active ? ', active' : ''}`))];
+  const loginState = (l: MachineLogin) => !l.member ? 'blocked, not removed yet'
+    : !l.canLogin ? 'closed (replication was disabled)'
+      : l.slotState === 'active' ? (l.client ? `streaming from ${l.client}` : 'streaming')
+        : l.slotState === 'absent' ? 'no slot' : 'not connected';
+  const loginLines: DbLine[] = !live ? []
+    : !Array.isArray(live.logins) ? [err('The machine logins could not be read.')]
+      : [tip('Machine logins'), ...live.logins.map((l) => tip(`${l.machine || 'no address listed'} (${l.login})${l.own ? ' (this machine)' : ''}: ${loginState(l)}`))];
   const keepTip = live && live.slotWalKeep === '-1' ? ' - WAL retention UNBOUNDED' : live && live.slotWalKeep ? ` - WAL bound ${live.slotWalKeep}` : '';
   const dbState = live ? (live.sslOn ? '' : ' - ssl not active yet, restart the instance') : rep.probeError ? ` - could not read the database (${rep.probeError})` : ' - database not running';
   return [
     tip(`Replication endpoint ${rep.publicHost}:${rep.hostPort} (TLS required off this machine)${dbState}${keepTip}`),
-    ...(rep.disablingSince ? [err(`A Disable of replication started on ${when(Date.parse(rep.disablingSince))} did not finish: some of its steps may already have run (the replication login may be revoked, the copies' slots dropped). Press Disable replication to finish it.`)] : []),
+    ...(rep.disablingSince ? [err(`A Disable of replication started on ${when(Date.parse(rep.disablingSince))} did not finish: some of its steps may already have run (the join login and the machines' logins may be closed, the copies' slots dropped). Press Disable replication to finish it.`)] : []),
     ...reachLines,
     ...slotLines,
+    ...loginLines,
   ];
 }
 

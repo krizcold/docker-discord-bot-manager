@@ -289,7 +289,7 @@ describe("NM20 part 4: the tick's logins on a main with copies", () => {
     await fleetSwitch.streamingCopies(stored('a'));
     done();
     expect(callsWith('pg_control_system()').map(loginOf)).toEqual(['dbm_admin']);
-    for (const part of ['INSERT INTO smdb_manager.copies AS c', "FROM smdb_manager.addresses WHERE slot IS NOT NULL ORDER BY host, port", "s.slot_type = 'physical'"]) {
+    for (const part of ['INSERT INTO smdb_manager.copies AS c', "FROM smdb_manager.addresses a\nWHERE a.slot ~ '^fleet_standby_[0-9a-f]{32}$'", "s.slot_type = 'physical'"]) {
       expect(callsWith(part).length, part).toBeGreaterThan(0);
       for (const c of callsWith(part)) expect(loginOf(c), part).toBe('dbm_meta');
     }

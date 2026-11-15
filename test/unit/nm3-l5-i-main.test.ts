@@ -84,21 +84,21 @@ const dbUrl = 'postgresql://smdb:Db-Secret,%25x@m-fleet-postgres:5432/smdb?sslmo
 const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'm-fleet-postgres-data' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'main.invalid', certHost: 'main.invalid', slotWalKeepMb: 4096 };
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
-  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { m: {
-    id: 'm', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
+  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { 'aaaaaaaa-0000-4000-8000-00000000000a': {
+    id: 'aaaaaaaa-0000-4000-8000-00000000000a', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...extra,
   } } }));
 };
-const bot = () => containerManager.getBot('m')!;
-const addressScript = () => h.sql.find(s => s.includes('CREATE SCHEMA IF NOT EXISTS smdb_manager'))!;
+const bot = () => containerManager.getBot('aaaaaaaa-0000-4000-8000-00000000000a')!;
+const addressScript = () => h.sql.find(s => s.includes('CREATE TABLE IF NOT EXISTS smdb_manager.addresses'))!;
 
 beforeEach(() => {
   h.sql = []; h.running = 'true'; h.cert = FIXTURE_PEM; h.fail = ''; h.failErr = ''; h.slots = ''; h.addresses = '[]'; h.listFail = false;
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
-  fs.mkdirSync(path.join(h.dir, 'bots', 'm', 'env'), { recursive: true });
+  fs.mkdirSync(path.join(h.dir, 'bots', 'aaaaaaaa-0000-4000-8000-00000000000a', 'env'), { recursive: true });
   writeRegistry({ fleetDb: { ...fleetDb, replication } });
-  envManager.setEnvVars('m', { DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('aaaaaaaa-0000-4000-8000-00000000000a', { DATA_BACKEND_URL: dbUrl });
 });
 afterAll(() => fs.rmSync(h.dir, { recursive: true, force: true }));
 
@@ -117,7 +117,7 @@ describe('Enable: the failure texts', () => {
   });
 
   it('a refused address script quotes the trimmed error without the password', async () => {
-    h.fail = 'CREATE SCHEMA IF NOT EXISTS smdb_manager';
+    h.fail = 'CREATE TABLE IF NOT EXISTS smdb_manager.addresses';
     h.failErr = '  ERROR:  denied near Repl-Secret-0123456789  \n';
     expect((await enableFleetReplication(bot(), 'main.invalid', 15432)).error).toBe('setting up the address list failed: ERROR:  denied near ***');
   });
@@ -129,18 +129,18 @@ describe('Enable: the address script', () => {
     expect(addressScript()).toContain("-----END CERTIFICATE-----', 'main.invalid')");
   });
 
-  it('a moved port alone deletes the old own row', async () => {
+  it('a moved port deletes every other own row, the old one included (NM22 R10)', async () => {
     await enableFleetReplication(bot(), 'main.invalid', 15440);
-    expect(addressScript()).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = 'main.invalid' AND port = 15432;");
+    expect(addressScript()).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = 'main.invalid' AND port = 15440);");
   });
 
-  it('a moved host alone deletes the old own row', async () => {
+  it('a moved host deletes every other own row, the old one included (NM22 R10)', async () => {
     await enableFleetReplication(bot(), 'new.invalid', 15432);
-    expect(addressScript()).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = 'main.invalid' AND port = 15432;");
+    expect(addressScript()).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = 'new.invalid' AND port = 15432);");
   });
 
-  it('with nothing moved the grants lead straight to the insert', () => {
-    expect(addressTableSql('main.invalid', 15432, 'pem', 'main.invalid', null)).toContain('ON smdb_manager.addresses TO replicator;\nGRANT SELECT ON smdb_manager.addresses TO dbm_work;\nINSERT INTO smdb_manager.addresses');
+  it('with nothing moved the grants lead to the delete of other own rows, then the insert (NM22 R10)', () => {
+    expect(addressTableSql('main.invalid', 15432, 'pem', 'main.invalid')).toContain("GRANT SELECT ON smdb_manager.addresses TO smdb_copies, dbm_work;\nDELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = 'main.invalid' AND port = 15432);\nINSERT INTO smdb_manager.addresses");
   });
 });
 

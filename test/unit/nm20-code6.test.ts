@@ -243,7 +243,7 @@ describe('NM20 part 6: the push (R3.6, X1, Y1, Y6, Z5, U2, U7)', () => {
     expect(m.input.endsWith('COMMIT;\n')).toBe(true);
     expect(m.input).toContain('CREATE SCHEMA smdb_manager;');
     expect(m.input).toContain('GRANT SELECT ON ALL TABLES IN SCHEMA smdb_manager TO dbm_work;');
-    expect(m.input.match(/INSERT INTO smdb_manager\.addresses /g)).toHaveLength(1000);
+    expect(m.input.match(/INSERT INTO smdb_manager\.addresses \(/g)).toHaveLength(1000);
     expect(scriptOf(m)).not.toMatch(/--single-transaction|(^| )-1( |$)/);
     for (const x of runs) for (const a of x.args) expect(a.length).toBeLessThanOrEqual(4096);
   });
@@ -324,7 +324,8 @@ describe('NM20 part 6: the push (R3.6, X1, Y1, Y6, Z5, U2, U7)', () => {
     expect(r.text).toBe('The data reached win.example and matched, but win.example could not be made the main (ERROR:  could not serialize access). Press Push again.');
     expect(runs.map(x => x.step).slice(-2)).toEqual(['cap', 'commit']);
     expect(run('cap').args).toContain(SHARD_CAP_DO_SQL);
-    const commit = run('commit').args.join('\n');
+    expect(run('commit').args).toContain('-i');
+    const commit = run('commit').input;
     expect(commit).toContain('SET ROLE dbm_meta;');
     expect(commit).not.toContain('dbm_admin');
     expect(commit).not.toContain('shard_claims');

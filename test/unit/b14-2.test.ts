@@ -308,7 +308,7 @@ describe('R1-J37 and R8-J6: a stale-primary re-seed destroys only after a fenced
   const start = () => reseedStalePrimary(containerManager.getBot('a')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/app'), 'standby.invalid', 5440, true);
 
   it('fences, dumps, then retires, and the seed names the dump', async () => {
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(at('fence')).toBeLessThan(at('dump'));
     expect(at('dump')).toBeLessThan(at('retire'));
@@ -319,7 +319,7 @@ describe('R1-J37 and R8-J6: a stale-primary re-seed destroys only after a fenced
 
   it('a failed dump parks the seed with the failure named and nothing retired', async () => {
     pg.dumpFails = true;
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).not.toContain('retire');
     expect(at('lift')).toBeGreaterThan(at('dump'));
@@ -330,7 +330,7 @@ describe('R1-J37 and R8-J6: a stale-primary re-seed destroys only after a fenced
 
   it('a failed fence parks the seed before any dump or retire', async () => {
     pg.fenceFails = true;
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).not.toContain('dump');
     expect(pg.events).not.toContain('retire');
@@ -339,7 +339,7 @@ describe('R1-J37 and R8-J6: a stale-primary re-seed destroys only after a fenced
 
   it('a failed retire lifts the fence from the database it left standing', async () => {
     pg.retireFails = true;
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(at('lift')).toBeGreaterThan(at('retire'));
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/could not retire/);
@@ -348,7 +348,7 @@ describe('R1-J37 and R8-J6: a stale-primary re-seed destroys only after a fenced
   it('a fence stuck after a failed dump names a re-seed, not a restore, as the retry', async () => {
     pg.dumpFails = true;
     pg.liftFails = true;
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/retrying the re-seed retries the lift/);
     expect(bot.fleetDbReplicaSeed?.lastError).not.toMatch(/restore/);

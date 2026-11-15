@@ -101,6 +101,7 @@ const FLEETDB = { containerName: 'b-fleet-postgres', user: 'smdb', db: 'smdb', v
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), fleetDbReplica: REPLICA, ...over,
 } } }, null, 2));
 const bot = () => containerManager.getBot('b')!;

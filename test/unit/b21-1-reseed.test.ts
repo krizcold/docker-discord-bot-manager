@@ -127,7 +127,7 @@ const start = () => reseedStalePrimary(containerManager.getBot('a')!, codeFor('p
 
 describe('R23-J3: the stale-primary re-seed compares the pasted primary with this database before the delete', () => {
   it('a primary that is a copy of this database on a later timeline is retired over', async () => {
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     await settled();
     expect(pg.events.indexOf('dump')).toBeLessThan(pg.events.indexOf('identify'));
     expect(pg.events.indexOf('identify')).toBeLessThan(pg.events.indexOf('retire'));
@@ -135,7 +135,7 @@ describe('R23-J3: the stale-primary re-seed compares the pasted primary with thi
 
   it('a primary of a different cluster is refused after the dump and nothing is retired', async () => {
     pg.primary = '9009|3|0/3000000|';
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).toContain('dump');
     expect(pg.events).not.toContain('retire');
@@ -147,7 +147,7 @@ describe('R23-J3: the stale-primary re-seed compares the pasted primary with thi
 
   it('a primary on a lower timeline is refused and nothing is retired', async () => {
     pg.local = '7001|4';
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).not.toContain('retire');
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/on timeline 3, below this database's timeline 4/);
@@ -155,7 +155,7 @@ describe('R23-J3: the stale-primary re-seed compares the pasted primary with thi
 
   it('a primary whose identity cannot be read is refused and nothing is retired', async () => {
     pg.primary = '';
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).not.toContain('retire');
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/the pasted primary's identity could not be read/);
@@ -163,7 +163,7 @@ describe('R23-J3: the stale-primary re-seed compares the pasted primary with thi
 
   it('a database whose own identity cannot be read is refused and nothing is retired', async () => {
     pg.local = '';
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).not.toContain('retire');
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/this database's identity could not be read/);

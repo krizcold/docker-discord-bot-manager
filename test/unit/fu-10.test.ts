@@ -75,7 +75,7 @@ const backupError = (fb: typeof import('../../src/instance/fleetBackup'), id: st
 import * as fleetReplication from '../../src/instance/fleetReplication';
 import { publishHostPort } from '../../src/templates/pcsProcessing';
 
-const botDir = path.join(h.dir, 'bots', 'b1');
+const botDir = path.join(h.dir, 'bots', 'b1b1b1b1-0000-4000-8000-000000000001');
 const DB_SECRET = 'Db-Secret-0123456789';
 const REPL_SECRET = 'Repl-Secret-0123456789';
 const dbUrl = `postgresql://smdb:${DB_SECRET}@bot1-fleet-postgres:5432/smdb`;
@@ -85,8 +85,8 @@ const replication = { role: 'replicator', password: REPL_SECRET, hostPort: 15432
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({
     instances: {
-      b1: {
-        id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
+      'b1b1b1b1-0000-4000-8000-000000000001': {
+        id: 'b1b1b1b1-0000-4000-8000-000000000001', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'running',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: { DATA_BACKEND: 'postgres' },
         fleetDb,
@@ -96,14 +96,14 @@ const writeRegistry = (extra: Record<string, unknown> = {}): void => {
     },
   }));
 };
-const bot = () => containerManager.getBot('b1')!;
+const bot = () => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!;
 const hbaWrites = () => h.calls.filter(c => c.args.join(' ').includes('pg_hba.conf'));
 
 beforeEach(() => {
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
   h.calls.length = 0;
   h.plainClients = '';
   h.dumpStderr = '';
@@ -134,9 +134,9 @@ describe('B19-1h: a Disable keeps the non-TLS lines an Enable kept where the nex
 
   it('narrows the lines at the next start once no kept client connects without TLS', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, keptPlain: ['10.5.0.7'] } });
-    const warning = await fleetReplication.narrowKeptPlainHba('b1');
+    const warning = await fleetReplication.narrowKeptPlainHba('b1b1b1b1-0000-4000-8000-000000000001');
     expect(warning).toBeNull();
-    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(fleetReplication.pgHbaContent('smdb'));
     expect(bot().fleetDb!.keptPlain).toBeUndefined();
     expect(bot().fleetDb!.replication).toBeUndefined();
   });
@@ -144,7 +144,7 @@ describe('B19-1h: a Disable keeps the non-TLS lines an Enable kept where the nex
   it('keeps a line while its client still connects without TLS', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, keptPlain: ['10.5.0.7', '10.5.0.8'] } });
     h.plainClients = '10.5.0.7';
-    const warning = await fleetReplication.narrowKeptPlainHba('b1');
+    const warning = await fleetReplication.narrowKeptPlainHba('b1b1b1b1-0000-4000-8000-000000000001');
     expect(warning).toMatch(/still connect to the database without TLS/);
     expect(hbaWrites()[0].stdin).toMatch(/^host +all +all +10\.5\.0\.7\/32 +scram-sha-256$/m);
     expect(hbaWrites()[0].stdin).not.toMatch(/10\.5\.0\.8/);
@@ -172,7 +172,7 @@ describe('B19-1h: a Disable keeps the non-TLS lines an Enable kept where the nex
       showNoAnswer: () => {}, renderFleetReplication: () => {}, loadBots: () => {}, fleetBackupBotId: null,
     });
     vm.runInContext(source, ctx);
-    await ctx.disableFleetReplication('b1');
+    await ctx.disableFleetReplication('b1b1b1b1-0000-4000-8000-000000000001');
     expect(messages[0][0]).toBe('success');
     expect(messages[0][1]).toMatch(/keeps admitting connections without TLS from 1 address\(es\).*until a start finds none of them/);
   });
@@ -186,7 +186,7 @@ describe('B06-1b: a dump error shown on the card carries no secret', () => {
     spy.mockRestore();
     fleetBackup.stopFleetBackupScheduler();
     tick();
-    await vi.waitFor(() => expect(backupError(fleetBackup, 'b1')).not.toBeNull());
+    await vi.waitFor(() => expect(backupError(fleetBackup, 'b1b1b1b1-0000-4000-8000-000000000001')).not.toBeNull());
   };
 
   it('hides the database and replication passwords that pg_dump quoted', async () => {
@@ -196,7 +196,7 @@ describe('B06-1b: a dump error shown on the card carries no secret', () => {
     });
     h.dumpStderr = `pg_dump: error: connection to "${dbUrl}" failed; password ${REPL_SECRET} rejected\n`;
     await scheduledDump();
-    const text = backupError(fleetBackup, 'b1')!;
+    const text = backupError(fleetBackup, 'b1b1b1b1-0000-4000-8000-000000000001')!;
     expect(text).toContain('pg_dump exited with code 1');
     expect(text).not.toContain(DB_SECRET);
     expect(text).not.toContain(REPL_SECRET);

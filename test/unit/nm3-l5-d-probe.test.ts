@@ -47,13 +47,14 @@ vi.mock('../../src/webui/server', () => ({ broadcastToClients: () => {} }));
 import * as fs from 'fs';
 import * as path from 'path';
 import { ensureClientImage, ensureProbeCert, mainProbe, probeFailureText, readAddresses, unreachableText } from '../../src/instance/fleetJoin';
+import { COPY_SESSION_OPTIONS } from '../../src/instance/dbLogin';
 import { FIXTURE_FP, FIXTURE_PEM, fakeJoin } from './join-fake';
 
-const instance = { id: 'b1', sanitizedName: 'b1' } as any;
+const instance = { id: 'b1', sanitizedName: 'b1', fleetLogin: { password: 'Own-Machine-Secret-01' } } as any;
 const fp16 = FIXTURE_FP.slice(0, 16);
 const certFile = path.join(h.dir, 'bots', 'b1', 'fleet-join', `${fp16}.crt`);
 const mount = `${path.resolve(h.dir).replace(/\\/g, '/')}/bots/b1/fleet-join/${fp16}.crt:/primary-ca.crt:ro`;
-const dsn = 'postgresql://replicator@main.invalid:15432/smdb?sslmode=verify-full&sslrootcert=/primary-ca.crt';
+const dsn = `postgresql://smdb_copy_b1@main.invalid:15432/smdb?sslmode=verify-full&sslrootcert=/primary-ca.crt&require_auth=scram-sha-256&options=${encodeURIComponent(COPY_SESSION_OPTIONS)}`;
 const pemBare = FIXTURE_PEM.trim();
 
 beforeEach(() => {
@@ -94,7 +95,7 @@ describe('ensureClientImage', () => {
 describe('mainProbe', () => {
   const okOut = '7012345|1|0/16B3748\nfalse|kept';
   const probe = (slot?: string, code = fakeJoin()) => mainProbe(instance, code, FIXTURE_PEM, slot);
-  const slotSql = (s: string) => `COALESCE((SELECT CASE WHEN active THEN 'active' WHEN wal_status = 'lost' THEN 'lost' ELSE 'kept' END FROM pg_replication_slots WHERE slot_name = '${s}'), 'absent')`;
+  const slotSql = (s: string) => `COALESCE((SELECT CASE WHEN active THEN 'active' WHEN wal_status = 'lost' THEN 'lost' ELSE 'kept' END FROM pg_catalog.pg_replication_slots WHERE slot_name = '${s}'), 'absent')`;
 
   it('runs psql in a named container with the certificate mounted and the slot read', async () => {
     h.run.out = okOut;
@@ -103,13 +104,13 @@ describe('mainProbe', () => {
     expect(h.spawns[0].args).toEqual(['run', '--rm', '--name', 'b1-fleet-join-probe', '-e', 'PGPASSWORD', '-v', mount,
       '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
       'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', 'sh', dsn,
-      `SELECT pg_is_in_recovery()::text || '|' || ${slotSql('fleet_slot_1')}`]);
+      `SELECT pg_catalog.pg_is_in_recovery()::text || '|' || ${slotSql('fleet_slot_1')}`]);
   });
 
   it('reads a slot name that is not a slot name as absent', async () => {
     h.run.out = okOut;
     await probe('x-y');
-    expect(h.spawns[0].args.at(-1)).toBe(`SELECT pg_is_in_recovery()::text || '|' || 'absent'`);
+    expect(h.spawns[0].args.at(-1)).toBe(`SELECT pg_catalog.pg_is_in_recovery()::text || '|' || 'absent'`);
   });
 
   it.each([['lost'], ['active']])('reads the slot state %s', async s => {
@@ -152,7 +153,7 @@ describe('mainProbe', () => {
 
   it('hides a short password the redaction leaves', async () => {
     h.run = { code: 2, out: '', err: 'FATAL: bad pw7 here' };
-    expect(await probe(undefined, fakeJoin({ repl: { user: 'replicator', password: 'pw7' } }))).toEqual({ ok: false, kind: 'unreachable', reason: 'FATAL: bad *** here' });
+    expect(await mainProbe({ ...instance, fleetLogin: { password: 'pw7' } }, fakeJoin(), FIXTURE_PEM)).toEqual({ ok: false, kind: 'unreachable', reason: 'FATAL: bad *** here' });
   });
 });
 

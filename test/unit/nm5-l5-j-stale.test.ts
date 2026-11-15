@@ -175,7 +175,7 @@ const noteOf = async () => (await getFleetReplicaStatus(await finished())).seedN
 
 describe('the stale-primary re-seed, its join and its dump', () => {
   it('a dump taken before the run is named, the join holds the lock, and the bot answer follows', async () => {
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true, { dumpDone: true, safetyDump: 'pre-reseed-given.dump' })).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true, { dumpDone: true, safetyDump: 'pre-reseed-given.dump' })).toMatchObject({ success: true });
     expect(await noteOf()).toBe("This machine's database was rebuilt as a copy of primary.invalid. A dump of the old database is kept with the backups (pre-reseed-given.dump). The running bot took the new database list.");
     expect(tmp.joinOpts).toEqual([{ inLock: true }]);
     expect(tmp.seenDump).toEqual(['pre-reseed-given.dump']);
@@ -184,13 +184,13 @@ describe('the stale-primary re-seed, its join and its dump', () => {
 
   it('a dump name without the done mark is not claimed when no dump was taken', async () => {
     tmp.mainVolumeAbsent = true;
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true, { safetyDump: 'pre-reseed-given.dump' })).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true, { safetyDump: 'pre-reseed-given.dump' })).toMatchObject({ success: true });
     expect(await noteOf()).toBe("This machine's database was rebuilt as a copy of primary.invalid. The running bot took the new database list.");
   });
 
   it('the database comes up handed over for the safety dump, and the notice goes with it', async () => {
     withNotice();
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
     await finished();
     expect(tmp.sidecarOpts).toEqual([{ retireRetry: true, handedOver: true }]);
     expect(fleetBackup.shownRestoreNoticeFile('a')).toBeNull();
@@ -199,7 +199,7 @@ describe('the stale-primary re-seed, its join and its dump', () => {
   it('a failed retire keeps the restore notice', async () => {
     withNotice();
     tmp.retireFail = true;
-    expect(reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
+    expect(await reseedStalePrimary(containerManager.getBot('a')!, CODE, 'standby.invalid', 5440, true)).toMatchObject({ success: true });
     await finished();
     expect(tmp.seenDump.length).toBe(1);
     expect(fleetBackup.shownRestoreNoticeFile('a')).toBe('old.dump');

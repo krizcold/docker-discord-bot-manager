@@ -342,7 +342,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       vi.spyOn(containerManager, 'retireFleetDbSidecar').mockImplementation(async () => ({ success: true }) as any),
     ];
     try {
-      const r = fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true);
+      const r = await fleetReplica.reseedStalePrimary(containerManager.getBot('b1')!, codeFor('postgresql://replicator:fakepass@primary.invalid:5433/smdb'), 'standby.invalid', 5440, true);
       expect(r.success, r.error).toBe(true);
       await vi.waitFor(() => expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked).toBe(true), { timeout: 5000 });
     } finally {
@@ -354,7 +354,9 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
   });
 
   it("adoptPromotedReplica's reset and reload, and the enable after it (psql and psqlScript), log in as dbm_admin", async () => {
-    writeInstance({ status: 'stopped', fleetDbReplica: { ...copy, certHost: copy.publicHost } });
+    // NM22: the Enable after the adopt makes this machine's own login from the instance id, a uuid as the manager gives it.
+    const id = 'b1b1b1b1-0000-4000-8000-000000000001';
+    writeInstance({ status: 'stopped', fleetDbReplica: { ...copy, certHost: copy.publicHost } }, id);
     h.env = { DATABASE_URL: `postgres://${copy.user}:pw@${copy.containerName}:5432/${copy.db}` };
     h.answer = args => {
       const sql = args.join(' ');
@@ -366,7 +368,7 @@ describe('NM1: the manager logs in to the fleet database as dbm_admin', () => {
       if (sql.includes('pg_authid')) return roleVerifierAnswer('pw');
       return '';
     };
-    await fleetReplica.adoptPromotedReplica(containerManager.getBot('b1')!);
+    await fleetReplica.adoptPromotedReplica(containerManager.getBot(id)!);
     for (const setting of ['primary_conninfo', 'primary_slot_name', 'synchronous_standby_names', 'default_transaction_read_only']) {
       expect(loginOf(`ALTER SYSTEM RESET ${setting};`)).toBe('dbm_admin');
     }

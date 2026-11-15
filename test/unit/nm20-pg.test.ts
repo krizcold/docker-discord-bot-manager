@@ -339,8 +339,8 @@ CREATE POLICY hide_two ON smdb_data.shard_claims USING (shard <> 2);`));
 
 // NM20 part 2: one real pg_restore -f - output of the manager's tables, read by parseMetaRows (X1, Y1, Y2, Y5).
 import { spawnSync as spawnBytes } from 'child_process';
-import { parseMetaRows, raiseSql, replicationRoleEnsureSql } from '../../src/instance/switchSql';
-import { addressTableSql, REPLICATION_ROLE } from '../../src/instance/fleetReplication';
+import { copyGroupEnsureSql, parseMetaRows, raiseSql } from '../../src/instance/switchSql';
+import { addressTableSql } from '../../src/instance/fleetReplication';
 import { parseAddressRows } from '../../src/instance/fleetJoin';
 import { sqlLiteral } from '../../src/config/joinCode';
 import { COPY_PEM, FIXTURE_PEM } from './join-fake';
@@ -368,9 +368,9 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 part 2: the s
   }, 180000);
 
   it('the parse reads the real output, its script loads back to the same dump, and planted address rows are skipped', () => {
-    ok(meta.psql('dbm_admin', replicationRoleEnsureSql(REPLICATION_ROLE), 'postgres'));
+    ok(meta.psql('dbm_admin', copyGroupEnsureSql(), 'postgres'));
     ok(meta.psql('dbm_meta', raiseSql('main.example', 3)));
-    ok(meta.psql('dbm_meta', addressTableSql('main.example', 5433, FIXTURE_PEM.trim(), 'main.example', null)));
+    ok(meta.psql('dbm_meta', addressTableSql('main.example', 5433, FIXTURE_PEM.trim(), 'main.example')));
     ok(meta.psql('dbm_meta', `INSERT INTO smdb_manager.handover (slot, machine, generation) VALUES ('smdb_slot_a', 'win.example', 3);
 INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('0123456789abcdef01234567', '7349081263451237', E'm\\tab\\\\x ''q'' \u00e9 \\n\\r end', 2);
 INSERT INTO smdb_manager.copies (slot, machine, client) VALUES ('smdb_copy_a', 'copy.example', '172.18.0.5');

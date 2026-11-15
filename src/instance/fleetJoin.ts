@@ -17,13 +17,13 @@ import { getBotDir } from '../git/repoManager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { dataPlace } from './dataPlace';
 import { callAppHook } from './appHookClient';
-import { redactSecrets } from '../config/secretText';
+import { redactSecrets, scramSha256Verifier } from '../config/secretText';
 import {
   addressList, CERT_PEM_RE, certFingerprint, decodeJoinCode, formatBackendUrlList, fp16, HOST_RE, isJoinCode,
   JoinCode, lsnToBigInt, machineText, sqlLiteral,
 } from '../config/joinCode';
 import { FleetJoinRecord, InstanceConfig, JoinAddress } from '../types';
-import { GEN_READ_SQL, GenRow, machineNameOf, parseGenRow, RECEIVE_MARK_COUNT_SQL } from './switchSql';
+import { COPY_LOGIN_RE, copyLogin, GEN_READ_SQL, GenRow, loginOfSlot, machineNameOf, parseGenRow, RECEIVE_MARK_COUNT_SQL } from './switchSql';
 
 const PGDATA = '/var/lib/postgresql/data';
 export const CERT_TIMEOUT_MS = 10_000;
@@ -41,12 +41,17 @@ export interface PrimaryLogin {
   db: string;
 }
 
-export function loginOf(code: JoinCode): PrimaryLogin {
-  return { user: code.repl.user, password: code.repl.password, host: code.host, port: code.port, db: code.db };
+export const NO_OWN_LOGIN = "this machine's own login to the main is not stored; press Re-seed (or Join, on a machine without a copy) to get a new one; if the main still has this machine's earlier login, the answer names it";
+
+/** This machine's own login to the database the code names; null when no password is stored. */
+export function copyLoginOf(instance: InstanceConfig, code: JoinCode): PrimaryLogin | null {
+  const password = instance.fleetLogin?.password;
+  if (typeof password !== 'string' || password === '') return null;
+  return { user: copyLogin(instance.id), password, host: code.host, port: code.port, db: code.db };
 }
 
 export function seedDsnFor(dsn: PrimaryLogin): string {
-  return `postgresql://${encodeURIComponent(dsn.user)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+  return `postgresql://${encodeURIComponent(dsn.user)}@${dsn.host}:${dsn.port}/${dsn.db}?sslmode=verify-full&sslrootcert=/primary-ca.crt&require_auth=scram-sha-256&options=${encodeURIComponent(dbLogin.COPY_SESSION_OPTIONS)}`;
 }
 
 function errorText(err: unknown): string {
@@ -61,13 +66,17 @@ function dockerRm(name: string): Promise<void> {
  * A libpq client run against the primary in a throwaway container. The password reaches it as PGPASSWORD from the
  * docker CLI's own environment (`-e NAME` with no value), so it is in no command line on either side. On timeout
  * the container is removed by name: a signal to the CLI is proxied to the client as PID 1, which drops it, and the
- * container runs daemon-side.
+ * container runs daemon-side. `opts.env` values reach the client the same way; `opts.stdin` is written to its stdin.
  */
-export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password'>, mounts: string[], entrypoint: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+export type ClientResult = { ok: boolean; stdout: string; stderr: string; timedOut?: true };
+
+export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password'>, mounts: string[], entrypoint: string, args: string[], timeoutMs: number, opts: { env?: Record<string, string>; stdin?: string } = {}): Promise<ClientResult> {
   return new Promise(resolve => {
-    const started = startProcess('docker', ['run', '--rm', '--name', name, '-e', 'PGPASSWORD',
+    const extra = opts.env ?? {};
+    const started = startProcess('docker', ['run', '--rm', ...(opts.stdin !== undefined ? ['-i'] : []), '--name', name, '-e', 'PGPASSWORD',
+      ...Object.keys(extra).flatMap(k => ['-e', k]),
       ...mounts.flatMap(m => ['-v', m]),
-      '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, PGPASSWORD: dsn.password } });
+      '--entrypoint', entrypoint, 'postgres:16-alpine', ...args], { env: { ...process.env, ...extra, PGPASSWORD: dsn.password } });
     if (!started.child) {
       resolve({ ok: false, stdout: '', stderr: `docker run could not start (${started.reason})` });
       return;
@@ -76,13 +85,15 @@ export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password
     let stdout = '';
     let stderr = '';
     let done = false;
-    const finish = (r: { ok: boolean; stdout: string; stderr: string }) => {
+    let timedOut = false;
+    const finish = (r: ClientResult) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      resolve(r);
+      resolve(timedOut ? { ...r, timedOut: true } : r);
     };
     const timer = setTimeout(() => {
+      timedOut = true;
       try {
         execFile('docker', ['rm', '-f', name], () => { try { child.kill('SIGKILL'); } catch { /* gone */ } });
       } catch { /* the rm could not start; the close or error ends the wait */ }
@@ -90,7 +101,11 @@ export function runPrimaryClient(name: string, dsn: Pick<PrimaryLogin, 'password
     child.stdout?.on('data', d => { stdout += d; });
     child.stderr?.on('data', d => { stderr += d; });
     child.on('error', () => finish({ ok: false, stdout, stderr: stderr || 'docker run failed' }));
-    child.on('close', code => finish({ ok: code === 0, stdout, stderr: redactSecrets(stderr, [dsn.password]) }));
+    child.on('close', code => finish({ ok: code === 0, stdout, stderr: redactSecrets(stderr, [dsn.password, ...Object.values(extra)]) }));
+    if (opts.stdin !== undefined) {
+      child.stdin?.on('error', () => undefined);
+      child.stdin?.end(opts.stdin);
+    }
   });
 }
 
@@ -159,7 +174,27 @@ export function fpMismatchText(host: string, port: number, seen: string, expecte
 }
 
 export function loginRefusedText(host: string, port: number, reason: string): string {
-  return `The main at ${host}:${port} refused the join code's login (${reason}); nothing was changed. Replication may have been disabled there, or its password changed: copy a new join code from the main's manager.`;
+  return `The main at ${host}:${port} refused this machine's login (${reason}); nothing was changed. Replication may have been disabled there, or the main's operator removed this machine's login: join again with the main's current join code.`;
+}
+
+export function joinSaveText(error: string): string {
+  return `The password of this machine's own login to the main could not be saved (${error}); nothing was changed.`;
+}
+
+export function joinTakenText(host: string, port: number, login: string, reason: string): string {
+  return `The main at ${host}:${port} already has a login for this machine (${login}), and it refused this manager's password for it (${reason}); nothing was changed. In the main's Database window, remove the login ${login}, then join again.`;
+}
+
+export function joinBlockedText(host: string, port: number, login: string): string {
+  return `The main at ${host}:${port} has a login for this machine (${login}), but the main blocked it: a Remove there did not finish, or the main found it streaming on another machine's slot. Nothing was changed. In the main's Database window, remove the login ${login}, then join again.`;
+}
+
+export function joinCodeOldText(host: string, port: number, reason: string): string {
+  return `The main at ${host}:${port} refused the join code's login (${reason}), and it has no login for this machine that opens with this manager's password; nothing was changed. Copy a new join code from the main's manager.`;
+}
+
+export function joinMintText(host: string, port: number, reason: string): string {
+  return `The main at ${host}:${port} could not make a login for this machine (${reason}); nothing was changed.`;
 }
 
 export function inRecoveryText(host: string, port: number): string {
@@ -239,37 +274,51 @@ export interface MainFacts {
   slot: SlotState;
 }
 
-export type MainProbe = { ok: true; facts: MainFacts } | { ok: false; kind: 'login' | 'unreachable' | 'garbled'; reason: string };
+export type MainProbe = { ok: true; facts: MainFacts } | { ok: false; kind: 'login' | 'unreachable' | 'garbled' | 'nologin'; reason: string };
 
 function firstReason(stderr: string): string {
-  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )WARNING: /.test(l));
   return (lines.find(l => /\b(FATAL|ERROR):/.test(l)) || lines[0] || 'psql failed').replace(/^psql: error: /, '');
 }
 
-function isLoginRefusal(text: string): boolean {
+/** The reason a client run failed: its time limit, naming the database it went to, or psql's first error line. */
+export function clientReason(r: ClientResult, timeoutMs: number, where: Pick<PrimaryLogin, 'host' | 'port'>): string {
+  if (r.timedOut) return `the database at ${where.host}:${where.port} did not answer within ${Math.round(timeoutMs / 1000)} seconds`;
+  return firstReason(r.stderr);
+}
+
+export function isLoginRefusal(text: string): boolean {
   return /password authentication failed|no pg_hba\.conf entry|is not permitted to log in|role "[^"]*" does not exist/i.test(text);
 }
 
 const SLOT_NAME_RE = /^[a-z0-9_]{1,63}$/;
 
+/** The main probe's SQL read: whether the main is in recovery, and the state of one slot. */
+export function mainStateSql(slot: string): string {
+  const slotSql = SLOT_NAME_RE.test(slot)
+    ? `COALESCE((SELECT CASE WHEN active THEN 'active' WHEN wal_status = 'lost' THEN 'lost' ELSE 'kept' END FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}'), 'absent')`
+    : `'absent'`;
+  return `SELECT pg_catalog.pg_is_in_recovery()::text || '|' || ${slotSql}`;
+}
+
+export const PEER_RECOVERY_SQL = 'SELECT pg_catalog.pg_is_in_recovery()::text';
+
 /**
- * J5 and the watcher's main read, as the replication login over verify-full: IDENTIFY_SYSTEM, whether the main is
+ * J5 and the watcher's main read, as this machine's login over verify-full: IDENTIFY_SYSTEM, whether the main is
  * in recovery, and the state of one slot.
  */
 export async function mainProbe(instance: InstanceConfig, code: JoinCode, pem: string, slot = ''): Promise<MainProbe> {
-  const login = loginOf(code);
+  const login = copyLoginOf(instance, code);
+  if (!login) return { ok: false, kind: 'nologin', reason: NO_OWN_LOGIN };
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   const name = `${instance.sanitizedName}-fleet-join-probe`;
   await dockerRm(name);
   const dsn = seedDsnFor(login);
-  const slotSql = SLOT_NAME_RE.test(slot)
-    ? `COALESCE((SELECT CASE WHEN active THEN 'active' WHEN wal_status = 'lost' THEN 'lost' ELSE 'kept' END FROM pg_replication_slots WHERE slot_name = '${slot}'), 'absent')`
-    : `'absent'`;
   const script = 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"';
-  const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, `SELECT pg_is_in_recovery()::text || '|' || ${slotSql}`], CLIENT_TIMEOUT_MS);
+  const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, mainStateSql(slot)], CLIENT_TIMEOUT_MS);
   if (!r.ok) {
-    const reason = firstReason(r.stderr).split(login.password).join('***');
-    return { ok: false, kind: isLoginRefusal(r.stderr) ? 'login' : 'unreachable', reason };
+    const reason = clientReason(r, CLIENT_TIMEOUT_MS, login).split(login.password).join('***');
+    return { ok: false, kind: !r.timedOut && isLoginRefusal(r.stderr) ? 'login' : 'unreachable', reason };
   }
   const [ident, rest] = r.stdout.trim().split('\n').map(l => l.trim());
   const [systemId, timeline, xlogpos] = (ident || '').split('|');
@@ -291,17 +340,18 @@ export type PeerProbe =
 const HBA_REJECT_RE = /pg_hba\.conf rejects connection|no pg_hba\.conf entry/i;
 
 /**
- * Another database of this bot, read as the replication login over verify-full: IDENTIFY_SYSTEM, whether it is in
+ * Another database of this bot, read as this machine's login over verify-full: IDENTIFY_SYSTEM, whether it is in
  * recovery, and its generation row. When IDENTIFY_SYSTEM answered and the SQL session was refused by pg_hba, the
  * database is under a write fence (its lines admit replication only).
  */
 export async function peerProbe(instance: InstanceConfig, code: JoinCode, pem: string, suffix = 'peer'): Promise<PeerProbe> {
-  const login = loginOf(code);
+  const login = copyLoginOf(instance, code);
+  if (!login) return { kind: 'unreachable', reason: NO_OWN_LOGIN };
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   const name = `${instance.sanitizedName}-fleet-${suffix}-probe`;
   await dockerRm(name);
   const dsn = seedDsnFor(login);
-  const script = 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 3; '
+  const script = `psql "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql "$1" -v ON_ERROR_STOP=1 -Atc "${PEER_RECOVERY_SQL}" || exit 3; `
     + 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
     + 'psql "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
   const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, GEN_READ_SQL, seedDsnFor({ ...login, db: 'postgres' }), RECEIVE_MARK_COUNT_SQL], CLIENT_TIMEOUT_MS);
@@ -309,9 +359,9 @@ export async function peerProbe(instance: InstanceConfig, code: JoinCode, pem: s
   const [systemId, timeline] = (lines[0] || '').split('|');
   const identified = /^\d+$/.test(systemId || '') && /^\d+$/.test(timeline || '');
   if (!r.ok) {
-    const reason = firstReason(r.stderr).split(login.password).join('***');
+    const reason = clientReason(r, CLIENT_TIMEOUT_MS, login).split(login.password).join('***');
     if (identified && lines.length === 1 && HBA_REJECT_RE.test(r.stderr)) return { kind: 'fenced', systemId, reason };
-    if (identified) return { kind: 'unreachable', reason };
+    if (identified || r.timedOut) return { kind: 'unreachable', reason };
     return { kind: isLoginRefusal(r.stderr) ? 'login-refused' : 'unreachable', reason };
   }
   const rec = lines[1];
@@ -324,19 +374,28 @@ export async function peerProbe(instance: InstanceConfig, code: JoinCode, pem: s
 }
 
 export function probeFailureText(code: JoinCode, p: Extract<MainProbe, { ok: false }>): string {
+  if (p.kind === 'nologin') return `${p.reason.charAt(0).toUpperCase()}${p.reason.slice(1)}.`;
   return p.kind === 'login' ? loginRefusedText(code.host, code.port, p.reason) : unreachableText(code.host, code.port, p.reason);
 }
 
-const ADDRESS_READ_SQL = `SELECT COALESCE(json_agg(json_build_object('host', a.host, 'port', a.port, 'slot', a.slot, 'cert', a.cert,
+export const ADDRESS_READ_SQL = `SELECT COALESCE(pg_catalog.json_agg(pg_catalog.json_build_object('host', a.host, 'port', a.port, 'slot', a.slot, 'cert', a.cert,
   'machine', a.machine) ORDER BY a.host, a.port), '[]')
 FROM smdb_manager.addresses a
-WHERE a.slot IS NULL OR EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.slot_name = a.slot);`;
+WHERE a.slot IS NULL
+   OR (a.slot ~ '^fleet_standby_[0-9a-f]{32}$'
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = a.slot)
+       AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_auth_members m ON m.member = r.oid
+                   WHERE r.rolname = 'smdb_copy_' || pg_catalog.substr(a.slot, 15) AND r.rolcanlogin
+                     AND m.roleid = pg_catalog.to_regrole('smdb_copies')));`;
 
-export function primarySql(instance: InstanceConfig, code: JoinCode, pem: string, suffix: string, sql: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  const login = loginOf(code);
+/** One statement on the database the code names, as this machine's login; with no stored password, NO-OWN-LOGIN and no container. */
+export async function primarySql(instance: InstanceConfig, code: JoinCode, pem: string, suffix: string, sql: string): Promise<ClientResult> {
+  const login = copyLoginOf(instance, code);
+  if (!login) return { ok: false, stdout: '', stderr: NO_OWN_LOGIN };
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   const name = `${instance.sanitizedName}-fleet-join-${suffix}`;
-  return dockerRm(name).then(() => runPrimaryClient(name, login, [mount], 'psql', [seedDsnFor(login), '-v', 'ON_ERROR_STOP=1', '-Atc', sql], CLIENT_TIMEOUT_MS));
+  await dockerRm(name);
+  return runPrimaryClient(name, login, [mount], 'psql', [seedDsnFor(login), '-v', 'ON_ERROR_STOP=1', '-Atc', sql], CLIENT_TIMEOUT_MS);
 }
 
 export function validAddress(row: unknown): JoinAddress | null {
@@ -363,7 +422,7 @@ export function parseAddressRows(text: string): JoinAddress[] {
 /** J7 and F2: the main's address list, rows with a malformed field left out. */
 export async function readAddresses(instance: InstanceConfig, code: JoinCode, pem: string): Promise<{ ok: true; addresses: JoinAddress[] } | { ok: false; reason: string }> {
   const r = await primarySql(instance, code, pem, 'list', ADDRESS_READ_SQL);
-  if (!r.ok) return { ok: false, reason: firstReason(r.stderr) };
+  if (!r.ok) return { ok: false, reason: clientReason(r, CLIENT_TIMEOUT_MS, code) };
   try {
     const parsed = JSON.parse(r.stdout.trim() || '[]');
     if (!Array.isArray(parsed)) return { ok: false, reason: 'the list is not a list' };
@@ -373,27 +432,50 @@ export async function readAddresses(instance: InstanceConfig, code: JoinCode, pe
   }
 }
 
-/** The upsert of one address row; slot null is the main's own row. */
-export function addressUpsertSql(row: JoinAddress): string {
+/** A copy's own address row; the main derives its slot from the login that writes it. */
+export type CopyAddress = Omit<JoinAddress, 'slot'>;
+
+/** The write of this machine's own row through set_copy_address. */
+export function addressUpsertSql(row: CopyAddress): string {
   if (!HOST_RE.test(row.host)) throw new Error(`the host ${row.host} is not a bare hostname or IPv4 address`);
   if (!Number.isInteger(row.port) || row.port < 1 || row.port > 65535) throw new Error('the port is not a port number');
   if (!CERT_PEM_RE.test(row.cert.trim())) throw new Error('the certificate is not a PEM certificate block');
-  const slot = row.slot === null ? 'NULL' : sqlLiteral(row.slot);
-  return `INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES (${sqlLiteral(row.host)}, ${row.port}, ${slot}, ${sqlLiteral(row.cert.trim())}, ${sqlLiteral(machineText(row.machine))})
-  ON CONFLICT (host, port) DO UPDATE SET slot = EXCLUDED.slot, cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = now();`;
+  return `SELECT smdb_manager.set_copy_address(${sqlLiteral(row.host)}, ${row.port}, ${sqlLiteral(row.cert.trim())}, ${sqlLiteral(machineText(row.machine))});`;
 }
 
-export async function registerAddress(instance: InstanceConfig, code: JoinCode, pem: string, row: JoinAddress): Promise<string | null> {
+export const DROP_ADDRESS_SQL = 'SELECT smdb_manager.drop_copy_address();';
+
+export type AddressTaken = { host: string; port: number; holder: string } | { host: string; port: number; main: true };
+
+/** set_copy_address's refusal of an address another row holds (R10); null for any other text. */
+export function parseAddressTaken(stderr: string): AddressTaken | null {
+  const slot = /smdb-address-taken: (\S+):(\d+) is listed with the slot (\S+)/.exec(stderr);
+  if (slot) return { host: slot[1], port: Number(slot[2]), holder: loginOfSlot(slot[3]) ?? slot[3] };
+  const main = /smdb-address-taken: (\S+):(\d+) is listed as the main's own address/.exec(stderr);
+  return main ? { host: main[1], port: Number(main[2]), main: true } : null;
+}
+
+/** ADDR-TAKEN and ADDR-TAKEN-MAIN. */
+export function addressTakenText(t: AddressTaken): string {
+  if ('main' in t) {
+    return `its address ${t.host}:${t.port} is listed on the main as the main's own address. If that is the main's current address, give this copy another one; otherwise the main's operator presses Enable replication there, which keeps only the main's current entry`;
+  }
+  return `its address ${t.host}:${t.port} is listed on the main for the machine login ${t.holder}. If no machine uses that address under that login any more, remove the login ${t.holder} in the main's Database window; this machine then adds its address at its next hourly check`;
+}
+
+export async function registerAddress(instance: InstanceConfig, code: JoinCode, pem: string, row: CopyAddress): Promise<string | null> {
   let sql: string;
   try { sql = addressUpsertSql(row); } catch (err) { return errorText(err); }
   const r = await primarySql(instance, code, pem, 'register', sql);
-  return r.ok ? null : firstReason(r.stderr);
+  if (r.ok) return null;
+  const taken = r.timedOut ? null : parseAddressTaken(r.stderr);
+  return taken ? addressTakenText(taken) : clientReason(r, CLIENT_TIMEOUT_MS, code);
 }
 
-export async function deleteAddress(instance: InstanceConfig, code: JoinCode, pem: string, host: string, port: number): Promise<string | null> {
-  if (!HOST_RE.test(host)) return `the host ${host} is not a bare hostname or IPv4 address`;
-  const r = await primarySql(instance, code, pem, 'unregister', `DELETE FROM smdb_manager.addresses WHERE host = ${sqlLiteral(host)} AND port = ${Number(port)};`);
-  return r.ok ? null : firstReason(r.stderr);
+/** Takes this machine's own rows off the list of the database the code names. */
+export async function deleteAddress(instance: InstanceConfig, code: JoinCode, pem: string): Promise<string | null> {
+  const r = await primarySql(instance, code, pem, 'unregister', DROP_ADDRESS_SQL);
+  return r.ok ? null : clientReason(r, CLIENT_TIMEOUT_MS, code);
 }
 
 /** The folder the bot reads certificate files from, in this process's path space. */
@@ -612,6 +694,65 @@ export function readCopyCert(containerName: string): Promise<string | null> {
 
 export { machineNameOf };
 
+/** What the mint of this machine's login answered (3.5 step 4, R22); `skipped` for a code whose login is a machine's. */
+export type MintAnswer = { kind: 'created' | 'exists' | 'skipped' } | { kind: 'login-refused' | 'failed'; reason: string };
+
+export const MINT_SQL = "\\getenv v SMDB_COPY_VERIFIER\nSELECT smdb_manager.add_copy_login(:'name', :'v');\n";
+
+/**
+ * 3.5: this machine's own login on the main the code names. The password is made and saved first when none is
+ * stored; then the code's join login mints the machine's login, unless the code already names a machine login. Only
+ * steps the operator starts call this.
+ */
+export async function ensureCopyLogin(instance: InstanceConfig, code: JoinCode, pem: string): Promise<{ ok: true; login: PrimaryLogin; minted: MintAnswer } | { ok: false; error: string }> {
+  let password = instance.fleetLogin?.password;
+  if (typeof password !== 'string' || password === '') {
+    if (COPY_LOGIN_RE.test(code.repl.user)) return { ok: false, error: probeFailureText(code, { ok: false, kind: 'nologin', reason: NO_OWN_LOGIN }) };
+    password = crypto.randomBytes(24).toString('base64url');
+    try {
+      containerManager.updateInstanceFleetLogin(instance.id, { password });
+    } catch (err) {
+      return { ok: false, error: joinSaveText(errorText(err)) };
+    }
+  }
+  const login: PrimaryLogin = { user: copyLogin(instance.id), password, host: code.host, port: code.port, db: code.db };
+  if (COPY_LOGIN_RE.test(code.repl.user)) return { ok: true, login, minted: { kind: 'skipped' } };
+  let verifier: string;
+  try {
+    verifier = scramSha256Verifier(password);
+  } catch (err) {
+    return { ok: false, error: joinMintText(code.host, code.port, errorText(err)) };
+  }
+  const joinLogin: PrimaryLogin = { user: code.repl.user, password: code.repl.password, host: code.host, port: code.port, db: 'postgres' };
+  const name = `${instance.sanitizedName}-fleet-join-login`;
+  const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
+  await dockerRm(name);
+  const r = await runPrimaryClient(name, joinLogin, [mount], 'sh',
+    ['-c', 'psql "$1" -v ON_ERROR_STOP=1 -qAt -v name="$2" -f -', 'sh', seedDsnFor(joinLogin), login.user], CLIENT_TIMEOUT_MS,
+    { env: { SMDB_COPY_VERIFIER: verifier }, stdin: MINT_SQL });
+  const clean = (text: string) => redactSecrets(text, [password as string, code.repl.password, verifier]);
+  if (r.ok) {
+    const last = r.stdout.trim().split('\n').pop()?.trim() ?? '';
+    if (last === 'blocked') return { ok: false, error: joinBlockedText(code.host, code.port, login.user) };
+    if (last === 'created' || last === 'exists') return { ok: true, login, minted: { kind: last } };
+    return { ok: true, login, minted: { kind: 'failed', reason: 'the main gave an answer the manager does not read' } };
+  }
+  if (!r.timedOut && isLoginRefusal(r.stderr) && !/\bERROR:/.test(r.stderr)) {
+    return { ok: true, login, minted: { kind: 'login-refused', reason: clean(firstReason(r.stderr)) } };
+  }
+  return { ok: true, login, minted: { kind: 'failed', reason: clean(clientReason(r, CLIENT_TIMEOUT_MS, code)).replace(/^.*?smdb-join: /, '') } };
+}
+
+/** The text for a failed probe as this machine's login, chosen by the mint's answer when the main refused the login (R22). */
+export function ownProbeFailureText(code: JoinCode, own: { login: PrimaryLogin; minted: MintAnswer }, p: Extract<MainProbe, { ok: false }>): string {
+  if (p.kind !== 'login') return probeFailureText(code, p);
+  const m = own.minted;
+  if (m.kind === 'login-refused') return joinCodeOldText(code.host, code.port, m.reason);
+  if (m.kind === 'exists') return joinTakenText(code.host, code.port, own.login.user, p.reason);
+  if (m.kind === 'failed') return joinMintText(code.host, code.port, m.reason);
+  return loginRefusedText(code.host, code.port, p.reason);
+}
+
 export type JoinResult = { success: true; message: string; addressCount: number } | { success: false; error: string };
 
 export interface JoinOpts {
@@ -643,15 +784,19 @@ function joinAdmission(instance: InstanceConfig, code: JoinCode): string | null 
   return null;
 }
 
-async function joinRun(instance: InstanceConfig, code: JoinCode, text: string, opts: JoinOpts): Promise<JoinResult> {
+async function joinRun(found: InstanceConfig, code: JoinCode, text: string, opts: JoinOpts): Promise<JoinResult> {
+  let instance = found;
   const refusal = joinAdmission(instance, code);
   if (refusal) return { success: false, error: refusal };
   const cert = await mainCertificate(code);
   if (!cert.ok) return { success: false, error: cert.text };
   const pulled = await ensureClientImage();
   if (pulled) return { success: false, error: pulled };
+  const own = await ensureCopyLogin(instance, code, cert.pem);
+  if (!own.ok) return { success: false, error: own.error };
+  instance = { ...instance, fleetLogin: { password: own.login.password } };
   const probe = await mainProbe(instance, code, cert.pem);
-  if (!probe.ok) return { success: false, error: probeFailureText(code, probe) };
+  if (!probe.ok) return { success: false, error: ownProbeFailureText(code, own, probe) };
   if (probe.facts.inRecovery) return { success: false, error: inRecoveryText(code.host, code.port) };
   const rec = instance.fleetDbReplica;
   if (rec && rec.copyCleared !== true) {
@@ -777,12 +922,12 @@ export async function resolveStoredJoinCode(instance: InstanceConfig, emit: (msg
 }
 
 /** The copy's own address row, when this machine holds a seeded copy with an address. */
-async function ownRow(instance: InstanceConfig): Promise<JoinAddress | null> {
+async function ownRow(instance: InstanceConfig): Promise<CopyAddress | null> {
   const rec = instance.fleetDbReplica;
   if (!rec || rec.copyCleared === true || typeof rec.seededAt !== 'number' || !rec.publicHost || !rec.hostPort) return null;
   const cert = await readCopyCert(rec.containerName);
   if (!cert) return null;
-  return { host: rec.publicHost, port: rec.hostPort, slot: rec.slot, cert, machine: machineNameOf(instance) };
+  return { host: rec.publicHost, port: rec.hostPort, cert, machine: machineNameOf(instance) };
 }
 
 /** Registers this machine's copy on the main's list; null when done or nothing to register, else the reason. */

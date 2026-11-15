@@ -499,8 +499,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
       const envCopies = containerManager.botEnvCopies(req.params.id);
       let success: boolean;
+      const notes: string[] = [];
       try {
-        success = await containerManager.deleteBot(req.params.id, keepData, keepEnv, confirmFleetData, confirmPromoted);
+        success = await containerManager.deleteBot(req.params.id, keepData, keepEnv, confirmFleetData, confirmPromoted, notes);
       } catch (err) {
         rollbackVaultGroup();
         throw err;
@@ -518,6 +519,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         ...(keptDataDir ? { keptDataDir } : {}),
         ...(dbDumps > 0 ? { dbDumpsKept: { count: dbDumps, folder: `backups/${req.params.id}/fleet-postgres` } } : {}),
         ...(keptReplicaVolume ? { keptReplicaVolume } : {}),
+        ...(notes.length > 0 ? { warning: notes.join(' ') } : {}),
       });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
@@ -1874,6 +1876,37 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     }
   });
 
+  /** POST /api/bots/:id/fleet-replication/join-code/renew - New join code: a new join password, and this machine's own login a new one. */
+  router.post('/:id/fleet-replication/join-code/renew', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      res.json(await fleetReplication.renewJoinCode(bot));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** DELETE /api/bots/:id/fleet-replication/logins/:login - Remove a machine's login ({ confirm } once it streams). */
+  router.delete('/:id/fleet-replication/logins/:login', async (req: Request, res: Response) => {
+    if (refusedWhileMigrating(res, req.params.id, 'db')) return;
+    try {
+      const bot = containerManager.getBot(req.params.id);
+      if (!bot) {
+        res.status(404).json({ success: false, error: 'Bot not found' });
+        return;
+      }
+      const confirm = (req.body as { confirm?: unknown } | undefined)?.confirm === true;
+      res.json(await fleetReplication.removeCopyLogin(bot, String(req.params.login || ''), confirm));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
   /** POST /api/bots/:id/fleet-join - Join the main a join code names ({ joinCode }). */
   router.post('/:id/fleet-join', async (req: Request, res: Response) => {
     if (refusedWhileMigrating(res, req.params.id, 'db')) return;
@@ -2017,7 +2050,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       }
       const { joinCode, publicHost, hostPort, confirm, confirmVolume, replaced } = (req.body ?? {}) as { joinCode?: string; publicHost?: string; hostPort?: number; confirm?: boolean; confirmVolume?: string; replaced?: boolean };
       if (replaced === true && (typeof joinCode !== 'string' || !joinCode.trim())) {
-        res.json(fleetSwitch.rejoinComposed(bot.id));
+        res.json(await fleetSwitch.rejoinComposed(bot.id));
         return;
       }
       if (typeof joinCode !== 'string' || !joinCode.trim()) {
@@ -2029,7 +2062,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         res.json({ success: false, error: 'Replication is not enabled on this database, so it cannot rejoin as a copy from a join code; enable it in the Replication section first; nothing was changed' });
         return;
       }
-      res.json(fleetReplica.reseedStalePrimary(bot, joinCode, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
+      res.json(await fleetReplica.reseedStalePrimary(bot, joinCode, typeof publicHost === 'string' ? publicHost : undefined, hostPort, confirm === true, { confirmVolume: typeof confirmVolume === 'string' ? confirmVolume : undefined }));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

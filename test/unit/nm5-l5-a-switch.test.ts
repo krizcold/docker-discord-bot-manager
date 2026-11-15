@@ -152,8 +152,8 @@ describe('handOverMain refuses a slot name that is not whole', () => {
 describe('composeJoinCode and peerCode', () => {
   const target = { host: 'copy.example', port: 5434, cert: COPY_PEM, machine: 'copy.example' };
   const inst = (over: Record<string, unknown> = {}) => ({ ...(containerManager.getBot('a') as object), ...over }) as any;
-  it("without the replication login", () => {
-    expect(composeJoinCode(inst({ fleetDb: { ...(inst().fleetDb), replication: { ...inst().fleetDb.replication, password: '' } } }), target)).toEqual({ ok: false, error: "this machine's replication login is not stored" });
+  it("without this machine's own login (NM22 X10)", () => {
+    expect(composeJoinCode(inst({ fleetLogin: { password: '' } }), target)).toEqual({ ok: false, error: "this machine's own login to the other databases is not stored" });
   });
   it('without the bot password on record (NM14 CJ-ABSENT, CJ-LOST)', () => {
     const { password: _p, ...absent } = inst().fleetDb;

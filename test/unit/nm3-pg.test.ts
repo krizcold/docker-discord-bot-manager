@@ -34,10 +34,15 @@ import { certFingerprint, encodeJoinCode, lsnToBigInt } from '../../src/config/j
 import * as containerManager from '../../src/docker/containerManager';
 import { MANAGER_DB_ROLE } from '../../src/instance/dbLogin';
 import { provisionedCluster } from './pg-cluster';
-import { addressTableSql } from '../../src/instance/fleetReplication';
-import { addressUpsertSql, fetchMainCertificate, mainProbe, readAddresses, readCopyFacts } from '../../src/instance/fleetJoin';
+import { deleteAddress, ensureCopyLogin, fetchMainCertificate, mainProbe, readAddresses, readCopyFacts, registerAddress } from '../../src/instance/fleetJoin';
 import { rebuildVerdict, runFleetCopyTick, VerdictCopy, VerdictMain } from '../../src/instance/fleetCopyWatch';
+import { JOIN_LOGIN, copyLogin, copySlot } from '../../src/instance/switchSql';
 import { InstanceConfig } from '../../src/types';
+import { enableAddressStep, enableRoleStep } from './nm22-enable';
+
+/** A row as a restore writes it, as dbm_meta: a slot of the machine-login form that the main does not hold. */
+const restoredRowSql = (r: { host: string; port: number; slot: string; cert: string; machine: string }) =>
+  `INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES ('${r.host}', ${r.port}, '${r.slot}', '${r.cert}', '${r.machine}');`;
 
 const dockerRuns = (() => {
   try {
@@ -61,12 +66,16 @@ const MAIN_IP = `10.213.${SUBNET_OCTET}.10`;
 // The main's port published on the default bridge's gateway, where the manager's own clients (run without a network)
 // reach it.
 const PORT = 20000 + (process.pid % 20000);
-const REPL_PW = 'replpass';
+// The copy's own login on the main (minted with the join code), the join login, and the main's own login from Enable.
+const BOT = '3a3a3a3a-3a3a-43a3-83a3-3a3a3a3a3a3a';
+const LOGIN = copyLogin(BOT);
+const COPY_PW = 'copy-own-pw';
+const JOIN_PW = 'join-pw';
+const MAIN_ID = '3b3b3b3b-3b3b-43b3-83b3-3b3b3b3b3b3b';
 const APP_PW = 'app-pw';
-const SLOT = 'fleet_standby_nm3pg';
+const SLOT = copySlot(BOT);
 const SLOT2 = 'fleet_standby_nm3pg2';
 const SLOT_UNRESERVED = 'fleet_standby_nm3pg3';
-const BOT = 'pgb';
 
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -85,8 +94,8 @@ const waitReady = (container: string) => {
 };
 /** A libpq client on the test network, as the manager runs one: the password from the environment, the main's certificate mounted. */
 const client = (certFile: string, script: string, ...args: string[]) =>
-  run(['run', '--rm', '--network', NET, '-e', 'PGPASSWORD', '-v', `${certFile}:/primary-ca.crt:ro`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script, 'sh', ...args], undefined, { PGPASSWORD: REPL_PW });
-const replDsn = (host: string) => `postgresql://replicator@${host}:5432/smdb?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
+  run(['run', '--rm', '--network', NET, '-e', 'PGPASSWORD', '-v', `${certFile}:/primary-ca.crt:ro`, '--entrypoint', 'sh', 'postgres:16-alpine', '-c', script, 'sh', ...args], undefined, { PGPASSWORD: COPY_PW });
+const replDsn = (host: string) => `postgresql://${LOGIN}@${host}:5432/smdb?sslmode=verify-full&sslrootcert=/primary-ca.crt`;
 
 describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code against a real Postgres 16 (Linux with docker)', () => {
   let certFile = '';
@@ -94,7 +103,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
   let gateway = '';
   const code = () => ({
     v: 1 as const, host: gateway, port: PORT, db: 'smdb', fp: certFingerprint(pem), machine: 'main',
-    repl: { user: 'replicator', password: REPL_PW }, app: { user: 'smdb', password: APP_PW },
+    repl: { user: JOIN_LOGIN, password: JOIN_PW }, app: { user: 'smdb', password: APP_PW },
   });
   const copyRecord = { containerName: COPY, volume: COPY_VOL, slot: SLOT, primaryHost: MAIN, primaryPort: 5432, certHost: COPY, user: 'smdb', db: 'smdb', seededAt: 1 };
   const instance = (): InstanceConfig => containerManager.getBot(BOT)!;
@@ -121,17 +130,21 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     expect(run(['exec', '-u', 'root', MAIN, 'sh', '-c', 'chown postgres:postgres /var/lib/postgresql/data/server.* && chmod 600 /var/lib/postgresql/data/server.key && printf "hostssl replication all 0.0.0.0/0 scram-sha-256\\nhostssl all all 0.0.0.0/0 scram-sha-256\\n" >> /var/lib/postgresql/data/pg_hba.conf']).status).toBe(0);
     expect(psql(MAIN, 'ALTER SYSTEM SET ssl = on;').status).toBe(0);
     expect(psql(MAIN, 'SELECT pg_reload_conf();').status).toBe(0);
-    expect(psql(MAIN, `CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '${REPL_PW}';`).status).toBe(0);
-    const table = psql(MAIN, addressTableSql(MAIN_IP, 5432, pem.trim(), 'main', null));
-    expect(table.status, table.err).toBe(0);
+    const roles = await enableRoleStep(MAIN, { joinPassword: JOIN_PW, ownId: MAIN_ID, ownPassword: 'main-own-pw' });
+    expect(roles.ok, roles.stderr).toBe(true);
+    const table = await enableAddressStep(MAIN, 'smdb', MAIN_IP, 5432, pem.trim(), 'main');
+    expect(table.ok, table.stderr).toBe(true);
     fs.mkdirSync(path.join(h.dir, 'bots', BOT, 'env'), { recursive: true });
     fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { [BOT]: {
       id: BOT, sanitizedName: `${ID}b`, displayName: 'PGB', titleName: 'PGB', status: 'stopped', sourceType: 'git',
       sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
       createdAt: '2026-10-27T00:00:00.000Z', updatedAt: '2026-10-27T00:00:00.000Z',
       fleetJoin: { code: encodeJoinCode(code()), host: gateway, port: PORT, db: 'smdb', fp: certFingerprint(pem), machine: 'main', joinedAt: '2026-10-27T00:00:00.000Z', addresses: [], addressesReadAt: Date.now() },
-      fleetDbReplica: copyRecord,
+      fleetDbReplica: copyRecord, fleetLogin: { password: COPY_PW },
     } } }, null, 2));
+    // The copy's own login, minted by the join login as a Join does.
+    const minted = await ensureCopyLogin(instance(), code(), pem);
+    expect(minted, JSON.stringify(minted)).toMatchObject({ ok: true, minted: { kind: 'created' } });
     h.startCopy = () => {
       const r = run(['run', '-d', '--name', COPY, '-v', `${COPY_VOL}:/var/lib/postgresql/data`, 'postgres:16-alpine']);
       return r.status === 0 ? { success: true } : { success: false, error: r.err };
@@ -140,12 +153,12 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
 
   afterAll(() => {
     for (const c of [MAIN, COPY, COPY2]) run(['rm', '-f', '-v', c]);
-    for (const v of [`${MAIN}-data`, COPY_VOL, COPY2_VOL]) run(['volume', 'rm', v]);
+    for (const v of [`${MAIN}-data`, COPY_VOL, COPY2_VOL]) run(['volume', 'rm', '-f', v]);
     run(['network', 'rm', NET]);
     fs.rmSync(h.dir, { recursive: true, force: true });
   }, 300000);
 
-  it('L4-1 the replication login runs IDENTIFY_SYSTEM and reads the slots over verify-full, and the handshake fingerprint is server.crt\'s', async () => {
+  it('L4-1 the copy\'s own login runs IDENTIFY_SYSTEM and reads the slots over verify-full, and the handshake fingerprint is server.crt\'s', async () => {
     const shown = await fetchMainCertificate(MAIN_IP, 5432);
     expect(shown).toMatchObject({ ok: true, fp: certFingerprint(pem) });
     const r = client(certFile, 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT count(*) FROM pg_replication_slots"', replDsn(MAIN));
@@ -160,24 +173,23 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     expect(psql(MAIN, `SELECT pg_drop_replication_slot('${SLOT_UNRESERVED}');`).status).toBe(0);
   }, 300000);
 
-  it('L4-3 the granted replication login upserts and deletes rows, and the table reaches a copy', () => {
+  it('L4-3 the copy\'s own login writes and takes off its row through the address functions, and the table reaches a copy', async () => {
     const cert = pem.trim();
-    const up = client(certFile, 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', replDsn(MAIN), addressUpsertSql({ host: 'gone.invalid', port: 1, slot: null, cert, machine: 'gone' }));
-    expect(up.status, up.err).toBe(0);
-    const del = client(certFile, 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', replDsn(MAIN), "DELETE FROM smdb_manager.addresses WHERE host = 'gone.invalid' AND port = 1;");
-    expect(del.status, del.err).toBe(0);
-    const reg = client(certFile, 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', replDsn(MAIN), addressUpsertSql({ host: 'copy.invalid', port: 15433, slot: SLOT, cert, machine: 'copy' }));
-    expect(reg.status, reg.err).toBe(0);
+    expect(await registerAddress(instance(), code(), pem, { host: 'gone.invalid', port: 1, cert, machine: 'gone' })).toBeNull();
+    expect(psql(MAIN, "SELECT slot FROM smdb_manager.addresses WHERE host = 'gone.invalid';").out).toBe(SLOT);
+    expect(await deleteAddress(instance(), code(), pem)).toBeNull();
+    expect(psql(MAIN, "SELECT count(*) FROM smdb_manager.addresses WHERE host = 'gone.invalid';").out).toBe('0');
+    expect(await registerAddress(instance(), code(), pem, { host: 'copy.invalid', port: 15433, cert, machine: 'copy' })).toBeNull();
     expect(psql(MAIN, `SELECT pg_create_physical_replication_slot('${SLOT}');`).status).toBe(0);
     const seed = run(['run', '--rm', '--network', NET, '-e', 'PGPASSWORD', '-v', `${COPY_VOL}:/var/lib/postgresql/data`, '-v', `${certFile}:/primary-ca.crt:ro`,
-      '--entrypoint', 'pg_basebackup', 'postgres:16-alpine', '-d', replDsn(MAIN), '-D', '/var/lib/postgresql/data', '-X', 'stream', '-R', '-S', SLOT, '--checkpoint=fast'], undefined, { PGPASSWORD: REPL_PW });
+      '--entrypoint', 'pg_basebackup', 'postgres:16-alpine', '-d', replDsn(MAIN), '-D', '/var/lib/postgresql/data', '-X', 'stream', '-R', '-S', SLOT, '--checkpoint=fast'], undefined, { PGPASSWORD: COPY_PW });
     expect(seed.status, seed.err).toBe(0);
     expect(run(['run', '--rm', '-v', `${COPY_VOL}:/d`, 'postgres:16-alpine', 'chown', '-R', 'postgres:postgres', '/d']).status).toBe(0);
     expect(run(['run', '-d', '--name', COPY, '--network', NET, '-v', `${COPY_VOL}:/var/lib/postgresql/data`, '-v', `${certFile}:/primary-ca.crt:ro`, 'postgres:16-alpine']).status).toBe(0);
     waitReady(COPY);
     let rows = '';
     for (let i = 0; i < 60 && rows !== '1'; i++) {
-      rows = psql(COPY, "SELECT count(*) FROM smdb_manager.addresses WHERE slot = 'fleet_standby_nm3pg';").out;
+      rows = psql(COPY, `SELECT count(*) FROM smdb_manager.addresses WHERE slot = '${SLOT}';`).out;
       if (rows !== '1') pause(500);
     }
     expect(rows).toBe('1');
@@ -195,7 +207,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
     const probe = await mainProbe(instance(), code(), pem, SLOT);
     expect(probe).toMatchObject({ ok: true, facts: { inRecovery: false, timeline: 1, slot: 'active' } });
     if (probe.ok && copy.answered) expect(probe.facts.systemId).toBe(copy.systemId);
-    const noSlot = client(certFile, 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', replDsn(MAIN), addressUpsertSql({ host: 'noslot.invalid', port: 2, slot: 'fleet_standby_noslot', cert: pem.trim(), machine: 'x' }));
+    const noSlot = psql(MAIN, restoredRowSql({ host: 'noslot.invalid', port: 2, slot: `fleet_standby_${'f'.repeat(32)}`, cert: pem.trim(), machine: 'x' }), 'dbm_meta');
     expect(noSlot.status, noSlot.err).toBe(0);
     const listed = await readAddresses(instance(), code(), pem);
     expect(listed.ok).toBe(true);
@@ -283,7 +295,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM3 the join code 
   it('L4-6 a copy of the old timeline, judged against a promoted database\'s IDENTIFY_SYSTEM, is held, not rebuilt', async () => {
     expect(psql(MAIN, `SELECT pg_create_physical_replication_slot('${SLOT2}');`).status).toBe(0);
     const seed = run(['run', '--rm', '--network', NET, '-e', 'PGPASSWORD', '-v', `${COPY2_VOL}:/var/lib/postgresql/data`, '-v', `${certFile}:/primary-ca.crt:ro`,
-      '--entrypoint', 'pg_basebackup', 'postgres:16-alpine', '-d', replDsn(MAIN), '-D', '/var/lib/postgresql/data', '-X', 'stream', '-R', '-S', SLOT2, '--checkpoint=fast'], undefined, { PGPASSWORD: REPL_PW });
+      '--entrypoint', 'pg_basebackup', 'postgres:16-alpine', '-d', replDsn(MAIN), '-D', '/var/lib/postgresql/data', '-X', 'stream', '-R', '-S', SLOT2, '--checkpoint=fast'], undefined, { PGPASSWORD: COPY_PW });
     expect(seed.status, seed.err).toBe(0);
     expect(run(['run', '--rm', '-v', `${COPY2_VOL}:/d`, 'postgres:16-alpine', 'chown', '-R', 'postgres:postgres', '/d']).status).toBe(0);
     expect(run(['run', '-d', '--name', COPY2, '--network', NET, '-v', `${COPY2_VOL}:/var/lib/postgresql/data`, '-v', `${certFile}:/primary-ca.crt:ro`, 'postgres:16-alpine']).status).toBe(0);

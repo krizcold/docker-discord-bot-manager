@@ -1,17 +1,16 @@
 /**
  * Standby side of managed fleet database replication (PLAN_REPLICATION.md
  * Stage 2). Takes its source from the stored join code (the main's address,
- * certificate fingerprint and replication login), seeds a volume with pg_basebackup, hardens the seeded PGDATA (own server
- * cert for THIS machine's endpoint, verify-full primary_conninfo pointing at
- * an in-volume copy of the primary's cert), then injects and starts the
- * standby service in the instance's compose project.
+ * certificate fingerprint and join login), seeds a volume with pg_basebackup as this machine's own login, hardens the
+ * seeded PGDATA (own server cert for THIS machine's endpoint, verify-full primary_conninfo pointing at an in-volume copy
+ * of the primary's cert), then injects and starts the standby service in the instance's compose project.
  *
- * The replicator password is used during provisioning only; after that it
- * lives solely inside the standby's postgresql.auto.conf. The manager record
- * keeps endpoints, never credentials.
+ * The join login only mints this machine's own login. That login's password is kept encrypted in the instance record
+ * (fleetLogin) and in the standby's postgresql.auto.conf; the replica record keeps endpoints, never credentials.
  */
 
 import { startProcess, execFileGuarded } from '../docker/processStart';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -23,7 +22,8 @@ import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
 import { getBotDir, getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
-import { generateCertPair, enableFleetReplication, REPLICATION_ROLE } from './fleetReplication';
+import { generateCertPair, enableFleetReplication } from './fleetReplication';
+import { COPY_LOGIN_RE, copyLogin, copySlot, JOIN_LOGIN } from './switchSql';
 import { findAppCapabilities, CompanionDbSpec } from '../config/appCapabilities';
 import { capabilityRefusal } from './appHookClient';
 import { probeErrorTail, urlPassword, verifierAccepts } from '../config/secretText';
@@ -32,17 +32,16 @@ import { decodeJoinCode, HOST_RE, JoinCode, lsnText, splitBackendUrls } from '..
 import { hasHostParam, readDatabaseUrl } from '../config/databaseUrl';
 import { alertStep, dmOutcomeText, ownerMessageKey, utcText } from './backupFiles';
 import {
-  AddressesOutcome, addressesText, deleteAddress, ensureClientImage, sendAddresses, inRecoveryText, loginOf, machineNameOf, mainCertificate, mainProbe, PrimaryLogin,
-  probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor, storedJoin, writeEnvList, joinFleet,
+  AddressesOutcome, addressesText, clientReason, copyLoginOf, deleteAddress, ensureClientImage, ensureCopyLogin, isLoginRefusal, sendAddresses, inRecoveryText, machineNameOf,
+  mainCertificate, mainProbe, MintAnswer, NO_OWN_LOGIN, ownProbeFailureText, PrimaryLogin, probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor,
+  storedJoin, writeEnvList, joinFleet,
 } from './fleetJoin';
 import { notifyOwner, withOutcome, type OwnerMessageOutcome } from './backupCheck';
 import { feedStdin } from '../docker/childStdin';
 
-/** Every fleet standby's slot begins with this; the rest is the standby instance's id, so N standbys of one primary never collide (20.19 F1/F2). */
-const FLEET_SLOT_PREFIX = 'fleet_standby';
-/** The instance id is a lowercase uuid, so the name is always slot-legal (a-z, 0-9, _; 46 of 63 characters) and survives a rename. */
+/** A standby's slot is the one its machine's login owns on the main, named from the instance id. */
 function slotNameFor(instance: InstanceConfig): string {
-  return `${FLEET_SLOT_PREFIX}_${instance.id.replace(/-/g, '')}`;
+  return copySlot(instance.id);
 }
 const DEFAULT_HOST_PORT = 15432;
 /** Past this the standby's clock runs behind the primary's so far that a time-based lag is not shown. */
@@ -541,10 +540,12 @@ export async function getFleetReplicaStatus(instance: InstanceConfig): Promise<F
 }
 
 interface ValidatedIntake {
-  dsn: ParsedDsn;
   join: JoinCode;
   host?: string;
   port?: number;
+  /** This machine's own login, set by the caller that ran ensureCopyLogin, with what its mint answered. */
+  login?: PrimaryLogin;
+  minted?: MintAnswer;
 }
 
 /** A port collision cannot be ruled out while the registry, the only list of ports in use here, cannot be read. */
@@ -560,13 +561,13 @@ function validateIntake(
   hostPort: number | undefined,
 ): { ok: true; intake: ValidatedIntake } | { ok: false; error: string } {
   const host = (publicHost ?? '').trim();
-  if (!host) return { ok: true, intake: { dsn: loginOf(join), join } };
+  if (!host) return { ok: true, intake: { join } };
   if (!HOST_RE.test(host)) {
     return { ok: false, error: 'Public host must be a bare hostname or IPv4 address' };
   }
   const port = hostPort ?? DEFAULT_HOST_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'Invalid port' };
-  return { ok: true, intake: { dsn: loginOf(join), join, host, port } };
+  return { ok: true, intake: { join, host, port } };
 }
 
 /** The stored join, decoded, or the refusal for its absence. */
@@ -579,16 +580,16 @@ function joinedSource(instance: InstanceConfig): { ok: true; join: JoinCode } | 
 
 function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): FleetDbReplicaRecord {
   // Identity stamped from the capability record at provisioning time (the
-  // standby is a byte copy of that app's database); the DSN's own user is the
-  // replication login, not the app identity.
+  // standby is a byte copy of that app's database); the seed's user is this
+  // machine's own login, not the app identity.
   const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   const containerName = `${instance.sanitizedName}-fleet-postgres-replica`;
   return {
     containerName,
     volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
     slot: slotNameFor(instance),
-    primaryHost: intake.dsn.host,
-    primaryPort: intake.dsn.port,
+    primaryHost: intake.join.host,
+    primaryPort: intake.join.port,
     ...(intake.host && intake.port ? { publicHost: intake.host, hostPort: intake.port } : {}),
     certHost: intake.host || containerName,
     ...(spec ? { user: spec.user, db: spec.database } : {}),
@@ -668,20 +669,20 @@ function startProvisioning(
       throwIfCancelled(instance.id);
       // Ahead of the preflight, which is where every lane destroys: a refusal
       // here has changed nothing and stays retryable.
-      const certPem = await assertSeedableSource(instance, intake);
+      const { certPem, login } = await assertSeedableSource(instance, intake, auto);
       // The probe can take a minute, and the preflight past it destroys; a cancel
       // filed while it ran is honoured here, with everything still in place.
       throwIfCancelled(instance.id);
       assertVolumeOwnedHere(instance.id, record.volume);
       if (preflight) await preflight(ctx);
       try {
-        await runProvisioning(instance, record, intake.dsn, certPem, purpose, confirmVolume, ctx);
+        await runProvisioning(instance, record, login, certPem, purpose, confirmVolume, ctx);
       } catch (err) {
         // A record still naming this slot means the standby's own copy survived
         // and may yet stream on it; anything else leaves it retaining WAL for a
         // copy that does not exist.
         if (containerManager.getBot(instance.id)?.fleetDbReplica?.slot !== record.slot || replicaClearHeld(instance.id, now)) {
-          await dropInactiveSlot(instance, intake.dsn, hostCertPathFor(instance.id), record.slot);
+          await dropInactiveSlot(instance, login, hostCertPathFor(instance.id), record.slot);
         }
         throw err;
       }
@@ -849,7 +850,7 @@ export function provisionFleetReplica(
 
   const validated = validateIntake(source.join, publicHost, hostPort);
   if (!validated.ok) return { success: false, error: validated.error };
-  const { dsn: parsedDsn, port } = validated.intake;
+  const { join: main, port } = validated.intake;
   if (port !== undefined) {
     const registryUnread = portUnconfirmed(port);
     if (registryUnread) return { success: false, error: registryUnread };
@@ -865,7 +866,7 @@ export function provisionFleetReplica(
   // standby but a shape 20.9 lists, so the operator owns the trade.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
-    return repl && repl.publicHost.toLowerCase() === parsedDsn.host.toLowerCase() && repl.hostPort === parsedDsn.port;
+    return repl && repl.publicHost.toLowerCase() === main.host.toLowerCase() && repl.hostPort === main.port;
   });
   if (samehost && !confirm) {
     return { success: false, needsConfirm: true, error: `That primary ("${samehost.displayName}") lives on THIS machine, so a standby here survives that database's container dying but not this machine dying. That shape is allowed. Check the standby reports streaming once it finishes: a container that shares a docker network with the primary's sidecar cannot always reach its published port, and the copy can seed over a path the running standby does not have` };
@@ -906,15 +907,18 @@ function seedFailureLine(stderr: string, password: string): string {
  * needs both, and doing the pull first keeps the later short-timeout runs from
  * absorbing a multi-minute pull.
  */
-async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedIntake): Promise<string> {
-  const dsn = intake.dsn;
+async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedIntake, auto: boolean): Promise<{ certPem: string; login: PrimaryLogin }> {
+  const main = intake.join;
+  // The automatic rebuild never mints: with no stored password it stops here, before anything is deleted.
+  const stored = auto ? copyLoginOf(containerManager.getBot(instance.id) ?? instance, main) : null;
+  if (auto && !stored) throw new Error("this machine's own login to the main is not stored; press Re-seed");
   // committed describes the VOLUME, so a retry over an attempt that already
   // wiped inherits it: the reassurance below would be a lie on exactly the
   // record that most needs the truth.
   const intact = seedRecord(instance.id)?.committed !== true ? ', so nothing has been changed' : '';
   // The main's certificate, proven by the join code's fingerprint in this run.
-  const shown = await mainCertificate(intake.join);
-  if (!shown.ok) throw new Error(`could not verify the primary at ${dsn.host}:${dsn.port}${intact}: ${shown.text}`);
+  const shown = await mainCertificate(main);
+  if (!shown.ok) throw new Error(`could not verify the primary at ${main.host}:${main.port}${intact}: ${shown.text}`);
   const certPem = shown.pem;
   // The primary's pinned cert: kept on disk for re-provisioning and mounted
   // into the seeding container; the standby's runtime copy lives in PGDATA.
@@ -931,6 +935,19 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
   if (!pulled.ok) throw new Error(`could not pull postgres:16-alpine: ${pulled.stderr.trim().split('\n').pop()}`);
   throwIfCancelled(instance.id);
 
+  let own: { login: PrimaryLogin; minted?: MintAnswer };
+  if (stored) {
+    own = { login: stored };
+  } else if (intake.login) {
+    own = { login: intake.login, minted: intake.minted };
+  } else {
+    const ensured = await ensureCopyLogin(containerManager.getBot(instance.id) ?? instance, main, certPem);
+    if (!ensured.ok) throw new Error(ensured.error);
+    own = ensured;
+    throwIfCancelled(instance.id);
+  }
+  const dsn = own.login;
+
   const probeName = primaryProbeContainerName(instance);
   await dockerRmForce(probeName);
   const probe = await runPrimaryClient(probeName, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql',
@@ -942,6 +959,9 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
     // and this lane exists for exactly that failure.
     const lines = probe.stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
     const reason = (lines.find(l => l.startsWith('ERROR')) || lines[0] || 'psql failed').split(dsn.password).join('***');
+    if (own.minted && !probe.timedOut && isLoginRefusal(probe.stderr)) {
+      throw new Error(ownProbeFailureText(main, { login: dsn, minted: own.minted }, { ok: false, kind: 'login', reason }));
+    }
     throw new Error(`could not verify the primary at ${dsn.host}:${dsn.port}${intact}: ${reason}`);
   }
   // A source in recovery is a standby: seeding from it would copy a follower,
@@ -949,7 +969,7 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
   if (probe.stdout.trim() !== 'f') {
     throw new Error(`the source at ${dsn.host}:${dsn.port} is itself following a primary${intact}; seed from the machine that now serves the fleet`);
   }
-  return certPem;
+  return { certPem, login: dsn };
 }
 
 /** What the first provision would clear, worded for its confirm; names what Remove replica recorded about the volume. */
@@ -1007,8 +1027,8 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
       throw new Error(`${stopped}: ${keptVolumeQuestion(containerManager.getBot(instance.id) ?? instance, record.volume)}. ${remedy}`);
     }
   }
-  // The slot is this standby's own (20.19 F1) and is minted here when missing:
-  // the replicator role may create slots, and enable mints none. A slot the
+  // The slot is this standby's own (20.19 F1) and is minted here when missing,
+  // as this machine's login; enable mints none. A slot the
   // WAL bound invalidated stays invalidated for good (a seed on it streams but
   // retains nothing and loses it again at the first blip), so an inactive lost
   // or unreserved one is re-created. A live one is left alone: pg_basebackup
@@ -1018,19 +1038,18 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   await dockerRmForce(resetName);
   const slotReset = await runPrimaryClient(resetName, dsn, [certMount], 'psql', [seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
       DO $$ DECLARE s record; BEGIN
-        SELECT active, wal_status INTO s FROM pg_replication_slots WHERE slot_name = '${record.slot}';
+        SELECT active, wal_status INTO s FROM pg_catalog.pg_replication_slots WHERE slot_name = '${record.slot}';
         IF NOT FOUND THEN
-          PERFORM pg_create_physical_replication_slot('${record.slot}');
+          PERFORM pg_catalog.pg_create_physical_replication_slot('${record.slot}');
         ELSIF NOT s.active AND s.wal_status IN ('lost', 'unreserved') THEN
-          PERFORM pg_drop_replication_slot('${record.slot}');
-          PERFORM pg_create_physical_replication_slot('${record.slot}');
+          PERFORM pg_catalog.pg_drop_replication_slot('${record.slot}');
+          PERFORM pg_catalog.pg_create_physical_replication_slot('${record.slot}');
         END IF;
       END $$;`], 60_000);
   if (!slotReset.ok) {
     // psql prints ERROR, DETAIL and CONTEXT lines; the ERROR line is the one
     // to show, never with the DSN's password should it ever be echoed.
-    const lines = slotReset.stderr.trim().split('\n');
-    const reason = (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').split(dsn.password).join('***');
+    const reason = clientReason(slotReset, 60_000, dsn).split(dsn.password).join('***');
     throw new Error(`could not prepare the replication slot on the primary: ${reason}`);
   }
 
@@ -1073,7 +1092,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   if (!strip.ok) throw new Error(`could not strip the primary's own settings from the copy: ${strip.stderr.trim()}`);
   // application_name is the slot name, so the primary's own status ties a
   // streaming link to its slot without reading process ids.
-  const conninfo = `user=${dsn.user} password=${dsn.password} host=${dsn.host} port=${dsn.port} sslmode=verify-full sslrootcert=${PGDATA}/primary-ca.crt application_name=${record.slot}`;
+  const conninfo = `user=${dsn.user} password=${dsn.password} host=${dsn.host} port=${dsn.port} sslmode=verify-full sslrootcert=${PGDATA}/primary-ca.crt require_auth=scram-sha-256 application_name=${record.slot}`;
   const conf = await volExec(record.volume, `cat >> ${PGDATA}/postgresql.auto.conf`, `primary_conninfo = '${conninfo}'\n`);
   if (!conf.ok) throw new Error(`primary_conninfo write failed: ${conf.stderr.trim()}`);
 
@@ -1152,7 +1171,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   }
   if (record.publicHost) {
     const registered = await registerOwnCopy(fresh, certPem);
-    if (registered) ctx.notes.push(`The copy runs, but its address could not be added to the main's list (${registered}); the manager tries again every hour.`);
+    if (registered) ctx.notes.push(`The copy runs, but its address could not be added to the main's list (${registered}).${ADDRESS_TAKEN_RE.test(registered) ? '' : ' The manager tries again every hour.'}`);
   }
   try {
     const written = await writeEnvList(instance.id);
@@ -1167,12 +1186,15 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   }
 }
 
+/** ADDR-TAKEN and ADDR-TAKEN-MAIN as registerOwnCopy words them: the address is another row's, which no hourly retry changes. */
+const ADDRESS_TAKEN_RE = /^its address \S+ is listed on the main (for the machine login |as the main's own address)/;
+
 /** Best effort: an inactive slot of this name on the primary is dropped; a failure is logged, never thrown. */
 async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCertPath: string, slot: string): Promise<void> {
   const name = `${slotResetContainerName(instance)}-drop`;
   await dockerRmForce(name);
   const result = await runPrimaryClient(name, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql', [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc',
-    `SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`], 60_000);
+    `SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`], 60_000);
   if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${result.stderr.trim().split('\n').pop()}`);
 }
 
@@ -1254,7 +1276,7 @@ export async function removeFleetReplica(instance: InstanceConfig, opts: { confi
     const join = storedJoin(after);
     if (rec.publicHost && rec.hostPort && join) {
       const shown = await mainCertificate(join);
-      const reason = shown.ok ? await deleteAddress(after, join, shown.pem, rec.publicHost, rec.hostPort) : shown.reason;
+      const reason = shown.ok ? await deleteAddress(after, join, shown.pem) : shown.reason;
       if (reason) warning += `; its address could not be taken off the main's list (${reason}), and the main stops listing it once the slot is dropped there`;
     }
     try {
@@ -1422,14 +1444,14 @@ function companionEnvKeys(botId: string): string[] {
  *
  * The instance must be STOPPED: this deletes the database it is running on.
  */
-export function reseedStalePrimary(
+export async function reseedStalePrimary(
   instance: InstanceConfig,
   joinCode: string,
   publicHost: string | undefined,
   hostPort?: number,
   confirm?: boolean,
   opts: { dumpDone?: boolean; confirmVolume?: string; safetyDump?: string } = {},
-): { success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string } {
+): Promise<{ success: boolean; error?: string; started?: boolean; needsConfirm?: boolean; confirmVolume?: string }> {
   if (!instance.fleetDb) {
     return { success: false, error: 'This instance hosts no managed fleet database, so there is no stale primary to heal - use Provision instead' };
   }
@@ -1459,7 +1481,7 @@ export function reseedStalePrimary(
   if (!decoded.ok) return { success: false, error: `This is not a join code: ${decoded.why}` };
   const validated = validateIntake(decoded.code, publicHost, hostPort);
   if (!validated.ok) return { success: false, error: validated.error };
-  const { dsn: parsedDsn, port } = validated.intake;
+  const { join: main, port } = validated.intake;
   if (port !== undefined) {
     const registryUnread = portUnconfirmed(port);
     if (registryUnread) return { success: false, error: registryUnread };
@@ -1476,7 +1498,7 @@ export function reseedStalePrimary(
   // standby from the very database that is about to be deleted.
   const samehost = containerManager.getAllBots().find(other => {
     const repl = other.fleetDb?.replication;
-    return repl && repl.publicHost.toLowerCase() === parsedDsn.host.toLowerCase() && repl.hostPort === parsedDsn.port;
+    return repl && repl.publicHost.toLowerCase() === main.host.toLowerCase() && repl.hostPort === main.port;
   });
   if (samehost?.id === instance.id) {
     return { success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet' };
@@ -1489,6 +1511,20 @@ export function reseedStalePrimary(
   const confirmVolume = opts.confirmVolume;
   const volumeRefusal = provisionVolumeRefusal(instance, record.volume, confirmVolume);
   if (volumeRefusal) return { success: false, ...volumeRefusal };
+
+  if (containerManager.isShuttingDown()) return { success: false, error: containerManager.SHUTDOWN_REFUSAL };
+  // This machine's own login, minted now: a refusal here holds no backup claim and has destroyed nothing. A code
+  // composed from this machine's records names its login already, which only the stored password opens.
+  if (COPY_LOGIN_RE.test(main.repl.user) && !copyLoginOf(instance, main)) {
+    return { success: false, error: probeFailureText(main, { ok: false, kind: 'nologin', reason: NO_OWN_LOGIN }) };
+  }
+  const shown = await mainCertificate(main);
+  if (!shown.ok) return { success: false, error: shown.text };
+  const pulled = await ensureClientImage();
+  if (pulled) return { success: false, error: pulled };
+  const own = await ensureCopyLogin(instance, main, shown.pem);
+  if (!own.ok) return { success: false, error: own.error };
+  const intake: ValidatedIntake = { ...validated.intake, login: own.login, minted: own.minted };
 
   const preflight = async (ctx: SeedRunContext) => {
     throwIfCancelled(instance.id);
@@ -1533,7 +1569,7 @@ export function reseedStalePrimary(
         }
       }
       if (!opts.dumpDone && fenced) {
-        const foreign = await reseedIdentityRefusal(instance, fleetDb, validated.intake.dsn);
+        const foreign = await reseedIdentityRefusal(instance, fleetDb, own.login);
         if (foreign) throw new Error(`${foreign}; nothing was destroyed`);
       }
       // Re-check just before the destructive step: the dump above can take
@@ -1589,7 +1625,7 @@ export function reseedStalePrimary(
   }
   let started: { success: boolean; error?: string };
   try {
-    started = startProvisioning(instance, record, validated.intake, 'reseed-stale-primary', { preflight, onSettled: () => fleetBackupGuards.releaseFleetBackupBusy(instance.id), confirmVolume, joinText: joinCode });
+    started = startProvisioning(instance, record, intake, 'reseed-stale-primary', { preflight, onSettled: () => fleetBackupGuards.releaseFleetBackupBusy(instance.id), confirmVolume, joinText: joinCode });
   } catch (err) {
     fleetBackupGuards.releaseFleetBackupBusy(instance.id);
     throw err;
@@ -1925,14 +1961,12 @@ export async function adoptPromotedReplica(
     return { success: false, error: `The write fence's lines could not be removed from this copy's pg_hba.conf (${probeErrorTail(fence.stderr)}), so the standby was not adopted; nothing was changed` };
   }
 
-  // The copy's catalog still holds the replication role its seed used, and
-  // every standby of this lineage pins that credential and the certificate the
-  // seed minted for this endpoint (B6 map F30). Filing them makes enable keep
-  // both instead of minting, so a handover does not invalidate the fleet's
-  // trust. Unreadable means enable mints, as before.
+  // The copy streamed as this machine's own login, whose password its primary_conninfo holds. The posture keeps the
+  // certificate the seed minted for this endpoint (B6 map F30), so a handover does not invalidate the fleet's trust,
+  // and gives the join login a password this machine knows.
   const credential = await readCopyCredential(rec);
-  const replication = !alone && credential && credential.user === REPLICATION_ROLE
-    ? { role: credential.user, password: credential.password, hostPort, publicHost, certHost: rec.certHost }
+  const replication = !alone
+    ? { role: JOIN_LOGIN, password: crypto.randomBytes(24).toString('base64url'), hostPort, publicHost, certHost: rec.certHost }
     : undefined;
   // The container-name form, written before the record flip so a refused env
   // write leaves nothing changed: with the record flipped it is what marks the
@@ -1988,6 +2022,13 @@ export async function adoptPromotedReplica(
   if (!adopted.success) {
     const left = putEnvBack();
     return left ? { success: false, error: `${adopted.error}; ${left}` } : adopted;
+  }
+  if (credential && credential.user === copyLogin(instance.id) && !containerManager.getBot(instance.id)?.fleetLogin?.password) {
+    try {
+      containerManager.updateInstanceFleetLogin(instance.id, { password: credential.password });
+    } catch (err) {
+      console.warn(`[FleetReplica] ${instance.id}: the password of this machine's own login, read from the copy, could not be saved (${errorText(err)}); join codes to this bot's other databases cannot be composed until a Join or Re-seed saves one`);
+    }
   }
   const live = containerManager.getBot(instance.id);
   if (!live) return { success: false, error: 'Bot not found after adopting the record' };
@@ -2045,7 +2086,7 @@ export async function fleetDbPasswordFallback(instance: InstanceConfig): Promise
   return (url && urlPassword(url)) || undefined;
 }
 
-/** The replication credential the seed wrote into this copy's own primary_conninfo; null when unreadable. */
+/** The login the seed wrote into this copy's own primary_conninfo, with its password; null when unreadable. */
 async function readCopyCredential(rec: FleetDbReplicaRecord): Promise<{ user: string; password: string } | null> {
   const conf = await replicaExec(rec.containerName, ['sh', '-c', `grep '^primary_conninfo' ${PGDATA}/postgresql.auto.conf | tail -n 1`]);
   const line = conf.ok ? conf.stdout.trim() : '';
@@ -2339,8 +2380,10 @@ export async function reseedStandby(instance: InstanceConfig, opts: { confirm?: 
   if (!shown.ok) return refuse(shown.text);
   const pulled = await ensureClientImage();
   if (pulled) return refuse(pulled);
-  const main = await mainProbe(instance, join, shown.pem);
-  if (!main.ok) return refuse(probeFailureText(join, main));
+  const own = await ensureCopyLogin(instance, join, shown.pem);
+  if (!own.ok) return refuse(own.error);
+  const main = await mainProbe({ ...instance, fleetLogin: { password: own.login.password } }, join, shown.pem);
+  if (!main.ok) return refuse(ownProbeFailureText(join, own, main));
   if (main.facts.inRecovery) return refuse(inRecoveryText(join.host, join.port));
   if (rec.copyCleared !== true) {
     const copy = await readCopyFacts(rec);
@@ -2366,7 +2409,7 @@ export async function reseedStandby(instance: InstanceConfig, opts: { confirm?: 
   let started: { success: boolean; error?: string };
   try {
     clearAutoRebuildHold(instance.id);
-    started = startProvisioning(instance, sameJoinTarget(rec, join), validated.intake, 'reseed-standby', { preflight: reseedPreflight(instance, rec), onSettled: release });
+    started = startProvisioning(instance, sameJoinTarget(rec, join), { ...validated.intake, login: own.login, minted: own.minted }, 'reseed-standby', { preflight: reseedPreflight(instance, rec), onSettled: release });
   } catch (err) {
     release();
     throw err;

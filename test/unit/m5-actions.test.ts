@@ -15,9 +15,9 @@ describe('m5 the Actions rows', () => {
   it('replication off offers Enable; on offers Disable; unbounded retention offers the bound', () => {
     expect(labels({ replication: replication({ enabled: false }) })).toEqual(['Enable replication']);
     expect(labels({ replication: ({ ok: true, value: {} }) })).toEqual(['Enable replication']);
-    expect(labels({ replication: on() })).toEqual(['Disable replication']);
-    expect(labels({ replication: on({ slotWalKeep: '-1', slots: [] }) })).toEqual(['Apply the 4096 MB WAL bound', 'Disable replication']);
-    expect(labels({ replication: on(undefined) })).toEqual(['Disable replication']);
+    expect(labels({ replication: on() })).toEqual(['New join code', 'Disable replication']);
+    expect(labels({ replication: on({ slotWalKeep: '-1', slots: [] }) })).toEqual(['Apply the 4096 MB WAL bound', 'New join code', 'Disable replication']);
+    expect(labels({ replication: on(undefined) })).toEqual(['New join code', 'Disable replication']);
   });
 
   it('a drop row for each fleet slot that is not active, with the slot its press sends', () => {
@@ -27,7 +27,7 @@ describe('m5 the Actions rows', () => {
       { slot: 'smdb_copy_c', fleet: true, active: false, machine: null },
       { slot: 'other_slot', fleet: false, active: false },
     ] }) });
-    expect(rows.map((r) => r.label)).toEqual(['Drop slot smdb_copy_b (the copy on hetzner)', 'Drop slot smdb_copy_c', 'Disable replication']);
+    expect(rows.map((r) => r.label)).toEqual(['Drop slot smdb_copy_b (the copy on hetzner)', 'Drop slot smdb_copy_c', 'New join code', 'Disable replication']);
     expect(rows.filter((r) => r.kind === 'drop').map((r) => (r as { slot: string }).slot)).toEqual(['smdb_copy_b', 'smdb_copy_c']);
   });
 
@@ -45,7 +45,7 @@ describe('m5 the Actions rows', () => {
     for (const bad of [{ ok: false as const, text: 'Bot not found' }, { ok: null, text: 'the manager did not answer within 15 s' }]) {
       expect(labels({ replication: bad as never, replica: bad as never })).toEqual([]);
       expect(labels({ replication: bad as never, replica: replica(seedRunning()) })).toEqual(['Cancel the seed']);
-      expect(labels({ replication: on(), replica: bad as never })).toEqual(['Disable replication']);
+      expect(labels({ replication: on(), replica: bad as never })).toEqual(['New join code', 'Disable replication']);
     }
     expect(labels({})).toEqual([]);
   });

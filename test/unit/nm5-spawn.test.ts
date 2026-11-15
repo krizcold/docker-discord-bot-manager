@@ -64,7 +64,7 @@ describe('runGuarded and runPrimaryClient under the fork faults', () => {
 });
 
 describe('peerProbe reads the receive mark count on the target\'s postgres database (D64)', () => {
-  const inst = { id: 'a', sanitizedName: 'a', displayName: 'A' } as any;
+  const inst = { id: 'a', sanitizedName: 'a', displayName: 'A', fleetLogin: { password: 'Own-Machine-Secret-01' } } as any;
   it.each([
     ['1', true], ['0', false], ['unread', null], ['', null],
   ] as const)('the fourth line %j -> receiveMark %s', async (line, want) => {

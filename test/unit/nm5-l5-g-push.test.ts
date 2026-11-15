@@ -208,8 +208,8 @@ describe('pushLocked clients', () => {
     expect(cap.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
     expect(cap.rest[0]).toBe(DSN('app'));
     const commit = client('commit');
-    expect(commit.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
-    expect(commit.rest[0]).toBe(META_DSN('app'));
+    expect(commit.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq');
+    expect(commit.rest).toEqual([META_DSN('app')]);
   });
   it('the push fails with two stderr lines: the ERROR line is named, and the mark keeps it as lastError', async () => {
     answers.push = bad(TWO_LINES);

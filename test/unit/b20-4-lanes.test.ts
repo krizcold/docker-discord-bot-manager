@@ -167,7 +167,7 @@ describe('R18-J4: a stale-primary re-seed after a partial retire', () => {
 
   it('marks the seed committed when the retire reports the volume gone', async () => {
     pg.retire = { success: false, volumeRemoved: true, error: 'the database volume bot-a-pgdata was removed, but its compose or record could not be updated: EIO' };
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(bot.fleetDbReplicaSeed?.committed).toBe(true);
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/was removed, but its compose or record/);
@@ -176,7 +176,7 @@ describe('R18-J4: a stale-primary re-seed after a partial retire', () => {
   it('refuses to dump a volume created after the retire first began', async () => {
     writeRegistry({ ...primary, retiringAt: RETIRING });
     pg.createdAt = '2026-10-21T00:00:00Z';
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(pg.events).toEqual([]);
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/created after/);
@@ -185,7 +185,7 @@ describe('R18-J4: a stale-primary re-seed after a partial retire', () => {
 
   it('brings up the volume the first attempt left standing past the retiring mark', async () => {
     writeRegistry({ ...primary, retiringAt: RETIRING });
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     await settled();
     expect(pg.events[0]).toBe('sidecar-up-retry');
   });

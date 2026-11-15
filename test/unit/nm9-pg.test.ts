@@ -128,7 +128,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
   beforeAll(async () => {
     await provisionedCluster({ name: NAME, user: USER, db: USER, password: 'pw' });
     ok(`ALTER ROLE ${USER} NOLOGIN`);
-    ok(switchSql.replicationRoleEnsureSql('replicator'));
+    ok(switchSql.copyGroupEnsureSql());
   }, 300000);
 
   afterAll(() => {
@@ -310,7 +310,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
     register(id, 'pg11b');
     await fleetSwitch.ensureMainGeneration(id);
     expect(ok('SELECT generation FROM smdb_manager.generation', 'pg11b')).toBe('1');
-    const enabled = run(['exec', '-i', NAME, 'psql', '-X', '-U', dbLogin.META_LOGIN, '-d', 'pg11b', '-v', 'ON_ERROR_STOP=1', '-At'], addressTableSql('recv.example', 5432, 'PEM', 'recv.example', null));
+    const enabled = run(['exec', '-i', NAME, 'psql', '-X', '-U', dbLogin.META_LOGIN, '-d', 'pg11b', '-v', 'ON_ERROR_STOP=1', '-At'], addressTableSql('recv.example', 5432, 'PEM', 'recv.example'));
     expect(enabled.status, enabled.err).toBe(0);
     const P11 = await fleetBackup.runFleetDump(bot(id, 'pg11b') as any, 'pre-receive-');
     expect(P11.success, P11.error).toBe(true);
@@ -333,7 +333,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM9 the shard clai
 
   const P ='0123456789abcdef01234567';
   const received = (id: string, g: number, conflict = true) => `INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES ('${id}', '1', 'main', ${g})${conflict ? ' ON CONFLICT (push_id) DO NOTHING' : ''};\n`;
-  const commitOf = (g: number, after = '') => `SET ROLE ${ADMIN};\n${switchSql.raiseSql('recv', g, `${addressTableSql('recv.example', 5432, 'PEM', 'recv', null)}
+  const commitOf = (g: number, after = '') => `SET ROLE ${ADMIN};\n${switchSql.raiseSql('recv', g, `${addressTableSql('recv.example', 5432, 'PEM', 'recv')}
 DELETE FROM smdb_manager.addresses WHERE NOT (host = 'recv.example' AND port = 5432);
 ${received(P, g)}${CAP}${after}`)}`;
   const asReceive = (db: string, sql: string) => run(['exec', NAME, 'psql', '-X', '-U', 'smdb_receive', '-d', db, '-v', 'ON_ERROR_STOP=1', '-tAq', '-c', sql]);

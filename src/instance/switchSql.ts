@@ -96,8 +96,8 @@ END $$;
 `;
 }
 
-/** The generation row as `<gen>|<machine>|<since>`; a missing table is read from psql's error (missingTable). */
-export const GEN_READ_SQL = `SELECT coalesce((SELECT generation || '|' || machine || '|' || ${SINCE} FROM smdb_manager.generation), '0||')`;
+/** The generation row as `<gen>|<machine>|<since>`; a missing table is read from psql's error (missingTable). Machine logins run it, so its functions are pg_catalog's. */
+export const GEN_READ_SQL = `SELECT coalesce((SELECT generation || '|' || machine || '|' || pg_catalog.${SINCE} FROM smdb_manager.generation), '0||')`;
 
 export const HANDOVER_READ_SQL = `SELECT coalesce((SELECT slot || '|' || generation || '|' || machine FROM smdb_manager.handover), '')`;
 
@@ -144,10 +144,445 @@ export const RECEIVE_END_SQL = `SELECT count(pg_terminate_backend(pid, 5000)) FR
 
 export const RECEIVE_DROP_SQL = 'DROP ROLE IF EXISTS smdb_receive, smdb_receive_meta;';
 
-/** The replication role, made NOLOGIN when this cluster lacks it, so a dump that grants to it restores (D59). */
-export function replicationRoleEnsureSql(role: string): string {
-  return `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLiteral(role)}) THEN CREATE ROLE ${role} NOLOGIN REPLICATION; END IF; END $$;`;
+export const JOIN_LOGIN = 'smdb_join';
+export const COPY_GROUP = 'smdb_copies';
+export const MINTER = 'smdb_minter';
+export const COPY_LOGIN_RE = /^smdb_copy_[0-9a-f]{32}$/;
+const COPY_SLOT_RE = /^fleet_standby_([0-9a-f]{32})$/;
+const VERIFIER_RE = /^SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/;
+
+/** This machine's own replication login on every database of its lineage: the instance id without its dashes. */
+export function copyLogin(instanceId: string): string {
+  return `smdb_copy_${instanceId.replace(/-/g, '')}`;
 }
+
+/** The slot of copyLogin(instanceId): the same 32 hex characters. */
+export function copySlot(instanceId: string): string {
+  return `fleet_standby_${instanceId.replace(/-/g, '')}`;
+}
+
+/** The machine login a slot belongs to; null for a name that is not a machine's slot. */
+export function loginOfSlot(slot: string): string | null {
+  const m = COPY_SLOT_RE.exec(slot);
+  return m ? `smdb_copy_${m[1]}` : null;
+}
+
+function machineLoginOnly(login: string): string {
+  if (!COPY_LOGIN_RE.test(login)) throw new Error(`${login} is not a machine login name`);
+  return login;
+}
+
+function verifierOnly(verifier: string): string {
+  if (!VERIFIER_RE.test(verifier)) throw new Error('the password is not a SCRAM-SHA-256 verifier');
+  return verifier;
+}
+
+/** C3: every membership that breaks Invariant L, revoked as the role that granted it. */
+export const MEMBERSHIP_REPAIR_SQL = `DO $$ DECLARE r record; BEGIN
+  FOR r IN
+    SELECT pg_catalog.pg_get_userbyid(m.roleid) AS role, pg_catalog.pg_get_userbyid(m.member) AS member,
+           pg_catalog.pg_get_userbyid(m.grantor) AS grantor,
+           (pg_catalog.pg_get_userbyid(m.member) ~ '^smdb_copy_[0-9a-f]{32}$' AND m.roleid = 'smdb_copies'::regrole AND m.admin_option) AS admin_only,
+           (m.member = 'smdb_minter'::regrole AND m.roleid = 'smdb_copies'::regrole) AS minter
+    FROM pg_catalog.pg_auth_members m
+    WHERE (m.roleid = 'smdb_copies'::regrole
+            AND pg_catalog.pg_get_userbyid(m.member) !~ '^smdb_copy_[0-9a-f]{32}$'
+            AND NOT (m.member = 'smdb_minter'::regrole AND m.grantor = 10))
+       OR (m.roleid = 'smdb_copies'::regrole AND m.admin_option AND pg_catalog.pg_get_userbyid(m.member) ~ '^smdb_copy_[0-9a-f]{32}$')
+       OR (pg_catalog.pg_get_userbyid(m.member) ~ '^smdb_copy_[0-9a-f]{32}$' AND m.roleid <> 'smdb_copies'::regrole)
+       OR (pg_catalog.pg_get_userbyid(m.roleid) ~ '^smdb_copy_[0-9a-f]{32}$' AND m.member <> 'smdb_minter'::regrole)
+       OR m.member IN (pg_catalog.to_regrole('smdb_join'), 'smdb_copies'::regrole)
+       OR (m.member = 'smdb_minter'::regrole AND m.roleid <> 'smdb_copies'::regrole AND pg_catalog.pg_get_userbyid(m.roleid) !~ '^smdb_copy_[0-9a-f]{32}$')
+  LOOP
+    IF r.admin_only THEN
+      EXECUTE pg_catalog.format('REVOKE ADMIN OPTION FOR %I FROM %I GRANTED BY %I CASCADE', r.role, r.member, r.grantor);
+    ELSIF r.minter THEN
+      EXECUTE pg_catalog.format('REVOKE %I FROM %I GRANTED BY %I', r.role, r.member, r.grantor);
+    ELSE
+      EXECUTE pg_catalog.format('REVOKE %I FROM %I GRANTED BY %I CASCADE', r.role, r.member, r.grantor);
+    END IF;
+  END LOOP;
+END $$;
+`;
+
+/** R18: the session settings anyone put on the join login, the minter, the group or a machine login. */
+export const SETTINGS_REPAIR_SQL = `DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT pg_catalog.pg_get_userbyid(s.setrole) AS role, db.datname AS d
+           FROM pg_catalog.pg_db_role_setting s LEFT JOIN pg_catalog.pg_database db ON db.oid = s.setdatabase
+           WHERE pg_catalog.pg_get_userbyid(s.setrole) IN ('smdb_join', 'smdb_minter', 'smdb_copies')
+              OR pg_catalog.pg_get_userbyid(s.setrole) ~ '^smdb_copy_[0-9a-f]{32}$' LOOP
+    IF r.d IS NULL THEN EXECUTE pg_catalog.format('ALTER ROLE %I RESET ALL', r.role);
+    ELSE EXECUTE pg_catalog.format('ALTER ROLE %I IN DATABASE %I RESET ALL', r.role, r.d); END IF;
+  END LOOP;
+END $$;
+`;
+
+/** G1: the rights COPY_ROLES_READ_SQL's login-rights reads, taken off every role on the machine-login pattern; LOGIN and REPLICATION are left. */
+export const LOGIN_RIGHTS_REPAIR_SQL = `DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT p.rolname AS n FROM pg_catalog.pg_roles p
+           WHERE p.rolname ~ '^smdb_copy_[0-9a-f]{32}$' AND (p.rolsuper OR p.rolcreatedb OR p.rolcreaterole OR p.rolbypassrls) LOOP
+    EXECUTE pg_catalog.format('ALTER ROLE %I NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS', r.n);
+  END LOOP;
+END $$;
+`;
+
+/** G2: every grantee of add_copy_login but its owner revoked, with what it passed on; a NULL ACL reads as PUBLIC's default. */
+export const FUNCTION_ACL_REPAIR_SQL = `DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT DISTINCT a.grantee FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) a
+           WHERE p.oid = pg_catalog.to_regprocedure('smdb_manager.add_copy_login(text, text)') AND a.grantee <> p.proowner LOOP
+    IF r.grantee = 0 THEN
+      EXECUTE 'REVOKE ALL ON FUNCTION smdb_manager.add_copy_login(text, text) FROM PUBLIC CASCADE';
+    ELSE
+      EXECUTE pg_catalog.format('REVOKE ALL ON FUNCTION smdb_manager.add_copy_login(text, text) FROM %I CASCADE', pg_catalog.pg_get_userbyid(r.grantee));
+    END IF;
+  END LOOP;
+END $$;
+`;
+
+/** 3.3: the group, the minter and the minting function, run by Enable as the superuser on postgres inside its transaction. */
+export const COPY_ROLES_SQL = `DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'smdb_copies') THEN CREATE ROLE smdb_copies NOLOGIN; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'smdb_minter') THEN CREATE ROLE smdb_minter NOLOGIN CREATEROLE REPLICATION; END IF;
+END $$;
+ALTER ROLE smdb_copies NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE smdb_minter NOLOGIN NOSUPERUSER NOCREATEDB CREATEROLE REPLICATION NOBYPASSRLS;
+${MEMBERSHIP_REPAIR_SQL}${SETTINGS_REPAIR_SQL}${LOGIN_RIGHTS_REPAIR_SQL}GRANT smdb_copies TO smdb_minter WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+CREATE SCHEMA IF NOT EXISTS smdb_manager;
+CREATE OR REPLACE FUNCTION smdb_manager.add_copy_login(p_name text, p_verifier text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+BEGIN
+  IF p_name IS NULL OR p_name !~ '^smdb_copy_[0-9a-f]{32}$' THEN
+    RAISE EXCEPTION 'smdb-join: % is not a machine login name', p_name;
+  END IF;
+  IF p_verifier IS NULL OR p_verifier !~ '^SCRAM-SHA-256\\$[0-9]+:[A-Za-z0-9+/=]+\\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$' THEN
+    RAISE EXCEPTION 'smdb-join: the password is not a SCRAM-SHA-256 verifier';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = p_name) THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m
+               WHERE m.member = pg_catalog.to_regrole(p_name) AND m.roleid = pg_catalog.to_regrole('smdb_copies')) THEN
+      RETURN 'exists';
+    END IF;
+    RETURN 'blocked';
+  END IF;
+  IF (SELECT count(*) FROM pg_catalog.pg_roles WHERE rolname ~ '^smdb_copy_') >= 100 THEN
+    RAISE EXCEPTION 'smdb-join: this database already has 100 machine logins; remove the ones no longer used in the main''s Database window';
+  END IF;
+  EXECUTE pg_catalog.format('CREATE ROLE %I LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS INHERIT PASSWORD %L IN ROLE smdb_copies', p_name, p_verifier);
+  RETURN 'created';
+END $f$;
+ALTER FUNCTION smdb_manager.add_copy_login(text, text) OWNER TO smdb_minter;
+${FUNCTION_ACL_REPAIR_SQL}GRANT EXECUTE ON FUNCTION smdb_manager.add_copy_login(text, text) TO smdb_join;
+GRANT USAGE ON SCHEMA smdb_manager TO smdb_join;
+`;
+
+/** 3.3: the join login's statement, CREATE when missing and ALTER when present. */
+export function joinLoginSql(exists: boolean, verifier: string): string {
+  return `${exists ? 'ALTER' : 'CREATE'} ROLE smdb_join LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${verifierOnly(verifier)}';\n`;
+}
+
+/** 3.3: this machine's own login on its main, in the group. */
+export function ownLoginSql(login: string, exists: boolean, verifier: string): string {
+  const name = machineLoginOnly(login);
+  const v = verifierOnly(verifier);
+  return exists
+    ? `ALTER ROLE ${name} LOGIN REPLICATION PASSWORD '${v}';\nGRANT smdb_copies TO ${name};\n`
+    : `CREATE ROLE ${name} LOGIN REPLICATION NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS INHERIT PASSWORD '${v}' IN ROLE smdb_copies;\n`;
+}
+
+/**
+ * G3: Enable's role step without its BEGIN, QUIET_ROLE_SESSION_SQL and COMMIT: the join login first (COPY_ROLES_SQL
+ * grants to it), then COPY_ROLES_SQL, this machine's own login (it needs smdb_copies), then the reopening loop.
+ */
+export function copyRolesStepSql(o: { joinExists: boolean; joinVerifier: string; ownLogin: string; ownExists: boolean; ownVerifier: string }): string {
+  return `${joinLoginSql(o.joinExists, o.joinVerifier)}${COPY_ROLES_SQL}${ownLoginSql(o.ownLogin, o.ownExists, o.ownVerifier)}${copyLoginsLoopSql('LOGIN')}`;
+}
+
+/** 3.3 and 3.6.2: every member of the group opened (Enable) or closed (Disable). */
+export function copyLoginsLoopSql(attr: 'LOGIN' | 'NOLOGIN'): string {
+  return `DO $$ DECLARE r record; BEGIN FOR r IN SELECT m.member::regrole::text AS n FROM pg_catalog.pg_auth_members m WHERE m.roleid = 'smdb_copies'::regrole AND m.member::regrole::text ~ '^smdb_copy_[0-9a-f]{32}$' LOOP EXECUTE pg_catalog.format('ALTER ROLE %I ${attr === 'LOGIN' ? 'LOGIN' : 'NOLOGIN'}', r.n); END LOOP; END $$;\n`;
+}
+
+export const COPY_ROLES_KEYS = ['join-missing', 'join-rights', 'join-member', 'group-missing', 'group-rights', 'minter-missing',
+  'minter-rights', 'minter-grant', 'minter-member', 'login-rights', 'login-member', 'login-admin', 'login-granted', 'group-member',
+  'function-missing', 'function-owner', 'function-acl', 'function-path', 'function-definer', 'role-settings'] as const;
+export type CopyRolesKey = (typeof COPY_ROLES_KEYS)[number];
+
+/** 3.6.4 with C3 and R18: `copyroles|ok`, or the keys of every finding against Invariant L's postgres half, in COPY_ROLES_KEYS order. */
+export const COPY_ROLES_READ_SQL = `WITH f AS (SELECT p.proowner, p.prosecdef, p.proconfig, p.proacl FROM pg_catalog.pg_proc p
+    WHERE p.oid = pg_catalog.to_regprocedure('smdb_manager.add_copy_login(text, text)')),
+  m AS (SELECT pg_catalog.pg_get_userbyid(m.roleid) AS role, pg_catalog.pg_get_userbyid(m.member) AS mem, m.grantor, m.admin_option,
+      m.inherit_option, m.set_option FROM pg_catalog.pg_auth_members m),
+  r AS (SELECT * FROM pg_catalog.pg_roles),
+  k(o, key, hit) AS (VALUES
+    (1, 'join-missing', NOT EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_join')),
+    (2, 'join-rights', EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_join'
+      AND (NOT r.rolcanlogin OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls))),
+    (3, 'join-member', EXISTS (SELECT 1 FROM m WHERE m.mem = 'smdb_join')),
+    (4, 'group-missing', NOT EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_copies')),
+    (5, 'group-rights', EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_copies'
+      AND (r.rolcanlogin OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls))
+      OR EXISTS (SELECT 1 FROM m WHERE m.mem = 'smdb_copies')),
+    (6, 'minter-missing', NOT EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_minter')),
+    (7, 'minter-rights', EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_minter'
+      AND (r.rolcanlogin OR NOT r.rolcreaterole OR NOT r.rolreplication OR r.rolsuper OR r.rolcreatedb OR r.rolbypassrls))),
+    (8, 'minter-grant', EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_minter') AND EXISTS (SELECT 1 FROM r WHERE r.rolname = 'smdb_copies')
+      AND NOT (EXISTS (SELECT 1 FROM m WHERE m.mem = 'smdb_minter' AND m.role = 'smdb_copies' AND m.admin_option
+                       AND NOT m.inherit_option AND NOT m.set_option AND m.grantor = 10)
+               AND (SELECT pg_catalog.count(*) FROM m WHERE m.mem = 'smdb_minter' AND m.role = 'smdb_copies') = 1)),
+    (9, 'minter-member', EXISTS (SELECT 1 FROM m WHERE m.mem = 'smdb_minter' AND m.role <> 'smdb_copies' AND m.role !~ '^smdb_copy_[0-9a-f]{32}$')),
+    (10, 'login-rights', EXISTS (SELECT 1 FROM r WHERE r.rolname ~ '^smdb_copy_[0-9a-f]{32}$'
+      AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls))),
+    (11, 'login-member', EXISTS (SELECT 1 FROM m WHERE m.mem ~ '^smdb_copy_[0-9a-f]{32}$' AND m.role <> 'smdb_copies')),
+    (12, 'login-admin', EXISTS (SELECT 1 FROM m WHERE m.mem ~ '^smdb_copy_[0-9a-f]{32}$' AND m.role = 'smdb_copies' AND m.admin_option)),
+    (13, 'login-granted', EXISTS (SELECT 1 FROM m WHERE m.role ~ '^smdb_copy_[0-9a-f]{32}$' AND m.mem <> 'smdb_minter')),
+    (14, 'group-member', EXISTS (SELECT 1 FROM m WHERE m.role = 'smdb_copies' AND m.mem !~ '^smdb_copy_[0-9a-f]{32}$' AND m.mem <> 'smdb_minter')),
+    (15, 'function-missing', NOT EXISTS (SELECT 1 FROM f)),
+    (16, 'function-owner', EXISTS (SELECT 1 FROM f WHERE f.proowner IS DISTINCT FROM pg_catalog.to_regrole('smdb_minter')::oid)),
+    (17, 'function-acl', EXISTS (SELECT 1 FROM f, pg_catalog.aclexplode(COALESCE(f.proacl, pg_catalog.acldefault('f', f.proowner))) a
+      WHERE a.privilege_type = 'EXECUTE' AND a.grantee <> f.proowner AND a.grantee IS DISTINCT FROM pg_catalog.to_regrole('smdb_join')::oid)),
+    (18, 'function-path', EXISTS (SELECT 1 FROM f WHERE f.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog, pg_temp']::text[])),
+    (19, 'function-definer', EXISTS (SELECT 1 FROM f WHERE NOT f.prosecdef)),
+    (20, 'role-settings', EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s
+      WHERE pg_catalog.pg_get_userbyid(s.setrole) IN ('smdb_join', 'smdb_minter', 'smdb_copies')
+         OR pg_catalog.pg_get_userbyid(s.setrole) ~ '^smdb_copy_[0-9a-f]{32}$')))
+SELECT 'copyroles|' || COALESCE(pg_catalog.string_agg(k.key, ',' ORDER BY k.o), 'ok') FROM k WHERE k.hit;`;
+
+/** The keys of COPY_ROLES_READ_SQL's one line ([] for ok); null for any other answer. */
+export function parseCopyRoles(out: string): CopyRolesKey[] | null {
+  const m = /^copyroles\|([a-z,-]+)$/.exec(out.replace(/\n$/, ''));
+  if (!m) return null;
+  if (m[1] === 'ok') return [];
+  const keys = m[1].split(',');
+  let at = -1;
+  for (const key of keys) {
+    const i = (COPY_ROLES_KEYS as readonly string[]).indexOf(key);
+    if (i <= at) return null;
+    at = i;
+  }
+  return keys as CopyRolesKey[];
+}
+
+/** 3.4 with R10: the address table and the two functions a machine login writes its own row through, run as dbm_meta inside the caller's transaction. */
+export const ADDRESS_DDL_SQL = `CREATE SCHEMA IF NOT EXISTS smdb_manager;
+CREATE TABLE IF NOT EXISTS smdb_manager.addresses (
+  host text NOT NULL, port integer NOT NULL, slot text, cert text NOT NULL, machine text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (host, port));
+CREATE OR REPLACE FUNCTION smdb_manager.set_copy_address(p_host text, p_port integer, p_cert text, p_machine text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE v_login text := session_user; v_slot text; v_n integer; v_holder text;
+BEGIN
+  IF v_login !~ '^smdb_copy_[0-9a-f]{32}$' OR NOT pg_catalog.pg_has_role(v_login, 'smdb_copies', 'MEMBER') THEN
+    RAISE EXCEPTION 'smdb-address: % is not a machine login', v_login;
+  END IF;
+  v_slot := 'fleet_standby_' || pg_catalog.substr(v_login, 11);
+  IF p_host IS NULL OR pg_catalog.length(p_host) > 253 OR p_host !~ '^[A-Za-z0-9][A-Za-z0-9.-]*$' THEN
+    RAISE EXCEPTION 'smdb-address: the host is not a bare hostname or IPv4 address';
+  END IF;
+  IF p_port IS NULL OR p_port < 1 OR p_port > 65535 THEN RAISE EXCEPTION 'smdb-address: the port is not a port number'; END IF;
+  IF p_cert IS NULL OR pg_catalog.octet_length(p_cert) > 65536 OR p_cert !~ '^-----BEGIN CERTIFICATE-----.+-----END CERTIFICATE-----$' THEN
+    RAISE EXCEPTION 'smdb-address: the certificate is not a PEM certificate block';
+  END IF;
+  IF p_machine IS NULL OR p_machine !~ '^[ -~]{1,64}$' THEN RAISE EXCEPTION 'smdb-address: the machine name is not 1 to 64 printable characters'; END IF;
+  IF NOT EXISTS (SELECT 1 FROM smdb_manager.addresses WHERE slot = v_slot)
+     AND (SELECT count(*) FROM smdb_manager.addresses) >= 1000 THEN
+    RAISE EXCEPTION 'smdb-address: the address list already holds 1000 rows';
+  END IF;
+  DELETE FROM smdb_manager.addresses WHERE slot = v_slot AND NOT (host = p_host AND port = p_port);
+  INSERT INTO smdb_manager.addresses AS a (host, port, slot, cert, machine) VALUES (p_host, p_port, v_slot, p_cert, p_machine)
+    ON CONFLICT (host, port) DO UPDATE SET cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = pg_catalog.now()
+    WHERE a.slot = v_slot;
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  IF v_n = 0 THEN
+    SELECT a.slot INTO v_holder FROM smdb_manager.addresses a WHERE a.host = p_host AND a.port = p_port;
+    IF v_holder IS NULL THEN RAISE EXCEPTION 'smdb-address-taken: %:% is listed as the main''s own address', p_host, p_port; END IF;
+    RAISE EXCEPTION 'smdb-address-taken: %:% is listed with the slot %', p_host, p_port, v_holder;
+  END IF;
+END $f$;
+CREATE OR REPLACE FUNCTION smdb_manager.drop_copy_address() RETURNS integer
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $f$
+DECLARE v_n integer;
+BEGIN
+  IF session_user !~ '^smdb_copy_[0-9a-f]{32}$' THEN RAISE EXCEPTION 'smdb-address: % is not a machine login', session_user; END IF;
+  DELETE FROM smdb_manager.addresses WHERE slot = 'fleet_standby_' || pg_catalog.substr(session_user, 11);
+  GET DIAGNOSTICS v_n = ROW_COUNT;
+  RETURN v_n;
+END $f$;
+REVOKE ALL ON FUNCTION smdb_manager.set_copy_address(text, integer, text, text), smdb_manager.drop_copy_address() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION smdb_manager.set_copy_address(text, integer, text, text), smdb_manager.drop_copy_address() TO smdb_copies;
+GRANT USAGE ON SCHEMA smdb_manager TO smdb_copies;
+GRANT SELECT ON smdb_manager.addresses TO smdb_copies, dbm_work;
+`;
+
+/** The main's own row (slot NULL), every other main row taken off first: a database has one main (R10). */
+export function OWN_ADDRESS_SQL(host: string, port: number, certPem: string, machine: string): string {
+  const h = sqlLiteral(host);
+  const p = Number(port);
+  return `DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = ${h} AND port = ${p});
+INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES (${h}, ${p}, NULL, ${sqlLiteral(certPem)}, ${sqlLiteral(machine)})
+  ON CONFLICT (host, port) DO UPDATE SET slot = NULL, cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = now();
+`;
+}
+
+/** The machine logins' group, made when this cluster lacks it, so ADDRESS_DDL_SQL's grants and a dump's apply (3.10). */
+export function copyGroupEnsureSql(): string {
+  return `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'smdb_copies') THEN CREATE ROLE smdb_copies NOLOGIN; END IF; END $$;`;
+}
+
+/** R3 step 1: streams on a machine's slot by any login but that slot's own, as `<slot>|<user>|<pid>`. */
+export const FOREIGN_READ_SQL = `SELECT s.slot_name || '|' || r.usename || '|' || r.pid
+FROM pg_catalog.pg_replication_slots s JOIN pg_catalog.pg_stat_replication r ON r.pid = s.active_pid
+WHERE s.slot_name ~ '^fleet_standby_[0-9a-f]{32}$'
+  AND r.usename IS DISTINCT FROM 'smdb_copy_' || pg_catalog.substr(s.slot_name, 15);`;
+
+export interface ForeignStream { slot: string; user: string; pid: number }
+
+/** FOREIGN_READ_SQL's lines; a non-empty line of another shape is unread. */
+export function parseForeignStreams(out: string): { streams: ForeignStream[]; unread: string[] } {
+  const streams: ForeignStream[] = [];
+  const unread: string[] = [];
+  for (const line of out.split('\n')) {
+    if (line === '') continue;
+    const m = /^(fleet_standby_[0-9a-f]{32})\|([^|]{1,63})\|([0-9]{1,10})$/.exec(line);
+    if (m) streams.push({ slot: m[1], user: m[2], pid: Number(m[3]) });
+    else unread.push(line);
+  }
+  return { streams, unread };
+}
+
+/** R3 step 1b: the stream on a machine's slot ended, the slot dropped once inactive; the last line is `slot|kept` or `slot|dropped`. */
+export function TAINTED_SLOT_SQL(slot: string): string {
+  if (!COPY_SLOT_RE.test(slot)) throw new Error(`${slot} is not a machine's slot name`);
+  return `SELECT pg_catalog.pg_terminate_backend(active_pid, 5000)::text FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND active_pid IS NOT NULL;
+DO $$ BEGIN
+  PERFORM pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;
+EXCEPTION WHEN object_in_use THEN NULL;
+END $$;
+SELECT 'slot|' || coalesce((SELECT 'kept' FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}'), 'dropped');`;
+}
+
+/** R3 step 2: the TCP sessions of machine logins outside the group, ended, as `<login>|<true or false>`. */
+export const BLOCKED_SESSIONS_SQL = `SELECT a.usename || '|' || pg_catalog.pg_terminate_backend(a.pid, 5000)::text
+FROM pg_catalog.pg_stat_activity a
+WHERE a.usename ~ '^smdb_copy_[0-9a-f]{32}$' AND a.client_addr IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = a.usesysid AND m.roleid = pg_catalog.to_regrole('smdb_copies'));`;
+
+/** R3 step 3: the large objects in postgres, counted per owner, then unlinked. */
+export const LOBJ_SWEEP_SQL = `SELECT pg_catalog.pg_get_userbyid(l.lomowner) || '|' || pg_catalog.count(*) FROM pg_catalog.pg_largeobject_metadata l GROUP BY l.lomowner ORDER BY 1;
+SELECT 'unlinked|' || pg_catalog.count(pg_catalog.lo_unlink(l.oid)) FROM pg_catalog.pg_largeobject_metadata l;`;
+
+/** R3 step 4: the members of the group, joined by commas. */
+export const NEW_LOGINS_READ_SQL = "SELECT string_agg(m.member::regrole::text, ',' ORDER BY 1) FROM pg_auth_members m WHERE m.roleid = to_regrole('smdb_copies')";
+
+function settingsRoleOnly(role: string): string {
+  if (role !== JOIN_LOGIN && role !== MINTER && role !== COPY_GROUP && !COPY_LOGIN_RE.test(role)) throw new Error(`${role} is not a role whose settings the manager clears`);
+  return role;
+}
+
+/** R18: every setting of a role, per database and role-wide. */
+export function ROLE_SETTINGS_RESET_SQL(role: string): string {
+  const name = settingsRoleOnly(role);
+  return `DO $$ DECLARE d text; BEGIN
+  FOR d IN SELECT db.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database db ON db.oid = s.setdatabase
+           WHERE s.setrole = pg_catalog.to_regrole('${name}') LOOP
+    EXECUTE pg_catalog.format('ALTER ROLE %I IN DATABASE %I RESET ALL', '${name}', d);
+  END LOOP;
+END $$;
+ALTER ROLE "${name}" RESET ALL;
+`;
+}
+
+/** The first statement after BEGIN of every transaction that writes roles: a lock it waits on fails it after 5 s. */
+export const ROLE_LOCK_LIMIT_SQL = "SET LOCAL lock_timeout = '5s';\n";
+
+/** 3.6.2: Disable closes the join login and every member of the group in one transaction; only smdb_join's sessions are ended. */
+export const DISABLE_CLOSE_SQL = `BEGIN;\n${lockedRoleWriteSql([JOIN_LOGIN])}ALTER ROLE ${JOIN_LOGIN} NOLOGIN;\n${copyLoginsLoopSql('NOLOGIN')}COMMIT;\n`;
+
+/** lockedRoleWriteSql's count of the sessions it ended, from a run's stdout; 0 when the line is absent. */
+export function closedCount(stdout: string): number {
+  const m = /^closed\|(\d+)$/m.exec(stdout);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * Opens a role-writing transaction: a 5 s lock limit, then the sessions of the logins whose role rows it writes ended,
+ * so an open ALTER ROLE of theirs cannot hold the transaction.
+ */
+export function lockedRoleWriteSql(logins: string[]): string {
+  const names = logins.map(l => (l === JOIN_LOGIN ? l : machineLoginOnly(l)));
+  return `${ROLE_LOCK_LIMIT_SQL}SELECT 'closed|' || pg_catalog.count(*) FILTER (WHERE pg_catalog.pg_terminate_backend(a.pid, 5000)) FROM pg_catalog.pg_stat_activity a WHERE a.usename IN (${names.map(n => `'${n}'`).join(', ')}) AND a.pid <> pg_catalog.pg_backend_pid();
+`;
+}
+
+/**
+ * The last statement before a role transaction's COMMIT. psql sends a statement only after the previous one's result
+ * and ON_ERROR_STOP stops it at an error, so its `committing` line shows that COMMIT was sent.
+ */
+export const COMMITTING_SQL = "SELECT 'committing';\n";
+
+/** R4 step 1 with R18 and R31: the login blocked in one transaction, then `blocked|<not a member>|<NOLOGIN>|<no password, no setting>`. */
+export function REMOVE_BLOCK_SQL(login: string): string {
+  const name = machineLoginOnly(login);
+  return `BEGIN;
+${lockedRoleWriteSql([name])}DO $$ DECLARE r record; BEGIN
+  FOR r IN SELECT pg_catalog.pg_get_userbyid(m.grantor) AS g FROM pg_catalog.pg_auth_members m
+           WHERE m.roleid = pg_catalog.to_regrole('smdb_copies') AND m.member = pg_catalog.to_regrole('${name}') LOOP
+    EXECUTE pg_catalog.format('REVOKE smdb_copies FROM %I GRANTED BY %I', '${name}', r.g);
+  END LOOP;
+END $$;
+ALTER ROLE "${name}" NOLOGIN PASSWORD NULL;
+${ROLE_SETTINGS_RESET_SQL(name)}${COMMITTING_SQL}COMMIT;
+SELECT 'blocked|' || (NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = r.oid AND m.roleid = pg_catalog.to_regrole('smdb_copies')))::text
+  || '|' || (NOT r.rolcanlogin)::text
+  || '|' || (r.rolpassword IS NULL AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s WHERE s.setrole = r.oid))::text
+FROM pg_catalog.pg_authid r WHERE r.rolname = '${name}';
+`;
+}
+
+export type BlockAnswer = { state: 'blocked'; clean: boolean } | { state: 'again'; line: string } | { state: 'unconfirmed' } | { state: 'none' };
+
+// The error line psql prints when it stops: a server ERROR, FATAL or PANIC, or psql's own error.
+const PSQL_STOP_LINE = /^psql:[^ ]*: (?:(?:ERROR|FATAL|PANIC):|error:) |^psql: error: /;
+
+/** Whether stderr holds the error line psql prints when it stops. */
+export function hasPsqlStopLine(stderr: string): boolean {
+  return stderr.split('\n').some(l => PSQL_STOP_LINE.test(l));
+}
+
+/**
+ * psql's own word that it stopped before COMMIT was sent: the run failed by itself (not on its time limit), printed
+ * no `committing` line, and its stderr holds psql's error line. Any other run with no result line may have committed.
+ */
+export function stoppedBeforeCommit(stdout: string, run: { ok: boolean; stderr: string; timedOut?: boolean }): boolean {
+  return !run.ok && !run.timedOut && !stdout.split('\n').some(l => l.trim() === 'committing')
+    && hasPsqlStopLine(run.stderr);
+}
+
+/**
+ * R31 and R40: go on when the membership and LOGIN fields are true; another `blocked|` line was undone. Without one,
+ * none when psql stopped before COMMIT (stoppedBeforeCommit), else unconfirmed: the block may have committed.
+ */
+export function parseRemoveBlock(out: string, run: { ok: boolean; stderr: string; timedOut?: boolean } = { ok: true, stderr: '' }): BlockAnswer {
+  const lines = out.split('\n').filter(l => l.startsWith('blocked|'));
+  const line = lines[lines.length - 1];
+  if (line === undefined) return stoppedBeforeCommit(out, run) ? { state: 'none' } : { state: 'unconfirmed' };
+  const m = /^blocked\|true\|true\|(true|false)$/.exec(line);
+  return m ? { state: 'blocked', clean: m[1] === 'true' } : { state: 'again', line };
+}
+
+/** R32: which of smdb_join, smdb_minter, smdb_copies and the machine logins hold session settings, joined by commas. */
+export const SETTINGS_HOLDERS_SQL = `SELECT coalesce(pg_catalog.string_agg(DISTINCT pg_catalog.pg_get_userbyid(s.setrole), ',' ORDER BY pg_catalog.pg_get_userbyid(s.setrole)), '')
+FROM pg_catalog.pg_db_role_setting s
+WHERE pg_catalog.pg_get_userbyid(s.setrole) IN ('smdb_join', 'smdb_minter', 'smdb_copies')
+   OR pg_catalog.pg_get_userbyid(s.setrole) ~ '^smdb_copy_[0-9a-f]{32}$';`;
+
+/** R4: every machine login with its membership, its slot and the client streaming on it, as a JSON list. */
+export const LOGINS_READ_SQL = `SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_object('login', r.rolname,
+  'member', EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = r.oid AND m.roleid = pg_catalog.to_regrole('smdb_copies')),
+  'canLogin', r.rolcanlogin, 'slot', s.slot_name, 'active', s.active, 'walStatus', s.wal_status, 'client', pg_catalog.host(st.client_addr)) ORDER BY r.rolname), '[]')
+FROM pg_catalog.pg_roles r
+LEFT JOIN pg_catalog.pg_replication_slots s ON s.slot_name = 'fleet_standby_' || pg_catalog.substr(r.rolname, 11)
+LEFT JOIN pg_catalog.pg_stat_replication st ON st.pid = s.active_pid
+WHERE r.rolname ~ '^smdb_copy_[0-9a-f]{32}$';`;
 
 /** Whether the old main's host and port are listed as this main's copy, with a slot that exists (D56). */
 export function FORMER_LISTED_SQL(host: string, port: number): string {
@@ -171,7 +606,7 @@ INSERT INTO smdb_manager.receive_mark AS m (one_row, mark_id, push_ids, db_oid, 
 }
 
 export const RECEIVE_MARK_READ_SQL = `SELECT coalesce((SELECT mark_id || '|' || push_ids || '|' || db_oid FROM smdb_manager.receive_mark), '')`;
-export const RECEIVE_MARK_COUNT_SQL = 'SELECT count(*) FROM smdb_manager.receive_mark';
+export const RECEIVE_MARK_COUNT_SQL = 'SELECT pg_catalog.count(*) FROM smdb_manager.receive_mark';
 
 /** The mark removed: only the row of this mark id, or any row when null. Rerun-safe; nothing without the table. */
 export function receiveMarkClearSql(markId: string | null): string {

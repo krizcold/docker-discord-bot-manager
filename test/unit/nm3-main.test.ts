@@ -84,21 +84,21 @@ const dbUrl = 'postgresql://smdb:Db-Secret,%25x@m-fleet-postgres:5432/smdb?sslmo
 const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'm-fleet-postgres-data', password: 'Db-Secret,%x' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'main.invalid', certHost: 'main.invalid', slotWalKeepMb: 4096 };
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
-  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { m: {
-    id: 'm', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
+  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { 'aaaaaaaa-0000-4000-8000-00000000000a': {
+    id: 'aaaaaaaa-0000-4000-8000-00000000000a', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...extra,
   } } }));
 };
-const bot = () => containerManager.getBot('m')!;
+const bot = () => containerManager.getBot('aaaaaaaa-0000-4000-8000-00000000000a')!;
 const stmtIndex = (needle: string) => h.sql.findIndex(s => s.includes(needle));
 
 beforeEach(() => {
   h.sql = []; h.running = 'true'; h.cert = FIXTURE_PEM; h.fail = ''; h.slots = ''; h.addresses = '[]';
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
-  fs.mkdirSync(path.join(h.dir, 'bots', 'm', 'env'), { recursive: true });
+  fs.mkdirSync(path.join(h.dir, 'bots', 'aaaaaaaa-0000-4000-8000-00000000000a', 'env'), { recursive: true });
   writeRegistry({ fleetDb: { ...fleetDb, replication } });
-  envManager.setEnvVars('m', { DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('aaaaaaaa-0000-4000-8000-00000000000a', { DATA_BACKEND_URL: dbUrl });
 });
 afterAll(() => fs.rmSync(h.dir, { recursive: true, force: true }));
 
@@ -109,7 +109,7 @@ describe('O1: the join code (C1 to C7)', () => {
     const d = decodeJoinCode(r.joinCode!);
     expect(d).toEqual({ ok: true, code: {
       v: 1, host: 'main.invalid', port: 15432, db: 'smdb', fp: FIXTURE_FP, machine: 'main.invalid',
-      repl: { user: 'replicator', password: 'Repl-Secret-0123456789' }, app: { user: 'smdb', password: 'Db-Secret,%x' },
+      repl: { user: 'smdb_join', password: 'Repl-Secret-0123456789' }, app: { user: 'smdb', password: 'Db-Secret,%x' },
     } });
   });
 
@@ -119,9 +119,9 @@ describe('O1: the join code (C1 to C7)', () => {
 
   it.each([
     ['T-1 replication off', () => writeRegistry({ fleetDb }), 'Replication is not enabled, so there is no join code.'],
-    ['T-2 an unfinished Disable', () => writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, disablingSince: '2026-10-25T00:00:00.000Z' } } }), 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it'],
+    ['T-2 an unfinished Disable', () => writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, disablingSince: '2026-10-25T00:00:00.000Z' } } }), "A Disable of replication did not finish, so the join login and the machines' logins may already be closed: press Disable replication to finish it"],
     ['T-4 the database is stopped', () => { h.running = 'false'; }, 'The database container is not running, so its certificate cannot be read for the join code'],
-    ['T-6 no app password (NM14 JC-ABSENT)', () => { writeRegistry({ fleetDb: { ...fleetDb, password: undefined, replication } }); envManager.setEnvVars('m', { DATA_BACKEND_URL: '' }); }, "The managed database's password is not on record (the Database URL holds no password to check), so no join code was made"],
+    ['T-6 no app password (NM14 JC-ABSENT)', () => { writeRegistry({ fleetDb: { ...fleetDb, password: undefined, replication } }); envManager.setEnvVars('aaaaaaaa-0000-4000-8000-00000000000a', { DATA_BACKEND_URL: '' }); }, "The managed database's password is not on record (the Database URL holds no password to check), so no join code was made"],
   ])('C1, C4, C6: %s', async (_n, arrange, error) => {
     arrange();
     expect(await getJoinCode(bot())).toEqual({ success: false, error });
@@ -130,7 +130,7 @@ describe('O1: the join code (C1 to C7)', () => {
   it('T-3: a password that no longer decrypts', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication: { ...replication, password: '' } } });
     const r = await getJoinCode(bot());
-    expect(r.error).toBe('The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to make a new one; every other machine then needs the new join code.');
+    expect(r.error).toBe('The stored join password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or press New join code to make a new one; machines that joined keep their own logins.');
   });
 
   it('C5 / T-5: an unreadable certificate names the reason', async () => {
@@ -148,22 +148,22 @@ describe('O2: Enable resets synchronous replication and writes the address list 
     const keep = stmtIndex('max_slot_wal_keep_size');
     const reset = stmtIndex('ALTER SYSTEM RESET synchronous_standby_names');
     const reload = stmtIndex('pg_reload_conf');
-    const addresses = stmtIndex('CREATE SCHEMA IF NOT EXISTS smdb_manager');
+    const addresses = stmtIndex('CREATE TABLE IF NOT EXISTS smdb_manager.addresses');
     expect(keep).toBeGreaterThanOrEqual(0);
     expect(reset).toBeGreaterThan(keep);
     expect(reload).toBeGreaterThan(reset);
     expect(addresses).toBeGreaterThan(reload);
     const script = h.sql[addresses];
-    expect(script).toContain('GRANT SELECT, INSERT, UPDATE, DELETE ON smdb_manager.addresses TO replicator');
+    expect(script).toContain('GRANT SELECT ON smdb_manager.addresses TO smdb_copies, dbm_work;');
     expect(script).toContain("VALUES ('main.invalid', 15432, NULL, '-----BEGIN CERTIFICATE-----");
-    expect(script).not.toContain('DELETE FROM smdb_manager.addresses');
+    expect(script).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = 'main.invalid' AND port = 15432);");
   });
 
   it('C13: a moved host or port deletes the old own row in the same script', async () => {
     await enableFleetReplication(bot(), 'new.invalid', 15440);
-    const script = h.sql[stmtIndex('CREATE SCHEMA IF NOT EXISTS smdb_manager')];
-    expect(script).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = 'main.invalid' AND port = 15432;");
-    expect(script.indexOf('DELETE FROM')).toBeLessThan(script.indexOf('INSERT INTO'));
+    const script = h.sql[stmtIndex('CREATE TABLE IF NOT EXISTS smdb_manager.addresses')];
+    expect(script).toContain("DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND NOT (host = 'new.invalid' AND port = 15440);");
+    expect(script.lastIndexOf('DELETE FROM smdb_manager.addresses WHERE slot IS NULL')).toBeLessThan(script.lastIndexOf('INSERT INTO smdb_manager.addresses (host'));
   });
 
   it('C8: a refused reset fails and leaves the record as it was', async () => {
@@ -176,7 +176,7 @@ describe('O2: Enable resets synchronous replication and writes the address list 
   });
 
   it('C11: a refused address script fails and leaves the record unwritten', async () => {
-    h.fail = 'CREATE SCHEMA IF NOT EXISTS smdb_manager';
+    h.fail = 'CREATE TABLE IF NOT EXISTS smdb_manager.addresses';
     const before = JSON.stringify(bot().fleetDb);
     const r = await enableFleetReplication(bot(), 'new.invalid', 15440);
     expect(r.success).toBe(false);

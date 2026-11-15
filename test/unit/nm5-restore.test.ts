@@ -526,15 +526,15 @@ describe('S18 to S20: the copies of a moved- restore, and an unfinished push (D4
   });
 });
 
-describe('S21, S22 (D59): step 7 makes sure the replication role exists before the drop', () => {
-  it('S21: the recreate runs the role ensure as its first -c, in the exempt session, before DROP DATABASE', async () => {
+describe('S21, S22 (D59, NM22 3.10): step 7 makes sure the group smdb_copies exists before the drop', () => {
+  it('S21: the recreate runs the group ensure as its first -c, in the exempt session, before DROP DATABASE', async () => {
     const r = await restore();
     expect(r.success).toBe(true);
     const args = claimDb.recreateArgs!;
     expect(args).not.toBeNull();
     expect(args.slice(0, 3)).toEqual(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off']);
     const cs = args.flatMap((a, i) => (a === '-c' ? [args[i + 1]] : []));
-    expect(cs[0]).toBe("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'replicator') THEN CREATE ROLE replicator NOLOGIN REPLICATION; END IF; END $$;");
+    expect(cs[0]).toBe("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'smdb_copies') THEN CREATE ROLE smdb_copies NOLOGIN; END IF; END $$;");
     expect(cs[1]).toMatch(/^DROP DATABASE IF EXISTS "app" WITH \(FORCE\)$/);
   });
   it('S22: the ensure fails: ON_ERROR_STOP ends the call before the DROP; the recreate failure keeps the notice and the fence', async () => {

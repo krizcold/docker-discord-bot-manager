@@ -26,16 +26,19 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import * as crypto from 'crypto';
-import { InstanceConfig, FleetDbReplication } from '../types';
+import { InstanceConfig, FleetDbReplication, MachineLoginStatus } from '../types';
 import { QUIET_ROLE_SESSION_SQL, childFailureText, probeErrorTail, redactSecrets, scramSha256Verifier, urlPassword, verifierAccepts } from '../config/secretText';
 import { feedStdin } from '../docker/childStdin';
 import * as fleetBackupGuards from './fleetBackupGuards';
 import * as dbLogin from './dbLogin';
-import { certFingerprint, encodeJoinCode, machineText, splitBackendUrls, sqlLiteral } from '../config/joinCode';
+import { certFingerprint, encodeJoinCode, machineText, splitBackendUrls } from '../config/joinCode';
 import { AddressesOutcome, sendAddresses } from './fleetJoin';
 import { hasHostParam, namesDatabaseOf, readDatabaseUrl, URL_FORM } from '../config/databaseUrl';
+import {
+  ADDRESS_DDL_SQL, COMMITTING_SQL, COPY_GROUP, COPY_LOGIN_RE, COPY_ROLES_READ_SQL, JOIN_LOGIN, LOGINS_READ_SQL, OWN_ADDRESS_SQL, REMOVE_BLOCK_SQL,
+  DISABLE_CLOSE_SQL, ROLE_LOCK_LIMIT_SQL, ROLE_SETTINGS_RESET_SQL, SETTINGS_HOLDERS_SQL, closedCount, copyLogin, copyLoginsLoopSql, lockedRoleWriteSql, copyRolesStepSql, copySlot, parseCopyRoles, hasPsqlStopLine, parseRemoveBlock, stoppedBeforeCommit,
+} from './switchSql';
 
-export const REPLICATION_ROLE = 'replicator';
 /** Every fleet standby's slot begins with this; the standby's manager appends its instance id (20.19 F1/F2). */
 const FLEET_SLOT_PREFIX = 'fleet_standby';
 const DEFAULT_HOST_PORT = 15432;
@@ -52,19 +55,22 @@ const EXEC_TIMEOUT_MS = 30_000;
 // scram. First match wins. keptPlain holds the addresses outside 172.16/12 that
 // a running bot on a custom address pool may still dial its old URL from: they
 // keep non-TLS access until a start finds none of them connected that way
-// (narrowKeptPlainHba).
-export function pgHbaContent(keptPlain: string[] = []): string {
+// (narrowKeptPlainHba). The join login reaches only the postgres database, and no
+// machine login reaches template1 (R2); only machine logins replicate.
+export function pgHbaContent(db: string, keptPlain: string[] = []): string {
   const kept = keptPlain.map(addr => {
     const cidr = `${addr}/${addr.includes(':') ? 128 : 32}`;
     return `host    all             all             ${cidr.padEnd(24)}scram-sha-256\n`;
   }).join('');
   return `# Managed by discord-bot-manager (replication posture). Do not edit.
 local   all             all                                     trust
+host    template1       ${JOIN_LOGIN},+${COPY_GROUP}  all             reject
+host    ${`"${db}"`.padEnd(15)} ${JOIN_LOGIN}               all             reject
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 host    all             all             172.16.0.0/12           scram-sha-256
 ${kept}hostssl all             all             0.0.0.0/0               scram-sha-256
-hostssl replication     all             0.0.0.0/0               scram-sha-256
+hostssl replication     +${COPY_GROUP}    0.0.0.0/0               scram-sha-256
 `;
 }
 
@@ -529,6 +535,16 @@ async function enableInLane(
   if (collision) {
     return { success: false, error: `Host port ${port} is already used by "${collision.displayName}" - pick another` };
   }
+  const ownLogin = copyLogin(instance.id);
+  let ownPassword = instance.fleetLogin?.password || '';
+  if (!ownPassword) {
+    ownPassword = crypto.randomBytes(24).toString('base64url');
+    try {
+      containerManager.updateInstanceFleetLogin(instance.id, { password: ownPassword });
+    } catch (err) {
+      return { success: false, error: `The password of this machine's own login could not be saved (${err instanceof Error ? err.message : String(err)}); replication was not set up` };
+    }
+  }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'Database container is not running (start the instance first)') };
@@ -557,12 +573,8 @@ async function enableInLane(
   }
   const refusedAgain = rolesRefusal(await confirmedAfterFill(instance));
   if (refusedAgain) return refusedAgain;
-  // An existing posture whose password reads empty is a key-loss scrub, not an
-  // absent credential: minting a fresh one here would silently rotate the
-  // fleet's replication credential and break every standby at its next
-  // reconnect.
   if (fleetDb.replication && !fleetDb.replication.password) {
-    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable replication and re-enable it to mint a fresh credential (existing standbys must then be re-seeded).' };
+    return { success: false, error: 'The stored join password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or press New join code to make a new one (machines that joined keep their own logins), then press Enable replication again.' };
   }
   const recordAtStart = fleetDbShape(fleetDb);
 
@@ -589,16 +601,32 @@ async function enableInLane(
   });
 
   const password = instance.fleetDb?.replication?.password || crypto.randomBytes(24).toString('base64url');
-  const exists = await clusterSql(fleetDb.containerName, `SELECT count(*) FROM pg_roles WHERE rolname = '${REPLICATION_ROLE}';`);
-  if (!exists.ok) return failed(`database setup failed: ${exists.stderr.trim()}`);
-  // The verifier, never the password, and outside a DO block: a failing
-  // statement inside one is echoed whole in the CONTEXT line, which the
-  // quiet session settings do not hold back.
+  const rolesFailed = (reason: string) => failed(`setting up the machine logins failed: ${reason}`);
+  const roleExists = async (name: string): Promise<boolean | string> => {
+    const read = await clusterSql(fleetDb.containerName, `SELECT count(*) FROM pg_roles WHERE rolname = '${name}';`);
+    return read.ok ? read.stdout.trim() !== '0' : sqlReason(read.stderr);
+  };
+  const joinExists = await roleExists(JOIN_LOGIN);
+  if (typeof joinExists === 'string') return rolesFailed(joinExists);
+  const ownExists = await roleExists(ownLogin);
+  if (typeof ownExists === 'string') return rolesFailed(ownExists);
+  // Verifiers, never passwords, and outside a DO block: a failing statement
+  // inside one is echoed whole in the CONTEXT line, which the quiet session
+  // settings do not hold back.
   const verifier = scramSha256Verifier(password);
-  const verb = exists.stdout.trim() === '0' ? 'CREATE' : 'ALTER';
-  const setup = await clusterSql(fleetDb.containerName,
-    `${QUIET_ROLE_SESSION_SQL}${verb} ROLE ${REPLICATION_ROLE} WITH REPLICATION LOGIN PASSWORD '${verifier}';\n`, true);
-  if (!setup.ok) return failed(`database setup failed: ${redactSecrets(setup.stderr.trim(), [password, verifier])}`);
+  const ownVerifier = scramSha256Verifier(ownPassword);
+  const secrets = [password, verifier, ownPassword, ownVerifier];
+  let roleStep: string;
+  try {
+    roleStep = enableRoleStepSql({ joinExists, joinVerifier: verifier, ownLogin, ownExists, ownVerifier });
+  } catch (err) {
+    return rolesFailed(err instanceof Error ? err.message : String(err));
+  }
+  const setup = await clusterSql(fleetDb.containerName, roleStep, true);
+  if (!setup.ok && setup.timedOut) {
+    return failed(`the manager can't confirm whether the machine logins were set up: the database did not answer within ${dbLogin.PSQL_TIMEOUT_MS / 1000} s, and the change may still be applied there; press Enable replication again`);
+  }
+  if (!setup.ok) return rolesFailed(redactSecrets(sqlReason(setup.stderr), secrets));
   // Separate calls: ALTER SYSTEM refuses to run inside the implicit transaction
   // a multi-statement psql -c wraps around its input.
   const ssl = await clusterSql(fleetDb.containerName, 'ALTER SYSTEM SET ssl = on;');
@@ -614,20 +642,18 @@ async function enableInLane(
 
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
-    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(fleetDb.db, plain.addrs));
   if (!hba.ok) return failed(`pg_hba rewrite failed: ${hba.stderr.trim()}`);
   const reload = await clusterSql(fleetDb.containerName, 'SELECT pg_reload_conf();');
   if (!reload.ok) return failed(`config reload failed: ${reload.stderr.trim()}`);
 
   const ownCert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
   if (!ownCert.ok) return failed(`setting up the address list failed: the server certificate could not be read (${probeErrorTail(ownCert.stderr)})`);
-  const previous = fleetDb.replication;
-  const moved = previous && (previous.publicHost !== host || previous.hostPort !== port) ? { host: previous.publicHost, port: previous.hostPort } : null;
-  const addresses = await metaSql(fleetDb.containerName, fleetDb.db, addressTableSql(host, port, ownCert.stdout.trim(), machineText(host), moved), true);
+  const addresses = await metaSql(fleetDb.containerName, fleetDb.db, `BEGIN;\n${addressTableSql(host, port, ownCert.stdout.trim(), machineText(host))}COMMIT;\n`, true);
   if (!addresses.ok) return failed(`setting up the address list failed: ${redactSecrets(addresses.stderr.trim(), [password])}`);
 
   const replication: FleetDbReplication = {
-    role: REPLICATION_ROLE,
+    role: JOIN_LOGIN,
     password,
     hostPort: port,
     publicHost: host,
@@ -641,7 +667,7 @@ async function enableInLane(
   // includes this instance's own bot). TLS on it too (ssl=on just activated): the authored pg_hba
   // accepts non-TLS only from 172.16/12, and a docker daemon with custom
   // address pools allocates outside it; hostssl covers every subnet.
-  const changed = `the database already has the replication role, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
+  const changed = `the database already has the join login, this machine's own login, ssl, the WAL settings, the server certificate${certRotated ? ' (a new one)' : ''} and the managed pg_hba`;
   if (fleetDbShape(containerManager.getBot(instance.id)?.fleetDb) !== recordAtStart) {
     return { success: false, certRotated, error: `The instance's database record changed while this Enable ran, so the record and the database URL were not written; ${changed}. Check the Replication section, then press Enable again` };
   }
@@ -664,7 +690,7 @@ async function enableInLane(
  * Disable: refuse while any fleet standby still streams (naming its slots),
  * drop every inactive fleet slot FIRST (a leaked slot retains WAL until the
  * disk fills, so a disable that cannot drop them refuses and keeps the record),
- * revoke the replication login (the port may stay published until the next
+ * close the join login and every machine login (the port may stay published until the next
  * restart, and a seed against a disabled primary must fail at the login), then
  * drop the record and revert the URL to the private sidecar form. Cert, ssl=on
  * and pg_hba stay in PGDATA; the non-TLS lines an Enable kept move to the
@@ -721,14 +747,15 @@ async function disableInLane(
     return { success: false, error: `Standbys are still streaming on slot(s) ${streaming.stdout.trim()}; stop or remove them first (nothing was disabled)` };
   }
   // A seed's base backup and a stream without a slot hold no active slot,
-  // and revoking the login would cut them off mid-copy.
+  // and closing the logins would cut them off mid-copy. A blocked login's
+  // stream counts too: it is outside the group but still open (R4).
   const senders = await clusterSql(fleetDb.containerName,
-    `SELECT COALESCE(string_agg(COALESCE(host(client_addr), 'a local socket'), ', ' ORDER BY client_addr), '') FROM pg_stat_replication WHERE usename = '${REPLICATION_ROLE}';`);
+    `SELECT COALESCE(string_agg(COALESCE(host(r.client_addr), 'a local socket'), ', ' ORDER BY r.client_addr), '') FROM pg_stat_replication r WHERE r.usename ~ '^smdb_copy_[0-9a-f]{32}$' OR EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m WHERE m.member = r.usesysid AND m.roleid = pg_catalog.to_regrole('${COPY_GROUP}'));`);
   if (!senders.ok) {
     return { success: false, error: `could not read the replication connections (nothing was disabled): ${senders.stderr.trim()}` };
   }
   if (senders.stdout.trim() !== '') {
-    return { success: false, error: `Replication connections of the ${REPLICATION_ROLE} role are open from ${senders.stdout.trim()} (a standby streaming without a slot, or a seed copying the database); stop or remove them first (nothing was disabled)` };
+    return { success: false, error: `Machine logins have replication connections open from ${senders.stdout.trim()} (a standby streaming without a slot, or a seed copying the database); stop or remove them first (nothing was disabled)` };
   }
   // Every refusal above changed nothing. From here on each step changes the
   // database, so the record says a Disable is under way until it finishes:
@@ -774,13 +801,17 @@ async function disableInLane(
   if (left.stdout.trim() !== '') {
     return { success: false, error: `Slot(s) ${left.stdout.trim()} survived the drop (a standby reconnected while it ran); stop or remove the standbys, then press Disable replication again to finish it` };
   }
-  const revoke = await clusterSql(fleetDb.containerName, `ALTER ROLE ${REPLICATION_ROLE} NOLOGIN;`);
+  const revoke = await clusterSql(fleetDb.containerName, DISABLE_CLOSE_SQL, true);
+  const joinEnded = (n: number) => (n === 0 ? '' : n === 1 ? `; ${JOIN_LOGIN}'s open session was ended` : `; ${JOIN_LOGIN}'s ${n} open sessions were ended`);
+  if (!revoke.ok && revoke.timedOut) {
+    return { success: false, error: `the manager can't confirm whether the join login and the machine logins were closed: the database did not answer within ${dbLogin.PSQL_TIMEOUT_MS / 1000} s, and the change may still be applied there (the slots are dropped); press Disable replication again to finish it` };
+  }
   if (!revoke.ok) {
-    return { success: false, error: `revoking the replication login failed (the slots are dropped; retry to finish disabling): ${revoke.stderr.trim()}` };
+    return { success: false, error: `revoking the join login and the machine logins failed (the slots are dropped; retry to finish disabling): ${sqlReason(revoke.stderr)}${joinEnded(closedCount(revoke.stdout))}` };
   }
 
   if (fleetDbShape(containerManager.getBot(instance.id)?.fleetDb) !== markedRecord) {
-    return { success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the replication login is revoked. Check the Replication section, then press Disable replication again to finish it" };
+    return { success: false, error: "The instance's database record changed while this Disable ran, so the record and the database URL were not written; the slots are dropped and the join login and the machines' logins are closed. Check the Replication section, then press Disable replication again to finish it" };
   }
   // ssl=on and the authored pg_hba survive the disable, so the local form
   // keeps TLS (see the enable-side note on custom address pools).
@@ -796,7 +827,7 @@ async function disableInLane(
   } catch (err) {
     // The disabling mark stays on the record, so the card shows the Disable as unfinished.
     forgetProbes(instance.id);
-    return { success: false, error: `Replication is off on the database (the slots are dropped and the replication login is revoked), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
+    return { success: false, error: `Replication is off on the database (the slots are dropped and the join login and the machines' logins are closed), but the database URL or the replication record could not be saved (${err instanceof Error ? err.message : String(err)}); press Disable replication again to finish it` };
   }
   forgetProbes(instance.id);
   return { success: true, restartRequired: true, ...plainKept, addresses: await sendAddresses(instance.id), ...(keptAtWrite ? { urlKept: keptAtWrite } : {}) };
@@ -821,7 +852,7 @@ export async function narrowKeptPlainHba(botId: string): Promise<string | null> 
   const plain = { addrs: live.addrs.filter(a => keptPlain.includes(a)) };
   const hbaFile = `${PGDATA}/pg_hba.conf`;
   const hba = await dbExec(fleetDb.containerName, ['sh', '-c',
-    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(plain.addrs));
+    `cat > ${hbaFile}.new && chown postgres:postgres ${hbaFile}.new && chmod 600 ${hbaFile}.new && mv -f ${hbaFile}.new ${hbaFile}`], pgHbaContent(fleetDb.db, plain.addrs));
   if (!hba.ok) return `Could not rewrite pg_hba (${hba.stderr.trim()}), so ${notNarrowed}`;
   const reload = await clusterSql(fleetDb.containerName, 'SELECT pg_reload_conf();');
   if (!reload.ok) return `pg_hba was rewritten but the reload failed (${reload.stderr.trim()}); the database applies it at its next reload or restart`;
@@ -859,6 +890,8 @@ export interface FleetReplicationStatus {
     slots: Array<{ slot: string; fleet: boolean; walStatus: string; active: boolean; retainedBytes: number | null; clientAddr: string | null; state: string | null; replayLagSeconds: number | null; behindBytes: number | null; machine: string | null; address: string | null }>;
     /** Live max_slot_wal_keep_size as postgres reports it ('-1' = unbounded, pre-RC-1 clusters). */
     slotWalKeep: string;
+    /** Every machine login on this main (LOGINS_READ_SQL); absent when the read failed. */
+    logins?: MachineLoginStatus[];
   };
   /** Can a container on the default bridge reach the published endpoint (the
    * path a node on another host dials)? Catches firewall traps before
@@ -980,19 +1013,25 @@ export async function getFleetReplicationStatus(
       }
     } catch { /* no slots */ }
     const listed = await metaSql(fleetDb.containerName, fleetDb.db, ADDRESS_BY_SLOT_SQL);
+    let rows: unknown[] = [];
     if (listed.ok) {
       try {
-        const rows = JSON.parse(listed.stdout.trim() || '[]');
-        for (const slot of slots) {
-          const row = Array.isArray(rows) ? rows.find((r: any) => r && r.slot === slot.slot) : null;
-          if (row) {
-            slot.machine = String(row.machine || '');
-            slot.address = `${row.host}:${row.port}`;
-          }
-        }
+        const parsed = JSON.parse(listed.stdout.trim() || '[]');
+        if (Array.isArray(parsed)) rows = parsed;
       } catch { /* no machine names */ }
     }
+    const rowOf = (slot: string): any => rows.find((r: any) => r && r.slot === slot) ?? null;
+    for (const slot of slots) {
+      const row = rowOf(slot.slot);
+      if (row) {
+        slot.machine = String(row.machine || '');
+        slot.address = `${row.host}:${row.port}`;
+      }
+    }
     status.live = { sslOn: sslOn === 'on', standbys, slots, slotWalKeep: (slotWalKeep || '').trim() };
+    const logins = await clusterSql(fleetDb.containerName, LOGINS_READ_SQL);
+    const parsedLogins = logins.ok ? parseLogins(logins.stdout, copyLogin(instance.id), rowOf) : null;
+    if (parsedLogins) status.live.logins = parsedLogins;
   } else {
     status.probeError = probeErrorTail(probe.stderr);
   }
@@ -1038,19 +1077,9 @@ const ADDRESS_BY_SLOT_SQL = `SELECT CASE WHEN to_regclass('smdb_manager.addresse
   (SELECT COALESCE(json_agg(json_build_object('slot', slot, 'machine', machine, 'host', host, 'port', port)), '[]'::json)
    FROM smdb_manager.addresses WHERE slot IS NOT NULL) END;`;
 
-/** Enable's address list script, run as the superuser on stdin: the table, the replication login's grants, and this main's own row. */
-export function addressTableSql(host: string, port: number, certPem: string, machine: string, moved: { host: string; port: number } | null): string {
-  const drop = moved ? `DELETE FROM smdb_manager.addresses WHERE slot IS NULL AND host = ${sqlLiteral(moved.host)} AND port = ${Number(moved.port)};\n` : '';
-  return `CREATE SCHEMA IF NOT EXISTS smdb_manager;
-CREATE TABLE IF NOT EXISTS smdb_manager.addresses (
-  host text NOT NULL, port integer NOT NULL, slot text, cert text NOT NULL, machine text NOT NULL,
-  updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (host, port));
-GRANT USAGE ON SCHEMA smdb_manager TO ${REPLICATION_ROLE};
-GRANT SELECT, INSERT, UPDATE, DELETE ON smdb_manager.addresses TO ${REPLICATION_ROLE};
-GRANT SELECT ON smdb_manager.addresses TO ${dbLogin.WORK_LOGIN};
-${drop}INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALUES (${sqlLiteral(host)}, ${Number(port)}, NULL, ${sqlLiteral(certPem)}, ${sqlLiteral(machine)})
-  ON CONFLICT (host, port) DO UPDATE SET slot = NULL, cert = EXCLUDED.cert, machine = EXCLUDED.machine, updated_at = now();
-`;
+/** The address list as dbm_meta inside the caller's transaction: the table, the two functions machine logins write through, and this main's own row. */
+export function addressTableSql(host: string, port: number, certPem: string, machine: string): string {
+  return `${ADDRESS_DDL_SQL}${OWN_ADDRESS_SQL(host, port, certPem, machine)}`;
 }
 
 /**
@@ -1059,20 +1088,12 @@ ${drop}INSERT INTO smdb_manager.addresses (host, port, slot, cert, machine) VALU
  * While the database waits for a push or a push left it unfinished, nothing is provisioned (a push makes
  * smdb_manager itself): Receive's own code is made without it, and any other caller is refused.
  */
-export async function getJoinCode(instance: InstanceConfig, opts: { forReceive?: boolean } = {}): Promise<{ success: boolean; error?: string; joinCode?: string }> {
+export async function getJoinCode(instance: InstanceConfig, opts: { forReceive?: boolean } = {}): Promise<{ success: boolean; error?: string; joinCode?: string; note?: string }> {
   const fleetDb = instance.fleetDb;
   const repl = fleetDb?.replication;
-  if (!fleetDb || !repl) return { success: false, error: 'Replication is not enabled, so there is no join code.' };
+  const refused = joinCodeRefusal(fleetDb, { renew: false, forReceive: opts.forReceive });
+  if (refused || !fleetDb || !repl) return { success: false, error: refused ?? 'Replication is not enabled, so there is no join code.' };
   const pushPending = !!(fleetDb.receive || fleetDb.pushBroken);
-  if (pushPending && !opts.forReceive) {
-    return { success: false, error: fleetDb.receive
-      ? 'This machine is receiving a bot; make the join code after the push ends (nothing was changed)'
-      : `A push into this database did not finish; restore the dump ${fleetDb.pushBroken!.safetyDump} or receive a push again, then make the join code (nothing was changed)` };
-  }
-  if (repl.disablingSince) return { success: false, error: 'A Disable of replication did not finish, so the replication login may already be revoked: press Disable replication to finish it' };
-  if (!repl.password) {
-    return { success: false, error: 'The stored replication password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or disable and re-enable replication to make a new one; every other machine then needs the new join code.' };
-  }
   const dbState = await containerState(fleetDb.containerName);
   if (dbState.running !== true) {
     return { success: false, error: dbDownText(dbState, 'The database container is not running, so its certificate cannot be read for the join code') };
@@ -1083,6 +1104,18 @@ export async function getJoinCode(instance: InstanceConfig, opts: { forReceive?:
   const roles = pushPending ? await adminPasswordRefusal(instance) : await provisionManagedRoles(instance, { reread: true });
   const refusedRoles = rolesRefusal(roles);
   if (refusedRoles) return refusedRoles;
+  const copyRoles = await clusterSql(fleetDb.containerName, COPY_ROLES_READ_SQL);
+  if (!copyRoles.ok) return { success: false, error: `The logins that machines get with the join code could not be checked (${sqlReason(copyRoles.stderr)}), so no join code was made` };
+  const keys = parseCopyRoles(copyRoles.stdout);
+  if (!keys || keys.some(k => k !== 'role-settings')) {
+    const found = keys ? keys.join(', ') : copyRoles.stdout.trim().slice(0, 200);
+    return { success: false, error: `The logins that machines get with the join code are not set up as the manager needs (${found}), so no join code was made; press Enable replication to set them up again` };
+  }
+  let note: string | undefined;
+  if (keys.includes('role-settings')) {
+    const holders = await clusterSql(fleetDb.containerName, SETTINGS_HOLDERS_SQL);
+    note = settingsNote(instance, holders.ok ? holders.stdout.trim() : null);
+  }
   const cert = await dbExec(fleetDb.containerName, ['cat', `${PGDATA}/server.crt`]);
   if (!cert.ok) return { success: false, error: `The database's certificate could not be read, so no join code was made: ${probeErrorTail(cert.stderr)}` };
   let fp: string;
@@ -1109,10 +1142,343 @@ export async function getJoinCode(instance: InstanceConfig, opts: { forReceive?:
     db: fleetDb.db,
     fp,
     machine: machineText(repl.publicHost),
-    repl: { user: repl.role, password: repl.password },
+    repl: { user: JOIN_LOGIN, password: repl.password },
     app: { user: fleetDb.user, password: appPassword },
   });
-  return { success: true, joinCode };
+  return { success: true, joinCode, ...(note ? { note } : {}) };
+}
+
+/** getJoinCode's and New join code's refusals from the record; the lost join password refuses a code but not its renewal (R23). */
+export function joinCodeRefusal(fleetDb: InstanceConfig['fleetDb'], opts: { renew: boolean; forReceive?: boolean }): string | null {
+  const repl = fleetDb?.replication;
+  if (!fleetDb || !repl) return 'Replication is not enabled, so there is no join code.';
+  if ((fleetDb.receive || fleetDb.pushBroken) && !opts.forReceive) {
+    return fleetDb.receive
+      ? 'This machine is receiving a bot; make the join code after the push ends (nothing was changed)'
+      : `A push into this database did not finish; restore the dump ${fleetDb.pushBroken!.safetyDump} or receive a push again, then make the join code (nothing was changed)`;
+  }
+  if (repl.disablingSince) return "A Disable of replication did not finish, so the join login and the machines' logins may already be closed: press Disable replication to finish it";
+  if (!opts.renew && !repl.password) {
+    return 'The stored join password no longer decrypts (the manager encryption key changed or was lost). Restore the key, or press New join code to make a new one; machines that joined keep their own logins.';
+  }
+  return null;
+}
+
+/** Enable's role step as one transaction under the 5 s lock limit; it ends no session, since it writes every machine's login. */
+export function enableRoleStepSql(o: Parameters<typeof copyRolesStepSql>[0]): string {
+  return `BEGIN;\n${ROLE_LOCK_LIMIT_SQL}${QUIET_ROLE_SESSION_SQL}${copyRolesStepSql(o)}COMMIT;\n`;
+}
+
+/** A database of this machine's lineage that still holds this machine's own login's password: New join code keeps it then (R25). */
+function ownPasswordHolder(instance: InstanceConfig): string | null {
+  const fleetDb = instance.fleetDb;
+  const handover = fleetDb?.handover?.mode === 'stream' ? fleetDb.handover.machine : undefined;
+  return fleetDb?.replacedBy?.machine ?? fleetDb?.mainConflict?.machine ?? fleetDb?.formerMain?.machine ?? handover ?? null;
+}
+
+/** Whether the main's tick runs its machine-login steps on this database, the blocked logins' sessions among them (3.8). */
+export function machineLoginsTickRuns(fleetDb: InstanceConfig['fleetDb']): boolean {
+  return !!fleetDb?.replication && !fleetDb.receive && !fleetDb.pushBroken && !fleetDb.replacedBy;
+}
+
+/** JC-SETTINGS (R41): each login with session settings, with the step that clears them. */
+function settingsNote(instance: InstanceConfig, holders: string | null): string {
+  const names = holders === null ? [] : holders.split(',').filter(Boolean);
+  if (names.length === 0) return "Some logins carry session settings of their own, which the manager's sessions override; Enable replication clears them.";
+  const own = copyLogin(instance.id);
+  const stepOf = (name: string): string => {
+    if (name === JOIN_LOGIN) return 'press New join code';
+    if (name === own) return ownPasswordHolder(instance) === null ? 'press New join code' : 'press Enable replication';
+    if (COPY_LOGIN_RE.test(name)) return 'remove it in the Machine logins list';
+    return 'press Enable replication';
+  };
+  return `Some logins carry session settings of their own, which the manager's sessions override: ${names.map(n => `${n} (${stepOf(n)})`).join('; ')}.`;
+}
+
+/** The first error line of a psql run, without psql's prefix; WARNING and NOTICE lines are never the reason. */
+function sqlReason(stderr: string): string {
+  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
+  const line = lines.find(l => /\b(FATAL|ERROR):/.test(l)) || lines[lines.length - 1] || 'psql failed';
+  return line.replace(/^psql:[^ ]*: /, '').replace(/^(ERROR|FATAL):\s+/, '').replace(/^psql: error: /, '').replace(/^error: /, '');
+}
+
+/** LOGINS_READ_SQL's list with this machine's own login and each login's address row; null for an answer of another shape. */
+function parseLogins(out: string, own: string, rowOf: (slot: string) => any): MachineLoginStatus[] | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(out.trim()); } catch { return null; }
+  if (!Array.isArray(parsed)) return null;
+  const logins: MachineLoginStatus[] = [];
+  for (const e of parsed as any[]) {
+    if (!e || typeof e.login !== 'string' || !COPY_LOGIN_RE.test(e.login) || typeof e.member !== 'boolean' || typeof e.canLogin !== 'boolean') return null;
+    const slot = typeof e.slot === 'string' ? e.slot : null;
+    const row = rowOf(`fleet_standby_${e.login.slice('smdb_copy_'.length)}`);
+    logins.push({
+      login: e.login,
+      own: e.login === own,
+      member: e.member,
+      canLogin: e.canLogin,
+      slot,
+      slotState: slot === null ? 'absent' : e.active === true ? 'active' : e.walStatus === 'lost' ? 'lost' : 'kept',
+      machine: row ? String(row.machine || '') : null,
+      address: row ? `${row.host}:${row.port}` : null,
+      client: typeof e.client === 'string' && e.client !== '' ? e.client : null,
+    });
+  }
+  return logins;
+}
+
+type RenewResult = { success: boolean; error?: string; text?: string };
+
+/**
+ * New join code (3.6.5 as R1, R18 and R25 give it): a new join password, and a new password for this machine's own
+ * login unless another database still holds the current one. The own password is saved before the database changes
+ * and written back when the transaction did not commit.
+ */
+export function renewJoinCode(instance: InstanceConfig): Promise<RenewResult> {
+  return inReplicationLane<RenewResult>(instance.id, 'New join code', async () => {
+    const fresh = containerManager.getBot(instance.id);
+    if (!fresh) return { success: false, error: 'Bot not found (nothing was changed)' };
+    return renewInLane(fresh);
+  });
+}
+
+async function renewInLane(instance: InstanceConfig): Promise<RenewResult> {
+  const fleetDb = instance.fleetDb;
+  const refused = joinCodeRefusal(fleetDb, { renew: true });
+  if (refused || !fleetDb?.replication) return { success: false, error: refused ?? 'Replication is not enabled, so there is no join code.' };
+  const repl = fleetDb.replication;
+  const dbState = await containerState(fleetDb.containerName);
+  if (dbState.running !== true) {
+    return { success: false, error: dbDownText(dbState, 'The database container is not running, so the join code was not renewed') };
+  }
+  const failText = (reason: string) => `The join code was not renewed (${reason}); the current code still works, and nothing was changed.`;
+  const holder = ownPasswordHolder(instance);
+  const ownLogin = copyLogin(instance.id);
+  const joinPassword = crypto.randomBytes(24).toString('base64url');
+  const ownPassword = holder === null ? crypto.randomBytes(24).toString('base64url') : null;
+  const earlier = instance.fleetLogin?.password;
+  if (ownPassword !== null) {
+    if (!COPY_LOGIN_RE.test(ownLogin)) return { success: false, error: failText(`${ownLogin} is not a machine login name`) };
+    try {
+      containerManager.updateInstanceFleetLogin(instance.id, { password: ownPassword });
+    } catch (err) {
+      return { success: false, error: failText(err instanceof Error ? err.message : String(err)) };
+    }
+  }
+  const joinVerifier = scramSha256Verifier(joinPassword);
+  const ownVerifier = ownPassword === null ? null : scramSha256Verifier(ownPassword);
+  const secrets = [joinPassword, joinVerifier, ...(ownPassword === null ? [] : [ownPassword, ownVerifier!])];
+  const own = ownPassword !== null;
+  const sql = `${QUIET_ROLE_SESSION_SQL}BEGIN;
+${lockedRoleWriteSql(own ? [JOIN_LOGIN, ownLogin] : [JOIN_LOGIN])}ALTER ROLE ${JOIN_LOGIN} LOGIN PASSWORD '${joinVerifier}';
+${own ? `ALTER ROLE "${ownLogin}" LOGIN PASSWORD '${ownVerifier}';\n` : ''}${ROLE_SETTINGS_RESET_SQL(JOIN_LOGIN)}${own ? ROLE_SETTINGS_RESET_SQL(ownLogin) : ''}${COMMITTING_SQL}COMMIT;
+SELECT 'renewed';
+SELECT 'ended|' || pg_catalog.count(pg_catalog.pg_terminate_backend(a.pid, 5000)) FROM pg_catalog.pg_stat_activity a WHERE a.usename IN ('${JOIN_LOGIN}'${own ? `, '${ownLogin}'` : ''}) AND a.pid <> pg_catalog.pg_backend_pid();
+SELECT 'unlinked|' || pg_catalog.count(pg_catalog.lo_unlink(l.oid)) FROM pg_catalog.pg_largeobject_metadata l;
+${own ? `DO $$ BEGIN
+  PERFORM pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${copySlot(instance.id)}' AND NOT active;
+EXCEPTION WHEN object_in_use THEN NULL;
+END $$;
+` : ''}`;
+  const run = await clusterSql(fleetDb.containerName, sql, true);
+  const lines = run.stdout.split('\n').map(l => l.trim());
+  const reason = () => redactSecrets(sqlReason(run.stderr), secrets);
+  if (!lines.includes('renewed') && !run.ok && run.timedOut) {
+    return { success: false, error: `The manager can't confirm whether the join code was renewed: the database did not answer within ${dbLogin.PSQL_TIMEOUT_MS / 1000} s, and the change may still be applied there. Press New join code again.` };
+  }
+  if (!lines.includes('renewed') && !stoppedBeforeCommit(run.stdout, run)) {
+    return { success: false, error: `The manager can't confirm whether the join code was renewed: the manager did not read the result (${run.ok ? "the database's answer held no result line" : hasPsqlStopLine(run.stderr) ? reason() : 'the call ended without an answer from psql'}), and the change may be applied there. Press New join code again.` };
+  }
+  if (!lines.includes('renewed')) {
+    const closed = closedCount(run.stdout);
+    const names = (joiner: string) => (own ? `${JOIN_LOGIN} ${joiner} ${ownLogin}` : JOIN_LOGIN);
+    const ranFail = (why: string) => (closed === 0 ? failText(why)
+      : `The join code was not renewed (${why}); the current code still works. ${closed === 1 ? `One open session of ${names('or')} was` : `The ${closed} open sessions of ${names('and')} were`} ended; nothing else was changed.`);
+    if (ownPassword === null) return { success: false, error: ranFail(reason()) };
+    try {
+      containerManager.updateInstanceFleetLogin(instance.id, earlier ? { password: earlier } : null);
+    } catch (err) {
+      return { success: false, error: `The join code was not renewed (${reason()}), and the manager could not put back this machine's own password on record (${err instanceof Error ? err.message : String(err)}), so this machine's own login does not open with it now; press New join code again.` };
+    }
+    return { success: false, error: ranFail(reason()) };
+  }
+  let notes = '';
+  const note = (step: string, why: string) => { notes += ` The renewal stands, but ${step} failed (${why}).`; };
+  if (!run.ok) {
+    const step = !lines.some(l => l.startsWith('ended|')) ? 'ending the old sessions'
+      : !lines.some(l => l.startsWith('unlinked|')) ? 'removing large objects from the postgres database'
+        : "removing a slot or address of this machine's own login";
+    note(step, reason());
+  }
+  if (own) {
+    const row = await metaSql(fleetDb.containerName, fleetDb.db, `DELETE FROM smdb_manager.addresses WHERE slot = '${copySlot(instance.id)}';`);
+    if (!row.ok) note("removing a slot or address of this machine's own login", sqlReason(row.stderr));
+  }
+  const done = own
+    ? "Made a new join code and gave this machine's own login a new password. The old code no longer adds machines; machines that joined before keep their logins."
+    : `Made a new join code. The old code no longer adds machines; machines that joined before keep their logins. This machine's own login kept its password, because the database on ${holder} still holds it for this machine.`;
+  let saveError: string | null = null;
+  try {
+    if (!containerManager.updateInstanceFleetDbReplication(instance.id, { ...repl, password: joinPassword })) saveError = "the bot's record is no longer in the registry";
+  } catch (err) {
+    saveError = err instanceof Error ? err.message : String(err);
+  }
+  if (saveError !== null) {
+    return { success: false, error: `The old join code no longer adds machines, but the new password could not be saved (${redactSecrets(saveError, secrets)}), so no code can be shown for it; press New join code again.${notes}` };
+  }
+  forgetProbes(instance.id);
+  return { success: true, text: `${done}${notes}` };
+}
+
+type RemoveResult = { success: boolean; error?: string; text?: string; needsConfirm?: true };
+
+const REMOVE_WAIT_MS = 10_000;
+const REMOVE_POLL_MS = 250;
+const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+/**
+ * Remove a machine's login (3.7 as R4, R18 and R31 give it): blocked first in one transaction, then its sessions
+ * ended, its slot dropped, its address row deleted, what it owns dropped, and the role dropped. Each step is
+ * rerun-safe, and a Remove that stops leaves the login blocked.
+ */
+export function removeCopyLogin(instance: InstanceConfig, login: string, confirm: boolean): Promise<RemoveResult> {
+  return inReplicationLane<RemoveResult>(instance.id, 'Remove', async () => {
+    const fresh = containerManager.getBot(instance.id);
+    if (!fresh) return { success: false, error: 'Bot not found (nothing was changed)' };
+    return removeInLane(fresh, login, confirm);
+  });
+}
+
+async function removeInLane(instance: InstanceConfig, login: string, confirm: boolean): Promise<RemoveResult> {
+  const fleetDb = instance.fleetDb;
+  if (!fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
+  const unknown = { success: false, error: `No machine login named ${String(login).slice(0, 80)} exists on this database; reload the Database window.` };
+  if (typeof login !== 'string' || !COPY_LOGIN_RE.test(login)) return unknown;
+  if (login === copyLogin(instance.id)) {
+    return { success: false, error: `${login} is this machine's own login, which it uses to rejoin another machine as a copy; it is not removed here.` };
+  }
+  const container = fleetDb.containerName;
+  const dbState = await containerState(container);
+  if (dbState.running !== true) return { success: false, error: dbDownText(dbState, 'Database container is not running') };
+  const fenced = await fenceLinesRefusal(container);
+  if (fenced) return { success: false, error: `The login ${login} was not removed: ${fenced}; nothing was changed.` };
+  const slot = `fleet_standby_${login.slice('smdb_copy_'.length)}`;
+  const slotStateSql = `SELECT coalesce((SELECT active::text FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}'), 'absent')`;
+  const admission = await clusterSql(container, `SELECT 'login|' || (EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = '${login}'))::text
+  || '|' || coalesce((SELECT s.active::text FROM pg_catalog.pg_replication_slots s WHERE s.slot_name = '${slot}'), 'absent')
+  || '|' || coalesce((SELECT pg_catalog.host(st.client_addr) FROM pg_catalog.pg_replication_slots s JOIN pg_catalog.pg_stat_replication st ON st.pid = s.active_pid WHERE s.slot_name = '${slot}'), '');`);
+  if (!admission.ok) return { success: false, error: `The login ${login} was not removed: reading it failed (${sqlReason(admission.stderr)}); nothing was changed.` };
+  const read = /^login\|(true|false)\|(true|false|absent)\|(.*)$/.exec(admission.stdout.trim().split('\n').pop() ?? '');
+  if (!read) return { success: false, error: `The login ${login} was not removed: the database answered in a form the manager does not read; nothing was changed.` };
+  if (read[1] !== 'true') return unknown;
+  if (read[2] === 'true' && confirm !== true) {
+    const listed = await metaSql(container, fleetDb.db, ADDRESS_BY_SLOT_SQL);
+    let machine: string | null = null;
+    if (listed.ok) {
+      try {
+        const rows = JSON.parse(listed.stdout.trim() || '[]');
+        const row = Array.isArray(rows) ? rows.find((r: any) => r && r.slot === slot) : null;
+        if (row && row.machine) machine = String(row.machine);
+      } catch { /* the client address names it */ }
+    }
+    const where = machine ?? (read[3] || 'a local socket');
+    return { success: false, needsConfirm: true, error: `The machine with the login ${login} streams from this database now (${where}). Removing its login ends that stream, drops its slot and takes its address off the list: its copy stops following this database, and other machines stop listing it within an hour. Its manager can join again while it holds this join code; make a new join code too if that machine should stay out. Remove it?` };
+  }
+
+  const blockedTail = !fleetDb.replication ? 'It is blocked: it cannot log in. Press Remove again to finish.'
+    : machineLoginsTickRuns(fleetDb)
+      ? 'It is blocked: it cannot log in, other machines stop listing it within an hour, and this database ends its open sessions within 5 minutes. Press Remove again to finish.'
+      : 'It is blocked: it cannot log in, and other machines stop listing it within an hour. Press Remove again to finish.';
+  const stepFailed = (step: string, reason: string): RemoveResult => ({ success: false, error: `The login ${login} was not removed completely: ${step} failed (${reason}). ${blockedTail}` });
+
+  const block = await clusterSql(container, REMOVE_BLOCK_SQL(login), true);
+  const blocked = parseRemoveBlock(block.stdout, block);
+  if ((blocked.state === 'none' || blocked.state === 'unconfirmed') && !block.ok && block.timedOut) {
+    return { success: false, error: `The manager can't confirm whether the login ${login} was blocked: the database did not answer within ${dbLogin.PSQL_TIMEOUT_MS / 1000} s, and the block may still be applied there. Press Remove again to finish.` };
+  }
+  if (blocked.state === 'unconfirmed') {
+    return { success: false, error: `The manager can't confirm whether the login ${login} was blocked: the manager did not read the result (${block.ok ? "the database's answer held no result line" : hasPsqlStopLine(block.stderr) ? sqlReason(block.stderr) : 'the call ended without an answer from psql'}), and the block may be applied there. Press Remove again to finish.` };
+  }
+  if (blocked.state === 'none') {
+    const closed = closedCount(block.stdout);
+    const changed = closed === 0 ? 'nothing was changed' : `${closed === 1 ? 'its open session was' : `its ${closed} open sessions were`} ended; nothing else was changed`;
+    return { success: false, error: `The login ${login} was not removed: blocking it failed (${sqlReason(block.stderr)}); ${changed}.` };
+  }
+  if (blocked.state === 'again') {
+    const fields = blocked.line.split('|');
+    const what = fields[1] !== 'true' && fields[2] !== 'true' ? 'its membership in smdb_copies and its right to log in'
+      : fields[1] !== 'true' ? 'its membership in smdb_copies' : 'its right to log in';
+    return { success: false, error: `The login ${login} was blocked, but the check that followed found ${what} back; something with rights over roles changed it. Press Remove again to block it again and finish.` };
+  }
+
+  const ended = await clusterSql(container, `SELECT pg_catalog.count(pg_catalog.pg_terminate_backend(pid, 5000)) FROM pg_catalog.pg_stat_activity WHERE usename = '${login}' AND pid <> pg_catalog.pg_backend_pid();`);
+  if (!ended.ok) return stepFailed('ending its sessions', sqlReason(ended.stderr));
+  for (let waited = 0; ; waited += REMOVE_POLL_MS) {
+    const left = await clusterSql(container, `SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity WHERE usename = '${login}'`);
+    if (!left.ok) return stepFailed('ending its sessions', sqlReason(left.stderr));
+    const n = left.stdout.trim();
+    if (n === '0') break;
+    if (waited >= REMOVE_WAIT_MS) return stepFailed('ending its sessions', /^\d+$/.test(n) ? `${n} of its sessions were still open after 10 seconds` : 'the count of its sessions could not be read');
+    await pause(REMOVE_POLL_MS);
+  }
+
+  const slotStep = `dropping its slot ${slot}`;
+  const slotState = async (): Promise<string> => {
+    const r = await clusterSql(container, slotStateSql);
+    if (!r.ok) throw new Error(sqlReason(r.stderr));
+    return r.stdout.trim();
+  };
+  try {
+    let state = await slotState();
+    if (state !== 'absent') {
+      if (state === 'true') {
+        const end = await clusterSql(container, `SELECT pg_catalog.pg_terminate_backend(active_pid) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND active_pid IS NOT NULL;`);
+        if (!end.ok) return stepFailed(slotStep, sqlReason(end.stderr));
+        for (let waited = 0; state === 'true'; waited += REMOVE_POLL_MS) {
+          if (waited >= REMOVE_WAIT_MS) return stepFailed(slotStep, 'a stream still held it after 10 seconds');
+          await pause(REMOVE_POLL_MS);
+          state = await slotState();
+        }
+      }
+      if (state !== 'absent') {
+        const drop = await clusterSql(container, `SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`);
+        if (!drop.ok) return stepFailed(slotStep, sqlReason(drop.stderr));
+        state = await slotState();
+        if (state !== 'absent') return stepFailed(slotStep, state === 'true' ? 'a stream took it again' : 'it was still there after the drop');
+      }
+    }
+  } catch (err) {
+    return stepFailed(slotStep, err instanceof Error ? err.message : String(err));
+  }
+
+  const row = await metaSql(container, fleetDb.db, `DO $$ BEGIN
+  IF to_regclass('smdb_manager.addresses') IS NOT NULL THEN
+    DELETE FROM smdb_manager.addresses WHERE slot = '${slot}';
+  END IF;
+END $$;`);
+  if (!row.ok) return stepFailed('taking its address off the list', sqlReason(row.stderr));
+
+  const ownedHere = await clusterSql(container, `DROP OWNED BY "${login}";`);
+  if (!ownedHere.ok) return stepFailed('dropping what it owns in the postgres database', sqlReason(ownedHere.stderr));
+
+  const opened = await clusterSql(container, `${ROLE_SETTINGS_RESET_SQL(login)}ALTER ROLE "${login}" LOGIN PASSWORD NULL;\n`, true);
+  const ownedThere = opened.ok ? await dbLogin.runCall(container, dbLogin.loginPsql(login, container, fleetDb.db, 'DROP OWNED BY CURRENT_USER')) : null;
+  const closed = await clusterSql(container, `ALTER ROLE "${login}" NOLOGIN PASSWORD NULL;`);
+  if (!closed.ok) {
+    return { success: false, error: `The login ${login} was not removed completely: closing it again after dropping what it owned failed (${sqlReason(closed.stderr)}). It has no password, and other machines stop listing it within an hour, so no machine can log in with it from outside this database's container. Press Remove again to finish.` };
+  }
+  if (!opened.ok) return stepFailed("dropping what it owns in the bot's database", sqlReason(opened.stderr));
+  if (ownedThere && !ownedThere.ok) return stepFailed("dropping what it owns in the bot's database", sqlReason(ownedThere.stderr));
+
+  const dropped = await clusterSql(container, `DROP ROLE IF EXISTS "${login}";`);
+  if (!dropped.ok) {
+    if (dropped.stderr.includes('cannot be dropped because some objects depend on it')) {
+      const detail = dropped.stderr.split('\n').map(l => l.trim()).find(l => l.startsWith('DETAIL:'))?.replace(/^DETAIL:\s+/, '') ?? sqlReason(dropped.stderr);
+      return { success: false, error: `The login ${login} is blocked (it cannot log in, and other machines stop listing it within an hour), but it was not dropped: Postgres still records ${detail}. That is a right the bot's own login granted it in the bot's database, as a grant or a default privilege, which only the bot's login can take back. Press Remove again once it is revoked.` };
+    }
+    return stepFailed('dropping the login', sqlReason(dropped.stderr));
+  }
+  return { success: true, text: `Removed the login ${login}: its sessions were ended, its slot dropped, its address taken off the list and what it owned dropped. A machine that holds this database's join code can join again; New join code stops that.` };
 }
 
 /** Connections one bot process opens to the main at most: data 10, claims 3, sweep 3, two listeners, one short session. */

@@ -60,7 +60,7 @@ export interface ClaimDb {
   /** The TOC read's exit code when fail is 'toc'. */
   tocCode: number;
   dropSeen: boolean;
-  /** The argv of step 7's recreate (the call that holds the replication role ensure, D59). */
+  /** The argv of step 7's recreate (the call that holds the ensure of smdb_copies, D59). */
   recreateArgs: string[] | null;
   raiseSql: string[];
   capSql: string[];
@@ -210,7 +210,7 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         claimDb.steps5.push('cert');
         return cb(null, claimDb.cert, '');
       }
-      if (sql.includes('NOLOGIN REPLICATION')) {
+      if (sql.includes('CREATE ROLE smdb_copies NOLOGIN')) {
         claimDb.recreateArgs = [...args];
         if (claimDb.fail === 'ensure') return fail('permission denied to create role');
       }

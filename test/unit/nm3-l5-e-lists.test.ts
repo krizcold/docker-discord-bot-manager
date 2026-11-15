@@ -90,7 +90,7 @@ const REGISTRY = path.join(h.dir, 'instances.json');
 const base = (over: Record<string, unknown> = {}) => ({
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
-  fleetJoin: fakeJoinRecord(), ...over,
+  fleetJoin: fakeJoinRecord(), fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') }, ...over,
 });
 const REPLICA = {
   containerName: 'b-fleet-postgres-replica', volume: 'b-fleet-postgres-replica-data', slot: 'fleet_standby_b',
@@ -156,7 +156,7 @@ describe('readAddresses', () => {
 });
 
 describe('addressUpsertSql', () => {
-  const good = { host: 'other.invalid', port: 15434, slot: null, cert: COPY_PEM, machine: 'other' };
+  const good = { host: 'other.invalid', port: 15434, cert: COPY_PEM, machine: 'other' };
 
   it('refuses a host that is not a bare hostname', () => {
     expect(() => addressUpsertSql({ ...good, host: 'bad host' })).toThrow(new Error('the host bad host is not a bare hostname or IPv4 address'));
@@ -167,7 +167,7 @@ describe('addressUpsertSql', () => {
   });
 
   it.each([1, 65535])('takes the port %s', port => {
-    expect(addressUpsertSql({ ...good, port })).toContain(`, ${port}, NULL, `);
+    expect(addressUpsertSql({ ...good, port })).toContain(`'other.invalid', ${port}, '-----BEGIN`);
   });
 
   it('refuses a certificate that is not a PEM block', () => {
@@ -179,24 +179,25 @@ describe('addressUpsertSql', () => {
     expect(sql).toContain(`'${COPY_PEM.trim()}', 'other')`);
   });
 
-  it('writes slot NULL for the main row', () => {
-    expect(addressUpsertSql(good)).toContain(`VALUES ('other.invalid', 15434, NULL, '${COPY_PEM.trim()}', 'other')`);
+  it('writes no slot: the main derives it from the machine login (NM22 R1)', () => {
+    expect(addressUpsertSql(good)).toBe(`SELECT smdb_manager.set_copy_address('other.invalid', 15434, '${COPY_PEM.trim()}', 'other');`);
   });
 });
 
 describe('registerAddress and deleteAddress', () => {
   it('runs the register in a container named for it', async () => {
-    expect(await registerAddress(bot(), code, FIXTURE_PEM, { host: 'other.invalid', port: 15434, slot: null, cert: COPY_PEM, machine: 'o' })).toBeNull();
+    expect(await registerAddress(bot(), code, FIXTURE_PEM, { host: 'other.invalid', port: 15434, cert: COPY_PEM, machine: 'o' })).toBeNull();
     expect(spawned().map(c => nameOf(c.args))).toEqual(['b-fleet-join-register']);
   });
 
   it('runs the delete in a container named for it', async () => {
-    expect(await deleteAddress(bot(), code, FIXTURE_PEM, 'other.invalid', 15434)).toBeNull();
+    expect(await deleteAddress(bot(), code, FIXTURE_PEM)).toBeNull();
     expect(spawned().map(c => nameOf(c.args))).toEqual(['b-fleet-join-unregister']);
   });
 
-  it('refuses to delete a host that is not a bare hostname, without running anything', async () => {
-    expect(await deleteAddress(bot(), code, FIXTURE_PEM, 'bad host', 1)).toBe('the host bad host is not a bare hostname or IPv4 address');
+  it('refuses to delete with no stored login, without running anything (NM22 L21)', async () => {
+    writeRegistry({ fleetLogin: undefined });
+    expect(await deleteAddress(bot(), code, FIXTURE_PEM)).toBe("this machine's own login to the main is not stored; press Re-seed (or Join, on a machine without a copy) to get a new one; if the main still has this machine's earlier login, the answer names it");
     expect(spawned()).toEqual([]);
   });
 });

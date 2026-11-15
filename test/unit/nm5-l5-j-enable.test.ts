@@ -89,20 +89,20 @@ const dbUrl = 'postgresql://smdb:Db-Secret%2C%25x@m-fleet-postgres:5432/smdb?ssl
 const fleetDb = { containerName: 'm-fleet-postgres', user: 'smdb', db: 'smdb', volume: 'm-fleet-postgres-data', password: 'Db-Secret,%x' };
 const replication = { role: 'replicator', password: 'Repl-Secret-0123456789', hostPort: 15432, publicHost: 'main.invalid', certHost: 'main.invalid', slotWalKeepMb: 4096 };
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
-  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { m: {
-    id: 'm', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
+  fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({ instances: { 'aaaaaaaa-0000-4000-8000-00000000000a': {
+    id: 'aaaaaaaa-0000-4000-8000-00000000000a', sanitizedName: 'm', displayName: 'M', titleName: 'M', status: 'running', sourceType: 'git',
     sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot', envVars: { DATA_BACKEND: 'postgres' },
     createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z', ...extra,
   } } }));
 };
-const bot = () => containerManager.getBot('m')!;
+const bot = () => containerManager.getBot('aaaaaaaa-0000-4000-8000-00000000000a')!;
 
 beforeEach(() => {
   h.sql = []; h.running = 'true'; h.cert = FIXTURE_PEM; h.fail = ''; h.failErr = ''; h.slots = ''; h.addresses = '[]'; h.listFail = false; h.sent = 0;
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
-  fs.mkdirSync(path.join(h.dir, 'bots', 'm', 'env'), { recursive: true });
+  fs.mkdirSync(path.join(h.dir, 'bots', 'aaaaaaaa-0000-4000-8000-00000000000a', 'env'), { recursive: true });
   writeRegistry({ fleetDb: { ...fleetDb, replication } });
-  envManager.setEnvVars('m', { DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('aaaaaaaa-0000-4000-8000-00000000000a', { DATA_BACKEND_URL: dbUrl });
 });
 afterAll(() => fs.rmSync(h.dir, { recursive: true, force: true }));
 

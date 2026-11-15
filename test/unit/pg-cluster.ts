@@ -49,7 +49,10 @@ export function startCluster(spec: ClusterSpec): Cluster {
     '-v', `${volume}:/var/lib/postgresql/data`, ...(spec.dockerArgs ?? []),
     '-e', `POSTGRES_USER=${spec.firstRole ?? 'dbm_admin'}`, '-e', `POSTGRES_PASSWORD=${spec.password}`, '-e', `POSTGRES_DB=${spec.db}`,
     PG_IMAGE, 'postgres', ...(spec.serverArgs ?? ['-c', 'reserved_connections=4'])]);
-  if (started.status !== 0) throw new Error(`${spec.name} did not start: ${started.err}`);
+  if (started.status !== 0) {
+    docker(['rm', '-f', '-v', spec.name]);
+    throw new Error(`${spec.name} did not start: ${started.err}`);
+  }
   let ready = false;
   for (let i = 0; i < 240 && !ready; i++) {
     ready = docker(['exec', spec.name, 'pg_isready', '-h', '127.0.0.1', '-q']).status === 0;

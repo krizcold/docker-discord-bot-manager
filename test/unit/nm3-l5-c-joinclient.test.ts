@@ -61,6 +61,7 @@ import { hostBotDirFor } from '../../src/docker/containerManager';
 import {
   ensureClientImage, ensureProbeCert, fetchMainCertificate, mainCertificate, mainProbe, runPrimaryClient, sameManagerMain, seedDsnFor,
 } from '../../src/instance/fleetJoin';
+import { COPY_SESSION_OPTIONS } from '../../src/instance/dbLogin';
 import { fakeJoin, FIXTURE_FP, FIXTURE_PEM } from './join-fake';
 
 const PW = 'supersecretpw1';
@@ -92,7 +93,7 @@ afterAll(() => fs.rmSync(h.dir, { recursive: true, force: true }));
 describe('client argv and image pull', () => {
   it('seedDsnFor names the user, host, port, db and the verify-full CA', () => {
     expect(seedDsnFor({ user: 'u s', password: PW, host: 'h.invalid', port: 5433, db: 'd' }))
-      .toBe('postgresql://u%20s@h.invalid:5433/d?sslmode=verify-full&sslrootcert=/primary-ca.crt');
+      .toBe(`postgresql://u%20s@h.invalid:5433/d?sslmode=verify-full&sslrootcert=/primary-ca.crt&require_auth=scram-sha-256&options=${encodeURIComponent(COPY_SESSION_OPTIONS)}`);
   });
 
   it('a missing image is pulled with a ten minute limit', async () => {
@@ -103,7 +104,7 @@ describe('client argv and image pull', () => {
   });
 
   it('mainProbe removes the old probe container by name before it runs the client', async () => {
-    await mainProbe({ id: 'p', sanitizedName: 'pp' } as any, fakeJoin(), FIXTURE_PEM);
+    await mainProbe({ id: 'p', sanitizedName: 'pp', fleetLogin: { password: PW } } as any, fakeJoin(), FIXTURE_PEM);
     expect(h.execCalls[0]).toEqual({ cmd: 'docker', args: ['rm', '-f', 'pp-fleet-join-probe'], opts: { timeout: 30000 } });
   });
 

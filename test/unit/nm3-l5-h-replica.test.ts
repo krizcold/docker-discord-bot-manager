@@ -79,6 +79,7 @@ const SEED = { purpose: 'reseed-standby', phase: 'seeding', startedAt: 5, update
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), fleetDbReplica: REPLICA, ...over,
 } } }, null, 2));
 const editRegistry = (edit: (b: any) => void) => {
@@ -446,28 +447,28 @@ describe('the stale-primary re-seed refusals', () => {
   const code = (dsn: string) => codeFor(dsn);
   beforeEach(() => writeRegistry({ status: 'stopped', fleetDbReplica: undefined, fleetJoin: undefined, fleetDb: STALE }));
 
-  it('a code that is not a join code', () => {
+  it('a code that is not a join code', async () => {
     const why = (decodeJoinCode('nope') as { ok: false; why: string }).why;
-    expect(fleetReplica.reseedStalePrimary(bot(), 'nope', 'standby.invalid', 5441)).toEqual({ success: false, error: `This is not a join code: ${why}` });
+    expect(await fleetReplica.reseedStalePrimary(bot(), 'nope', 'standby.invalid', 5441)).toEqual({ success: false, error: `This is not a join code: ${why}` });
   });
 
   it.each([
     ['its primary', { fleetDb: { ...STALE, containerName: 'c-fleet-postgres', replication: { publicHost: 'c.invalid', hostPort: 5441 } } }],
     ['its standby', { fleetDbReplica: { ...REPLICA, containerName: 'c-fleet-postgres-replica', hostPort: 5441 } }],
-  ])('a host port another instance uses for %s', (_n, over) => {
+  ])('a host port another instance uses for %s', async (_n, over) => {
     withOther(over);
-    expect(fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@primary.invalid:5433/smdb'), 'standby.invalid', 5441))
+    expect(await fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@primary.invalid:5433/smdb'), 'standby.invalid', 5441))
       .toEqual({ success: false, error: 'Host port 5441 is already used by "C" - pick another' });
   });
 
-  it('this instance\'s own port is free, and its own join code is refused', () => {
-    expect(fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@self.invalid:5440/smdb'), 'standby.invalid', 5440)).toEqual({
+  it('this instance\'s own port is free, and its own join code is refused', async () => {
+    expect(await fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@self.invalid:5440/smdb'), 'standby.invalid', 5440)).toEqual({
       success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet',
     });
   });
 
-  it('D86 (round 5) its own join code with the host in upper case is refused the same way', () => {
-    expect(fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@SELF.INVALID:5440/smdb'), 'standby.invalid', 5440)).toEqual({
+  it('D86 (round 5) its own join code with the host in upper case is refused the same way', async () => {
+    expect(await fleetReplica.reseedStalePrimary(bot(), code('postgresql://replicator:pw@SELF.INVALID:5440/smdb'), 'standby.invalid', 5440)).toEqual({
       success: false, error: 'That join code is this instance\'s own database, which is the stale one. Paste the join code from the machine that now serves the fleet',
     });
   });

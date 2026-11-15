@@ -201,7 +201,7 @@ describe('B14-2s: a stale-primary re-seed asks docker whether the instance runs'
 
   it('stops before the dump and the retire when docker runs the instance its record says is stopped', async () => {
     pg.live.a = ['bot-a-app'];
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/bot-a-app/);
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/nothing was destroyed/);
@@ -212,7 +212,7 @@ describe('B14-2s: a stale-primary re-seed asks docker whether the instance runs'
 
   it("says it can't confirm and destroys nothing when docker does not answer", async () => {
     pg.live.a = null;
-    expect(start()).toMatchObject({ success: true });
+    expect(await start()).toMatchObject({ success: true });
     const bot = await settled();
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/can't confirm/);
     expect(bot.fleetDbReplicaSeed?.lastError).toMatch(/nothing was destroyed/);

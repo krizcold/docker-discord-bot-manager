@@ -31,7 +31,7 @@ import { certFingerprint, encodeMoveCode } from '../../src/config/joinCode';
 import * as containerManager from '../../src/docker/containerManager';
 import { provisionRoles } from '../../src/instance/dbLogin';
 import { pushMain, receiveLoginsSql, receiveStep, stopReceiving } from '../../src/instance/fleetMove';
-import { DB_OID_SQL, ensureGenerationSql, raiseSql, replicationRoleEnsureSql } from '../../src/instance/switchSql';
+import { copyGroupEnsureSql, DB_OID_SQL, ensureGenerationSql, raiseSql } from '../../src/instance/switchSql';
 import { type Cluster, docker, dockerRuns, provisionedCluster } from './pg-cluster';
 
 const ID = `nm20pg6${process.pid}`;
@@ -140,7 +140,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 part 6: the p
     ok(docker(['exec', '-u', 'root', RECV, 'sh', '-c', 'chown postgres:postgres /var/lib/postgresql/data/server.* && chmod 600 /var/lib/postgresql/data/server.key && printf "hostssl all all 0.0.0.0/0 scram-sha-256\\n" >> /var/lib/postgresql/data/pg_hba.conf']));
     admin(recv, 'ALTER SYSTEM SET ssl = on;');
     admin(recv, 'SELECT pg_reload_conf();');
-    admin(recv, replicationRoleEnsureSql('replicator'));
+    admin(recv, copyGroupEnsureSql());
     ok(send.psql(U, BOT_SQL, DB));
     ok(send.psql('dbm_meta', ensureGenerationSql('snd.example'), DB));
   }, 900000);

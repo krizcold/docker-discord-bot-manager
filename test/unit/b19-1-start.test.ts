@@ -113,7 +113,7 @@ describe('the start lane narrows the non-TLS lines an Enable kept', () => {
     const r = await containerManager.startBot('b1');
     expect(r.success).toBe(true);
     expect(hbaWrites().length).toBe(1);
-    expect(hbaWrites()[0].stdin).toBe(pgHbaContent());
+    expect(hbaWrites()[0].stdin).toBe(pgHbaContent('smdb'));
     expect(reloads().length).toBe(1);
     expect(containerManager.getBot('b1')!.fleetDb!.replication!.keptPlain).toBeUndefined();
     expect(containerManager.getBot('b1')!.fleetDb!.replication!.password).toBe(replication.password);

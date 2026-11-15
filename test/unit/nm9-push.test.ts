@@ -64,7 +64,7 @@ beforeEach(() => {
 });
 afterAll(() => fs.rmSync(tmp.dir, { recursive: true, force: true }));
 
-const commits = () => fake.calls.filter(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit')).map(c => c.args[c.args.length - 1]);
+const commits = () => fake.calls.filter(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-commit')).map(c => c.input);
 const caps = () => fake.calls.filter(c => c.args[0] === 'run' && c.args.includes('a-fleet-move-cap')).map(c => c.args[c.args.length - 1]);
 const count = (text: string, part: string) => text.split(part).length - 1;
 

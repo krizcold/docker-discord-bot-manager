@@ -67,6 +67,7 @@ export function deleteDoneText(done: DeleteDone, keepData: boolean, keepEnv: boo
   if (done.dbDumpsKept) msg += `; its ${done.dbDumpsKept.count} database ${done.dbDumpsKept.count === 1 ? 'dump stays' : 'dumps stay'} in the manager's ${done.dbDumpsKept.folder} folder`;
   if (!keepEnv) msg += done.envDeleted ? '; environment values deleted' : '; deleting the environment values could not be confirmed';
   else if (done.vaulted) msg += '; environment values copied to the vault';
+  if (done.warning) msg += `. ${done.warning}`;
   return msg;
 }
 

@@ -129,7 +129,7 @@ import { codeFor, fixtureCert } from './join-fake';
 
 beforeEach(() => { certSource.fetch = fixtureCert; });
 
-const botDir = path.join(h.dir, 'bots', 'b1');
+const botDir = path.join(h.dir, 'bots', 'b1b1b1b1-0000-4000-8000-000000000001');
 const DB_SECRET = 'Db-Secret-0123456789';
 const REPL_SECRET = 'Repl-Secret-0123456789';
 const dbUrl = `postgresql://smdb:${DB_SECRET}@bot1-fleet-postgres:5432/smdb?sslmode=no-verify`;
@@ -139,8 +139,8 @@ const replication = { role: 'replicator', password: REPL_SECRET, hostPort: 15432
 const writeRegistry = (extra: Record<string, unknown> = {}): void => {
   fs.writeFileSync(path.join(h.dir, 'instances.json'), JSON.stringify({
     instances: {
-      b1: {
-        id: 'b1', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
+      'b1b1b1b1-0000-4000-8000-000000000001': {
+        id: 'b1b1b1b1-0000-4000-8000-000000000001', sanitizedName: 'bot1', displayName: 'Bot 1', titleName: 'Bot 1', status: 'stopped',
         sourceType: 'git', sourceUrl: 'https://example.invalid/fake/super-modular-discord-bot',
         envVars: { DATA_BACKEND: 'postgres' },
         fleetDb,
@@ -160,7 +160,7 @@ beforeEach(() => {
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   fs.mkdirSync(path.join(botDir, 'env'), { recursive: true });
   writeRegistry();
-  envManager.setEnvVars('b1', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
+  envManager.setEnvVars('b1b1b1b1-0000-4000-8000-000000000001', { DATA_BACKEND: 'postgres', DATA_BACKEND_URL: dbUrl });
   h.calls.length = 0;
   h.failWhen = null;
   h.failStderr = '';
@@ -190,26 +190,27 @@ describe('the SCRAM verifier', () => {
 });
 
 describe('enabling replication', () => {
-  it('sets the replicator password as a verifier on stdin, never in argv or as plain text', async () => {
-    const res = await enableFleetReplication(containerManager.getBot('b1')!, 'primary.invalid', 15432);
+  it('sets the join password as a verifier on stdin, never in argv or as plain text (NM22: the join login)', async () => {
+    const res = await enableFleetReplication(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!, 'primary.invalid', 15432);
     expect(res.success).toBe(true);
-    const password = containerManager.getBot('b1')!.fleetDb!.replication!.password;
+    const password = containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!.fleetDb!.replication!.password;
     expect(password.length).toBeGreaterThan(10);
     expect(argvWith(password)).toEqual([]);
     expect(h.calls.filter(c => c.stdin.includes(password))).toEqual([]);
-    const role = h.calls.filter(c => /ROLE replicator/.test(c.stdin));
+    const role = h.calls.filter(c => /ROLE smdb_join/.test(c.stdin));
     expect(role.length).toBe(1);
     expect(role[0].stdin).toMatch(/SET log_min_error_statement = panic;/);
-    expect(role[0].stdin).toMatch(/PASSWORD 'SCRAM-SHA-256\$4096:/);
-    expect(role[0].stdin).not.toMatch(/DO \$\$/);
-    expect(h.calls.filter(c => /ROLE replicator/.test(c.args.join(' ')))).toEqual([]);
+    expect(role[0].stdin).toMatch(/^(ALTER|CREATE) ROLE smdb_join LOGIN [A-Z ]+ PASSWORD 'SCRAM-SHA-256\$4096:[^']+';$/m);
+    // Each verifier stands on a role statement of its own, outside any DO block.
+    for (const line of role[0].stdin.split('\n').filter(l => l.includes("PASSWORD 'SCRAM-SHA-256$"))) expect(line).toMatch(/^(ALTER|CREATE) ROLE /);
+    expect(h.calls.filter(c => /ROLE smdb_join/.test(c.args.join(' ')))).toEqual([]);
   });
 
   it('reports a failed role statement without the password or its verifier', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
-    h.failWhen = /ROLE replicator/;
+    h.failWhen = /ROLE smdb_join/;
     h.failStderr = 'ERROR:  fake failure\nSTATEMENT:';
-    const res = await enableFleetReplication(containerManager.getBot('b1')!, 'primary.invalid', 15432);
+    const res = await enableFleetReplication(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!, 'primary.invalid', 15432);
     expect(res.success).toBe(false);
     expect(res.error).toContain('fake failure');
     expect(res.error).not.toContain(REPL_SECRET);
@@ -221,7 +222,7 @@ describe('the endpoint reachability probe', () => {
   it('passes the database password by environment and reports a failure without the command line', async () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
     h.failWhen = /SELECT 1/;
-    const status = await getFleetReplicationStatus(containerManager.getBot('b1')!);
+    const status = await getFleetReplicationStatus(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!);
     const probe = h.calls.filter(c => c.args.includes('SELECT 1'));
     expect(probe.length).toBe(1);
     expect(argvWith(DB_SECRET)).toEqual([]);
@@ -236,24 +237,27 @@ describe('the endpoint reachability probe', () => {
 describe('seeding a standby', () => {
   it('gives psql and pg_basebackup the password by environment, never in argv', async () => {
     const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-    const started = reseedStalePrimary(containerManager.getBot('b1')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
+    const started = await reseedStalePrimary(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
     expect(started).toMatchObject({ success: true });
-    await waitFor(() => containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked === true);
-    expect(containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked).toBe(true);
+    await waitFor(() => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')?.fleetDbReplicaSeed?.parked === true);
+    expect(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')?.fleetDbReplicaSeed?.parked).toBe(true);
     expect(argvWith(REPL_SECRET)).toEqual([]);
+    // NM22 S4: the seed's clients log in as this machine's own login, saved by the request-time mint.
+    const own = containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!.fleetLogin!.password;
+    expect(argvWith(own)).toEqual([]);
     const clients = h.calls.filter(c => c.args[0] === 'run' && (c.args.includes('psql') || c.args.includes('pg_basebackup')));
     expect(clients.some(c => c.args.includes('pg_basebackup'))).toBe(true);
     expect(clients.length).toBeGreaterThanOrEqual(3);
     for (const c of clients) {
       expect(c.args).toContain('PGPASSWORD');
-      expect(c.env.PGPASSWORD).toBe(REPL_SECRET);
+      expect(c.env.PGPASSWORD).toBe(own);
     }
   });
 
   it('B14-2Lb: strips the primary\'s fence lines from the copied pg_hba.conf with its inherited settings', async () => {
     const pem = '-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----';
-    reseedStalePrimary(containerManager.getBot('b1')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
-    await waitFor(() => containerManager.getBot('b1')?.fleetDbReplicaSeed?.parked === true);
+    await reseedStalePrimary(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!, codeFor(`postgresql://replicator:${REPL_SECRET}@primary.invalid:5433/smdb`), 'standby.invalid', 5440, true, { dumpDone: true });
+    await waitFor(() => containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')?.fleetDbReplicaSeed?.parked === true);
     const seed = h.calls.findIndex(c => c.args.includes('pg_basebackup'));
     const strip = h.calls.findIndex(c => c.args[0] === 'run' && c.args[c.args.length - 1].includes('/^synchronous_standby_names/d'));
     expect(seed).toBeGreaterThanOrEqual(0);
@@ -273,13 +277,13 @@ describe('stored error texts', () => {
   it('never keep a record secret on disk', () => {
     writeRegistry({ fleetDb: { ...fleetDb, replication } });
     const now = Date.now();
-    containerManager.updateInstanceFleetDbReplicaSeed('b1', {
+    containerManager.updateInstanceFleetDbReplicaSeed('b1b1b1b1-0000-4000-8000-000000000001', {
       purpose: 'provision', phase: 'seeding', startedAt: now, updatedAt: now, publicHost: 'h', hostPort: 5440,
       primaryHost: 'p', primaryPort: 5433, slot: 's', parked: true, lastError: `psql: could not log in with ${REPL_SECRET}`,
     });
     const disk = fs.readFileSync(path.join(h.dir, 'instances.json'), 'utf8');
     expect(disk).not.toContain(REPL_SECRET);
-    const bot = containerManager.getBot('b1')!;
+    const bot = containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!;
     expect(bot.fleetDbReplicaSeed?.lastError).toContain('***');
   });
 });
@@ -287,11 +291,11 @@ describe('stored error texts', () => {
 describe('the status of a parked seed', () => {
   it('shows the stored error as it was saved', async () => {
     const now = Date.now();
-    containerManager.updateInstanceFleetDbReplicaSeed('b1', {
+    containerManager.updateInstanceFleetDbReplicaSeed('b1b1b1b1-0000-4000-8000-000000000001', {
       purpose: 'provision', phase: 'seeding', startedAt: now, updatedAt: now, publicHost: 'h', hostPort: 5440,
       primaryHost: 'p', primaryPort: 5433, slot: 's', parked: true, lastError: 'pg_basebackup failed: connection refused',
     });
-    const status = await getFleetReplicaStatus(containerManager.getBot('b1')!);
+    const status = await getFleetReplicaStatus(containerManager.getBot('b1b1b1b1-0000-4000-8000-000000000001')!);
     expect(status.parkedSeed?.lastError).toBe('pg_basebackup failed: connection refused');
   });
 });

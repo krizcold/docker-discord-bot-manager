@@ -13,7 +13,7 @@ import * as fleetBackup from './fleetBackup';
 import * as fleetJoin from './fleetJoin';
 import * as fleetReplica from './fleetReplica';
 import * as maintenance from './maintenance';
-import { addressTableSql, getJoinCode, REPLICATION_ROLE } from './fleetReplication';
+import { addressTableSql, getJoinCode } from './fleetReplication';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { getBotDir } from '../git/repoManager';
 import {
@@ -21,8 +21,8 @@ import {
 } from './backupFiles';
 import { decodeJoinCode, decodeMoveCode, encodeJoinCode, encodeMoveCode, JoinLogin, MoveCode, sqlLiteral } from '../config/joinCode';
 import {
-  copiesInsertSql, DB_OID_SQL, GEN_READ_SQL, machineNameOf, markIdOf, missingTable, OWN_COPIES_READ_SQL, parseGenRow, pushBrokenOf, raiseSql, RECEIVE_DROP_SQL,
-  RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, replicationRoleEnsureSql, SHARD_CAP_DO_SQL,
+  copiesInsertSql, copyGroupEnsureSql, DB_OID_SQL, GEN_READ_SQL, machineNameOf, markIdOf, missingTable, OWN_COPIES_READ_SQL, parseGenRow, pushBrokenOf, raiseSql, RECEIVE_DROP_SQL,
+  RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, SHARD_CAP_DO_SQL,
 } from './switchSql';
 import {
   clusterSql, ensureMainGeneration, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
@@ -289,8 +289,8 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
   const fence = await switchAdmissionNotice(botId, 'receiving was refused', { skipNotice: true });
   if (fence) return refusal(fence);
   const t = { container: db.containerName, user: db.user };
-  const ensured = await clusterSql(t, replicationRoleEnsureSql(REPLICATION_ROLE));
-  if (!ensured.ok) return refusal(`The manager could not make sure the replication role exists in this database's cluster (${failed(ensured).error}), and a pushed database that grants to it would not restore${NOTHING}`, 500);
+  const ensured = await clusterSql(t, copyGroupEnsureSql());
+  if (!ensured.ok) return refusal(`The manager could not make sure the group of the machines' logins (smdb_copies) exists in this database's cluster (${failed(ensured).error}), and a pushed database that grants to it would not restore${NOTHING}`, 500);
 
   if (prior) {
     const got = await receivedLine(inst, prior);
@@ -545,7 +545,7 @@ export async function pushMain(botId: string, moveCode: string, confirm: boolean
       const fresh = containerManager.getBot(botId);
       if (!fresh) return first;
       const joinText = encodeJoinCode({ v: 1, host: code.host, port: code.port, db: code.db, fp: code.fp, machine: code.machine, repl: code.repl, app: code.app });
-      const re = fleetReplica.reseedStalePrimary(fresh, joinText, fresh.fleetDb?.replication?.publicHost, fresh.fleetDb?.replication?.hostPort, false, { dumpDone: !!safetyDump, ...(safetyDump ? { safetyDump } : {}) });
+      const re = await fleetReplica.reseedStalePrimary(fresh, joinText, fresh.fleetDb?.replication?.publicHost, fresh.fleetDb?.replication?.hostPort, false, { dumpDone: !!safetyDump, ...(safetyDump ? { safetyDump } : {}) });
       return re.success ? first : { ...first, text: `${first.text} Rejoining as a copy did not start: ${re.error}; press Rejoin as a copy.` };
     },
   };
@@ -719,11 +719,11 @@ async function sendPush(inst: InstanceConfig, code: MoveCode, pem: string, p: Pu
   const capped = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'cap', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'recv'), SHARD_CAP_DO_SQL], timeoutMs: MOVE_TIMING.clientMs });
   if (loginGone(capped)) return fail(RECVLOGIN);
   if (!capped.ok) return notMain(capped);
-  const commit = `SET ROLE ${dbLogin.META_LOGIN};\n${raiseSql(code.machine, p.target, `${addressTableSql(code.host, code.port, pem, code.machine, null)}
+  const commit = `SET ROLE ${dbLogin.META_LOGIN};\n${raiseSql(code.machine, p.target, `${addressTableSql(code.host, code.port, pem, code.machine)}
 DELETE FROM smdb_manager.addresses WHERE NOT (host = ${sqlLiteral(code.host)} AND port = ${Number(code.port)});
 INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES (${sqlLiteral(code.recv.id)}, ${sqlLiteral(p.systemId)}, ${sqlLiteral(machineNameOf(inst))}, ${p.target}) ON CONFLICT (push_id) DO NOTHING;
 `)}`;
-  const committed = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'commit', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'meta'), commit], timeoutMs: MOVE_TIMING.clientMs });
+  const committed = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'commit', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.clientMs, input: commit });
   if (loginGone(committed)) return fail(RECVLOGIN);
   if (!committed.ok) return notMain(committed);
   return null;

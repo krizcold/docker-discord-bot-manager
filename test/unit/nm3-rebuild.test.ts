@@ -80,6 +80,7 @@ const REPLICA = {
 const writeRegistry = (over: Record<string, unknown> = {}) => fs.writeFileSync(REGISTRY, JSON.stringify({ instances: { b: {
   id: 'b', sanitizedName: 'b', displayName: 'B', titleName: 'B', status: 'running', sourceType: 'git', sourceUrl: SMDB,
   envVars: { DATA_BACKEND: 'postgres' }, createdAt: '2026-10-24T00:00:00.000Z', updatedAt: '2026-10-24T00:00:00.000Z',
+  fleetLogin: { password: envManager.encrypt('Own-Machine-Secret-01') },
   fleetJoin: fakeJoinRecord(), fleetDbReplica: REPLICA, ...over,
 } } }, null, 2));
 const bot = () => containerManager.getBot('b')!;
@@ -133,7 +134,7 @@ describe('O6: the refresh', () => {
   });
 
   it.each([
-    ['T-17 a refused login', () => { docker.main.fail = 'psql: error: FATAL:  password authentication failed for user "replicator"'; }, /^The main at main.invalid:15432 refused the join code's login/],
+    ['T-17 a refused login', () => { docker.main.fail = 'psql: error: FATAL:  password authentication failed for user "replicator"'; }, /^The main at main.invalid:15432 refused this machine's login/],
     ['T-15 an unreachable main', () => { certSource.fetch = async () => ({ ok: false, reason: 'timeout' }); }, /^Can't reach the main at main.invalid:15432 \(timeout\)/],
     ['T-16 another certificate', () => { certSource.fetch = async () => ({ ok: true, pem: COPY_PEM, fp: 'f'.repeat(64) }); }, /^The database at main.invalid:15432 shows a certificate with fingerprint ffffffffffffffff/],
     ['T-18 a main in recovery', () => { docker.main.inRecovery = true; }, /^The database at main.invalid:15432 follows another database itself/],

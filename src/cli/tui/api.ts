@@ -543,6 +543,8 @@ export interface DeleteDone {
   keptDataDir?: string;
   dbDumpsKept?: { count: number; folder: string };
   keptReplicaVolume?: string;
+  /** What the delete left for another machine's operator (deleteBot's notes, R24). */
+  warning?: string;
 }
 
 export type DeleteAnswer =
@@ -574,6 +576,7 @@ export async function deleteBot(client: Client, botId: string, keepData: boolean
       ...(typeof b.keptDataDir === 'string' && b.keptDataDir ? { keptDataDir: b.keptDataDir } : {}),
       ...(dumps && typeof dumps.count === 'number' && typeof dumps.folder === 'string' ? { dbDumpsKept: { count: dumps.count, folder: dumps.folder } } : {}),
       ...(typeof b.keptReplicaVolume === 'string' && b.keptReplicaVolume ? { keptReplicaVolume: b.keptReplicaVolume } : {}),
+      ...(typeof b.warning === 'string' && b.warning ? { warning: b.warning } : {}),
     },
   };
 }
@@ -1210,12 +1213,25 @@ export interface ReplicationSlot {
   machine?: string | null;
 }
 
+/** One line of the main's Machine logins list (LOGINS_READ_SQL, fleetReplication.ts getFleetReplicationStatus). */
+export interface MachineLogin {
+  login: string;
+  own?: boolean;
+  member?: boolean;
+  canLogin?: boolean;
+  slot?: string | null;
+  slotState?: 'active' | 'kept' | 'lost' | 'absent';
+  machine?: string | null;
+  address?: string | null;
+  client?: string | null;
+}
+
 export interface ReplicationStatus {
   enabled?: boolean;
   disablingSince?: string;
   publicHost?: string;
   hostPort?: number;
-  live?: { sslOn?: boolean; slots?: ReplicationSlot[]; slotWalKeep?: string };
+  live?: { sslOn?: boolean; slots?: ReplicationSlot[]; slotWalKeep?: string; logins?: MachineLogin[] };
   reachability?: { ok?: boolean; unchecked?: boolean; error?: string; ageSeconds?: number };
   probeError?: string;
 }
@@ -1408,6 +1424,16 @@ export function dropReplicationSlot(client: Client, botId: string, slot: string)
   return call(client, 'DELETE', `/api/bots/${botId}/fleet-replication/slots/${encodeURIComponent(slot)}`);
 }
 
+/** DELETE /api/bots/:id/fleet-replication/logins/:login (bots.ts:1895), removeCopyLogin: confirm is sent true only after the server's question. */
+export function removeMachineLogin(client: Client, botId: string, login: string, confirm: boolean): Promise<Outcome<Body>> {
+  return call(client, 'DELETE', `/api/bots/${botId}/fleet-replication/logins/${encodeURIComponent(login)}`, { confirm });
+}
+
+/** POST /api/bots/:id/fleet-replication/join-code/renew (bots.ts:1880), renewJoinCode; no time limit. */
+export function renewJoinCode(client: Client, botId: string): Promise<Outcome<Body>> {
+  return call(client, 'POST', `/api/bots/${botId}/fleet-replication/join-code/renew`, {});
+}
+
 /** DELETE /api/bots/:id/fleet-replica/seed (bots.ts:2226), cancelReplicaSeed (fleetReplica.ts:2086). */
 export function cancelSeed(
   client: Client, botId: string, body: { startedAt: number; parked: boolean; committed?: boolean; confirm?: boolean },
@@ -1443,7 +1469,7 @@ export function finishRetire(client: Client, botId: string): Promise<Outcome<Bod
 }
 
 /** GET /api/bots/:id/fleet-replication/join-code (bots.ts:1864), getJoinCode (src/instance/fleetReplication.ts:962). */
-export function readJoinCode(client: Client, botId: string, limitMs: number): Read<{ joinCode?: string }> {
+export function readJoinCode(client: Client, botId: string, limitMs: number): Read<{ joinCode?: string; note?: string }> {
   return read(client, `/api/bots/${botId}/fleet-replication/join-code`, limitMs);
 }
 

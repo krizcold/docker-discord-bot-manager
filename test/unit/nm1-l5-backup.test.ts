@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { replicationRoleEnsureSql } from '../../src/instance/switchSql';
+import { copyGroupEnsureSql } from '../../src/instance/switchSql';
 
 const h = vi.hoisted(() => {
   const os = require('os') as typeof import('os');
@@ -174,7 +174,7 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     const r = await fleetBackup.runFleetDump({ id: 'b1', fleetDb } as any);
     expect(r.success, r.error).toBe(true);
     expect(h.calls.filter(isHolder)).toEqual([holderArgv]);
-    expect(callWith('pg_dump')).toEqual([['exec', '-e', PIN, C, 'pg_dump', '-U', 'dbm_work', '-d', 'smdb', '-Fc', '--snapshot=00000003-1']]);
+    expect(callWith('pg_dump')).toEqual([['exec', '-e', PIN, C, 'pg_dump', '-U', 'dbm_work', '-d', 'smdb', '-Fc', '-B', '--snapshot=00000003-1']]);
     expect(roleChecks()).toBe(0);
   });
 
@@ -348,7 +348,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     const r = await run(() => '');
     expect(r.success, r.error).toBe(true);
     expect(h.calls).toContainEqual(['exec', C, ...psql('postgres'), '-c', `SELECT count(*) FROM pg_database WHERE datname = 'sm''"db'`]);
-    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', replicationRoleEnsureSql('replicator'), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`,
+    expect(h.calls).toContainEqual([...ex, ...psql('postgres'), '-c', copyGroupEnsureSql(), '-c', `DROP DATABASE IF EXISTS "sm'""db" WITH (FORCE)`, '-c', `CREATE DATABASE "sm'""db" OWNER "smu"`,
       '-c', `GRANT CONNECT, CREATE ON DATABASE "sm'""db" TO dbm_meta; GRANT CONNECT ON DATABASE "sm'""db" TO dbm_work;`]);
     expect(restores()).toEqual([pgRestoreArgv]);
     expect(callWith('pg_restore').filter(a => a.includes('-l'))).toEqual([['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l'],

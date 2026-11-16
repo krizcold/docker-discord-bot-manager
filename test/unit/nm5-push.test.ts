@@ -259,7 +259,7 @@ describe('P23, P24: the received row of this push id (D41)', () => {
       if (step === 'probe') {
         // The receiver counts the rows the probe asks for: this code's push id, or (the built key) any row of this system id.
         const id = /push_id = '([0-9a-f]+)'/.exec(args[args.length - 1])?.[1];
-        return ok(`false\n3|win.example|\n${(id ? rows.has(id) : rows.size > 0) ? 1 : 0}\n`);
+        return ok(`false\n2|win.example|2026-11-01T00:00:00Z\n${(id ? rows.has(id) : rows.size > 0) ? 1 : 0}\n`);
       }
       if (step === 'commit') rows.add(/VALUES \('([0-9a-f]+)'/.exec(args.join(' '))![1]);
       return answers[step] ?? ok();

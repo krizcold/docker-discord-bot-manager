@@ -161,8 +161,9 @@ describe('pushLocked reads before the dump', () => {
     expect((await push('a', CODE)).text).toBe(`The database at win.example:5440 follows another database, so it cannot receive a main${NOTHING}`);
     expect(steps).toEqual(['probe']);
   });
-  it('the target generation above this one sets the new generation', async () => {
-    answers.probe = ok('false\n7|win.example|\n0\n');
+  it('the new generation is one above this side when this side is the higher', async () => {
+    fake.dbs['a-pg'].generation = { generation: 7, machine: 'main.example', since: null };
+    answers.probe = ok('false\n6|win.example|2026-11-01T00:00:00Z\n0\n');
     expect((await push('a', CODE)).text).toContain('win.example is the main now (generation 8);');
   });
   it('the generation read fails: its error is named', async () => {

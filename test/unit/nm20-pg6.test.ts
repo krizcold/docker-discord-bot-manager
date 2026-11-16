@@ -31,7 +31,7 @@ import { certFingerprint, encodeMoveCode } from '../../src/config/joinCode';
 import * as containerManager from '../../src/docker/containerManager';
 import { provisionRoles } from '../../src/instance/dbLogin';
 import { pushMain, receiveLoginsSql, receiveStep, stopReceiving } from '../../src/instance/fleetMove';
-import { DB_OID_SQL, ensureGenerationSql, replicationRoleEnsureSql } from '../../src/instance/switchSql';
+import { DB_OID_SQL, ensureGenerationSql, raiseSql, replicationRoleEnsureSql } from '../../src/instance/switchSql';
 import { type Cluster, docker, dockerRuns, provisionedCluster } from './pg-cluster';
 
 const ID = `nm20pg6${process.pid}`;
@@ -173,6 +173,8 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 part 6: the p
     ['fails (C4, fix 5b)', true, PUSH_ID2],
   ] as const)('PG11, S12, Y3 with Z2: the push runs each step as its login; its last step %s; the receiver keeps Invariant A, and finishReceive drops both logins', async (_n, failLast, pushId) => {
     receiving(`pg11-receive-pw-${pushId}`, `pg11-meta-pw-${pushId}`, pushId);
+    // The first row left the receiver at generation 2; the sender is raised above it so the push is not refused.
+    if (failLast) ok(send.psql('dbm_meta', raiseSql('snd.example', 3), DB));
     if (failLast) admin(recv, "ALTER ROLE smdb_receive SET smdb_test.fail_last = 'on'");
     const code = encodeMoveCode({
       v: 1, host: gateway, port: PORT, db: DB, fp: certFingerprint(pem), machine: 'rcv.example',

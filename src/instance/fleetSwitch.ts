@@ -222,23 +222,26 @@ export async function ownGeneration(t: Target, db: string): Promise<{ ok: true; 
 
 const ensureLogged = new Map<string, string>();
 
+export type EnsureOutcome = { kind: 'skipped'; why: string } | { kind: 'wrote' } | { kind: 'failed'; error: string };
+
 /** N-a: the generation row on a main that has none; skipped while a restore notice stands, never fence-exempt. */
-export async function ensureMainGeneration(botId: string): Promise<void> {
+export async function ensureMainGeneration(botId: string): Promise<EnsureOutcome> {
   const inst = containerManager.getBot(botId);
   const db = inst?.fleetDb;
-  if (!inst || !db || db.retiringAt) return;
+  if (!inst || !db || db.retiringAt) return { kind: 'skipped', why: 'this instance holds no main database' };
   // D42: a receiving main writes nothing of its own into the database a push replaces.
-  if (db.receive || db.pushBroken) return;
-  if (fleetBackup.shownRestoreNoticeFile(botId)) return;
+  if (db.receive || db.pushBroken) return { kind: 'skipped', why: db.receive ? 'this database is waiting to receive a push' : 'a push into this database did not finish' };
+  if (fleetBackup.shownRestoreNoticeFile(botId)) return { kind: 'skipped', why: 'a restore notice stands' };
   const t = { container: db.containerName, user: db.user };
   const read = await readGeneration(t, db.db);
-  if (read.ok && read.row) return;
+  if (read.ok && read.row) return { kind: 'skipped', why: 'the row was already there' };
   const r = await metaSql(t, db.db, ensureGenerationSql(machineNameOf(inst)));
   const error = r.ok ? '' : failText(r);
   if (ensureLogged.get(botId) !== error) {
     ensureLogged.set(botId, error);
     if (error) console.warn(`[Switch] ${inst.displayName}: the generation row could not be written (${error}); the manager tries again every minute`);
   }
+  return error ? { kind: 'failed', error } : { kind: 'wrote' };
 }
 
 // ─── Pure verdicts ───

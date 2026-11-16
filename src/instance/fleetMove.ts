@@ -25,7 +25,7 @@ import {
   RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, replicationRoleEnsureSql, SHARD_CAP_DO_SQL,
 } from './switchSql';
 import {
-  clusterSql, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
+  clusterSql, ensureMainGeneration, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
   SWITCH_TIMING, switchAdmissionNotice, workSql,
 } from './fleetSwitch';
 import { FleetDbReceive, InstanceConfig, JoinAddress } from '../types';
@@ -588,8 +588,18 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
       return out(refusal(`${where} already holds the push made with this move code, and ${why}, so nothing was pushed or changed here. If this database should move there, press Receive again on that machine and push with the new move code.`));
     }
   }
+  const ensured = already ? null : await ensureMainGeneration(botId);
   const own = await ownGeneration(t, db.db);
   if (!own.ok) return out(refusal(`The manager could not read this database's generation (${own.error})${NOTHING}`));
+  if (ensured && !own.row) {
+    const why = ensured.kind === 'failed' ? `writing it failed (${ensured.error})` : ensured.kind === 'skipped' ? `the manager did not write it (${ensured.why})` : 'the write ran but left no row (a database in recovery takes none)';
+    return out(refusal(`The push was refused: this database has no generation row, and ${why}${NOTHING}`));
+  }
+  const ownGen = own.row?.generation ?? 0;
+  const ownMachine = own.row?.machine || machineNameOf(inst);
+  if (!already && theirGen && (theirGen.generation > ownGen || (theirGen.generation === ownGen && theirGen.generation > 1 && theirGen.machine !== ownMachine))) {
+    return out(refusal(`The push was refused: ${where} holds a newer main than this database (generation ${theirGen.generation} from ${theirGen.machine || where}; this database is at generation ${ownGen} from ${ownMachine}), so a push would replace its data with older data${NOTHING}`));
+  }
   const target = Math.max(own.row?.generation ?? 0, theirGen?.generation ?? 0) + 1;
 
   let file = db.handover?.mode === 'push' ? db.handover.file ?? '' : '';

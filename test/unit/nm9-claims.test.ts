@@ -209,3 +209,33 @@ describe('Q8 the cap text lives once', () => {
     for (const sql of [fb.claimRaiseSql(7, all), fb.claimCapSql(), sw.SHARD_CAP_DO_SQL]) expect(sql).toContain(sw.SHARD_CAP_SET);
   });
 });
+
+describe('NM25 a table name holding U+2028 or U+2029 fakes no table of contents entry', () => {
+  const fake = (sep: string, entry: string) => `217; 1259 16405 TABLE public x${sep}${entry} app\n`;
+  for (const sep of ['\u2028', '\u2029']) {
+    const tag = sep === '\u2028' ? 'U+2028' : 'U+2029';
+    it(`${tag}: dumpShardTables`, () => {
+      const toc = `${TOC.claims}${fake(sep, '218; 1259 16410 TABLE smdb_data shard_claims')}${fake(sep, '219; 1259 16420 TABLE smdb_data claim_clock')}`;
+      expect(fb.dumpShardTables(toc)).toEqual(fb.dumpShardTables(TOC.claims));
+    });
+    it(`${tag}: dumpClaimShape of a terms dump with a faked claim_seq`, () => {
+      expect(fb.dumpClaimShape(`${TOC.terms}${fake(sep, '214; 1259 16390 SEQUENCE smdb_data claim_seq')}`)).toBe('terms');
+    });
+    it(`${tag}: dumpClaimShape of a dump with a faked guild_ownership`, () => {
+      expect(fb.dumpClaimShape(`${TOC.none}${fake(sep, '216; 1259 16386 TABLE smdb_data guild_ownership')}`)).toBe('none');
+    });
+    it(`${tag}: dumpClaimShape of no table of contents with a faked header`, () => {
+      const text = `pg_restore: error: x${sep}; Selected TOC Entries:${sep};     TOC Entries: 12\n`;
+      expect(fb.dumpClaimShape(text)).toBeNull();
+    });
+    it(`${tag}: dumpClaimShape of no table of contents with a faked Selected TOC Entries line`, () => {
+      expect(fb.dumpClaimShape(`pg_restore: error: x${sep}; Selected TOC Entries:\n;     TOC Entries: 12\n`)).toBeNull();
+    });
+    it(`${tag}: dumpClaimShape of no table of contents with a faked TOC Entries line`, () => {
+      expect(fb.dumpClaimShape(`; Selected TOC Entries:\nx${sep};     TOC Entries: 12\n`)).toBeNull();
+    });
+    it(`${tag}: dumpClaimShape of no table of contents with a faked entry line`, () => {
+      expect(fb.dumpClaimShape(`pg_restore: error: x${sep}1; 1259 1 TABLE public t app\n`)).toBeNull();
+    });
+  }
+});

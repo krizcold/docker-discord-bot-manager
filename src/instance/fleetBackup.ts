@@ -1934,16 +1934,19 @@ export function parseClaimCap(stdout: string): { ok: true; expired: number; cloc
   return { ok: true, expired: capped, clock: checked.clock };
 }
 
+/** Whether a line of a `pg_restore -l` text matches re: split on \n only, since /m would also break lines at U+2028 and U+2029 inside a name. */
+const tocHasLine = (toc: string, re: RegExp) => toc.split('\n').some(line => re.test(line));
+
 /** Whether a dump's `pg_restore -l` lists NB4's shard claims table and its claim clock table (a TABLE DATA line alone counts for neither). */
 export function dumpShardTables(toc: string): { shards: boolean; clock: boolean } {
-  return { shards: /^\d+; \d+ \d+ TABLE smdb_data shard_claims /m.test(toc), clock: /^\d+; \d+ \d+ TABLE smdb_data claim_clock /m.test(toc) };
+  return { shards: tocHasLine(toc, /^\d+; \d+ \d+ TABLE smdb_data shard_claims /), clock: tocHasLine(toc, /^\d+; \d+ \d+ TABLE smdb_data claim_clock /) };
 }
 
 /** What a dump's `pg_restore -l` lists: the claim sequence, the term schema's ownership table without it, or neither (also for the header alone that a database with no objects lists); null when it is no table of contents. */
 export function dumpClaimShape(toc: string): 'claims' | 'terms' | 'none' | null {
-  if (!/^\d+; /m.test(toc)) return /^; Selected TOC Entries:\r?$/m.test(toc) && /^;\s+TOC Entries: [1-9]\d*\r?$/m.test(toc) ? 'none' : null;
-  if (/^\d+; \d+ \d+ SEQUENCE smdb_data claim_seq /m.test(toc)) return 'claims';
-  if (/^\d+; \d+ \d+ TABLE smdb_data guild_ownership /m.test(toc)) return 'terms';
+  if (!tocHasLine(toc, /^\d+; /)) return tocHasLine(toc, /^; Selected TOC Entries:\r?$/) && tocHasLine(toc, /^;\s+TOC Entries: [1-9]\d*\r?$/) ? 'none' : null;
+  if (tocHasLine(toc, /^\d+; \d+ \d+ SEQUENCE smdb_data claim_seq /)) return 'claims';
+  if (tocHasLine(toc, /^\d+; \d+ \d+ TABLE smdb_data guild_ownership /)) return 'terms';
   return 'none';
 }
 
@@ -2255,10 +2258,10 @@ export function countsToCompare(recorded: Record<string, number>, restored: Reco
 }
 
 /** A dump without a counts file: the restored counts its counts file would hold, so no manager table the dump lacks that the manager's DDL made empty. */
-function unrecordedCounts(restored: Record<string, number>, toc: string): Record<string, number> {
+export function unrecordedCounts(restored: Record<string, number>, toc: string): Record<string, number> {
   const res = { ...restored };
   for (const t of MANAGER_TABLES) {
-    const held = new RegExp(`^\\d+; \\d+ \\d+ TABLE smdb_manager ${t.slice('smdb_manager.'.length)} `, 'm').test(toc);
+    const held = tocHasLine(toc, new RegExp(`^\\d+; \\d+ \\d+ TABLE smdb_manager ${t.slice('smdb_manager.'.length)} `));
     if (!held && res[t] === 0) delete res[t];
   }
   return res;

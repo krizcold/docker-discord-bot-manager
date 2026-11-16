@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { metaTocGaps, parseQualifiedName } from '../../src/instance/backupFiles';
 import { COUNTS_OF, TOC } from './restore-fake';
+import { unrecordedCounts } from '../../src/instance/fleetBackup';
 
 const HEAD = TOC.empty;
 
@@ -70,4 +71,18 @@ describe('metaTocGaps', () => {
   it('F14 a recorded name that does not parse', () => {
     expect(metaTocGaps({ 'a.b.c': 1 }, TOC.claims)).toEqual(['a.b.c: not a schema and table name']);
   });
+});
+
+describe('NM25 a table name holding U+2028 or U+2029 fakes no table of contents entry', () => {
+  for (const sep of ['\u2028', '\u2029']) {
+    it(`${sep === '\u2028' ? 'U+2028' : 'U+2029'}: metaTocGaps`, () => {
+      const toc = `${TOC.none}217; 1259 16405 TABLE public x${sep}220; 1259 16500 TABLE smdb_manager generation app\n`;
+      expect(metaTocGaps({ 'smdb_manager.generation': 0 }, toc)).toEqual(metaTocGaps({ 'smdb_manager.generation': 0 }, TOC.none));
+    });
+    it(`${sep === '\u2028' ? 'U+2028' : 'U+2029'}: unrecordedCounts`, () => {
+      const toc = `${TOC.none}217; 1259 16405 TABLE public x${sep}220; 1259 16500 TABLE smdb_manager generation app\n`;
+      const restored = { 'public.t': 3, 'smdb_manager.generation': 0 };
+      expect(unrecordedCounts(restored, toc)).toEqual(unrecordedCounts(restored, TOC.none));
+    });
+  }
 });

@@ -125,6 +125,10 @@ describe('R16-38: generated backing services get per-instance passwords, never t
     expect(decodeURIComponent(new URL(doc.services.bot.environment.DATABASE_URL).password)).toBe('pg-secret');
   });
 
+  it('the generated postgres creates its volume with data checksums', () => {
+    const doc = YAML.parse(generateCompose(bot(), detect(['postgres']), '/tmp/x', 'img', secrets));
+    expect(doc.services.postgres.environment.POSTGRES_INITDB_ARGS).toBe('--data-checksums');
+  });
   it('a detected database with no password on record refuses instead of falling back', () => {
     expect(() => generateCompose(bot(), detect(['postgres']), '/tmp/x', 'img', {})).toThrow(/No password is on record for the generated postgres service/);
   });

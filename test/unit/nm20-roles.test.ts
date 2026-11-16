@@ -745,7 +745,7 @@ describe('the compose (3.1, S8)', () => {
   const services = (content: string) => (parseDocument(content).toJSON() as any).services;
   it('the database starts with dbm_admin as its first role, the bot password, and reserved_connections=4', () => {
     const svc = services(addFleetPostgresService(base, bot, { containerName: 'pg', volume: 'v', password: 'p', user: 'u', db: 'd' }))['fleet-postgres'];
-    expect(svc.environment).toEqual({ POSTGRES_USER: 'dbm_admin', POSTGRES_DB: 'd', POSTGRES_PASSWORD: 'p' });
+    expect(svc.environment).toEqual({ POSTGRES_USER: 'dbm_admin', POSTGRES_DB: 'd', POSTGRES_PASSWORD: 'p', POSTGRES_INITDB_ARGS: '--data-checksums' });
     expect(svc.environment.POSTGRES_USER).toBe(MANAGER_DB_ROLE);
     expect(svc.command).toEqual(['postgres', '-c', 'reserved_connections=4']);
     expect(svc.healthcheck.test).toEqual(['CMD-SHELL', 'pg_isready -U u -d d']);

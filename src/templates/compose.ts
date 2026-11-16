@@ -278,7 +278,8 @@ function addPostgres(compose: ComposeFile, botService: ComposeService, botId: st
     environment: {
       POSTGRES_USER: 'bot',
       POSTGRES_PASSWORD: composeEnvValue(pw),
-      POSTGRES_DB: 'bot_data'
+      POSTGRES_DB: 'bot_data',
+      POSTGRES_INITDB_ARGS: '--data-checksums'
     },
     volumes: [{ type: 'volume', source: volName, target: '/var/lib/postgresql/data' }],
     labels: dbLabels(botId, 'database'),

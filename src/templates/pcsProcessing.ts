@@ -1420,6 +1420,7 @@ export function addFleetPostgresService(
       POSTGRES_USER: 'dbm_admin',
       POSTGRES_DB: db.db,
       POSTGRES_PASSWORD: db.password,
+      POSTGRES_INITDB_ARGS: '--data-checksums',
     },
     command: [...FLEET_POSTGRES_COMMAND],
     volumes: [{ type: 'volume', source: volumeKey, target: '/var/lib/postgresql/data' }],

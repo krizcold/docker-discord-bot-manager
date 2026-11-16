@@ -1550,13 +1550,18 @@ async function clearRestorePending(inst: InstanceConfig): Promise<void> {
   if (fleetBackup.shownRestoreNoticeFile(inst.id)) return;
   const t = { container: db.containerName, user: db.user };
   const rs = await readRestoreState(t);
-  if (!rs.ok || !rs.state?.pending) return;
+  if (!rs.ok) return;
+  if (!rs.state?.pending) {
+    fleetBackup.restoreRecordCleared(inst.id);
+    return;
+  }
   const fence = await dbLogin.readWriteFence(t);
   if (!fence.ok || fence.on) return;
   const login = await dbLogin.readBotLogin(t);
   if (!login.ok || login.login.inRecovery) return;
   const r = await clusterSql(t, RESTORE_STATE_CLEAR);
-  if (!r.ok) console.warn(`[Switch] ${inst.displayName}: the restore record could not be marked finished (${failText(r)})`);
+  if (r.ok) fleetBackup.restoreRecordCleared(inst.id);
+  else console.warn(`[Switch] ${inst.displayName}: the restore record could not be marked finished (${failText(r)})`);
 }
 
 /** The RV-LOG-STALEFAIL error last logged per bot; deleted when a stale mark is removed. */

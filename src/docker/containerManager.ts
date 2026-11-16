@@ -1005,7 +1005,7 @@ export function deployedComposeEnvValues(botId: string, keys: string[], activeOn
 }
 
 /** Set or clear a failed restore's notice. Throws when the registry cannot be saved. */
-export function updateInstanceFleetRestoreError(botId: string, notice: { file: string; text: string; at: string; doubt: boolean } | null): void {
+export function updateInstanceFleetRestoreError(botId: string, notice: InstanceConfig['fleetRestoreError'] | null): void {
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return;

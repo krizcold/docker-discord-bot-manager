@@ -320,6 +320,17 @@ export interface FleetBackupAlert {
   dmRepeat?: true;                    // the bot had already posted this key
 }
 
+export interface FleetRestoreNotice {
+  file: string;
+  text: string;
+  at: string;
+  doubt: boolean;
+  /** The pre-restore dump holding the database as it was before the restore of file (null: that restore found the database missing); absent when not recorded. */
+  asWas?: { dump: string | null; file: string };
+  /** Written before any drop by a restore that followed no unfinished one: without asWas, the database is as it was. */
+  beforeDrop?: true;
+}
+
 export interface InstanceConfig {
   id: string;
   sourceId: string | null;             // FK to SourceMeta.id (null for docker-image)
@@ -355,7 +366,7 @@ export interface InstanceConfig {
   fleetDbPinsWarning?: string;         // the last retire of the database env pins could not edit a deployed compose; cleared by a clean retire
   projectVolumes?: string[];          // every {project}_ volume this instance's deployed composes have declared (union over deploys)
   projectVolumesUnverified?: boolean; // a deploy or Remove found its compose unreadable, so projectVolumes may be incomplete
-  fleetRestoreError?: { file: string; text: string; at: string; doubt: boolean }; // a restore's notice, the time it was written, and whether it leaves the data in doubt; Running is refused while it stands
+  fleetRestoreError?: FleetRestoreNotice; // a restore's notice, the time it was written, and whether it leaves the data in doubt; Running is refused while it stands
   fleetBackup?: FleetBackupConfig;     // backup schedule; absent = defaults
   fleetBackupTests?: Partial<Record<BackupFamily, FleetBackupTests>>; // the daily test restore of each family
   fleetBackupAlerts?: Record<string, FleetBackupAlert>; // standing backup alerts by <family>:<dumps|test>

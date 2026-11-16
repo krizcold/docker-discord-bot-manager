@@ -454,10 +454,13 @@ describe('NM4 L5 e: the restore lane past the admission', () => {
     expect(pg.sql.filter(s => s.endsWith('SELECT pg_reload_conf()') && !s.includes('ALTER SYSTEM')).length).toBe(RELOADS_ON_SUCCESS);
   });
 
-  it('a failed rewrite logs it', async () => {
+  it('a failed rewrite refuses the restore before the drop', async () => {
     pg.at.dump = () => { pg.saveFails = true; };
-    await restore();
-    expect(errorLines()).toContain("[FleetBackup] Could not add the safety dump's name to the restore notice for a: ENOSPC: no space left on device");
+    const r = await restore();
+    expect(r.success).toBe(false);
+    expect(dropped()).toBe(false);
+    expect(r.error).toContain('The restore could not record the name of its safety dump before dropping the database, so the restore was refused');
+    expect(r.error).toContain('ENOSPC: no space left on device');
   });
 
   it('the sharers are released before the notice clear', async () => {

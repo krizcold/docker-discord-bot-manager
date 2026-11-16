@@ -22,9 +22,9 @@ import { addressTableSql } from '../../src/instance/fleetReplication';
 import { fenceHbaScript } from '../../src/instance/fleetBackup';
 import { peerProbe } from '../../src/instance/fleetJoin';
 import {
-  COPIES_READ_SQL, COPIES_SYNC_SQL, DB_OID_SQL, ensureGenerationSql, GEN_READ_SQL, pushBrokenOf, GENERATION_SCHEMA_SQL, generationAfterRestore, generationBefore, parseGenRow, parseRestoreState, raiseSql,
+  COPIES_READ_SQL, COPIES_SYNC_SQL, DB_OID_SQL, ensureGenerationSql, GEN_READ_SQL, pushBrokenOf, GENERATION_SCHEMA_SQL, generationAfterRestore, generationBefore, parseGenRow, parseRestoreState, parseRestoreStateBefore, raiseSql,
   missingTable, parseReceiveMark, RECEIVE_DROP_SQL, RECEIVE_END_SQL, RECEIVE_MARK_COUNT_SQL, RECEIVE_MARK_READ_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql,
-  replicationRoleEnsureSql, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, restoreStateUpsertSql, takeoverBlockScript, takeoverLiftScript,
+  replicationRoleEnsureSql, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, restoreStateBackSql, restoreStateUpsertSql, takeoverBlockScript, takeoverLiftScript,
 } from '../../src/instance/switchSql';
 import { provisionedCluster } from './pg-cluster';
 
@@ -177,14 +177,25 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM5 switch and mov
   }, 300000);
 
   it('PG9 the restore record: upserted under the read-only setting in the exempt session, kept higher, left by a drop, replicated, cleared', () => {
+    ok(MAIN, 'DROP TABLE IF EXISTS smdb_manager.restore_state;', 'postgres');
     ok(MAIN, 'CREATE DATABASE scratch OWNER smdb;');
     ok(MAIN, 'ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();', 'postgres');
     try {
       const up = run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateUpsertSql('a.dump', { generation: 5, machine: 'main', since: null })]);
       expect(up.status, up.err).toBe(0);
-      expect(up.out.split('\n').pop()).toBe('5|main|');
+      // run() trims, so the empty first line of an upsert with no record before it does not show.
+      expect(up.out).toBe('5|main|');
       const lower = run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateUpsertSql('b.dump', { generation: 3, machine: 'x', since: null })]);
-      expect(lower.out.split('\n').pop()).toBe('5|main|');
+      expect(lower.out).toBe('true|a.dump\n5|main|');
+      expect(parseRestoreStateBefore(lower.out)).toEqual({ pending: true, file: 'a.dump' });
+      const back = run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateBackSql({ pending: true, file: "o'k.dump" })]);
+      expect(back.status, back.err).toBe(0);
+      expect(parseRestoreState(ok(MAIN, RESTORE_STATE_READ, 'postgres'))).toMatchObject({ pending: true, file: "o'k.dump", floor: { generation: 5 } });
+      const none = run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateBackSql(null)]);
+      expect(none.status, none.err).toBe(0);
+      expect(parseRestoreState(ok(MAIN, RESTORE_STATE_READ, 'postgres'))).toMatchObject({ pending: false, file: "o'k.dump", floor: { generation: 5 } });
+      const again = run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tAq', '-v', 'ON_ERROR_STOP=1', '-c', restoreStateUpsertSql('b.dump', { generation: 3, machine: 'x', since: null })]);
+      expect(again.out).toBe("false|o'k.dump\n5|main|");
       expect(run(['exec', '-i', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', MAIN, 'psql', '-X', '-U', 'smdb', '-d', 'postgres', '-c', 'DROP DATABASE scratch WITH (FORCE)']).status).toBe(0);
     } finally {
       ok(MAIN, 'ALTER SYSTEM RESET default_transaction_read_only; SELECT pg_reload_conf();', 'postgres');

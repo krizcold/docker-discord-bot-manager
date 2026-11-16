@@ -239,9 +239,10 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         const m = /now\(\), (\d+), '([^']*)', (?:'([^']*)'::timestamptz|NULL)/.exec(sql);
         const g = m ? Number(m[1]) : 0;
         const prior = claimDb.restoreState;
+        const before = prior ? `${prior.pending}|${prior.file}` : '';
         const higher = !prior || g > prior.generation;
         claimDb.restoreState = { pending: true, file: (/VALUES \(true, true, '([^']*)'/.exec(sql) ?? [])[1] ?? '', generation: higher ? g : prior!.generation, machine: higher ? (m?.[2] ?? '') : prior!.machine, since: higher ? (m?.[3] ?? null) : prior!.since };
-        return cb(null, `${claimDb.restoreState.generation}|${claimDb.restoreState.machine}|${claimDb.restoreState.since ?? ''}\n`, '');
+        return cb(null, `${before}\n${claimDb.restoreState.generation}|${claimDb.restoreState.machine}|${claimDb.restoreState.since ?? ''}\n`, '');
       }
       if (sql.includes('DELETE FROM smdb_manager.receive_mark')) {
         claimDb.genEvents.push('mark-clear');
@@ -252,6 +253,15 @@ export function withRestoreFakes<F extends ExecFileFake>(fake: F): F {
         claimDb.genEvents.push('state-clear');
         if (claimDb.fail === 'clear') return fail('connection reset by peer');
         if (claimDb.restoreState) claimDb.restoreState.pending = false;
+        return cb(null, '', '');
+      }
+      const putBack = /UPDATE smdb_manager\.restore_state SET \(pending, file\) = \((true|false), (?:'((?:[^']|'')*)'|file)\)/.exec(sql);
+      if (putBack) {
+        claimDb.genEvents.push('state-put-back');
+        if (claimDb.restoreState) {
+          claimDb.restoreState.pending = putBack[1] === 'true';
+          if (putBack[2] !== undefined) claimDb.restoreState.file = putBack[2].replace(/''/g, "'");
+        }
         return cb(null, '', '');
       }
       if (sql.includes('INSERT INTO smdb_manager.generation')) {

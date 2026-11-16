@@ -226,7 +226,11 @@ export function parseGenRow(text: string): GenRow | null | undefined {
   return { generation, machine: m[2], since: m[3] || null };
 }
 
-/** The restore record's upsert under the fence, before the drop: the floor only rises. Answers the kept floor; sent as one -c string, which runs as one transaction. */
+/**
+ * The restore record's upsert under the fence, before the drop: the floor only rises. Answers two lines: the record as
+ * it stood before (`<pending>|<file>`, empty when there was none), then the kept floor. Sent as one -c string, which
+ * runs as one transaction.
+ */
 export function restoreStateUpsertSql(file: string, live: GenRow | null): string {
   const g = live?.generation ?? 0;
   const machine = live ? sqlLiteral(machineText(live.machine)) : "''";
@@ -236,14 +240,30 @@ CREATE TABLE IF NOT EXISTS smdb_manager.restore_state (
   one_row boolean PRIMARY KEY DEFAULT true CHECK (one_row), pending boolean NOT NULL, file text NOT NULL,
   at timestamptz NOT NULL, generation bigint NOT NULL CHECK (generation >= 0), machine text NOT NULL,
   since timestamptz);
+WITH was AS (SELECT pending, file FROM smdb_manager.restore_state)
 INSERT INTO smdb_manager.restore_state AS r (one_row, pending, file, at, generation, machine, since)
   VALUES (true, true, ${sqlLiteral(file)}, now(), ${g}, ${machine}, ${since})
   ON CONFLICT (one_row) DO UPDATE SET pending = true, file = EXCLUDED.file, at = EXCLUDED.at,
     generation = GREATEST(r.generation, EXCLUDED.generation),
     machine = CASE WHEN EXCLUDED.generation > r.generation THEN EXCLUDED.machine ELSE r.machine END,
     since = CASE WHEN EXCLUDED.generation > r.generation THEN EXCLUDED.since ELSE r.since END
-  RETURNING generation || '|' || machine || '|'
+  RETURNING coalesce((SELECT was.pending::text || '|' || was.file FROM was), '') || chr(10)
+    || generation || '|' || machine || '|'
     || coalesce(to_char(since AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '');`;
+}
+
+/** The record as it stood before restoreStateUpsertSql ran, from the first of its two lines; null when there was none. */
+export function parseRestoreStateBefore(text: string): { pending: boolean; file: string } | null {
+  const lines = text.split('\n').map(l => l.trim());
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  if (lines.length < 2) return null;
+  const m = /^(true|false)\|(.*)$/.exec(lines[lines.length - 2]);
+  return m ? { pending: m[1] === 'true', file: m[2] } : null;
+}
+
+/** The record's pending flag and file put back as parseRestoreStateBefore read them; with none before, not pending. The floor stays. */
+export function restoreStateBackSql(before: { pending: boolean; file: string } | null): string {
+  return `UPDATE smdb_manager.restore_state SET (pending, file) = (${before?.pending ? 'true' : 'false'}, ${before ? sqlLiteral(before.file) : 'file'})`;
 }
 
 export const RESTORE_STATE_CLEAR = `DO $$ BEGIN

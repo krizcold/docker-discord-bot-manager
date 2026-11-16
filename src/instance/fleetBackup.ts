@@ -21,7 +21,7 @@ import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import { findAppCapabilities } from '../config/appCapabilities';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from '../config/fileModes';
-import { ContainerInfo, InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, JoinAddress } from '../types';
+import { ContainerInfo, InstanceConfig, FleetBackupConfig, BackupFamily, FleetBackupAlert, FleetBackupTestRecord, FleetRestoreNotice, JoinAddress } from '../types';
 import {
   ALERT_AFTER_MS, backupDir, compareCounts, COPY_FILE_PREFIX, COUNTS_SQL, DumpKind, errorLine, isRecoveryConflict, STDERR_KEEP, DumpMeta, dumpDue, dumpFileName, hourSlot, holderStdin, metaTocGaps, newestScheduled, parseCountLines, parseDumpName,
   ScheduledKind, stampOf, testDue, trimVictims, utcText, validateDumpMeta,
@@ -34,7 +34,7 @@ import { MANAGER_DB_ROLE } from './dbLogin';
 import { addressTableSql, REPLICATION_ROLE } from './fleetReplication';
 import { parseAddressRows, readCopyCert, validAddress } from './fleetJoin';
 import {
-  copiesInsertSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow,
+  copiesInsertSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
   raiseSql, receiveMarkClearSql, replicationRoleEnsureSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
 } from './switchSql';
 import { readDatabaseUrl } from '../config/databaseUrl';
@@ -110,7 +110,10 @@ function clearStuck(botId: string, containerName: string): void {
 }
 const isStuck = (botId: string, containerName: string) => fenceStuck.get(botId)?.has(containerName) === true;
 
-type RestoreNotice = { file: string; text: string; at: string; doubt: boolean };
+type RestoreNotice = FleetRestoreNotice;
+type AsWas = FleetRestoreNotice['asWas'];
+type NoticeExtra = Pick<FleetRestoreNotice, 'asWas' | 'beforeDrop'>;
+const extraOf = (extra: NoticeExtra): NoticeExtra => ({ ...(extra.asWas ? { asWas: extra.asWas } : {}), ...(extra.beforeDrop ? { beforeDrop: true as const } : {}) });
 
 /** The restore notice's text: a restore that has not finished, or did not end with its fence lifted. */
 export function getFleetRestoreError(botId: string): string | null {
@@ -149,6 +152,15 @@ export function shownRestoreNoticeFile(botId: string): string | null {
 // Notices the registry could not save; read before the record, which then holds an older notice or none.
 const unsavedRestoreErrors: Map<string, RestoreNotice> = new Map();
 
+// The file of a good restore whose restore record could not be marked finished, per bot: a pending record for it
+// is not a restore that did not finish.
+const unclearedRecords: Map<string, string> = new Map();
+
+/** The restore record of the bot was marked finished. */
+export function restoreRecordCleared(botId: string): void {
+  unclearedRecords.delete(botId);
+}
+
 function restoreNotice(botId: string): RestoreNotice | null {
   const instance = containerManager.getBot(botId);
   if (!instance?.fleetDb) {
@@ -159,9 +171,9 @@ function restoreNotice(botId: string): RestoreNotice | null {
 }
 
 /** Saves a notice, stamped now unless at is given; the registry's error when it could not. */
-function saveNotice(botId: string, file: string, text: string, doubt: boolean, at = new Date().toISOString()): string | null {
+function saveNotice(botId: string, file: string, text: string, doubt: boolean, extra: NoticeExtra = {}, at = new Date().toISOString()): string | null {
   try {
-    containerManager.updateInstanceFleetRestoreError(botId, { file, text, at, doubt });
+    containerManager.updateInstanceFleetRestoreError(botId, { file, text, at, doubt, ...extraOf(extra) });
     unsavedRestoreErrors.delete(botId);
     return null;
   } catch (err) {
@@ -170,18 +182,18 @@ function saveNotice(botId: string, file: string, text: string, doubt: boolean, a
 }
 
 /** Saves a notice, or holds it in memory, marked as such, when the registry cannot save it. */
-function keepNotice(botId: string, file: string, text: string, doubt: boolean, at = new Date().toISOString()): void {
+function keepNotice(botId: string, file: string, text: string, doubt: boolean, extra: NoticeExtra = {}, at = new Date().toISOString()): void {
   const scrubbedText = scrubbed(botId, text);
-  const failed = saveNotice(botId, file, scrubbedText, doubt, at);
+  const failed = saveNotice(botId, file, scrubbedText, doubt, extra, at);
   if (!failed) return;
   console.error(`[FleetBackup] Could not save the restore notice for ${botId}: ${failed}`);
-  unsavedRestoreErrors.set(botId, { file, text: `${scrubbedText}${UNSAVED_MARK}`, at, doubt });
+  unsavedRestoreErrors.set(botId, { file, text: `${scrubbedText}${UNSAVED_MARK}`, at, doubt, ...extraOf(extra) });
 }
 
 const UNSAVED_MARK = ' (this notice is not saved and a manager restart drops it)';
 
-function setRestoreError(botId: string, file: string, reason: string, consequence: string): void {
-  keepNotice(botId, file, `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`, true);
+function setRestoreError(botId: string, file: string, reason: string, consequence: string, asWas: AsWas): void {
+  keepNotice(botId, file, `Restore of ${file} failed: ${reason}. ${consequence}; restore a dump again before the bot relies on it`, true, { asWas });
 }
 
 /** The write fences a lane left on, one text per database; null when none. */
@@ -2430,6 +2442,27 @@ async function restoreLocked(
   // The notice that stood before this lane, put back by an exit before the drop whose lift ended lifted.
   const priorNotice = containerManager.getBot(botId)?.fleetRestoreError ?? null;
   const priorUnsaved = unsavedRestoreErrors.get(botId) ?? null;
+  // A standing notice that leaves the data in doubt is a restore that did not finish; the restore record's upsert
+  // below is the second way to learn of one, read only when no notice stood. Its dump, not this lane's, holds the
+  // database as it was. A notice written before any drop and naming no dump left the database as it was.
+  const standing = priorUnsaved ?? priorNotice;
+  const unfinished = standing && standing.doubt !== false && !(standing.beforeDrop && !standing.asWas) ? standing : null;
+  let earlierRestore: { file: string; asWas: AsWas } | null = unfinished ? { file: unfinished.file, asWas: unfinished.asWas } : null;
+  // What this lane's notices record from its pre-restore dump step on.
+  const asWas = (): AsWas => (earlierRestore ? earlierRestore.asWas : { dump: steps.preRestoreDump, file });
+  // Before the drop: what is known so far, or the mark that this lane left the database as it was.
+  const knownAsWas = (): NoticeExtra => (earlierRestore ? { asWas: earlierRestore.asWas }
+    : steps.preRestoreDump ? { asWas: { dump: steps.preRestoreDump, file } } : { beforeDrop: true });
+  // Names the dump holding the database as it was; plain when no unfinished restore came before this one.
+  const backText = (plain: string): string => {
+    if (!earlierRestore) return plain;
+    const own = steps.preRestoreDump
+      ? `the pre-restore dump ${steps.preRestoreDump} holds the database ${earlierRestore.asWas ? `the unfinished restore of ${earlierRestore.file} left` : 'that restore left'}`
+      : 'no pre-restore dump was taken now, because the database was missing';
+    const was = earlierRestore.asWas;
+    if (!was) return `a restore of ${earlierRestore.file} did not finish before this one, and the manager has no record of which dump holds the database as it was before it; ${own}`;
+    return `${was.dump ? `the pre-restore dump ${was.dump} holds the database as it was before the restore of ${was.file}` : `the database was missing before the restore of ${was.file}`}, and ${own}`;
+  };
   // From this lane's first notice until the drop starts, an exit owes the notice back.
   let noticeOwed = false;
   // The answer names the state after the second attempt, so the finally has no lift left to change it.
@@ -2478,10 +2511,10 @@ async function restoreLocked(
       const prior = priorUnsaved ?? priorNotice;
       if (prior && prior.doubt !== false) {
         const earlier = prior.text.replace(UNSAVED_MARK, '').replace(/\.$/, '');
-        keepNotice(botId, prior.file, restoreLiftNotice(`${earlier}. Then a restore of ${file} was refused before the database was dropped`, cleared, layersHeld, fleetDb.volume, false, true), true);
+        keepNotice(botId, prior.file, restoreLiftNotice(`${earlier}. Then a restore of ${file} was refused before the database was dropped`, cleared, layersHeld, fleetDb.volume, false, true), true, { asWas: prior.asWas, beforeDrop: prior.beforeDrop });
       } else {
         const unchanged = cleared === 'gone' ? '' : ', so its data is unchanged';
-        keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} was refused before the database was dropped${unchanged}`, cleared, layersHeld, fleetDb.volume, false), cleared === 'gone');
+        keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} was refused before the database was dropped${unchanged}`, cleared, layersHeld, fleetDb.volume, false), cleared === 'gone', cleared === 'gone' ? knownAsWas() : {});
       }
       return '';
     }
@@ -2525,9 +2558,9 @@ async function restoreLocked(
     const kept = stillStopped.length > 0
       ? `, ${self}, and the other stopped instances stay stopped (${stillStopped.map(nameOf).join(', ')})`
       : ` and ${self}`;
-    const back = steps.preRestoreDump
+    const back = backText(steps.preRestoreDump
       ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
-      : 'no pre-restore dump was taken, because the database was missing';
+      : 'no pre-restore dump was taken, because the database was missing');
     setStuck(botId, fleetDb, `The database is READ-ONLY: a restore of ${file} failed (${reason}), so its write fence stays on${access}; with the bot in Maintenance or Off, restore a dump again (${back})`);
     return `${reason}. ${runs}The write fence stays on${kept}, so nothing writes to ${guards}${access}; with the bot in Maintenance or Off, restore a dump again: ${back}`;
   };
@@ -2644,7 +2677,7 @@ async function restoreLocked(
 
     // Before the fence, so a manager restart at any later point leaves a notice that refuses Running.
     const pending = (back: string) => `Restore of ${file} has not finished: if it is no longer running (the manager restarted), the database may be missing or hold a partial restore, and its write fence may still be on; restore a dump again before choosing Running${back}`;
-    const unrecorded = saveNotice(botId, file, pending(''), true);
+    const unrecorded = saveNotice(botId, file, pending(''), true, unfinished ? { asWas: unfinished.asWas } : { beforeDrop: true });
     if (unrecorded) return await refuseBeforeFence('The restore could not be recorded before the database was fenced, so the restore was refused', unrecorded);
     noticeOwed = true;
 
@@ -2678,7 +2711,13 @@ async function restoreLocked(
 
     // A refusal past the fence lifts it and brings back what was stopped; only then has it changed nothing.
     let resetRan = false;
+    // Set once the restore record is upserted: a refusal puts the record back as it stood, since nothing was dropped.
+    let recordToPutBack: { before: { pending: boolean; file: string } | null } | null = null;
     const refuse = async (refused: string, detail: string) => {
+      if (recordToPutBack) {
+        const back = await clusterCall(fleetDb, restoreStateBackSql(recordToPutBack.before), true, undefined);
+        if (!back.ok) console.error(`[FleetBackup] Could not put back the restore record of ${botId} after a refused restore of ${file} (${scrubbed(botId, lastLine(back.stderr))}); a retry may read it as a restore that did not finish`);
+      }
       const cleared = await finalLift();
       const note = await undo();
       const noticeNote = settleNotice(cleared);
@@ -2765,9 +2804,12 @@ async function restoreLocked(
     const kept = await clusterCall(fleetDb, restoreStateUpsertSql(file, liveGen), true, undefined);
     const keptFloor = kept.ok ? parseGenRow(kept.stdout) : undefined;
     if (keptFloor === undefined) {
-      return await refuse("The database's generation could not be kept before the drop, so the restore was refused", scrubbed(botId, kept.ok ? `it answered '${kept.stdout.trim()}'` : lastLine(kept.stderr)));
+      return await refuse("The database's generation could not be kept before the drop, so the restore was refused", scrubbed(botId, kept.ok ? `it answered '${kept.stdout.trim().split('\n').pop()}'` : lastLine(kept.stderr)));
     }
     const genBefore = generationBefore(liveGen, keptFloor);
+    const recordBefore = parseRestoreStateBefore(kept.stdout);
+    recordToPutBack = { before: recordBefore };
+    if (!standing && recordBefore?.pending && unclearedRecords.get(botId) !== recordBefore.file) earlierRestore = { file: recordBefore.file, asWas: undefined };
 
     const outside = await sharersRunning(others);
     if (outside === null) {
@@ -2784,10 +2826,15 @@ async function restoreLocked(
       return await refuse('The restore list could not be written into the database container, so the restore was refused', scrubbed(botId, listed.error));
     }
 
-    // The notice gains the safety dump's name; when it cannot, the first notice stands and still refuses Running.
-    const back = steps.preRestoreDump ? `the pre-restore dump is ${steps.preRestoreDump}` : 'no pre-restore dump was taken, because the database was missing';
-    const unnamed = saveNotice(botId, file, pending(` (${back})`), true);
-    if (unnamed) console.error(`[FleetBackup] Could not add the safety dump's name to the restore notice for ${botId}: ${unnamed}`);
+    // The notice gains the safety dump's name before the drop; without it a retry could not tell which dump holds the
+    // database as it was, so nothing is dropped.
+    const back = backText(steps.preRestoreDump ? `the pre-restore dump is ${steps.preRestoreDump}` : 'no pre-restore dump was taken, because the database was missing');
+    const unnamed = saveNotice(botId, file, pending(` (${back})`), true, { asWas: asWas() });
+    if (unnamed) {
+      return await refuse('The restore could not record the name of its safety dump before dropping the database, so the restore was refused', scrubbed(botId, unnamed));
+    }
+    // From here the pending record is this restore's, not the earlier one whose clear failed.
+    unclearedRecords.delete(botId);
     noticeOwed = false;
 
     // 7. Drop and recreate the database under the fence. pg_restore --clean
@@ -2804,7 +2851,7 @@ async function restoreLocked(
       '-c', databaseGrantsSql(fleetDb.db)]);
     if (!recreate.ok) {
       const reason = scrubbed(botId, `could not recreate the database: ${lastLine(recreate.stderr)}`);
-      setRestoreError(botId, file, reason, `The database may be missing or empty, or unchanged if the drop itself failed; its write fence stays on (${back})`);
+      setRestoreError(botId, file, reason, `The database may be missing or empty, or unchanged if the drop itself failed; its write fence stays on (${back})`, asWas());
       return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
 
@@ -2813,7 +2860,7 @@ async function restoreLocked(
     const metaWrite = await dbLogin.runCall(fleetDb.containerName, dbLogin.metaPsql(fleetDb.containerName, fleetDb.db, `BEGIN;\n${metaTransactionSql(metaRows.script)}COMMIT;\n`, { stdin: true, exempt: true }), DUMP_TIMEOUT_MS);
     if (!metaWrite.ok) {
       const reason = scrubbed(botId, `the manager's tables could not be written (${errorLine(metaWrite.stderr)})`);
-      setRestoreError(botId, file, reason, `The database holds none of the bot's data from the dump; its write fence stays on (${back})`);
+      setRestoreError(botId, file, reason, `The database holds none of the bot's data from the dump; its write fence stays on (${back})`, asWas());
       return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
     const { check: badAddresses, cap: overCap } = metaRows.skipped;
@@ -2882,7 +2929,7 @@ async function restoreLocked(
       // would keep writing into the database.
       await execDocker(dbLogin.clusterPsql(fleetDb.containerName, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'").args);
       const reason = scrubbed(botId, restore.error || 'unknown error');
-      setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`);
+      setRestoreError(botId, file, reason, `The database may hold a partial restore; its write fence stays on (${back})`, asWas());
       return { success: false, error: `Restore failed: ${await keepFenced(reason)}`, steps };
     }
     steps.restored = true;
@@ -2924,7 +2971,7 @@ async function restoreLocked(
       const raised = await raiseClaims(fleetDb, floor);
       if (!raised.ok) {
         const reason = scrubbed(botId, `the restored claim numbers could not be raised above ${floor} (${raised.error})${countsSuffix}`);
-        setRestoreError(botId, file, reason, `A process of the bot that ran before the restore could save over the restored rows, so the write fence stays on (${back})`);
+        setRestoreError(botId, file, reason, `A process of the bot that ran before the restore could save over the restored rows, so the write fence stays on (${back})`, asWas());
         return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
       }
       steps.claimFloor = floor;
@@ -2947,7 +2994,7 @@ async function restoreLocked(
           : `the restored shard claims could not be expired (${capped.error})`) + countsSuffix;
         setRestoreError(botId, file, reason, capped.unread
           ? `The manager can't confirm that no restored shard claim is left live, so the write fence stays on (${back})`
-          : `A process named in a restored shard claim could keep that shard, so the write fence stays on (${back})`);
+          : `A process named in a restored shard claim could keep that shard, so the write fence stays on (${back})`, asWas());
         return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
       }
       if (capped.expired !== null) {
@@ -2960,7 +3007,7 @@ async function restoreLocked(
     const genWrite = await writeRestoredGeneration(instance, fleetDb, file, genBefore, ownCopies, cert);
     if (!genWrite.ok) {
       const reason = scrubbed(botId, `the generation row could not be written back (${genWrite.error})${countsSuffix}`);
-      setRestoreError(botId, file, reason, `Bots may take another database of this bot for the main while this one shows the dump's older generation, so the write fence stays on (${back})`);
+      setRestoreError(botId, file, reason, `Bots may take another database of this bot for the main while this one shows the dump's older generation, so the write fence stays on (${back})`, asWas());
       return { success: false, error: `The dump was restored, but ${await keepFenced(reason)}`, steps };
     }
     steps.generation = genWrite.generation;
@@ -2971,7 +3018,7 @@ async function restoreLocked(
       const reason = (startedMeanwhile === null
         ? "docker could not say whether an instance sharing the database was started during the restore, so the manager can't confirm that none read it while it was rebuilt"
         : `${startedMeanwhile.names.join(', ')} was started outside the manager during the restore and may act on what it read while the database was rebuilt; stop it`) + countsSuffix;
-      setRestoreError(botId, file, reason, `The dump was restored, but the write fence stays on so nothing writes from what was read mid-restore (${back})`);
+      setRestoreError(botId, file, reason, `The dump was restored, but the write fence stays on so nothing writes from what was read mid-restore (${back})`, asWas());
       return { success: false, error: `The dump was restored, but ${await keepFenced(reason, 'the restored database from what was read mid-restore', startedMeanwhile?.ids)}`, steps };
     }
 
@@ -2995,15 +3042,15 @@ async function restoreLocked(
     lastErrors.delete(familyKey(botId, 'main'));
     // After a difference or an unread count the other instances stay stopped and the notice refuses Running.
     const stayStopped = steps.stopped.filter(id => id !== botId).map(nameOf);
-    const doubtBack = steps.preRestoreDump
+    const doubtBack = backText(steps.preRestoreDump
       ? `the pre-restore dump ${steps.preRestoreDump} holds the database as it was`
-      : 'no pre-restore dump was taken, because the database was missing';
+      : 'no pre-restore dump was taken, because the database was missing');
     let noticeWarning = '';
     if (doubtful && lift === 'lifted') {
       const stoppedClause = stayStopped.length > 0 ? `, and the other instances stopped for the restore stay stopped (${stayStopped.join(', ')})` : '';
-      keepNotice(botId, file, `Restore of ${file} ran, but ${countsText}. The bot's login stays blocked, so the bot writes nothing${stoppedClause}. Running is refused until you restore a dump again (${doubtBack}) or dismiss this notice to keep the restored data`, true);
+      keepNotice(botId, file, `Restore of ${file} ran, but ${countsText}. The bot's login stays blocked, so the bot writes nothing${stoppedClause}. Running is refused until you restore a dump again (${doubtBack}) or dismiss this notice to keep the restored data`, true, { asWas: asWas() });
     } else if (doubtful) {
-      keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran (${countsText})`, lift, layersHeld, fleetDb.volume, true, false, doubtBack), true);
+      keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran (${countsText})`, lift, layersHeld, fleetDb.volume, true, false, doubtBack), true, { asWas: asWas() });
     } else if (lift === 'lifted') {
       unsavedRestoreErrors.delete(botId);
       let cleared = true;
@@ -3016,7 +3063,11 @@ async function restoreLocked(
       }
       if (cleared) {
         const done = await clusterCall(fleetDb, RESTORE_STATE_CLEAR);
-        if (!done.ok) console.error(`[FleetBackup] Could not mark the restore of ${file} finished for ${botId}'s copies (${scrubbed(botId, lastLine(done.stderr))}); the switch check marks it within a minute`);
+        if (done.ok) unclearedRecords.delete(botId);
+        else {
+          unclearedRecords.set(botId, file);
+          console.error(`[FleetBackup] Could not mark the restore of ${file} finished for ${botId}'s copies (${scrubbed(botId, lastLine(done.stderr))}); the switch check marks it within a minute`);
+        }
         if (containerManager.getBot(botId)?.fleetDb?.pushBroken) {
           let unmarked = false;
           try {
@@ -3032,7 +3083,7 @@ async function restoreLocked(
         }
       }
     } else {
-      keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran`, lift, layersHeld, fleetDb.volume, true), lift === 'gone');
+      keepNotice(botId, file, restoreLiftNotice(`Restore of ${file} ran`, lift, layersHeld, fleetDb.volume, true), lift === 'gone', lift === 'gone' ? { asWas: asWas() } : {});
     }
 
     if (doubtful) {
@@ -3063,7 +3114,7 @@ async function restoreLocked(
     const startWarning = unstarted.length > 0 ? `; these instances were stopped and could not be restarted: ${unstarted.join(', ')} (start them by hand)` : '';
 
     if (lift !== 'lifted') return { success: false, error: `${lift === 'gone' ? 'The restore ran' : 'Restored'}, but ${restoreLiftClause(lift, layersHeld, fleetDb.volume, true)} (see manager logs)${startWarning}`, steps };
-    const warning = `${noticeWarning}${startWarning}`;
+    const warning = `${earlierRestore ? `; ${doubtBack}` : ''}${noticeWarning}${startWarning}`;
     return { success: true, ...(warning ? { warning: warning.slice(2) } : {}), steps };
   } finally {
     // The leftover-lift attempt must finish before the busy gate opens, or a

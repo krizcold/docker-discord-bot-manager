@@ -731,11 +731,12 @@ describe('NM4 round 1 fixes', () => {
     expect(registryA().fleetRestoreError).toEqual(PRIOR);
   });
 
-  it('N2: a failed rewrite at P17 keeps the first notice and does not refuse', async () => {
+  it('N2: a failed rewrite at P17 refuses before the drop', async () => {
     pg.at.dump = () => { pg.saveFails = true; };
     const r = await restore();
-    expect(r.success).toBe(true);
-    expect((pg.noticeAtDrop as any).text).toBe(FIRST_NOTICE);
+    expect(r.success).toBe(false);
+    expect(dropped()).toBe(false);
+    expect(r.error).toMatch(/^The restore could not record the name of its safety dump before dropping the database, so the restore was refused/);
   });
 
   it('N3: every notice carries the time it was written', async () => {

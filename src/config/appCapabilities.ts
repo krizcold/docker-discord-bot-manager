@@ -74,6 +74,8 @@ export interface AppHooksSpec {
   port: number;
   /** Env var that overrides the port for this instance. */
   portEnvKey?: string;
+  /** The file under the app's data folder that holds its saved maintenance state ({ state, message, since }). */
+  stateFile?: string;
 }
 
 export interface AppCapabilityManifest {
@@ -211,6 +213,7 @@ const superModularDiscordBot: AppCapabilityManifest = {
     basePath: '/api/managed',
     port: 8080,
     portEnvKey: 'WEBUI_PORT',
+    stateFile: 'maintenance.json',
   },
 };
 

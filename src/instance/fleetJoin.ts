@@ -486,11 +486,19 @@ export async function certDirOf(instance: InstanceConfig): Promise<string> {
   return path.join(dataDir, 'db-certs');
 }
 
+/** T-G-CERTS: the answer of writeCertFiles while a new-start or put-back record is open. */
+export const KEPT_CERTS_TEXT = 'the certificate files were not written: Start on a new database or Put back is open on this bot, and the next refresh after it writes them';
+
 /** J8: one file per certificate, named by fingerprint; a name's content never changes and old files stay. */
 export async function writeCertFiles(instance: InstanceConfig, pems: string[]): Promise<string | null> {
   let dir = '';
   try {
     dir = await certDirOf(instance);
+    // The data folder may be moving: the record is read after the await and before the first write.
+    if (containerManager.keptOpOpen(containerManager.getBot(instance.id))) {
+      console.warn(`[FleetCopy] ${instance.displayName}: ${KEPT_CERTS_TEXT}`);
+      return KEPT_CERTS_TEXT;
+    }
     for (const pem of pems) writeOnce(path.join(dir, `${fp16(certFingerprint(pem))}.crt`), pem.endsWith('\n') ? pem : `${pem}\n`);
     return null;
   } catch (err) {

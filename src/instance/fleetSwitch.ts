@@ -197,11 +197,39 @@ async function liftBotBlock(t: Target, db: string): Promise<string | null> {
 }
 
 /** The generation row; null when absent. */
-export async function readGeneration(t: Target, db: string): Promise<{ ok: true; row: GenRow | null } | { ok: false; error: string }> {
+export async function readGeneration(t: Target, db: string): Promise<{ ok: true; row: GenRow | null } | { ok: false; error: string; stderr?: string }> {
   const r = await metaSql(t, db, GEN_READ_SQL);
-  if (!r.ok) return missingTable(r.stderr) ? { ok: true, row: null } : { ok: false, error: failText(r) };
+  if (!r.ok) return missingTable(r.stderr) ? { ok: true, row: null } : { ok: false, error: failText(r), stderr: r.stderr };
   const row = parseGenRow(r.stdout);
   return row === undefined ? { ok: false, error: `the generation read answered '${lastLine(r.stdout)}'` } : { ok: true, row };
+}
+
+const ADMIN_GEN_READ = `SELECT coalesce((SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.generation')), '-') AS kind,
+  coalesce((SELECT relkind = 'r' FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.generation')), false) AS is_table \\gset
+\\echo :kind
+\\if :is_table
+${GEN_READ_SQL};
+\\endif
+`;
+
+/**
+ * The generation row of a cluster without dbm_meta, read as dbm_admin in the bot's database, read-only, and only where
+ * the bot role is itself a superuser; a missing table is no row, and anything but a plain table is not read.
+ */
+export async function readGenerationAsAdmin(t: Target, db: string): Promise<{ ok: true; row: GenRow | null } | { ok: false; error: string }> {
+  const sup = await clusterSql(t, `SELECT coalesce((SELECT rolsuper::text FROM pg_catalog.pg_roles WHERE rolname = ${sqlLiteral(t.user)}), 'missing')`);
+  if (!sup.ok) return { ok: false, error: failText(sup) };
+  const superuser = lastLine(sup.stdout);
+  if (superuser === 'missing') return { ok: false, error: `the bot's role ${t.user} does not exist in the database's cluster` };
+  if (superuser !== 'true') return { ok: false, error: `the database has no ${dbLogin.META_LOGIN} login, and the bot's role ${t.user} is not a superuser, so the manager does not read the bot's database as one` };
+  const r = await runGuarded('docker', [...dbLogin.adminReadArgs(t.container, db), '-q'], { input: ADMIN_GEN_READ, timeoutMs: SWITCH_TIMING.readMs });
+  if (!r.ok) return { ok: false, error: failText(r) };
+  const lines = r.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  const kind = lines[0] ?? '';
+  if (kind === '-') return { ok: true, row: null };
+  if (kind !== 'r') return { ok: false, error: `smdb_manager.generation is not a plain table (${kind ? `relkind ${kind}` : 'no answer'}), so the manager did not read it` };
+  const row = parseGenRow(lines[1] ?? '');
+  return row === undefined ? { ok: false, error: `the generation read answered '${lines[1] ?? ''}'` } : { ok: true, row };
 }
 
 /** The restore record in the cluster's postgres database; null when absent. */
@@ -424,7 +452,7 @@ export async function startLane(botId: string, op: string, fn: (admit: () => voi
   if (containerManager.isShuttingDown()) return refusal(containerManager.SHUTDOWN_REFUSAL, 503);
   const busy = containerManager.isBotBusy(botId);
   if (busy) return refusal(busyText(busy));
-  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.keptOpRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
   if (migrating) return refusal(migrating.error);
   let admitted = false;
   let answer!: (r: { accepted: true } | LaneOutcome) => void;
@@ -444,7 +472,7 @@ export async function runLane(botId: string, op: string, fn: (admit: () => void)
   if (containerManager.isShuttingDown()) return refusal(containerManager.SHUTDOWN_REFUSAL, 503);
   const busy = containerManager.isBotBusy(botId);
   if (busy) return refusal(busyText(busy));
-  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+  const migrating = containerManager.migrateRefusal(botId, 'db') ?? containerManager.keptOpRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
   if (migrating) return refusal(migrating.error);
   try {
     return await settle(await containerManager.withExternalBotOp(botId, op, () => fn(() => undefined)));

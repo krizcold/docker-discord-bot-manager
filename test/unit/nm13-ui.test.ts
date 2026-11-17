@@ -84,7 +84,7 @@ describe('CU2: only the main\'s window holds the line', () => {
     const { ctx, els } = load(['showFleetBackups'], () => null, {
       bots: [bot], fleetBackupStored: null,
       fleetBackupListHtml: async () => '', fleetBackupErrorHtml: () => '', renderSeedBanner: noop, renderFleetReplication: noop, renderFleetSwitch: noop,
-      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop,
+      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop, renderKeptData: noop,
       renderConnectionLine: (id: string) => { seen.push(id); },
     });
     await ctx.showFleetBackups('a');

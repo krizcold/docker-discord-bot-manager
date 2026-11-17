@@ -88,7 +88,7 @@ export interface BackupFamilyStatus {
   lastError?: string | null;
   failingSince?: number | null;
   listError?: string | null;
-  skip?: 'scope' | 'seed' | null;
+  skip?: 'scope' | 'seed' | 'kept' | null;
   test?: BackupTest | null;
   alerts?: { dumps?: BackupAlert | null; test?: BackupAlert | null };
 }

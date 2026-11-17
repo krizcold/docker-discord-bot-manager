@@ -53,6 +53,13 @@ export function psqlFailureClass(stderr: string): PsqlClass {
   return 'other';
 }
 
+/** The plain manager login a psql failure says does not exist (a cluster made before the manager's own logins); null otherwise. */
+export function missingLogin(stderr: string): typeof META_LOGIN | typeof WORK_LOGIN | null {
+  if (stderr.includes(`role "${META_LOGIN}" does not exist`)) return META_LOGIN;
+  if (stderr.includes(`role "${WORK_LOGIN}" does not exist`)) return WORK_LOGIN;
+  return null;
+}
+
 function lastLine(text: string): string {
   const lines = text.split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
   return lines[lines.length - 1] || 'psql failed with no message';
@@ -102,6 +109,14 @@ export function argvFor(login: ManagerLogin, db: string, opts: { exempt?: boolea
     return { env: opts.exempt ? [...FENCE_EXEMPT] : [], conn: ['-U', login, '-d', db] };
   }
   return { env: ['-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS}${opts.exempt ? ` ${FENCE_EXEMPT_OPTION}` : ''}`], conn: ['-U', login, '-d', db] };
+}
+
+/**
+ * A psql script on stdin as the superuser in the bot's database, read-only, for a cluster that has no dbm_meta: the
+ * one manager call that runs as the superuser outside the postgres database.
+ */
+export function adminReadArgs(container: string, db: string): string[] {
+  return ['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS} -c default_transaction_read_only=on`, '-i', container, 'psql', '-U', MANAGER_DB_ROLE, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
 }
 
 function psqlCall(login: ManagerLogin, container: string, db: string, sql: string, opts: CallOpts): PsqlCall {

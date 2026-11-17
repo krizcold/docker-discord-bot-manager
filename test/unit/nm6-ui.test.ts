@@ -115,7 +115,7 @@ describe('UG3: the window titles and the State button', () => {
     const { ctx, els } = load(['showFleetBackups'], () => null, {
       bots: [bot], fleetBackupStored: null,
       fleetBackupListHtml: async () => '', fleetBackupErrorHtml: () => '', renderSeedBanner: noop, renderFleetReplication: noop, renderFleetSwitch: noop,
-      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop, renderConnectionLine: noop,
+      refreshFleetBackupStatus: noop, renderFleetReplica: noop, renderPastFleetBackups: noop, refreshStateLine: noop, renderMemoryLine: noop, renderConnectionLine: noop, renderKeptData: noop,
     });
     await ctx.showFleetBackups('a');
     return els['fleet-backup-content'].innerHTML;
@@ -293,7 +293,7 @@ describe('UG10 (fixer 3): the window of a bot on JSON files or an outside databa
       bots: [{ id: 'a', displayName: 'A', appHooks: true, ...bot }], fleetBackupStored: null,
       fleetBackupListHtml: async () => '', fleetBackupErrorHtml: () => '', renderSeedBanner: noop, renderFleetReplication: noop, renderFleetSwitch: noop,
       refreshFleetBackupStatus: noop, renderFleetReplica: () => called.push('replica'), renderPastFleetBackups: noop,
-      refreshStateLine: () => called.push('state'), renderMemoryLine: () => called.push('memory'),
+      refreshStateLine: () => called.push('state'), renderMemoryLine: () => called.push('memory'), renderKeptData: () => {},
     });
     await ctx.showFleetBackups('a');
     return { html: els['fleet-backup-content'].innerHTML, called };

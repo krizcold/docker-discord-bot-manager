@@ -30,7 +30,7 @@ import { probeErrorTail, urlPassword, verifierAccepts } from '../config/secretTe
 import { InstanceConfig, FleetBackupAlert, FleetDbReplicaRecord, FleetReplicaSeedPhase, FleetReplicaSeedPurpose, FleetReplicaSeedRecord } from '../types';
 import { decodeJoinCode, HOST_RE, JoinCode, lsnText, splitBackendUrls } from '../config/joinCode';
 import { hasHostParam, readDatabaseUrl } from '../config/databaseUrl';
-import { alertStep, dmOutcomeText, ownerMessageKey, utcText } from './backupFiles';
+import { alertStep, dmOutcomeText, ownerMessageKey, stampOf, utcText } from './backupFiles';
 import {
   AddressesOutcome, addressesText, clientReason, copyLoginOf, deleteAddress, ensureClientImage, ensureCopyLogin, isLoginRefusal, sendAddresses, inRecoveryText, machineNameOf,
   mainCertificate, mainProbe, MintAnswer, NO_OWN_LOGIN, ownProbeFailureText, PrimaryLogin, probeFailureText, readCopyFacts, registerOwnCopy, runPrimaryClient, seedDsnFor,
@@ -584,9 +584,10 @@ function replicaRecordFor(instance: InstanceConfig, intake: ValidatedIntake): Fl
   // machine's own login, not the app identity.
   const spec = findAppCapabilities(instance.sourceUrl)?.companionDb;
   const containerName = `${instance.sanitizedName}-fleet-postgres-replica`;
+  const plain = `${instance.sanitizedName}-fleet-postgres-replica-data`;
   return {
     containerName,
-    volume: `${instance.sanitizedName}-fleet-postgres-replica-data`,
+    volume: containerManager.keptVolumeReason(plain) ? `${plain}-${stampOf(Date.now())}` : plain,
     slot: slotNameFor(instance),
     primaryHost: intake.join.host,
     primaryPort: intake.join.port,
@@ -833,6 +834,8 @@ export function provisionFleetReplica(
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  const kept = containerManager.keptOpRefusal(instance.id, 'db');
+  if (kept) return kept;
   // Null record routes through refusal, never a silent degrade: the standby
   // record's identity is stamped from the capability record, so without one
   // the minted record could never be probed or adopted.
@@ -1238,6 +1241,8 @@ function unreadCopyRefusal(instance: InstanceConfig, rec: FleetDbReplicaRecord, 
 export async function removeFleetReplica(instance: InstanceConfig, opts: { confirmPromoted?: boolean } = {}): Promise<{ success: boolean; error?: string; needsConfirm?: boolean; warning?: string }> {
   const rec = instance.fleetDbReplica;
   if (!rec) return { success: false, error: 'No replica on this instance' };
+  const kept = containerManager.keptOpRefusal(instance.id, 'db');
+  if (kept) return kept;
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is running; wait for it to finish' };
   const hold = removalHold(instance.id, rec.containerName);
   if (hold) return { success: false, error: hold };
@@ -1304,6 +1309,8 @@ export async function instanceRemovalRefusal(
   confirmFleetData: boolean,
   confirmPromoted = false,
 ): Promise<{ error: string; needsConfirm?: true; confirmFlag?: 'confirmFleetData' | 'confirmPromoted' } | null> {
+  const kept = containerManager.keptDeleteRefusal(instance.id);
+  if (kept) return { error: kept };
   if (instance.fleetDbReplica) {
     // Remove takes the copy's container down whether or not it keeps the data.
     const copyState = await copyHeld(instance.fleetDbReplica);
@@ -1461,6 +1468,8 @@ export async function reseedStalePrimary(
   if (seedRunning(instance.id)) return { success: false, error: 'Provisioning is already running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  const kept = containerManager.keptOpRefusal(instance.id, 'db');
+  if (kept) return kept;
   // Same null-record refusal as provisionFleetReplica: the re-seeded standby's
   // record is stamped from the capability record.
   if (!findAppCapabilities(instance.sourceUrl)?.companionDb) {
@@ -1707,7 +1716,7 @@ export async function decommissionFleetDb(
     return await containerManager.withExternalBotOp(botId, 'decommission', async () => {
       const instance = containerManager.getBot(botId);
       if (!instance?.fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
-      const held = containerManager.migrationHoldRefusal(botId);
+      const held = containerManager.keptOpRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
       if (held) return held;
       const refusal = capabilityRefusal(instance);
       if (refusal) return { success: false, error: refusal };
@@ -2358,6 +2367,8 @@ export async function reseedStandby(instance: InstanceConfig, opts: { confirm?: 
   if (seedRunning(instance.id)) return { success: false, error: 'A seed is already running on this instance' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { success: false, error: `Operation '${busyOp}' is running on this instance; wait for it to finish` };
+  const kept = containerManager.keptOpRefusal(instance.id, 'db');
+  if (kept) return kept;
   if (!rec.user || !rec.db) return { success: false, error: 'This standby record predates identity stamping; retire and re-provision the standby' };
   const capability = capabilityRefusal(instance);
   if (capability) return { success: false, error: capability };
@@ -2436,6 +2447,8 @@ export function startAutoRebuild(instance: InstanceConfig, slotState: 'absent' |
   if (seedRunning(instance.id)) return { started: false, reason: 'a seed is running' };
   const busyOp = containerManager.isBotBusy(instance.id);
   if (busyOp) return { started: false, reason: `operation '${busyOp}' is running` };
+  const kept = containerManager.keptOpRefusal(instance.id, 'db');
+  if (kept) return { started: false, reason: kept.error };
   const validated = validateIntake(join, rec.publicHost, rec.hostPort);
   if (!validated.ok) return { started: false, reason: validated.error };
   if (!fleetBackupGuards.claimFleetBackupBusy(instance.id)) return { started: false, reason: 'a backup or restore is running on this database' };

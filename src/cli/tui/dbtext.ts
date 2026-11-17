@@ -213,6 +213,8 @@ export function backupAlertLines(a: BackupAlert | null | undefined, when: When):
   return [tip(line)];
 }
 
+const KEPT_WAIT = "Backups wait until this bot's Start on a new database or Put back finishes.";
+
 // backupStatusHtml (:2782): the backup lines of one family.
 export function backupStatusLines(f: BackupFamilyStatus | null | undefined, when: When): DbLine[] {
   if (!f) return [];
@@ -220,6 +222,7 @@ export function backupStatusLines(f: BackupFamilyStatus | null | undefined, when
   if (!f.enabled) return [err('Backups are off for this bot: no backup is taken and none is deleted.'), ...testAlert];
   if (f.skip === 'scope') return testAlert;
   if (f.skip === 'seed') return [tip('Backups of this copy start after its seed finishes.'), ...testAlert];
+  if (f.skip === 'kept') return [tip(KEPT_WAIT), ...testAlert];
   const file = f.lastFile || '';
   const failing = f.alerts && f.alerts.dumps;
   const lines: DbLine[] = [];
@@ -256,7 +259,9 @@ export function emptyBackupsText(fb: FleetBackupStatus): string {
       ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
       : fb.scoped === null
         ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
-        : 'No backup yet; the first one starts within a minute.';
+        : fb.main?.skip === 'kept'
+          ? `No backups. ${KEPT_WAIT}`
+          : 'No backup yet; the first one starts within a minute.';
 }
 
 const because = (r: { text: string }) => (r.text ? ` (${r.text})` : '');

@@ -48,6 +48,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   databaseHoldRefusal: (_id: string, action: string) => (h.hold ? { success: false, error: `A database restore is running on this instance's database; ${action} is refused until it ends` } : null),
   deleteLaneRefusal: (_id: string, action: string) => (h.deleteLane ? { success: false, error: `A Delete of this instance did not finish, so its containers, image or compose may already be gone; ${action} is refused until Delete is run again` } : null),
   migrateRefusal: () => null, heldOrderRefusal: () => null,
+  keptOpRefusal: () => null, keptSharerRefusal: () => null, keptOpOpen: () => null,
   updateInstanceMaintenance: (_id: string, rec: any) => {
     const n = h.writes.length + 1;
     const err = h.failWrite(n, rec);

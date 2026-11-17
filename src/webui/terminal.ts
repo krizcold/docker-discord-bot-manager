@@ -543,6 +543,45 @@ function safeDir(abs: string, realBase: string | null): SafeDir {
   return { dir: realDir, name };
 }
 
+// A data folder that Start on a new database or Put back set aside or is building.
+const KEPT_SEGMENT_RE = /^data\.(kept|new)-/;
+
+const keptFilesText = (p: string) => `${p} is kept data of this bot (Kept data in its Database window), and the Files panel does not change it; nothing was changed`;
+
+/** Whether a segment of p below the base, or of the whole of p when it is not inside the base, names a kept folder. */
+function inKeptFolder(p: string, base: string | null): boolean {
+  const below = base !== null && pathInside(base, p) ? p.slice(base.length) : p;
+  return below.split('/').some((seg) => KEPT_SEGMENT_RE.test(seg));
+}
+
+/**
+ * Where abs really lands: the real path of its parent folder (as safeDir resolves
+ * it) joined with the final name, or, when the parent is still to be made, the
+ * deepest existing folder's real path with the rest. Null when it cannot be read.
+ */
+function realLanding(abs: string): string | null {
+  const rest = [path.posix.basename(abs)];
+  let probe = path.posix.dirname(abs);
+  for (;;) {
+    try { return path.posix.join(toPosix(fs.realpathSync(probe)), ...rest); }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+      const parent = path.posix.dirname(probe);
+      if (parent === probe) return null;
+      rest.unshift(path.posix.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+/** T-G-FILES: abs, or where a link in its folders makes it land, is inside a kept folder. */
+function keptPathRefusal(abs: string, base: string | null): { success: false; error: string } | null {
+  if (inKeptFolder(abs, base)) return { success: false, error: keptFilesText(abs) };
+  const real = realLanding(abs);
+  if (real !== null && inKeptFolder(real, base)) return { success: false, error: keptFilesText(real) };
+  return null;
+}
+
 /**
  * mkdir -p that creates nothing outside the scope. It resolves the deepest
  * EXISTING ancestor, confirms the path it will create is inside, then anchors on
@@ -1010,6 +1049,8 @@ function createNoLink(dir: { fd: number; at: string }, dest: string, tmpPath: st
  * created exclusively where the filesystem has no hard links (createNoLink).
  */
 function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
+  const kept = keptPathRefusal(abs, realBase);
+  if (kept) return kept;
   if (bytes.length > MAX_FILE_BYTES) return { success: false, error: TOO_LARGE_TO_SAVE };
   const made = mkdirInScope(path.posix.dirname(abs), realBase);
   if (made.error) return { success: false, error: made.error };
@@ -1019,6 +1060,8 @@ function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
   const judged = judgeSaveTarget(`${safe.dir}/${safe.name}`, realBase);
   if ('error' in judged) return { success: false, error: judged.error };
   const { dest, old } = judged;
+  const keptDest = keptPathRefusal(dest, realBase);
+  if (keptDest) return keptDest;
   const name = path.posix.basename(dest);
 
   const dir = pinDir(path.posix.dirname(dest), realBase);
@@ -1077,6 +1120,8 @@ function localWrite(abs: string, bytes: Buffer, realBase: string | null): any {
 
 // O_EXCL never opens an existing name, and O_NOFOLLOW never follows a link.
 function localCreate(abs: string, realBase: string | null): any {
+  const kept = keptPathRefusal(abs, realBase);
+  if (kept) return kept;
   const made = mkdirInScope(path.posix.dirname(abs), realBase);
   if (made.error) return { success: false, error: made.error };
   const safe = safeDir(abs, realBase);
@@ -1100,12 +1145,16 @@ function localCreate(abs: string, realBase: string | null): any {
 }
 
 function localMkdir(abs: string, realBase: string | null): any {
+  const kept = keptPathRefusal(abs, realBase);
+  if (kept) return kept;
   const made = mkdirInScope(abs, realBase);
   if (made.error) return { success: false, error: made.error };
   return { success: true, path: abs };
 }
 
 function localDelete(abs: string, realBase: string | null): any {
+  const kept = keptPathRefusal(abs, realBase);
+  if (kept) return kept;
   const safe = safeDir(abs, realBase);
   if ('error' in safe) {
     if (safe.missing) return { success: true, path: abs, removed: false };   // rm -f semantics
@@ -1125,6 +1174,8 @@ function localDelete(abs: string, realBase: string | null): any {
 // first: a folder is always refused (a file cannot replace one, and an empty
 // folder would vanish), anything else only with the operator's confirmation.
 function localRename(absFrom: string, absTo: string, realBase: string | null, overwrite: boolean): any {
+  const kept = keptPathRefusal(absFrom, realBase) ?? keptPathRefusal(absTo, realBase);
+  if (kept) return kept;
   const from = safeDir(absFrom, realBase);
   if ('error' in from) return { success: false, error: from.error };
   const to = safeDir(absTo, realBase);

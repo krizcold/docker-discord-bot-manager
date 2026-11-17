@@ -2540,10 +2540,12 @@
     // other bot that takes the manager's hooks. A seed owns the instance
     // through the window in which it carries neither database record.
     function databaseButtonHtml(bot) {
-      const own = bot.fleetBackup || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetWorker || bot.hasDbBackups;
+      const kept = (bot.keptSets && bot.keptSets.length > 0) || !!bot.keptOp;
+      const own = bot.fleetBackup || bot.fleetDbReplica || bot.fleetDbReplicaSeed || bot.fleetWorker || bot.hasDbBackups || kept;
       if (!own && !bot.appHooks) return '';
       const title = bot.fleetDb ? 'Backups and replication of this bot\'s managed database'
         : (bot.fleetDbReplica || bot.fleetWorker) ? 'Standby replica of this bot\'s managed database on this machine'
+        : kept && !bot.hasDbBackups && !bot.fleetBackup && !bot.fleetDbReplicaSeed ? 'Data this bot used before, kept on this machine'
         : own ? 'Earlier database backups kept on this machine'
         : 'State and memory of this bot';
       return `<button class="btn btn-secondary btn-small" onclick="showFleetBackups('${bot.id}')" title="${title}">Database</button>`;
@@ -2565,11 +2567,13 @@
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;"><div id="fleet-state-line"></div><button class="btn btn-secondary btn-small" onclick="showStateWindow(${jsArg(botId)})">State...</button></div>
           <div id="fleet-memory-line" class="env-tip"></div>
           <div class="env-tip">${place}</div>
+          <div id="fleet-kept-data"></div>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
           </div>`;
         refreshStateLine(botId);
         renderMemoryLine(botId);
+        renderKeptData(botId);
         return;
       }
 
@@ -2582,6 +2586,7 @@
           <div id="fleet-replica-body"><div class="loading">Loading...</div></div>
           <div class="env-group" style="margin-top:14px;"><div class="env-group-title">Move</div><div id="fleet-switch-body"></div></div>
           <div id="fleet-past-backups"></div>
+          <div id="fleet-kept-data"></div>
           <div class="modal-actions">
             <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
           </div>`;
@@ -2590,6 +2595,7 @@
         renderPastFleetBackups(botId);
         refreshStateLine(botId);
         renderMemoryLine(botId);
+        renderKeptData(botId);
         return;
       }
 
@@ -2630,6 +2636,7 @@
           <div class="env-group-title">Move</div>
           <div id="fleet-switch-body"></div>
         </div>
+        <div id="fleet-kept-data"></div>
         <div class="modal-actions">
           <button class="btn btn-secondary" onclick="hideFleetBackups()">Close</button>
         </div>`;
@@ -2639,7 +2646,204 @@
       refreshStateLine(botId);
       renderMemoryLine(botId);
       renderConnectionLine(botId);
+      renderKeptData(botId);
       if (bots.find(b => b.id === botId)?.fleetBackup !== bot?.fleetBackup) refreshFleetBackupStatus(botId);
+    }
+
+    // ─── Kept data: Start on a new database, Put back and Delete (src/instance/keptData.ts) ───
+    function keptOpName(op) {
+      return op === 'new-start' ? 'Start on a new database' : op === 'put-back' ? 'Put back' : op === 'delete' ? 'Delete' : 'Keep it';
+    }
+
+    // A set's id is the time it was set aside (an undo's ends in -new); keptData.ts's keptDate gives the same text.
+    function keptSetDate(id) {
+      const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})[-:](\d{2})/.exec(String(id || ''));
+      return m ? `${m[1]} ${m[2]}:${m[3]} UTC` : String(id || '');
+    }
+
+    function keptSetLine(set) {
+      const parts = [
+        set.db ? `database volume ${set.db.volume}` : set.copy ? `live copy volume ${set.copy.volume}` : '',
+        set.folder ? `data folder ${set.folder}` : '',
+      ].filter(Boolean);
+      return `${keptSetDate(set.id)}, set aside by ${keptOpName(set.by)}: ${parts.length ? parts.join(', ') : 'no volume or folder, only its join record'}`;
+    }
+
+    // The variant the server read for this bot when the list loaded; null when it could not tell.
+    function keptStartVariant(bot) {
+      return bot.keptStartVariant || null;
+    }
+
+    // Shown when the bot is Off and settled, no record is open, and the bot keeps its data in a database.
+    function keptStartShown(bot) {
+      const m = bot.maintenance;
+      if (!bot.appHooks || bot.keptOp || !m || m.state !== 'off' || !m.settled) return false;
+      return !!(bot.fleetDb || bot.fleetDbReplica || bot.fleetWorker || bot.dataPlace === 'outside');
+    }
+
+    function keptStartConfirmText(bot) {
+      const variant = keptStartVariant(bot);
+      const first = variant === 'main'
+        ? 'The bot\'s database is stopped, and its volume and the bot\'s data folder are kept as they are, the folder under the name data.kept-<the start\'s time>. A new empty database starts on a new volume with the same login, so the Database URL does not change.'
+        : variant === 'copy'
+        ? 'This machine\'s live copy is stopped, and its volume and the bot\'s data folder are kept as they are; this machine holds no live copy afterwards.'
+        : variant === 'folder'
+        ? 'The bot\'s data folder is kept as it is, under a new name, and its database is not changed.'
+        : 'The manager can\'t confirm what this start keeps: when the bot list was last read, the bot\'s settings could not be read or named no database to start again. The start reads them again and refuses if that is still so.';
+      return `Start on a new database?\n\n${first} The bot gets a new data folder that holds maintenance.json${bot.fleetJoin ? ', and the join\'s certificate files,' : ''} so its next start is a maintenance boot. The bot stays stopped, and its State becomes Running.\n\nPut back returns the kept database and folder; Delete removes them after a dump.`;
+    }
+
+    function keptPutBackConfirmText(date) {
+      return `Put back the kept data of ${date}?\n\nWhat is in use now is kept the same way, and the kept database and folder are used again. The bot stays Off.`;
+    }
+
+    function keptDeleteConfirmText(date) {
+      return `Delete the kept data of ${date}?\n\nThe kept database is copied to a scratch volume, the copy is dumped and the dump is restored in a throwaway database to check it; the kept folder is archived and the archive checked. Only then are the volume and the folder removed. The dump and the archive stay in this manager's backups folder.`;
+    }
+
+    // The steps an open record reached, in the words of keptData.ts's newStartDone, putBackDone and deleteDone.
+    function keptStepWords(rec) {
+      const parts = rec.parts || [];
+      const store = parts.includes('db') ? 'db' : parts.includes('copy') ? 'copy' : null;
+      const folder = parts.includes('folder');
+      let order;
+      let words;
+      if (rec.op === 'delete') {
+        order = ['recorded', 'copy-made', 'dumped', 'scratch-gone', 'checked', 'archived', 'archive-checked', 'removing'];
+        words = [
+          ['copy-made', store ? 'the kept database was copied to a scratch volume' : null],
+          ['dumped', store ? 'the copy was dumped' : null],
+          ['scratch-gone', store ? 'the scratch copy was removed' : null],
+          ['checked', store ? 'the dump restored cleanly in a throwaway database' : null],
+          ['archived', folder ? 'the kept folder was archived' : null],
+          ['archive-checked', folder ? 'the archive matched the kept folder' : null],
+          ['removing', 'the removal began'],
+        ];
+      } else if (rec.op === 'new-start' && !rec.undo) {
+        order = ['recorded', 'db-stopped', 'db-out', 'swapped', 'folder', 'db-in', 'db-up', 'login'];
+        words = [
+          ['db-stopped', store === 'db' ? 'the database was stopped' : store === 'copy' ? 'the live copy was stopped' : null],
+          ['db-out', store ? 'its service was taken out of the compose' : null],
+          ['swapped', 'the earlier data was recorded as kept'],
+          ['folder', 'the new data folder was made'],
+          ['folder', 'the data folder was set aside'],
+          ['folder', 'the new data folder is in use'],
+          ['db-in', store === 'db' ? 'the new database\'s service was written' : null],
+          ['db-up', store === 'db' ? 'the new database started' : null],
+          ['login', store === 'db' ? 'its login is open' : null],
+        ];
+      } else {
+        order = ['recorded', 'db-stopped', 'db-out', 'swapped', 'folder', 'db-in', 'settled'];
+        words = [
+          ['db-stopped', store === 'db' ? 'the database in use was stopped' : store === 'copy' ? 'the live copy in use was stopped' : null],
+          ['db-out', store ? 'its service was taken out of the compose' : null],
+          ['swapped', 'the kept data was recorded as in use and the data in use as kept'],
+          ['folder', !folder ? null : rec.folderMissing ? 'the data folder was found missing and left so' : 'the data folders were exchanged'],
+          ['db-in', store === 'db' ? 'the database\'s service was written' : store === 'copy' ? 'the live copy\'s service was written and it started' : null],
+          ['settled', 'the Off order ran'],
+        ];
+      }
+      const at = order.indexOf(rec.step);
+      return words.filter(([step, w]) => w && at >= order.indexOf(step)).map(([, w]) => w);
+    }
+
+    // The open record's line; a Delete that stopped on one of its whole sentences shows that sentence alone.
+    function keptOpenLineText(rec) {
+      if (rec.op === 'delete' && rec.lastError && /^[A-Z]/.test(rec.lastError)) return rec.lastError;
+      const done = keptStepWords(rec);
+      const store = (rec.parts || []).some(p => p === 'db' || p === 'copy');
+      const lead = rec.op === 'delete' ? 'Delete' : rec.op === 'new-start' && !rec.undo ? 'Start on a new database' : 'Put back';
+      const head = rec.lastError ? `${lead} stopped before it finished: ${rec.lastError}.` : `${lead} has not finished: it runs now, or the manager restarted while it ran.`;
+      const next = rec.op === 'delete'
+        ? (rec.step !== 'removing' ? 'Run it again to go on, or Keep it to stop here.' : 'Run it again to go on.')
+        : rec.op === 'new-start' && !rec.undo && rec.lastError && rec.folderGone
+        ? `Run it again to go on, or Put back to ${store ? 'return to the earlier database' : 'close this'}; the data folder stays missing. Until one of them finishes, the bot stays stopped and Start is refused.`
+        : rec.op === 'new-start' && !rec.undo
+        ? 'Run it again to go on, or Put back to return to the earlier database and data folder; until one of them finishes, the bot stays stopped and Start is refused.'
+        : rec.undo
+        ? 'Run it again to finish going back to the earlier data; until it finishes, the bot stays stopped and Start is refused.'
+        : 'Run it again to go on, or Put back again to reverse it; until one of them finishes, the bot stays stopped and Start is refused.';
+      return `${head} Done so far: ${done.length ? done.join(', ') : 'nothing'}. ${next}`;
+    }
+
+    function keptDataHtml(bot) {
+      const sets = bot.keptSets || [];
+      const rec = bot.keptOp || null;
+      const last = bot.keptLast || null;
+      const start = keptStartShown(bot);
+      if (!sets.length && !rec && !last && !start) return '';
+      const id = jsArg(bot.id);
+      const button = (cls, call, label) => `<button class="btn ${cls} btn-small" onclick="${call}">${label}</button>`;
+      const lines = [];
+      if (rec) {
+        const again = rec.op === 'delete' ? `keptDelete(${id}, ${jsArg(rec.set)}, true)`
+          : rec.op === 'new-start' && !rec.undo ? `keptStart(${id})`
+          : `keptPutBack(${id}, ${jsArg(rec.set)}, 'again')`;
+        const buttons = [button('btn-secondary', again, 'Run it again')];
+        if (rec.op !== 'delete' && !rec.undo) buttons.push(button('btn-secondary', `keptPutBack(${id}, ${jsArg(rec.set)}, 'reverse')`, 'Put back'));
+        if (rec.op === 'delete' && rec.step !== 'removing') buttons.push(button('btn-secondary', `keptKeep(${id})`, 'Keep it'));
+        lines.push(`<div class="error-message">${escapeHtml(keptOpenLineText(rec))}<div style="margin-top:6px;display:flex;gap:6px;">${buttons.join('')}</div></div>`);
+      }
+      for (const set of sets) {
+        lines.push(`<div class="env-row" style="align-items:center;gap:6px;"><span style="flex:1;font-size:0.8rem;">${escapeHtml(keptSetLine(set))}</span>`
+          + button('btn-secondary', `keptPutBack(${id}, ${jsArg(set.id)}, 'set')`, 'Put back')
+          + button('btn-danger', `keptDelete(${id}, ${jsArg(set.id)}, false)`, 'Delete') + '</div>');
+      }
+      if (last && !rec) lines.push(`<div class="${last.outcome === 'failed' ? 'error-message' : 'env-tip'}">Last, at ${escapeHtml(keptSetDate(last.at))}: ${escapeHtml(last.text)}</div>`);
+      if (start) lines.push(`<div style="margin-top:6px;">${button('btn-secondary', `keptStart(${id})`, 'Start on a new database')}</div>`);
+      return `<div class="env-group" style="margin-top:14px;"><div class="env-group-title">Kept data</div>${lines.join('')}</div>`;
+    }
+
+    function renderKeptData(botId) {
+      const box = document.getElementById('fleet-kept-data');
+      const bot = bots.find(b => b.id === botId);
+      if (!box || fleetBackupBotId !== botId || !bot) return;
+      box.innerHTML = keptDataHtml(bot);
+    }
+
+    // Each kept operation answers when it ends, which can take long (a Delete copies, dumps and checks first).
+    async function keptAnswer(botId, what, doing, send) {
+      showMessage('info', `The manager works on ${doing}; the result shows here when it finishes`);
+      try {
+        const res = await send();
+        if (!res.success) showMessage('error', res.error || `${what} was refused`);
+        else {
+          showMessage('success', res.text);
+          if (res.warning) showMessage('warning', res.warning);
+        }
+      } catch (err) {
+        showNoAnswer(what);
+      } finally {
+        await loadBots();
+        if (fleetBackupBotId === botId) showFleetBackups(botId);
+      }
+    }
+
+    // A press with a record open goes on with it, so only a fresh start asks.
+    async function keptStart(botId) {
+      const bot = bots.find(b => b.id === botId);
+      if (!bot) return;
+      if (!bot.keptOp && !confirm(keptStartConfirmText(bot))) return;
+      await keptAnswer(botId, 'Start on a new database', 'Start on a new database', () => api('POST', `/bots/${botId}/fleet-db/new-start`, {}));
+    }
+
+    // mode 'set': a kept set's Put back; 'again': Run it again on an open put-back; 'reverse': the open record's Put back.
+    async function keptPutBack(botId, setId, mode) {
+      const bot = bots.find(b => b.id === botId);
+      const rec = bot && bot.keptOp;
+      const back = mode === 'reverse' && rec && rec.op === 'put-back' && rec.asideSet ? rec.asideSet : setId;
+      if (mode !== 'again' && !confirm(keptPutBackConfirmText(keptSetDate(back)))) return;
+      await keptAnswer(botId, 'Put back', `Put back of the kept data of ${keptSetDate(back)}`, () => api('POST', `/bots/${botId}/fleet-db/kept/${encodeURIComponent(setId)}/put-back`, { reverse: mode === 'reverse' }));
+    }
+
+    // again: Run it again on an open Delete, which asks nothing.
+    async function keptDelete(botId, setId, again) {
+      if (!again && !confirm(keptDeleteConfirmText(keptSetDate(setId)))) return;
+      await keptAnswer(botId, 'Delete', `Delete of the kept data of ${keptSetDate(setId)}`, () => api('POST', `/bots/${botId}/fleet-db/kept/${encodeURIComponent(setId)}/delete`, { again: !!again }));
+    }
+
+    async function keptKeep(botId) {
+      await keptAnswer(botId, 'Keep it', 'stopping that Delete (Keep it)', () => api('POST', `/bots/${botId}/fleet-db/kept/abandon`, {}));
     }
 
     function fleetBackupErrorHtml(fb) {
@@ -2671,6 +2875,8 @@
             ? 'No backups. Scheduled dumps are skipped: the stored database URL does not point at the database this manager provisioned.'
             : fb.scoped === null
             ? 'No backups. Scheduled dumps are paused: the stored database URL could not be read, so its scope cannot be checked.'
+            : fb.main && fb.main.skip === 'kept'
+            ? 'No backups. Backups wait until this bot\'s Start on a new database or Put back finishes.'
             : 'No backup yet; the first one starts within a minute.';
         return !res.success
           ? `<div class="error-message">Could not list the backups: ${escapeHtml(res.error || 'unknown error')}</div>`
@@ -2787,6 +2993,7 @@
       if (!f.enabled) return '<div class="error-message">Backups are off for this bot: no backup is taken and none is deleted.</div>' + testAlert;
       if (f.skip === 'scope') return testAlert;
       if (f.skip === 'seed') return '<div class="env-tip">Backups of this copy start after its seed finishes.</div>' + testAlert;
+      if (f.skip === 'kept') return '<div class="env-tip">Backups wait until this bot\'s Start on a new database or Put back finishes.</div>' + testAlert;
       const file = escapeHtml(f.lastFile || '');
       const failing = f.alerts && f.alerts.dumps;
       const lines = [];

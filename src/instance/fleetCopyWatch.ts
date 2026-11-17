@@ -280,10 +280,10 @@ export async function stepCopyAlerts(instance: InstanceConfig, cases: Record<'he
 
 export { dmOutcomeText };
 
-/** The instance as the registry holds it now, when the watcher still looks after it: joined, not the main itself, and free. */
+/** The instance as the registry holds it now, when the watcher still looks after it: joined, not the main itself, free, and with no new-start or put-back record open. */
 function watched(id: string): InstanceConfig | null {
   const instance = containerManager.getBot(id);
-  if (!instance?.fleetJoin || instance.fleetDb || instance.migrate || containerManager.isBotBusy(id)) return null;
+  if (!instance?.fleetJoin || instance.fleetDb || instance.migrate || containerManager.keptOpOpen(instance) || containerManager.isBotBusy(id)) return null;
   return instance;
 }
 

@@ -406,6 +406,9 @@ export interface InstanceConfig {
   maintenance?: MaintenanceRecord | null; // the operator's state order; absent = Running, settled; null in a browser copy
   migrate?: MigrateRecord | null;      // an open data migration; absent = none; null in a browser copy
   migrateLast?: MigrateLast | null;    // the last migration's outcome
+  keptSets?: KeptDataSet[];            // databases, live copies and data folders this instance used before, kept unchanged
+  keptOp?: KeptOpRecord | null;        // an open Start on a new database, Put back or Delete; absent = none; null in a browser copy
+  keptLast?: KeptLast | null;          // the last of those operations' outcome
 
   // Commit tracking
   lastBuiltCommit: string | null;      // SHA at time of last buildBot()
@@ -431,7 +434,7 @@ export interface MaintenanceRecord {
   message: string;                    // '' = the bot's default text
   orderedAt: string;
   settled: boolean;                   // every step the order needs is confirmed
-  hook: 'confirmed' | 'unconfirmed' | 'missing' | 'none';
+  hook: 'confirmed' | 'unconfirmed' | 'missing' | 'none' | 'not-sent'; // not-sent: set while the bot was stopped; its saved state decides its next boot
   login: 'blocked' | 'open' | 'unconfirmed' | 'not-managed';
   savedByBot: 'running' | 'maintenance' | null; // the last state the bot confirmed saving, across orders
   held?: MaintenanceHeld;             // what the bot answered about the changes it holds in memory (contract 1's saved)
@@ -471,6 +474,48 @@ export interface MigrateRecord {
 }
 
 export interface MigrateLast { to: MigrateTo; outcome: 'done' | 'failed'; jobId: string | null; text: string; at: string }
+
+/** A database volume, a live copy's volume and a data folder this instance used before (NM31); kept unchanged until Put back or Delete. */
+export interface KeptDataSet {
+  id: string;                         // stampOf(keptAt), or `${stamp}-new` for what an undo sets aside
+  keptAt: string;
+  by: 'new-start' | 'put-back';
+  folder: string | null;              // absolute, in the manager's path space; null when no folder is part of the set
+  db?: FleetDbRecord;                 // the fleetDb record as it stood; db.volume is the kept volume
+  restoreNotice?: FleetRestoreNotice; // fleetRestoreError as it stood beside that database
+  copy?: FleetDbReplicaRecord;        // the live copy record as it stood; copy.volume is the kept copy volume
+  join?: FleetJoinRecord;             // fleetJoin as it stood, whenever the instance had one
+}
+
+export type KeptOpKind = 'new-start' | 'put-back' | 'delete';
+export type KeptStep = 'recorded' | 'db-stopped' | 'db-out' | 'swapped' | 'folder' | 'db-in' | 'db-up' | 'login'
+  | 'settled' | 'copy-made' | 'dumped' | 'scratch-gone' | 'checked' | 'archived' | 'archive-checked' | 'removing';
+
+export interface KeptOpRecord {
+  op: KeptOpKind;
+  set: string;                        // new-start: the id of the set it makes; put-back and delete: the set it acts on
+  asideSet?: string;                  // put-back: the id of the set the data in use becomes
+  stamp: string;                      // stampOf(startedAt)
+  startedAt: string;
+  parts: Array<'db' | 'copy' | 'folder'>;
+  dataDir: string;                    // instanceDataDir() at admission
+  outDir: string;                     // where the folder in use goes
+  inDir: string;                      // the folder that comes into use
+  owner?: { uid: number; gid: number; mode: number }; // new-start: the data folder's, read at admission
+  newVolume?: string;                 // new-start with a database
+  offMessage: string;                 // the Off order's message at admission
+  sharers: string[];                  // instance ids held while the record is open
+  step: KeptStep;
+  undo?: true;                        // new-start or put-back: the operator chose Put back before it finished
+  dump?: string;                      // delete: the dump file, once written
+  archive?: string;                   // delete: the archive file, once written
+  dropped?: string;                   // delete: the kept volume X0 dropped from the set (docker said it no longer exists)
+  folderMissing?: true;               // a reverse: its folder step found the data folder missing and left it so
+  folderGone?: true;                  // new-start: it last stopped because the data folder was missing (T-N-GONE)
+  lastError?: string;
+}
+
+export interface KeptLast { op: KeptOpKind | 'abandoned'; set: string; outcome: 'done' | 'failed'; text: string; at: string }
 
 /**
  * Written before a lane's first destructive step. An update, restart or build

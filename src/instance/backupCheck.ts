@@ -21,7 +21,8 @@ const RUN_MS = 300_000;
 const COUNT_MS = 300_000;
 const GIB = 1024 * 1024 * 1024;
 const MIB = 1024 * 1024;
-const LABEL = 'smdb.testrestore';
+export const THROWAWAY_LABEL = 'smdb.testrestore';
+const LABEL = THROWAWAY_LABEL;
 const THROWAWAY_RE = /^smdb-testrestore-[A-Za-z0-9_-]+$/;
 
 export const throwawayName = (botId: string): string => `smdb-testrestore-${botId}`;
@@ -113,7 +114,7 @@ async function removeThrowaway(name: string): Promise<string | null> {
   return null;
 }
 
-type Verdict = { passed: true; tables: number; rows: number } | { passed: false; reason: string };
+export type Verdict = { passed: true; tables: number; rows: number } | { passed: false; reason: string };
 
 function restoreInto(name: string, dumpPath: string): Promise<string | null> {
   return new Promise(resolve => {
@@ -151,8 +152,12 @@ function restoreInto(name: string, dumpPath: string): Promise<string | null> {
   });
 }
 
-async function testInThrowaway(botId: string, dumpPath: string, dbBytes: number, recorded: Record<string, number>): Promise<Verdict> {
-  const name = throwawayName(botId);
+function testInThrowaway(botId: string, dumpPath: string, dbBytes: number, recorded: Record<string, number>): Promise<Verdict> {
+  return checkDumpInThrowaway(throwawayName(botId), botId, dumpPath, dbBytes, recorded);
+}
+
+/** Restores a dump into the throwaway `name`, labelled for `botId`, and compares its table counts; the caller removes the throwaway. */
+export async function checkDumpInThrowaway(name: string, botId: string, dumpPath: string, dbBytes: number, recorded: Record<string, number>): Promise<Verdict> {
   const leftover = await removeThrowaway(name);
   if (leftover) return { passed: false, reason: `the throwaway container or volume ${name} from an earlier test could not be removed (${leftover})` };
   const volume = await execDocker(['volume', 'create', '--label', `${LABEL}=${botId}`, name], DOCKER_MS);

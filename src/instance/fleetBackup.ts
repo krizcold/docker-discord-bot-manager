@@ -1132,6 +1132,17 @@ export async function dumpCopyForRebuild(instance: InstanceConfig, prefix: strin
   return { success: false, error: scrubbed(instance.id, result.error || 'unknown error') };
 }
 
+/**
+ * Delete's dump of a scratch copy of kept data (NM31 X2): `target` is the scratch container, the file `<prefix><time>.dump`
+ * with its counts file. Claims nothing; the caller holds the backup slot.
+ */
+export async function dumpKeptDatabase(instance: InstanceConfig, target: DumpTarget, family: BackupFamily, prefix: string): Promise<{ success: true; file: string; meta: DumpMeta } | { success: false; error: string }> {
+  const at = Date.now();
+  const result = await dumpDatabase(instance, target, `${prefix}${stampOf(at)}.dump`, family, 'safety', at);
+  if (result.success && result.file && result.meta) return { success: true, file: result.file, meta: result.meta };
+  return { success: false, error: scrubbed(instance.id, result.error || 'unknown error') };
+}
+
 const MIB = 1024 * 1024;
 
 /**
@@ -1335,11 +1346,12 @@ ${dumpErr}`);
 const FAMILIES: BackupFamily[] = ['main', 'copy'];
 
 /** What the scheduler does with a family: nothing held, held and skipped, held and failing before a dump, or dumped. */
-type FamilyPlan = { skip: 'scope' | 'seed' } | { error: string } | { target: DumpTarget };
+type FamilyPlan = { skip: 'scope' | 'seed' | 'kept' } | { error: string } | { target: DumpTarget };
 
 function familyPlan(instance: InstanceConfig, family: BackupFamily): FamilyPlan | null {
   if (family === 'main') {
     if (!instance.fleetDb) return null;
+    if (containerManager.keptOpOpen(instance)) return { skip: 'kept' };
     // A broken store cannot verify scope, and the dumps HAVE stopped: that counts as failing.
     const scope = backupScopeUnverifiable(instance);
     if (scope.corrupt) return { error: 'the env store cannot be read (a copy is kept beside it as storage.json.corrupt-<time> when it could be read), so the scheduled dump cannot verify its scope' };
@@ -1349,6 +1361,7 @@ function familyPlan(instance: InstanceConfig, family: BackupFamily): FamilyPlan 
   }
   const rec = instance.fleetDbReplica;
   if (!rec || rec.copyCleared) return null;
+  if (containerManager.keptOpOpen(instance)) return { skip: 'kept' };
   const seed = fleetReplica.seedView(instance);
   if (seed && seed.parked !== true) return { skip: 'seed' };
   if (!rec.user || !rec.db) return { error: 'the standby record has no database identity, so no scheduled dump of this copy ran' };
@@ -1551,8 +1564,8 @@ async function runFleetBackupTick(): Promise<void> {
 export type FamilyStatus = {
   family: BackupFamily; role: string; enabled: boolean; hour: number; paused: boolean;
   lastFile: string | null; lastAt: number | null; dataAt: number | null; lastError: string | null; failingSince: number | null; listError: string | null;
-  /** Why the scheduler takes no dump of this family now: out of scope, or its seed runs. */
-  skip: 'scope' | 'seed' | null;
+  /** Why the scheduler takes no dump of this family now: out of scope, its seed runs, or a kept-data record is open. */
+  skip: 'scope' | 'seed' | 'kept' | null;
   test: FleetBackupTestRecord | null; alerts: { dumps: FleetBackupAlert | null; test: FleetBackupAlert | null };
 };
 
@@ -1738,6 +1751,10 @@ export async function previewFleetRestore(botId: string): Promise<{ success: tru
  */
 function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; step: string; whole?: boolean } | null {
   if (instance.migrate) return { refusal: 'A data migration of this bot is open; finish it before restoring a dump', step: 'finish the migration with Migrate' };
+  const kept = containerManager.keptOpOpen(instance);
+  if (kept) return { refusal: containerManager.keptGateText(kept, 'db'), step: `finish ${containerManager.keptOpName(kept.op)} in the Database window` };
+  const keptHold = containerManager.keptSharerText(instance.id, 'a restore of a dump');
+  if (keptHold) return { refusal: keptHold, step: "finish the other bot's operation in its Database window" };
   const held = containerManager.migrationHolds(instance.id)[0];
   if (held) {
     const other = held.other.displayName;

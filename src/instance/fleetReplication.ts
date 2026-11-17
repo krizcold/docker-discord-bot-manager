@@ -492,7 +492,7 @@ async function inReplicationLane<T extends { success: boolean; error?: string }>
   try {
     return await containerManager.withExternalBotOp(botId, 'replication', async () => {
       entered = true;
-      const held = containerManager.migrateRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
+      const held = containerManager.migrateRefusal(botId, 'db') ?? containerManager.keptOpRefusal(botId, 'db') ?? containerManager.migrationHoldRefusal(botId);
       return held ?? fn();
     });
   } catch (err) {

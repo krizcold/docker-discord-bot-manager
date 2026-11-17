@@ -33,6 +33,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   deleteLaneRefusal: () => null,
   migrateRefusal: () => null,
   heldOrderRefusal: () => null,
+  keptOpRefusal: () => null, keptSharerRefusal: () => null, keptOpOpen: () => null,
   appContainerRunning: async () => h.app,
   withExternalBotOp: async (_id: string, op: string, fn: () => Promise<unknown>) => { h.lock = op; try { return await fn(); } finally { h.lock = null; } },
   updateInstanceMaintenance: (_id: string, rec: any) => { h.inst.maintenance = JSON.parse(JSON.stringify(rec)); },

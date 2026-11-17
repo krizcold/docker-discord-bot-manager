@@ -2472,6 +2472,9 @@ export function redeliverDockerConfigFiles(
   return report;
 }
 
+/** A data folder set aside or being built by Start on a new database or Put back; the ownership walks never enter it. */
+const KEPT_FOLDER_RE = /^data\.(kept|new)-/;
+
 /**
  * Docker-mode ownership fix. The root manager delivers bot files root-owned, but the
  * bot service runs as the injected PUID:PGID, so without this it hits EACCES on the
@@ -2501,7 +2504,7 @@ export function fixDockerBotOwnership(containerBotDir: string, logFn?: (msg: str
     if (st.isDirectory()) {
       let entries: string[] = [];
       try { entries = fs.readdirSync(p); } catch { return; }
-      for (const e of entries) walk(path.join(p, e));
+      for (const e of entries) if (!KEPT_FOLDER_RE.test(e)) walk(path.join(p, e));
     }
   };
   walk(containerBotDir);
@@ -2550,7 +2553,7 @@ export function grantToApp(
     if (opts.recursive && st.isDirectory()) {
       let entries: string[] = [];
       try { entries = fs.readdirSync(p); } catch { return; }
-      for (const e of entries) chownRootOwned(path.join(p, e));
+      for (const e of entries) if (!KEPT_FOLDER_RE.test(e)) chownRootOwned(path.join(p, e));
     }
   };
   if (ownable) chownRootOwned(target);

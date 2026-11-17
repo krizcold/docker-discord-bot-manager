@@ -20,10 +20,11 @@ import {
   CreateInstanceRequest, CreateDockerImageInstanceRequest, UpdateInstanceRequest,
   DetectionResult, FleetDbRecord, FleetDbReplication, FleetDbReplicaRecord, FleetReplicaSeedRecord,
   ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord, BackupFamily, FleetBackupTests, FleetBackupAlert,
-  FleetJoinRecord, MigrateLast, MigrateRecord,
+  FleetJoinRecord, MigrateLast, MigrateRecord, KeptOpKind, KeptOpRecord, KeptDataSet, KeptLast, KeptStep, FleetRestoreNotice,
 } from '../types';
 import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
 import { copyLogin, switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
+import { stampOf } from '../instance/backupFiles';
 import type { AppMemory } from '../instance/memoryRoom';
 import * as dockerClient from './dockerClient';
 import { DockerLogFn } from './outputStream';
@@ -229,6 +230,13 @@ function decryptRecordSecrets(inst: InstanceConfig): void {
   if (inst.fleetDb?.formerMain) {
     inst.fleetDb.formerMain.code = decryptRecordSecret(inst.id, 'fleetDb.formerMain.code', inst.fleetDb.formerMain.code) ?? '';
   }
+  for (const set of inst.keptSets || []) {
+    const at = `keptSets.${set.id}`;
+    if (set.db && set.db.password !== undefined) set.db.password = decryptRecordSecret(inst.id, `${at}.db.password`, set.db.password, 'restore the key') ?? '';
+    if (set.db?.replication) set.db.replication.password = decryptRecordSecret(inst.id, `${at}.db.replication.password`, set.db.replication.password) ?? '';
+    if (set.db?.formerMain) set.db.formerMain.code = decryptRecordSecret(inst.id, `${at}.db.formerMain.code`, set.db.formerMain.code) ?? '';
+    if (set.join) set.join.code = decryptRecordSecret(inst.id, `${at}.join.code`, set.join.code) ?? '';
+  }
   if (inst.fleetLogin) {
     inst.fleetLogin.password = decryptRecordSecret(inst.id, 'fleetLogin.password', inst.fleetLogin.password, 'restore the key; a Join or Re-seed instead makes a new password, which the main accepts only after its operator removes this machine\'s login there') ?? '';
   }
@@ -245,10 +253,72 @@ function encryptedOrStashed(instId: string, field: string, plain: string | undef
   return lostRecordBlobs.get(`${instId}:${field}`) ?? plain;
 }
 
+const DB_SECRET_FIELDS = ['password', 'replication.password', 'formerMain.code'];
+const JOIN_SECRET_FIELDS = ['code'];
+
+/** Each secret-holding record of an instance, with every field path its stash keys start with (a record can sit at two). */
+function secretHomes(inst: InstanceConfig): Map<object, { ats: string[]; fields: string[] }> {
+  const homes = new Map<object, { ats: string[]; fields: string[] }>();
+  const add = (record: object | undefined, at: string, fields: string[]) => {
+    if (!record) return;
+    const home = homes.get(record);
+    if (home) home.ats.push(at);
+    else homes.set(record, { ats: [at], fields });
+  };
+  add(inst.fleetDb, 'fleetDb', DB_SECRET_FIELDS);
+  add(inst.fleetJoin, 'fleetJoin', JOIN_SECRET_FIELDS);
+  for (const set of inst.keptSets || []) {
+    add(set.db, `keptSets.${set.id}.db`, DB_SECRET_FIELDS);
+    add(set.join, `keptSets.${set.id}.join`, JOIN_SECRET_FIELDS);
+  }
+  return homes;
+}
+
+/**
+ * Applies `change` to a loaded instance and saves the registry. A stashed ciphertext (a secret whose key was lost)
+ * follows its record to every path the change gives it and leaves the paths the record left, so the save writes it
+ * where the record now is and a restored key heals it there. The stash is put back when the save throws.
+ */
+function saveMovingStash(registry: InstanceRegistry, instance: InstanceConfig, change: () => void): void {
+  const before = secretHomes(instance);
+  change();
+  const after = secretHomes(instance);
+  const key = (field: string) => `${instance.id}:${field}`;
+  const drop: string[] = [];
+  const put: Array<[string, string]> = [];
+  for (const [record, home] of before) {
+    const now = after.get(record)?.ats ?? [];
+    for (const field of home.fields) {
+      const blob = home.ats.map(at => lostRecordBlobs.get(key(`${at}.${field}`))).find(b => b !== undefined);
+      if (blob === undefined) continue;
+      for (const at of home.ats) if (!now.includes(at)) drop.push(`${at}.${field}`);
+      for (const at of now) put.push([`${at}.${field}`, blob]);
+    }
+  }
+  const prior = new Map<string, string | undefined>();
+  for (const f of [...drop, ...put.map(([f]) => f)]) if (!prior.has(f)) prior.set(f, lostRecordBlobs.get(key(f)));
+  for (const f of drop) lostRecordBlobs.delete(key(f));
+  for (const [f, blob] of put) lostRecordBlobs.set(key(f), blob);
+  try {
+    saveRegistry(registry);
+  } catch (err) {
+    for (const [f, blob] of prior) {
+      if (blob === undefined) lostRecordBlobs.delete(key(f));
+      else lostRecordBlobs.set(key(f), blob);
+    }
+    throw err;
+  }
+}
+
 /** The record's own credentials and the env store's sensitive values (passwords inside URLs included). */
 export function recordSecrets(inst: InstanceConfig): string[] {
   const secrets = [inst.updateToken, inst.fleetDb?.replication?.password, inst.fleetDb?.password, inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code, inst.fleetLogin?.password];
-  for (const text of [inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code]) {
+  const codes = [inst.fleetJoin?.code, inst.fleetDb?.formerMain?.code];
+  for (const set of inst.keptSets || []) {
+    secrets.push(set.db?.password, set.db?.replication?.password, set.db?.formerMain?.code, set.join?.code);
+    codes.push(set.db?.formerMain?.code, set.join?.code);
+  }
+  for (const text of codes) {
     const joined = text ? decodeJoinCode(text) : null;
     if (joined?.ok) secrets.push(joined.code.repl.password, joined.code.app.password);
   }
@@ -272,7 +342,7 @@ export function recordSecrets(inst: InstanceConfig): string[] {
  */
 function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   const has = typeof inst.fleetDbReplicaSeed?.lastError === 'string' && inst.fleetDbReplicaSeed.lastError !== '';
-  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts && !inst.fleetCopyAlerts && !inst.fleetJoin?.addressesError && !inst.migrate?.text && !inst.migrateLast?.text) return inst;
+  if (!has && !inst.fleetRestoreError && !inst.fleetBackupTests && !inst.fleetBackupAlerts && !inst.fleetCopyAlerts && !inst.fleetJoin?.addressesError && !inst.migrate?.text && !inst.migrateLast?.text && typeof inst.keptOp?.lastError !== 'string' && !inst.keptLast?.text) return inst;
   const secrets = recordSecrets(inst);
   const scrub = <T extends { lastError?: string }>(r: T | undefined): T | undefined =>
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
@@ -303,6 +373,8 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
   if (out.fleetJoin?.addressesError) out.fleetJoin = { ...out.fleetJoin, addressesError: redactSecrets(out.fleetJoin.addressesError, secrets) };
   if (out.migrate?.text) out.migrate = { ...out.migrate, text: redactSecrets(out.migrate.text, secrets) };
   if (out.migrateLast?.text) out.migrateLast = { ...out.migrateLast, text: redactSecrets(out.migrateLast.text, secrets) };
+  if (out.keptOp) out.keptOp = scrub(out.keptOp);
+  if (out.keptLast?.text) out.keptLast = { ...out.keptLast, text: redactSecrets(out.keptLast.text, secrets) };
   return out;
 }
 
@@ -324,6 +396,21 @@ function withRecordSecretsEncrypted(inst: InstanceConfig): InstanceConfig {
   if (out.fleetLogin) {
     out.fleetLogin = { ...out.fleetLogin, password: encryptedOrStashed(inst.id, 'fleetLogin.password', out.fleetLogin.password) ?? '' };
   }
+  if (out.keptSets) {
+    out.keptSets = out.keptSets.map((set) => {
+      const at = `keptSets.${set.id}`;
+      const kept = { ...set };
+      if (kept.db) {
+        const db = { ...kept.db };
+        if (db.password !== undefined) db.password = encryptedOrStashed(inst.id, `${at}.db.password`, db.password) ?? '';
+        if (db.replication) db.replication = { ...db.replication, password: encryptedOrStashed(inst.id, `${at}.db.replication.password`, db.replication.password) ?? '' };
+        if (db.formerMain) db.formerMain = { ...db.formerMain, code: encryptedOrStashed(inst.id, `${at}.db.formerMain.code`, db.formerMain.code) ?? '' };
+        kept.db = db;
+      }
+      if (kept.join) kept.join = { ...kept.join, code: encryptedOrStashed(inst.id, `${at}.join.code`, kept.join.code) ?? '' };
+      return kept;
+    });
+  }
   return out;
 }
 
@@ -342,6 +429,8 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   out.maintenance = inst.maintenance ?? null;
   out.migrate = inst.migrate ?? null;
   out.migrateLast = inst.migrateLast ?? null;
+  out.keptOp = inst.keptOp ?? null;
+  out.keptLast = inst.keptLast ?? null;
   if (out.fleetDb?.replication) {
     out.fleetDb = { ...out.fleetDb, replication: { ...out.fleetDb.replication, password: '' } };
   }
@@ -357,6 +446,18 @@ export function withoutRecordSecrets(inst: InstanceConfig | null): (InstanceConf
   if (out.fleetLogin) {
     out.fleetLogin = { password: '' };
   }
+  out.keptSets = (inst.keptSets || []).map((set) => {
+    const kept = { ...set };
+    if (kept.db) {
+      const db = { ...kept.db };
+      if (db.password !== undefined) db.password = '';
+      if (db.replication) db.replication = { ...db.replication, password: '' };
+      if (db.formerMain) db.formerMain = { ...db.formerMain, code: '' };
+      kept.db = db;
+    }
+    if (kept.join) kept.join = { ...kept.join, code: '' };
+    return kept;
+  });
   return out;
 }
 
@@ -797,6 +898,334 @@ export function updateInstanceMigrate(botId: string, record: MigrateRecord | nul
   saveRegistry(registry);
 }
 
+const KEPT_OP_NAMES: Record<KeptOpKind, string> = { 'new-start': 'Start on a new database', 'put-back': 'Put back', delete: 'Delete' };
+
+export function keptOpName(op: KeptOpKind): string {
+  return KEPT_OP_NAMES[op];
+}
+
+/** A5: the refusal of a kept operation while another record is open. */
+export function keptOpOpenText(open: KeptOpRecord): string {
+  return `${keptOpName(open.op)} did not finish on this bot; finish it in the Database window first; nothing was changed`;
+}
+
+export const KEPT_RECORD_CLOSED = 'the record was closed while this ran';
+
+/**
+ * Writes keptOp only while none is open, in one load and save; answers A5's text when one is. With `drop`, the same
+ * save drops that kept set's volume part (X0, docker says the volume is gone), and answers KEPT_SET_GONE (nothing
+ * written) when the set is no longer recorded. Throws when the registry cannot be written.
+ */
+export function createKeptOpIf(botId: string, record: KeptOpRecord, drop?: { set: string; part: 'db' | 'copy' }): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (instance.keptOp) return keptOpOpenText(instance.keptOp);
+  const sets = drop ? keptSetsWithout(instance, drop.set, drop.part) : null;
+  if (sets === KEPT_SET_GONE) return KEPT_SET_GONE;
+  saveMovingStash(registry, instance, () => {
+    if (sets) {
+      if (sets.length) instance.keptSets = sets;
+      else delete instance.keptSets;
+    }
+    instance.keptOp = record;
+    instance.updatedAt = new Date().toISOString();
+  });
+  return null;
+}
+
+/**
+ * Applies patch to keptOp only while its op, set and stamp equal key (an undefined value removes that field);
+ * answers KEPT_RECORD_CLOSED otherwise. Throws when the registry cannot be written.
+ */
+export function saveKeptOpIf(botId: string, key: Pick<KeptOpRecord, 'op' | 'set' | 'stamp'>, patch: Partial<KeptOpRecord>): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  const open = instance.keptOp;
+  if (!open || open.op !== key.op || open.set !== key.set || open.stamp !== key.stamp) return KEPT_RECORD_CLOSED;
+  const next: Record<string, unknown> = { ...open };
+  for (const [field, value] of Object.entries(patch)) {
+    if (value === undefined) delete next[field];
+    else next[field] = value;
+  }
+  instance.keptOp = next as unknown as KeptOpRecord;
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return null;
+}
+
+/** The volumes an instance's open new-start or put-back record brings in or sets aside, besides its kept sets. */
+function keptOpVolumes(inst: InstanceConfig): string[] {
+  const rec = inst.keptOp;
+  if (!rec || rec.op === 'delete') return [];
+  const out: string[] = [];
+  if (rec.op === 'new-start') {
+    if (rec.newVolume) out.push(rec.newVolume);
+    if (rec.parts.includes('db') && inst.fleetDb) out.push(inst.fleetDb.volume);
+    if (rec.parts.includes('copy') && inst.fleetDbReplica) out.push(inst.fleetDbReplica.volume);
+    return out;
+  }
+  const set = (inst.keptSets || []).find(s => s.id === rec.set);
+  if (set?.db && inst.fleetDb) out.push(inst.fleetDb.volume);
+  if (set?.copy && inst.fleetDbReplica) out.push(inst.fleetDbReplica.volume);
+  return out;
+}
+
+/**
+ * Why a volume is kept data: named by any instance's kept set or by an open record's new volume, or the current
+ * volume of an instance whose open record sets it aside. `exceptSet` leaves out that set of the instance `botId`.
+ */
+export function keptVolumeReason(volume: string, opts: { botId?: string; exceptSet?: string } = {}): string | null {
+  const registry = loadRegistry();
+  if (brokenRegistryLoads.has(registry)) return `the manager can't confirm it is not kept data (the instance registry cannot be read)`;
+  for (const [id, inst] of Object.entries(registry.instances)) {
+    const own = id === opts.botId || inst.id === opts.botId;
+    const sets = (inst.keptSets || []).filter(s => !(own && opts.exceptSet !== undefined && s.id === opts.exceptSet));
+    if (sets.some(s => s.db?.volume === volume || s.copy?.volume === volume) || keptOpVolumes(inst).includes(volume)) {
+      return `it is kept by ${inst.displayName || id}'s Kept data`;
+    }
+  }
+  return null;
+}
+
+/** The instance's open new-start or put-back record, which gates its lanes; a delete record gates none of them. */
+export function keptOpOpen(inst: InstanceConfig | null | undefined): KeptOpRecord | null {
+  const rec = inst?.keptOp;
+  return rec && rec.op !== 'delete' ? rec : null;
+}
+
+const KEPT_GATE_WHAT: Record<MigrateGateKey, string> = {
+  start: 'Start',
+  build: 'Update and Build',
+  order: 'a state change',
+  setup: 'a change of its source or name',
+  db: 'a change of its database setup',
+  files: 'a change of its files',
+  guard: 'this',
+};
+
+/** T-G-<key> without its "; nothing was changed" ending. */
+export function keptGateText(rec: KeptOpRecord, key: MigrateGateKey): string {
+  return `${keptOpName(rec.op)} did not finish on this bot, so ${KEPT_GATE_WHAT[key]} is refused until it does; open the Database window to run it again`;
+}
+
+/** T-G-<key>: the refusal an open new-start or put-back record gives; null with no record or a delete record. */
+export function keptOpRefusal(botId: string, key: MigrateGateKey): { success: false; error: string } | null {
+  const rec = keptOpOpen(getBot(botId));
+  return rec ? { success: false, error: `${keptGateText(rec, key)}; nothing was changed` } : null;
+}
+
+/** T-G-SHARER without its "; nothing was changed" ending: another instance's open new-start or put-back record holds this bot. */
+export function keptSharerText(botId: string, action: string): string | null {
+  for (const other of Object.values(loadRegistry().instances)) {
+    const rec = keptOpOpen(other);
+    if (!rec || other.id === botId || !rec.sharers.includes(botId)) continue;
+    return `${other.displayName}'s ${keptOpName(rec.op)} did not finish, and this bot uses the same database, so ${action} is refused until it does`;
+  }
+  return null;
+}
+
+/** T-G-SHARER: this bot uses the database another instance's open new-start or put-back record set aside. */
+export function keptSharerRefusal(botId: string, action: string): { success: false; error: string } | null {
+  const text = keptSharerText(botId, action);
+  return text ? { success: false, error: `${text}; nothing was changed` } : null;
+}
+
+/** T-G-DELETE, or A5's text while a record is open and nothing is kept yet; null when the instance keeps nothing. */
+export function keptDeleteRefusal(botId: string): string | null {
+  const inst = getBot(botId);
+  const sets = inst?.keptSets?.length ?? 0;
+  if (sets > 0) return `This bot keeps earlier data (${sets} under Kept data in its Database window); put back or delete each first; nothing was changed`;
+  return inst?.keptOp ? keptOpOpenText(inst.keptOp) : null;
+}
+
+const listText = (items: string[]) => (items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`);
+
+/** What one kept-data swap writes besides the record's step: undefined leaves a field as it is, null deletes it. */
+export type KeptSwap = {
+  add: KeptDataSet;
+  remove?: string;
+  fleetDb?: FleetDbRecord | null;
+  fleetRestoreError?: FleetRestoreNotice | null;
+  fleetDbReplica?: FleetDbReplicaRecord | null;
+  fleetJoin?: FleetJoinRecord | null;
+};
+
+const sameKeptOp = (open: KeptOpRecord | null | undefined, key: Pick<KeptOpRecord, 'op' | 'set' | 'stamp'>): open is KeptOpRecord =>
+  !!open && open.op === key.op && open.set === key.set && open.stamp === key.stamp;
+
+/**
+ * Swaps the data in use with a kept set in one load and save, built from the instance as stored, and saves keptOp.step
+ * with it, dropping the last stop's lastError and folderGone; answers KEPT_RECORD_CLOSED (nothing written) when keptOp no
+ * longer matches key. Throws on a save error.
+ */
+export function swapKeptData(botId: string, key: Pick<KeptOpRecord, 'op' | 'set' | 'stamp'>, build: (inst: InstanceConfig) => KeptSwap, step: KeptStep): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  const open = instance.keptOp;
+  if (!sameKeptOp(open, key)) return KEPT_RECORD_CLOSED;
+  const swap = build(instance);
+  saveMovingStash(registry, instance, () => {
+    instance.keptSets = [...(instance.keptSets || []).filter(s => s.id !== swap.add.id && s.id !== swap.remove), swap.add];
+    for (const field of ['fleetDb', 'fleetRestoreError', 'fleetDbReplica', 'fleetJoin'] as const) {
+      const value = swap[field];
+      if (value === null) delete instance[field];
+      else if (value !== undefined) (instance as unknown as Record<string, unknown>)[field] = value;
+    }
+    const { lastError: _e, folderGone: _g, ...left } = open;
+    instance.keptOp = { ...left, step };
+    instance.updatedAt = new Date().toISOString();
+  });
+  return null;
+}
+
+/**
+ * Closes keptOp in one load and save with its outcome in keptLast, the maintenance record when given and the kept
+ * sets as `sets` leaves them; answers KEPT_RECORD_CLOSED (nothing written) when keptOp no longer matches key.
+ */
+export function closeKeptOp(botId: string, key: Pick<KeptOpRecord, 'op' | 'set' | 'stamp'>, close: { last: Omit<KeptLast, 'at'>; maintenance?: MaintenanceRecord; sets?: (sets: KeptDataSet[]) => KeptDataSet[] }): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (!sameKeptOp(instance.keptOp, key)) return KEPT_RECORD_CLOSED;
+  const sets = close.sets ? close.sets(instance.keptSets || []) : null;
+  saveMovingStash(registry, instance, () => {
+    delete instance.keptOp;
+    instance.keptLast = { ...close.last, at: new Date(Date.now()).toISOString() };
+    if (close.maintenance) instance.maintenance = close.maintenance;
+    if (sets) {
+      if (sets.length) instance.keptSets = sets;
+      else delete instance.keptSets;
+    }
+    instance.updatedAt = new Date().toISOString();
+  });
+  return null;
+}
+
+export const KEPT_SET_GONE = 'the kept data is no longer recorded';
+
+/**
+ * X0: drops a kept set's volume part (docker says the volume is gone) in one load and save, while no record is open;
+ * a set left naming no volume and no folder is removed. Answers A5's text or KEPT_SET_GONE (nothing written).
+ */
+export function dropKeptPart(botId: string, setId: string, part: 'db' | 'copy'): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (instance.keptOp) return keptOpOpenText(instance.keptOp);
+  const left = keptSetsWithout(instance, setId, part);
+  if (left === KEPT_SET_GONE) return KEPT_SET_GONE;
+  saveMovingStash(registry, instance, () => {
+    if (left.length) instance.keptSets = left;
+    else delete instance.keptSets;
+    instance.updatedAt = new Date().toISOString();
+  });
+  return null;
+}
+
+/** The kept sets with `part` dropped from the set `setId`, a set left naming no volume and no folder removed; KEPT_SET_GONE when the set is not recorded. */
+function keptSetsWithout(instance: InstanceConfig, setId: string, part: 'db' | 'copy'): KeptDataSet[] | typeof KEPT_SET_GONE {
+  const sets = instance.keptSets || [];
+  const set = sets.find(s => s.id === setId);
+  if (!set) return KEPT_SET_GONE;
+  const next: KeptDataSet = { ...set };
+  delete next[part];
+  if (part === 'db') delete next.restoreNotice;
+  return sets.flatMap(s => (s.id !== setId ? [s] : next.db || next.copy || next.folder ? [next] : []));
+}
+
+/**
+ * X11: closes an open Delete record in one load and save while it matches key and its step is before 'removing',
+ * with keptLast. Answers KEPT_RECORD_CLOSED or 'removing' (nothing written).
+ */
+export function closeKeptDeleteIf(botId: string, key: Pick<KeptOpRecord, 'op' | 'set' | 'stamp'>, last: Omit<KeptLast, 'at'>): string | null {
+  const registry = loadRegistry();
+  refuseBrokenRegistry(registry);
+  const instance = registry.instances[botId];
+  if (!instance) throw new Error('the bot is no longer in the registry');
+  if (!sameKeptOp(instance.keptOp, key)) return KEPT_RECORD_CLOSED;
+  if (instance.keptOp.step === 'removing') return 'removing';
+  delete instance.keptOp;
+  instance.keptLast = { ...last, at: new Date(Date.now()).toISOString() };
+  instance.updatedAt = new Date().toISOString();
+  saveRegistry(registry);
+  return null;
+}
+
+/** `docker inspect` of one container by its exact name: null when docker did not say; "no such container" is stopped. */
+export function containerRunningExact(name: string): Promise<boolean | null> {
+  return new Promise(resolve => {
+    execFile('docker', ['inspect', '-f', '{{.State.Running}}', name], { timeout: 10_000 }, (err, stdout, stderr) => {
+      if (!err) return resolve(String(stdout).trim() === 'true');
+      resolve(/no such object|no such container/i.test(String(stderr || err.message)) ? false : null);
+    });
+  });
+}
+
+/** `docker stop` of one container by its exact name, then the inspect read; a missing container counts as stopped. */
+export async function stopContainerExact(name: string, graceSec: number): Promise<{ ok: true } | { ok: false; error: string }> {
+  const failed = await new Promise<string | null>(resolve => {
+    execFile('docker', ['stop', '--time', String(graceSec), name], { timeout: (graceSec + 30) * 1000 }, (err, _stdout, stderr) => {
+      if (!err) return resolve(null);
+      const text = errorText({ stderr, message: err.killed ? `docker did not answer within ${graceSec + 30} s` : err.message });
+      resolve(/no such container/i.test(text) ? null : text);
+    });
+  });
+  if (failed) return { ok: false, error: failed };
+  const running = await containerRunningExact(name);
+  if (running === null) return { ok: false, error: `docker did not say whether ${name} stopped` };
+  return running ? { ok: false, error: `${name} still runs` } : { ok: true };
+}
+
+/** Takes the managed database services out of the deployed compose; a compose without them is not written. */
+export function takeFleetDbServicesOut(botId: string): LaneResult {
+  const composePath = resolveComposePath(botId, resolveAppName(botId));
+  const stripped = strippedDeployedCompose(composePath, removeFleetDbServices);
+  if (stripped.error) return { success: false, error: stripped.error };
+  if (stripped.content === null) return { success: true };
+  try {
+    if (stripped.content !== fs.readFileSync(composePath, 'utf-8')) rewriteComposeFile(composePath, stripped.content);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: errorText(err) };
+  }
+}
+
+/**
+ * Writes the database service of `db` into the deployed compose in one rewrite: both database services out, the
+ * service in, and its published port set from `db.replication` as syncComposeEnvVars sets it. Equal content is not written.
+ */
+export async function writeFleetDbService(botId: string, db: FleetDbRecord): Promise<LaneResult> {
+  const instance = getBot(botId);
+  if (!instance) return { success: false, error: 'Bot not found' };
+  const composePath = resolveComposePath(botId, resolveAppName(botId));
+  try {
+    const raw = fs.readFileSync(composePath, 'utf-8');
+    const mode = await getDeploymentMode();
+    const spec = { containerName: db.containerName, volume: db.volume, password: db.password ?? '', user: db.user, db: db.db };
+    const added = addFleetPostgresService(removeFleetDbServices(raw), { ...instance, envVars: mergedEnvVars(instance) } as any, spec, { mode });
+    const compose = YAML.parseDocument(added).toJSON();
+    const svc = Object.values((compose?.services || {}) as Record<string, any>).find(s => s?.container_name === db.containerName);
+    if (!svc) throw new Error('the compose has no services section');
+    const ports = Array.isArray(svc.ports) ? svc.ports.filter((p: unknown) => !(typeof p === 'string' && p.endsWith(':5432'))) : [];
+    if (db.replication) ports.push(`${db.replication.hostPort}:5432`);
+    if (ports.length > 0) svc.ports = ports;
+    else delete svc.ports;
+    const next = YAML.stringify(compose, { lineWidth: 0 });
+    if (next !== raw) rewriteComposeFile(composePath, next);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: errorText(err) };
+  }
+}
+
 export const migrateTo = (rec: MigrateRecord) => (rec.to === 'postgres' ? 'Postgres' : 'JSON files');
 
 export const MIGRATE_GATE = {
@@ -888,7 +1317,8 @@ const urlFormText = (form: DatabaseUrlForm) => `The Database URL ${URL_FORM[form
 export function migrateEnvRefusal(botId: string, change: { vars?: Record<string, unknown>; removed?: unknown; renamed?: unknown }): { success: false; error: string } | null {
   const inst = getBot(botId);
   const rec = inst?.migrate;
-  if (!inst || !rec) return null;
+  const kept = keptOpOpen(inst);
+  if (!inst || (!rec && !kept)) return null;
   const keys = migrateKeys(inst);
   let stored: Record<string, string> | null = null;
   try { stored = envManager.getEnvVars(botId); } catch { /* unreadable: every given key counts as a change */ }
@@ -902,6 +1332,8 @@ export function migrateEnvRefusal(botId: string, change: { vars?: Record<string,
   };
   const touched = keys.all.filter(k => given(k) || removed.includes(k) || Object.keys(renamed).includes(k) || Object.values(renamed).includes(k));
   if (touched.length === 0) return null;
+  if (kept) return { success: false, error: `${keptOpName(kept.op)} did not finish on this bot, so ${listText(touched)} cannot change until it does; nothing was changed` };
+  if (!rec) return null;
   if (rec.awaiting === 'destination' && touched.every(k => k === keys.urlKey || k === 'DATA_BACKEND_URL')) {
     for (const k of touched) {
       if (!Object.prototype.hasOwnProperty.call(vars, k)) continue;
@@ -1728,7 +2160,7 @@ async function updateBotCore(botId: string, update: UpdateInstanceRequest, migra
     // AppData folder and the primary vhost. Excluding this instance keeps
     // cosmetic self-renames allowed.
     const renamesProject = names.sanitizedName !== instance.sanitizedName;
-    const migrating = renamesProject ? migrateRefusal(botId, 'setup') : null;
+    const migrating = renamesProject ? migrateRefusal(botId, 'setup') ?? keptOpRefusal(botId, 'setup') : null;
     if (migrating) throw new Error(migrating.error);
     if (renamesProject) {
       const deployed = deployedTraces(instance);
@@ -1892,7 +2324,7 @@ export function reassignSource(botId: string, newSourceId: string): InstanceConf
   const registry = loadRegistry();
   const instance = registry.instances[botId];
   if (!instance) return null;
-  const migrating = migrateRefusal(botId, 'setup');
+  const migrating = migrateRefusal(botId, 'setup') ?? keptOpRefusal(botId, 'setup');
   if (migrating) throw new Error(migrating.error);
 
   const source = sourceManager.getSource(newSourceId);
@@ -2573,9 +3005,11 @@ function composeVolumeNames(botId: string, appName: string): string[] | null {
  * volume (a keep-data delete and a reinstall under the same name, a restored
  * record); removing it then destroys the other bot's data.
  */
-export function sharedVolumeReason(volume: string, botId: string): string | null {
+export function sharedVolumeReason(volume: string, botId: string, opts: { exceptSet?: string } = {}): string | null {
   const registry = loadRegistry();
   if (brokenRegistryLoads.has(registry)) return `the manager can't confirm no other bot uses it (the instance registry cannot be read)`;
+  const kept = keptVolumeReason(volume, { botId, exceptSet: opts.exceptSet });
+  if (kept) return kept;
   const others = Object.entries(registry.instances).filter(([id, other]) => id !== botId && other.id !== botId);
   for (const [id, other] of others) {
     if (other.fleetDb?.volume === volume || other.fleetDbReplica?.volume === volume || (other.projectVolumes ?? []).includes(volume)) {
@@ -3943,12 +4377,14 @@ export function startPreflightRefusal(botId: string): { success: false; error: s
 /** Only the migrate lane's own start (startBotInOp under 'migrate') skips MG-START. */
 function startRefusal(botId: string, migrateLane: boolean): { success: false; error: string } | null {
   const instance = getBot(botId);
+  const kept = keptOpRefusal(botId, 'start');
+  if (kept) return kept;
   if (instance?.maintenance?.state === 'off') return { success: false, error: OFF_START_REFUSAL };
   const retiringAt = instance?.fleetDb?.retiringAt;
   if (retiringAt) return { success: false, error: unfinishedRetireRefusal(retiringAt) };
   const switched = instance ? switchStartRefusal(instance) : null;
   if (switched) return { success: false, error: switched };
-  return (migrateLane ? null : migrateRefusal(botId, 'start')) ?? sharerRefusal(botId, { closingStart: true }) ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
+  return (migrateLane ? null : migrateRefusal(botId, 'start')) ?? sharerRefusal(botId, { closingStart: true }) ?? keptSharerRefusal(botId, 'Start') ?? databaseHoldRefusal(botId, 'Start') ?? deleteLaneRefusal(botId, 'Start');
 }
 
 async function startBotImpl(botId: string, migrateLane = false): Promise<LaneResult> {
@@ -4635,7 +5071,7 @@ export function updatePreflightRefusal(botId: string): { success: false; error: 
   if (cfgBroken.length > 0) {
     return { success: false, error: `Stored config file bodies no longer decrypt (${cfgBroken.join(', ')}); re-enter them in the config editor or restore the encryption key before updating` };
   }
-  return migrateRefusal(botId, 'build') ?? sharerRefusal(botId) ?? databaseHoldRefusal(botId, 'Update') ?? deleteLaneRefusal(botId, 'Update');
+  return migrateRefusal(botId, 'build') ?? keptOpRefusal(botId, 'build') ?? sharerRefusal(botId) ?? keptSharerRefusal(botId, 'Update') ?? databaseHoldRefusal(botId, 'Update') ?? deleteLaneRefusal(botId, 'Update');
 }
 
 /** Fetches a git instance's source and checks its clone before an update stops anything; the refusal text, or null. */
@@ -4810,7 +5246,7 @@ async function modeMismatchRefusal(instance: InstanceConfig, emit?: EmitFn): Pro
 /** The synchronous refusal a Build answers before touching anything; null when it may proceed. */
 export function buildPreflightRefusal(botId: string): { success: false; error: string } | null {
   const own = getBot(botId)?.migrate?.phase === 'waiting' ? null : migrateRefusal(botId, 'build');
-  return own ?? sharerRefusal(botId) ?? databaseHoldRefusal(botId, 'Build') ?? deleteLaneRefusal(botId, 'Build');
+  return own ?? keptOpRefusal(botId, 'build') ?? sharerRefusal(botId) ?? keptSharerRefusal(botId, 'Build') ?? databaseHoldRefusal(botId, 'Build') ?? deleteLaneRefusal(botId, 'Build');
 }
 
 export async function buildBot(botId: string): Promise<LaneResult> {
@@ -5078,7 +5514,8 @@ export function ensureFleetDataBackend(instance: InstanceConfig, opts: { forMigr
   if (!opts.forMigrate && spec.env.mode && (stored[spec.env.mode.key] || '').trim().toLowerCase() !== spec.env.mode.value) return null;
 
   const containerName = instance.fleetDb?.containerName || `${instance.sanitizedName}-fleet-postgres`;
-  const volume = instance.fleetDb?.volume || `${instance.sanitizedName}-fleet-postgres-data`;
+  const plainVolume = `${instance.sanitizedName}-fleet-postgres-data`;
+  const volume = instance.fleetDb?.volume || (keptVolumeReason(plainVolume) ? `${plainVolume}-${stampOf(Date.now())}` : plainVolume);
   const url = (stored[spec.env.url] || '').trim();
   if (!instance.fleetDb && (instance.fleetJoin || isJoinCode(url) || isBackendUrlList(url))) return null;
 

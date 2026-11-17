@@ -18,6 +18,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   getBot: (id: string) => (h.inst?.id === id ? JSON.parse(JSON.stringify(h.inst)) : null),
   isBotBusy: () => h.lock,
   migrateRefusal: () => null, heldOrderRefusal: () => null,
+  keptOpRefusal: () => null, keptSharerRefusal: () => null, keptOpOpen: () => null,
   appContainerRunning: async () => h.app,
 }));
 vi.mock('../../src/instance/dbLogin', async (importOriginal) => ({

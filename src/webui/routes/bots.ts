@@ -29,6 +29,7 @@ import * as maintenance from '../../instance/maintenance';
 import { memoryReading, readHostMemory } from '../../instance/memoryRoom';
 import { memorySendState } from '../../instance/memorySend';
 import * as migrate from '../../instance/migrate';
+import * as keptData from '../../instance/keptData';
 import { loadVault, readVault, saveVault, vaultFileBroken } from './vault';
 import { getDeploymentInfo, setDeploymentMode, getDeploymentMode, DeploymentModeForcedError } from '../../casaos/detector';
 import { broadcastToClients } from '../server';
@@ -109,9 +110,10 @@ export function createBotRoutes(wss: WebSocketServer): Router {
     res.status(503).json({ success: false, error: containerManager.SHUTDOWN_REFUSAL });
   });
 
-  /** True when an open migration record refused the request (and the 409 is sent). */
+  /** True when an open migration record, or an open Start on a new database or Put back, refused the request (and the 409 is sent). */
   function refusedWhileMigrating(res: Response, botId: string, key: Parameters<typeof containerManager.migrateRefusal>[1]): boolean {
-    const refusal = containerManager.migrateRefusal(botId, key) ?? (key === 'db' ? containerManager.migrationHoldRefusal(botId) : null);
+    const refusal = containerManager.migrateRefusal(botId, key) ?? containerManager.keptOpRefusal(botId, key)
+      ?? (key === 'db' ? containerManager.migrationHoldRefusal(botId) : null);
     if (!refusal) return false;
     res.status(409).json(refusal);
     return true;
@@ -226,6 +228,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           appHooks: hasAppHooks(bot),
           // The Database window's data line for a hooks bot with no managed database.
           ...(hasAppHooks(bot) && !bot.fleetDb && !bot.fleetDbReplica ? { dataPlace: dataPlace(bot) } : {}),
+          // The variant Start on a new database would run, for its confirm.
+          ...(hasAppHooks(bot) ? { keptStartVariant: keptData.newStartVariantOf(bot) } : {}),
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           ...(updateCantConfirm ? { updateCantConfirm } : {}),
@@ -556,6 +560,11 @@ export function createBotRoutes(wss: WebSocketServer): Router {
 
   /** POST /api/bots/:id/migrate - Start or go on with a data migration (non-blocking; progress arrives as bot:migrate). */
   router.post('/:id/migrate', async (req: Request, res: Response) => {
+    const kept = containerManager.keptOpRefusal(req.params.id, 'db');
+    if (kept) {
+      res.status(409).json(kept);
+      return;
+    }
     try {
       const { to } = (req.body || {}) as { to?: unknown };
       const admission = await migrate.runMigration(req.params.id, to, 'press');
@@ -1825,6 +1834,53 @@ export function createBotRoutes(wss: WebSocketServer): Router {
         return;
       }
       res.json(await fleetReplica.decommissionFleetDb(bot.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** A kept-data answer: 200 with its text, or its status with the error (open: true while the record stays open). */
+  function sendKept(res: Response, answer: keptData.KeptAnswer): void {
+    if (answer.success) res.json(answer);
+    else res.status(answer.status).json({ success: false, ...(answer.open ? { open: true } : {}), error: answer.error });
+  }
+
+  /**
+   * POST /api/bots/:id/fleet-db/new-start - Start on a new database: the database volume and data folder are set aside
+   * as Kept data and the bot gets a new empty database and data folder. Answers when the operation ends.
+   */
+  router.post('/:id/fleet-db/new-start', async (req: Request, res: Response) => {
+    try {
+      sendKept(res, await keptData.startOnNewDatabase(req.params.id));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-db/kept/:set/put-back - Put back a kept set; `reverse: true` reverses the open record of that set. */
+  router.post('/:id/fleet-db/kept/:set/put-back', async (req: Request, res: Response) => {
+    try {
+      const { reverse } = (req.body || {}) as { reverse?: unknown };
+      sendKept(res, await keptData.putBack(req.params.id, req.params.set, { reverse: reverse === true }));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-db/kept/:set/delete - Delete a kept set after its checks; `again: true` is Run again on an open Delete. */
+  router.post('/:id/fleet-db/kept/:set/delete', async (req: Request, res: Response) => {
+    try {
+      const { again } = (req.body || {}) as { again?: unknown };
+      sendKept(res, await keptData.deleteKept(req.params.id, req.params.set, { again: again === true }));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-db/kept/abandon - Keep it: stop an open Delete before it removes anything. */
+  router.post('/:id/fleet-db/kept/abandon', async (req: Request, res: Response) => {
+    try {
+      sendKept(res, await keptData.keepKept(req.params.id));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

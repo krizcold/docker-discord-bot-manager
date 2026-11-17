@@ -63,6 +63,7 @@ vi.mock('../../src/docker/containerManager', () => ({
   getAllBots: () => (h.inst ? [JSON.parse(JSON.stringify(h.inst))] : []),
   isBotBusy: () => (h.busyFn ? h.busyFn() : h.lock),
   migrateRefusal: () => null, heldOrderRefusal: () => null,
+  keptOpRefusal: () => null, keptSharerRefusal: () => null, keptOpOpen: () => null,
   databaseHoldRefusal: (_id: string, action: string) => { h.holdActions.push(action); return h.hold ? { success: false, error: 'held' } : null; },
   deleteLaneRefusal: () => null,
   updateInstanceMaintenance: (_id: string, rec: any) => {

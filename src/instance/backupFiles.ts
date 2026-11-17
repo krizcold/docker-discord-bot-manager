@@ -298,7 +298,7 @@ export function isRecoveryConflict(stderr: string): boolean {
 
 /** psql's first ERROR or FATAL line, which names the failure (its DETAIL, HINT and later lines do not), else the last line; '' for none. */
 export function errorLine(stderr: string): string {
-  const lines = stderr.split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = stderr.split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
   return lines.find(l => /\b(ERROR|FATAL):/.test(l)) ?? lines[lines.length - 1] ?? '';
 }
 

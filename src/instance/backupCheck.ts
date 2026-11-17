@@ -178,7 +178,7 @@ async function testInThrowaway(botId: string, dumpPath: string, dbBytes: number,
   const restored = await restoreInto(name, dumpPath);
   if (restored) return { passed: false, reason: restored };
   const counted = await execDocker(['exec', name, 'psql', '-U', 'postgres', '-d', 'restorecheck', '-X', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', COUNTS_SQL], COUNT_MS);
-  if (!counted.ok) return { passed: false, reason: `the restored tables could not be counted (${lastLine(counted.stderr)})` };
+  if (!counted.ok) return { passed: false, reason: `the restored tables could not be counted (${lastLine(counted.stderr.split('\n').filter(l => !/(^|: )(WARNING|NOTICE): /.test(l.trim())).join('\n'))})` };
   const parsed = parseCountLines(counted.stdout);
   if (!parsed.ok) return { passed: false, reason: `the restored tables could not be counted (${parsed.error})` };
   const compared = compareCounts(recorded, parsed.counts);

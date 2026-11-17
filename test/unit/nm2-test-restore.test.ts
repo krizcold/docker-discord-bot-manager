@@ -215,6 +215,14 @@ describe('NM2 B: the daily test restore', () => {
     expect(rec?.text).toBe('the restored tables could not be counted (psql: error: FATAL: database "restorecheck" does not exist)');
   });
 
+  it('NM26: a WARNING after the counts query\'s error is never the reason', async () => {
+    putDump(FILE, { counts: COUNTS });
+    docker.overrides.push({ match: a => a[0] === 'exec' && a[1] === T && a.includes('psql'), answer: { ok: false, stderr: 'ERROR:  x\nWARNING:  w' } });
+    const { bc, bot } = await check();
+    const rec = await bc.runTestRestore(bot(), 'main', FILE);
+    expect(rec?.text).toBe('the restored tables could not be counted (ERROR:  x)');
+  });
+
   it('B13 counts that differ fail with X-MISMATCH', async () => {
     putDump(FILE, { counts: COUNTS });
     docker.restoredCounts = { '"public"."t"': 2 };

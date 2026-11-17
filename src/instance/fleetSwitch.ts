@@ -45,9 +45,9 @@ export const SWITCH_TIMING = {
 
 const SLOT_RE = /^[a-z0-9_]{1,63}$/;
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
-const lastLine = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no reason given';
+const lastLine = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l)).pop() || 'no reason given';
 const errorOf = (stderr: string) => {
-  const lines = stderr.split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = stderr.split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
   return (lines.find(l => /\b(ERROR|FATAL):/.test(l)) ?? lines[lines.length - 1] ?? 'no reason given').replace(/^psql: error: /, '');
 };
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -1063,7 +1063,7 @@ type TakeoverTail = {
   lastAt: string | null; addresses?: fleetJoin.AddressesOutcome; former: 'follow' | 'alone' | 'nocode' | 'norepl';
 };
 
-const lastLineOrEmpty = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() ?? '';
+const lastLineOrEmpty = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l)).pop() ?? '';
 
 /** T-OTHERS' entries from COPIES_READ_SQL's `<machine>|<client>` list (D50). */
 function copyNames(line: string): string[] {
@@ -1293,10 +1293,6 @@ async function foreignStream(inst: InstanceConfig, t: Target, s: ForeignStream):
   let blockEnded = false;
   if (machine) {
     const blocked = await clusterSql(t, REMOVE_BLOCK_SQL(s.user));
-    if (!blocked.ok && blocked.timedOut && !blocked.stdout.includes('blocked|')) {
-      console.warn(`[Switch] ${bot}: a stream on the slot ${s.slot} by ${s.user} was not handled: the manager can't confirm the login was blocked (${blocked.error}); the next check tries again`);
-      return;
-    }
     const answer = blocked.ok ? parseRemoveBlock(blocked.stdout) : null;
     if (!answer || answer.state !== 'blocked') {
       // Under -q a committed block and a failed one print alike; only the 'again' state is known to have failed.

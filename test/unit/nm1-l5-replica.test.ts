@@ -285,6 +285,12 @@ describe('NM1 L5: fleetReplication logins as dbm_admin', () => {
     expect(h.calls.filter(isFenceRead).length).toBe(1);
     expect(callsWith(SUPER).length).toBe(0);
   });
+
+  it('NM26: a WARNING line after the error is never the reason', async () => {
+    writeInstance({ fleetDb });
+    h.answer = answerWith(args => (isFenceRead(args) ? { stderr: 'could not connect\nWARNING:  w' } : base(args)));
+    expect(await fenceLinesRefusal(fleetDb.containerName)).toBe('whether a write fence stands in pg_hba.conf could not be read (could not connect)');
+  });
 });
 
 describe('NM1 L5: the SQL fleetReplication sends', () => {

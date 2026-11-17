@@ -54,7 +54,7 @@ export function psqlFailureClass(stderr: string): PsqlClass {
 }
 
 function lastLine(text: string): string {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
   return lines[lines.length - 1] || 'psql failed with no message';
 }
 
@@ -62,15 +62,15 @@ function lastLine(text: string): string {
  * The session options of every plain login's call: a database or role setting the bot role makes cannot change what
  * a manager call reads, writes, formats or waits for. The fence's read-only default is left out on purpose.
  */
-export const MANAGER_SESSION_OPTIONS = '-c search_path=pg_catalog,pg_temp -c lock_timeout=0 -c statement_timeout=0 -c idle_in_transaction_session_timeout=0 -c idle_session_timeout=0 -c tcp_keepalives_idle=0 -c tcp_keepalives_interval=0 -c tcp_keepalives_count=0 -c tcp_user_timeout=0 -c TimeZone=UTC -c DateStyle=ISO,MDY -c IntervalStyle=postgres -c extra_float_digits=1 -c bytea_output=hex -c client_encoding=UTF8 -c timezone_abbreviations=Default -c lc_numeric=C -c lc_monetary=C -c lc_time=C -c xmloption=content -c standard_conforming_strings=on -c backslash_quote=safe_encoding -c array_nulls=on -c quote_all_identifiers=off -c transform_null_equals=off -c row_security=off -c restrict_nonsystem_relation_kind= -c gin_fuzzy_search_limit=0 -c local_preload_libraries= -c client_min_messages=notice -c exit_on_error=off -c default_transaction_isolation=read\\ committed -c default_transaction_deferrable=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c synchronous_commit=on -c stats_fetch_consistency=cache -c plpgsql.variable_conflict=error -c plpgsql.extra_errors=none -c plpgsql.extra_warnings=none -c plpgsql.check_asserts=on -c plpgsql.print_strict_params=off';
+export const MANAGER_SESSION_OPTIONS = '-c search_path=pg_catalog,pg_temp -c lock_timeout=0 -c statement_timeout=0 -c idle_in_transaction_session_timeout=0 -c idle_session_timeout=0 -c tcp_keepalives_idle=0 -c tcp_keepalives_interval=0 -c tcp_keepalives_count=0 -c tcp_user_timeout=0 -c TimeZone=UTC -c DateStyle=ISO,MDY -c IntervalStyle=postgres -c extra_float_digits=1 -c bytea_output=hex -c client_encoding=UTF8 -c timezone_abbreviations=Default -c lc_numeric=C -c lc_monetary=C -c lc_time=C -c xmloption=content -c standard_conforming_strings=on -c backslash_quote=safe_encoding -c array_nulls=on -c quote_all_identifiers=off -c transform_null_equals=off -c row_security=off -c restrict_nonsystem_relation_kind= -c gin_fuzzy_search_limit=0 -c local_preload_libraries= -c client_min_messages=notice -c exit_on_error=off -c default_transaction_isolation=read\\ committed -c default_transaction_deferrable=off -c default_tablespace= -c temp_tablespaces= -c default_table_access_method=heap -c synchronous_commit=on -c stats_fetch_consistency=cache -c plpgsql.extra_errors=none -c plpgsql.extra_warnings=none -c plpgsql.check_asserts=on -c plpgsql.print_strict_params=off';
 
 const FENCE_EXEMPT_OPTION = '-c default_transaction_read_only=off';
 
 /**
  * The session options of every session of a machine login or the join login (R18): the manager's, with the read-only
- * default off and the session acting as its login. plpgsql.variable_conflict is left out: only a superuser may set it (R33).
+ * default off and the session acting as its login.
  */
-export const COPY_SESSION_OPTIONS = `${MANAGER_SESSION_OPTIONS.replace(' -c plpgsql.variable_conflict=error', '')} ${FENCE_EXEMPT_OPTION} -c role=none`;
+export const COPY_SESSION_OPTIONS = `${MANAGER_SESSION_OPTIONS} ${FENCE_EXEMPT_OPTION} -c role=none`;
 
 /** The session option a lane's own write runs under while a write fence holds the read-only default. */
 const FENCE_EXEMPT = ['-e', `PGOPTIONS=${FENCE_EXEMPT_OPTION}`];

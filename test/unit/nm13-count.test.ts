@@ -112,6 +112,12 @@ describe('CN2: connectionReading', () => {
     h.settings = { code: 2, out: '', err: 'first\npsql: connection refused\n' };
     expect(await connectionReading(inst)).toEqual({ state: 'unread', error: 'the database did not answer (psql: connection refused)' });
   });
+  it('NM26: WARNING and NOTICE lines are never the reason', async () => {
+    h.settings = { code: 2, out: '', err: 'psql: connection refused\nWARNING:  w\n' };
+    expect(await connectionReading(inst)).toEqual({ state: 'unread', error: 'the database did not answer (psql: connection refused)' });
+    h.settings = { code: 2, out: '', err: 'psql:<stdin>:1: NOTICE:  n\n' };
+    expect(await connectionReading(inst)).toEqual({ state: 'unread', error: 'the database did not answer (no answer)' });
+  });
   it('unread: a psql fails with no stderr', async () => {
     h.nodes = { code: 1, out: '', err: '' };
     // NM20 R3.3: the read runs through dbLogin.runCall, which names the exit code when psql printed nothing.

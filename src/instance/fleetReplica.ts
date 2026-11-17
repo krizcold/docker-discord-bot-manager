@@ -884,12 +884,14 @@ export function provisionFleetReplica(
   return { success: true, started: true };
 }
 
+const keptLines = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
+
 /**
  * pg_basebackup ends a failed run with its cleanup notice ("removing contents
  * of data directory"), so the cause is its error line, never its last line.
  */
 function seedFailureLine(stderr: string, password: string): string {
-  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const lines = keptLines(stderr);
   const line = lines.find(l => /error/i.test(l)) || lines[0] || 'no output (killed or timed out)';
   return line.split(password).join('***');
 }
@@ -957,7 +959,7 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
     // FIRST line, not last: a refused or timed-out connection puts the reason
     // there ("... failed: Connection refused") and a generic hint after it,
     // and this lane exists for exactly that failure.
-    const lines = probe.stderr.trim().split('\n').map(l => l.trim()).filter(Boolean);
+    const lines = keptLines(probe.stderr);
     const reason = (lines.find(l => l.startsWith('ERROR')) || lines[0] || 'psql failed').split(dsn.password).join('***');
     if (own.minted && !probe.timedOut && isLoginRefusal(probe.stderr)) {
       throw new Error(ownProbeFailureText(main, { login: dsn, minted: own.minted }, { ok: false, kind: 'login', reason }));
@@ -1195,7 +1197,7 @@ async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCe
   await dockerRmForce(name);
   const result = await runPrimaryClient(name, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql', [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc',
     `SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`], 60_000);
-  if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${result.stderr.trim().split('\n').pop()}`);
+  if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${keptLines(result.stderr).pop() ?? ''}`);
 }
 
 /**
@@ -1657,7 +1659,7 @@ async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNulla
     [`${seedDsnFor(dsn)}&replication=true`, '-Atc', 'IDENTIFY_SYSTEM'], PROBE_TIMEOUT_MS);
   const [primaryId, primaryTl] = ident.ok ? ident.stdout.trim().split('|') : ['', ''];
   if (!/^\d+$/.test(primaryId) || !/^\d+$/.test(primaryTl)) {
-    const reason = (ident.stderr.trim().split('\n').map(l => l.trim()).filter(Boolean)[0] || 'no answer').split(dsn.password).join('***');
+    const reason = (keptLines(ident.stderr)[0] || 'no answer').split(dsn.password).join('***');
     return `the pasted primary's identity could not be read (${reason}), so it cannot be compared with this database's`;
   }
   if (primaryId !== localId) {
@@ -2043,10 +2045,10 @@ export async function adoptPromotedReplica(
   // it can always run, and the reload is what actually lifts a live wedge.
   for (const setting of ['primary_conninfo', 'primary_slot_name', 'synchronous_standby_names', 'default_transaction_read_only']) {
     const reset = await managerReplicaExec(rec.containerName, `ALTER SYSTEM RESET ${setting};`);
-    if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${reset.stderr.trim().split('\n').pop()}`);
+    if (!reset.ok) console.warn(`[FleetReplica] Could not reset ${setting} on the adopted primary: ${keptLines(reset.stderr).pop() ?? ''}`);
   }
   const reload = await managerReplicaExec(rec.containerName, 'SELECT pg_reload_conf();');
-  if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${reload.stderr.trim().split('\n').pop()}`);
+  if (!reload.ok) console.warn(`[FleetReplica] Could not reload the adopted primary's config: ${keptLines(reload.stderr).pop() ?? ''}`);
   if (alone) return { success: true, restartRequired: true, alone: true, flipped: true, addresses: await sendAddresses(instance.id) };
 
   const enabled = await enableFleetReplication(live, publicHost, hostPort, undefined, { dbPassword: password, offerAddresses: false });

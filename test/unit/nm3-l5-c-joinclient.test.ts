@@ -265,6 +265,18 @@ describe('sameManagerMain and the local certificate read', () => {
     expect(await mainCertificate(fakeJoin({ host: 'local.invalid' }))).toMatchObject({ ok: false, kind: 'unreachable', reason: 'last' });
   });
 
+  it('NM26: a WARNING line is never the reason; with only one the error message answers', async () => {
+    h.execAnswer = () => ({ err: new Error('m'), stdout: '', stderr: 'last\nWARNING:  w\n' });
+    expect(await mainCertificate(fakeJoin({ host: 'local.invalid' }))).toMatchObject({ ok: false, reason: 'last' });
+    h.execAnswer = () => ({ err: new Error('m'), stdout: '', stderr: 'WARNING:  w\n' });
+    expect(await mainCertificate(fakeJoin({ host: 'local.invalid' }))).toMatchObject({ ok: false, reason: 'm' });
+  });
+
+  it('NM26: a WARNING-only stderr answers the Command failed line', async () => {
+    h.execAnswer = () => ({ err: new Error('Command failed: docker exec ...\nWARNING:  w\n'), stdout: '', stderr: 'WARNING:  w\n' });
+    expect(await mainCertificate(fakeJoin({ host: 'local.invalid' }))).toMatchObject({ ok: false, reason: 'Command failed: docker exec ...' });
+  });
+
   it('a failed exec with no text says docker exec failed', async () => {
     h.execAnswer = () => ({ err: new Error(''), stdout: '', stderr: '' });
     expect(await mainCertificate(fakeJoin({ host: 'local.invalid' }))).toMatchObject({ ok: false, reason: 'docker exec failed' });

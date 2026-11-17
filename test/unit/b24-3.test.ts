@@ -97,6 +97,18 @@ describe('the database URL test on a manager without the test image', () => {
     expect(res).toEqual({ ok: false, error: 'Connection test timed out after 10 seconds' });
     expect(h.spawns.map(a => a[0])).toEqual(['image', 'run']);
   });
+
+  it('NM26: drops WARNING and NOTICE lines from a failed test\'s text', async () => {
+    h.code.run = 2;
+    h.stderr.run = 'WARNING:  w\npsql: error: refused\npsql:<stdin>:1: NOTICE:  n';
+    let p = probeDatabaseUrl(URL_, null);
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await p).error).toBe('psql: error: refused');
+    h.stderr.run = 'WARNING:  w';
+    p = probeDatabaseUrl(URL_, null);
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await p).error).toBe('psql exited with code 2');
+  });
 });
 
 describe('an untested database is not reported as a failed connection', () => {

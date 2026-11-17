@@ -54,7 +54,7 @@ export function childFailureText(stderr: unknown, err: unknown): string {
 
 /** The last non-empty line of a failed probe's stderr, short enough for a badge. */
 export function probeErrorTail(stderr: string): string {
-  const line = String(stderr || '').trim().split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no output';
+  const line = String(stderr || '').trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l)).pop() || 'no output';
   return line.length > 200 ? `${line.slice(0, 200)}...` : line;
 }
 

@@ -1,3 +1,4 @@
+import { probeErrorTail } from '../../src/config/secretText';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -121,6 +122,14 @@ describe('NM2 L5 d: parsers', () => {
   it('stderr past the kept length is not read; lines are trimmed', () => {
     expect(isRecoveryConflict(`${'x'.repeat(4000)}conflict with recovery`)).toBe(false);
     expect(errorLine('  first\n  last  ')).toBe('last');
+  });
+
+  it('NM26: WARNING and NOTICE lines are never the reason', () => {
+    expect(errorLine('WARNING:  permission denied to set parameter "x"')).toBe('');
+    expect(errorLine('psql:<stdin>:1: NOTICE:  hi\nWARNING:  w\nERROR:  boom\nDETAIL:  d')).toBe('ERROR:  boom');
+    expect(errorLine('plain\nNOTICE:  n')).toBe('plain');
+    expect(probeErrorTail('WARNING:  w')).toBe('no output');
+    expect(probeErrorTail('psql: error: refused\npsql:<stdin>:3: WARNING:  w')).toBe('psql: error: refused');
   });
 });
 

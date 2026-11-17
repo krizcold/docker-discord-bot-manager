@@ -1639,7 +1639,7 @@ type RestoreSteps = {
 /** The restored tables, counted right after pg_restore: compared with the dump's counts file, or unrecorded for an uploaded dump that has none. */
 type RestoreCounts = { result: 'matched' | 'differ' | 'unread' | 'unrecorded'; tables: number | null; rows: number | null; text: string | null };
 
-const lastLine = (text: string) => text.trim().split('\n').pop() || 'unknown reason';
+const lastLine = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l)).pop() || 'unknown reason';
 
 /**
  * The instances on this manager that share the database: this one always, and every other whose stored URL names

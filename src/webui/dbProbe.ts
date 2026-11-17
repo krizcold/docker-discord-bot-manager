@@ -93,6 +93,6 @@ export async function probeDatabaseUrl(target: string, network: string | null): 
   if (r.spawnError) return { ok: false, error: `Failed to run docker: ${r.spawnError}` };
   if (r.killed) return { ok: false, error: 'Connection test timed out after 10 seconds' };
   if (r.code === 0) return { ok: true };
-  const text = (r.stderr.trim() || `psql exited with code ${r.code}`).split(target).join(redactDbUrl(target));
+  const text = (r.stderr.trim().split('\n').filter(l => !/(^|: )(WARNING|NOTICE): /.test(l.trim())).join('\n').trim() || `psql exited with code ${r.code}`).split(target).join(redactDbUrl(target));
   return { ok: false, error: redactSecrets(text, secrets) };
 }

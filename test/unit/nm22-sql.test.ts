@@ -412,17 +412,15 @@ describe('pg_catalog names in what a machine login or the join login runs (R6)',
 });
 
 describe('dbLogin: COPY_SESSION_OPTIONS, loginPsql, botRoleRefusal (R18, R33, R4, 3.10)', () => {
-  const ITEM = '-c plpgsql.variable_conflict=error';
-
-  it('MANAGER_SESSION_OPTIONS holds the variable_conflict item once, COPY_SESSION_OPTIONS not at all', () => {
-    expect(MANAGER_SESSION_OPTIONS.split(ITEM).length - 1).toBe(1);
+  it('neither option set holds plpgsql.variable_conflict, which only a superuser may set', () => {
+    expect(MANAGER_SESSION_OPTIONS).not.toContain('variable_conflict');
     expect(COPY_SESSION_OPTIONS).not.toContain('variable_conflict');
   });
 
-  it('COPY_SESSION_OPTIONS is the manager options without that item, then read-only off and role none', () => {
+  it('COPY_SESSION_OPTIONS is the manager options, then read-only off and role none', () => {
     const tail = ' -c default_transaction_read_only=off -c role=none';
     expect(COPY_SESSION_OPTIONS.endsWith(tail)).toBe(true);
-    expect(COPY_SESSION_OPTIONS.slice(0, -tail.length)).toBe(MANAGER_SESSION_OPTIONS.replace(` ${ITEM}`, ''));
+    expect(COPY_SESSION_OPTIONS.slice(0, -tail.length)).toBe(MANAGER_SESSION_OPTIONS);
     expect(COPY_SESSION_OPTIONS.startsWith('-c search_path=pg_catalog,pg_temp ')).toBe(true);
   });
 

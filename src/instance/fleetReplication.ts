@@ -149,7 +149,7 @@ function workSql(containerName: string, db: string, sql: string): Promise<dbLogi
 export async function fenceLinesRefusal(containerName: string): Promise<string | null> {
   const read = await clusterSql(containerName, fleetBackupGuards.FENCE_HBA_COUNT_SQL);
   const count = read.ok ? read.stdout.trim() : '';
-  if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${read.stderr.trim().split('\n').pop() || 'no answer'})`;
+  if (!/^\d+$/.test(count)) return `whether a write fence stands in pg_hba.conf could not be read (${keptLines(read.stderr).pop() || 'no answer'})`;
   if (Number(count) === 0) return null;
   const owners = await clusterSql(containerName, fleetBackupGuards.FENCE_HBA_OWNER_SQL);
   const owner = owners.ok ? fleetBackupGuards.parseFenceOwner(owners.stdout) : null;
@@ -923,7 +923,7 @@ async function probeEndpoint(instance: InstanceConfig): Promise<Reachability> {
     execFileGuarded('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
       { timeout: PROBE_TIMEOUT_MS, env: { ...process.env, PGPASSWORD: dbPassword } }, (err, stdout, stderr) => {
         if (!err && String(stdout).trim() === '1') resolve({ ok: true });
-        else resolve({ ok: false, error: redactSecrets(childFailureText(stderr, err) || 'no response', [dbPassword]).split('\n').pop() });
+        else resolve({ ok: false, error: redactSecrets(childFailureText(keptLines(String(stderr ?? '')).join('\n'), err) || 'no response', [dbPassword]).split('\n').pop() });
       });
   });
 }
@@ -1060,7 +1060,7 @@ export async function dropFleetSlot(instance: InstanceConfig, slot: string): Pro
       PERFORM pg_drop_replication_slot('${slot}');
     END $$;`);
   const errorOf = (stderr: string) => {
-    const lines = stderr.trim().split('\n');
+    const lines = stderr.trim().split('\n').filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
     return (lines.find(l => l.startsWith('ERROR')) || lines.pop() || 'psql failed').replace(/^ERROR:\s*/, '');
   };
   if (!result.ok) return { success: false, error: errorOf(result.stderr) };
@@ -1195,9 +1195,11 @@ function settingsNote(instance: InstanceConfig, holders: string | null): string 
   return `Some logins carry session settings of their own, which the manager's sessions override: ${names.map(n => `${n} (${stepOf(n)})`).join('; ')}.`;
 }
 
+const keptLines = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
+
 /** The first error line of a psql run, without psql's prefix; WARNING and NOTICE lines are never the reason. */
 function sqlReason(stderr: string): string {
-  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
+  const lines = keptLines(stderr);
   const line = lines.find(l => /\b(FATAL|ERROR):/.test(l)) || lines[lines.length - 1] || 'psql failed';
   return line.replace(/^psql:[^ ]*: /, '').replace(/^(ERROR|FATAL):\s+/, '').replace(/^psql: error: /, '').replace(/^error: /, '');
 }
@@ -1505,7 +1507,7 @@ export async function connectionReading(instance: InstanceConfig): Promise<Conne
   if (!fleetDb) return { state: 'none' };
   if ((await containerState(fleetDb.containerName)).running !== true) return { state: 'none' };
   const unanswered = (r: { stderr: string }): ConnectionReading =>
-    ({ state: 'unread', error: `the database did not answer (${r.stderr.trim().split('\n').pop() || 'no answer'})` });
+    ({ state: 'unread', error: `the database did not answer (${keptLines(r.stderr).pop() || 'no answer'})` });
   const unparsed: ConnectionReading = { state: 'unread', error: 'the database answered in a form the manager does not read' };
   const settings = await workSql(fleetDb.containerName, fleetDb.db, CONNECTION_SETTINGS_SQL);
   if (!settings.ok) return unanswered(settings);

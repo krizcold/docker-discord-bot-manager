@@ -36,7 +36,7 @@ export const RECEIVE_META_ROLE = 'smdb_receive_meta';
 const MIN_FREE_BYTES = 512 * 1024 * 1024;
 const NOTHING = '; nothing was changed';
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
-const lastLine = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() || 'no reason given';
+const lastLine = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l)).pop() || 'no reason given';
 const refusal = (text: string, status = 409): LaneOutcome => ({ success: false, text, status });
 const SLOT_BUSY = `A backup or restore operation is in progress on this database; wait for it to finish${NOTHING}`;
 const NAME: Record<string, string> = { running: 'Running', maintenance: 'Maintenance', off: 'Off' };

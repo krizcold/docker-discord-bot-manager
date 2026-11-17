@@ -281,7 +281,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM20 the logins an
       standard_conforming_strings: 'off', backslash_quote: 'on', array_nulls: 'off', quote_all_identifiers: 'on', transform_null_equals: 'on',
       row_security: 'on', restrict_nonsystem_relation_kind: 'view', gin_fuzzy_search_limit: '100', client_min_messages: 'error', exit_on_error: 'on',
       default_transaction_isolation: 'serializable', default_transaction_deferrable: 'on', default_tablespace: 'pg_default',
-      temp_tablespaces: 'pg_default', synchronous_commit: 'off', stats_fetch_consistency: 'none', 'plpgsql.variable_conflict': 'use_column',
+      temp_tablespaces: 'pg_default', synchronous_commit: 'off', stats_fetch_consistency: 'none',
       'plpgsql.extra_errors': 'all', 'plpgsql.extra_warnings': 'all', 'plpgsql.check_asserts': 'off', 'plpgsql.print_strict_params': 'on',
     };
     const own = ['local_preload_libraries', 'default_table_access_method'];

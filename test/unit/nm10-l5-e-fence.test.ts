@@ -166,6 +166,10 @@ describe('fenceMigrateSource', () => {
     h.settings = { out: '', err: 'psql: error: connection refused' };
     expect(await fenceMigrateSource(a(), 'migrate:1')).toBe("the database's settings could not be read (psql: error: connection refused)");
   });
+  it('NM26: a blank line and a WARNING after the error are never the reason', async () => {
+    h.settings = { out: '', err: 'ERROR:  x\n\nWARNING:  w' };
+    expect(await fenceMigrateSource(a(), 'migrate:1')).toBe("the database's settings could not be read (ERROR:  x)");
+  });
   const unknown = (out: string) => `the database's settings read back in an unknown form (${out})`;
   for (const [name, out] of [
     ['a timeout with a leading letter', `${HBA}|a1|0`],

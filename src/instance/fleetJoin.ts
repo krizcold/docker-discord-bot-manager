@@ -210,7 +210,7 @@ export async function mainCertificate(code: JoinCode): Promise<CertCheck> {
   if (local?.fleetDb) {
     got = await new Promise(resolve => {
       execFileGuarded('docker', ['exec', local.fleetDb!.containerName, 'cat', `${PGDATA}/server.crt`], { timeout: READ_TIMEOUT_MS }, (err, stdout, stderr) => {
-        if (err) return resolve({ ok: false, reason: (String(stderr || err.message).trim().split('\n').pop() || 'docker exec failed') });
+        if (err) return resolve({ ok: false, reason: (keptLines(String(stderr || '')).pop() || keptLines(String(err.message)).pop() || 'docker exec failed') });
         try {
           const pem = String(stdout);
           resolve({ ok: true, pem, fp: certFingerprint(pem) });
@@ -276,8 +276,10 @@ export interface MainFacts {
 
 export type MainProbe = { ok: true; facts: MainFacts } | { ok: false; kind: 'login' | 'unreachable' | 'garbled' | 'nologin'; reason: string };
 
+const keptLines = (text: string) => text.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )(WARNING|NOTICE): /.test(l));
+
 function firstReason(stderr: string): string {
-  const lines = stderr.trim().split('\n').map(l => l.trim()).filter(l => l && !/(^|: )WARNING: /.test(l));
+  const lines = keptLines(stderr);
   return (lines.find(l => /\b(FATAL|ERROR):/.test(l)) || lines[0] || 'psql failed').replace(/^psql: error: /, '');
 }
 

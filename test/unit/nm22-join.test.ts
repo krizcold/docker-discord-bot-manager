@@ -298,6 +298,7 @@ describe('the mint\'s time limit and stderr (L26, L27)', () => {
     ['a WARNING before the ERROR gives the ERROR line', `WARNING:  permission denied to set parameter "plpgsql.variable_conflict"\n${MINT_CAP}`, CAP],
     ['only a WARNING gives psql failed', 'WARNING:  permission denied to set parameter "plpgsql.variable_conflict"', 'psql failed'],
     ['a prefixed WARNING is skipped too', 'psql:<stdin>:2: WARNING:  something\n', 'psql failed'],
+    ['NM26: a NOTICE line is skipped too', 'psql:<stdin>:2: NOTICE:  something\n', 'psql failed'],
   ])('L27: %s', async (_n, stderr, reason) => {
     docker.mint = { out: '', fail: stderr };
     docker.main.fail = PROBE_REFUSED;

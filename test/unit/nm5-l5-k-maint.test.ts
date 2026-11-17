@@ -15,10 +15,11 @@ vi.mock('../../src/env/manager', async (importOriginal) => ({
 }));
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/config/appCapabilities')>();
+  const { withoutSaveOrder } = await import('./nx5-nosave');
   return {
     ...real,
     findAppCapabilities: (url: string) => {
-      const caps = real.findAppCapabilities(url);
+      const caps = withoutSaveOrder(real.findAppCapabilities(url));
       return caps && h.noHooks ? { ...caps, hooks: undefined } : caps;
     },
   };

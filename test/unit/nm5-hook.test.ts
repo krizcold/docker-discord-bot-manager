@@ -13,6 +13,7 @@ const h = vi.hoisted(() => ({
   canLogin: false,
 }));
 
+vi.mock('../../src/config/appCapabilities', async (o) => (await import('./nx5-nosave')).capsWithoutSaveOrder(await o()));
 vi.mock('../../src/env/manager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/env/manager')>()),
   getEnvVarsWithStatus: () => ({ vars: h.inst?.fleetDb ? { DATA_BACKEND: 'postgres' } : {}, undecryptable: [], encrypted: [], corrupt: false }),
@@ -111,10 +112,10 @@ describe('each caller of the maintenance hook records held', () => {
     await runMaintenanceOrder('b1', 'off', 'Back soon');
     expect(h.writes[0].held).toBeUndefined();
   });
-  it("Off's stop turns an answer other than yes into stopped, and keeps yes", async () => {
+  it("Off's stop turns an answer other than yes into stopped, keeping the answer it replaced and whether the login was shut (NX5 J2, L3), and keeps yes", async () => {
     h.answers = [okAnswer({ saved: null })];
     await runMaintenanceOrder('b1', 'off', '');
-    expect(h.inst.maintenance.held).toEqual({ state: 'stopped' });
+    expect(h.inst.maintenance.held).toEqual({ state: 'stopped', before: { state: 'unknown' }, shut: true });
     setup('database', rec('running'));
     h.app = true;
     h.answers = [okAnswer({ saved: true })];

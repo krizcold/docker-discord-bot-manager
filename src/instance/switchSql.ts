@@ -16,10 +16,13 @@ export function machineNameOf(instance: InstanceConfig): string {
 
 const SINCE = `to_char(since AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`;
 
-const TABLES = `CREATE SCHEMA IF NOT EXISTS smdb_manager;
-CREATE TABLE IF NOT EXISTS smdb_manager.generation (
+const GENERATION_TABLE = `CREATE TABLE IF NOT EXISTS smdb_manager.generation (
   one_row boolean PRIMARY KEY DEFAULT true CHECK (one_row), machine text NOT NULL,
-  generation bigint NOT NULL CHECK (generation >= 1), since timestamptz NOT NULL DEFAULT now());
+  generation bigint NOT NULL CHECK (generation >= 1), since timestamptz NOT NULL DEFAULT now());`;
+const GENERATION_PUBLIC = 'GRANT SELECT ON smdb_manager.generation TO PUBLIC;';
+
+const TABLES = `CREATE SCHEMA IF NOT EXISTS smdb_manager;
+${GENERATION_TABLE}
 CREATE TABLE IF NOT EXISTS smdb_manager.handover (
   one_row boolean PRIMARY KEY DEFAULT true CHECK (one_row), slot text NOT NULL, machine text NOT NULL,
   generation bigint NOT NULL, at timestamptz NOT NULL DEFAULT now());
@@ -29,10 +32,225 @@ CREATE TABLE IF NOT EXISTS smdb_manager.received (
 CREATE TABLE IF NOT EXISTS smdb_manager.copies (
   slot text PRIMARY KEY, machine text, client text, seen_at timestamptz NOT NULL DEFAULT now());
 GRANT USAGE ON SCHEMA smdb_manager TO PUBLIC, dbm_work;
-GRANT SELECT ON smdb_manager.generation TO PUBLIC;
+${GENERATION_PUBLIC}
 GRANT SELECT ON smdb_manager.generation, smdb_manager.handover, smdb_manager.received, smdb_manager.copies TO dbm_work;`;
 
 export const GENERATION_SCHEMA_SQL = TABLES;
+
+// ─── Contract 11: the save order ───
+
+const quotedRole = (user: string): string => {
+  if (!TAKEOVER_ROLE_RE.test(user)) throw new Error(`the bot's role name ${user} is not a plain identifier`);
+  return `"${user}"`;
+};
+
+/**
+ * The save order's tables and the bot role's grants, run by dbm_meta at the head of every writer of them: the order
+ * step, Running's row and the restore's rewrite. Idempotent; it also makes the generation table, which every reader
+ * of the order needs.
+ */
+export function SAVE_ORDER_DDL(user: string): string {
+  const role = quotedRole(user);
+  return `CREATE SCHEMA IF NOT EXISTS smdb_manager;
+${GENERATION_TABLE}
+${GENERATION_PUBLIC}
+CREATE TABLE IF NOT EXISTS smdb_manager.save_order (
+  one_row boolean PRIMARY KEY DEFAULT true CHECK (one_row), order_id text NOT NULL,
+  state text NOT NULL CHECK (state IN ('maintenance', 'running')), message text, generation bigint NOT NULL,
+  reason text NOT NULL CHECK (reason IN ('order', 'restore')), up_ms bigint, at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS smdb_manager.save_acks (
+  process_id text PRIMARY KEY, order_id text NOT NULL, node_id text, node_name text, saved boolean NULL,
+  unsaved_guilds integer, unsaved_files integer, unanswered_guilds integer, unconfirmed_files integer, unanswered_files integer,
+  resave_guilds integer NOT NULL DEFAULT 0, acked_at timestamptz NOT NULL DEFAULT now());
+GRANT USAGE ON SCHEMA smdb_manager TO ${role};
+GRANT SELECT ON smdb_manager.save_order TO ${role};
+GRANT SELECT, INSERT, UPDATE ON smdb_manager.save_acks TO ${role};`;
+}
+
+const CURRENT_GENERATION = 'coalesce((SELECT generation FROM smdb_manager.generation), 0)';
+
+/** The claim clock as `clock|<up_ms>`, `clock|` when the table or its row is missing; run by dbm_work, which reads smdb_data. */
+export const CLAIM_CLOCK_READ_SQL = `SELECT to_regclass('smdb_data.claim_clock') IS NOT NULL AS nx5_clock \\gset
+\\if :nx5_clock
+SELECT 'clock|' || coalesce((SELECT up_ms::text FROM smdb_data.claim_clock WHERE id = 1), '');
+\\else
+SELECT 'clock|';
+\\endif
+`;
+
+/** The up_ms of CLAIM_CLOCK_READ_SQL's last line; null for none; undefined when the line does not parse. */
+export function parseClaimClock(text: string): number | null | undefined {
+  const line = text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() ?? '';
+  const m = /^clock\|(-?\d*)$/.exec(line);
+  if (!m) return undefined;
+  if (m[1] === '') return null;
+  const n = Number(m[1]);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+/**
+ * The order step's transaction: the standing row and its answers are kept, with the new message, only when the row
+ * is current, at 'maintenance', carries `keepId` and has reason 'order' (or 'restore' when `keepRestore`); otherwise
+ * `newId` is written with `upMs` and every answer is deleted. Its last line is
+ * `<order_id>|<t when kept>|<generation>|<up_ms or empty>`.
+ */
+export function saveOrderSql(p: { keepId: string | null; keepRestore: boolean; newId: string; message: string; user: string; upMs: number | null }): string {
+  if (p.upMs !== null && !Number.isSafeInteger(p.upMs)) throw new Error('the claim clock is not a whole number');
+  const keep = p.keepId === null ? 'NULL' : sqlLiteral(p.keepId);
+  const match = `order_id = ${keep} AND state = 'maintenance' AND generation = ${CURRENT_GENERATION}${p.keepRestore ? '' : " AND reason = 'order'"}`;
+  const standing = `EXISTS (SELECT 1 FROM smdb_manager.save_order WHERE ${match})`;
+  return `BEGIN;
+${SAVE_ORDER_DDL(p.user)}
+UPDATE smdb_manager.save_order SET message = ${sqlLiteral(p.message)} WHERE ${match};
+DELETE FROM smdb_manager.save_acks WHERE NOT ${standing};
+INSERT INTO smdb_manager.save_order AS o (one_row, order_id, state, message, generation, reason, up_ms, at)
+  SELECT true, ${sqlLiteral(p.newId)}, 'maintenance', ${sqlLiteral(p.message)}, ${CURRENT_GENERATION}, 'order', ${p.upMs === null ? 'NULL' : p.upMs}, now() WHERE NOT ${standing}
+  ON CONFLICT (one_row) DO UPDATE SET order_id = EXCLUDED.order_id, state = 'maintenance', message = EXCLUDED.message,
+    generation = EXCLUDED.generation, reason = 'order', up_ms = EXCLUDED.up_ms, at = now();
+COMMIT;
+SELECT order_id || '|' || CASE WHEN order_id = ${keep} THEN 't' ELSE 'f' END || '|' || generation || '|' || coalesce(up_ms::text, '') FROM smdb_manager.save_order;
+`;
+}
+
+export interface SaveOrderWritten { orderId: string; kept: boolean; generation: number; upMs: number | null }
+
+/** saveOrderSql's last line; undefined when it does not parse. */
+export function parseSaveOrderWritten(text: string): SaveOrderWritten | undefined {
+  const line = text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() ?? '';
+  const m = /^([^|]+)\|([tf])\|(\d+)\|(-?\d*)$/.exec(line);
+  if (!m) return undefined;
+  const generation = Number(m[3]);
+  const upMs = m[4] === '' ? null : Number(m[4]);
+  if (!Number.isSafeInteger(generation) || (upMs !== null && !Number.isSafeInteger(upMs))) return undefined;
+  return { orderId: m[1], kept: m[2] === 't', generation, upMs };
+}
+
+/**
+ * Running's row, in one transaction run by dbm_meta before the login opens: 'running', reason 'order', the current
+ * generation and no answers; a new order id only when no row exists.
+ */
+export function runningOpenSql(p: { user: string; newId: string }): string {
+  return `BEGIN;
+${SAVE_ORDER_DDL(p.user)}
+INSERT INTO smdb_manager.save_order AS o (one_row, order_id, state, message, generation, reason, up_ms, at)
+  VALUES (true, ${sqlLiteral(p.newId)}, 'running', '', ${CURRENT_GENERATION}, 'order', NULL, now())
+  ON CONFLICT (one_row) DO UPDATE SET state = 'running', reason = 'order', generation = EXCLUDED.generation, at = now();
+DELETE FROM smdb_manager.save_acks;
+COMMIT;
+`;
+}
+
+/**
+ * The restore's rewrite inside its raise (decision 7): the row carries `orderId` at the raised generation with reason
+ * 'restore', and no answer stands. `extra` of raiseSql, so the raise's generation is the row's.
+ */
+export function restoreOrderSql(p: { user: string; orderId: string; message: string }): string {
+  return `${SAVE_ORDER_DDL(p.user)}
+DELETE FROM smdb_manager.save_acks;
+INSERT INTO smdb_manager.save_order AS o (one_row, order_id, state, message, generation, reason, up_ms, at)
+  VALUES (true, ${sqlLiteral(p.orderId)}, 'maintenance', ${sqlLiteral(p.message)}, ${CURRENT_GENERATION}, 'restore', NULL, now())
+  ON CONFLICT (one_row) DO UPDATE SET order_id = EXCLUDED.order_id, state = 'maintenance', message = EXCLUDED.message,
+    generation = EXCLUDED.generation, reason = 'restore', up_ms = NULL, at = now();
+`;
+}
+
+const ACKS_JSON = `coalesce((SELECT jsonb_agg(jsonb_build_object('process', process_id, 'order', order_id, 'saved', saved,
+  'unsavedGuilds', unsaved_guilds, 'unsavedFiles', unsaved_files, 'unansweredGuilds', unanswered_guilds,
+  'unconfirmedFiles', unconfirmed_files, 'unansweredFiles', unanswered_files) ORDER BY process_id) FROM smdb_manager.save_acks), '[]'::jsonb)`;
+const ORDER_JSON = `(SELECT jsonb_build_object('id', order_id, 'state', state, 'message', message, 'current', generation = ${CURRENT_GENERATION},
+  'reason', reason, 'upMs', up_ms) FROM smdb_manager.save_order)`;
+
+function holdersJson(standbyLeftOut: boolean): string {
+  const standby = standbyLeftOut
+    ? " AND NOT EXISTS (SELECT 1 FROM smdb_data.reshard x WHERE x.state IN ('standby', 'flipped') AND x.to_count = c.shard_count)"
+    : '';
+  return `WITH u AS (SELECT up_ms FROM smdb_manager.save_order WHERE up_ms IS NOT NULL),
+r AS (SELECT c.holder_process AS p, c.holder_name AS n, c.expires_up_ms AS e, c.renewed_at AS t FROM smdb_data.shard_claims c
+  WHERE NOT c.released${standby} AND EXISTS (SELECT 1 FROM u)),
+h AS (SELECT p, max(n) AS n, max(t) AS t, bool_or(e > (SELECT up_ms FROM u)) AS live FROM r GROUP BY p)
+SELECT jsonb_build_object('order', ${ORDER_JSON}, 'claims', true,
+  'expected', coalesce((SELECT jsonb_agg(jsonb_build_object('process', p, 'name', n, 'agoMs', greatest(0, (extract(epoch FROM (now() - t)) * 1000)::bigint)) ORDER BY n, p) FROM h WHERE live), '[]'::jsonb),
+  'notSeen', coalesce((SELECT jsonb_agg(jsonb_build_object('process', p, 'name', n, 'agoMs', greatest(0, (extract(epoch FROM (now() - t)) * 1000)::bigint)) ORDER BY n, p) FROM h WHERE NOT live), '[]'::jsonb),
+  'acks', ${ACKS_JSON})::text;`;
+}
+
+/**
+ * The read of `acks`, `final` and the lanes, run by dbm_work (smdb_manager through its grants, smdb_data through the
+ * bot role): one JSON line with the order row, whether the claim tables exist, the expected set and the processes not
+ * seen (decision 3, computed from the row's up_ms at each read), and every answer.
+ */
+export const SAVE_READ_SQL = `SELECT to_regclass('smdb_manager.save_order') IS NOT NULL AND to_regclass('smdb_manager.save_acks') IS NOT NULL AND to_regclass('smdb_manager.generation') IS NOT NULL AS nx5_order,
+  to_regclass('smdb_data.shard_claims') IS NOT NULL AND to_regclass('smdb_data.claim_clock') IS NOT NULL AS nx5_claims,
+  to_regclass('smdb_data.reshard') IS NOT NULL AS nx5_reshard \\gset
+\\if :nx5_order
+\\if :nx5_claims
+\\if :nx5_reshard
+${holdersJson(true)}
+\\else
+${holdersJson(false)}
+\\endif
+\\else
+SELECT jsonb_build_object('order', ${ORDER_JSON}, 'claims', false, 'expected', '[]'::jsonb, 'notSeen', '[]'::jsonb, 'acks', ${ACKS_JSON})::text;
+\\endif
+\\else
+SELECT jsonb_build_object('order', NULL, 'claims', :'nx5_claims'::boolean, 'expected', '[]'::jsonb, 'notSeen', '[]'::jsonb, 'acks', '[]'::jsonb)::text;
+\\endif
+`;
+
+export interface SaveHolder { process: string; name: string; agoMs: number }
+export interface SaveAck {
+  process: string; order: string; saved: boolean | null;
+  unsavedGuilds: number | null; unsavedFiles: number | null; unansweredGuilds: number | null; unconfirmedFiles: number | null; unansweredFiles: number | null;
+}
+export interface SaveRows {
+  order: { id: string; state: 'maintenance' | 'running'; message: string; current: boolean; reason: 'order' | 'restore'; upMs: number | null } | null;
+  claims: boolean;
+  expected: SaveHolder[];
+  notSeen: SaveHolder[];
+  acks: SaveAck[];
+}
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+
+function holderOf(v: unknown): SaveHolder | null {
+  const o = v as Record<string, unknown> | null;
+  if (!o || typeof o.process !== 'string' || typeof o.name !== 'string' || typeof o.agoMs !== 'number' || !Number.isFinite(o.agoMs)) return null;
+  return { process: o.process, name: o.name, agoMs: Math.max(0, o.agoMs) };
+}
+
+function ackOf(v: unknown): SaveAck | null {
+  const o = v as Record<string, unknown> | null;
+  if (!o || typeof o.process !== 'string' || typeof o.order !== 'string' || !(o.saved === true || o.saved === false || o.saved === null)) return null;
+  const n = (k: string) => (o[k] === undefined ? null : o[k]);
+  const counts = ['unsavedGuilds', 'unsavedFiles', 'unansweredGuilds', 'unconfirmedFiles', 'unansweredFiles'].map(n);
+  if (!counts.every(c => c === null || isCount(c))) return null;
+  const [unsavedGuilds, unsavedFiles, unansweredGuilds, unconfirmedFiles, unansweredFiles] = counts as Array<number | null>;
+  return { process: o.process, order: o.order, saved: o.saved, unsavedGuilds, unsavedFiles, unansweredGuilds, unconfirmedFiles, unansweredFiles };
+}
+
+/** SAVE_READ_SQL's last line; undefined for anything that does not have its shape. */
+export function parseSaveRows(text: string): SaveRows | undefined {
+  const line = text.trim().split('\n').map(l => l.trim()).filter(Boolean).pop() ?? '';
+  let v: Record<string, unknown>;
+  try {
+    v = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (!v || typeof v !== 'object' || typeof v.claims !== 'boolean' || !Array.isArray(v.expected) || !Array.isArray(v.notSeen) || !Array.isArray(v.acks)) return undefined;
+  let order: SaveRows['order'] = null;
+  if (v.order !== null) {
+    const o = v.order as Record<string, unknown>;
+    if (!o || typeof o.id !== 'string' || (o.state !== 'maintenance' && o.state !== 'running') || typeof o.message !== 'string'
+      || typeof o.current !== 'boolean' || (o.reason !== 'order' && o.reason !== 'restore') || !(o.upMs === null || (typeof o.upMs === 'number' && Number.isSafeInteger(o.upMs)))) return undefined;
+    order = { id: o.id, state: o.state, message: o.message, current: o.current, reason: o.reason, upMs: o.upMs as number | null };
+  }
+  const expected = v.expected.map(holderOf);
+  const notSeen = v.notSeen.map(holderOf);
+  const acks = v.acks.map(ackOf);
+  if (expected.some(x => !x) || notSeen.some(x => !x) || acks.some(x => !x)) return undefined;
+  return { order, claims: v.claims, expected: expected as SaveHolder[], notSeen: notSeen as SaveHolder[], acks: acks as SaveAck[] };
+}
 
 /** The ensure: the tables and generation 1, only on a database that is not in recovery. */
 export function ensureGenerationSql(machine: string): string {
@@ -366,7 +584,9 @@ const META_TABLES: Record<MetaTable, MetaColumn[]> = {
 };
 const META_ORDER: MetaTable[] = ['generation', 'handover', 'received', 'copies', 'addresses'];
 const META_KEYS: Record<MetaTable, string[]> = { generation: ['one_row'], handover: ['one_row'], received: ['push_id'], copies: ['slot'], addresses: ['host', 'port'] };
-const COPY_RE = /^COPY smdb_manager\.(generation|handover|received|copies|addresses) \(([a-z_, ]+)\) FROM stdin;$/;
+/** The save order's tables: a dump's rows of them are read past and never written back (decision 7, the raise rewrites the order). */
+export const SAVE_ORDER_TABLES = ['save_order', 'save_acks'] as const;
+const COPY_RE = /^COPY smdb_manager\.(generation|handover|received|copies|addresses|save_order|save_acks) \(([a-z_, ]+)\) FROM stdin;$/;
 const ENTRY_RE = /^-- (?:Data for )?Name: (.+?); Type: (.+?); Schema: ([^;]+)(?:;|$)/;
 const TIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?[+-](\d{2})(?::(\d{2})(?::(\d{2}))?)?$/;
 const COPY_ESCAPES: Record<string, number> = { b: 8, f: 12, n: 10, r: 13, t: 9, v: 11 };
@@ -494,8 +714,8 @@ export function metaRowsSql(rows: MetaRows): string {
 }
 
 /**
- * X1 rule 2 with Y1, Y2 and Y5, fed while the dump is read: only the five tables' COPY blocks are read, every other
- * line is ignored, and the first problem refuses. No addresses row refuses: one longer than 64 KiB is dropped as it
+ * X1 rule 2 with Y1, Y2 and Y5, fed while the dump is read: only the five tables' COPY blocks are read, the save
+ * order's two blocks are passed over unread, every other line is ignored, and the first problem refuses. No addresses row refuses: one longer than 64 KiB is dropped as it
  * is read, and kept addresses rows have their own 4 MiB, outside the other tables' 16 MiB.
  */
 export class MetaRowsReader {
@@ -505,10 +725,11 @@ export class MetaRowsReader {
   private lineNo = 0;
   private problem: string | null = null;
   private block: { table: MetaTable; order: MetaColumn[] } | null = null;
+  private passing: string | null = null;
   private entry: string | null = null;
   private kept = 0;
   private keptAddresses = 0;
-  private readonly seen = new Set<MetaTable>();
+  private readonly seen = new Set<string>();
   private readonly rows: MetaRows = { generation: [], handover: [], received: [], copies: [], addresses: [] };
   private readonly keys: Record<MetaTable, Set<string>> = {
     generation: new Set(), handover: new Set(), received: new Set(), copies: new Set(), addresses: new Set(),
@@ -539,7 +760,7 @@ export class MetaRowsReader {
   end(): MetaParse {
     if (!this.problem && this.skippingLine) this.endSkippedLine();
     if (!this.problem && this.pendingSize > 0) this.takeLine();
-    if (!this.problem && this.block) this.fail(`the dump ends inside the rows of smdb_manager.${this.block.table}`);
+    if (!this.problem && (this.block || this.passing)) this.fail(`the dump ends inside the rows of smdb_manager.${this.block?.table ?? this.passing}`);
     if (!this.problem && this.entry !== null) this.notFollowed();
     if (this.problem) return { ok: false, problem: this.problem };
     let script: string;
@@ -592,7 +813,9 @@ export class MetaRowsReader {
       this.fail(`line ${this.lineNo} is not valid UTF-8 text`);
       return;
     }
-    if (this.block) this.dataLine(text, bytes.length + 1);
+    if (this.passing) {
+      if (text === '\\.') this.passing = null;
+    } else if (this.block) this.dataLine(text, bytes.length + 1);
     else this.otherLine(text, bytes.length + 1);
   }
 
@@ -617,6 +840,12 @@ export class MetaRowsReader {
       return this.fail(`line ${n}: a COPY line that is not for one of the manager's five tables in smdb_manager`);
     }
     this.entry = null;
+    if (this.seen.has(m[1])) return this.fail(`line ${n}: smdb_manager.${m[1]} has a second block of rows`);
+    this.seen.add(m[1]);
+    if ((SAVE_ORDER_TABLES as readonly string[]).includes(m[1])) {
+      this.passing = m[1];
+      return;
+    }
     const table = m[1] as MetaTable;
     const want = META_TABLES[table];
     const names = m[2].split(',').map(s => s.trim());
@@ -624,8 +853,6 @@ export class MetaRowsReader {
     if (names.length !== want.length || new Set(names).size !== names.length || order.some(c => !c)) {
       return this.fail(`line ${n}: the COPY line of smdb_manager.${table} names the columns (${names.join(', ')}), not (${want.map(c => c.name).join(', ')})`);
     }
-    if (this.seen.has(table)) return this.fail(`line ${n}: smdb_manager.${table} has a second block of rows`);
-    this.seen.add(table);
     this.block = { table, order: order as MetaColumn[] };
     this.keep(size);
   }

@@ -31,6 +31,7 @@ const h = vi.hoisted(() => {
   return s;
 });
 
+vi.mock('../../src/config/appCapabilities', async (o) => (await import('./nx5-nosave')).capsWithoutSaveOrder(await o()));
 vi.mock('../../src/env/manager', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/env/manager')>()),
   getEnvVarsWithStatus: () => h.env,

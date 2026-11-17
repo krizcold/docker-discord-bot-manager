@@ -31,7 +31,8 @@ const h = vi.hoisted(() => ({
 
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../src/config/appCapabilities')>();
-  return { ...real, findAppCapabilities: (url: string) => (h.caps !== undefined ? h.caps : real.findAppCapabilities(url)) };
+  const { withoutSaveOrder } = await import('./nx5-nosave');
+  return { ...real, findAppCapabilities: (url: string) => (h.caps !== undefined ? h.caps : withoutSaveOrder(real.findAppCapabilities(url))) };
 });
 
 vi.mock('../../src/env/manager', async (importOriginal) => ({

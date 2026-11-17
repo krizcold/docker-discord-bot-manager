@@ -13,11 +13,15 @@ import * as dbLogin from './dbLogin';
 import { postgresBackend } from './dataPlace';
 import * as fleetBackup from './fleetBackup';
 import { fenceOwnerLane, fenceOwnerText } from './fleetBackupGuards';
-import { hasSwitchMark, switchStateRefusal } from './switchSql';
-import { BotRunState, InstanceConfig, MaintenanceHeld, MaintenanceRecord, MigrateTo } from '../types';
+import { randomBytes } from 'crypto';
+import {
+  CLAIM_CLOCK_READ_SQL, hasSwitchMark, parseClaimClock, parseSaveOrderWritten, parseSaveRows, runningOpenSql, SAVE_READ_SQL, saveOrderSql, SaveOrderWritten,
+  SaveRows, switchStateRefusal,
+} from './switchSql';
+import { BotRunState, InstanceConfig, MaintenanceHeld, MaintenanceRecord, MaintenanceSaveOrder, MigrateTo, SaveVerdictKind } from '../types';
 
 export type MaintenanceKind = 'database' | 'copy' | 'external' | 'json' | 'none';
-export type PlanStep = 'hook' | 'db-up' | 'block' | 'end-sessions' | 'stop' | 'db-up-alone' | 'open' | 'start' | 'hook-wait';
+export type PlanStep = 'hook' | 'db-up' | 'order' | 'acks' | 'block' | 'end-sessions' | 'final' | 'stop' | 'db-up-alone' | 'open' | 'start' | 'hook-wait';
 export type OrderResult = { settled: boolean; text: string };
 export type Admission = { accepted: true } | { accepted: false; status: number; error: string };
 export type MaintenanceProof =
@@ -32,6 +36,8 @@ export const MAINTENANCE_TIMING = {
   hookWaitPauseMs: 2_000,
   sessionPauseMs: 1_000,
   reconcileMs: 30_000,
+  ackPollMs: 1_000,
+  ackWaitMs: 60_000,
 };
 
 const OP = 'maintenance';
@@ -133,13 +139,18 @@ export function readKind(inst: InstanceConfig): { kind: MaintenanceKind } | { er
   return { kind: maintenanceKind(inst, env) };
 }
 
-export function orderPlan(p: { kind: MaintenanceKind; to: BotRunState; fromOff: boolean; app: boolean; savedByBot: 'running' | 'maintenance' | null; hooks: boolean }):
+export function orderPlan(p: { kind: MaintenanceKind; to: BotRunState; fromOff: boolean; app: boolean; savedByBot: 'running' | 'maintenance' | null; hooks: boolean; saveOrder?: boolean }):
   { steps: PlanStep[] } | { refusal: 'R7' | 'R9' | 'R10' } {
   const { kind, to, app } = p;
   const fromOff = p.fromOff && !app;
   if (kind === 'database') {
     let steps: PlanStep[];
-    if (to === 'maintenance') {
+    if (p.saveOrder && to !== 'running') {
+      const own: PlanStep[] = app ? ['hook'] : [];
+      steps = ['db-up', 'order', 'acks', ...own, 'block', 'end-sessions', 'final'];
+      if (to === 'maintenance' && fromOff) steps.push('start', 'hook-wait');
+      if (to === 'off') steps.push(...(app ? ['stop' as const] : []), 'db-up-alone');
+    } else if (to === 'maintenance') {
       steps = app ? ['hook', 'db-up', 'block', 'end-sessions']
         : fromOff ? ['db-up', 'block', 'end-sessions', 'start', 'hook-wait'] : ['db-up', 'block', 'end-sessions'];
     } else if (to === 'off') {
@@ -182,8 +193,9 @@ export function settledVerdict(p: { kind: MaintenanceKind; to: BotRunState; hook
   return p.startOwed ? runs && hookOk : stopped || hookOk;
 }
 
+type Stays = 'order' | 'login' | 'file';
 type HookOutcome =
-  | { hook: 'confirmed'; restarting?: boolean | null; held?: MaintenanceHeld }
+  | { hook: 'confirmed'; restarting?: boolean | null; held?: MaintenanceHeld; stays?: Stays; unread?: string; starting?: true }
   | { hook: 'missing' }
   | { hook: 'unconfirmed'; why: 'unknown' | 'unreachable' | 'refused'; reason: string; detail: string };
 
@@ -207,7 +219,14 @@ function hookOutcome(r: AppHookResult, state?: 'running' | 'maintenance'): HookO
     if (state === 'maintenance') return { hook: 'confirmed', held: heldOf(r.body) };
     if (state !== 'running') return { hook: 'confirmed' };
     const restarting = r.body?.restarting;
-    return { hook: 'confirmed', restarting: typeof restarting === 'boolean' ? restarting : null };
+    const stays = r.body?.stays;
+    const unread = r.body?.unread;
+    return {
+      hook: 'confirmed', restarting: typeof restarting === 'boolean' ? restarting : null,
+      ...(stays === 'order' || stays === 'login' || stays === 'file' ? { stays: stays as Stays } : {}),
+      ...(typeof unread === 'string' ? { unread: unread.slice(0, 200) } : {}),
+      ...(r.body?.starting === true ? { starting: true as const } : {}),
+    };
   }
   if (r.status === 404) return { hook: 'missing' };
   const detail = r.error || 'no reason given';
@@ -236,14 +255,182 @@ async function waitForHook(inst: InstanceConfig, to: BotRunState, message: strin
   }
 }
 
+// ─── Contract 11: the save order's texts and verdict ───
+
+/** How long ago, as the operator reads it: seconds below two minutes, else whole minutes. */
+export function agoText(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 120) return `${s} ${s === 1 ? 'second' : 'seconds'}`;
+  return `${Math.floor(s / 60)} minutes`;
+}
+
+const REPLACED_WAY = 'Another database replaced this one as the main, so Running is refused here; rejoin this machine as a copy instead.';
+const LOGIN_READ_PREFIX = "it could not read the bot's database login: ";
+
+/** The way out after a refusal or a verdict: `Choose Running, then Maintenance again`, or with a move recorded, its Cancel first. */
+export function againText(cancel: 'hand-over' | 'push' | null): string {
+  return cancel ? `Cancel the ${cancel}, then choose Running, then Maintenance again` : 'Choose Running, then Maintenance again';
+}
+
+/** The error of an `orderError` whose login read failed, without the reason's own prefix. */
+export function loginErrorOf(reason: string): string {
+  return reason.startsWith(LOGIN_READ_PREFIX) ? reason.slice(LOGIN_READ_PREFIX.length) : reason;
+}
+
+/** G8-5: a NULL count says so, never 0. */
+const UNCOUNTED = 'the bot could not count them';
+
+/** The counts of a false answer, or UNCOUNTED when either is NULL. */
+export function unsavedCountText(g: number | null, f: number | null): string {
+  return g === null || f === null ? UNCOUNTED : `${g} guild(s), ${f} file(s)`;
+}
+
+/** Decision 5's texts; `again` is againText's ending, or null on a replaced main (G7-5). */
+export const SAVE_TEXTS = {
+  covered: (n: number, names: string) => `Every bot process the manager waited for saved what it held (${n} on ${names}).`,
+  empty: (to: string) => `No bot process held a live shard claim on this database when ${to} began, so the manager waited for none.`,
+  uncovered: (name: string, ago: string, again: string | null) => `The bot on ${name} did not confirm that it saved what it holds before its login was blocked (it last renewed its shards ${ago} ago). The manager can't confirm whether that bot still holds those changes: a bot that crashed lost them, and a bot that is only cut off keeps them until its login returns. Hand over, Push and Move by file are refused until every bot confirms${again === null ? `. ${REPLACED_WAY}` : `: ${again.charAt(0).toLowerCase()}${again.slice(1)} once the bot on ${name} reaches this database.`}`,
+  update: 'If the bots run a build older than this manager, they do not answer; update them.',
+  unsaved: (name: string, g: number | null, f: number | null) => `The bot on ${name} reports changes it could not save (${unsavedCountText(g, f)}); its log names them.`,
+  unconfirmed: (name: string, u: number | null) => `The bot on ${name} can't confirm that every change it holds is saved (${u === null ? UNCOUNTED : `${u} save(s) the database did not answer, which may have landed`}).`,
+  notSeen: (name: string, to: string, ago: string) => `The bot on ${name} was not waited for: its shards' claims had already expired on this database's claim clock when ${to} began (it last renewed them ${ago} ago), so other machines could already take its shards.`,
+  askedBlocked: (again: string | null) => `The login was already blocked when this order asked the bots to save, so no bot could answer. ${again === null ? REPLACED_WAY : `${again}, before a Hand over, Push or Move by file.`}`,
+  cant: (reason: string, once: boolean, again: string | null) => `The manager can't confirm which bot processes use this database (${reason}), so Hand over, Push and Move by file are refused. ${again === null ? REPLACED_WAY : `${again}${once ? ' once the bot has served from this database' : ''}.`}`,
+  noTables: 'this database has no shard claim tables',
+  notWritten: (e: string) => `the save order could not be written (${e})`,
+  restored: "A whole-bot restore ran on this database during this maintenance, so changes a bot process held from before it can no longer be saved here; that loss is the restore's. Hand over, Push and Move by file do not need the bots' answers to this order.",
+  notAsked: (again: string | null) => `This order did not ask the bots to save: the database's save order is not the one this maintenance wrote (a switch, a restore, another order, or the database's first generation record replaced it). ${again === null ? REPLACED_WAY : `${again}, before a Hand over, Push or Move by file.`}`,
+  notAskedErr: (e: string, again: string | null) => `This order did not ask the bots to save: the manager could not write the save order (${e}). ${again === null ? REPLACED_WAY : `${again}, before a Hand over, Push or Move by file.`}`,
+  unread: (e: string, again: string | null) => `The manager can't confirm that this order asked the bots to save: it could not read the bot's database login before writing the order (${e}). ${again === null ? REPLACED_WAY : `${again}, before a Hand over, Push or Move by file.`}`,
+  msgWrite: (e: string) => `The manager could not write the new message to the database (${e}), so the bots that read it from there show the earlier one.`,
+  msgRead: (e: string) => `The manager did not write the new message to the database, because it could not read the bot's database login (${e}), so the bots that read it from there show the earlier one.`,
+};
+
+/** Whether the row is the one this record's order wrote: current, at 'maintenance', carrying the recorded id. */
+export function rowIsOrders(rows: SaveRows, f: MaintenanceSaveOrder): boolean {
+  const row = rows.order;
+  return !!f.orderId && !!row && row.current && row.state === 'maintenance' && row.id === f.orderId;
+}
+
+/** The expected processes without a true answer to this order, in the read's order, with the answer each gave. */
+export function uncoveredOf(rows: SaveRows, orderId: string): Array<{ process: string; name: string; agoMs: number; ack: SaveRows['acks'][number] | null }> {
+  const ackOf = (p: string) => rows.acks.find(a => a.process === p && a.order === orderId) ?? null;
+  return rows.expected.filter(e => ackOf(e.process)?.saved !== true).map(e => ({ ...e, ack: ackOf(e.process) }));
+}
+
+const uniqueNames = (xs: Array<{ name: string }>) => [...new Set(xs.map(x => x.name))].join(', ');
+
+/**
+ * `final`'s one rule (decision 4): the verdict this order records, and the sentence its settled text appends. The
+ * message sentence comes only when the row read holds another message than `message`, the one this order writes.
+ */
+export function finalVerdict(rows: SaveRows, f: MaintenanceSaveOrder, to: 'maintenance' | 'off', replaced: boolean, message: string): { kind: SaveVerdictKind; text: string } {
+  const T = SAVE_TEXTS;
+  const name = NAME[to];
+  const again = replaced ? null : againText(null);
+  const e = f.orderError;
+  if (!rowIsOrders(rows, f)) {
+    if (e?.login === 'open') return { kind: 'cantConfirm', text: T.cant(T.notWritten(e.reason), false, again) };
+    if (e?.login === 'blocked') return { kind: 'notAsked', text: T.notAskedErr(e.reason, again) };
+    if (e?.login === 'unread') return { kind: 'unread', text: T.unread(loginErrorOf(e.reason), again) };
+    return { kind: 'notAsked', text: T.notAsked(again) };
+  }
+  const row = rows.order!;
+  const stale = !e || row.message === message ? '' : e.login === 'unread' ? ` ${T.msgRead(loginErrorOf(e.reason))}` : ` ${T.msgWrite(e.reason)}`;
+  let v: { kind: SaveVerdictKind; text: string };
+  if (row.reason === 'restore') v = { kind: 'restored', text: T.restored };
+  else if (f.askedBlocked) v = { kind: 'askedBlocked', text: T.askedBlocked(again) };
+  else if (!rows.claims || row.upMs === null) v = { kind: 'cantConfirm', text: T.cant(T.noTables, true, again) };
+  else {
+    const left = uncoveredOf(rows, f.orderId!);
+    const parts: string[] = [];
+    if (!left.length) parts.push(rows.expected.length ? T.covered(rows.expected.length, uniqueNames(rows.expected)) : T.empty(name));
+    for (const u of left) {
+      if (u.ack?.saved === false) parts.push(T.unsaved(u.name, u.ack.unsavedGuilds, u.ack.unsavedFiles));
+      else if (u.ack && u.ack.saved === null) {
+        const c = [u.ack.unansweredGuilds, u.ack.unconfirmedFiles, u.ack.unansweredFiles];
+        parts.push(T.unconfirmed(u.name, c.some(x => x === null) ? null : (c as number[]).reduce((a, b) => a + b, 0)));
+      }
+      else parts.push(T.uncovered(u.name, agoText(u.agoMs), again));
+    }
+    if (left.length && !rows.acks.some(a => a.order === f.orderId)) parts.push(T.update);
+    for (const n of rows.notSeen) parts.push(T.notSeen(n.name, name, agoText(n.agoMs)));
+    v = { kind: left.length ? 'uncovered' : 'confirmed', text: parts.join(' ') };
+  }
+  return { kind: v.kind, text: v.text + stale };
+}
+
+/** The State window's line while `acks` waits, per bot. */
+const waitingLines = new Map<string, string>();
+
+/** One read of the save order, its expected set and its answers, as dbm_work in the bot's database. */
+export async function readSaveRows(t: dbLogin.DbTarget, db: string, opts: { exempt?: boolean } = {}): Promise<{ ok: true; rows: SaveRows } | { ok: false; error: string }> {
+  const r = await dbLogin.runCall(t.container, dbLogin.workPsql(t.container, db, SAVE_READ_SQL, { stdin: true, exempt: opts.exempt }));
+  if (!r.ok) return { ok: false, error: r.error };
+  const rows = parseSaveRows(r.stdout);
+  return rows ? { ok: true, rows } : { ok: false, error: `the read answered '${r.stdout.trim().split('\n').pop()?.slice(0, 200) ?? ''}'` };
+}
+
+/** Removes the record's `fleet.blockedAt`, read fresh: the login was found or made open while the state is not Running. */
+export function clearBlockedAt(botId: string): void {
+  const inst = containerManager.getBot(botId);
+  const rec = inst?.maintenance;
+  if (!rec?.fleet?.blockedAt) return;
+  const fleet = { ...rec.fleet };
+  delete fleet.blockedAt;
+  try {
+    containerManager.updateInstanceMaintenance(botId, { ...rec, fleet });
+  } catch (err) {
+    console.error(`[Maintenance] ${inst!.displayName}: the record could not drop its block mark after the login was found open: ${errText(err)}`);
+  }
+}
+
+/**
+ * Decision 7: a whole-bot restore rewrote the save order with `orderId`; the record keeps that id, with the block mark
+ * the restore's proof holds, and the 'restored' verdict, whose text replaces the warning of the verdict it replaces.
+ */
+export function noteRestoredOrder(botId: string, orderId: string): void {
+  const inst = containerManager.getBot(botId);
+  const rec = inst?.maintenance;
+  if (!rec) return;
+  const verdict = { kind: 'restored' as const, text: SAVE_TEXTS.restored };
+  const fleet: MaintenanceSaveOrder = { ...(rec.fleet ?? {}), orderId, verdict };
+  if (!fleet.blockedAt) fleet.blockedAt = new Date().toISOString();
+  const baseReason = rec.lastError !== undefined && rec.lastError !== rec.fleet?.verdict?.text ? rec.lastError : undefined;
+  try {
+    containerManager.updateInstanceMaintenance(botId, { ...rec, fleet, lastError: baseReason ?? verdict.text });
+  } catch (err) {
+    console.error(`[Maintenance] ${inst!.displayName}: the record could not keep the save order a restore wrote: ${errText(err)}`);
+  }
+}
+
+export function newOrderId(): string {
+  return randomBytes(12).toString('hex');
+}
+
+/** Whether the app declares contract 11's save order. */
+export function declaresSaveOrder(inst: InstanceConfig): boolean {
+  return !!findAppCapabilities(inst.sourceUrl)?.companionDb?.saveOrder;
+}
+
 interface Outcome {
   kind: MaintenanceKind;
   to: BotRunState;
   hooks: boolean;
+  saveOrder?: boolean;
+  /** The order step failed once while the login may be open: the pass ended after it. */
+  orderStop?: string;
+  /** `final`'s read failed: no verdict, and the order stays unsettled. */
+  finalFail?: string;
+  verdict?: { kind: SaveVerdictKind; text: string };
+  /** settledVerdict's own answer, before the save order's need of a verdict. */
+  baseSettled?: boolean;
   hook?: HookOutcome;
   started: boolean;
   blockLanded: boolean;
   startOwed?: boolean;
+  /** This order's plan starts the bot (it was stopped at admission). */
+  startPlanned?: boolean;
   planRefused?: 'R7' | 'R9' | 'R10';
   dbDownAfterStop?: boolean;
   dbFail?: string;
@@ -263,8 +450,29 @@ function hookClause(h: HookOutcome | undefined): string {
   return `The bot did not take the message (${h.reason}). `;
 }
 
+const STAYS: Record<Stays, string> = {
+  order: "the main database holds a maintenance order; it leaves when the main's state is Running.",
+  login: 'the main database refuses its login; it leaves once the login is accepted and no maintenance order holds it.',
+  file: 'its saved maintenance state still says maintenance.',
+};
+const STARTING = "The state is Running, and the bot started, but it was still starting when it took the order, so the manager can't confirm it runs normally: it stays in maintenance while the main database refuses its login or holds a maintenance order.";
+
 /** The operator text of a finished order, and the reason it stores as lastError (undefined = none). */
 function orderText(o: Outcome): { text: string; reason?: string } {
+  if (o.to !== 'running' && o.orderStop !== undefined) {
+    const reason = `the manager could not ask the bots to save (${o.orderStop})`;
+    return { text: `${NAME[o.to]} is not confirmed: ${reason}; it tries again in 30 seconds.`, reason };
+  }
+  if (o.to !== 'running' && o.finalFail !== undefined && o.baseSettled) {
+    const reason = `the manager could not read whether every bot process saved what it held (${o.finalFail})`;
+    return { text: `${NAME[o.to]} is not confirmed: the bot's database login is blocked with no session open, but ${reason}. It reads again every 30 seconds; Hand over, Push and Move by file are refused while this order is not confirmed.`, reason };
+  }
+  const base = baseOrderText(o);
+  if (o.to === 'running' || !o.settled || !o.verdict) return base;
+  return { text: `${base.text} ${o.verdict.text}`, reason: base.reason ?? (o.verdict.kind === 'confirmed' ? undefined : o.verdict.text) };
+}
+
+function baseOrderText(o: Outcome): { text: string; reason?: string } {
   const db = o.kind === 'database';
   const h = o.hook;
   const hookReason = h?.hook === 'unconfirmed' ? h.reason : h?.hook === 'missing' ? "its build has no maintenance hook" : undefined;
@@ -337,7 +545,8 @@ function orderText(o: Outcome): { text: string; reason?: string } {
     return { text: `Running is not confirmed: ${state}. ${next}`, reason: FENCED };
   }
   if (db && o.dbFail) {
-    return { text: `Running is not confirmed: the bot's database login could not be restored (${o.dbFail}). The bot answers with the maintenance message until it is. Choose Running again to retry.`, reason: `the bot's database login could not be restored (${o.dbFail})` };
+    const bot = o.startPlanned && !o.started ? 'The bot is stopped.' : 'The bot answers with the maintenance message until it is.';
+    return { text: `Running is not confirmed: the bot's database login could not be restored (${o.dbFail}). ${bot} Choose Running again to retry.`, reason: `the bot's database login could not be restored (${o.dbFail})` };
   }
   if (o.startOwed) return { text: `Running is not confirmed: ${RETRY_NO_START}.${db ? ' Its database login is restored.' : ''} Choose Running again to start it.`, reason: RETRY_NO_START };
   if (o.startFail || !o.settled && o.app !== true) {
@@ -352,6 +561,13 @@ function orderText(o: Outcome): { text: string; reason?: string } {
     if (!o.hooks) return { text: `The state is Running${db ? ", and the bot's database login is restored" : ''}. The bot is stopped.` };
     return { text: `The state is Running${db ? ", and the bot's database login is restored" : ''}. The bot is stopped, so it takes the order when it next runs.` };
   }
+  if (h?.hook === 'confirmed' && h.stays) {
+    return { text: `The state is Running${db ? ", and the bot's database login is restored" : ''}, and the bot took the order, but it stays in maintenance: ${STAYS[h.stays]}` };
+  }
+  if (h?.hook === 'confirmed' && h.unread !== undefined) {
+    return { text: `The state is Running${db ? ", and the bot's database login is restored" : ''}, but the manager can't confirm the bot left maintenance: it could not read the main database (${h.unread}). It leaves once a read shows nothing holds it.` };
+  }
+  if (h?.hook === 'confirmed' && h.starting && !db) return { text: STARTING };
   if (h?.hook === 'missing') return { text: `The bot is running normally${db ? ': its database login is restored' : ''}. Its build has no maintenance hook, so it was never in maintenance.` };
   if (h?.hook === 'confirmed') {
     const restart = h.restarting === true ? H_TRUE : h.restarting === false ? H_FALSE : H_NULL;
@@ -360,6 +576,43 @@ function orderText(o: Outcome): { text: string; reason?: string } {
   }
   if (o.started) return { text: db ? 'The bot is running normally: it started, and its database login is restored.' : 'The bot is running normally: it started.' };
   return { text: db ? 'The bot is running normally: its database login is restored.' : 'The bot is running normally.' };
+}
+
+const answerText = (stdout: string) => stdout.trim().split('\n').pop()?.slice(0, 200) ?? '';
+
+/**
+ * The order step's write: the claim clock read by dbm_work (dbm_meta cannot read smdb_data), then the row's
+ * transaction by dbm_meta under the block's fence exemption. The clock is read before the transaction, so a claim
+ * renewed in between counts as live: the expected set can only grow.
+ */
+async function writeSaveOrder(t: dbLogin.DbTarget, db: string, p: { keepId: string | null; keepRestore: boolean; message: string; user: string }): Promise<{ ok: true; row: SaveOrderWritten } | { ok: false; error: string }> {
+  const clock = await dbLogin.runCall(t.container, dbLogin.workPsql(t.container, db, CLAIM_CLOCK_READ_SQL, { stdin: true }));
+  if (!clock.ok) return { ok: false, error: clock.error };
+  const upMs = parseClaimClock(clock.stdout);
+  if (upMs === undefined) return { ok: false, error: `the claim clock read answered '${answerText(clock.stdout)}'` };
+  const sql = saveOrderSql({ keepId: p.keepId, keepRestore: p.keepRestore, newId: newOrderId(), message: p.message, user: p.user, upMs });
+  const w = await dbLogin.runCall(t.container, dbLogin.metaPsql(t.container, db, sql, { stdin: true, exempt: true }));
+  if (!w.ok) return { ok: false, error: w.error };
+  const row = parseSaveOrderWritten(w.stdout);
+  return row ? { ok: true, row } : { ok: false, error: `the order write answered '${answerText(w.stdout)}'` };
+}
+
+/**
+ * Running's `open` for a save-order app: the login read first (a copy in recovery fails before any write), then the
+ * row set to 'running' with no answers by dbm_meta, then the login opened by the cluster login. dbm_meta cannot alter
+ * a role and the cluster login reaches only the postgres database, so the row commits first: no bot sees the login
+ * back while the row says maintenance.
+ */
+async function openWithSaveOrder(t: dbLogin.DbTarget, db: string): Promise<dbLogin.DbResult> {
+  const read = await dbLogin.readBotLogin(t);
+  if (!read.ok) return read;
+  if (read.login.inRecovery) return { ok: false, cls: 'recovery', error: 'the database is in recovery' };
+  const row = await dbLogin.runCall(t.container, dbLogin.metaPsql(t.container, db, runningOpenSql({ user: t.user, newId: newOrderId() }), { stdin: true }));
+  if (!row.ok) {
+    const cls = dbLogin.psqlFailureClass(row.stderr);
+    return { ok: false, cls: cls === 'recovery' ? 'write-fence' : cls, error: row.error };
+  }
+  return dbLogin.openBotLogin(t);
 }
 
 type CoreResult = { refused: true; status: number; error: string } | { refused: false; result: OrderResult; notify: boolean };
@@ -398,6 +651,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   if ('error' in kindRead) return refuse(409, kindRead.error);
   const kind = kindRead.kind;
   const hooks = hasHooks(inst);
+  const saveOrder = kind === 'database' && declaresSaveOrder(inst);
   let target: dbLogin.DbTarget | null = null;
   if (kind === 'database') {
     const roleRefusal = dbLogin.botRoleRefusal(inst.fleetDb!.user);
@@ -412,7 +666,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   if (app === null) return refuse(409, R11);
 
   const fromOff = current.state === 'off' || (!current.settled && current.prior?.state === 'off');
-  const planned = orderPlan({ kind, to, fromOff, app, savedByBot: current.savedByBot, hooks });
+  const planned = orderPlan({ kind, to, fromOff, app, savedByBot: current.savedByBot, hooks, saveOrder });
   if ('refusal' in planned && mode === 'order') return refuse(409, planned.refusal === 'R7' ? R7 : planned.refusal === 'R9' ? R9 : R10);
   const fullPlan = 'steps' in planned ? planned.steps : [];
   const startOwed = fullPlan.includes('start');
@@ -420,7 +674,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   let retryDbFail: string | undefined;
   if (mode === 'retry') {
     const sidecar = target ? await dbLogin.sidecarRunning(target.container) : null;
-    const dbSteps = (s: PlanStep) => s === 'block' || s === 'end-sessions' || s === 'open';
+    const dbSteps = (s: PlanStep) => s === 'order' || s === 'acks' || s === 'block' || s === 'end-sessions' || s === 'final' || s === 'open';
     if (target && sidecar !== true && fullPlan.some(dbSteps)) retryDbFail = sidecar === false ? RETRY_DB_DOWN : RETRY_DB_UNKNOWN;
     steps = fullPlan.filter(s => (s === 'hook' ? current.hook === 'unconfirmed' : s === 'stop' || dbSteps(s) && sidecar === true));
   } else if (mode === 'resumed' && current.hook === 'missing') {
@@ -435,13 +689,21 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
       hook: hooks ? 'unconfirmed' : 'none', login: kind === 'database' ? 'unconfirmed' : 'not-managed',
       savedByBot: current.savedByBot, ...(prior ? { prior } : {}),
     };
+    if (saveOrder) {
+      // P1: a new order keeps of the record before it only what the keep rule judges a standing row by.
+      const was = current.fleet ?? {};
+      const keys: Array<keyof MaintenanceSaveOrder> = to === 'running' ? ['orderId'] : ['orderId', 'blockedAt', 'askedBlocked'];
+      const fleet: MaintenanceSaveOrder = {};
+      for (const key of keys) if (was[key] !== undefined) (fleet as Record<string, unknown>)[key] = was[key];
+      if (to !== 'running' || fleet.orderId) rec.fleet = fleet;
+    }
     try {
       containerManager.updateInstanceMaintenance(botId, rec);
     } catch (err) {
       return refuse(500, R12(errText(err)));
     }
   } else {
-    rec = { ...current, settled: false };
+    rec = { ...current, settled: false, ...(current.fleet ? { fleet: { ...current.fleet } } : {}) };
     if (kind === 'database' && mode === 'resumed') rec.login = 'unconfirmed';
   }
   onAdmit();
@@ -457,7 +719,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
     }
   };
 
-  const o: Outcome = { kind, to, hooks, started: false, blockLanded: false, app, settled: false, savedByBot: rec.savedByBot, dbFail: retryDbFail };
+  const o: Outcome = { kind, to, hooks, saveOrder, started: false, blockLanded: false, app, settled: false, savedByBot: rec.savedByBot, dbFail: retryDbFail, startPlanned: startOwed };
   if (mode === 'retry') {
     o.startOwed = startOwed;
     if ('refusal' in planned) o.planRefused = planned.refusal;
@@ -476,6 +738,8 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
     rec.hook = h.hook;
     if (h.hook === 'confirmed') rec.savedByBot = hookState(to);
     o.savedByBot = rec.savedByBot;
+    if (h.hook === 'unconfirmed') rec.hookError = h.reason;
+    else delete rec.hookError;
     if (to === 'running') return;
     if (h.hook === 'confirmed' && h.held) rec.held = h.held;
     else delete rec.held;
@@ -484,6 +748,9 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   let dbTouched = false;
   let opened = false;
   let stopped = false;
+  let orderLanded = false;
+  let orderLogin: 'open' | 'blocked' | 'unread' | null = null;
+  const fleetOf = (): MaintenanceSaveOrder => rec.fleet ?? (rec.fleet = {});
 
   for (const step of steps) {
     if (step === 'hook') {
@@ -501,6 +768,79 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
         if (!up.success) { o.dbFail = `the database did not start (${up.error})`; continue; }
       }
       await ensureRole();
+    } else if (step === 'order') {
+      dbTouched = true;
+      if (o.dbFail || !await ensureRole()) continue;
+      const f = fleetOf();
+      const read = await dbLogin.readBotLogin(target!);
+      const login = !read.ok || read.login.canLogin === null ? 'unread' : read.login.canLogin ? 'open' : 'blocked';
+      if (mode === 'retry' && f.orderFor === rec.orderedAt && login !== 'open') continue;
+      orderLogin = login;
+      delete f.verdict;
+      const keepId = f.orderId && (login === 'open' || f.blockedAt) ? f.orderId : null;
+      if (!keepId) {
+        // L4: no earlier order's id or block mark may outlive a write that must make a new id.
+        delete f.orderId;
+        delete f.blockedAt;
+        delete f.askedBlocked;
+        if (!save(rec)) break;
+      }
+      const written = login === 'unread'
+        ? { ok: false as const, error: `${LOGIN_READ_PREFIX}${read.ok ? `the role ${target!.user} does not exist` : read.error}` }
+        : await writeSaveOrder(target!, inst.fleetDb!.db, { keepId, keepRestore: login !== 'open', message, user: target!.user });
+      if (written.ok) {
+        const w = written.row;
+        Object.assign(f, { orderId: w.orderId, generation: w.generation, upMs: w.upMs, orderFor: rec.orderedAt });
+        if (!w.kept) {
+          delete f.blockedAt;
+          f.askedBlocked = login === 'blocked';
+        } else if (login === 'open') f.askedBlocked = false;
+        delete f.orderFails;
+        delete f.orderError;
+        orderLanded = true;
+        if (!save(rec)) break;
+      } else {
+        f.orderFails = (f.orderFails ?? 0) + 1;
+        f.orderError = { reason: written.error, login };
+        if (!save(rec)) break;
+        if (login !== 'blocked' && f.orderFails < 2) {
+          o.orderStop = written.error;
+          break;
+        }
+      }
+    } else if (step === 'acks') {
+      if (o.dbFail || !orderLanded || orderLogin !== 'open') continue;
+      const f = fleetOf();
+      const started = Date.now();
+      const deadline = started + MAINTENANCE_TIMING.ackWaitMs;
+      const total = Math.round(MAINTENANCE_TIMING.ackWaitMs / 1000);
+      try {
+        for (;;) {
+          const r = await readSaveRows(target!, inst.fleetDb!.db);
+          if (r.ok) {
+            if (!rowIsOrders(r.rows, f) || !r.rows.claims || r.rows.order!.upMs === null) break;
+            const left = uncoveredOf(r.rows, f.orderId!);
+            if (!left.length) break;
+            waitingLines.set(botId, `${NAME[to]}: waiting for the bot on ${uniqueNames(left)} to save what it holds (${Math.floor((Date.now() - started) / 1000)} of ${total} seconds); this database still accepts its login.`);
+          }
+          if (Date.now() >= deadline) break;
+          await pause(MAINTENANCE_TIMING.ackPollMs);
+        }
+      } finally {
+        waitingLines.delete(botId);
+      }
+    } else if (step === 'final') {
+      dbTouched = true;
+      if (o.dbFail || !await ensureRole()) continue;
+      const f = fleetOf();
+      if (f.verdict) continue;
+      const r = await readSaveRows(target!, inst.fleetDb!.db, { exempt: true });
+      if (!r.ok) {
+        o.finalFail = r.error;
+        continue;
+      }
+      f.verdict = finalVerdict(r.rows, f, to === 'off' ? 'off' : 'maintenance', !!inst.fleetDb!.replacedBy, message);
+      if (!save(rec)) break;
     } else if (step === 'block' || step === 'end-sessions' || step === 'open') {
       dbTouched = true;
       if (o.dbFail || !await ensureRole()) continue;
@@ -508,13 +848,17 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
         const r = await dbLogin.blockBotLogin(target!);
         if (r.ok) o.blockLanded = true;
         else o.dbFail = r.cls === 'recovery' ? RECOVERY_BLOCK : r.cls === 'write-fence' ? FENCED : `the database login could not be blocked (${r.error})`;
+        if (r.ok && saveOrder) {
+          fleetOf().blockedAt = new Date().toISOString();
+          if (!save(rec)) break;
+        }
       } else if (step === 'end-sessions') {
         const r = await dbLogin.endBotSessions(target!, MAINTENANCE_TIMING.sessionPauseMs);
         if (!r.ok) o.dbFail = 'left' in r && r.left !== undefined
           ? `${r.left} session(s) of the bot's database role were still open after three attempts to end them`
           : `the manager can't confirm the login is blocked: ${r.error}`;
       } else {
-        const r = await dbLogin.openBotLogin(target!);
+        const r = saveOrder ? await openWithSaveOrder(target!, inst.fleetDb!.db) : await dbLogin.openBotLogin(target!);
         if (r.ok) opened = true;
         else o.dbFail = r.cls === 'recovery' ? RECOVERY_OPEN : r.cls === 'write-fence' ? FENCED : r.error;
         if (!r.ok && r.cls === 'write-fence') {
@@ -526,7 +870,13 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
       stopped = true;
       const r = await containerManager.stopBotInOp(botId, OP);
       if (!r.success && r.error !== 'Bot is not running') o.stopFail = r.error || 'no reason given';
-      else if (rec.held?.state !== 'yes') rec.held = { state: 'stopped' };
+      else if (rec.held?.state !== 'yes' && rec.held?.state !== 'stopped') {
+        // J2, L3: the stop keeps the answer it replaced, and whether the login read blocked with no session then.
+        const was = rec.held;
+        const before = was?.state === 'no' ? { state: 'no' as const, guilds: was.guilds, files: was.files } : was?.state === 'unknown' ? { state: 'unknown' as const } : null;
+        const shut = kind === 'database' && !o.dbFail && (o.blockLanded || !!rec.fleet?.blockedAt);
+        rec.held = { state: 'stopped', ...(before ? { before } : {}), shut };
+      }
     } else if (step === 'db-up-alone') {
       if (await dbLogin.sidecarRunning(target!.container) === true) continue;
       const r = await containerManager.startFleetDbSidecar(botId);
@@ -548,7 +898,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   };
   if (!notRecorded) {
     if (kind === 'database' && (dbTouched || retryDbFail)) {
-      if (o.dbFail) rec.login = 'unconfirmed';
+      if (o.dbFail || o.orderStop !== undefined) rec.login = 'unconfirmed';
       else {
         const read = await dbLogin.readBotLogin(target!);
         if (!read.ok) {
@@ -558,11 +908,21 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
           if (read.login.canLogin === true) rec.login = 'open';
           else { o.dbFail = 'the login read back as blocked after it was restored'; rec.login = 'unconfirmed'; }
         } else if (read.login.canLogin === false && !read.login.inRecovery) rec.login = 'blocked';
-        else { o.dbFail = 'the login read back as open after it was blocked'; rec.login = 'unconfirmed'; }
+        else {
+          o.dbFail = 'the login read back as open after it was blocked';
+          rec.login = 'unconfirmed';
+          if (read.login.canLogin === true) delete rec.fleet?.blockedAt;
+        }
       }
     }
     o.app = await containerManager.appContainerRunning(botId);
-    o.settled = settledVerdict({ kind, to, hook: rec.hook, login: rec.login, app: o.app, startOwed, hooks });
+    o.baseSettled = settledVerdict({ kind, to, hook: rec.hook, login: rec.login, app: o.app, startOwed, hooks });
+    const needsVerdict = saveOrder && to !== 'running' && fullPlan.includes('final');
+    if (needsVerdict) {
+      o.verdict = rec.fleet?.verdict;
+      if (!o.verdict && o.finalFail === undefined) o.finalFail = 'the read did not run in this pass';
+    }
+    o.settled = o.baseSettled && (!needsVerdict || !!o.verdict);
     const { text, reason } = orderText(o);
     rec.settled = o.settled;
     if (reason) rec.lastError = reason;
@@ -743,9 +1103,10 @@ export async function maintenanceStatus(inst: InstanceConfig, driftText: string 
     else if (up === false) live = { down: true };
     else live = { ok: false, error: 'docker did not say whether the database runs' };
   }
+  const waiting = !rec.settled ? waitingLines.get(inst.id) : undefined;
   return {
     state: rec.state, message: rec.message, settled: rec.settled, kind, orderedAt: rec.orderedAt,
-    lastError: rec.lastError ?? null, summary: maintenanceView(rec, kind, driftText, live, inst.migrate?.to),
+    lastError: rec.lastError ?? null, summary: waiting ?? maintenanceView(rec, kind, driftText, live, inst.migrate?.to),
     held: rec.state !== 'running' && rec.held ? rec.held : null,
   };
 }
@@ -779,6 +1140,7 @@ export function resetMaintenanceState(): void {
   unsavedText.clear();
   loggedDrift.clear();
   provisionLogged.clear();
+  waitingLines.clear();
   passRunning = false;
   firstPassDone = false;
   dbLogin.resetManagerRoleCache();
@@ -894,6 +1256,7 @@ async function reconcileBot(listed: InstanceConfig, first: boolean): Promise<voi
     const now = containerManager.getBot(inst.id);
     const stored = now ? maintenanceOf(now) : null;
     if (!stored || !stored.settled || stored.state === 'running') return;
+    clearBlockedAt(inst.id);
     const role = await dbLogin.ensureManagerDbRole(t);
     if (!role.ok) return;
     const blocked = await dbLogin.blockBotLogin(t);

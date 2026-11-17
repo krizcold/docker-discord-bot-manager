@@ -1117,6 +1117,7 @@ class Lane {
         if (!read.ok) return { go: 'close', text: T.login(read.error) };
         if (read.login.inRecovery) return { go: 'close', text: T.login(MIGRATE_RECOVERY) };
         if (read.login.canLogin === null) return { go: 'close', text: T.login(`the role ${t.user} does not exist`) };
+        maintenance.clearBlockedAt(this.botId);
         if (read.login.canLogin === false) {
           if (!this.save({ loginOpened: true })) return this.stop();
           const opened = await dbLogin.openBotLogin(t);

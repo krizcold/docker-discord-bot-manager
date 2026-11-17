@@ -59,6 +59,11 @@ export interface CompanionDbSpec {
   appEnvFile?: string;
   /** Where the app's data folder is mounted in its container; the certificate files of a join land under it. */
   appDataPath?: string;
+  /**
+   * The app's processes answer contract 11's save order: Maintenance and Off write smdb_manager.save_order and wait
+   * for every shard claim holder's answer in smdb_manager.save_acks before the login is blocked.
+   */
+  saveOrder?: boolean;
 }
 
 /**
@@ -205,6 +210,7 @@ const superModularDiscordBot: AppCapabilityManifest = {
     env: smdbDbEnv,
     appEnvFile: '.env',
     appDataPath: '/data',
+    saveOrder: true,
   },
   wizardFields: smdbWizardFields(),
   hooks: {

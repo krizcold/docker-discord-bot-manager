@@ -341,6 +341,11 @@ export function cmMock(): Record<string, unknown> {
     deleteLaneRefusal: (_id: string, action: string) => (m.deleteLane ? { success: false, error: `A Delete of this instance did not finish; ${action} is refused until Delete is run again` } : null),
     unfinishedRetireRefusal: (at: string) => `The fleet database of this instance was being removed (since ${at})`,
     withExternalBotOp: withLock,
+    updateInstanceMaintenance: (id: string, rec: any) => {
+      m.events.push('maintenance-write');
+      if (rec) m.bots[id].maintenance = clone(rec);
+      else delete m.bots[id].maintenance;
+    },
     updateInstanceMigrate: (id: string, rec: any, last?: any) => {
       const n = m.migrateWrites.length + 1;
       const err = m.failMigrateWrite(n, rec);

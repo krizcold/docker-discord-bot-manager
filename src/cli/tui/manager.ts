@@ -463,6 +463,9 @@ export class ManagerScreen {
         text = `Deployment mode set to ${mode}.`;
         s.manager.deploySeq++;
         s.manager.deployment = { reading: false, value: a.info, error: null };
+      } else if (a.kind === 'saved') {
+        text = a.text;
+        void readDeploy(s);
       } else {
         text = a.kind === 'refused' ? a.text : `can't confirm whether the mode changed: ${a.text}`;
         void readDeploy(s);

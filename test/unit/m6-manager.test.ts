@@ -38,7 +38,7 @@ const versionBody = (over: Record<string, unknown> = {}) => ok({
 const record = (state: string, over: Record<string, unknown> = {}) => ({ opId: 'op-1', state, at: '2026-11-14T09:58:00.000Z', ...over });
 // POST /api/manager/update (manager.ts:58).
 const accepted = (opId = 'op-1') => ok({ success: true, opId, message: 'Manager update started' });
-// GET and PUT /api/system/deployment (bots.ts:2472, :2496): getDeploymentInfo (detector.ts:206 to :212).
+// GET and PUT /api/system/deployment (bots.ts:2502, :2511): getDeploymentInfo (detector.ts:206 to :212).
 const deployBody = (over: Record<string, unknown> = {}) => ok({ success: true, mode: 'docker', casaosAvailable: false, autoDetected: true, forcedByEnv: false, ...over });
 
 interface Opened {
@@ -611,7 +611,23 @@ describe('m6 manager: D deployment mode', () => {
     }
   });
 
-  it('the 500 after a saved mode (bots.ts:2494 to :2497) says can\'t confirm and reads the mode again', async () => {
+  it('a saved mode whose details could not be read shows the warning and reads the mode again', async () => {
+    const state = { deploy: deployBody() };
+    const warning = 'The deployment mode was saved as casaos, but reading the deployment details failed: docker did not answer. Reload to see them.';
+    const f = routes({ deploy: () => state.deploy }).on('PUT', DEPLOY, () => {
+      state.deploy = deployBody({ mode: 'casaos', autoDetected: false });
+      return ok({ success: true, mode: 'casaos', warning });
+    });
+    const v = await toDialog(f);
+    const before = v.reads(DEPLOY);
+    await v.press('y');
+    await v.until(warning);
+    await v.until('Deployment mode: casaos (set by the operator)');
+    expect(v.reads(DEPLOY)).toBe(before + 1);
+    expect(flat(v.frame())).not.toContain("can't confirm");
+  });
+
+  it('a 500 with no not-saved text says can\'t confirm and reads the mode again', async () => {
     const state = { deploy: deployBody() };
     const f = routes({ deploy: () => state.deploy }).on('PUT', DEPLOY, () => {
       state.deploy = deployBody({ mode: 'casaos', autoDetected: false });

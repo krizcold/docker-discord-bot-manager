@@ -1230,7 +1230,8 @@ export async function fsMkdir(botId: string, target: string, reqPath: string): P
   const abs = resolveAbs(t, reqPath);
   if (!abs) return { success: false, error: 'Path outside allowed scope' };
   if (t.kind === 'local') return localMkdir(abs, t.jail ? resolvedBase(t.base) : null);
-  const { stderr, code } = await spawnCapture('docker', execArgs(t, ['mkdir', '-p', '--', abs]));
+  const { stderr, code, timedOut } = await spawnCapture('docker', execArgs(t, ['mkdir', '-p', '--', abs]));
+  if (timedOut) return unconfirmed('create');
   if (code !== 0) return { success: false, error: stderr.trim() || 'Failed to create directory' };
   return { success: true, path: abs };
 }

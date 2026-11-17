@@ -2525,7 +2525,17 @@ export function createSystemRoutes(): Router {
         res.status(500).json({ success: false, error: `The deployment mode could not be saved, so it was not changed: ${(error as Error)?.message || error}` });
         return;
       }
-      const info = await getDeploymentInfo();
+      let info;
+      try {
+        info = await getDeploymentInfo();
+      } catch (error) {
+        res.json({
+          success: true,
+          mode,
+          warning: `The deployment mode was saved as ${mode}, but reading the deployment details failed: ${(error as Error)?.message || error}. Reload to see them.`,
+        });
+        return;
+      }
       res.json({ success: true, ...info });
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });

@@ -689,21 +689,25 @@ export function readDeployment(client: Client, limitMs: number): Read<Deployment
 
 export type DeploymentAnswer =
   | { kind: 'set'; info: DeploymentInfo }
+  | { kind: 'saved'; mode: string; text: string }
   | { kind: 'refused'; text: string }
   | { kind: 'unsure'; text: string };
 
 const NOT_SAVED = 'The deployment mode could not be saved';
 
 /**
- * PUT /api/system/deployment (bots.ts:2478); no time limit. Only the 409 of a forced mode (detector.ts:170) and the 500
- * that names an unsaved mode (bots.ts:2492) say nothing changed; the 500 after a saved mode (:2494 to :2497) and every
- * other refusal leave the mode unknown.
+ * PUT /api/system/deployment (bots.ts:2511); no time limit. Only the 409 of a forced mode (detector.ts:170) and the 500
+ * that names an unsaved mode (bots.ts:2525) say nothing changed; every other refusal leaves the mode unknown. A saved
+ * mode whose details could not be read answers success with a `warning` and no details (bots.ts:2530).
  */
 export async function setDeployment(client: Client, mode: 'casaos' | 'docker'): Promise<DeploymentAnswer> {
   const { status, outcome } = await send(client, 'PUT', '/api/system/deployment', { mode });
   if (outcome.ok !== true) return { kind: 'unsure', text: outcome.text };
   const b = outcome.value;
-  if (b.success === true) return { kind: 'set', info: b as DeploymentInfo };
+  if (b.success === true) {
+    if (typeof b.warning === 'string') return { kind: 'saved', mode: typeof b.mode === 'string' ? b.mode : mode, text: b.warning };
+    return { kind: 'set', info: b as DeploymentInfo };
+  }
   const error = typeof b.error === 'string' ? b.error : '';
   if (status === 409 && error) return { kind: 'refused', text: error };
   if (status === 500 && error.startsWith(NOT_SAVED)) return { kind: 'refused', text: error };

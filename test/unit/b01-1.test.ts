@@ -210,6 +210,18 @@ describe('New File', () => {
   });
 });
 
+describe('New Folder in a container', () => {
+  it('answers not confirmed when the exec outlives the time limit', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const made = terminal.fsMkdir('b1', 'slow', '/srv/new');
+    while (!h.calls.some((c) => c[0] === 'exec')) await realSleep(20);
+    await vi.advanceTimersByTimeAsync(15000);
+    const res = await made;
+    expect(res).toMatchObject({ success: false, unconfirmed: true });
+    expect(res.error).toBe('The container did not answer within 15 s, so whether the create happened could not be confirmed yet. Reload to see the result.');
+  });
+});
+
 describe('rename', () => {
   it('refuses an existing target in the host scope unless overwrite is confirmed', async () => {
     fs.writeFileSync(path.join(data, 'a.txt'), 'A');

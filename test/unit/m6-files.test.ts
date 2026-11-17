@@ -470,6 +470,16 @@ describe('m6 files: new file, new folder, rename, delete', () => {
     w.unmount();
   });
 
+  it('K answered unconfirmed says it cannot confirm the folder', async () => {
+    const v = await openFiles(base().on('POST', MKDIR, unconfirmed('create')));
+    await v.press('k');
+    await v.type('d');
+    await v.press(ENTER);
+    await v.untilText(`Can't confirm the creation of ${BASE}/d: The container did not answer within 15 s`);
+    expect(v.frames.map(flat).join(' ')).not.toContain('is there now');
+    v.unmount();
+  });
+
   it('K asks for a folder (fsMkdir, terminal.ts:1105); a success never says Created, and a refusal shows its text', async () => {
     const f = base().on('POST', MKDIR, ok({ success: true, path: `${BASE}/cache` }));
     const v = await openFiles(f);

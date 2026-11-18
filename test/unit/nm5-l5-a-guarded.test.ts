@@ -123,7 +123,7 @@ describe('clusterSql', () => {
     sp.queue = [{ stdout: ['ok\n'] }];
     const r = await clusterSql(T, 'SELECT 1;');
     expect(r.ok).toBe(true);
-    expect(sp.calls[0].args).toEqual(['exec', '-i', 'c-pg', 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q']);
+    expect(sp.calls[0].args).toEqual(['exec', '-i', 'c-pg', 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q']);
     expect(sp.calls[0].input).toBe('SELECT 1;<end>');
     expect(sp.calls).toHaveLength(1);
     expect(sp.exec).toEqual([]);

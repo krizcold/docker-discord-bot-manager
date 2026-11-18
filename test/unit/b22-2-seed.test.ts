@@ -13,6 +13,8 @@ const h = vi.hoisted(() => {
     refusePark: false,
     refuseMark: false,
     probeOk: true,
+    failBasebackup: false,
+    spawned: [] as string[][],
   };
 });
 
@@ -39,11 +41,13 @@ vi.mock('child_process', async (importOriginal) => {
     child.stderr = new PassThrough();
     child.stdin = new PassThrough();
     child.kill = () => {};
+    h.spawned.push(args);
     const probe = args.includes('SELECT pg_is_in_recovery()');
+    const failSeed = h.failBasebackup && args.includes('pg_basebackup');
     setTimeout(() => {
       child.stdout.end(probe && h.probeOk ? 'f\n' : '');
       child.stderr.end(probe && !h.probeOk ? 'psql: error: connection refused (fake)\n' : '');
-      setTimeout(() => child.emit('close', probe && !h.probeOk ? 2 : 0), 1);
+      setTimeout(() => child.emit('close', (probe && !h.probeOk) || failSeed ? 2 : 0), 1);
     }, 1);
     return child;
   };
@@ -135,6 +139,8 @@ beforeEach(async () => {
   h.refusePark = false;
   h.refuseMark = false;
   h.probeOk = true;
+  h.failBasebackup = false;
+  h.spawned.length = 0;
   retryHeldSeedRecords();
   writeRegistry();
 });
@@ -225,5 +231,20 @@ describe('R40-J3: other lanes read a seed held done as finished', () => {
     await waitFor(() => containerManager.isBotBusy('b1') === null);
     expect(bot().fleetDbReplicaSeed).toBeDefined();
     expect(fleetBackup.databaseLaneBlocker()).toBeNull();
+  });
+});
+
+describe('NM35: the psql runs a seed starts on the primary pass -X', () => {
+  it('the probe, the slot reset and, after a failed pg_basebackup, the slot drop', async () => {
+    h.failBasebackup = true;
+    provisionFleetReplica(bot(), 'standby.invalid', 5440, true);
+    await waitFor(() => containerManager.isBotBusy('b1') === null);
+    const afterImage = (needle: string) => {
+      const a = h.spawned.find(x => x[0] === 'run' && x.join(' ').includes(needle));
+      return a ? a[a.indexOf('postgres:16-alpine') + 1] : 'no such run';
+    };
+    expect(afterImage('SELECT pg_is_in_recovery()')).toBe('-X');
+    expect(afterImage('wal_status INTO s')).toBe('-X');
+    expect(afterImage('pg_drop_replication_slot(slot_name)')).toBe('-X');
   });
 });

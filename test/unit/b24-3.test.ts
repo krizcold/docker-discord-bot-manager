@@ -63,6 +63,14 @@ describe('the database URL test on a manager without the test image', () => {
     expect(h.spawns[2]).toContain('never');
   });
 
+  it('NM35: the test runs psql -X, so a .psqlrc in the image changes nothing', async () => {
+    const p = probeDatabaseUrl(URL_, null);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await p;
+    const run = h.spawns.find(a => a[0] === 'run')!;
+    expect(run[run.indexOf('psql') + 1]).toBe('-X');
+  });
+
   it('says the image download ran out of time and the database was not tested', async () => {
     h.code.image = 1;
     h.delay.pull = Infinity;

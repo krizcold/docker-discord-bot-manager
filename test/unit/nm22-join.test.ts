@@ -157,7 +157,7 @@ describe('O1 ensureCopyLogin through Join (L1 to L18, L24, L25)', () => {
     const dsn = mint.args[mint.args.length - 2];
     expect(mint.args).toEqual(['run', '--rm', '-i', '--name', 'b-fleet-join-login', '-e', 'PGPASSWORD', '-e', 'SMDB_COPY_VERIFIER',
       '-v', expect.stringMatching(/fleet-join\/[0-9a-f]{16}\.crt:\/primary-ca\.crt:ro$/), '--entrypoint', 'sh', 'postgres:16-alpine',
-      '-c', 'psql "$1" -v ON_ERROR_STOP=1 -qAt -v name="$2" -f -', 'sh', dsn, LOGIN]);
+      '-c', 'psql -X "$1" -v ON_ERROR_STOP=1 -qAt -v name="$2" -f -', 'sh', dsn, LOGIN]);
     expect(dsnUser(dsn)).toBe('replicator');
     expect(new URL(dsn).pathname).toBe('/postgres');
     expect(mint.stdin).toBe("\\getenv v SMDB_COPY_VERIFIER\nSELECT smdb_manager.add_copy_login(:'name', :'v');\n");

@@ -58,8 +58,8 @@ const psqlCalls = () => fake.calls.filter(c => c.args[0] === 'exec' && c.args.in
 const callsWith = (part: string) => psqlCalls().filter(c => c.input.includes(part));
 const caps = () => psqlCalls().filter(c => c.input.includes('UPDATE smdb_data.shard_claims'));
 const raises = () => psqlCalls().filter(c => c.input.includes('INSERT INTO smdb_manager.generation AS g'));
-const ADMIN = (c: string) => ['exec', '-i', c, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q'];
-const PLAIN = (login: string, c: string, db: string) => ['exec', '-e', PIN, '-i', c, 'psql', '-U', login, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1', '-q'];
+const ADMIN = (c: string) => ['exec', '-i', c, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q'];
+const PLAIN = (login: string, c: string, db: string) => ['exec', '-e', PIN, '-i', c, 'psql', '-X', '-U', login, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1', '-q'];
 const markRow = (dbOid: string, pushIds = ['a1']) => { fake.dbs['c-pg'].receiveMark = { markId: pushIds[0], pushIds, dbOid }; };
 const quiet = () => {
   const spies = (['warn', 'log', 'error'] as const).map(l => vi.spyOn(console, l).mockImplementation(() => undefined));
@@ -306,9 +306,9 @@ describe('NM20 part 4: fleetJoin readCopyFacts and validAddress', () => {
     const r = await (await join()).readCopyFacts(rec);
     expect(r).toEqual({ ok: true, facts: { inRecovery: true, streaming: true, systemId: '7001', timeline: 1, lsn: 0x4000000n } });
     expect(tmp.exec).toHaveLength(1);
-    expect(tmp.exec[0].slice(0, 10)).toEqual(['exec', rec.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
-    expect(tmp.exec[0][10]).toBe('-c');
-    expect(tmp.exec[0][11]).toContain('pg_control_checkpoint()');
+    expect(tmp.exec[0].slice(0, 11)).toEqual(['exec', rec.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
+    expect(tmp.exec[0][11]).toBe('-c');
+    expect(tmp.exec[0][12]).toContain('pg_control_checkpoint()');
   });
 
   it('a missing dbm_admin is one failed read: no check, no role made, no login as the bot role', async () => {
@@ -336,7 +336,7 @@ describe("NM20 part 4: fleetReplica's probes run as dbm_admin on postgres", () =
     await fleetReplica.getFleetReplicaStatus({ id: 'b1', fleetDbReplica: copy } as any);
     const probes = tmp.exec.filter(a => a.some(x => x.includes('pg_stat_wal_receiver')));
     expect(probes).toHaveLength(1);
-    expect(probes[0].slice(0, 11)).toEqual(['exec', copy.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
+    expect(probes[0].slice(0, 12)).toEqual(['exec', copy.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
     expect(tmp.exec.filter(a => a.includes('psql') && a[a.indexOf('-U') + 1] !== 'dbm_admin')).toEqual([]);
   });
 });

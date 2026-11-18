@@ -41,9 +41,9 @@ import { FIXTURE_PEM, fakeJoin } from './join-fake';
 
 const inst = { id: 'a', sanitizedName: 'a', displayName: 'A', fleetLogin: { password: 'Own-Machine-Secret-01' } } as any;
 const GEN = '4|copy.example|2026-10-30T09:00:00Z';
-const SCRIPT = 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_catalog.pg_is_in_recovery()::text" || exit 3; '
-  + 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
-  + 'psql "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
+const SCRIPT = 'psql -X "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql -X "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_catalog.pg_is_in_recovery()::text" || exit 3; '
+  + 'psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
+  + 'psql -X "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
 const UNREAD = { kind: 'unreachable', reason: 'the database gave an answer the manager does not read' };
 const HBA = 'psql: error: FATAL:  pg_hba.conf rejects connection for host "10.0.0.2", user "replicator"';
 const PWFAIL = 'psql: error: FATAL:  password authentication failed for user "replicator"';

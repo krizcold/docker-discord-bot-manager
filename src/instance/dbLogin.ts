@@ -117,7 +117,7 @@ export function argvFor(login: ManagerLogin, db: string, opts: { exempt?: boolea
  * one manager call that runs as the superuser outside the postgres database.
  */
 export function adminReadArgs(container: string, db: string): string[] {
-  return ['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS} -c default_transaction_read_only=on`, '-i', container, 'psql', '-U', MANAGER_DB_ROLE, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
+  return ['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS} -c default_transaction_read_only=on`, '-i', container, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
 }
 
 /** Settings a Postgres 16.0 server refuses at login; a cluster with no dbm_admin may predate them. */
@@ -137,7 +137,7 @@ export function ownerReadArgs(container: string, user: string, db: string): stri
 
 function psqlCall(login: ManagerLogin, container: string, db: string, sql: string, opts: CallOpts): PsqlCall {
   const { env, conn } = argvFor(login, db, opts);
-  const head = ['exec', ...env, ...(opts.stdin ? ['-i'] : []), container, 'psql', ...conn, '-tA', '-v', 'ON_ERROR_STOP=1'];
+  const head = ['exec', ...env, ...(opts.stdin ? ['-i'] : []), container, 'psql', '-X', ...conn, '-tA', '-v', 'ON_ERROR_STOP=1'];
   return opts.stdin ? { login, args: head, input: sql } : { login, args: [...head, '-c', sql] };
 }
 
@@ -164,13 +164,13 @@ export function receivePsql(login: ReceiveLogin, container: string, db: string, 
 /** psql as a machine login over the container's socket, in the bot's database: Remove's step 5b (R4, R18). */
 export function loginPsql(login: string, container: string, db: string, sql: string): PsqlCall {
   if (!COPY_LOGIN_NAME.test(login)) throw new Error(`${login} is not a machine login name`);
-  return { login: login as MachineLogin, args: ['exec', '-e', `PGOPTIONS=${COPY_SESSION_OPTIONS}`, container, 'psql', '-U', login, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql] };
+  return { login: login as MachineLogin, args: ['exec', '-e', `PGOPTIONS=${COPY_SESSION_OPTIONS}`, container, 'psql', '-X', '-U', login, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql] };
 }
 
 /** A client tool as dbm_work in the bot's database; `args` follow the login. */
 export function workArgs(container: string, db: string, tool: 'psql' | 'pg_dump' | 'pg_restore', args: string[], opts: CallOpts = {}): string[] {
   const { env, conn } = argvFor(WORK_LOGIN, db, opts);
-  return ['exec', ...env, ...(opts.stdin ? ['-i'] : []), container, tool, ...conn, ...args];
+  return ['exec', ...env, ...(opts.stdin ? ['-i'] : []), container, tool, ...(tool === 'psql' ? ['-X'] : []), ...conn, ...args];
 }
 
 /** `timedOut`: the call ended on its own time limit, so what the server did is not known. */

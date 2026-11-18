@@ -173,24 +173,24 @@ describe('the argv builders (R3.3, U2 part 1, X2, Y7)', () => {
   const PIN_EXEMPT = `PGOPTIONS=${MANAGER_SESSION_OPTIONS} -c default_transaction_read_only=off`;
 
   it('clusterPsql: dbm_admin on postgres with no pins; the fence exemption only when asked', () => {
-    expect(clusterPsql(C, 'SELECT 1').args).toEqual(['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
-    expect(clusterPsql(C, 'SELECT 1', { exempt: true }).args).toEqual(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
+    expect(clusterPsql(C, 'SELECT 1').args).toEqual(['exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
+    expect(clusterPsql(C, 'SELECT 1', { exempt: true }).args).toEqual(['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
     const script = clusterPsql(C, 'ALTER ROLE x LOGIN;', { stdin: true });
-    expect(script.args).toEqual(['exec', '-i', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
+    expect(script.args).toEqual(['exec', '-i', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
     expect(script.input).toBe('ALTER ROLE x LOGIN;');
   });
 
   it('metaPsql and workPsql carry the pins in one argv element; the exemption only when asked', () => {
-    expect(metaPsql(C, DB, 'SELECT 1').args).toEqual(['exec', '-e', PIN, C, 'psql', '-U', 'dbm_meta', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
-    expect(workPsql(C, DB, 'SELECT 1').args).toEqual(['exec', '-e', PIN, C, 'psql', '-U', 'dbm_work', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
+    expect(metaPsql(C, DB, 'SELECT 1').args).toEqual(['exec', '-e', PIN, C, 'psql', '-X', '-U', 'dbm_meta', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
+    expect(workPsql(C, DB, 'SELECT 1').args).toEqual(['exec', '-e', PIN, C, 'psql', '-X', '-U', 'dbm_work', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT 1']);
     expect(metaPsql(C, DB, 'SELECT 1', { exempt: true }).args[2]).toBe(PIN_EXEMPT);
-    expect(workPsql(C, DB, 'X', { exempt: true, stdin: true })).toMatchObject({ args: ['exec', '-e', PIN_EXEMPT, '-i', C, 'psql', '-U', 'dbm_work', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1'], input: 'X' });
+    expect(workPsql(C, DB, 'X', { exempt: true, stdin: true })).toMatchObject({ args: ['exec', '-e', PIN_EXEMPT, '-i', C, 'psql', '-X', '-U', 'dbm_work', '-d', DB, '-tA', '-v', 'ON_ERROR_STOP=1'], input: 'X' });
   });
 
   it('workArgs for psql, pg_dump and pg_restore', () => {
     expect(workArgs(C, DB, 'pg_dump', ['-Fc'])).toEqual(['exec', '-e', PIN, C, 'pg_dump', '-U', 'dbm_work', '-d', DB, '-Fc']);
     expect(workArgs(C, DB, 'pg_restore', ['--no-owner'], { exempt: true, stdin: true })).toEqual(['exec', '-e', PIN_EXEMPT, '-i', C, 'pg_restore', '-U', 'dbm_work', '-d', DB, '--no-owner']);
-    expect(workArgs(C, DB, 'psql', ['-c', 'SELECT 1'])).toEqual(['exec', '-e', PIN, C, 'psql', '-U', 'dbm_work', '-d', DB, '-c', 'SELECT 1']);
+    expect(workArgs(C, DB, 'psql', ['-c', 'SELECT 1'])).toEqual(['exec', '-e', PIN, C, 'psql', '-X', '-U', 'dbm_work', '-d', DB, '-c', 'SELECT 1']);
   });
 
   it('argvFor pins the receive logins too, and dbm_admin never', () => {
@@ -574,7 +574,7 @@ describe('V1 to V5: where a new role takes its password (R3.2 step 6, S7, S10)',
     expect(h.saved).toEqual([['b1', PW]]);
     expect(await verifierAccepts(cl.botVerifier!, PW, U)).toBe(true);
     const verifierRead = h.calls.find(isVerifierRead)!;
-    expect(verifierRead.args).toEqual(['docker', 'exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c',
+    expect(verifierRead.args).toEqual(['docker', 'exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c',
       "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM pg_authid WHERE rolname = 'dbm_admin') THEN 'missing' ELSE 'v|' || coalesce((SELECT rolpassword FROM pg_authid WHERE rolname = 'dbm_admin'), '') END"]);
   });
 
@@ -677,7 +677,7 @@ describe('U2: the drift read and the failure rule', () => {
   it('the drift read runs as dbm_admin on postgres and names the bot database', async () => {
     await checkRolesDrift({ container: C, db: DB });
     expect(h.calls).toHaveLength(1);
-    expect(h.calls[0].args.slice(0, 8)).toEqual(['docker', 'exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres']);
+    expect(h.calls[0].args.slice(0, 9)).toEqual(['docker', 'exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres']);
     expect(sqlOf(h.calls[0])).toContain("d.datname = 'smdb'");
   });
 

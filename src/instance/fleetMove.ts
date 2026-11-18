@@ -565,9 +565,9 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
   const sys = await clusterSql(t, 'SELECT system_identifier FROM pg_control_system();');
   if (!sys.ok) return out(refusal(`The manager could not read this database's identity (${sys.error || lastLine(sys.stderr)})${NOTHING}`));
   const systemId = lastLine(sys.stdout);
-  const probeScript = 'psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
-    + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
-    + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }';
+  const probeScript = 'psql -X "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
+    + 'psql -X "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
+    + 'psql -X "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }';
   const probe = await receiverClient(inst, code, cert.pem, { as: 'meta', suffix: 'probe', script: probeScript, timeoutMs: MOVE_TIMING.clientMs,
     args: [recvDsn(code, 'postgres', 'meta'), recvDsn(code, code.db, 'meta'), GEN_READ_SQL, `SELECT count(*) FROM smdb_manager.received WHERE push_id = ${sqlLiteral(code.recv.id)}`] });
   if (!probe.ok) {
@@ -679,12 +679,12 @@ async function sendPush(inst: InstanceConfig, code: MoveCode, pem: string, p: Pu
 
   const dbIdent = quoteIdent(code.db);
   const arg = (sql: string) => `'${sql.replace(/'/g, "'\\''")}'`;
-  const createScript = `psql "$1" -v ON_ERROR_STOP=1 -c ${arg(`DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`)} -c ${arg(`CREATE DATABASE ${dbIdent} OWNER ${quoteIdent(user)}`)}`
+  const createScript = `psql -X "$1" -v ON_ERROR_STOP=1 -c ${arg(`DROP DATABASE IF EXISTS ${dbIdent} WITH (FORCE)`)} -c ${arg(`CREATE DATABASE ${dbIdent} OWNER ${quoteIdent(user)}`)}`
     + ` -c ${arg(`GRANT CONNECT, CREATE ON DATABASE ${dbIdent} TO ${dbLogin.META_LOGIN}`)} -c ${arg(`GRANT CONNECT ON DATABASE ${dbIdent} TO ${dbLogin.WORK_LOGIN}`)}`;
   const created = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'create', script: createScript, args: [recvDsn(code, 'postgres', 'meta')], timeoutMs: MOVE_TIMING.clientMs });
   if (!created.ok) return pushFailed(created);
   const metaTx = `SET ROLE ${dbLogin.META_LOGIN};\nBEGIN;\n${fleetBackup.metaTransactionSql(p.metaScript)}COMMIT;\n`;
-  const written = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'meta', script: 'psql "$1" -v ON_ERROR_STOP=1 -q', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.pushMs, input: metaTx });
+  const written = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'meta', script: 'psql -X "$1" -v ON_ERROR_STOP=1 -q', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.pushMs, input: metaTx });
   if (!written.ok) return pushFailed(written);
   const restoreScript = `pg_restore -d "$1" --role="$2" --no-owner --no-privileges --single-transaction --exit-on-error -L ${fleetBackup.RESTORE_LIST_PATH}`;
   const pushed = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'push', script: restoreScript, args: [recvDsn(code, code.db, 'recv'), user], timeoutMs: MOVE_TIMING.pushMs, inputPath: p.dumpPath, mounts: [p.listMount] });
@@ -698,7 +698,7 @@ async function sendPush(inst: InstanceConfig, code: MoveCode, pem: string, p: Pu
   } catch (err) {
     return mismatch(`the counts could not be read (${errText(err)})`);
   }
-  const read = (suffix: string, sql: string) => receiverClient(inst, code, pem, { as: 'recv', suffix, script: 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', args: [recvDsn(code, code.db, 'recv'), sql], timeoutMs: MOVE_TIMING.verifyMs });
+  const read = (suffix: string, sql: string) => receiverClient(inst, code, pem, { as: 'recv', suffix, script: 'psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2"', args: [recvDsn(code, code.db, 'recv'), sql], timeoutMs: MOVE_TIMING.verifyMs });
   const counts = await read('counts', COUNTS_SQL);
   if (loginGone(counts)) return fail(RECVLOGIN);
   const theirCounts = counts.ok ? parseCountLines(counts.stdout) : null;
@@ -716,14 +716,14 @@ async function sendPush(inst: InstanceConfig, code: MoveCode, pem: string, p: Pu
   if (!sumCmp.ok) return mismatch(`checksums: ${sumCmp.text}`);
 
   const notMain = (r: { error?: string; stderr: string }) => fail(`The data reached ${machine} and matched, but ${machine} could not be made the main (${why(r)}). Press Push again.`);
-  const capped = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'cap', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'recv'), SHARD_CAP_DO_SQL], timeoutMs: MOVE_TIMING.clientMs });
+  const capped = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'cap', script: 'psql -X "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"', args: [recvDsn(code, code.db, 'recv'), SHARD_CAP_DO_SQL], timeoutMs: MOVE_TIMING.clientMs });
   if (loginGone(capped)) return fail(RECVLOGIN);
   if (!capped.ok) return notMain(capped);
   const commit = `SET ROLE ${dbLogin.META_LOGIN};\n${raiseSql(code.machine, p.target, `${addressTableSql(code.host, code.port, pem, code.machine)}
 DELETE FROM smdb_manager.addresses WHERE NOT (host = ${sqlLiteral(code.host)} AND port = ${Number(code.port)});
 INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, generation) VALUES (${sqlLiteral(code.recv.id)}, ${sqlLiteral(p.systemId)}, ${sqlLiteral(machineNameOf(inst))}, ${p.target}) ON CONFLICT (push_id) DO NOTHING;
 `)}`;
-  const committed = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'commit', script: 'psql "$1" -v ON_ERROR_STOP=1 -tAq', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.clientMs, input: commit });
+  const committed = await receiverClient(inst, code, pem, { as: 'meta', suffix: 'commit', script: 'psql -X "$1" -v ON_ERROR_STOP=1 -tAq', args: [recvDsn(code, code.db, 'meta')], timeoutMs: MOVE_TIMING.clientMs, input: commit });
   if (loginGone(committed)) return fail(RECVLOGIN);
   if (!committed.ok) return notMain(committed);
   return null;
@@ -736,7 +736,7 @@ INSERT INTO smdb_manager.received (push_id, from_system_id, from_machine, genera
  */
 async function lastStep(inst: InstanceConfig, code: MoveCode, pem: string): Promise<void> {
   const user = inst.fleetDb!.user;
-  const script = 'psql "$1" -v ON_ERROR_STOP=1 -q';
+  const script = 'psql -X "$1" -v ON_ERROR_STOP=1 -q';
   const recv = await receiverClient(inst, code, pem, { as: 'recv', suffix: 'last', script, args: [recvDsn(code, code.db, 'recv')], timeoutMs: MOVE_TIMING.clientMs,
     input: `${clearOwnedSql(RECEIVE_ROLE, user)}ALTER ROLE ${RECEIVE_ROLE} PASSWORD NULL;\nSELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = '${RECEIVE_ROLE}' AND pid <> pg_catalog.pg_backend_pid();\n` });
   if (!recv.ok) {

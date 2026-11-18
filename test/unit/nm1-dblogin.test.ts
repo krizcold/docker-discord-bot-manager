@@ -18,8 +18,8 @@ import { ensureManagerDbRole, readBotLogin, blockBotLogin, endBotSessions, openB
 
 const t = { container: 'b1-fleet-postgres', user: 'smdb' };
 const READ_SQL = "SELECT pg_is_in_recovery()::text || '|' || coalesce((SELECT rolcanlogin::text FROM pg_roles WHERE rolname = 'smdb'), 'missing') || '|' || (SELECT count(*) FROM pg_stat_activity WHERE usename = 'smdb' AND backend_type = 'client backend')::text";
-const argv = (role: string, sql: string) => ['docker', 'exec', 'b1-fleet-postgres', 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
-const exemptArgv = (role: string, sql: string) => ['docker', 'exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', 'b1-fleet-postgres', 'psql', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
+const argv = (role: string, sql: string) => ['docker', 'exec', 'b1-fleet-postgres', 'psql', '-X', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
+const exemptArgv = (role: string, sql: string) => ['docker', 'exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', 'b1-fleet-postgres', 'psql', '-X', '-U', role, '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
 const FENCE_SQL = "SELECT current_setting('default_transaction_read_only')";
 const FENCE_OWNER_SQL = "SELECT coalesce(btrim(pg_read_file('smdb-fence-owner', true), E' \\n'), '') || '|' || (SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only')";
 const sqlOf = (c: { args: string[] }) => c.args[c.args.length - 1];

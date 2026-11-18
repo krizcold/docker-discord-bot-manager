@@ -312,7 +312,7 @@ describe('readCopyFacts', () => {
     expect(h.calls).toHaveLength(1);
     expect(h.calls[0].cmd).toBe('docker');
     // NM20 S1, decide1 G1: the cluster reads run as dbm_admin on postgres.
-    expect(h.calls[0].args.slice(0, 11)).toEqual(['exec', 'b-fleet-postgres-replica', 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
+    expect(h.calls[0].args.slice(0, 12)).toEqual(['exec', 'b-fleet-postgres-replica', 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
     expect(h.calls[0].opts).toEqual({ timeout: 120_000 });
   });
 

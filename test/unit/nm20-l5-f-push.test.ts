@@ -141,8 +141,8 @@ describe('L5 f (NM20): the last step', () => {
     expect((await push('a', CODE)).success).toBe(true);
     warn.restore();
     expect(steps).toEqual(ALL);
-    expect(client('last')).toBe('psql "$1" -v ON_ERROR_STOP=1 -q');
-    expect(client('last-meta')).toBe('psql "$1" -v ON_ERROR_STOP=1 -q');
+    expect(client('last')).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -q');
+    expect(client('last-meta')).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -q');
     expect(ours(warn.out)).toEqual([]);
   });
   it('the smdb_receive clean-up fails: its warning names the ERROR line, the push still succeeds', async () => {

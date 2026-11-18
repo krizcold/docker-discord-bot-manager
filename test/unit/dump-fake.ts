@@ -36,7 +36,7 @@ export function resetHolder(): void {
   Object.assign(holder, freshHolder());
 }
 
-export const isHolder = (args: string[]): boolean => args[0] === 'exec' && args.includes('-i') && args.includes('psql') && args.includes('-X') && args.includes('-q');
+export const isHolder = (args: string[]): boolean => args[0] === 'exec' && args.includes('-i') && args.includes('psql') && args[args.indexOf('-d') + 2] === '-q';
 
 function holderChild(args: string[]): any {
   holder.spawned.push(args);

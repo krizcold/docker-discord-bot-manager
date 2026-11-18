@@ -956,7 +956,7 @@ async function assertSeedableSource(instance: InstanceConfig, intake: ValidatedI
   const probeName = primaryProbeContainerName(instance);
   await dockerRmForce(probeName);
   const probe = await runPrimaryClient(probeName, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql',
-    [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc', 'SELECT pg_is_in_recovery()'], PROBE_TIMEOUT_MS);
+    ['-X', seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc', 'SELECT pg_is_in_recovery()'], PROBE_TIMEOUT_MS);
 
   if (!probe.ok) {
     // FIRST line, not last: a refused or timed-out connection puts the reason
@@ -1041,7 +1041,7 @@ async function runProvisioning(instance: InstanceConfig, record: FleetDbReplicaR
   // replication was disabled refuses earlier, at the login disable revoked.
   const resetName = slotResetContainerName(instance);
   await dockerRmForce(resetName);
-  const slotReset = await runPrimaryClient(resetName, dsn, [certMount], 'psql', [seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
+  const slotReset = await runPrimaryClient(resetName, dsn, [certMount], 'psql', ['-X', seedDsn, '-v', 'ON_ERROR_STOP=1', '-Atc', `
       DO $$ DECLARE s record; BEGIN
         SELECT active, wal_status INTO s FROM pg_catalog.pg_replication_slots WHERE slot_name = '${record.slot}';
         IF NOT FOUND THEN
@@ -1198,7 +1198,7 @@ const ADDRESS_TAKEN_RE = /^its address \S+ is listed on the main (for the machin
 async function dropInactiveSlot(instance: InstanceConfig, dsn: ParsedDsn, hostCertPath: string, slot: string): Promise<void> {
   const name = `${slotResetContainerName(instance)}-drop`;
   await dockerRmForce(name);
-  const result = await runPrimaryClient(name, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql', [seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc',
+  const result = await runPrimaryClient(name, dsn, [`${hostCertPath}:/primary-ca.crt:ro`], 'psql', ['-X', seedDsnFor(dsn), '-v', 'ON_ERROR_STOP=1', '-Atc',
     `SELECT pg_catalog.pg_drop_replication_slot(slot_name) FROM pg_catalog.pg_replication_slots WHERE slot_name = '${slot}' AND NOT active;`], 60_000);
   if (!result.ok) console.warn(`[FleetReplica] Could not drop slot ${slot} on the primary after the failed seed: ${keptLines(result.stderr).pop() ?? ''}`);
 }
@@ -1665,7 +1665,7 @@ async function reseedIdentityRefusal(instance: InstanceConfig, fleetDb: NonNulla
   const probeName = primaryProbeContainerName(instance);
   await dockerRmForce(probeName);
   const ident = await runPrimaryClient(probeName, dsn, [`${hostCertPathFor(instance.id)}:/primary-ca.crt:ro`], 'psql',
-    [`${seedDsnFor(dsn)}&replication=true`, '-Atc', 'IDENTIFY_SYSTEM'], PROBE_TIMEOUT_MS);
+    ['-X', `${seedDsnFor(dsn)}&replication=true`, '-Atc', 'IDENTIFY_SYSTEM'], PROBE_TIMEOUT_MS);
   const [primaryId, primaryTl] = ident.ok ? ident.stdout.trim().split('|') : ['', ''];
   if (!/^\d+$/.test(primaryId) || !/^\d+$/.test(primaryTl)) {
     const reason = (keptLines(ident.stderr)[0] || 'no answer').split(dsn.password).join('***');

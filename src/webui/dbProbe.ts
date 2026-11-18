@@ -88,7 +88,7 @@ export async function probeDatabaseUrl(target: string, network: string | null): 
   if (imageError) return { ok: false, error: imageError, notTested: true };
   const r = await runDocker(['run', '--rm', '--pull', 'never', ...(network ? ['--network', network] : []),
     ...(split.password ? ['-e', 'PGPASSWORD'] : []),
-    PROBE_IMAGE, 'psql', split.url, '-c', 'SELECT 1'],
+    PROBE_IMAGE, 'psql', '-X', split.url, '-c', 'SELECT 1'],
     PROBE_TIMEOUT_MS, split.password ? { ...process.env, PGPASSWORD: split.password } : process.env);
   if (r.spawnError) return { ok: false, error: `Failed to run docker: ${r.spawnError}` };
   if (r.killed) return { ok: false, error: 'Connection test timed out after 10 seconds' };

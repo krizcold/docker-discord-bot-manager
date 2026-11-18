@@ -920,7 +920,7 @@ async function probeEndpoint(instance: InstanceConfig): Promise<Reachability> {
   const url = `postgresql://${instance.fleetDb!.user}@${repl.publicHost}:${repl.hostPort}/${instance.fleetDb!.db}?sslmode=require&connect_timeout=8`;
   // The password rides the docker CLI's environment (`-e NAME` with no value), never its argv.
   return new Promise(resolve => {
-    execFileGuarded('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', url, '-Atc', 'SELECT 1'],
+    execFileGuarded('docker', ['run', '--rm', '-e', 'PGPASSWORD', 'postgres:16-alpine', 'psql', '-X', url, '-Atc', 'SELECT 1'],
       { timeout: PROBE_TIMEOUT_MS, env: { ...process.env, PGPASSWORD: dbPassword } }, (err, stdout, stderr) => {
         if (!err && String(stdout).trim() === '1') resolve({ ok: true });
         else resolve({ ok: false, error: redactSecrets(childFailureText(keptLines(String(stderr ?? '')).join('\n'), err) || 'no response', [dbPassword]).split('\n').pop() });

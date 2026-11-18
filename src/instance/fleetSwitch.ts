@@ -143,7 +143,7 @@ const HBA_REJECTS = 'pg_hba.conf rejects connection';
 
 /** A bot-role login over TCP on the copy: whether pg_hba rejects it (a NOLOGIN refusal or a success both read false). */
 async function hbaRejects(t: Target, db: string): Promise<boolean> {
-  const r = await runGuarded('docker', ['exec', t.container, 'psql', '-h', '127.0.0.1', '-U', t.user, '-d', db, '-w', '-tAc', 'SELECT 1'], { timeoutMs: SWITCH_TIMING.readMs });
+  const r = await runGuarded('docker', ['exec', t.container, 'psql', '-X', '-h', '127.0.0.1', '-U', t.user, '-d', db, '-w', '-tAc', 'SELECT 1'], { timeoutMs: SWITCH_TIMING.readMs });
   return r.stderr.includes(HBA_REJECTS);
 }
 

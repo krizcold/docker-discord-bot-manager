@@ -188,6 +188,13 @@ SELECT 'unlinked|' || pg_catalog.count(pg_catalog.lo_unlink(l.oid)) FROM pg_cata
     await getFleetReplicationStatus(bot(), { probeEndpoint: true });
     expect(probes()).toBe(2);
   });
+
+  it('NM35: the reachability probe runs psql -X', async () => {
+    expect((await renewJoinCode(bot())).success).toBe(true);
+    await getFleetReplicationStatus(bot(), { probeEndpoint: true });
+    const probe = lane.calls.filter(c => c.args.includes('postgres:16-alpine')).pop();
+    expect(probe?.args).toContain(' postgres:16-alpine psql -X postgresql:');
+  });
 });
 
 describe('NM22 L5 b: Remove', () => {

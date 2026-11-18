@@ -316,7 +316,7 @@ export async function mainProbe(instance: InstanceConfig, code: JoinCode, pem: s
   const name = `${instance.sanitizedName}-fleet-join-probe`;
   await dockerRm(name);
   const dsn = seedDsnFor(login);
-  const script = 'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"';
+  const script = 'psql -X "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2"';
   const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, mainStateSql(slot)], CLIENT_TIMEOUT_MS);
   if (!r.ok) {
     const reason = clientReason(r, CLIENT_TIMEOUT_MS, login).split(login.password).join('***');
@@ -353,9 +353,9 @@ export async function peerProbe(instance: InstanceConfig, code: JoinCode, pem: s
   const name = `${instance.sanitizedName}-fleet-${suffix}-probe`;
   await dockerRm(name);
   const dsn = seedDsnFor(login);
-  const script = `psql "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql "$1" -v ON_ERROR_STOP=1 -Atc "${PEER_RECOVERY_SQL}" || exit 3; `
-    + 'psql "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
-    + 'psql "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
+  const script = `psql -X "$1&replication=true" -Atc IDENTIFY_SYSTEM || exit 2; psql -X "$1" -v ON_ERROR_STOP=1 -Atc "${PEER_RECOVERY_SQL}" || exit 3; `
+    + 'psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2" 2>/tmp/gen.err || { if grep -q "does not exist" /tmp/gen.err; then echo "0||"; else cat /tmp/gen.err >&2; exit 4; fi; }; '
+    + 'psql -X "$3" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/mark.err || { if grep -q smdb_manager /tmp/mark.err; then echo 0; else echo unread; fi; }';
   const r = await runPrimaryClient(name, login, [mount], 'sh', ['-c', script, 'sh', dsn, GEN_READ_SQL, seedDsnFor({ ...login, db: 'postgres' }), RECEIVE_MARK_COUNT_SQL], CLIENT_TIMEOUT_MS);
   const lines = r.stdout.trim().split('\n').map(l => l.trim()).filter(Boolean);
   const [systemId, timeline] = (lines[0] || '').split('|');
@@ -397,7 +397,7 @@ export async function primarySql(instance: InstanceConfig, code: JoinCode, pem: 
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   const name = `${instance.sanitizedName}-fleet-join-${suffix}`;
   await dockerRm(name);
-  return runPrimaryClient(name, login, [mount], 'psql', [seedDsnFor(login), '-v', 'ON_ERROR_STOP=1', '-Atc', sql], CLIENT_TIMEOUT_MS);
+  return runPrimaryClient(name, login, [mount], 'psql', ['-X', seedDsnFor(login), '-v', 'ON_ERROR_STOP=1', '-Atc', sql], CLIENT_TIMEOUT_MS);
 }
 
 export function validAddress(row: unknown): JoinAddress | null {
@@ -738,7 +738,7 @@ export async function ensureCopyLogin(instance: InstanceConfig, code: JoinCode, 
   const mount = `${ensureProbeCert(instance.id, code.fp, pem)}:/primary-ca.crt:ro`;
   await dockerRm(name);
   const r = await runPrimaryClient(name, joinLogin, [mount], 'sh',
-    ['-c', 'psql "$1" -v ON_ERROR_STOP=1 -qAt -v name="$2" -f -', 'sh', seedDsnFor(joinLogin), login.user], CLIENT_TIMEOUT_MS,
+    ['-c', 'psql -X "$1" -v ON_ERROR_STOP=1 -qAt -v name="$2" -f -', 'sh', seedDsnFor(joinLogin), login.user], CLIENT_TIMEOUT_MS,
     { env: { SMDB_COPY_VERIFIER: verifier }, stdin: MINT_SQL });
   const clean = (text: string) => redactSecrets(text, [password as string, code.repl.password, verifier]);
   if (r.ok) {

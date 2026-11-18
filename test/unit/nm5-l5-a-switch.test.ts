@@ -70,7 +70,7 @@ describe('the take-over block on the copy', () => {
     fake.dbs['c-pg'].authTimeout = '0';
     expect((await takeOverMain('c', { confirm: true })).success).toBe(true);
     const probe = fake.calls.find(c => c.args.includes('127.0.0.1'))!;
-    expect(probe.args).toEqual(['exec', 'c-pg', 'psql', '-h', '127.0.0.1', '-U', 'app', '-d', 'app', '-w', '-tAc', 'SELECT 1']);
+    expect(probe.args).toEqual(['exec', 'c-pg', 'psql', '-X', '-h', '127.0.0.1', '-U', 'app', '-d', 'app', '-w', '-tAc', 'SELECT 1']);
     expect(dbOf('pg_reload_conf()')).toBe('postgres');
     expect(dbOf("current_setting('hba_file')")).toBe('postgres');
     expect(dbOf("name = 'authentication_timeout'")).toBe('postgres');

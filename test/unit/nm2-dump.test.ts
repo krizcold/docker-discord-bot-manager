@@ -337,7 +337,7 @@ describe('NM2 A: the scheduled dump of one family', () => {
     expect(stored().fleetBackupAlerts?.['main:dumps']).toBeUndefined();
     const dump = pgDumps()[0];
     expect(dump).toContain('--snapshot=00000003-0000001B-1');
-    expect(holder.spawned[0]).toEqual(['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`, '-i', PRIMARY.containerName, 'psql', '-U', 'dbm_work', '-d', PRIMARY.db, '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1']);
+    expect(holder.spawned[0]).toEqual(['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`, '-i', PRIMARY.containerName, 'psql', '-X', '-U', 'dbm_work', '-d', PRIMARY.db, '-q', '-tA', '-v', 'ON_ERROR_STOP=1']);
     expect(holder.stdin[0]).toMatch(/^SET idle_in_transaction_session_timeout = '720s';\nBEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\n/);
     expect(holder.stdin[0]).toContain('pg_export_snapshot()');
     expect(holder.stdin[0]).toMatch(/SELECT 'end\|';\nCOMMIT;\n$/);

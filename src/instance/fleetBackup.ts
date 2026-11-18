@@ -652,7 +652,7 @@ const fenceSleep = (ms: number) => new Promise<void>(resolve => setTimeout(resol
 async function rejectInForce(db: RestoreFleetDb): Promise<boolean> {
   const until = Date.now() + fenceTiming.probeDeadlineMs;
   for (;;) {
-    const probe = await readDocker(['exec', db.containerName, 'psql', '-h', '127.0.0.1', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
+    const probe = await readDocker(['exec', db.containerName, 'psql', '-X', '-h', '127.0.0.1', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
     if (!probe.ok && probe.stderr.includes('pg_hba.conf rejects connection')) return true;
     if (Date.now() >= until) return false;
     await fenceSleep(fenceTiming.probeGapMs);
@@ -848,7 +848,7 @@ export async function liftLaneFence(botId: string, fleetDb: RestoreFleetDb, owne
 
 /** Which layers of the write fence the database holds now and whose they are; null when it cannot be asked. */
 export async function fenceLayers(target: RestoreFleetDb): Promise<FenceState | null> {
-  const probe = await readDocker(['exec', target.containerName, 'psql', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-c',
+  const probe = await readDocker(['exec', target.containerName, 'psql', '-X', '-U', MANAGER_DB_ROLE, '-d', 'postgres', '-tA', '-c',
     `SELECT current_setting('default_transaction_read_only') || '|' || (${FENCE_HBA_COUNT_SQL}) || '|' || ${FENCE_OWNER_FILE_SQL} || '|' || (${FENCE_HBA_OWNER_SQL})`]);
   const m = probe.ok ? /^(on|off)\|(\d+)\|([^|\n]*)\|([^|\n]*)$/.exec(probe.stdout.trim()) : null;
   if (!m) return null;
@@ -1221,7 +1221,7 @@ function dumpOnce(target: DumpTarget, dir: string, fileName: string, about: { fa
     let out: fs.WriteStream | null = null;
     let dumpTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const holderStart = startProcess('docker', dbLogin.workArgs(target.containerName, target.db, 'psql', ['-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1'], { stdin: true }));
+    const holderStart = startProcess('docker', dbLogin.workArgs(target.containerName, target.db, 'psql', ['-q', '-tA', '-v', 'ON_ERROR_STOP=1'], { stdin: true }));
     if (!holderStart.child) return resolve({ success: false, error: `Failed to run docker exec: ${holderStart.reason}` });
     const holder = holderStart.child;
     const fail = (error: string) => {

@@ -180,35 +180,35 @@ describe('pushLocked clients', () => {
   it('every client runs its own script with its own arguments', async () => {
     expect((await push('a', CODE)).success).toBe(true);
     const probe = client('probe');
-    expect(probe.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
-      + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
-      + 'psql "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }');
+    expect(probe.script).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -Atc "SELECT pg_is_in_recovery()::text" || exit 2; '
+      + 'psql -X "$2" -v ON_ERROR_STOP=1 -Atc "$3" 2>/tmp/g.err || { if grep -q "does not exist" /tmp/g.err; then echo "0||"; else cat /tmp/g.err >&2; exit 3; fi; }; '
+      + 'psql -X "$2" -v ON_ERROR_STOP=1 -Atc "$4" 2>/tmp/r.err || { if grep -q "does not exist" /tmp/r.err; then echo "0"; else cat /tmp/r.err >&2; exit 4; fi; }');
     // NM20 R3.6: the probe, the drop and create, the meta rows and the raise run as smdb_receive_meta; the pg_restore
     // (S2's list), counts, checksums and the cap as smdb_receive.
     expect(probe.rest.slice(0, 2)).toEqual([META_DSN('postgres'), META_DSN('app')]);
     expect(probe.rest).toHaveLength(4);
     const created = client('create');
-    expect(created.script).toBe(`psql "$1" -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS "app" WITH (FORCE)' -c 'CREATE DATABASE "app" OWNER "app"' -c 'GRANT CONNECT, CREATE ON DATABASE "app" TO dbm_meta' -c 'GRANT CONNECT ON DATABASE "app" TO dbm_work'`);
+    expect(created.script).toBe(`psql -X "$1" -v ON_ERROR_STOP=1 -c 'DROP DATABASE IF EXISTS "app" WITH (FORCE)' -c 'CREATE DATABASE "app" OWNER "app"' -c 'GRANT CONNECT, CREATE ON DATABASE "app" TO dbm_meta' -c 'GRANT CONNECT ON DATABASE "app" TO dbm_work'`);
     expect(created.rest).toEqual([META_DSN('postgres')]);
     const meta = client('meta');
-    expect(meta.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -q');
+    expect(meta.script).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -q');
     expect(meta.rest).toEqual([META_DSN('app')]);
     const pushed = client('push');
     expect(pushed.script).toBe('pg_restore -d "$1" --role="$2" --no-owner --no-privileges --single-transaction --exit-on-error -L /tmp/smdb-restore.list');
     expect(pushed.rest).toEqual([DSN('app'), 'app']);
     for (const step of ['counts', 'sums'] as const) {
       const c = client(step);
-      expect(c.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"');
+      expect(c.script).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2"');
       expect(c.rest).toHaveLength(2);
       expect(c.rest[0]).toBe(DSN('app'));
     }
     expect(client('counts').rest[1]).toMatch(/count/);
     expect(client('sums').rest[1]).toMatch(/checksum/);
     const cap = client('cap');
-    expect(cap.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
+    expect(cap.script).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -tAq -c "$2"');
     expect(cap.rest[0]).toBe(DSN('app'));
     const commit = client('commit');
-    expect(commit.script).toBe('psql "$1" -v ON_ERROR_STOP=1 -tAq');
+    expect(commit.script).toBe('psql -X "$1" -v ON_ERROR_STOP=1 -tAq');
     expect(commit.rest).toEqual([META_DSN('app')]);
   });
   it('the push fails with two stderr lines: the ERROR line is named, and the mark keeps it as lastError', async () => {

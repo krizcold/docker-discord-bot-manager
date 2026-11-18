@@ -159,7 +159,7 @@ describe('NM1 L5: fleetReplica logins as dbm_admin', () => {
     await fleetReplica.getFleetReplicaStatus({ id: 'b1', fleetDbReplica: copy } as any);
     const probes = callsWith('pg_stat_wal_receiver');
     expect(probes.length).toBe(1);
-    expect(probes[0].slice(0, 11)).toEqual(['exec', copy.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
+    expect(probes[0].slice(0, 12)).toEqual(['exec', copy.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
     expect(callsWith(SUPER).length).toBe(0);
     expect(creators()).toEqual([]);
   });
@@ -171,7 +171,7 @@ describe('NM1 L5: fleetReplica logins as dbm_admin', () => {
     expect(callsWith(SUPER).length).toBe(0);
   });
 
-  const CLUSTER = (sql: string) => ['exec', copy.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
+  const CLUSTER = (sql: string) => ['exec', copy.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', sql];
 
   it("removeFleetReplica's copyHeld probe runs psql -d postgres -c", async () => {
     writeInstance({ fleetDbReplica: copy });
@@ -205,7 +205,7 @@ describe("NM1 L5: reseedStalePrimary's identity read", () => {
   const rest = (args: string[]): Answer => {
     const sql = args.join(' ');
     if (args[0] === 'volume' && args[1] === 'inspect') return String(args[args.length - 1]).endsWith('-replica-data') ? { stderr: 'Error: No such volume' } : '[]';
-    if (args.includes('-i') && args.includes('psql') && args.includes('-X')) return 'snap|00000003-1|f|1000|-1\nend|\n';
+    if (args.includes('-i') && args.includes('psql') && args[args.indexOf('-d') + 2] === '-q') return 'snap|00000003-1|f|1000|-1\nend|\n';
     if (args.includes('pg_dump')) return 'dump';
     if (args.includes('SELECT pg_is_in_recovery()')) return 'f\n';
     if (args.includes('IDENTIFY_SYSTEM')) return '9009|3|0/3000000|\n';
@@ -246,7 +246,7 @@ describe("NM1 L5: reseedStalePrimary's identity read", () => {
     expect(err).toContain(`this database's identity could not be read (${MISSING})`);
     const r = reads();
     expect(r.length).toBe(1);
-    expect(r[0].a).toEqual(['exec', fleetDb.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', IDENTITY_SQL]);
+    expect(r[0].a).toEqual(['exec', fleetDb.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', IDENTITY_SQL]);
     expect(r[0].o?.timeout).toBeGreaterThan(0);
     expect(r[0].c).toBe('docker');
     expect(creators()).toEqual([]);
@@ -274,7 +274,7 @@ describe('NM1 L5: fleetReplication logins as dbm_admin', () => {
     expect(await fenceLinesRefusal(fleetDb.containerName)).toBe(`whether a write fence stands in pg_hba.conf could not be read (${MISSING})`);
     const reads = h.calls.filter(isFenceRead);
     expect(reads.length).toBe(1);
-    expect(reads[0].slice(0, 11)).toEqual(['exec', fleetDb.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
+    expect(reads[0].slice(0, 12)).toEqual(['exec', fleetDb.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c']);
     expect(creators()).toEqual([]);
   });
 
@@ -295,7 +295,7 @@ describe('NM1 L5: fleetReplication logins as dbm_admin', () => {
 
 describe('NM1 L5: the SQL fleetReplication sends', () => {
   // NM20 R3.3: cluster statements run as dbm_admin on postgres.
-  const PSQL = ['exec', fleetDb.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+  const PSQL = ['exec', fleetDb.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
   const psqlCall = (sql: string) => h.calls.find(a => a.includes('psql') && a[a.length - 1] === sql);
 
   it('enable sets wal_log_hints and the WAL retention bound, reloads, and makes the join and machine logins through psql -At on stdin', async () => {
@@ -310,7 +310,7 @@ describe('NM1 L5: the SQL fleetReplication sends', () => {
       expect(psqlCall(sql), sql).toEqual([...PSQL, sql]);
     }
     expect(h.calls.find(a => a[0] === 'exec' && a[1] === '-i' && a.includes('psql'))).toEqual(
-      ['exec', '-i', fleetDb.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
+      ['exec', '-i', fleetDb.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1']);
   });
 
   it('disable reads the active fleet slots and, after the drop, every fleet slot left', async () => {
@@ -327,14 +327,14 @@ describe('NM1 L5: the SQL fleetReplication sends', () => {
     writeInstance({ status: 'running', fleetDb: { ...fleetDb, replication } });
     await getFleetReplicationStatus(containerManager.getBot('b1')!);
     const status = h.calls.find(a => a.includes('psql'))!;
-    expect(status.slice(0, 11)).toEqual(PSQL);
-    expect(status[11]).toMatch(/^SELECT current_setting\('ssl'\),\s+\(SELECT json_agg\(json_build_object\(/);
+    expect(status.slice(0, 12)).toEqual(PSQL);
+    expect(status[12]).toMatch(/^SELECT current_setting\('ssl'\),\s+\(SELECT json_agg\(json_build_object\(/);
     h.calls.length = 0;
     const r = await dropFleetSlot(containerManager.getBot('b1')!, 'fleet_standby_b9');
     expect(r.success).toBe(true);
     const drop = h.calls.find(a => a.includes('psql'))!;
-    expect(drop.slice(0, 11)).toEqual(PSQL);
-    expect(drop[11]).toContain("SELECT active INTO s FROM pg_replication_slots WHERE slot_name = 'fleet_standby_b9';");
-    expect(drop[11]).toContain("PERFORM pg_drop_replication_slot('fleet_standby_b9');");
+    expect(drop.slice(0, 12)).toEqual(PSQL);
+    expect(drop[12]).toContain("SELECT active INTO s FROM pg_replication_slots WHERE slot_name = 'fleet_standby_b9';");
+    expect(drop[12]).toContain("PERFORM pg_drop_replication_slot('fleet_standby_b9');");
   });
 });

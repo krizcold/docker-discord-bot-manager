@@ -13,6 +13,7 @@ const tmp = vi.hoisted(() => {
 // The stale-primary re-seed with a fake docker: this database's identity (system id|timeline) and the pasted primary's IDENTIFY_SYSTEM answer.
 const pg = vi.hoisted(() => ({
   events: [] as string[],
+  identifyArgs: [] as string[][],
   local: '7001|2',
   primary: '7001|3|0/3000000|',
   retire: { success: true } as { success: boolean; error?: string; volumeRemoved?: boolean },
@@ -80,7 +81,7 @@ vi.mock('child_process', async (importOriginal) => {
     const isDump = args.includes('pg_dump');
     if (isDump) pg.events.push('dump');
     const identify = args.includes('IDENTIFY_SYSTEM');
-    if (identify) pg.events.push('identify');
+    if (identify) { pg.events.push('identify'); pg.identifyArgs.push(args); }
     setTimeout(() => {
       child.stdout.end(isDump ? 'dump' : args.includes('SELECT pg_is_in_recovery()') ? 'f\n' : identify ? `${pg.primary}\n` : '');
       child.stderr.end('');
@@ -111,6 +112,7 @@ const primary = { containerName: 'bot-a-postgres', user: 'app', db: 'app', volum
 
 beforeEach(() => {
   pg.events.length = 0;
+  pg.identifyArgs.length = 0;
   pg.local = '7001|2';
   pg.primary = '7001|3|0/3000000|';
   pg.retire = { success: true };
@@ -135,6 +137,13 @@ describe('B20-3s: the stale-primary re-seed commits once its own database is ret
     const bot = await settled();
     expect(pg.events).toContain('retire');
     expect(bot.fleetDbReplicaSeed?.committed).toBe(true);
+  });
+
+  it('NM35: the identity read on the primary runs psql -X', async () => {
+    expect(await start()).toMatchObject({ success: true });
+    await settled();
+    expect(pg.identifyArgs.length).toBeGreaterThan(0);
+    expect(pg.identifyArgs.map(a => a[a.indexOf('postgres:16-alpine') + 1])).toEqual(pg.identifyArgs.map(() => '-X'));
   });
 
   it('a retire that fails after it removed the volume records the commit', async () => {

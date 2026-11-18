@@ -262,10 +262,10 @@ const MOVED = 'moved-2026-10-30T12-00-00-000Z.dump';
 const BROKEN = { pushBroken: { at: '2026-10-30T09:00:00.000Z', safetyDump: 'pre-receive-x.dump' } };
 const REPL = { role: 'replicator', password: 'pw', hostPort: 5434, publicHost: 'main.example', certHost: 'main.example' };
 const EXEMPT = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off'];
-const ON_POSTGRES = ['psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q', '-c'];
+const ON_POSTGRES = ['psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-q', '-c'];
 // NM20 R3.3: smdb_manager in the bot's database is dbm_meta's, pinned; the generation write is fence-exempt.
 const PIN = `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`;
-const ON_APP = ['bot-a-postgres', 'psql', '-U', 'dbm_meta', '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+const ON_APP = ['bot-a-postgres', 'psql', '-X', '-U', 'dbm_meta', '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
 const callsWith = (part: string) => pg.argv.filter(a => a.join(' ').includes(part));
 const errors = async (run: () => Promise<unknown>) => {
   const seen: string[] = [];

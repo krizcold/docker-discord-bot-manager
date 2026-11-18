@@ -103,7 +103,7 @@ describe('mainProbe', () => {
     expect(h.execs[0].args).toEqual(['rm', '-f', 'b1-fleet-join-probe']);
     expect(h.spawns[0].args).toEqual(['run', '--rm', '--name', 'b1-fleet-join-probe', '-e', 'PGPASSWORD', '-v', mount,
       '--entrypoint', 'sh', 'postgres:16-alpine', '-c',
-      'psql "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql "$1" -v ON_ERROR_STOP=1 -Atc "$2"', 'sh', dsn,
+      'psql -X "$1&replication=true" -Atc IDENTIFY_SYSTEM && psql -X "$1" -v ON_ERROR_STOP=1 -Atc "$2"', 'sh', dsn,
       `SELECT pg_catalog.pg_is_in_recovery()::text || '|' || ${slotSql('fleet_slot_1')}`]);
   });
 
@@ -176,7 +176,7 @@ describe('readAddresses', () => {
     expect(h.execs[0].args).toEqual(['rm', '-f', 'b1-fleet-join-list']);
     const a = h.spawns[0].args;
     expect(a.slice(0, a.length - 1)).toEqual(['run', '--rm', '--name', 'b1-fleet-join-list', '-e', 'PGPASSWORD', '-v', mount,
-      '--entrypoint', 'psql', 'postgres:16-alpine', dsn, '-v', 'ON_ERROR_STOP=1', '-Atc']);
+      '--entrypoint', 'psql', 'postgres:16-alpine', '-X', dsn, '-v', 'ON_ERROR_STOP=1', '-Atc']);
     expect(a.at(-1)).toContain('FROM smdb_manager.addresses a');
   });
 

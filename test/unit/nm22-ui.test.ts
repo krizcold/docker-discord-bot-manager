@@ -122,7 +122,7 @@ describe('NM22 Remove a machine\'s login (O5 M1 to M32, as R4, R20, R27, R31 and
   it('5b opens the login with its settings reset and no password in one stdin call, and drops as the login over the socket with COPY_SESSION_OPTIONS', async () => {
     expect((await removeCopyLogin(bot(), A, false)).success).toBe(true);
     expect(callOf(`ALTER ROLE "${A}" LOGIN PASSWORD NULL;`)!.stdin).toBe(`${ROLE_SETTINGS_RESET_SQL(A)}ALTER ROLE "${A}" LOGIN PASSWORD NULL;\n`);
-    expect(callOf('DROP OWNED BY CURRENT_USER')!.args).toBe(`exec -e PGOPTIONS=${COPY_SESSION_OPTIONS} m-fleet-postgres psql -U ${A} -d smdb -tA -v ON_ERROR_STOP=1 -c DROP OWNED BY CURRENT_USER`);
+    expect(callOf('DROP OWNED BY CURRENT_USER')!.args).toBe(`exec -e PGOPTIONS=${COPY_SESSION_OPTIONS} m-fleet-postgres psql -X -U ${A} -d smdb -tA -v ON_ERROR_STOP=1 -c DROP OWNED BY CURRENT_USER`);
   });
 
   it('5b exit 0 is success whatever WARNING lines it printed', async () => {

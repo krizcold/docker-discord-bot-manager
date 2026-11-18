@@ -155,12 +155,12 @@ const writeInstance = (record: Record<string, unknown>, id = 'b1') => {
 };
 const roleChecks = () => h.calls.filter(a => a.some(x => x.includes('rolsuper'))).length;
 // The dump's snapshot holder: a psql session fed on stdin that prints the snapshot, the counts and the end marker.
-const isHolder = (args: string[]) => args[0] === 'exec' && args.includes('-i') && args.includes('psql') && args.includes('-X');
+const isHolder = (args: string[]) => args[0] === 'exec' && args.includes('-i') && args.includes('psql') && args[args.indexOf('-d') + 2] === '-q';
 const HOLDER = 'snap|00000003-1|f|1000|-1\ncount|"public"."t"|2\nend|\n';
 // NM20 R3.3 and R3.6: dbm_work, pinned, in the bot's database.
 const PIN = `PGOPTIONS=${MANAGER_SESSION_OPTIONS}`;
 const PIN_EXEMPT = `${PIN} -c default_transaction_read_only=off`;
-const holderArgv = ['exec', '-e', PIN, '-i', 'bot1-fleet-postgres', 'psql', '-U', 'dbm_work', '-d', 'smdb', '-X', '-q', '-tA', '-v', 'ON_ERROR_STOP=1'];
+const holderArgv = ['exec', '-e', PIN, '-i', 'bot1-fleet-postgres', 'psql', '-X', '-U', 'dbm_work', '-d', 'smdb', '-q', '-tA', '-v', 'ON_ERROR_STOP=1'];
 const callWith = (marker: string) => h.calls.filter(a => a.some(x => x.includes(marker)));
 const C = fleetDb.containerName;
 const raw = async <T>(f: () => Promise<T>): Promise<T> => {
@@ -212,8 +212,8 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     expect(await raw(() => fleetBackup.fenceLayers(fleetDb))).toBeNull();
     const reads = callWith('regexp_split_to_table');
     expect(reads.length).toBe(1);
-    expect(reads[0].slice(0, 9)).toEqual(['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-c']);
-    expect(reads[0].length).toBe(10);
+    expect(reads[0].slice(0, 10)).toEqual(['exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-c']);
+    expect(reads[0].length).toBe(11);
     expect(roleChecks()).toBe(0);
     expect(await raw(() => fleetBackup.fenceLayers(fleetDb))).toEqual({ readOnly: false, hba: false, readOnlyOwner: null, hbaOwner: null, ownerFile: '' });
   });
@@ -236,7 +236,7 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
       return '';
     };
     expect(await raw(() => fleetBackup.probeClaims(fleetDb))).toEqual({ ok: true, shape: 'claims', claim: 7 });
-    const head = ['exec', '-e', PIN, C, 'psql', '-U', 'dbm_work', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+    const head = ['exec', '-e', PIN, C, 'psql', '-X', '-U', 'dbm_work', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
     const tables = "SELECT to_regclass('smdb_data.claim_seq') IS NOT NULL, to_regclass('smdb_data.guild_ownership') IS NOT NULL, EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('smdb_data.guild_ownership') AND attname = 'claim' AND NOT attisdropped), to_regclass('smdb_data.shard_claims') IS NOT NULL, to_regclass('smdb_data.claim_clock') IS NOT NULL";
     expect(h.calls).toEqual([
       [...head, tables],
@@ -244,7 +244,7 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     ]);
     h.calls.length = 0;
     expect(await raw(() => fleetBackup.raiseClaims(fleetDb, 3))).toEqual({ ok: true, seq: 4, guilds: ['g1'] });
-    const ex = ['exec', '-e', PIN_EXEMPT, C, 'psql', '-U', 'dbm_work', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
+    const ex = ['exec', '-e', PIN_EXEMPT, C, 'psql', '-X', '-U', 'dbm_work', '-d', 'smdb', '-tA', '-v', 'ON_ERROR_STOP=1', '-c'];
     expect(h.calls[0]).toEqual([...head, tables]);
     expect(h.calls[1]).toEqual([...ex, fleetBackup.claimRaiseSql(3, { seq: true, table: true, claim: true, shards: false, clock: false }) as string]);
   });
@@ -261,9 +261,9 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
     };
     const r = await raw(() => fleetBackup.applyWriteFence(fleetDb, fleetBackup.newFenceOwner('restore' as any), 'any' as any));
     expect(r.ok, r.stderr).toBe(true);
-    const psql = ['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1'];
+    const psql = ['exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1'];
     expect(h.calls).toContainEqual([...psql, '-c', 'SELECT pg_reload_conf()']);
-    expect(h.calls).toContainEqual(['exec', C, 'psql', '-h', '127.0.0.1', '-U', 'dbm_admin', '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
+    expect(h.calls).toContainEqual(['exec', C, 'psql', '-X', '-h', '127.0.0.1', '-U', 'dbm_admin', '-d', 'postgres', '-w', '-tAc', 'SELECT 1']);
     expect(h.calls).toContainEqual([...psql, '-c', 'SELECT count(*) FROM pg_stat_activity WHERE pid IN (11, 12)']);
   });
 
@@ -288,8 +288,8 @@ describe('NM1 L5: fleetBackup argv and the missing-role retry', () => {
       fleetBackup.stopFleetBackupScheduler();
       fenceOwners.clear();
     }
-    expect(callWith('pg_is_in_recovery()')[0]).toEqual(['exec', copy.containerName, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT pg_is_in_recovery()']);
-    expect(callWith('pg_file_settings')[0]).toEqual(['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
+    expect(callWith('pg_is_in_recovery()')[0]).toEqual(['exec', copy.containerName, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT pg_is_in_recovery()']);
+    expect(callWith('pg_file_settings')[0]).toEqual(['exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', "SELECT count(*) FROM pg_file_settings WHERE name = 'default_transaction_read_only'"]);
   });
 });
 
@@ -338,7 +338,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
       spies.forEach(s => s.mockRestore());
     }
   };
-  const psql = (db: string) => ['psql', '-U', 'dbm_admin', '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
+  const psql = (db: string) => ['psql', '-X', '-U', 'dbm_admin', '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
   const ex = ['exec', '-e', 'PGOPTIONS=-c default_transaction_read_only=off', C];
   const restores = () => callWith('pg_restore').filter(a => !a.includes('-l') && !a.includes('--data-only'));
   const pgRestoreArgv = ['exec', '-e', PIN_EXEMPT, '-i', C, 'timeout', '-s', 'KILL', '600', 'pg_restore', '-U', 'dbm_work', '-d', `sm'"db`,
@@ -353,7 +353,7 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     expect(restores()).toEqual([pgRestoreArgv]);
     expect(callWith('pg_restore').filter(a => a.includes('-l'))).toEqual([['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l'],
       ['exec', '-i', C, 'timeout', '-s', 'KILL', '60', 'pg_restore', '-l', '-n', 'smdb_manager']]);
-    expect(h.calls).toContainEqual(['exec', '-e', PIN_EXEMPT, C, 'psql', '-U', 'dbm_work', '-d', `sm'"db`, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true, shards: false, clock: false }) as string]);
+    expect(h.calls).toContainEqual(['exec', '-e', PIN_EXEMPT, C, 'psql', '-X', '-U', 'dbm_work', '-d', `sm'"db`, '-tA', '-v', 'ON_ERROR_STOP=1', '-c', fleetBackup.claimRaiseSql(7, { seq: true, table: true, claim: true, shards: false, clock: false }) as string]);
     expect(roleChecks()).toBe(0);
   });
 
@@ -385,6 +385,6 @@ describe('NM1 L5: restoreFleetBackup argv', () => {
     expect(r.error).not.toContain('y'.repeat(501));
     expect(restores().length).toBe(1);
     expect(roleChecks()).toBe(0);
-    expect(h.calls).toContainEqual(['exec', C, 'psql', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
+    expect(h.calls).toContainEqual(['exec', C, 'psql', '-X', '-U', 'dbm_admin', '-d', 'postgres', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_type = 'client backend'"]);
   });
 });

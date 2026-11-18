@@ -382,7 +382,7 @@ describe('NM22 New join code (O4 E16 to E29; R1, R18, R25)', () => {
     expect(own).not.toBe(OWN_PW);
     expect(join).not.toBe(JOIN_PW);
     const call = renewCall();
-    expect(call.args).toContain('-i m-fleet-postgres psql -U dbm_admin -d postgres');
+    expect(call.args).toContain('-i m-fleet-postgres psql -X -U dbm_admin -d postgres');
     const s = call.stdin;
     expect(s.startsWith(`${QUIET_ROLE_SESSION_SQL}BEGIN;\nSET LOCAL lock_timeout = '5s';\nSELECT 'closed|' || pg_catalog.count(*) FILTER (WHERE pg_catalog.pg_terminate_backend(a.pid, 5000)) FROM pg_catalog.pg_stat_activity a WHERE a.usename IN ('smdb_join', '${OWN}') AND a.pid <> pg_catalog.pg_backend_pid();\nALTER ROLE smdb_join LOGIN PASSWORD '`)).toBe(true);
     expect(await verifierAccepts(verifierAfter(s, 'ALTER ROLE smdb_join LOGIN PASSWORD'), join, 'smdb_join')).toBe(true);

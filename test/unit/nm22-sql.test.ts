@@ -427,7 +427,7 @@ describe('dbLogin: COPY_SESSION_OPTIONS, loginPsql, botRoleRefusal (R18, R33, R4
   it('loginPsql runs psql as the machine login over the socket with COPY_SESSION_OPTIONS', () => {
     expect(loginPsql(A, 'db-c', 'app', 'DROP OWNED BY CURRENT_USER')).toEqual({
       login: A,
-      args: ['exec', '-e', `PGOPTIONS=${COPY_SESSION_OPTIONS}`, 'db-c', 'psql', '-U', A, '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'DROP OWNED BY CURRENT_USER'],
+      args: ['exec', '-e', `PGOPTIONS=${COPY_SESSION_OPTIONS}`, 'db-c', 'psql', '-X', '-U', A, '-d', 'app', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'DROP OWNED BY CURRENT_USER'],
     });
   });
 

@@ -19,6 +19,7 @@ export type ReceiveLogin = (typeof RECEIVE_LOGINS)[number];
 export type ManagerLogin = typeof MANAGER_DB_ROLE | typeof META_LOGIN | typeof WORK_LOGIN | ReceiveLogin;
 
 export const PSQL_TIMEOUT_MS = 30_000;
+export const NO_ADMIN_ERROR = `the role ${MANAGER_DB_ROLE} does not exist in this database's cluster; the manager creates it only as the first role of a database it creates`;
 
 export interface DbTarget { container: string; user: string }
 export interface BotLogin { inRecovery: boolean; canLogin: boolean | null; sessions: number }
@@ -117,6 +118,21 @@ export function argvFor(login: ManagerLogin, db: string, opts: { exempt?: boolea
  */
 export function adminReadArgs(container: string, db: string): string[] {
   return ['exec', '-e', `PGOPTIONS=${MANAGER_SESSION_OPTIONS} -c default_transaction_read_only=on`, '-i', container, 'psql', '-U', MANAGER_DB_ROLE, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
+}
+
+/** Settings a Postgres 16.0 server refuses at login; a cluster with no dbm_admin may predate them. */
+const NOT_IN_PG16_0 = ['restrict_nonsystem_relation_kind'];
+
+/** MANAGER_SESSION_OPTIONS without the settings Postgres 16.0 does not know. */
+export const OWNER_SESSION_OPTIONS = MANAGER_SESSION_OPTIONS.slice('-c '.length).split(' -c ')
+  .filter(o => !NOT_IN_PG16_0.includes(o.split('=')[0])).map(o => `-c ${o}`).join(' ');
+
+/**
+ * A psql script on stdin as the database's own bot role (its POSTGRES_USER) over the container's socket, for a cluster
+ * with no dbm_admin: read-only from the client, with server-side limits so a session the client lost ends on its own.
+ */
+export function ownerReadArgs(container: string, user: string, db: string): string[] {
+  return ['exec', '-e', `PGOPTIONS=${OWNER_SESSION_OPTIONS} -c statement_timeout=20s -c lock_timeout=10s -c idle_session_timeout=10s -c idle_in_transaction_session_timeout=10s -c default_transaction_read_only=on -c role=none`, '-i', container, 'psql', '-X', '-w', '-q', '-U', user, '-d', db, '-tA', '-v', 'ON_ERROR_STOP=1'];
 }
 
 function psqlCall(login: ManagerLogin, container: string, db: string, sql: string, opts: CallOpts): PsqlCall {
@@ -258,7 +274,7 @@ export async function ensureManagerDbRole(t: DbTarget): Promise<DbResult> {
   if (managerRoleReady.has(t.container)) return { ok: true };
   const check = await checkManagerRole(t.container);
   if (!check.ok && check.cls === 'missing-role') {
-    return { ok: false, cls: 'missing-role', error: `the role ${MANAGER_DB_ROLE} does not exist in this database's cluster; the manager creates it only as the first role of a database it creates` };
+    return { ok: false, cls: 'missing-role', error: NO_ADMIN_ERROR };
   }
   if (check.ok) managerRoleReady.add(t.container);
   return check;

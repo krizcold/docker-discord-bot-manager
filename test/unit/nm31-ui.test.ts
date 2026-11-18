@@ -189,7 +189,7 @@ describe('nm31 ui: the group\'s lines', () => {
 
   it('open record (3 of 3): a delete record reads a whole sentence alone, else T-X-OPEN; Keep it only before removing; Run it again sends again', async () => {
     const { ctx, calls, confirms } = load(KEPT_FNS);
-    const whole = [KEPT_TEXT.xDisk(100, 2124), KEPT_TEXT.xDump('pg_dump exited 1') + KEPT_TEXT.xNoWork, KEPT_TEXT.xCheck('pre-delete-x.dump', 'counts differ'),
+    const whole = [KEPT_TEXT.xDisk(100, 2124), KEPT_TEXT.xDump('pg_dump exited 1') + KEPT_TEXT.xNoWork(mainSet.db.volume), KEPT_TEXT.xCheck('pre-delete-x.dump', 'counts differ'),
       KEPT_TEXT.xArchive('ENOSPC'), KEPT_TEXT.xArchCheck('x.tar', 'a.txt differs', '/k'), KEPT_TEXT.xPartial({ volume: 'v', err: 'in use', dump: 'd.dump' }),
       KEPT_TEXT.xCurrent('v'), KEPT_TEXT.xInUse('v', 'c1'), KEPT_TEXT.xPath('/x'), KEPT_TEXT.aDocker('v')];
     for (const text of whole) expect(ctx.keptOpenLineText(rec({ op: 'delete', parts: ['db', 'folder'], step: 'copy-made', lastError: text }))).toBe(text);

@@ -22,7 +22,7 @@ import * as dbLogin from './dbLogin';
 import { claimFleetBackupBusy, isFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { checkDumpInThrowaway, THROWAWAY_LABEL, Verdict } from './backupCheck';
 import { backupDir, parseDfFreeKb, stampOf, validateDumpMeta } from './backupFiles';
-import { generationBefore } from './switchSql';
+import { generationBefore, GenRow, parseRestoreState, RESTORE_STATE_READ, RestoreState } from './switchSql';
 import { InstanceConfig, KeptDataSet, KeptOpRecord, KeptStep } from '../types';
 
 const NOTHING = '; nothing was changed';
@@ -31,6 +31,7 @@ const errText = (err: unknown) => (err instanceof Error ? err.message : String(e
 // ─── Texts (section 10) ───
 
 const NEW_START = 'Start on a new database';
+const NA_LEAD = `The bot's Off is not confirmed because its database has no ${dbLogin.MANAGER_DB_ROLE} role, so the bot's login could not be blocked`;
 const FOLDER_CLAUSE = (certs: boolean) => `maintenance.json${certs ? ', and the join\'s certificate files,' : ''}`;
 const TAIL_BOOT = (certs: boolean) => `Its new data folder holds ${FOLDER_CLAUSE(certs)} so its next start is a maintenance boot`;
 const OTHER_FILES = 'the other files of the old folder, its .env among them, stay in the kept folder.';
@@ -71,6 +72,13 @@ export const KEPT_TEXT = {
   aGenUnknown: (err: string) => `The manager can't confirm the database's main generation (${err}), and a new database below it would leave the bot stopped as replaced${NOTHING}`,
   aGenDown: `The bot's database is not running, so its main generation cannot be read; choose Off again, which starts it alone${NOTHING}`,
   aRecord: (err: string) => `${NEW_START} was not recorded, so nothing was changed: ${err}`,
+  aNaAdmin: `The bot's Off is not confirmed, and its database now has a ${dbLogin.MANAGER_DB_ROLE} role that is a superuser and can log in; choose Off again, which uses it to block the bot's login${NOTHING}`,
+  aNaAdminPlain: `The bot's Off is not confirmed, and its database now has a ${dbLogin.MANAGER_DB_ROLE} role that cannot log in or is not a superuser, so the manager cannot use it to block the bot's login; ${NEW_START} and Put back accept an unconfirmed Off only on a database with no ${dbLogin.MANAGER_DB_ROLE} role. Make ${dbLogin.MANAGER_DB_ROLE} a superuser that can log in, or remove it, then choose Off again${NOTHING}`,
+  aNaSessions: (user: string, a: number, b: number) => `${NA_LEAD}, and two reads one second apart found open sessions of the bot's role ${user} on the database (${a}, then ${b}). The manager does not end them; try again once they are closed${NOTHING}`,
+  aNaStandby: `${NA_LEAD}, and the database runs in recovery as a live copy, so the manager does not stop it as this bot's main${NOTHING}`,
+  aNaNotSuper: (user: string) => `${NA_LEAD}, and the bot's role ${user} is not a superuser of that database, so the manager does not read the database as that role${NOTHING}`,
+  aNaRead: (user: string, err: string) => `${NA_LEAD}, and the manager could not read the database as the bot's role ${user} over the container's socket (${err}), so it can't confirm that nothing uses it${NOTHING}`,
+  aNaDown: `${NA_LEAD}, and the database is not running, so the manager cannot check it as the bot's role; choose Off again, which starts it alone${NOTHING}`,
 
   // Start on a new database
   nDoneMain: (p: { old: string; outDir: string; newVolume: string; certs: boolean; replication: boolean; sharers: string | null }) =>
@@ -125,6 +133,9 @@ export const KEPT_TEXT = {
   pEmpty: (set: string) => `The kept data ${set} holds no database, live copy or data folder, so there is nothing to put back${NOTHING}`,
   pNamesSet: (set: string) => `The kept data ${set} already exists, so that name is taken${NOTHING}; try again`,
   pOrderRefused: (err: string) => `The Off order was refused: ${err}`,
+  cNotSuper: (user: string) => `the live copy's role ${user} is not a superuser there, so the manager did not read it as that role`,
+  cRead: (user: string, err: string) => `the read as the live copy's role ${user} failed too (${err})`,
+  cName: (user: string) => `the live copy's role name ${user} is not one the manager reads as, so it did not read the copy as that role`,
 
   // Delete
   xCurrent: (v: string) => `The kept volume ${v} is the one this bot uses now; nothing was deleted`,
@@ -132,8 +143,9 @@ export const KEPT_TEXT = {
   xPath: (f: string) => `The kept folder ${f} is not beside the bot's data folder, so the manager does not delete it; nothing was deleted`,
   xDropped: (v: string, folder: string | null) => ` The kept volume ${v} no longer exists (docker says no such volume), so the set now holds only ${folder ? `the folder ${folder}` : 'nothing'}.`,
   xDisk: (freeMb: number, needMb: number) => `The disk that holds Docker's volumes has ${freeMb} MB free, and a scratch copy of the kept database needs ${needMb} MB (its size, plus 1 GB kept free for the live database); nothing was deleted`,
-  xDump: (err: string) => `The dump of the kept database failed (${err}), so nothing was deleted. Run Delete again, or Keep it.`,
-  xNoWork: ` The database has no ${dbLogin.WORK_LOGIN} login: it was made before the manager's own logins existed, so the manager cannot dump it, and it stays under Kept data.`,
+  xDump: (err: string): string => `${KEPT_TEXT.xDumpFailed(err)} Run Delete again, or Keep it.`,
+  xDumpFailed: (err: string) => `The dump of the kept database failed (${err}), so nothing was deleted.`,
+  xNoWork: (v: string) => ` The database has no ${dbLogin.WORK_LOGIN} login: it was made before the manager's own logins existed, so the manager cannot dump it, and it stays under Kept data. To remove it by hand without changing it: choose Keep it, copy the volume ${v} to a new volume (mounting ${v} read-only), start Postgres on the copy only, dump the copy as the database's own superuser and check that dump, then remove the volume with docker volume rm ${v}; Delete then removes the rest of this kept data after its own checks.`,
   xCheck: (file: string, reason: string) => `The dump ${file} did not restore cleanly in a throwaway database (${reason}), so nothing was deleted; the dump stays with the backups`,
   xArchive: (err: string) => `The kept folder could not be archived (${err}), so nothing was deleted`,
   xArchCheck: (file: string, difference: string, dir: string) => `The archive ${file} does not match the kept folder (${difference}), so nothing was deleted; the archive stays in ${dir}`,
@@ -302,14 +314,28 @@ function switchWord(inst: InstanceConfig): 'hand-over' | 'push' | 'receive' | 't
   return null;
 }
 
-/** A6 to A8: the Off order settled (unless `skipSettled`) and the app stopped; null when they pass. */
-async function offAndStopped(botId: string, inst: InstanceConfig, skipSettled: boolean, offText: string = KEPT_TEXT.aOff): Promise<{ status: number; error: string } | { runs: true } | null> {
+/**
+ * What Invariant A reads at A7: the open record (a resume passes by its `noAdminOff`), or for a fresh press whether
+ * the instance's kind is 'database'.
+ */
+export type NoAdminGate = { open: KeptOpRecord } | { database: boolean };
+
+/**
+ * A6 to A8: the Off order settled (unless `skipSettled`), or unsettled only for the missing dbm_admin under `na`, and
+ * the app stopped. A pass answers `na`: the Off's orderedAt when a fresh press passed by Invariant A, else null.
+ */
+async function offAndStopped(botId: string, inst: InstanceConfig, skipSettled: boolean, offText: string = KEPT_TEXT.aOff, na?: NoAdminGate): Promise<{ status: number; error: string } | { runs: true } | { na: string | null }> {
   const m = maintenance.maintenanceOf(inst);
   if (m.state !== 'off') return { status: 409, error: offText };
-  if (!skipSettled && !m.settled) return { status: 409, error: KEPT_TEXT.aUnsettled(m.lastError || 'the order has not finished') };
+  let admitted: string | null = null;
+  if (!skipSettled && !m.settled) {
+    const accepted = !!na && maintenance.noAdminOff(m) && ('open' in na ? na.open.noAdminOff === m.orderedAt : na.database);
+    if (!accepted) return { status: 409, error: KEPT_TEXT.aUnsettled(m.lastError || 'the order has not finished') };
+    if (!('open' in na!)) admitted = m.orderedAt;
+  }
   const app = await containerManager.appContainerRunning(botId);
   if (app === null) return { status: 409, error: R11 };
-  return app ? { runs: true } : null;
+  return app ? { runs: true } : { na: admitted };
 }
 
 /** T-N-RUNS for the running app container: its id as docker lists it, else the compose project with no command. */
@@ -337,11 +363,147 @@ async function sharersRefusal(inst: InstanceConfig, url: string): Promise<string
   return null;
 }
 
-/** A20: the generation the manager acts on (ownGeneration's rule), read before anything changes. */
-export async function generationRefusal(db: NonNullable<InstanceConfig['fleetDb']>): Promise<string | null> {
+// ─── The reads as the bot's own role, on a database with no dbm_admin (NM34 5.1) ───
+
+const SU_HEAD = `BEGIN TRANSACTION READ ONLY;
+SELECT coalesce((SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user), false) AS su \\gset
+\\echo :su
+\\if :su
+`;
+const SESSIONS_COUNT = "count(*) FROM pg_catalog.pg_stat_activity WHERE usename = current_user AND backend_type = 'client backend' AND pid <> pg_catalog.pg_backend_pid()";
+
+/** S1, on postgres: superuser, recovery, dbm_admin, two session counts 1 s apart, and the restore record when it is a plain table. */
+export const OWNER_CLUSTER_READ = `${SU_HEAD}SELECT 'recovery|' || pg_catalog.pg_is_in_recovery()::text;
+SELECT 'admin|' || coalesce((SELECT (rolsuper AND rolcanlogin)::text FROM pg_catalog.pg_roles WHERE rolname = '${dbLogin.MANAGER_DB_ROLE}'), 'missing');
+SELECT 'sessions|' || ${SESSIONS_COUNT};
+SELECT 'restorekind|' || coalesce((SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.restore_state')), '-');
+SELECT coalesce((SELECT relkind = 'r' FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.restore_state')), false) AS rs_table \\gset
+\\if :rs_table
+SELECT 'restore|' || (${RESTORE_STATE_READ});
+\\endif
+ROLLBACK;
+SELECT pg_catalog.pg_sleep(1);
+BEGIN TRANSACTION READ ONLY;
+SELECT 'sessions2|' || ${SESSIONS_COUNT};
+ROLLBACK;
+\\endif
+`;
+
+/** S2, in the bot's database: the generation row as the admin read gives it. */
+export const OWNER_GEN_READ = `BEGIN TRANSACTION READ ONLY;\n${fleetSwitch.ADMIN_GEN_READ}ROLLBACK;\n`;
+
+/** S3, on postgres of a live copy: superuser, recovery and the WAL receiver's status. */
+export const OWNER_COPY_READ = `${SU_HEAD}SELECT 'copy|' || pg_catalog.pg_is_in_recovery()::text || '|' || coalesce((SELECT status FROM pg_catalog.pg_stat_wal_receiver LIMIT 1), '');
+\\endif
+ROLLBACK;
+`;
+
+export type OwnerCluster = { superuser: false } | {
+  superuser: true; recovery: boolean; admin: 'missing' | 'usable' | 'unusable'; sessions: [number, number];
+  restore: RestoreState | null | { notTable: string } | undefined;
+};
+export type OwnerCopy = { superuser: false } | { superuser: true; recovery: boolean; status: string };
+export type OwnerFailure = { ok: false; refused: string } | { ok: false; error: string };
+
+const readLines = (stdout: string) => stdout.split('\n').map(l => l.trim()).filter(Boolean);
+
+/** S1's answer; undefined unless it is exactly `f`, or `t` and the lines in their order. */
+export function parseOwnerClusterRead(stdout: string): OwnerCluster | undefined {
+  const lines = readLines(stdout);
+  if (lines.length === 1 && lines[0] === 'f') return { superuser: false };
+  if (lines[0] !== 't') return undefined;
+  const recovery = /^recovery\|(true|false)$/.exec(lines[1] ?? '');
+  const admin = /^admin\|(missing|true|false)$/.exec(lines[2] ?? '');
+  const first = /^sessions\|(0|[1-9]\d*)$/.exec(lines[3] ?? '');
+  const kind = /^restorekind\|(.)$/.exec(lines[4] ?? '');
+  if (!recovery || !admin || !first || !kind) return undefined;
+  let next = 5;
+  let restore: RestoreState | null | { notTable: string } | undefined;
+  if (kind[1] === 'r') {
+    const line = /^restore\|(.*)$/.exec(lines[5] ?? '');
+    if (!line) return undefined;
+    restore = parseRestoreState(line[1]);
+    next = 6;
+  } else restore = kind[1] === '-' ? null : { notTable: kind[1] };
+  const second = /^sessions2\|(0|[1-9]\d*)$/.exec(lines[next] ?? '');
+  if (!second || lines.length !== next + 1) return undefined;
+  return {
+    superuser: true, recovery: recovery[1] === 'true', admin: admin[1] === 'missing' ? 'missing' : admin[1] === 'true' ? 'usable' : 'unusable',
+    sessions: [Number(first[1]), Number(second[1])], restore,
+  };
+}
+
+/** S3's answer; undefined unless it is exactly `f`, or `t` and the copy line. */
+export function parseOwnerCopyRead(stdout: string): OwnerCopy | undefined {
+  const lines = readLines(stdout);
+  if (lines.length === 1 && lines[0] === 'f') return { superuser: false };
+  if (lines.length !== 2 || lines[0] !== 't') return undefined;
+  const m = /^copy\|(true|false)\|(.*)$/.exec(lines[1]);
+  return m ? { superuser: true, recovery: m[1] === 'true', status: m[2] } : undefined;
+}
+
+/** One script as the bot's role over the container's socket; a name botRoleRefusal refuses starts no process. */
+async function ownerRead(container: string, user: string, db: string, script: string): Promise<{ ok: true; stdout: string } | OwnerFailure> {
+  const bad = dbLogin.botRoleRefusal(user);
+  if (bad) return { ok: false, refused: bad };
+  const r = await fleetSwitch.runGuarded('docker', dbLogin.ownerReadArgs(container, user, db), { input: script, timeoutMs: fleetSwitch.SWITCH_TIMING.readMs });
+  return r.ok ? { ok: true, stdout: r.stdout } : { ok: false, error: r.error || 'psql failed with no message' };
+}
+
+const answered = (stdout: string) => `the read answered '${readLines(stdout).pop() ?? ''}'`;
+
+export async function readOwnerCluster(container: string, user: string): Promise<{ ok: true; read: OwnerCluster; stdout: string } | OwnerFailure> {
+  const r = await ownerRead(container, user, 'postgres', OWNER_CLUSTER_READ);
+  if (!r.ok) return r;
+  const read = parseOwnerClusterRead(r.stdout);
+  return read ? { ok: true, read, stdout: r.stdout } : { ok: false, error: answered(r.stdout) };
+}
+
+export async function readOwnerGeneration(container: string, user: string, db: string): Promise<{ ok: true; row: GenRow | null } | OwnerFailure> {
+  const r = await ownerRead(container, user, db, OWNER_GEN_READ);
+  return r.ok ? fleetSwitch.parseAdminGenRead(r.stdout) : r;
+}
+
+export async function readOwnerCopy(container: string, user: string): Promise<{ ok: true; read: OwnerCopy } | OwnerFailure> {
+  const r = await ownerRead(container, user, 'postgres', OWNER_COPY_READ);
+  if (!r.ok) return r;
+  const read = parseOwnerCopyRead(r.stdout);
+  return read ? { ok: true, read } : { ok: false, error: answered(r.stdout) };
+}
+
+/** S1's verdict wherever it runs: the refusal, or null when the database may be stopped under Invariant A. */
+export function ownerClusterRefusal(user: string, r: Awaited<ReturnType<typeof readOwnerCluster>>): string | null {
+  if (!r.ok) return 'refused' in r ? r.refused : KEPT_TEXT.aNaRead(user, r.error);
+  const c = r.read;
+  if (!c.superuser) return KEPT_TEXT.aNaNotSuper(user);
+  if (c.recovery) return KEPT_TEXT.aNaStandby;
+  if (c.admin === 'usable') return KEPT_TEXT.aNaAdmin;
+  if (c.admin === 'unusable') return KEPT_TEXT.aNaAdminPlain;
+  if (c.sessions[0] > 0 && c.sessions[1] > 0) return KEPT_TEXT.aNaSessions(user, c.sessions[0], c.sessions[1]);
+  return null;
+}
+
+/** A20-NA: S1, then S2 in the bot's database, both as the bot's role; the database already reads running. */
+async function ownerGenerationRefusal(db: NonNullable<InstanceConfig['fleetDb']>): Promise<string | null> {
+  const s1 = await readOwnerCluster(db.containerName, db.user);
+  const bad = ownerClusterRefusal(db.user, s1);
+  if (bad) return bad;
+  if (!s1.ok || !s1.read.superuser) return KEPT_TEXT.aNaRead(db.user, 'the read answered nothing usable');
+  const restore = s1.read.restore;
+  if (restore && 'notTable' in restore) return KEPT_TEXT.aGenUnknown(`smdb_manager.restore_state is not a plain table (relkind ${restore.notTable}), so the manager did not read it`);
+  if (restore === undefined) return KEPT_TEXT.aGenUnknown(`the restore record answered '${/^restore\|(.*)$/m.exec(s1.stdout)?.[1]?.trim() ?? ''}'`);
+  const live = await readOwnerGeneration(db.containerName, db.user, db.db);
+  if (!live.ok) return KEPT_TEXT.aGenUnknown('refused' in live ? live.refused : live.error);
+  const g = generationBefore(live.row, restore?.floor ?? null);
+  return g && g.generation > 1 ? KEPT_TEXT.aGen(g.generation) : null;
+}
+
+/** A20: the generation the manager acts on (ownGeneration's rule), read before anything changes; `noAdmin` reads it as the bot's role (A20-NA). */
+export async function generationRefusal(db: NonNullable<InstanceConfig['fleetDb']>, opts: { noAdmin?: boolean } = {}): Promise<string | null> {
   const running = await dbLogin.sidecarRunning(db.containerName);
   if (running === null) return KEPT_TEXT.aGenUnknown(`docker did not say whether the database container ${db.containerName} runs`);
   if (!running) return KEPT_TEXT.aGenDown;
+  if (opts.noAdmin) return ownerGenerationRefusal(db);
   const t = { container: db.containerName, user: db.user };
   const meta = await fleetSwitch.readGeneration(t, db.db);
   const live = !meta.ok && dbLogin.missingLogin(meta.stderr ?? '') === dbLogin.META_LOGIN ? await fleetSwitch.readGenerationAsAdmin(t, db.db) : meta;
@@ -378,7 +540,7 @@ function laneRefusal(botId: string, inst: InstanceConfig, opName: string): strin
 }
 
 /** A9 to A18 and A20, then A19; the slot is already claimed when the variant needs it. */
-async function admitFresh(botId: string, inst: InstanceConfig, variant: NewStartVariant, url: string, offMessage: string): Promise<NewStartAdmission> {
+async function admitFresh(botId: string, inst: InstanceConfig, variant: NewStartVariant, url: string, offMessage: string, na: string | null): Promise<NewStartAdmission> {
   const lane = laneRefusal(botId, inst, NEW_START);
   if (lane) return no(409, lane);
   if (inst.fleetDb?.retiringAt) return no(409, containerManager.unfinishedRetireRefusal(inst.fleetDb.retiringAt));
@@ -422,7 +584,7 @@ async function admitFresh(botId: string, inst: InstanceConfig, variant: NewStart
     const state = dockerClient.volumeState(names.newVolume);
     if (state === 'unknown') return no(409, KEPT_TEXT.aDocker(names.newVolume));
     if (state === 'exists' || containerManager.keptVolumeReason(names.newVolume)) return no(409, KEPT_TEXT.aNamesVolume(names.newVolume));
-    const gen = await generationRefusal(db!);
+    const gen = await generationRefusal(db!, { noAdmin: na !== null });
     if (gen) return no(409, gen);
   }
   const sharers = variant === 'main' ? fleetBackup.databaseSharers(containerManager.getBot(botId) ?? inst, url).filter(b => b.id !== botId).map(b => b.id) : [];
@@ -432,6 +594,7 @@ async function admitFresh(botId: string, inst: InstanceConfig, variant: NewStart
     dataDir, outDir: names.outDir, inDir: names.inDir, owner,
     ...(variant === 'main' ? { newVolume: names.newVolume } : {}),
     offMessage, sharers, step: 'recorded',
+    ...(na !== null ? { noAdminOff: na } : {}),
   };
   let opened: string | null;
   try {
@@ -490,18 +653,18 @@ export async function admitNewStart(botId: string): Promise<NewStartAdmission> {
 }
 
 async function admitClaimed(botId: string, inst: InstanceConfig, open: KeptOpRecord | null, variant: NewStartVariant, url: string): Promise<NewStartAdmission> {
-  const off = await offAndStopped(botId, inst, false);
-  if (off && 'runs' in off) {
+  const off = await offAndStopped(botId, inst, false, KEPT_TEXT.aOff, open ? { open } : { database: variant === 'main' });
+  if ('runs' in off) {
     if (!open) return no(409, KEPT_TEXT.aRuns);
     return { ok: false, answer: { success: false, status: 409, open: true, error: KEPT_TEXT.nOpen(await appRunsText(inst), newStartDone(open)) } };
   }
-  if (off) return no(off.status, off.error);
+  if ('error' in off) return no(off.status, off.error);
   if (open) {
     console.log(`[KeptData] ${inst.displayName}: ${NEW_START} goes on from step ${open.step}`);
     return { ok: true, record: open, resumed: true, slot: false };
   }
   const fresh = containerManager.getBot(botId) ?? inst;
-  return admitFresh(botId, fresh, variant, url, maintenance.maintenanceOf(fresh).message);
+  return admitFresh(botId, fresh, variant, url, maintenance.maintenanceOf(fresh).message, variant === 'main' ? off.na : null);
 }
 
 // ─── Start on a new database: the forward run (3.3) ───
@@ -735,6 +898,14 @@ async function runNewStart(botId: string, a: NewStartAdmitted): Promise<KeptAnsw
     }
     const sharers = await sharersRefusal(inst, env.url);
     if (sharers) return closeRefused(sharers);
+    if (rec.noAdminOff) {
+      const running = await dbLogin.sidecarRunning(inst.fleetDb.containerName);
+      if (running === null) return open(`docker did not say whether the database container ${inst.fleetDb.containerName} runs`);
+      if (running) {
+        const bad = ownerClusterRefusal(inst.fleetDb.user, await readOwnerCluster(inst.fleetDb.containerName, inst.fleetDb.user));
+        if (bad) return closeRefused(bad);
+      }
+    }
   }
 
   // N1, N1c
@@ -1044,7 +1215,17 @@ async function copyNote(botId: string): Promise<CopyNote | undefined> {
   const st = await fleetReplica.getFleetReplicaStatus(inst);
   const live = st.live;
   if (live?.running && live.inRecovery === true && live.receiverStatus === 'streaming') return { streams: `${rec.primaryHost}:${rec.primaryPort}` };
-  if (!live) return { unknown: fleetReplica.standbyDownText(st) };
+  if (!live) {
+    const down = fleetReplica.standbyDownText(st);
+    if (!st.probeError || !dbLogin.isMissingManagerRole(st.probeError)) return { unknown: down };
+    const user = rec.user ?? '';
+    const r = await readOwnerCopy(rec.containerName, user);
+    if (!r.ok) return { unknown: `${down}; ${'refused' in r ? KEPT_TEXT.cName(user) : KEPT_TEXT.cRead(user, r.error)}` };
+    if (!r.read.superuser) return { unknown: `${down}; ${KEPT_TEXT.cNotSuper(user)}` };
+    if (!r.read.recovery) return { down: 'it is not in recovery, so it does not follow the main' };
+    if (r.read.status === 'streaming') return { streams: `${rec.primaryHost}:${rec.primaryPort}` };
+    return { down: `its WAL receiver reads ${r.read.status || 'nothing'}` };
+  }
   if (!live.running) return { stopped: fleetReplica.standbyDownText(st) };
   if (live.inRecovery !== true) return { down: 'it is not in recovery, so it does not follow the main' };
   return { down: `its WAL receiver reads ${live.receiverStatus ?? 'nothing'}` };
@@ -1125,6 +1306,31 @@ async function runPutBack(botId: string, start: KeptOpRecord, plan: PutBackPlan)
     }
     return null;
   };
+
+  /** A refusal of the put-back re-check: only the record exists at 'recorded', so it closes and the answer is the refusal. */
+  const closePutBackRefused = (text: string): KeptAnswer => {
+    let r: string | null;
+    try {
+      r = containerManager.closeKeptOp(botId, s.key, { last: { op: 'put-back', set: s.rec.set, outcome: 'failed', text } });
+    } catch (err) {
+      return s.open(`${withoutEnding(text)}; the record could not be closed (${errText(err)})`, 500);
+    }
+    if (r) return s.closed();
+    console.warn(`[KeptData] ${label}: ${PUT_BACK} refused before P1, record closed: ${text}`);
+    return refuse(409, text);
+  };
+
+  // The re-check before P1 under Invariant A: a stopped database holds no session, and a running one is read as the bot's role
+  if (start.op === 'put-back' && !start.undo && s.rec.noAdminOff && s.rec.step === 'recorded') {
+    const db = containerManager.getBot(botId)?.fleetDb;
+    if (!db) return s.open(`this instance no longer has a managed database, so the manager cannot check it as the bot's role before the database in use is stopped`);
+    const running = await dbLogin.sidecarRunning(db.containerName);
+    if (running === null) return s.open(`docker did not say whether the database container ${db.containerName} runs`);
+    if (running) {
+      const bad = ownerClusterRefusal(db.user, await readOwnerCluster(db.containerName, db.user));
+      if (bad) return closePutBackRefused(bad);
+    }
+  }
 
   // P1
   if (kind && !putBackReached(s.rec.step, 'db-stopped')) {
@@ -1326,6 +1532,12 @@ function runReverse(botId: string, rec: KeptOpRecord): Promise<KeptAnswer> {
     : { restoreId: rec.asideSet ?? '', asideId: rec.set, inDir: rec.outDir, outDir: rec.inDir, mode: 'undo' });
 }
 
+/** NA-b: the instance's kind, from the stored env as admission reads it, is 'database'; an unreadable store answers false. */
+function mainKind(inst: InstanceConfig): boolean {
+  const read = storedEnv(inst);
+  return !('error' in read) && maintenance.maintenanceKind(inst, read.env) === 'database';
+}
+
 type PutBackAdmission = { ok: true; slot: boolean; run: () => Promise<KeptAnswer> } | { ok: false; answer: KeptAnswer };
 const noPut = (status: number, error: string): PutBackAdmission => ({ ok: false, answer: refuse(status, error) });
 
@@ -1369,12 +1581,13 @@ async function admitPutBack(botId: string, setId: string, reverse: boolean): Pro
 async function admitPutBackClaimed(botId: string, inst: InstanceConfig, open: KeptOpRecord | null, set: KeptDataSet | undefined,
   mode: 'fresh' | 'undo' | 'reverse' | 'resume', parts: KeptOpRecord['parts']): Promise<PutBackAdmission> {
   const skipSettled = mode === 'undo' || mode === 'reverse' || (mode === 'resume' && putBackReached(open!.step, 'db-in'));
-  const off = await offAndStopped(botId, inst, skipSettled, KEPT_TEXT.pOff);
-  if (off && 'runs' in off) {
+  const na: NoAdminGate | undefined = skipSettled ? undefined : open ? { open } : { database: mainKind(inst) };
+  const off = await offAndStopped(botId, inst, skipSettled, KEPT_TEXT.pOff, na);
+  if ('runs' in off) {
     if (!open) return noPut(409, KEPT_TEXT.aRuns);
     return { ok: false, answer: { success: false, status: 409, open: true, error: recordOpenText(open, await appRunsText(inst)) } };
   }
-  if (off) return noPut(off.status, off.error);
+  if ('error' in off) return noPut(off.status, off.error);
 
   if (open && mode === 'resume') {
     console.log(`[KeptData] ${inst.displayName}: ${PUT_BACK} goes on from step ${open.step}`);
@@ -1422,6 +1635,15 @@ async function admitPutBackClaimed(botId: string, inst: InstanceConfig, open: Ke
     const sharers = await sharersRefusal(fresh, url);
     if (sharers) return noPut(409, sharers);
   }
+  if (off.na !== null) {
+    const db = fresh.fleetDb;
+    if (!db) return noPut(409, KEPT_TEXT.aUnsettled(maintenance.maintenanceOf(fresh).lastError || 'the order has not finished'));
+    const running = await dbLogin.sidecarRunning(db.containerName);
+    if (running === null) return noPut(409, KEPT_TEXT.aNaRead(db.user, `docker did not say whether the database container ${db.containerName} runs`));
+    if (!running) return noPut(409, KEPT_TEXT.aNaDown);
+    const bad = ownerClusterRefusal(db.user, await readOwnerCluster(db.containerName, db.user));
+    if (bad) return noPut(409, bad);
+  }
   let dataDir: string;
   try {
     dataDir = await fleetReplica.instanceDataDir(fresh);
@@ -1447,6 +1669,7 @@ async function admitPutBackClaimed(botId: string, inst: InstanceConfig, open: Ke
     dataDir, outDir, inDir: kept.folder ?? '', offMessage: maintenance.maintenanceOf(fresh).message,
     sharers: kept.db ? fleetBackup.databaseSharers(fresh, url).filter(b => b.id !== botId).map(b => b.id) : [],
     step: 'recorded',
+    ...(off.na !== null ? { noAdminOff: off.na } : {}),
   };
   let opened: string | null;
   try {
@@ -1645,7 +1868,7 @@ async function scratchCopy(botId: string, volume: string, n: ReturnType<typeof k
 }
 
 /** X2: the scratch copy started with no network and dumped; the file, or the failure text. */
-async function scratchDump(inst: InstanceConfig, store: { user?: string; db?: string }, family: 'main' | 'copy', n: ReturnType<typeof keptScratchNames>): Promise<{ file: string } | { error: string }> {
+async function scratchDump(inst: InstanceConfig, store: { user?: string; db?: string; volume: string }, family: 'main' | 'copy', n: ReturnType<typeof keptScratchNames>): Promise<{ file: string } | { error: string }> {
   if (!store.user || !store.db) return { error: KEPT_TEXT.xDump('the kept record names no database or login to dump') };
   const label = `${THROWAWAY_LABEL}=${inst.id}`;
   const started = await runTool('docker', ['run', '-d', '--name', n.scratch, '--label', label, '--network', 'none',
@@ -1660,7 +1883,7 @@ async function scratchDump(inst: InstanceConfig, store: { user?: string; db?: st
   if (!ready) return { error: KEPT_TEXT.xDump(`the scratch copy did not accept connections within ${Math.round(KEPT_TIMING.readyMs / 1000)} s`) };
   const dumped = await fleetBackup.dumpKeptDatabase(inst, { containerName: n.scratch, user: store.user, db: store.db }, family, family === 'copy' ? 'copy-pre-delete-' : 'pre-delete-');
   if (dumped.success) return { file: dumped.file };
-  return { error: KEPT_TEXT.xDump(dumped.error) + (dbLogin.missingLogin(dumped.error) === dbLogin.WORK_LOGIN ? KEPT_TEXT.xNoWork : '') };
+  return { error: dbLogin.missingLogin(dumped.error) === dbLogin.WORK_LOGIN ? KEPT_TEXT.xDumpFailed(dumped.error) + KEPT_TEXT.xNoWork(store.volume) : KEPT_TEXT.xDump(dumped.error) };
 }
 
 /** The saves of a Delete run: every save is a compare-and-save on the record's key. */

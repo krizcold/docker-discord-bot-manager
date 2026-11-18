@@ -84,6 +84,15 @@ const RECOVERY_BLOCK = "the database is a live copy in recovery, so its login ca
 const RECOVERY_OPEN = 'the database is a live copy in recovery';
 const FENCED = 'the database is READ-ONLY under a write fence';
 const NOT_RECORDED = (err: string) => ` The manager could not record this (${err}); the record still holds the order as not confirmed, so the manager runs it again within 30 seconds, except that a retry never starts the bot or its database.`;
+/** The reason runCore's ensureRole stores when the manager's database role cannot be confirmed. */
+export const adminFailText = (err: string): string => `the manager's database role ${dbLogin.MANAGER_DB_ROLE} could not be confirmed (${err})`;
+export const NO_ADMIN_OFF_REASON = adminFailText(dbLogin.NO_ADMIN_ERROR);
+
+/** An Off left unsettled only because the database has no dbm_admin (the newest pass stored that reason alone). */
+export function noAdminOff(rec: MaintenanceRecord): boolean {
+  return rec.state === 'off' && rec.settled === false && rec.login === 'unconfirmed' && rec.lastError === NO_ADMIN_OFF_REASON;
+}
+
 const RETRY_DB_DOWN = 'the database is not running, and a retry does not start it';
 const RETRY_DB_UNKNOWN = 'docker did not say whether the database runs, and a retry does not start it';
 const RETRY_NO_START = 'the bot is stopped, and a retry does not start it';
@@ -469,7 +478,7 @@ async function runCore(botId: string, ordered: BotRunState, orderedMessage: stri
   const ensureRole = async (): Promise<boolean> => {
     if (roleReady) return true;
     const role = await dbLogin.ensureManagerDbRole(target!);
-    if (!role.ok) { o.dbFail = `the manager's database role ${dbLogin.MANAGER_DB_ROLE} could not be confirmed (${role.error})`; return false; }
+    if (!role.ok) { o.dbFail = adminFailText(role.error); return false; }
     roleReady = true;
     return true;
   };

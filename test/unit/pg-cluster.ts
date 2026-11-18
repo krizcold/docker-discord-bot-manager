@@ -34,6 +34,8 @@ export interface ClusterSpec {
   serverArgs?: string[];
   /** More docker run arguments before the image: an address on the network, a published port. */
   dockerArgs?: string[];
+  /** The Postgres image; PG_IMAGE when absent. */
+  image?: string;
 }
 
 export interface Cluster extends ClusterSpec {
@@ -48,7 +50,7 @@ export function startCluster(spec: ClusterSpec): Cluster {
   const started = docker(['run', '-d', '--name', spec.name, ...(spec.network ? ['--network', spec.network] : []),
     '-v', `${volume}:/var/lib/postgresql/data`, ...(spec.dockerArgs ?? []),
     '-e', `POSTGRES_USER=${spec.firstRole ?? 'dbm_admin'}`, '-e', `POSTGRES_PASSWORD=${spec.password}`, '-e', `POSTGRES_DB=${spec.db}`,
-    PG_IMAGE, 'postgres', ...(spec.serverArgs ?? ['-c', 'reserved_connections=4'])]);
+    spec.image ?? PG_IMAGE, 'postgres', ...(spec.serverArgs ?? ['-c', 'reserved_connections=4'])]);
   if (started.status !== 0) {
     docker(['rm', '-f', '-v', spec.name]);
     throw new Error(`${spec.name} did not start: ${started.err}`);

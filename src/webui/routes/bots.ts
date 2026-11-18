@@ -76,6 +76,13 @@ function withHealth<T extends { id: string } | null | undefined>(bot: T): T {
   return record ? { ...bot, ...botHealth(record) } : bot;
 }
 
+/** What Start on a new database's button and confirm read, for a hook app; {} for a bot that is gone or has no hooks. */
+function keptStartFields(bot: InstanceConfig | null | undefined): { keptStartVariant?: keptData.NewStartVariant | null; keptNoAdminOff?: boolean } {
+  if (!bot || !hasAppHooks(bot)) return {};
+  const variant = keptData.newStartVariantOf(bot);
+  return { keptStartVariant: variant, keptNoAdminOff: variant === 'main' && maintenance.noAdminOff(maintenance.maintenanceOf(bot)) };
+}
+
 type HealthPush = { id: string } & ReturnType<typeof botHealth>;
 
 /** Pushes for the bots whose verdict or backup status changed since the last call. */
@@ -120,13 +127,15 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   }
 
   migrate.setMigrateListener((botId, ev) => {
-    const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
-    broadcastToClients(wss, 'bot:migrate', { ...bot, id: botId, text: containerManager.scrubbedRecordText(botId, ev.text), final: ev.final });
+    const inst = containerManager.getBot(botId);
+    const bot = withHealth(withActiveOp(publicBot(inst)));
+    broadcastToClients(wss, 'bot:migrate', { ...bot, ...keptStartFields(inst), id: botId, text: containerManager.scrubbedRecordText(botId, ev.text), final: ev.final });
   });
 
   maintenance.setMaintenanceListener((botId, result, notify) => {
-    const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
-    broadcastToClients(wss, 'bot:maintenance', { ...bot, id: botId, opId: null, settled: result.settled, text: result.text, notify });
+    const inst = containerManager.getBot(botId);
+    const bot = withHealth(withActiveOp(publicBot(inst)));
+    broadcastToClients(wss, 'bot:maintenance', { ...bot, ...keptStartFields(inst), id: botId, opId: null, settled: result.settled, text: result.text, notify });
   });
 
   const healthSeen = new Map<string, string>();
@@ -228,8 +237,8 @@ export function createBotRoutes(wss: WebSocketServer): Router {
           appHooks: hasAppHooks(bot),
           // The Database window's data line for a hooks bot with no managed database.
           ...(hasAppHooks(bot) && !bot.fleetDb && !bot.fleetDbReplica ? { dataPlace: dataPlace(bot) } : {}),
-          // The variant Start on a new database would run, for its confirm.
-          ...(hasAppHooks(bot) ? { keptStartVariant: keptData.newStartVariantOf(bot) } : {}),
+          // The variant Start on a new database would run, and whether its Off is unsettled only by a missing dbm_admin.
+          ...keptStartFields(bot),
           source: source ? { id: source.id, composeName: source.composeName, lastCommitHash: source.lastCommitHash, url: source.url, autoUpdate: source.autoUpdate } : null,
           updateAvailable,
           ...(updateCantConfirm ? { updateCantConfirm } : {}),
@@ -589,8 +598,9 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       const botId = req.params.id;
       const opId = randomUUID();
       const admission = await maintenance.orderMaintenance(botId, state as any, message ?? '', (result) => {
-        const bot = withHealth(withActiveOp(publicBot(containerManager.getBot(botId))));
-        broadcastToClients(wss, 'bot:maintenance', { ...bot, id: botId, opId, settled: result.settled, text: result.text });
+        const inst = containerManager.getBot(botId);
+        const bot = withHealth(withActiveOp(publicBot(inst)));
+        broadcastToClients(wss, 'bot:maintenance', { ...bot, ...keptStartFields(inst), id: botId, opId, settled: result.settled, text: result.text });
       });
       if (!admission.accepted) {
         res.status(admission.status).json({ success: false, error: admission.error });

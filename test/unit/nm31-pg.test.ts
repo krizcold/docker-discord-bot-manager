@@ -329,7 +329,7 @@ describe.skipIf(process.platform === 'win32' || !dockerRuns)('NM31 part 5: the s
     const answer = await deleteKept(botId, KEPT_SET) as { success: boolean; error: string };
     expect(answer).toMatchObject({ success: false, open: true });
     expect(answer.error.startsWith('The dump of the kept database failed (')).toBe(true);
-    expect(answer.error.endsWith(KEPT_TEXT.xNoWork)).toBe(true);
+    expect(answer.error.endsWith(KEPT_TEXT.xNoWork(volume))).toBe(true);
     expect(missingLogin(answer.error)).toBe('dbm_work');
     expect(containerManager.getBot(botId)!.keptOp).toMatchObject({ op: 'delete', step: 'copy-made' });
     expect(containerManager.getBot(botId)!.keptSets).toHaveLength(1);

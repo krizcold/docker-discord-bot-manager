@@ -2674,10 +2674,10 @@
       return bot.keptStartVariant || null;
     }
 
-    // Shown when the bot is Off and settled, no record is open, and the bot keeps its data in a database.
+    // Shown when the bot is Off and settled (or unsettled only because its database has no dbm_admin role), no record is open, and the bot keeps its data in a database.
     function keptStartShown(bot) {
       const m = bot.maintenance;
-      if (!bot.appHooks || bot.keptOp || !m || m.state !== 'off' || !m.settled) return false;
+      if (!bot.appHooks || bot.keptOp || !m || m.state !== 'off' || !(m.settled || bot.keptNoAdminOff === true)) return false;
       return !!(bot.fleetDb || bot.fleetDbReplica || bot.fleetWorker || bot.dataPlace === 'outside');
     }
 
@@ -2690,7 +2690,7 @@
         : variant === 'folder'
         ? 'The bot\'s data folder is kept as it is, under a new name, and its database is not changed.'
         : 'The manager can\'t confirm what this start keeps: when the bot list was last read, the bot\'s settings could not be read or named no database to start again. The start reads them again and refuses if that is still so.';
-      return `Start on a new database?\n\n${first} The bot gets a new data folder that holds maintenance.json${bot.fleetJoin ? ', and the join\'s certificate files,' : ''} so its next start is a maintenance boot. The bot stays stopped, and its State becomes Running.\n\nPut back returns the kept database and folder; Delete removes them after a dump.`;
+      return `Start on a new database?\n\n${first} The bot gets a new data folder that holds maintenance.json${bot.fleetJoin ? ', and the join\'s certificate files,' : ''} so its next start is a maintenance boot. The bot stays stopped, and its State becomes Running.${bot.keptNoAdminOff === true ? ' Its Off is not confirmed because the database has no dbm_admin role; the start first checks, as the bot\'s own role and without writing, that no session of the bot uses the database.' : ''}\n\nPut back returns the kept database and folder; Delete removes them after a dump.`;
     }
 
     function keptPutBackConfirmText(date) {

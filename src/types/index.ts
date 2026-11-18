@@ -512,6 +512,7 @@ export interface KeptOpRecord {
   dropped?: string;                   // delete: the kept volume X0 dropped from the set (docker said it no longer exists)
   folderMissing?: true;               // a reverse: its folder step found the data folder missing and left it so
   folderGone?: true;                  // new-start: it last stopped because the data folder was missing (T-N-GONE)
+  noAdminOff?: string;                // new-start or put-back: the orderedAt of the unsettled Off admitted with no dbm_admin
   lastError?: string;
 }
 

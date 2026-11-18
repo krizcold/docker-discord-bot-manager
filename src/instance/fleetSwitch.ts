@@ -204,7 +204,7 @@ export async function readGeneration(t: Target, db: string): Promise<{ ok: true;
   return row === undefined ? { ok: false, error: `the generation read answered '${lastLine(r.stdout)}'` } : { ok: true, row };
 }
 
-const ADMIN_GEN_READ = `SELECT coalesce((SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.generation')), '-') AS kind,
+export const ADMIN_GEN_READ = `SELECT coalesce((SELECT relkind::text FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.generation')), '-') AS kind,
   coalesce((SELECT relkind = 'r' FROM pg_catalog.pg_class WHERE oid = pg_catalog.to_regclass('smdb_manager.generation')), false) AS is_table \\gset
 \\echo :kind
 \\if :is_table
@@ -224,7 +224,12 @@ export async function readGenerationAsAdmin(t: Target, db: string): Promise<{ ok
   if (superuser !== 'true') return { ok: false, error: `the database has no ${dbLogin.META_LOGIN} login, and the bot's role ${t.user} is not a superuser, so the manager does not read the bot's database as one` };
   const r = await runGuarded('docker', [...dbLogin.adminReadArgs(t.container, db), '-q'], { input: ADMIN_GEN_READ, timeoutMs: SWITCH_TIMING.readMs });
   if (!r.ok) return { ok: false, error: failText(r) };
-  const lines = r.stdout.split('\n').map(l => l.trim()).filter(Boolean);
+  return parseAdminGenRead(r.stdout);
+}
+
+/** ADMIN_GEN_READ's answer: '-' is no row, a kind other than 'r' is not read, then the generation row. */
+export function parseAdminGenRead(stdout: string): { ok: true; row: GenRow | null } | { ok: false; error: string } {
+  const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean);
   const kind = lines[0] ?? '';
   if (kind === '-') return { ok: true, row: null };
   if (kind !== 'r') return { ok: false, error: `smdb_manager.generation is not a plain table (${kind ? `relkind ${kind}` : 'no answer'}), so the manager did not read it` };

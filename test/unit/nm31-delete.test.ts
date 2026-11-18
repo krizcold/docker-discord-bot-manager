@@ -415,7 +415,8 @@ describe('nm31 delete: a step fails, and nothing is removed', () => {
     const answer = await deleteKept('a', set());
     const error = (answer as { error: string }).error;
     expect(error.startsWith('The dump of the kept database failed (')).toBe(true);
-    expect(error.endsWith(`Run Delete again, or Keep it.${KEPT_TEXT.xNoWork}`)).toBe(true);
+    expect(error.endsWith(`, so nothing was deleted.${KEPT_TEXT.xNoWork(OLD)}`), 'B2 (NM34 code review 1): no Run Delete again before T-X-NOWORK').toBe(true);
+    expect(error).not.toContain('Run Delete again');
     openWith(answer, error, 'copy-made');
     nothingRemoved();
   });

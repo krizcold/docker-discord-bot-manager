@@ -1786,7 +1786,7 @@ async function tickBot(listed: InstanceConfig, now: number): Promise<void> {
   await rejoinCheck(inst, now);
   if (await dbLogin.sidecarRunning(db.containerName) !== true) return;
   const fresh = containerManager.getBot(inst.id);
-  if (!fresh?.fleetDb || containerManager.isBotBusy(inst.id)) return;
+  if (!fresh?.fleetDb || containerManager.isBotBusy(inst.id) || containerManager.newDatabaseUnchecked(fresh)) return;
   await ensureMainGeneration(inst.id);
   await stepNotice(inst.id, now);
   if (receiveStep) await receiveStep(fresh, now);

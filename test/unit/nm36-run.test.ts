@@ -166,7 +166,7 @@ describe('nm36 run: the db-up step with the kept database on TLS', () => {
     expectDone(before, answer);
     const at = (pred: (a: string[]) => boolean) => docker.calls.findIndex(pred);
     const sums = at(a => a.join(' ').includes('SHOW data_checksums'));
-    const mounts = at(a => a[0] === 'container' && a[1] === 'inspect');
+    const mounts = docker.calls.map(a => a[0] === 'container' && a[1] === 'inspect').lastIndexOf(true);
     const e1 = at(a => a[0] === 'exec' && a.includes('sh') && a[a.length - 1].startsWith(`test -f ${P}/server.crt && test -f ${P}/server.key`));
     const alter = at(a => a.includes('ALTER SYSTEM SET ssl = on;'));
     const opened = at(a => a[0] === 'openBotLogin');
@@ -187,7 +187,16 @@ describe('nm36 run: the db-up step with the kept database on TLS', () => {
     expect(tlsFake.calls).toEqual([]);
     expect(tlsFake.opensslArgs).toEqual([]);
     expect(docker.calls.filter(a => a.join(' ').includes('ALTER SYSTEM SET ssl'))).toEqual([]);
-    expect(docker.calls.filter(a => a[0] === 'container')).toEqual([]);
+    const reads = docker.calls.map((a, i) => (a[0] === 'container' ? i : -1)).filter(i => i >= 0);
+    expect(reads).toHaveLength(2);
+    const made = docker.calls.findIndex(a => a[0] === 'sh' && a[1].endsWith('up --no-start fleet-postgres'));
+    const up = docker.calls.findIndex((a, i) => i > made && a[0] === 'sh' && a[1].endsWith('up -d fleet-postgres'));
+    const ready = docker.calls.findIndex((a, i) => i > made && a[0] === 'sh' && a[1].includes(' pg_isready '));
+    expect(made).toBeGreaterThanOrEqual(0);
+    expect(reads[0]).toBeGreaterThan(made);
+    expect(reads[0]).toBeLessThan(up);
+    expect(reads[1]).toBeGreaterThan(up);
+    expect(reads[1]).toBeLessThan(ready);
   });
 
   it('R3: an open record at db-in without keptSsl, as an older manager left it: Run again makes no TLS call, text without the clause', async () => {

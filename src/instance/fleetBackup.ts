@@ -908,7 +908,7 @@ async function seedStuckFences(): Promise<void> {
       }
     }
     const db = instance.fleetDb;
-    if (!db || isStuck(instance.id, db.containerName)) continue;
+    if (!db || isStuck(instance.id, db.containerName) || containerManager.newDatabaseUnchecked(containerManager.getBot(instance.id))) continue;
     if (!await isContainerRunning(db.containerName)) continue;
     const layers = await fenceLayers(db);
     await dropStaleOwner(instance.id, db, layers);
@@ -962,6 +962,7 @@ async function reprobeStuckFences(): Promise<void> {
   for (const [containerName, { db }] of Array.from(staleOwnerFiles.entries())) {
     const instance = containerManager.getAllBots().find(b => b.fleetDb?.containerName === containerName || b.fleetDbReplica?.containerName === containerName);
     if (!instance) { staleOwnerFiles.delete(containerName); continue; }
+    if (containerManager.newDatabaseUnchecked(instance)) continue;
     if (!await isContainerRunning(containerName)) continue;
     const layers = await fenceLayers(db);
     // Read-only again: a lane fenced since, and the file is its owner now.
@@ -971,6 +972,7 @@ async function reprobeStuckFences(): Promise<void> {
   for (const [id, entries] of Array.from(fenceStuck.entries())) {
     const instance = containerManager.getBot(id);
     if (!instance) { fenceStuck.delete(id); continue; }
+    if (containerManager.newDatabaseUnchecked(instance)) continue;
     for (const { db } of Array.from(entries.values())) {
       // A database the instance no longer records is gone, and its warning with it.
       if (instance.fleetDb?.containerName !== db.containerName && instance.fleetDbReplica?.containerName !== db.containerName) { clearStuck(id, db.containerName); continue; }

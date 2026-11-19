@@ -192,6 +192,7 @@ describe('nm31 start: end states', () => {
     expectMainDone(before, answer);
     expect(changing()).toEqual([
       ['stop', '--time', '60', CONTAINER],
+      ['sh', `docker compose -f "${composePathOf('a')}" -p "bota" up --no-start fleet-postgres`],
       ['sh', `docker compose -f "${composePathOf('a')}" -p "bota" up -d fleet-postgres`],
     ]);
     expect(docker.calls.some(a => a.join(' ').includes('SHOW data_checksums'))).toBe(true);

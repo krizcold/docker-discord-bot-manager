@@ -339,10 +339,15 @@ function spawnTls(base: (...a: unknown[]) => unknown) {
   };
 }
 
-/** execFileSync: docker container inspect answers from `mounts` (default: the new volume); anything else is the real one. */
-function execFileSyncTls(real: typeof import('child_process')['execFileSync']) {
+/**
+ * execFileSync: docker container inspect right after a compose up is the start's own mount read, answered by nm31-run;
+ * any other is G0's and answers from `mounts` (default: the new volume). Anything else goes to nm31-run's mock, where
+ * another docker command throws.
+ */
+function execFileSyncTls(base: (cmd: string, args: string[], opts?: unknown) => unknown, nm31: typeof import('./nm31-run')) {
   return (cmd: string, args: string[], opts?: unknown): unknown => {
-    if (cmd !== 'docker' || args[0] !== 'container' || args[1] !== 'inspect') return (real as any)(cmd, args, opts);
+    if (cmd !== 'docker' || args[0] !== 'container' || args[1] !== 'inspect') return base(cmd, args, opts);
+    if (nm31.run.upRead) return nm31.mountRead(args);
     docker.calls.push(args);
     tlsFake.calls.push('mounts');
     const c = args[args.length - 1];
@@ -354,10 +359,10 @@ function execFileSyncTls(real: typeof import('child_process')['execFileSync']) {
 
 export async function childProcessMock(real: typeof import('child_process'), fsReal: typeof import('fs')): Promise<Record<string, unknown>> {
   const nm31 = await import('./nm31-run');
-  const base = await nm31.childProcessMock(real, fsReal) as { execFile: (...a: unknown[]) => unknown; spawn: (...a: unknown[]) => unknown; exec: unknown };
+  const base = await nm31.childProcessMock(real, fsReal) as { execFile: (...a: unknown[]) => unknown; spawn: (...a: unknown[]) => unknown; exec: unknown; execFileSync: (cmd: string, args: string[], opts?: unknown) => unknown };
   const execFile = execFileTls(base.execFile, fsReal);
   const spawn = spawnTls(base.spawn);
-  const execFileSync = execFileSyncTls(real.execFileSync);
+  const execFileSync = execFileSyncTls(base.execFileSync, nm31);
   const wrap = { execFile, spawn, exec: base.exec, execFileSync };
   return { ...real, ...wrap, default: { ...real, ...wrap } };
 }

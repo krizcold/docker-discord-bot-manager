@@ -16,6 +16,7 @@ import { addFleetPostgresReplicaService, addFleetPostgresService } from '../../s
 import { docker } from './nm2-docker';
 import { seedBot, stored } from './nm2-harness';
 import { run, PsqlAnswer, PsqlCall, stopsStop } from './nm31-run';
+import { generationOf, resetSo, saveOrderAnswer } from './nm31-save';
 import { COPY_PEM, FIXTURE_PEM, fakeJoinRecord } from './join-fake';
 
 export const SMDB = 'https://github.com/x/fully-modular-discord-bot';
@@ -33,6 +34,8 @@ export const app: Record<string, boolean | null> = {};
 export const gen = { meta: { code: 0, stdout: '0||\n' } as PsqlAnswer, restore: { code: 0, stdout: '\n' } as PsqlAnswer };
 
 export function psqlAnswer(c: PsqlCall): PsqlAnswer {
+  const saved = saveOrderAnswer(c, generationOf(gen.meta.stdout));
+  if (saved) return saved;
   if (c.login === 'dbm_meta') return gen.meta;
   if (c.login === 'dbm_admin' && c.db === 'postgres' && c.input.includes('restore_state')) return gen.restore;
   return { code: 1, stderr: 'ERROR: unexpected psql call' };
@@ -51,6 +54,7 @@ export const db = {
 /** Resets the fakes' answers and spies the reads every row shares; call from beforeEach. */
 export function resetSeed(): void {
   for (const k of Object.keys(app)) delete app[k];
+  resetSo();
   Object.assign(gen, { meta: { code: 0, stdout: '0||\n' }, restore: { code: 0, stdout: '\n' } });
   Object.assign(db, {
     role: { ok: true }, open: { ok: true }, login: { ok: true, login: { inRecovery: false, canLogin: true, sessions: 0 } },
@@ -90,13 +94,21 @@ const BASE_COMPOSE = (id: string) => `services:
       - ./data:/data
 `;
 
-/** The Off order as the maintenance tool runs it with the app stopped, its database calls answered at dbLogin. */
+/**
+ * The Off order as the maintenance tool runs it with the app stopped, its database calls answered at dbLogin: the
+ * login reads open until the block lands (a save-order app's order is then asked under an open login).
+ */
 export async function offOrder(id: string, opts: { blockFails?: string } = {}): Promise<void> {
+  let blocked = false;
   const spies = [
     vi.spyOn(dbLogin, 'ensureManagerDbRole').mockResolvedValue({ ok: true }),
-    vi.spyOn(dbLogin, 'blockBotLogin').mockResolvedValue(opts.blockFails ? { ok: false, cls: 'other', error: opts.blockFails } : { ok: true } as any),
+    vi.spyOn(dbLogin, 'blockBotLogin').mockImplementation(async () => {
+      if (opts.blockFails) return { ok: false, cls: 'other', error: opts.blockFails };
+      blocked = true;
+      return { ok: true } as any;
+    }),
     vi.spyOn(dbLogin, 'endBotSessions').mockResolvedValue({ ok: true }),
-    vi.spyOn(dbLogin, 'readBotLogin').mockResolvedValue({ ok: true, login: { inRecovery: false, canLogin: false, sessions: 0 } }),
+    vi.spyOn(dbLogin, 'readBotLogin').mockImplementation(async () => ({ ok: true, login: { inRecovery: false, canLogin: !blocked, sessions: 0 } })),
   ];
   try {
     const r = await maintenance.runMaintenanceOrder(id, 'off', OFF_MESSAGE);

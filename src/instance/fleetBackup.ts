@@ -35,7 +35,7 @@ import { addressTableSql } from './fleetReplication';
 import { parseAddressRows, readCopyCert, validAddress } from './fleetJoin';
 import {
   ADDRESS_DDL_SQL, COPY_GROUP, copiesInsertSql, copyGroupEnsureSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
-  raiseSql, receiveMarkClearSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreStateUpsertSql, SHARD_CAP_SET,
+  raiseSql, receiveMarkClearSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreOrderSql, restoreStateUpsertSql, SAVE_ORDER_TABLES, SHARD_CAP_SET,
 } from './switchSql';
 import { readDatabaseUrl } from '../config/databaseUrl';
 import * as maintenance from './maintenance';
@@ -2270,21 +2270,29 @@ ${addressDdlSql()}${rowsScript}GRANT SELECT ON ALL TABLES IN SCHEMA smdb_manager
 
 const MANAGER_TABLES = ['generation', 'handover', 'received', 'copies', 'addresses'].map(t => `smdb_manager.${t}`);
 
+/** The save order's tables in a counts file: the restore and the push never write their rows back, so neither compares them. */
+export function withoutSaveOrder<T>(rows: Record<string, T>): Record<string, T> {
+  const rest = { ...rows };
+  for (const t of SAVE_ORDER_TABLES) delete rest[`smdb_manager.${t}`];
+  return rest;
+}
+
 /**
  * The counts a restore compares (NM18, Y1): the backup's count of smdb_manager.addresses less the rows the parse left
- * out, and no entry for a manager table the backup did not hold that the manager's DDL made empty.
+ * out, no entry for a manager table the backup did not hold that the manager's DDL made empty, and none for the save
+ * order's tables.
  */
 export function countsToCompare(recorded: Record<string, number>, restored: Record<string, number>, addressesLeftOut: number): { recorded: Record<string, number>; restored: Record<string, number> } {
-  const rec = { ...recorded };
+  const rec = withoutSaveOrder(recorded);
   if (addressesLeftOut > 0 && 'smdb_manager.addresses' in rec) rec['smdb_manager.addresses'] -= addressesLeftOut;
-  const res = { ...restored };
+  const res = withoutSaveOrder(restored);
   for (const t of MANAGER_TABLES) if (!(t in rec) && res[t] === 0) delete res[t];
   return { recorded: rec, restored: res };
 }
 
-/** A dump without a counts file: the restored counts its counts file would hold, so no manager table the dump lacks that the manager's DDL made empty. */
+/** A dump without a counts file: the restored counts its counts file would hold, so no manager table the dump lacks that the manager's DDL made empty, and no save order table. */
 export function unrecordedCounts(restored: Record<string, number>, toc: string): Record<string, number> {
-  const res = { ...restored };
+  const res = withoutSaveOrder(restored);
   for (const t of MANAGER_TABLES) {
     const held = tocHasLine(toc, new RegExp(`^\\d+; \\d+ \\d+ TABLE smdb_manager ${t.slice('smdb_manager.'.length)} `));
     if (!held && res[t] === 0) delete res[t];
@@ -2972,8 +2980,9 @@ async function restoreLocked(
       const counted = countsToCompare(meta.counts, restoredCounts, badAddresses + overCap);
       const compared = compareCounts(counted.recorded, counted.restored);
       if (compared.ok) {
-        steps.counts = { result: 'matched', tables: meta.tables, rows: meta.rows, text: null };
-        console.log(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: ${meta.tables} tables and ${meta.rows} rows match its counts file`);
+        const matched = totalsOf(counted.recorded);
+        steps.counts = { result: 'matched', ...matched, text: null };
+        console.log(`[FleetBackup] Restore of ${file} on ${fleetDb.containerName}: ${matched.tables} tables and ${matched.rows} rows match its counts file`);
       } else {
         steps.counts = { result: 'differ', ...totalsOf(restoredCounts), text: compared.text };
         countsText = compared.text;
@@ -3169,7 +3178,9 @@ async function writeRestoredGeneration(instance: InstanceConfig, fleetDb: Restor
   if (restored === undefined) return { ok: false, error: read.ok ? `the restored row read back as '${read.stdout.trim()}'` : lastLine(read.stderr) };
   const machine = machineNameOf(instance);
   const target = generationAfterRestore(before, restored, machine, new Date().toISOString());
-  const own = repl && cert ? addressTableSql(repl.publicHost, repl.hostPort, cert, machine) : '';
+  // Decision 7: the raise rewrites the save order with the record's id at the new generation, reason 'restore'.
+  const orderId = maintenance.declaresSaveOrder(instance) ? (instance.maintenance?.fleet?.orderId ?? maintenance.newOrderId()) : null;
+  const own = `${repl && cert ? addressTableSql(repl.publicHost, repl.hostPort, cert, machine) : ''}${orderId ? restoreOrderSql({ user: fleetDb.user, orderId, message: instance.maintenance?.message ?? '' }) : ''}`;
   let sql: string;
   if (kind === 'ordinary') {
     try {
@@ -3182,7 +3193,9 @@ async function writeRestoredGeneration(instance: InstanceConfig, fleetDb: Restor
     sql = raiseSql(machine, target.generation, `${cutAddressesSql(repl ? { host: repl.publicHost, port: repl.hostPort } : null)}${own}${copiesInsertSql(ownCopies)}`);
   }
   const write = await metaCall(fleetDb, sql, true, undefined);
-  return write.ok ? { ok: true, generation: target.generation } : { ok: false, error: lastLine(write.stderr) };
+  if (!write.ok) return { ok: false, error: lastLine(write.stderr) };
+  if (orderId) maintenance.noteRestoredOrder(instance.id, orderId);
+  return { ok: true, generation: target.generation };
 }
 
 /**

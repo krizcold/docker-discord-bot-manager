@@ -148,6 +148,7 @@ vi.mock('../../src/source/sourceManager', async (importOriginal) => {
     fetchSource: (id: string) => real.withSourceLock(id, fetchSourceHeld),
   };
 });
+vi.mock('../../src/config/appCapabilities', async (o) => (await import('./nx5-nosave')).capsWithoutSaveOrder(await o()));
 vi.mock('../../src/instance/appHookClient', async (o) => (await import('./migrate-fake')).hookMock(await o()));
 vi.mock('../../src/instance/dbLogin', async (o) => (await import('./migrate-fake')).dbLoginMock(await o()));
 vi.mock('../../src/instance/fleetBackup', async (o) => ({ ...(await o<typeof import('../../src/instance/fleetBackup')>()), ...(await import('./migrate-fake')).fenceMock() }));

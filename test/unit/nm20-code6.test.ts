@@ -276,6 +276,18 @@ describe('NM20 part 6: the push (R3.6, X1, Y1, Y6, Z5, U2, U7)', () => {
     expect(r.success).toBe(true);
     expect(warn.mock.calls.filter(c => String(c[0]).includes('smdb_manager.addresses'))).toEqual([['[Switch] A: left out 4 row(s) of smdb_manager.addresses from the pushed dump (3 failed the address check or were over the size limit, 1 past the 1000-row cap)']]);
   });
+  it('NX5: a dump with the save order tables pushes: their blocks are not written back, and counts and checksums leave them out', async () => {
+    const orderCols = 'one_row, order_id, state, message, generation, reason, up_ms, at';
+    const ackCols = 'process_id, order_id, node_id, node_name, saved, unsaved_guilds, unsaved_files, unanswered_guilds, unconfirmed_files, unanswered_files, resave_guilds, acked_at';
+    g.meta = metaDump(entry('addresses', ADDR_COLS, [addressRow('main.example', 5433)]), GENERATION, RECEIVED,
+      entry('save_acks', ackCols, [`p1\tX\tn1\thost-a\tt\t0\t0\t0\t0\t0\t0\t${TS}`]), entry('save_order', orderCols, [`t\tX\tmaintenance\tBack soon\t3\torder\t100000\t${TS}`]));
+    fs.writeFileSync(path.join(DIR, `${FILE}.json`), JSON.stringify({ file: FILE, takenAt: 1, family: 'main', kind: 'safety', inRecovery: false, dataAt: null, dbBytes: 1, counts: { '"public"."t"': 3, 'smdb_manager.save_acks': 1, 'smdb_manager.save_order': 1 }, tables: 3, rows: 5 }));
+    answers.sums = ok(`${SUM}\nchecksum|smdb_manager.save_order|ffffffffffffffffffffffffffffffff\n`);
+    const r = await push('a', CODE);
+    expect(r.success).toBe(true);
+    expect(run('meta').input).not.toMatch(/save_order|save_acks/);
+    expect(run('meta').input).toContain('INSERT INTO smdb_manager.received ');
+  });
   it('W11, U2 part 4: the sender resets its own database as dbm_admin on postgres before the dump', async () => {
     expect((await push('a', CODE)).success).toBe(true);
     const [reset] = execs('IS_TEMPLATE false');

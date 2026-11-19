@@ -497,9 +497,9 @@ async function readOwnDump(inst: InstanceConfig, dumpPath: string): Promise<{ ok
   return { ok: true, script: meta.script, list: lists.other };
 }
 
-/** Y1: the push compares every table but smdb_manager.addresses, whose rows the commit writes anew. */
+/** Y1: the push compares every table but smdb_manager.addresses, whose rows the commit writes anew, and the save order's tables, which it never writes. */
 function withoutAddresses<T>(rows: Record<string, T>): Record<string, T> {
-  const { 'smdb_manager.addresses': _left, ...rest } = rows;
+  const { 'smdb_manager.addresses': _left, ...rest } = fleetBackup.withoutSaveOrder(rows);
   return rest;
 }
 
@@ -636,7 +636,8 @@ async function pushLocked(inst: InstanceConfig, code: MoveCode, admit: () => voi
   const doneError = saveSwitch(botId, { handover: { ...kept, phase: 'done' } });
   if (committedNow) await lastStep(inst, code, cert.pem);
   const meta = file ? readMeta(path.join(backupDir(botId), file)) : null;
-  const checked = meta ? `${meta.tables} tables and ${meta.rows} rows` : 'every table';
+  const compared = meta ? withoutAddresses(meta.counts) : null;
+  const checked = compared ? `${Object.keys(compared).length} tables and ${Object.values(compared).reduce((a, b) => a + b, 0)} rows` : 'every table';
   let text = `The database was pushed to ${machine} and checked: ${checked}, with the same counts and checksums on both.`;
   text += ` ${machine} is the main now (generation ${target}); choose Running in its State window to start the bot there. This machine now rebuilds itself as a copy of ${machine}; a dump of its database from before the push is kept with the backups (${file || 'none'}).`;
   if (doneError) text += ` The manager could not record this (${doneError}); press the same button again to finish recording it.`;

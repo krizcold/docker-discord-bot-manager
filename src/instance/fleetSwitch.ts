@@ -24,7 +24,7 @@ import { DM_RETRY_MS, utcText } from './backupFiles';
 import {
   BLOCKED_SESSIONS_SQL, closedCount, COPIES_READ_SQL, COPIES_SYNC_SQL, COPY_LOGIN_RE, copyLogin, copySlot, DB_OID_SQL, FOREIGN_READ_SQL, ForeignStream, LOBJ_SWEEP_SQL, NEW_LOGINS_READ_SQL, parseForeignStreams, parseRemoveBlock, REMOVE_BLOCK_SQL, TAINTED_SLOT_SQL, ensureGenerationSql, FORMER_LISTED_SQL, GEN_READ_SQL, GENERATION_SCHEMA_SQL, GenRow, generationBefore, HANDOVER_READ_SQL, machineNameOf, missingTable, moveModeText,
   parseGenRow, parseReceiveMark, parseRestoreState, raiseSql, RECEIVE_MARK_READ_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkVerdict, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, RestoreState, TAKEOVER_ROLE_RE,
-  SHARD_CAP_DO_SQL, takeoverBlockScript, takeoverLiftScript,
+  SaveRows, SHARD_CAP_DO_SQL, takeoverBlockScript, takeoverLiftScript,
 } from './switchSql';
 import { FleetDbConflict, FleetDbFormerMain, FleetDbHandover, FleetDbReplaced, FleetDbReplicaRecord, FleetDbSwitchNotice, InstanceConfig, MaintenanceHeld, MaintenanceRecord, OwnerDm } from '../types';
 
@@ -284,14 +284,37 @@ export type Noun = 'hand-over' | 'push' | 'move';
 
 export type HeldVerdict = { go: true } | { ask: string } | { refuse: string };
 
+/** The move a resumed lane has recorded, whose Cancel comes first in its way out; Move by file never resumes. */
+const cancelOf = (noun: Noun, mode: string | null): 'hand-over' | 'push' | null => (mode && noun !== 'move' ? noun : null);
+
+/** Decision 6's 'stopped' answer of a save-order app (J2, L3, G7-3), refused under the owner's ruling of 2026-11-16. */
+function stoppedRefusal(held: Extract<MaintenanceHeld, { state: 'stopped' }>, noun: Noun, reason: string, mode: string | null): string {
+  const b = held.before;
+  const unconfirmed = "This machine's bot answered that it can't confirm every change it held was saved";
+  const counts = b?.state === 'no' ? `This machine's bot reported changes it could not save (${b.guilds} guild(s), ${b.files} file(s))` : '';
+  const unsure = `before the manager confirmed that its database login was blocked with no session open`;
+  let body: string;
+  if (held.shut) {
+    body = !b ? `This machine's bot was stopped before it confirmed that it saved what it held (${reason}), so the manager can't confirm that it saved what it accepted after its last save. Whatever it had not saved was lost at that stop, not by this ${noun}, which loses nothing more.`
+      : b.state === 'no' ? `${counts}, then it was stopped with its login blocked, so those changes were lost at that stop, not by this ${noun}, which loses nothing more. Its log names them.`
+      : `${unconfirmed}, then it was stopped with its login blocked, so the manager can't confirm whether anything was lost at that stop. This ${noun} loses nothing more.`;
+  } else {
+    body = !b ? `This machine's bot was stopped before it confirmed that it saved what it held (${reason}) and ${unsure}, so its exit drain may have saved what it held; the manager can't confirm whether anything was lost at that stop. This ${noun} loses nothing more.`
+      : b.state === 'no' ? `${counts}, then it was stopped ${unsure}, so its exit drain may have saved them; the manager can't confirm whether they were lost at that stop. Its log names them. This ${noun} loses nothing more.`
+      : `${unconfirmed}, then it was stopped ${unsure}, so its exit drain may have saved what it held; the manager can't confirm whether anything was lost at that stop. This ${noun} loses nothing more.`;
+  }
+  return `${body} The ${noun} was refused and nothing was changed, since a ${noun} goes only once every bot confirmed its save. ${maintenance.againText(cancelOf(noun, mode))}.`;
+}
+
 /** Contract 1's answer, as a planned move reads it. */
-export function heldVerdict(held: MaintenanceHeld | undefined, confirm: boolean, noun: Noun = 'hand-over', reason = 'it did not answer'): HeldVerdict {
+export function heldVerdict(held: MaintenanceHeld | undefined, confirm: boolean, noun: Noun = 'hand-over', reason = 'it did not answer', saveOrder = false, mode: string | null = null): HeldVerdict {
   const refused = `the ${noun} was refused and nothing was changed`;
   if (!held) {
     return { refuse: `The bot did not answer the maintenance order (${reason}), so the manager can't confirm it saved the changes it holds; ${refused}. Choose Maintenance again while the bot runs, or choose Off.` };
   }
   if (held.state === 'yes' || held.state === 'not-running') return { go: true };
   if (held.state === 'stopped') {
+    if (saveOrder) return { refuse: stoppedRefusal(held, noun, reason, mode) };
     if (confirm) return { go: true };
     const q = noun === 'hand-over' ? 'Hand over anyway?' : noun === 'push' ? 'Push anyway?' : 'Make the backup anyway?';
     return { ask: `The bot was stopped without confirming that it saved what it held. Whatever it had not saved was lost at that stop, not by this ${noun}, which loses nothing more. ${q}` };
@@ -300,6 +323,37 @@ export function heldVerdict(held: MaintenanceHeld | undefined, confirm: boolean,
     return { refuse: `The bot reports changes it could not save (${held.guilds} guild(s), ${held.files} file(s)), so ${refused}: a ${noun} now would leave them behind. Choose Maintenance again so the bot tries the save again; the bot's log names what it could not save.` };
   }
   return { refuse: `The bot could not confirm that it saved every change it holds, so ${refused}. Choose Maintenance again; the bot answers whether its changes are saved.` };
+}
+
+/**
+ * Decision 6: whether the rows read under the blocked login let a planned move go. It goes only on this record's
+ * own order row with the login blocked since its answers, and then on a restore's row or on every expected process
+ * answering true to a row not written under a blocked login. `mode` is the recorded move's mode on a resumed lane.
+ */
+export function saveVerdict(rows: SaveRows, record: MaintenanceRecord, noun: Noun, mode: string | null): { go: true } | { refuse: string } {
+  const T = maintenance.SAVE_TEXTS;
+  const again = maintenance.againText(cancelOf(noun, mode));
+  const lane = `The ${noun} was refused and nothing was changed: `;
+  const refuse = (text: string) => ({ refuse: text });
+  const f = record.fleet;
+  if (!f) return refuse(`${lane}this maintenance began before this manager asked the bots to confirm their saves. ${again}.`);
+  if (!maintenance.rowIsOrders(rows, f)) {
+    const e = f.orderError;
+    if (e?.login === 'unread') return refuse(`${lane}the manager can't confirm that this maintenance asked the bots to save (it could not read the bot's database login before writing the order: ${maintenance.loginErrorOf(e.reason)}). ${again}.`);
+    if (e) return refuse(`${lane}the manager could not ask the bots to save (${e.reason}). ${again}.`);
+    return refuse(`${lane}the database's save order is not the one this maintenance wrote (a switch, a restore, another order, or the database's first generation record replaced it). ${again}.`);
+  }
+  if (!f.blockedAt) return refuse(`${lane}the bot's login was open after the bots confirmed (a migration ran, or the login was opened outside this manager). ${again}.`);
+  const row = rows.order!;
+  if (row.reason === 'restore') return { go: true };
+  if (f.askedBlocked) return refuse(T.askedBlocked(again));
+  if (!rows.claims || row.upMs === null) return refuse(T.cant(T.noTables, true, again));
+  const first = maintenance.uncoveredOf(rows, f.orderId!)[0];
+  if (!first) return { go: true };
+  if (first.ack?.saved === false) {
+    return refuse(`The bot on ${first.name} reports changes it could not save (${maintenance.unsavedCountText(first.ack.unsavedGuilds, first.ack.unsavedFiles)}), so the ${noun} was refused and nothing was changed: a ${noun} now would leave them behind. The bot's log names what it could not save. ${again} once the bot on ${first.name} can save them.`);
+  }
+  return refuse(`${lane}the bot on ${first.name} did not confirm that it saved what it holds before its login was blocked, so a ${noun} now could drop changes it accepted. ${again} once the bot on ${first.name} reaches this database.`);
 }
 
 export type OldMain = 'writable' | 'in-recovery' | 'fenced' | 'unreachable' | 'login-refused' | 'other-system' | 'no-code';
@@ -541,15 +595,24 @@ function noAnswerReason(inst: InstanceConfig): string {
   const rec = maintenance.maintenanceOf(inst);
   if (rec.hook === 'missing') return 'its build has no maintenance hook';
   if (rec.hook === 'none') return 'this app declares no maintenance hook';
-  return rec.lastError || 'it did not answer';
+  return rec.hookError || rec.lastError || 'it did not answer';
 }
 
-/** H-c: maintenance proven, the held answer, then the read-only layer. */
+/** H-c: maintenance proven, the save order's verdict (decision 6), the held answer, then the read-only layer. */
 export async function provenMaintenance(botId: string, noun: Noun, confirm: boolean): Promise<LaneOutcome | null> {
   const proof = await maintenance.requireMaintenance(botId, 'database');
   if (!proof.ok) return refusal(`The ${noun} was refused and nothing was changed: ${proof.error}`);
   const inst = containerManager.getBot(botId)!;
-  const held = heldVerdict(proof.held, confirm, noun, noAnswerReason(inst));
+  const saveOrder = maintenance.declaresSaveOrder(inst);
+  const mode = inst.fleetDb?.handover?.mode ?? null;
+  if (saveOrder) {
+    const db = inst.fleetDb!;
+    const read = await maintenance.readSaveRows({ container: db.containerName, user: db.user }, db.db);
+    if (!read.ok) return refusal(`The ${noun} was refused and nothing was changed: the manager could not read whether every bot process saved what it held (${read.error}). Try again.`);
+    const save = saveVerdict(read.rows, maintenance.maintenanceOf(inst), noun, mode);
+    if ('refuse' in save) return refusal(save.refuse);
+  }
+  const held = heldVerdict(proof.held, confirm, noun, noAnswerReason(inst), saveOrder, mode);
   if ('refuse' in held) return refusal(held.refuse);
   if ('ask' in held) return { success: false, text: held.ask, needsConfirm: true, status: 409 };
   const fence = await switchAdmissionNotice(botId, `the ${noun} was refused`, { skipNotice: true });
@@ -730,7 +793,9 @@ SELECT pg_current_wal_lsn();`);
     }
     if (login.login.canLogin) {
       const cause = "The bot's database login read open during the hand-over";
-      return undo(`${cause}, ${AGAIN}`, cause, "This lane did not block the login again; the manager's maintenance check blocks it at its next pass (every 30 seconds), since the bot's state is Maintenance or Off and cannot change while the hand-over is recorded.");
+      // The reconciler blocks the login again and drops the block mark, so a save-order app needs Running before Maintenance.
+      const again = maintenance.declaresSaveOrder(inst) ? 'so it was undone. Choose Running, then Maintenance again, then hand over.' : AGAIN;
+      return undo(`${cause}, ${again}`, cause, "This lane did not block the login again; the manager's maintenance check blocks it at its next pass (every 30 seconds), since the bot's state is Maintenance or Off and cannot change while the hand-over is recorded.");
     }
     if (login.login.sessions > 0) {
       const cause = `${login.login.sessions} session(s) of the bot's database role appeared during the hand-over`;
@@ -1506,6 +1571,7 @@ async function keepBlocked(inst: InstanceConfig, what: string): Promise<void> {
   const t = { container: db.containerName, user: db.user };
   const login = await dbLogin.readBotLogin(t);
   if (!login.ok || login.login.canLogin !== true) return;
+  maintenance.clearBlockedAt(inst.id);
   const again = await dbLogin.blockBotLogin(t);
   if (again.ok) await dbLogin.endBotSessions(t, 0);
   console.warn(`[Switch] ${inst.displayName}: the bot's database login was open ${what}; ${again.ok ? 'blocked it again' : `it could not be blocked (${again.error})`}`);

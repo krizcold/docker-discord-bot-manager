@@ -76,6 +76,7 @@ import { APP_CAPABILITIES } from '../../src/config/appCapabilities';
 import * as keptData from '../../src/instance/keptData';
 import { admitNewStart, startOnNewDatabase, KEPT_TEXT, newStartNames } from '../../src/instance/keptData';
 import { docker, resetDocker } from './nm2-docker';
+import { generationOf, resetSo, saveOrderAnswer } from './nm31-save';
 import { seedBot, stored, registryPath, clearRegistry } from './nm2-harness';
 import type { KeptOpRecord } from '../../src/types';
 
@@ -93,6 +94,8 @@ const gen = { meta: { code: 0, stdout: '0||\n' } as PsqlAnswer, restore: { code:
 const META_MISSING = 'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  role "dbm_meta" does not exist\n';
 
 function psqlAnswer(c: PsqlCall): PsqlAnswer {
+  const saved = saveOrderAnswer(c, generationOf(gen.meta.stdout));
+  if (saved) return saved;
   if (c.login === 'dbm_meta') return gen.meta;
   if (c.login === 'dbm_admin' && c.db === 'postgres') return c.input.includes('restore_state') ? gen.restore : c.input.includes('rolsuper') ? gen.rolsuper : { code: 1, stderr: 'ERROR: unexpected cluster read' };
   if (c.login === 'dbm_admin') return gen.admin;
@@ -180,6 +183,7 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(Date, 'now').mockReturnValue(NOW);
   resetDocker();
+  resetSo();
   docker.overrides.push({ match: a => a.join(' ').includes('SHOW ssl'), answer: { ok: true, stdout: 'off\n' } });
   clearRegistry();
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
@@ -500,6 +504,7 @@ describe('nm31 admit: A20, the generation read before anything changes', () => {
   ];
   it.each(passRows)('%s', async (_n, arrange) => {
     await seedMain();
+    h.psqlCalls.length = 0;
     arrange();
     const a = await admitNewStart('a');
     expect(a).toMatchObject({ ok: true, resumed: false, slot: true });

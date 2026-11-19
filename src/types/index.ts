@@ -425,9 +425,32 @@ export interface InstanceConfig {
 
 export type BotRunState = 'running' | 'maintenance' | 'off';
 
+/** The hook's answer a stop replaced: changes it could not save, or that it can't confirm every change is saved. */
+export type MaintenanceHeldBefore = { state: 'no'; guilds: number; files: number } | { state: 'unknown' };
+
 export type MaintenanceHeld =
-  | { state: 'yes' | 'unknown' | 'stopped' | 'not-running'; note?: string }
+  | { state: 'yes' | 'unknown' | 'not-running'; note?: string }
+  /** `shut`: the login read blocked with no session when the stop ran (an older record without it reads false). */
+  | { state: 'stopped'; before?: MaintenanceHeldBefore; shut?: boolean; note?: string }
   | { state: 'no'; guilds: number; files: number; note?: string };
+
+export type SaveVerdictKind = 'confirmed' | 'uncovered' | 'notAsked' | 'askedBlocked' | 'restored' | 'cantConfirm' | 'unread';
+
+/** Contract 11's save order as the maintenance record keeps it for the order it belongs to. */
+export interface MaintenanceSaveOrder {
+  orderId?: string;
+  generation?: number;
+  upMs?: number | null;
+  /** The row was written while the login read blocked, so no bot could answer it. */
+  askedBlocked?: boolean;
+  /** The login read blocked since the answers; removed whenever it is found or made open outside Running. */
+  blockedAt?: string;
+  /** The record's orderedAt once its `order` step committed. */
+  orderFor?: string;
+  verdict?: { kind: SaveVerdictKind; text: string };
+  orderFails?: number;
+  orderError?: { reason: string; login: 'open' | 'blocked' | 'unread' };
+}
 
 export interface MaintenanceRecord {
   state: BotRunState;
@@ -440,6 +463,8 @@ export interface MaintenanceRecord {
   held?: MaintenanceHeld;             // what the bot answered about the changes it holds in memory (contract 1's saved)
   prior?: { state: BotRunState; message: string };
   lastError?: string;                 // why the order is not settled, or the warning a settled order carries
+  hookError?: string;                 // why this order's hook was not confirmed
+  fleet?: MaintenanceSaveOrder;       // contract 11's save order of this record
 }
 
 export type MigrateTo = 'postgres' | 'file';

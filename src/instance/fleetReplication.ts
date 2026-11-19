@@ -114,18 +114,23 @@ function ownContainersOutsidePool(projectName: string, sidecarName: string): Pro
   });
 }
 
-function dbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+/** `timedOut`: the timer killed the docker CLI, so what the command did is not known; `code`: the exit code on a close. */
+function dbExec(containerName: string, args: string[], stdin?: string): Promise<{ ok: boolean; stdout: string; stderr: string; code?: number | null; timedOut?: true }> {
   return new Promise(resolve => {
     const started = startProcess('docker', ['exec', ...(stdin !== undefined ? ['-i'] : []), containerName, ...args]);
     if (!started.child) return resolve({ ok: false, stdout: '', stderr: 'docker exec failed' });
     const child = started.child;
     let stdout = '';
     let stderr = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), EXEC_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, EXEC_TIMEOUT_MS);
     child.stdout?.on('data', d => { stdout += d; });
     child.stderr?.on('data', d => { stderr += d; });
     child.on('error', () => { clearTimeout(timer); resolve({ ok: false, stdout, stderr: stderr || 'docker exec failed' }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ ok: code === 0, stdout, stderr }); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0 && !timedOut, stdout, stderr, code, ...(timedOut ? { timedOut: true as const } : {}) });
+    });
     if (stdin !== undefined) feedStdin(child.stdin, stdin);
   });
 }
@@ -413,7 +418,7 @@ export function generateCertPair(dir: string, publicHost: string): Promise<{ ok:
  * .new file left behind marks an install that stopped between the renames and
  * forces a fresh pair. rotated: a pair was installed over an existing cert.
  */
-async function ensureServerCert(containerName: string, publicHost: string, certHost: string | undefined): Promise<{ error: string | null; rotated: boolean }> {
+async function ensureServerCert(containerName: string, publicHost: string, certHost: string | undefined, again = 'press Enable again'): Promise<{ error: string | null; rotated: boolean }> {
   const crt = `${PGDATA}/server.crt`;
   const key = `${PGDATA}/server.key`;
   if (certHost === publicHost) {
@@ -443,10 +448,114 @@ async function ensureServerCert(containerName: string, publicHost: string, certH
       if (!put.ok) return { error: `certificate install failed (${path.posix.basename(file)}; the installed pair was not changed): ${put.stderr.trim()}`, rotated: false };
     }
     const swap = await dbExec(containerName, ['sh', '-c', `mv -f ${key}.new ${key} && mv -f ${crt}.new ${crt}`]);
-    if (!swap.ok) return { error: `certificate install failed while moving the new pair into place, so the key and certificate on disk may not match (the configuration was not reloaded; press Enable again to install a fresh pair): ${swap.stderr.trim()}`, rotated: false };
+    if (!swap.ok) return { error: `certificate install failed while moving the new pair into place, so the key and certificate on disk may not match (the configuration was not reloaded; ${again} to install a fresh pair): ${swap.stderr.trim()}`, rotated: false };
     return { error: null, rotated: hadCert };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+export const LOCAL_TLS_TIMING = { tryMs: 10_000, gapMs: 500, deadlineMs: 10_000 };
+export const LOCAL_TLS_READ_SQL = "SELECT pg_catalog.current_setting('ssl') || '|' || coalesce((SELECT s.ssl::text FROM pg_catalog.pg_stat_ssl s WHERE s.pid = pg_catalog.pg_backend_pid()), 'none');";
+export const LOCAL_PAIR_TEST = `test -f ${PGDATA}/server.crt && test -f ${PGDATA}/server.key && test ! -e ${PGDATA}/server.crt.new && test ! -e ${PGDATA}/server.key.new`;
+
+/** E1: 'complete', 'absent' only on exit 1 with nothing on stderr, else why docker did not say. */
+function localPairState(containerName: string): Promise<'complete' | 'absent' | { why: string }> {
+  return new Promise(resolve => {
+    execFileGuarded('docker', ['exec', containerName, 'sh', '-c', LOCAL_PAIR_TEST], { timeout: EXEC_TIMEOUT_MS }, (err, _stdout, stderr) => {
+      if (!err) return resolve('complete');
+      const text = String(stderr ?? '');
+      if (err.code === 1 && !err.killed && text === '') return resolve('absent');
+      const lead = 'docker did not say whether the certificate pair is in place: ';
+      resolve({ why: err.killed ? `${lead}no answer within ${EXEC_TIMEOUT_MS / 1000} s` : `${lead}${probeErrorTail(text || err.message)}` });
+    });
+  });
+}
+
+/** E7: new sessions over TLS on the container's loopback until one reads ssl on and its own session encrypted. */
+async function readLocalTls(containerName: string): Promise<{ why: string; off: boolean } | null> {
+  const { tryMs, gapMs, deadlineMs } = LOCAL_TLS_TIMING;
+  const call: dbLogin.PsqlCall = {
+    login: dbLogin.MANAGER_DB_ROLE,
+    args: ['exec', containerName, 'psql', '-X', '-w', '-d', `host=127.0.0.1 port=5432 dbname=postgres user=${dbLogin.MANAGER_DB_ROLE} sslmode=require connect_timeout=10`,
+      '-tA', '-v', 'ON_ERROR_STOP=1', '-c', LOCAL_TLS_READ_SQL],
+  };
+  const first = Date.now();
+  for (;;) {
+    const r = await dbLogin.runCall(containerName, call, tryMs);
+    if (r.ok && r.stdout.trim() === 'on|true') return null;
+    if (Date.now() - first > deadlineMs) {
+      if (!r.ok && /server does not support SSL/i.test(r.error)) return { why: `the server still refused TLS ${deadlineMs / 1000} s after the reload: ${r.error}`, off: true };
+      return { why: `no session over TLS opened within ${deadlineMs / 1000} s of the reload: ${r.ok ? `the session read '${r.stdout.trim()}'` : r.error}`, off: false };
+    }
+    await new Promise(res => setTimeout(res, gapMs));
+  }
+}
+
+/** The undo after the server refused TLS: 'done', or the stage that failed and why; `timedOut`: its outcome is not known. */
+export type TlsUndo = { stage: 'done' } | { stage: 'reset' | 'aside' | 'reload'; why: string; timedOut?: true };
+
+/**
+ * U1 to U3: ssl reset first, so a start never meets ssl saved beside a pair it cannot load; then the pair under its
+ * .new names, which the pair test reads as absent and the next install overwrites; then a reload.
+ */
+async function undoLocalTls(containerName: string): Promise<TlsUndo> {
+  const limit = `${dbLogin.PSQL_TIMEOUT_MS / 1000} s`;
+  let stage: 'reset' | 'aside' | 'reload' = 'reset';
+  try {
+    const reset = await clusterSql(containerName, 'ALTER SYSTEM RESET ssl;');
+    if (!reset.ok) return { stage, why: reset.timedOut ? `the database did not answer ALTER SYSTEM RESET ssl within ${limit}` : `ALTER SYSTEM RESET ssl failed: ${reset.error}` };
+    stage = 'aside';
+    const aside = await dbExec(containerName, ['sh', '-c', `mv -f ${PGDATA}/server.key ${PGDATA}/server.key.new && mv -f ${PGDATA}/server.crt ${PGDATA}/server.crt.new`]);
+    if (aside.timedOut) {
+      return { stage, why: `docker did not answer within ${EXEC_TIMEOUT_MS / 1000} s, so the manager can't confirm the certificate files were renamed`, timedOut: true };
+    }
+    if (!aside.ok) {
+      const said = aside.stderr.trim();
+      return { stage, why: said ? `the certificate files could not be renamed: ${said}` : `the certificate files could not be renamed (docker exec ${typeof aside.code === 'number' ? `exited ${aside.code}` : 'ended with no exit code'} with no message)` };
+    }
+    stage = 'reload';
+    const reload = await clusterSql(containerName, 'SELECT pg_reload_conf();');
+    if (!reload.ok) {
+      return reload.timedOut ? { stage, why: `the database did not answer pg_reload_conf() within ${limit}`, timedOut: true } : { stage, why: reload.error };
+    }
+    if (reload.stdout.trim() !== 't') return { stage, why: `pg_reload_conf answered '${reload.stdout.trim()}'` };
+    return { stage: 'done' };
+  } catch (err) {
+    return { stage, why: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Start on a new database (NM36): TLS on for a new database whose kept one had it, with an interim pair for localhost
+ * that Enable replaces. A complete pair is never replaced unless the server refused it (the undo). `off`: TLS is known
+ * not to be on.
+ */
+export async function ensureLocalTls(containerName: string): Promise<{ why: string; off: boolean; undo?: TlsUndo } | null> {
+  let mayBeOn = false;
+  try {
+    const pair = await localPairState(containerName);
+    if (typeof pair === 'object') return { why: pair.why, off: false };
+    if (pair === 'complete') {
+      mayBeOn = true;
+    } else {
+      const cert = await ensureServerCert(containerName, 'localhost', undefined, 'run it again');
+      if (cert.error) return { why: cert.error, off: true };
+    }
+    const limit = `${dbLogin.PSQL_TIMEOUT_MS / 1000} s`;
+    const alter = await clusterSql(containerName, 'ALTER SYSTEM SET ssl = on;');
+    if (!alter.ok) {
+      if (alter.timedOut) return { why: `the database did not answer ALTER SYSTEM SET ssl = on within ${limit}`, off: false };
+      return { why: `ssl = on could not be saved: ${alter.error}`, off: !mayBeOn };
+    }
+    mayBeOn = true;
+    const reload = await clusterSql(containerName, 'SELECT pg_reload_conf();');
+    if (!reload.ok) return { why: reload.timedOut ? `the database did not answer pg_reload_conf() within ${limit}` : `the configuration could not be reloaded: ${reload.error}`, off: false };
+    if (reload.stdout.trim() !== 't') return { why: `pg_reload_conf answered '${reload.stdout.trim()}'`, off: false };
+    const read = await readLocalTls(containerName);
+    return read?.off ? { ...read, undo: await undoLocalTls(containerName) } : read;
+  } catch (err) {
+    return { why: err instanceof Error ? err.message : String(err), off: !mayBeOn };
   }
 }
 

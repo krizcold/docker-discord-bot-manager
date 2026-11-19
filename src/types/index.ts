@@ -503,6 +503,7 @@ export interface KeptOpRecord {
   inDir: string;                      // the folder that comes into use
   owner?: { uid: number; gid: number; mode: number }; // new-start: the data folder's, read at admission
   newVolume?: string;                 // new-start with a database
+  keptSsl?: boolean;                  // new-start with a database: the kept database's ssl as admission read it (NM36)
   offMessage: string;                 // the Off order's message at admission
   sharers: string[];                  // instance ids held while the record is open
   step: KeptStep;

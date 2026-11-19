@@ -180,6 +180,7 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(Date, 'now').mockReturnValue(NOW);
   resetDocker();
+  docker.overrides.push({ match: a => a.join(' ').includes('SHOW ssl'), answer: { ok: true, stdout: 'off\n' } });
   clearRegistry();
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   for (const k of Object.keys(h.volumes)) delete h.volumes[k];

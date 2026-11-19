@@ -662,6 +662,20 @@ export function volumeState(name: string): 'exists' | 'absent' | 'unknown' {
 }
 
 /**
+ * The mounts of a container at `destination`, each `<type> <volume name, or a bind's source path>`. docker container
+ * inspect, so a missing name reads as gone and never matches an image or a volume.
+ */
+export function containerMounts(container: string, destination: string): { ok: true; mounts: string[] } | DockerReadFailure {
+  try {
+    const out = execDocker(['container', 'inspect', '-f',
+      `{{range .Mounts}}{{if eq .Destination ${JSON.stringify(destination)}}}{{.Type}} {{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}{{println}}{{end}}{{end}}`, container]);
+    return { ok: true, mounts: out.split('\n').map(l => l.trim()).filter(Boolean) };
+  } catch (err) {
+    return dockerReadFailure(err);
+  }
+}
+
+/**
  * Remove a Docker volume by name. A volume PROVEN absent counts as removed
  * (a retry after a partial teardown must not fail on the step a previous
  * attempt completed), but absence must come from docker saying "no such

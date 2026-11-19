@@ -180,6 +180,7 @@ beforeEach(() => {
   vi.spyOn(console, 'error').mockImplementation(() => {});
   vi.spyOn(Date, 'now').mockReturnValue(NOW);
   resetDocker();
+  docker.overrides.push({ match: a => a.join(' ').includes('SHOW ssl'), answer: { ok: true, stdout: 'off\n' } });
   clearRegistry();
   fs.rmSync(path.join(h.dir, 'bots'), { recursive: true, force: true });
   for (const k of Object.keys(h.volumes)) delete h.volumes[k];
@@ -523,7 +524,7 @@ describe('nm31 admit: passes, resumes and the record race', () => {
     expect(stored().keptOp).toEqual({
       op: 'new-start', set: names.stamp, stamp: names.stamp, startedAt: names.startedAt, parts: ['db', 'folder'],
       dataDir: dataDirOf('a'), outDir: names.outDir, inDir: names.inDir, owner: expect.objectContaining({ uid: expect.any(Number), gid: expect.any(Number), mode: expect.any(Number) }),
-      newVolume: names.newVolume, offMessage: 'Moving to a new database', sharers: [], step: 'recorded',
+      newVolume: names.newVolume, keptSsl: false, offMessage: 'Moving to a new database', sharers: [], step: 'recorded',
     });
   });
 

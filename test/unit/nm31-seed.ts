@@ -45,6 +45,7 @@ export const db = {
   login: { ok: true, login: { inRecovery: false, canLogin: true, sessions: 0 } } as Awaited<ReturnType<typeof dbLogin.readBotLogin>>,
   roles: { ok: true, wrote: [] } as dbLogin.ProvisionResult,
   checksums: { ok: true, stdout: 'on\n' } as { ok: boolean; stdout?: string; stderr?: string },
+  ssl: { ok: true, stdout: 'off\n' } as { ok: boolean; stdout?: string; stderr?: string },
 };
 
 /** Resets the fakes' answers and spies the reads every row shares; call from beforeEach. */
@@ -53,11 +54,12 @@ export function resetSeed(): void {
   Object.assign(gen, { meta: { code: 0, stdout: '0||\n' }, restore: { code: 0, stdout: '\n' } });
   Object.assign(db, {
     role: { ok: true }, open: { ok: true }, login: { ok: true, login: { inRecovery: false, canLogin: true, sessions: 0 } },
-    roles: { ok: true, wrote: [] }, checksums: { ok: true, stdout: 'on\n' },
+    roles: { ok: true, wrote: [] }, checksums: { ok: true, stdout: 'on\n' }, ssl: { ok: true, stdout: 'off\n' },
   });
   run.psql = psqlAnswer;
   stopsStop();
   docker.overrides.push({ match: a => a.join(' ').includes('SHOW data_checksums'), answer: () => ({ ...db.checksums }) });
+  docker.overrides.push({ match: a => a.join(' ').includes('SHOW ssl'), answer: () => ({ ...db.ssl }) });
   vi.spyOn(containerManager, 'appContainerRunning').mockImplementation(async (id: string) => (id in app ? app[id] : false));
   vi.spyOn(containerManager, 'runningAppContainer').mockImplementation(async () => 'f00dcafe1234');
   vi.spyOn(fleetReplica, 'instanceDataDir').mockImplementation(async (inst) => dataDirOf(inst.id));

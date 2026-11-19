@@ -51,17 +51,20 @@ export const owner = {
   gen: '-\n',
   /** S3's copy line after `copy|`. */
   copy: 'true|streaming',
+  /** S4's ssl setting after `ssl|`. */
+  ssl: 'off',
   s1Queue: [] as Scripted[],
   s1: null as Scripted | null,
   s2: null as Scripted | null,
   s3: null as Scripted | null,
+  s4: null as Scripted | null,
   calls: [] as PsqlCall[],
 };
 
 export function resetOwner(): void {
   Object.assign(owner, {
-    superuser: true, recovery: 'false', admin: 'missing', sessions: [0, 0], restorekind: '-', restore: '', gen: '-\n', copy: 'true|streaming',
-    s1Queue: [], s1: null, s2: null, s3: null, calls: [],
+    superuser: true, recovery: 'false', admin: 'missing', sessions: [0, 0], restorekind: '-', restore: '', gen: '-\n', copy: 'true|streaming', ssl: 'off',
+    s1Queue: [], s1: null, s2: null, s3: null, s4: null, calls: [],
   });
 }
 
@@ -80,10 +83,11 @@ function play(s: Scripted, c: PsqlCall, fallback: () => PsqlAnswer): PsqlAnswer 
   return a ?? fallback();
 }
 
-/** Which of the three scripts a call of the bot role runs. */
-export function scriptOf(c: PsqlCall): 'S1' | 'S2' | 'S3' | null {
+/** Which of the four scripts a call of the bot role runs. */
+export function scriptOf(c: PsqlCall): 'S1' | 'S2' | 'S3' | 'S4' | null {
   if (c.input.includes("'sessions2|'")) return 'S1';
   if (c.input.includes("'copy|'")) return 'S3';
+  if (c.input.includes("'ssl|'")) return 'S4';
   if (c.input.includes('smdb_manager.generation')) return 'S2';
   return null;
 }
@@ -105,6 +109,7 @@ export function ownerPsql(c: PsqlCall): PsqlAnswer | Promise<PsqlAnswer> {
     const stdout = owner.superuser ? `t\ncopy|${owner.copy}\n` : 'f\n';
     return owner.s3 ? play(owner.s3, c, () => ({ code: 0, stdout })) : { code: 0, stdout };
   }
+  if (which === 'S4') return owner.s4 ? play(owner.s4, c, () => ({ code: 0, stdout: `ssl|${owner.ssl}\n` })) : { code: 0, stdout: `ssl|${owner.ssl}\n` };
   return { code: 1, stderr: 'ERROR: unexpected script for the bot role' };
 }
 

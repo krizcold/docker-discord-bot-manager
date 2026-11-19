@@ -79,10 +79,11 @@ export const KEPT_TEXT = {
   aNaNotSuper: (user: string) => `${NA_LEAD}, and the bot's role ${user} is not a superuser of that database, so the manager does not read the database as that role${NOTHING}`,
   aNaRead: (user: string, err: string) => `${NA_LEAD}, and the manager could not read the database as the bot's role ${user} over the container's socket (${err}), so it can't confirm that nothing uses it${NOTHING}`,
   aNaDown: `${NA_LEAD}, and the database is not running, so the manager cannot check it as the bot's role; choose Off again, which starts it alone${NOTHING}`,
+  aSslUnknown: (err: string) => `The manager can't confirm whether the bot's database runs with TLS (${err}); the new database gets TLS only when this one has it${NOTHING}`,
 
   // Start on a new database
-  nDoneMain: (p: { old: string; outDir: string; newVolume: string; certs: boolean; replication: boolean; sharers: string | null }) =>
-    `Started on a new database. The volume ${p.old} and the data folder ${p.outDir} are kept unchanged under Kept data. The new database runs alone on the volume ${p.newVolume}, with data checksums on and the bot's login open; the Database URL is unchanged. The bot is stopped and its State is Running. ${TAIL_BOOT(p.certs)}; ${OTHER_FILES}`
+  nDoneMain: (p: { old: string; outDir: string; newVolume: string; certs: boolean; replication: boolean; sharers: string | null; tls?: boolean }) =>
+    `Started on a new database. The volume ${p.old} and the data folder ${p.outDir} are kept unchanged under Kept data. The new database runs alone on the volume ${p.newVolume}, with data checksums on${p.tls ? ', TLS on as the kept database had it (with a certificate of its own, which Enable replication replaces),' : ''} and the bot's login open; the Database URL is unchanged. The bot is stopped and its State is Running. ${TAIL_BOOT(p.certs)}; ${OTHER_FILES}`
     + (p.replication ? ' Copies on other machines still follow the kept database: enable replication here, then Copy join code and Add a live copy on each machine.' : '')
     + (p.sharers ? ` ${p.sharers} also use this database and still have their old data folders; run ${NEW_START} on each before you start it.` : ''),
   nDoneFolder: (p: { outDir: string; certs: boolean }) =>
@@ -95,6 +96,18 @@ export const KEPT_TEXT = {
     : `Run it again to go on, or Put back to ${gone === 'folder' ? 'close this' : 'return to the earlier database'}; the data folder stays missing. Until one of them finishes, the bot stays stopped and Start is refused.`),
   nNotOurs: (folder: string, names: string[]) => `the data folder ${folder} holds ${names.slice(0, 5).join(', ')} that this start did not write, so the manager can't confirm which folder is the bot's`,
   nChecksums: 'the new database does not have data checksums on, so it was not made from an empty volume by this start',
+  nTls: (why: string) => `TLS could not be turned on for the new database (${why}); the kept database had it on, and a Database URL that asks for TLS does not connect without it`,
+  nTlsUnknown: (why: string) => `the manager can't confirm that TLS is on for the new database (${why}); the kept database had it on, and a Database URL that asks for TLS does not connect without it`,
+  /** `unknown`: the reload got no answer, so whether it happened is not known. */
+  nTlsOff: (why: string, reload?: string, unknown = false) => `TLS could not be turned on for the new database (${why}), so the manager turned it off again and set its certificate aside${!reload ? ''
+    : unknown ? `; the manager can't confirm the configuration was reloaded after that (${reload}), so the running database may still show ssl on until its next reload or restart`
+    : `; the configuration was not reloaded after that (${reload}), so the running database still shows ssl on until its next reload or restart`}; the new database runs without TLS while the Database URL asks for TLS, and Run it again makes a fresh certificate`,
+  /** `unknown`: the renames got no answer, so whether they happened is not known. */
+  nTlsAside: (why: string, aside: string, unknown = false) => `TLS could not be turned on for the new database (${why}), so the manager turned it off again, but ${unknown ? 'the manager can\'t confirm its certificate was set aside' : 'its certificate could not be set aside'} (${aside}); the new database runs without TLS while the Database URL asks for TLS`,
+  nTlsStuck: (why: string, reset: string) => `TLS could not be turned on for the new database (${why}), and turning it off again failed (${reset}), so ssl may still be saved beside a certificate the database cannot load: a restart of the new database may fail, and Put back returns the kept database`,
+  nMount: (mounts: string[], volume: string) => `docker shows ${mounts.length ? mounts.join(', ') : 'no mount'} at the database's data folder, not the new volume ${volume}, so the manager did not turn TLS on`,
+  nMountGone: 'the database container is gone (docker says no such container), so the manager did not turn TLS on',
+  nMountUnknown: (err: string) => `docker did not say which volume the database container runs on (${err}), so the manager did not turn TLS on`,
   nGone: (dataDir: string) => `the data folder ${dataDir} is missing, so nothing was set aside; put the folder back there and run it again`,
   nRuns: (name: string) => `the bot's container (or its database or copy container) runs although this has not finished; stop it in a shell with docker stop ${name}, then run it again`,
   nRunsUnnamed: (project: string) => `the bot's container (or its database or copy container) runs although this has not finished, and the manager could not name it; stop the app container of ${project} in a shell, then run it again`,
@@ -183,7 +196,7 @@ export const KEPT_TEXT = {
 };
 
 /** T-N-OPEN's step words, in order, with the step whose save marks each done. */
-const NEW_START_DONE: Array<{ words: string; after: KeptStep; part: 'store' | 'db' | 'all'; copy?: string }> = [
+const NEW_START_DONE: Array<{ words: string; after: KeptStep; part: 'store' | 'db' | 'tls' | 'all'; copy?: string }> = [
   { words: 'the database was stopped', after: 'db-stopped', part: 'store', copy: 'the live copy was stopped' },
   { words: 'its service was taken out of the compose', after: 'db-out', part: 'store' },
   { words: 'the earlier data was recorded as kept', after: 'swapped', part: 'all' },
@@ -192,16 +205,19 @@ const NEW_START_DONE: Array<{ words: string; after: KeptStep; part: 'store' | 'd
   { words: 'the new data folder is in use', after: 'folder', part: 'all' },
   { words: 'the new database\'s service was written', after: 'db-in', part: 'db' },
   { words: 'the new database started', after: 'db-up', part: 'db' },
+  { words: 'TLS is on', after: 'db-up', part: 'tls' },
   { words: 'its login is open', after: 'login', part: 'db' },
 ];
 const NEW_START_ORDER: KeptStep[] = ['recorded', 'db-stopped', 'db-out', 'swapped', 'folder', 'db-in', 'db-up', 'login'];
 
 /** The step words of an open new-start record, from its last saved step. */
-export function newStartDone(rec: Pick<KeptOpRecord, 'step' | 'parts'>): string[] {
+export function newStartDone(rec: Pick<KeptOpRecord, 'step' | 'parts' | 'keptSsl'>): string[] {
   const at = NEW_START_ORDER.indexOf(rec.step);
   const store = rec.parts.includes('db') || rec.parts.includes('copy');
+  const shown = (part: 'store' | 'db' | 'tls' | 'all') => part === 'all' || (part === 'store' ? store
+    : part === 'tls' ? rec.parts.includes('db') && rec.keptSsl === true : rec.parts.includes('db'));
   return NEW_START_DONE
-    .filter(d => (d.part === 'all' || (d.part === 'store' ? store : rec.parts.includes('db'))) && NEW_START_ORDER.indexOf(d.after) <= at)
+    .filter(d => shown(d.part) && NEW_START_ORDER.indexOf(d.after) <= at)
     .map(d => (d.copy && !rec.parts.includes('db') ? d.copy : d.words));
 }
 
@@ -471,6 +487,31 @@ export async function readOwnerCopy(container: string, user: string): Promise<{ 
   return read ? { ok: true, read } : { ok: false, error: answered(r.stdout) };
 }
 
+/** S4, on postgres: the server's ssl setting, which any role may read. */
+export const OWNER_SSL_READ = "BEGIN TRANSACTION READ ONLY;\nSELECT 'ssl|' || pg_catalog.current_setting('ssl');\nROLLBACK;\n";
+
+/** A21's answer: exactly one line, `on` or `off` (admin) or `ssl|on` or `ssl|off` (S4); undefined otherwise. */
+export function parseKeptSsl(stdout: string, from: 'admin' | 'owner'): boolean | undefined {
+  const lines = readLines(stdout);
+  if (lines.length !== 1) return undefined;
+  const m = (from === 'admin' ? /^(on|off)$/ : /^ssl\|(on|off)$/).exec(lines[0]);
+  return m ? m[1] === 'on' : undefined;
+}
+
+/** A21: the kept database's ssl, read live as dbm_admin, or as the bot's role (S4) on a database with no dbm_admin. */
+export async function readKeptSsl(db: NonNullable<InstanceConfig['fleetDb']>, opts: { noAdmin?: boolean } = {}): Promise<{ ok: true; on: boolean } | { ok: false; error: string }> {
+  if (opts.noAdmin) {
+    const r = await ownerRead(db.containerName, db.user, 'postgres', OWNER_SSL_READ);
+    if (!r.ok) return { ok: false, error: 'refused' in r ? r.refused : r.error };
+    const on = parseKeptSsl(r.stdout, 'owner');
+    return on === undefined ? { ok: false, error: answered(r.stdout) } : { ok: true, on };
+  }
+  const r = await dbLogin.runCall(db.containerName, dbLogin.clusterPsql(db.containerName, 'SHOW ssl'));
+  if (!r.ok) return { ok: false, error: r.error };
+  const on = parseKeptSsl(r.stdout, 'admin');
+  return on === undefined ? { ok: false, error: answered(r.stdout) } : { ok: true, on };
+}
+
 /** S1's verdict wherever it runs: the refusal, or null when the database may be stopped under Invariant A. */
 export function ownerClusterRefusal(user: string, r: Awaited<ReturnType<typeof readOwnerCluster>>): string | null {
   if (!r.ok) return 'refused' in r ? r.refused : KEPT_TEXT.aNaRead(user, r.error);
@@ -580,19 +621,23 @@ async function admitFresh(botId: string, inst: InstanceConfig, variant: NewStart
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return no(409, KEPT_TEXT.aFolder(dir, errText(err)));
     }
   }
+  let keptSsl = false;
   if (variant === 'main') {
     const state = dockerClient.volumeState(names.newVolume);
     if (state === 'unknown') return no(409, KEPT_TEXT.aDocker(names.newVolume));
     if (state === 'exists' || containerManager.keptVolumeReason(names.newVolume)) return no(409, KEPT_TEXT.aNamesVolume(names.newVolume));
     const gen = await generationRefusal(db!, { noAdmin: na !== null });
     if (gen) return no(409, gen);
+    const ssl = await readKeptSsl(db!, { noAdmin: na !== null });
+    if (!ssl.ok) return no(409, KEPT_TEXT.aSslUnknown(ssl.error));
+    keptSsl = ssl.on;
   }
   const sharers = variant === 'main' ? fleetBackup.databaseSharers(containerManager.getBot(botId) ?? inst, url).filter(b => b.id !== botId).map(b => b.id) : [];
   const record: KeptOpRecord = {
     op: 'new-start', set: names.stamp, stamp: names.stamp, startedAt: names.startedAt,
     parts: variant === 'main' ? ['db', 'folder'] : variant === 'copy' ? ['copy', 'folder'] : ['folder'],
     dataDir, outDir: names.outDir, inDir: names.inDir, owner,
-    ...(variant === 'main' ? { newVolume: names.newVolume } : {}),
+    ...(variant === 'main' ? { newVolume: names.newVolume, keptSsl } : {}),
     offMessage, sharers, step: 'recorded',
     ...(na !== null ? { noAdminOff: na } : {}),
   };
@@ -1033,6 +1078,20 @@ async function runNewStart(botId: string, a: NewStartAdmitted): Promise<KeptAnsw
       const sums = await dbLogin.runCall(db.containerName, dbLogin.clusterPsql(db.containerName, 'SHOW data_checksums'));
       if (!sums.ok) return open(`the manager can't confirm the new database has data checksums on (${sums.error})`);
       if (sums.stdout.trim() !== 'on') return open(KEPT_TEXT.nChecksums);
+      if (rec.keptSsl === true) {
+        const m = dockerClient.containerMounts(db.containerName, '/var/lib/postgresql/data');
+        if (!('ok' in m)) return open('gone' in m ? KEPT_TEXT.nMountGone : KEPT_TEXT.nMountUnknown(m.error));
+        if (m.mounts.length !== 1 || m.mounts[0] !== `volume ${rec.newVolume}`) return open(KEPT_TEXT.nMount(m.mounts, rec.newVolume ?? ''));
+        const tls = await fleetReplication.ensureLocalTls(db.containerName);
+        if (tls) {
+          const u = tls.undo;
+          return open(!u ? (tls.off ? KEPT_TEXT.nTls(tls.why) : KEPT_TEXT.nTlsUnknown(tls.why))
+            : u.stage === 'done' ? KEPT_TEXT.nTlsOff(tls.why)
+            : u.stage === 'reload' ? KEPT_TEXT.nTlsOff(tls.why, u.why, !!u.timedOut)
+            : u.stage === 'aside' ? KEPT_TEXT.nTlsAside(tls.why, u.why, !!u.timedOut)
+            : KEPT_TEXT.nTlsStuck(tls.why, u.why));
+        }
+      }
       const s = save('db-up');
       if (s) return s;
     }
@@ -1059,7 +1118,7 @@ async function runNewStart(botId: string, a: NewStartAdmitted): Promise<KeptAnsw
   const certs = fs.existsSync(path.join(rec.dataDir, 'db-certs'));
   const sharers = rec.sharers.map(id => containerManager.getBot(id)?.displayName ?? id);
   const text = variant === 'main'
-    ? KEPT_TEXT.nDoneMain({ old: kept?.db?.volume ?? '', outDir: rec.outDir, newVolume: rec.newVolume ?? '', certs, replication: !!kept?.db?.replication, sharers: sharers.length ? listText(sharers) : null })
+    ? KEPT_TEXT.nDoneMain({ old: kept?.db?.volume ?? '', outDir: rec.outDir, newVolume: rec.newVolume ?? '', certs, replication: !!kept?.db?.replication, sharers: sharers.length ? listText(sharers) : null, tls: rec.keptSsl === true })
     : variant === 'copy'
       ? KEPT_TEXT.nDoneCopy({ volume: kept?.copy?.volume ?? '', outDir: rec.outDir, certs })
       : KEPT_TEXT.nDoneFolder({ outDir: rec.outDir, certs });

@@ -219,10 +219,10 @@ describe('nm34 admit: Start on a new database under Invariant A', () => {
     expect(stop).toBeGreaterThan(0);
     expect(up).toBeGreaterThan(stop);
     const before = docker.calls.slice(0, stop).filter(a => a.includes('psql') && a.includes(CONTAINER));
-    expect(before.length).toBe(3);
+    expect(before.length).toBe(4);
     for (const a of before) expect(isOwnerShape(a, user())).toBe(true);
     const reads = run.psqlCalls.filter(c => c.args.includes(CONTAINER) && docker.calls.indexOf(c.args) < stop);
-    expect(reads.map(scriptOf)).toEqual(['S1', 'S2', 'S1']);
+    expect(reads.map(scriptOf)).toEqual(['S1', 'S2', 'S4', 'S1']);
     for (const c of reads) expect(c.input.startsWith('BEGIN TRANSACTION READ ONLY;')).toBe(true);
     expect(docker.calls.slice(stop + 1, up).filter(a => a[0] !== 'inspect' && a.join(' ').includes(CONTAINER))).toEqual([]);
     expect(docker.calls.slice(stop + 1, up).filter(a => a[0] === 'inspect').every(a => a[1] === '-f')).toBe(true);
@@ -548,34 +548,34 @@ describe('nm34 admit: the re-check before N1', () => {
       const { answer, before } = clock ? await pressWithClock() : await press();
       const text = textOf(user());
       expect(answer).toEqual(refused(text));
-      expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S1']);
+      expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S4', 'S1']);
       closedUnchanged(before, text);
     });
   });
 
   it('RC3: at the re-check the database reads stopped: no read, on to N1 and the clean end state', async () => {
     await fixture();
-    owner.s2 = () => {
+    owner.s4 = () => {
       docker.running[CONTAINER] = false;
-      return { code: 0, stdout: '-\n' };
+      return { code: 0, stdout: 'ssl|off\n' };
     };
     const { answer, before } = await press();
     expectMainDone(before, answer);
-    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2']);
+    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S4']);
   });
 
   it('RC4: at the re-check docker gives no answer for the database: the run stops with the record open', async () => {
     await fixture();
-    owner.s2 = () => {
+    owner.s4 = () => {
       docker.running[CONTAINER] = null;
-      return { code: 0, stdout: '-\n' };
+      return { code: 0, stdout: 'ssl|off\n' };
     };
     const { answer } = await press();
     const reason = `docker did not say whether the database container ${CONTAINER} runs`;
     expect(answer).toEqual({ success: false, status: 409, open: true, error: KEPT_TEXT.nOpen(reason, []) });
     const rec = bot().keptOp!;
     expect(rec).toMatchObject({ op: 'new-start', step: 'recorded', lastError: reason, noAdminOff: bot().maintenance!.orderedAt });
-    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2']);
+    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S4']);
     expect(docker.calls.filter(a => !READS(a))).toEqual([]);
   });
 });

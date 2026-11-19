@@ -2730,6 +2730,7 @@
           ['folder', 'the new data folder is in use'],
           ['db-in', store === 'db' ? 'the new database\'s service was written' : null],
           ['db-up', store === 'db' ? 'the new database started' : null],
+          ['db-up', store === 'db' && rec.keptSsl === true ? 'TLS is on' : null],
           ['login', store === 'db' ? 'its login is open' : null],
         ];
       } else {

@@ -307,7 +307,7 @@ describe('nm34 run: Put back of the open record, then Start again', () => {
     const answer: any = await press();
     expect(answer).toMatchObject({ success: true });
     expect(answer.text).toMatch(/^Started on a new database\. /);
-    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S1']);
+    expect(owner.calls.map(scriptOf)).toEqual(['S1', 'S2', 'S4', 'S1']);
     expect(bot().keptLast).toMatchObject({ op: 'new-start', outcome: 'done' });
     expect(bot().keptSets).toEqual([expect.objectContaining({ by: 'new-start', db: before.inst.fleetDb })]);
     expect(bot().maintenance).toMatchObject({ state: 'running', settled: true });

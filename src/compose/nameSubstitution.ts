@@ -5,7 +5,8 @@
  * replace all occurrences across the compose structure.
  *
  * Replacements:
- *   name: field, service keys, container_name, depends_on, hostname,
+ *   name: field, service keys, container_name, container:<name> references,
+ *   depends_on, hostname,
  *   env values, labels, volume references and container paths, working_dir,
  *   command, entrypoint, healthcheck test, volume and network keys with their
  *   service references (an external one keeps the docker object it names),
@@ -19,6 +20,8 @@ export interface NameSubstitutionResult {
   content: string;
   /** Build-log lines naming each env value the substitution changed. */
   notes: string[];
+  /** Each container_name, as it stands in content, that holds the instance name because the source held the compose name there. */
+  scopedContainerNames: Set<string>;
 }
 
 /**
@@ -34,8 +37,17 @@ export function substituteComposeNames(
   titleName?: string,
 ): NameSubstitutionResult {
   const notes: string[] = [];
-  if (!originalName || originalName === newSanitizedName) {
-    return { content: composeContent, notes };
+  const scopedContainerNames = new Set<string>();
+  if (!originalName) return { content: composeContent, notes, scopedContainerNames };
+  if (originalName === newSanitizedName) {
+    let same: any;
+    try { same = YAML.parseDocument(composeContent).toJSON(); } catch { same = null; }
+    const sameServices = same && typeof same === 'object' && same.services && typeof same.services === 'object' ? same.services : {};
+    for (const service of Object.values(sameServices) as any[]) {
+      const fixed = service && typeof service === 'object' ? service.container_name : undefined;
+      if (typeof fixed === 'string' && fixed.includes(originalName)) scopedContainerNames.add(fixed);
+    }
+    return { content: composeContent, notes, scopedContainerNames };
   }
 
   const parsed = YAML.parseDocument(composeContent);
@@ -71,6 +83,23 @@ export function substituteComposeNames(
   if (doc.services && typeof doc.services === 'object') {
     const oldServiceNames = Object.keys(doc.services);
     const serviceNameMap = buildServiceNameMap(oldServiceNames, originalName, newSanitizedName);
+    const oldContainerNames = new Set<string>();
+    for (const service of Object.values(doc.services) as any[]) {
+      if (service && typeof service === 'object' && typeof service.container_name === 'string') oldContainerNames.add(service.container_name);
+    }
+    // A reference to a container of this compose (its container_name, or the default
+    // <project>-<service>-<n>) follows the rename; one to a container outside it stays.
+    const renameContainerRef = (ref: unknown): unknown => {
+      const m = typeof ref === 'string' ? /^container:([^:]+)(:.*)?$/.exec(ref) : null;
+      if (!m) return ref;
+      let to: string | undefined;
+      if (oldContainerNames.has(m[1])) to = rename(m[1]);
+      else {
+        const key = oldServiceNames.find(k => m[1].startsWith(`${originalName}-${k}-`) && /^[0-9]+$/.test(m[1].slice(originalName.length + k.length + 2)));
+        if (key !== undefined) to = `${newSanitizedName}-${serviceNameMap[key] || key}-${m[1].slice(originalName.length + key.length + 2)}`;
+      }
+      return to === undefined ? ref : `container:${to}${m[2] ?? ''}`;
+    };
 
     // Rename service keys
     const newServices: Record<string, any> = {};
@@ -84,7 +113,11 @@ export function substituteComposeNames(
     for (const [serviceName, service] of Object.entries(doc.services) as Array<[string, any]>) {
       if (!service || typeof service !== 'object') continue;
 
-      if (typeof service.container_name === 'string') service.container_name = rename(service.container_name);
+      if (typeof service.container_name === 'string') {
+        const renamed = rename(service.container_name);
+        if (renamed !== service.container_name) scopedContainerNames.add(renamed);
+        service.container_name = renamed;
+      }
       if (typeof service.hostname === 'string') service.hostname = rename(service.hostname);
 
       // depends_on (array or object form)
@@ -139,6 +172,11 @@ export function substituteComposeNames(
           return vol;
         });
       }
+
+      for (const field of ['network_mode', 'ipc', 'pid']) {
+        if (service[field] !== undefined) service[field] = renameContainerRef(service[field]);
+      }
+      if (Array.isArray(service.volumes_from)) service.volumes_from = service.volumes_from.map(renameContainerRef);
 
       if (typeof service.working_dir === 'string') service.working_dir = rename(service.working_dir);
       for (const field of ['command', 'entrypoint'] as const) {
@@ -219,7 +257,7 @@ export function substituteComposeNames(
     doc[section] = renamed;
   }
 
-  return { content: YAML.stringify(doc, { lineWidth: 0 }), notes };
+  return { content: YAML.stringify(doc, { lineWidth: 0 }), notes, scopedContainerNames };
 }
 
 // ─── Internal Helpers ───

@@ -48,7 +48,7 @@ import {
   BackingSecret,
   ComposeResult
 } from '../templates/compose';
-import { applyVariableSubstitution } from '../templates/variableSubstitution';
+import { applyVariableSubstitution, substituteVariablesInNames } from '../templates/variableSubstitution';
 import {
   processComposeForCasaOS,
   getMainServiceWebPort,
@@ -5732,6 +5732,10 @@ async function buildGitInstanceHeld(
     appName = instance.sanitizedName;
 
     // Apply name substitution if we have an original compose name to replace
+    let scopedContainerNames: Set<string> | undefined;
+    if (originalComposeName === appName) {
+      scopedContainerNames = substituteComposeNames(rawCompose, originalComposeName, appName).scopedContainerNames;
+    }
     if (originalComposeName && originalComposeName !== appName) {
       let substituted;
       try {
@@ -5740,6 +5744,7 @@ async function buildGitInstanceHeld(
         throw new Error(`Name substitution refused: ${err?.message || err}`);
       }
       rawCompose = substituted.content;
+      scopedContainerNames = substituted.scopedContainerNames;
       emit(`[Info] Substituted compose name: ${originalComposeName} -> ${appName}`, 'info');
       for (const note of substituted.notes) emit(note, 'info');
       // Substitution renamed the build-target service (its key and x-casaos.build),
@@ -5762,7 +5767,7 @@ async function buildGitInstanceHeld(
 
     // Apply deployment processing (mode-aware: casaos vs plain docker)
     {
-      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
+      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId), scopedContainerNames: substituteVariablesInNames(scopedContainerNames, botWithEnv) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
       droppedGatewayBinds = processed.droppedGatewayBinds || [];

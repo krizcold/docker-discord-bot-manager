@@ -100,6 +100,11 @@ export function applyVariableSubstitution(compose: string, bot: BotConfig): stri
   });
 }
 
+/** Names taken from a compose before applyVariableSubstitution, as they stand in the compose after it. */
+export function substituteVariablesInNames(names: ReadonlySet<string> | undefined, bot: BotConfig): Set<string> | undefined {
+  return names && new Set([...names].map(name => applyVariableSubstitution(name, bot)));
+}
+
 /**
  * Validates that all required variables are present in the bot config.
  * Returns list of missing required variables.

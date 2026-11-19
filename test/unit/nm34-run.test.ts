@@ -174,7 +174,7 @@ describe('nm34 run: a crash, then a press that resumes under Invariant A', () =>
     expect(isOwnerShape(reads[0], user())).toBe(true);
     expect(owner.calls.map(scriptOf)).toEqual(['S1']);
     expect(owner.calls[0].input.startsWith('BEGIN TRANSACTION READ ONLY;')).toBe(true);
-    expect(docker.calls.slice(stop + 1, up).filter(a => a[0] !== 'inspect' && a.join(' ').includes(CONTAINER))).toEqual([]);
+    expect(docker.calls.slice(stop + 1, up).filter(a => a[0] !== 'inspect' && a[0] !== 'container' && a.join(' ').includes(CONTAINER))).toEqual([]);
     expect(docker.calls.slice(stop + 1, up).filter(a => a[0] === 'inspect').every(a => a[1] === '-f')).toBe(true);
   });
 

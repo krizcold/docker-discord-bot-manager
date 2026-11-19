@@ -233,10 +233,10 @@ export function processComposeForCasaOS(
   composeContent: string,
   appName: string,
   bot: BotConfig,
-  opts: { mode?: DeploymentMode; hostBotDir?: string } = {}
+  opts: { mode?: DeploymentMode; hostBotDir?: string; scopedContainerNames?: ReadonlySet<string> } = {}
 ): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[]; networkNotes?: string[] } {
   if ((opts.mode ?? 'casaos') === 'docker') {
-    return processComposeForDocker(composeContent, appName, bot, opts.hostBotDir);
+    return processComposeForDocker(composeContent, appName, bot, opts.hostBotDir, opts.scopedContainerNames);
   }
   const pcs = getPCSEnvironment();
   const doc = parseDocument(composeContent);
@@ -244,7 +244,7 @@ export function processComposeForCasaOS(
 
   // ── Ensure name field ──
   delete compose.version;
-  scopeContainerNames(compose, appName);
+  scopeContainerNames(compose, appName, opts.scopedContainerNames);
   if (!compose.name) compose.name = appName;
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
@@ -727,17 +727,19 @@ function assertUniqueContainerNames(services: Record<string, Record<string, unkn
 }
 
 /**
- * A fixed container_name the name substitution did not scope (any in a compose
- * with no top-level name; in a named one, any without the compose name) would be
- * shared by every instance of the source and the second one would fail to start.
- * Each one not already scoped to this instance is prefixed with the app name, and
+ * A fixed container_name the name substitution did not scope would be shared by
+ * every instance of the source and the second one would fail to start. The
+ * substitution scopes one that held the compose's top-level name, and reports
+ * those names in scoped; they are left alone. So are the app name itself and a
+ * name starting with the app name and a hyphen. Every other one is prefixed with
+ * the app name (all of them when the caller has no scoped set), and
  * the repo's name stays resolvable as an alias on the project's own networks,
  * which namespaceNamedNetworks keeps per instance; never on an external or
  * platform network, where instances meet. A service with none of those networks
  * keeps its name, since nothing would carry the alias. A `container:<name>`
  * reference follows the rename.
  */
-function scopeContainerNames(compose: Record<string, unknown>, appName: string): void {
+function scopeContainerNames(compose: Record<string, unknown>, appName: string, scoped?: ReadonlySet<string>): void {
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;
   if (!services || typeof services !== 'object') return;
   const declared = (compose.networks && typeof compose.networks === 'object' ? compose.networks : {}) as Record<string, unknown>;
@@ -754,6 +756,7 @@ function scopeContainerNames(compose: Record<string, unknown>, appName: string):
     if (!service || typeof service !== 'object') continue;
     const fixed = service.container_name;
     if (typeof fixed !== 'string' || !fixed || fixed === appName || fixed.startsWith(`${appName}-`)) continue;
+    if (scoped?.has(fixed)) continue;
     const rename = (): void => {
       service.container_name = `${appName}-${fixed}`;
       renamed.set(fixed, service.container_name as string);
@@ -951,13 +954,14 @@ export function processComposeForDocker(
   composeContent: string,
   appName: string,
   bot: BotConfig,
-  hostBotDir?: string
+  hostBotDir?: string,
+  scopedContainerNames?: ReadonlySet<string>
 ): { content: string; sidecarInjected: boolean; droppedGatewayBinds?: string[]; networkNotes?: string[] } {
   const pcs = getPCSEnvironment();
   const compose = parseDocument(composeContent).toJSON() as Record<string, unknown>;
 
   delete compose.version;
-  scopeContainerNames(compose, appName);
+  scopeContainerNames(compose, appName, scopedContainerNames);
   if (!compose.name) compose.name = appName;
 
   const services = compose.services as Record<string, Record<string, unknown>> | undefined;

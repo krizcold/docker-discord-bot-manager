@@ -46,6 +46,8 @@ function openText(lead: string, reason: string, done: string[], next: string): s
 /** What one status read says of a live copy put back. `unknown`: the probe failed and docker did not say the container is stopped. */
 export type CopyNote = { streams: string } | { down: string } | { stopped: string } | { unknown: string };
 
+const UP_REMOVE = (c: string) => `; remove it in a shell with docker rm ${c}, then run it again, so that compose makes the container anew from the deployed compose`;
+
 export const KEPT_TEXT = {
   // Admission
   aOff: `${NEW_START} needs the bot Off: choose Off in its State window first${NOTHING}`,
@@ -108,6 +110,12 @@ export const KEPT_TEXT = {
   nMount: (mounts: string[], volume: string) => `docker shows ${mounts.length ? mounts.join(', ') : 'no mount'} at the database's data folder, not the new volume ${volume}, so the manager did not turn TLS on`,
   nMountGone: 'the database container is gone (docker says no such container), so the manager did not turn TLS on',
   nMountUnknown: (err: string) => `docker did not say which volume the database container runs on (${err}), so the manager did not turn TLS on`,
+  nUpMount: (mounts: string[], volume: string) => `docker shows ${mounts.length ? mounts.join(', ') : 'no mount'} at the database's data folder, not the new volume ${volume}, so the manager wrote nothing into that database`,
+  nUpMountUnknown: (volume: string, err: string) => `docker did not say whether the database container runs on the new volume ${volume} (${err}), so the manager wrote nothing more into its database`,
+  nUpMountGone: (volume: string) => `the database container is gone (docker says no such container), so the manager could not check it against the new volume ${volume} and wrote nothing more`,
+  nUpIdle: (c: string, remove: boolean) => `, and did not start the container ${c}${remove ? UP_REMOVE(c) : ''}`,
+  nUpStopped: (c: string, started: boolean, remove: boolean) => `; ${started ? `compose started the container ${c}, and it is stopped again` : `the container ${c} is stopped now`}${remove ? UP_REMOVE(c) : ''}`,
+  nUpNotStopped: (c: string, err: string, how: 'started' | 'found' | 'unread', remove: boolean) => `; ${how === 'started' ? `compose started the container ${c}, and it did not stop` : how === 'found' ? `the container ${c} did not stop` : `the manager can't confirm whether the container ${c} runs or stopped`} (${err}); stop it in a shell with docker stop ${c}${remove ? `, remove it with docker rm ${c} and run it again, so that compose makes the container anew from the deployed compose` : ''}`,
   nGone: (dataDir: string) => `the data folder ${dataDir} is missing, so nothing was set aside; put the folder back there and run it again`,
   nRuns: (name: string) => `the bot's container (or its database or copy container) runs although this has not finished; stop it in a shell with docker stop ${name}, then run it again`,
   nRunsUnnamed: (project: string) => `the bot's container (or its database or copy container) runs although this has not finished, and the manager could not name it; stop the app container of ${project} in a shell, then run it again`,
@@ -847,6 +855,26 @@ function newStartSwap(inst: InstanceConfig, rec: KeptOpRecord, variant: NewStart
   return { add };
 }
 
+/**
+ * Why N8 stopped at a read of the new database's data mount. A container that runs, or may run, on something docker
+ * did not show as the new volume is stopped here. `started`: compose started it in this pass. `afterStart`: the stop
+ * came at the read after `up -d`, so the container is taken as running without another read. A stop that fails is
+ * worded from its own answer: "did not stop" when docker said so, "can't confirm" when docker did not answer, and
+ * also when nothing was started, the running read had no answer and `docker stop` itself failed: no read showed that
+ * the container ever ran.
+ */
+async function upMountReason(container: string, volume: string, mount: containerManager.DataMountStop, started: boolean, afterStart: boolean): Promise<string> {
+  if ('gone' in mount) return KEPT_TEXT.nUpMountGone(volume);
+  const remove = 'mounts' in mount;
+  const lead = 'mounts' in mount ? KEPT_TEXT.nUpMount(mount.mounts, volume) : KEPT_TEXT.nUpMountUnknown(volume, mount.error);
+  const ran = afterStart ? true : await containerManager.containerRunningExact(container);
+  if (ran === false) return lead + KEPT_TEXT.nUpIdle(container, remove);
+  const stop = await containerManager.stopContainerOutcome(container, 60);
+  if (stop.ok) return lead + KEPT_TEXT.nUpStopped(container, started, remove);
+  const unknown = stop.unconfirmed || (ran === null && !stop.stillRuns);
+  return lead + KEPT_TEXT.nUpNotStopped(container, stop.error, unknown ? 'unread' : started ? 'started' : 'found', remove);
+}
+
 /** The forward run from the step after the record's (3.3); every step reads its effect first, so a resume repeats none. */
 async function runNewStart(botId: string, a: NewStartAdmitted): Promise<KeptAnswer> {
   let rec = a.record;
@@ -1069,7 +1097,8 @@ async function runNewStart(botId: string, a: NewStartAdmitted): Promise<KeptAnsw
       const volume = dockerClient.volumeState(db.volume);
       if (volume === 'unknown') return open(`docker did not say whether the volume ${db.volume} exists`);
       dbLogin.forgetManagerRole(db.containerName);
-      const up = await containerManager.startFleetDbSidecar(botId);
+      const up = await containerManager.startFleetDbSidecar(botId, { dataVolume: db.volume });
+      if (up.mount) return open(await upMountReason(db.containerName, db.volume, up.mount, up.started === true, up.ran !== undefined));
       if (!up.success) return open(`the new database did not start (${up.error})`);
       const now = containerManager.getBot(botId);
       if (!now) return refuse(404, 'Bot not found');

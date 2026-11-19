@@ -207,6 +207,7 @@ describe('nm34 admit: Start on a new database under Invariant A', () => {
     expect(records[0].noAdminOff).toBe(orderedAt);
     expect(changing()).toEqual([
       ['stop', '--time', '60', CONTAINER],
+      ['sh', `docker compose -f "${composePathOf('a')}" -p "bota" up --no-start fleet-postgres`],
       ['sh', `docker compose -f "${composePathOf('a')}" -p "bota" up -d fleet-postgres`],
     ]);
   });
@@ -224,7 +225,7 @@ describe('nm34 admit: Start on a new database under Invariant A', () => {
     const reads = run.psqlCalls.filter(c => c.args.includes(CONTAINER) && docker.calls.indexOf(c.args) < stop);
     expect(reads.map(scriptOf)).toEqual(['S1', 'S2', 'S4', 'S1']);
     for (const c of reads) expect(c.input.startsWith('BEGIN TRANSACTION READ ONLY;')).toBe(true);
-    expect(docker.calls.slice(stop + 1, up).filter(a => a[0] !== 'inspect' && a.join(' ').includes(CONTAINER))).toEqual([]);
+    expect(docker.calls.slice(stop + 1, up).filter(a => a[0] !== 'inspect' && a[0] !== 'container' && a.join(' ').includes(CONTAINER))).toEqual([]);
     expect(docker.calls.slice(stop + 1, up).filter(a => a[0] === 'inspect').every(a => a[1] === '-f')).toBe(true);
   });
 });

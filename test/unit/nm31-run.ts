@@ -1,15 +1,19 @@
 // The NM31 run fakes: docker through child_process (nm2-docker's execFile and spawn, a psql spawn answered by
 // `run.psql`, and an exec that answers compose up, pg_isready and rm -f), a renameSync hook, and dockerClient's
-// volumeState. State lives on globalThis so the vi.mock factories and the test share it. No src import here: the
-// factories load this file before the modules they mock.
+// volumeState. docker container inspect (execFileSync) answers the data mount the deployed compose names. State lives
+// on globalThis so the vi.mock factories and the test share it. No src import here: the factories load this file
+// before the modules they mock.
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
+import YAML from 'yaml';
 import { docker } from './nm2-docker';
 import { isHolder } from './dump-fake';
 
 export type PsqlCall = { login: string; db: string; input: string; args: string[] };
 export type PsqlAnswer = { code: number; stdout?: string; stderr?: string };
 export type ExecAnswer = { ok: boolean; stdout?: string; stderr?: string; hang?: boolean };
+/** One answer of docker container inspect: its output, docker's error text, or no answer within the call's limit. */
+export type MountAnswer = { out: string } | { stderr: string } | { timeout: true };
 
 export interface RunState {
   volumes: Record<string, 'exists' | 'absent' | 'unknown'>;
@@ -29,10 +33,19 @@ export interface RunState {
   beforeRm: null | ((target: string) => void);
   /** When a list: lstatSync answers uid 0 (a file the root manager delivered) and chownSync and lchownSync record their path here instead of acting. */
   rootOwned: null | string[];
+  /** Set by every compose up command (with or without --no-start), cleared by the next mount read. */
+  upRead: boolean;
+  /** The -f file of the last compose up command. */
+  upFile: string | null;
+  /** Mount reads by container name; a list gives one answer per read (null: the default) and the default once it is used up. */
+  mounts: Record<string, MountAnswer | Array<MountAnswer | null>>;
 }
 
 function fresh(): RunState {
-  return { volumes: {}, psql: null, psqlCalls: [], execCalls: [], execOverrides: [], beforeRename: null, afterRename: null, holderToBase: false, beforeRm: null, rootOwned: null };
+  return {
+    volumes: {}, psql: null, psqlCalls: [], execCalls: [], execOverrides: [], beforeRename: null, afterRename: null, holderToBase: false, beforeRm: null, rootOwned: null,
+    upRead: false, upFile: null, mounts: {},
+  };
 }
 
 export const run: RunState = ((globalThis as { __nm31Run?: RunState }).__nm31Run ??= fresh());
@@ -43,15 +56,46 @@ export function resetRun(): void {
 
 const unquote = (s: string) => s.replace(/^"|"$/g, '');
 
-/** The built-in exec answers: compose up starts the service's container, pg_isready answers for a running one, rm -f removes. */
+const DATA_MOUNT = '/var/lib/postgresql/data';
+type Files = { read: null | ((file: string) => string) };
+const files: Files = ((globalThis as { __nm31Files?: Files }).__nm31Files ??= { read: null });
+
+/** What docker shows at the data folder of container c, made from the compose of the last up: the volume its service names. */
+function composeMount(c: string): MountAnswer {
+  const gone = { stderr: `Error: No such container: ${c}` };
+  if (!run.upFile || !files.read) return gone;
+  let compose: any;
+  try { compose = YAML.parse(files.read(run.upFile)); } catch { return gone; }
+  const svc = Object.values((compose?.services ?? {}) as Record<string, any>).find(s => s?.container_name === c);
+  if (!svc) return gone;
+  const entry = ((svc.volumes ?? []) as any[]).find(v => (typeof v === 'string' ? v.split(':')[1] : v?.target) === DATA_MOUNT);
+  if (!entry) return { out: '' };
+  const source = String(typeof entry === 'string' ? entry.split(':')[0] : entry.source);
+  if (typeof entry === 'string' ? /^[./]/.test(source) : entry.type === 'bind') return { out: `bind ${source}\n` };
+  return { out: `volume ${compose?.volumes?.[source]?.name ?? source}\n` };
+}
+
+/** docker container inspect of a container's mounts, as execFileSync answers or throws it. */
+export function mountRead(args: string[]): string {
+  docker.calls.push(args);
+  run.upRead = false;
+  const c = String(args[args.length - 1]);
+  const set = run.mounts[c];
+  const a = (Array.isArray(set) ? set.shift() : set) ?? composeMount(c);
+  if ('timeout' in a) throw Object.assign(new Error('spawnSync docker ETIMEDOUT'), { code: 'ETIMEDOUT', stderr: '' });
+  if ('stderr' in a) throw Object.assign(new Error(`Command failed: docker ${args.join(' ')}\n${a.stderr}`), { status: 1, stderr: Buffer.from(`${a.stderr}\n`), stdout: Buffer.from('') });
+  return a.out;
+}
+
+/** The built-in exec answers: compose up makes the service's container and, without --no-start, starts it; pg_isready answers for a running one; rm -f removes. */
 function builtIn(command: string, fsReal: typeof import('fs')): ExecAnswer {
-  const up = /^docker compose -f "([^"]+)" -p "[^"]+" up -d ([A-Za-z0-9._-]+)$/.exec(command);
+  const up = /^docker compose -f "([^"]+)" -p "[^"]+" up (-d|--no-start) ([A-Za-z0-9._-]+)$/.exec(command);
   if (up) {
     const text = fsReal.readFileSync(up[1], 'utf-8');
-    const block = text.split(/\n(?=  \S)/).find(b => b.startsWith(`  ${up[2]}:`));
+    const block = text.split(/\n(?=  \S)/).find(b => b.startsWith(`  ${up[3]}:`));
     const name = block ? /container_name: (\S+)/.exec(block)?.[1] : undefined;
-    if (!name) return { ok: false, stderr: `no such service: ${up[2]}` };
-    docker.running[name] = true;
+    if (!name) return { ok: false, stderr: `no such service: ${up[3]}` };
+    if (up[2] === '-d') docker.running[name] = true;
     return { ok: true };
   }
   const ready = /^docker exec "([^"]+)" pg_isready /.exec(command);
@@ -67,6 +111,7 @@ function builtIn(command: string, fsReal: typeof import('fs')): ExecAnswer {
 export async function childProcessMock(real: typeof import('child_process'), fsReal: typeof import('fs')): Promise<Record<string, unknown>> {
   const fake = await import('./nm2-docker');
   const base = await fake.childProcessMock(real) as { spawn: (...a: unknown[]) => unknown; execFile: unknown };
+  files.read = file => fsReal.readFileSync(file, 'utf-8');
   const spawn = (cmd: string, args: string[], opts?: unknown) => {
     if (cmd !== 'docker' || !args.includes('psql') || (run.holderToBase && isHolder(args))) return base.spawn(cmd, args, opts);
     docker.calls.push(args);
@@ -93,6 +138,11 @@ export async function childProcessMock(real: typeof import('child_process'), fsR
     const cb = (typeof optsOrCb === 'function' ? optsOrCb : maybeCb) as ((err: Error | null, out: string, errOut: string) => void) | undefined;
     run.execCalls.push(command);
     docker.calls.push(['sh', command]);
+    const up = /^docker compose -f "([^"]+)" -p "[^"]+" up (?:-d|--no-start) /.exec(command);
+    if (up) {
+      run.upRead = true;
+      run.upFile = up[1];
+    }
     const child = new EventEmitter();
     void (async () => {
       const over = run.execOverrides.find(o => o.match(command));
@@ -102,7 +152,13 @@ export async function childProcessMock(real: typeof import('child_process'), fsR
     })();
     return child;
   };
-  return { ...real, execFile: base.execFile, spawn, exec, default: { ...real, execFile: base.execFile, spawn, exec } };
+  const execFileSync = (cmd: string, args: string[], opts?: unknown): unknown => {
+    if (cmd !== 'docker') return (real.execFileSync as any)(cmd, args, opts);
+    if (args[0] === 'container' && args[1] === 'inspect') return mountRead(args);
+    throw new Error(`the fake docker does not run: docker ${args.join(' ')}`);
+  };
+  const wrap = { execFile: base.execFile, spawn, exec, execFileSync };
+  return { ...real, ...wrap, default: { ...real, ...wrap } };
 }
 
 export function fsMock(real: typeof import('fs')): Record<string, unknown> {

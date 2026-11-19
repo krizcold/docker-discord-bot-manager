@@ -48,7 +48,7 @@ import {
   BackingSecret,
   ComposeResult
 } from '../templates/compose';
-import { applyVariableSubstitution } from '../templates/variableSubstitution';
+import { applyVariableSubstitution, substituteVariablesInNames } from '../templates/variableSubstitution';
 import {
   processComposeForCasaOS,
   getMainServiceWebPort,
@@ -997,6 +997,13 @@ export function keptOpOpen(inst: InstanceConfig | null | undefined): KeptOpRecor
   return rec && rec.op !== 'delete' ? rec : null;
 }
 
+/** A new-start whose new database is recorded as in use and has not passed its start checks. */
+export function newDatabaseUnchecked(inst: InstanceConfig | null | undefined): boolean {
+  const rec = inst?.keptOp;
+  return !!rec && rec.op === 'new-start' && rec.parts.includes('db') && inst?.fleetDb?.volume === rec.newVolume
+    && rec.step !== 'db-up' && rec.step !== 'login';
+}
+
 const KEPT_GATE_WHAT: Record<MigrateGateKey, string> = {
   start: 'Start',
   build: 'Update and Build',
@@ -1169,19 +1176,29 @@ export function containerRunningExact(name: string): Promise<boolean | null> {
   });
 }
 
-/** `docker stop` of one container by its exact name, then the inspect read; a missing container counts as stopped. */
-export async function stopContainerExact(name: string, graceSec: number): Promise<{ ok: true } | { ok: false; error: string }> {
-  const failed = await new Promise<string | null>(resolve => {
+/**
+ * `docker stop` of one container by its exact name, then the inspect read; a missing container counts as stopped.
+ * unconfirmed: the stop or the read after it got no answer, so whether the container runs is not known.
+ * stillRuns: the stop exited 0 and the read after it showed the container running.
+ */
+export async function stopContainerOutcome(name: string, graceSec: number): Promise<{ ok: true } | { ok: false; error: string; unconfirmed: boolean; stillRuns: boolean }> {
+  const failed = await new Promise<{ error: string; unconfirmed: boolean } | null>(resolve => {
     execFile('docker', ['stop', '--time', String(graceSec), name], { timeout: (graceSec + 30) * 1000 }, (err, _stdout, stderr) => {
       if (!err) return resolve(null);
       const text = errorText({ stderr, message: err.killed ? `docker did not answer within ${graceSec + 30} s` : err.message });
-      resolve(/no such container/i.test(text) ? null : text);
+      resolve(/no such container/i.test(text) ? null : { error: text, unconfirmed: err.killed === true });
     });
   });
-  if (failed) return { ok: false, error: failed };
+  if (failed) return { ok: false, ...failed, stillRuns: false };
   const running = await containerRunningExact(name);
-  if (running === null) return { ok: false, error: `docker did not say whether ${name} stopped` };
-  return running ? { ok: false, error: `${name} still runs` } : { ok: true };
+  if (running === null) return { ok: false, error: `docker did not say whether ${name} stopped`, unconfirmed: true, stillRuns: false };
+  return running ? { ok: false, error: `${name} still runs`, unconfirmed: false, stillRuns: true } : { ok: true };
+}
+
+/** `docker stop` of one container by its exact name, then the inspect read; a missing container counts as stopped. */
+export async function stopContainerExact(name: string, graceSec: number): Promise<{ ok: true } | { ok: false; error: string }> {
+  const r = await stopContainerOutcome(name, graceSec);
+  return r.ok ? r : { ok: false, error: r.error };
 }
 
 /** Takes the managed database services out of the deployed compose; a compose without them is not written. */
@@ -1766,14 +1783,30 @@ export function unfinishedRetireRefusal(retiringAt: string): string {
   return `The fleet database of this instance was being removed (since ${retiringAt}) and the removal did not finish, so its volume may already be gone and a start would create an empty database in its place. Run the decommission or the re-seed again to finish it`;
 }
 
+/** What docker showed in place of the one data mount a start expects: the lines it printed, or why it printed none. */
+export type DataMountStop = { mounts: string[] } | dockerClient.DockerReadFailure;
+
+/** Null when a read of a container's data mount shows exactly the named volume; else what docker showed. */
+export function dataMountStop(read: ReturnType<typeof dockerClient.containerMounts>, volume: string): DataMountStop | null {
+  if (!('ok' in read)) return read;
+  return read.mounts.length === 1 && read.mounts[0] === `volume ${volume}` ? null : { mounts: read.mounts };
+}
+
+const DB_DATA_MOUNT = '/var/lib/postgresql/data';
+
 /**
  * Bring ONLY the managed database sidecar up and wait for it to accept
  * connections. Stopping an instance takes its whole compose project down, so
  * the stale-primary re-seed (PLAN_REPLICATION.md Stage 5) has no database to
  * dump until this runs; the app service is deliberately left down.
  * retireRetry: the caller proved the volume predates the retiring mark.
+ * dataVolume: the container is created first and started only when docker shows its data folder on this volume, and
+ * nothing is written into it unless docker shows the same after the start. A stop at the read after the start answers
+ * `ran`, whether the container ran before the start (null: docker did not say), and `started` true only when it did not.
  */
-export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: boolean; handedOver?: boolean } = {}): Promise<LaneResult> {
+export async function startFleetDbSidecar(
+  botId: string, opts: { retireRetry?: boolean; handedOver?: boolean; dataVolume?: string } = {},
+): Promise<LaneResult & { mount?: DataMountStop; started?: boolean; ran?: boolean | null }> {
   const instance = getBot(botId);
   const fleetDb = instance?.fleetDb;
   if (!instance || !fleetDb) return { success: false, error: 'This instance hosts no managed fleet database' };
@@ -1794,10 +1827,26 @@ export async function startFleetDbSidecar(botId: string, opts: { retireRetry?: b
       if (svc?.container_name === fleetDb.containerName && /^[A-Za-z0-9._-]+$/.test(key)) { service = key; break; }
     }
   } catch { /* default stands */ }
+  const expected = opts.dataVolume;
+  const mountStop = (volume: string) => {
+    const mount = dataMountStop(dockerClient.containerMounts(fleetDb.containerName, DB_DATA_MOUNT), volume);
+    return mount && { success: false, error: `docker did not show the database container on the volume ${volume}`, mount };
+  };
+  let ran: boolean | null = null;
   try {
+    if (expected !== undefined) {
+      await execAsync(`docker compose -f "${composePath}" -p "${appName}" up --no-start ${service}`);
+      const stop = mountStop(expected);
+      if (stop) return { ...stop, started: false };
+      ran = await containerRunningExact(fleetDb.containerName);
+    }
     await execAsync(`docker compose -f "${composePath}" -p "${appName}" up -d ${service}`);
   } catch (err) {
     return { success: false, error: String(err) };
+  }
+  if (expected !== undefined) {
+    const stop = mountStop(expected);
+    if (stop) return { ...stop, started: ran === false, ran };
   }
   const deadline = Date.now() + START_DB_READY.deadlineMs;
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -5683,6 +5732,10 @@ async function buildGitInstanceHeld(
     appName = instance.sanitizedName;
 
     // Apply name substitution if we have an original compose name to replace
+    let scopedContainerNames: Set<string> | undefined;
+    if (originalComposeName === appName) {
+      scopedContainerNames = substituteComposeNames(rawCompose, originalComposeName, appName).scopedContainerNames;
+    }
     if (originalComposeName && originalComposeName !== appName) {
       let substituted;
       try {
@@ -5691,6 +5744,7 @@ async function buildGitInstanceHeld(
         throw new Error(`Name substitution refused: ${err?.message || err}`);
       }
       rawCompose = substituted.content;
+      scopedContainerNames = substituted.scopedContainerNames;
       emit(`[Info] Substituted compose name: ${originalComposeName} -> ${appName}`, 'info');
       for (const note of substituted.notes) emit(note, 'info');
       // Substitution renamed the build-target service (its key and x-casaos.build),
@@ -5713,7 +5767,7 @@ async function buildGitInstanceHeld(
 
     // Apply deployment processing (mode-aware: casaos vs plain docker)
     {
-      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId) });
+      const processed = processComposeForCasaOS(rawCompose, appName, botWithEnv, { mode: isCasaOS ? 'casaos' : 'docker', hostBotDir: isCasaOS ? undefined : hostBotDirFor(botId), scopedContainerNames: substituteVariablesInNames(scopedContainerNames, botWithEnv) });
       composeContent = processed.content;
       sidecarInjected = processed.sidecarInjected;
       droppedGatewayBinds = processed.droppedGatewayBinds || [];

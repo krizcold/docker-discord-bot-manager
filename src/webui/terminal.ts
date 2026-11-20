@@ -5,6 +5,7 @@
  * CLI and bridges its stdio to the browser over the existing /ws WebSocket
  * (multiplexed as terminal:* messages). Using the CLI (not the raw Engine socket)
  * keeps it cross-platform - it works on the Windows Docker Desktop named pipe too.
+ * A terminal:start with `tty: true` asks the Docker daemon for a pseudo-terminal instead (execTty.ts).
  *
  * File operations: against the bot's running container they run scoped `docker exec`
  * commands (argv arrays, never a shell string, so paths cannot inject). The
@@ -27,6 +28,7 @@ import { getDataPath } from '../git/repoManager';
 import { getDeploymentMode } from '../casaos/detector';
 import { grantToApp, grantFd } from '../templates/pcsProcessing';
 import { feedStdin } from '../docker/childStdin';
+import { dockerSocketPath, ExecTty, openExecTty, resizeSize, termSize } from './execTty';
 
 const DATA_ROOT = process.env.DATA_ROOT || '/DATA';
 
@@ -1333,7 +1335,12 @@ export async function fsRename(botId: string, target: string, fromPath: string, 
 
 // ─── Interactive terminal (multiplexed over the /ws connection) ─────────────
 
-interface TermSession { child: ChildProcess }
+interface TermSession { child?: ChildProcess; tty?: ExecTty; closed?: boolean }
+
+// Output the channel has not sent yet: over the first mark the daemon's stream is no longer read; it is read again
+// under the second, or once none of the shell's own frames is waiting (other frames can keep the channel full).
+const TTY_HOLD_OVER = 1024 * 1024;
+const TTY_READ_UNDER = 256 * 1024;
 
 function send(ws: WebSocket, type: string, extra: Record<string, unknown> = {}): void {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type, ...extra }));
@@ -1342,17 +1349,83 @@ function send(ws: WebSocket, type: string, extra: Record<string, unknown> = {}):
 export function closeTerminal(ws: WebSocket): void {
   const sess = (ws as any).__term as TermSession | undefined;
   if (sess?.child) { try { sess.child.kill('SIGKILL'); } catch { /* ignore */ } }
+  if (sess) {
+    sess.closed = true;
+    sess.tty?.close();
+  }
   (ws as any).__term = undefined;
 }
 
-// `docker exec` args for an interactive shell. The wrapper sets the initial TTY
-// size, then execs bash if present else sh.
+// The wrapper sets the initial TTY size, then execs bash if present else sh.
+function shellWrap(cols: number, rows: number): string {
+  return `stty rows ${rows} cols ${cols} 2>/dev/null; if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi`;
+}
+
+// `docker exec` args for an interactive shell.
 function buildExecArgs(container: string, useTty: boolean, cols: number, rows: number): string[] {
   const args = ['exec', '-i'];
   if (useTty) args.push('-t');
-  const wrap = `stty rows ${rows} cols ${cols} 2>/dev/null; if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi`;
-  args.push(container, '/bin/sh', '-c', wrap);
+  args.push(container, '/bin/sh', '-c', shellWrap(cols, rows));
   return args;
+}
+
+// The shell under a pseudo-terminal the Docker daemon allocates; the session exists from before the first call, so a
+// channel that closes while the daemon answers still ends the stream.
+async function startTty(ws: WebSocket, target: string, msg: any): Promise<void> {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  const socketPath = dockerSocketPath();
+  if (!socketPath) {
+    send(ws, 'terminal:error', { message: 'DOCKER_HOST does not name a local socket, so no terminal can be asked from the Docker daemon' });
+    return;
+  }
+  const sess: TermSession = {};
+  (ws as any).__term = sess;
+  const mine = () => (ws as any).__term === sess;
+  const { cols, rows } = termSize(msg.cols, msg.rows);
+  let tty: ExecTty | undefined;
+  let held = false;
+  let waiting = 0;
+  const relay = (d: Buffer) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    waiting += 1;
+    ws.send(JSON.stringify({ type: 'terminal:data', data: d.toString('base64') }), () => {
+      waiting -= 1;
+      if (held && (waiting === 0 || ws.bufferedAmount < TTY_READ_UNDER)) {
+        held = false;
+        tty?.resume();
+      }
+    });
+    if (!held && ws.bufferedAmount > TTY_HOLD_OVER) {
+      held = true;
+      tty?.pause();
+    }
+  };
+  try {
+    tty = await openExecTty({
+      socketPath,
+      container: target,
+      cmd: ['/bin/sh', '-c', shellWrap(cols, rows)],
+      cols,
+      rows,
+      onData: relay,
+      onExit: (code, running) => {
+        if (mine()) (ws as any).__term = undefined;
+        send(ws, 'terminal:exit', running ? { code, running: true } : { code });
+      },
+    });
+  } catch (err) {
+    if (sess.closed) return;
+    if (mine()) (ws as any).__term = undefined;
+    send(ws, 'terminal:error', { message: err instanceof Error ? err.message : String(err) });
+    return;
+  }
+  if (sess.closed) {
+    tty.close();
+    return;
+  }
+  sess.tty = tty;
+  if (held) tty.pause();
+  send(ws, 'terminal:ready', { container: target });
 }
 
 async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
@@ -1367,6 +1440,11 @@ async function startTerminal(ws: WebSocket, msg: any): Promise<void> {
   if (match.state !== 'running') { send(ws, 'terminal:error', { message: 'Container is not running' }); return; }
 
   closeTerminal(ws);
+
+  if (msg.tty === true) {
+    await startTty(ws, target, msg);
+    return;
+  }
 
   const cols = Number(msg.cols) || 80;
   const rows = Number(msg.rows) || 24;
@@ -1422,15 +1500,21 @@ export function handleTerminalMessage(ws: WebSocket, raw: string): boolean {
   const sess = (ws as any).__term as TermSession | undefined;
   switch (msg.type) {
     case 'terminal:start':
-      void startTerminal(ws, msg);
+      startTerminal(ws, msg).catch((err) => {
+        closeTerminal(ws);
+        send(ws, 'terminal:error', { message: `the manager failed while opening the shell (${err instanceof Error ? err.message : String(err)})` });
+      });
       break;
     case 'terminal:input':
-      if (sess?.child?.stdin) sess.child.stdin.write(Buffer.from(String(msg.data || ''), 'base64'));
+      if (sess?.tty) sess.tty.write(Buffer.from(String(msg.data || ''), 'base64'));
+      else if (sess?.child?.stdin) sess.child.stdin.write(Buffer.from(String(msg.data || ''), 'base64'));
       break;
-    case 'terminal:resize':
-      // Live resize needs a real PTY (node-pty follow-up); initial size is set by
-      // buildExecArgs. No-op here to keep the CLI path dependency-free.
+    case 'terminal:resize': {
+      // Only a session under the daemon's pseudo-terminal can change size; a docker exec child keeps its first size.
+      const size = sess?.tty ? resizeSize(msg.cols, msg.rows) : null;
+      if (size) sess!.tty!.resize(size.cols, size.rows);
       break;
+    }
     case 'terminal:stop':
       closeTerminal(ws);
       break;

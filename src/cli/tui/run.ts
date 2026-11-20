@@ -9,6 +9,7 @@ import { Session } from './session';
 import { startRead } from './manager';
 import { editBody, editorCommand, EditRequest, EditResult } from './editbody';
 import { runShell, shellBanner, ShellDeps } from './shell';
+import { RouteDeps, runShellRoute } from './shellroute';
 
 const SHOW_CURSOR = '\x1b[?25h';
 
@@ -54,6 +55,18 @@ function handOff(command: string, modes: ScreenModes): Promise<string | undefine
 /** The shell hand-off: docker exec in a bot container with the terminal's stdio; the result is the frame's notice. */
 export function shellHandOff(container: string, modes: ScreenModes, deps: ShellDeps = {}): Promise<string | undefined> {
   return suspended(modes, shellBanner(container, process.stdout.columns || 80), () => runShell(container, deps));
+}
+
+/** A terminal on the manager's local socket has no docker of its own, so its shell goes through the manager's console route. */
+export function shellWay(client: { onSocket?: boolean }): 'route' | 'docker' {
+  return client.onSocket === true ? 'route' : 'docker';
+}
+
+/** The shell hand-off through the manager's console route; the result is the frame's notice. */
+export function shellRouteHandOff(
+  client: Pick<Client, 'openWs'>, botId: string, container: string, modes: ScreenModes, deps: RouteDeps = {},
+): Promise<string | undefined> {
+  return suspended(modes, shellBanner(container, process.stdout.columns || 80), () => runShellRoute(client, botId, container, deps));
 }
 
 /** The config body hand-off: the editor on a private copy of the body, then the outcome goes back to the form. */
@@ -125,7 +138,10 @@ export async function runTui(client: Client, deps: { ink?: InkApi } = {}): Promi
       if (outcome.shell !== undefined && outcome.next) {
         state = outcome.next;
         process.stdin.pause();
-        state = { ...state, notice: await shellHandOff(outcome.shell, modes) };
+        const notice = shellWay(client) === 'route'
+          ? await shellRouteHandOff(client, state.botId ?? '', outcome.shell, modes)
+          : await shellHandOff(outcome.shell, modes);
+        state = { ...state, notice };
         continue;
       }
       if (!outcome.next || command === undefined) break;

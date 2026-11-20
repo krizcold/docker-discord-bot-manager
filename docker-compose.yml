@@ -51,6 +51,7 @@ services:
     networks:
       - internal
       - pcs
+      - terminal
 
   discordbotmanagerapp:
     image: ghcr.io/krizcold/docker-discord-bot-manager:latest
@@ -69,6 +70,9 @@ services:
       DATA_DIR: /data
       PORT: 8080
       MANAGER_GATE_NETWORK: discordbotmanager_internal
+      # The local socket the terminal service's dbm connects to, and the user it runs as.
+      MANAGER_SOCKET: /run/dbm/manager.sock
+      MANAGER_SOCKET_OWNER: "1000:1000"
 
       # Platform variables
       PUID: $PUID
@@ -105,6 +109,9 @@ services:
       - type: bind
         source: $DATA_ROOT/AppData/
         target: /DATA/AppData/
+      - type: volume
+        source: manager_socket
+        target: /run/dbm
     networks:
       internal:
         aliases:
@@ -131,13 +138,59 @@ services:
           description:
             en_us: CasaOS AppData directory for metadata placement and volume management.
 
+  # The dbm terminal frame in a browser (ttyd). AppShield reaches it only when its
+  # BACKEND_HOST names this service; it holds no Docker socket and no data folder.
+  discordbotmanagerterminal:
+    image: ghcr.io/krizcold/docker-discord-bot-manager:latest
+    container_name: discordbotmanagerterminal
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    tmpfs:
+      - /tmp:size=16m
+    entrypoint: ["ttyd", "-W", "-O", "-m", "1", "-p", "8080", "node", "/app/dist/cli/dbm.js"]
+    environment:
+      DBM_SOCKET: /run/dbm/manager.sock
+      DATA_DIR: /data
+      HOST_DATA_DIR: $DATA_ROOT/AppData/discordbotmanager/data
+      TZ: $TZ
+    volumes:
+      - type: volume
+        source: manager_socket
+        target: /run/dbm
+        read_only: true
+    networks:
+      - terminal
+
+    cpu_shares: 50
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
 networks:
   internal:
     name: discordbotmanager_internal
     driver: bridge
+  terminal:
+    name: discordbotmanager_terminal
+    driver: bridge
+    internal: true
   pcs:
     name: pcs
     external: true
+
+volumes:
+  manager_socket: {}
 
 x-casaos:
   architectures:

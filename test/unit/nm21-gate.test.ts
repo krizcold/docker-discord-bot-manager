@@ -280,12 +280,13 @@ describe('NM21: the other platforms', () => {
     await s.close();
   });
 
-  it('13. the Yundera compose routes AppShield to the gate alias', () => {
+  it('13. the Yundera compose routes AppShield to the gate alias or the terminal service', () => {
     const root = path.join(__dirname, '..', '..');
     const y = YAML.parse(fs.readFileSync(path.join(root, 'docker-compose.yml'), 'utf8'));
     const app = y.services.discordbotmanagerapp;
     expect(app.environment.MANAGER_GATE_NETWORK).toBe(y.networks.internal.name);
-    expect(app.networks.internal.aliases).toContain(y.services.discordbotmanager.environment.BACKEND_HOST);
+    const terminal = y.services.discordbotmanagerterminal ? ['discordbotmanagerterminal'] : [];
+    expect([...app.networks.internal.aliases, ...terminal]).toContain(y.services.discordbotmanager.environment.BACKEND_HOST);
     expect(app.networks.pcs?.aliases).toBeUndefined();
     for (const f of ['docker-compose.remote.yml', 'docker-compose.standalone.yml']) {
       const other = YAML.parse(fs.readFileSync(path.join(root, f), 'utf8'));

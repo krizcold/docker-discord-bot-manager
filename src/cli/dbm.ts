@@ -29,6 +29,7 @@ Raw:      api <METHOD> <path> [--body JSON]
 Global flags:
   --port N        target 127.0.0.1:N (default: $PORT or 8080; standalone host uses 8090)
   --url URL       loopback URL override (rejected if not 127.0.0.1/::1/localhost)
+  DBM_SOCKET      environment: path of the manager's local socket, used when neither --port nor --url is given
   --json          force JSON output (also implied when stdout is not a TTY)
   --wait          block on the terminal WebSocket event for async lifecycle verbs
   --timeout S     seconds before --wait / wait / SSE gives up

@@ -37,14 +37,15 @@ const h = vi.hoisted(() => ({
 const NOHOOKS_URL = 'https://github.com/x/db-without-hooks';
 vi.mock('../../src/config/appCapabilities', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../../src/config/appCapabilities')>();
+  const { withoutSaveOrder } = await import('./nx5-nosave');
   return {
     ...orig,
     findAppCapabilities: (url: string | null | undefined) => {
       if (url === NOHOOKS_URL) {
-        const caps = orig.findAppCapabilities('https://github.com/x/fully-modular-discord-bot');
+        const caps = withoutSaveOrder(orig.findAppCapabilities('https://github.com/x/fully-modular-discord-bot'));
         return caps ? { ...caps, hooks: undefined } : null;
       }
-      return orig.findAppCapabilities(url);
+      return withoutSaveOrder(orig.findAppCapabilities(url));
     },
   };
 });

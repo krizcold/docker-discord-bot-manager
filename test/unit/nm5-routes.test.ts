@@ -42,7 +42,7 @@ vi.mock('../../src/instance/fleetReplica', async (o) => ({
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { createBotRoutes } from '../../src/webui/routes/bots';
+import { collectHealthChanges, createBotRoutes } from '../../src/webui/routes/bots';
 
 const router = createBotRoutes({ clients: new Set() } as any);
 const call = async (method: 'get' | 'post' | 'delete', routePath: string, body: unknown = {}, id = 'a', query: Record<string, string> = {}): Promise<{ status: number; body: any }> => {
@@ -106,6 +106,33 @@ describe('W3: GET /fleet-switch', () => {
     expect(got.body).toMatchObject({ success: true, copies: [{ slot: 'slot_c', machine: 'copy.example', streaming: true }], badges: [{ text: 'Handed over', danger: false }] });
     expect(got.body.lines[0]).toBe('Handed over to copy.example on 2026-10-30 09:00 UTC. This machine rejoins as its copy once copy.example is the main; last check: not checked yet.');
     expect(JSON.stringify(got.body)).not.toContain('PEM');
+  });
+});
+
+describe('NM41: the bot list serves takeBack with the health keys', () => {
+  const served = () => collectHealthChanges(new Map()).find(b => b.id === 'a');
+  const rewrite = (change: (handover: Record<string, unknown>) => Record<string, unknown> | undefined) => {
+    const file = path.join(r.dir, 'instances.json');
+    const all = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const next = change(all.instances.a.fleetDb.handover);
+    if (next) all.instances.a.fleetDb.handover = next; else delete all.instances.a.fleetDb.handover;
+    fs.writeFileSync(file, JSON.stringify(all));
+  };
+  it('false for a stopped hand-over with host, port and certificate; true once any of the three is missing; false while waiting and with no record', () => {
+    expect(served()).toMatchObject({ id: 'a', takeBack: false });
+    rewrite(({ cert: _cert, ...h }) => h);
+    expect(served()).toMatchObject({ takeBack: true });
+    rewrite(({ host: _host, port: _port, ...h }) => ({ ...h, phase: 'waiting' }));
+    expect(served()).toMatchObject({ takeBack: false });
+    rewrite(() => undefined);
+    expect(served()).toMatchObject({ takeBack: false });
+  });
+  it('a change of takeBack alone is pushed as a health change', () => {
+    const seen = new Map<string, string>();
+    expect(collectHealthChanges(seen).map(b => b.id)).toEqual(['a']);
+    expect(collectHealthChanges(seen)).toEqual([]);
+    rewrite(({ cert: _cert, ...h }) => h);
+    expect(collectHealthChanges(seen)).toEqual([expect.objectContaining({ id: 'a', takeBack: true })]);
   });
 });
 

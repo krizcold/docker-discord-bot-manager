@@ -25,8 +25,8 @@ import {
   RECEIVE_END_SQL, RECEIVE_NOLOGIN_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkSql, SHARD_CAP_DO_SQL,
 } from './switchSql';
 import {
-  clusterSql, ensureMainGeneration, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration, provenMaintenance, runGuarded, runLane, setReceiveStep,
-  SWITCH_TIMING, switchAdmissionNotice, workSql,
+  clusterSql, DbStop, ensureMainGeneration, finishUnconnectedHandover, finishWaitingHandover, handedOverNoAddress, handoverNoAddress, LaneOutcome, mainAdmission, metaSql, noticeRefusal, ownGeneration,
+  provenMaintenance, runGuarded, runLane, sentence, setReceiveStep, stopAndReadDb, SWITCH_TIMING, switchAdmissionNotice, withoutNothing, workSql,
 } from './fleetSwitch';
 import { FleetDbReceive, InstanceConfig, JoinAddress } from '../types';
 
@@ -222,7 +222,7 @@ const sessionsLogged = new Map<string, number>();
 /** The expiry's end failure last logged per bot (Y3: once per distinct error); cleared when the receive ends. */
 const endErrorLogged = new Map<string, string>();
 
-/** D51: a push of the mark finished: the copies written back, the login ended, receive and pushBroken cleared in one save. */
+/** D51: a push of the mark finished: the copies written back, the login ended; receive, pushBroken and a hand-over with no address cleared in one save. */
 async function finishReceive(inst: InstanceConfig, r: FleetDbReceive, line: string): Promise<{ ok: true; machine: string; generation: string } | { ok: false; error: string; saveFailed?: boolean }> {
   const db = inst.fleetDb!;
   dbLogin.noteLoginFault(db.containerName);
@@ -232,7 +232,8 @@ async function finishReceive(inst: InstanceConfig, r: FleetDbReceive, line: stri
   }
   const ended = await endReceiveLogin(inst);
   if (!ended.ok) return { ok: false, error: ended.error };
-  const saved = saveSwitch(inst.id, { receive: null, pushBroken: null });
+  const handedOver = handedOverNoAddress(containerManager.getBot(inst.id)?.fleetDb?.handover);
+  const saved = saveSwitch(inst.id, { receive: null, pushBroken: null, ...(handedOver ? { handover: null } : {}) });
   if (saved) return { ok: false, error: saved, saveFailed: true };
   await clearMarkLogged(inst, markIdOf(r));
   sessionsLogged.delete(inst.id);
@@ -266,6 +267,38 @@ async function clearMarkLogged(inst: InstanceConfig, markId: string): Promise<vo
   if (error) console.warn(`[Switch] ${inst.displayName}: the mark that tells this database's copies it is receiving could not be removed (${error}); the manager tries again every minute`);
 }
 
+type Stopped = Exclude<DbStop, { runs: false }>;
+/** After a refused Receive whose database did not stop again: what docker shows, and the login only when this press read it blocked. */
+const stopAgainTail = (stop: Stopped, proven: boolean) => (stop.runs
+  ? ` The database was started for Receive and did not stop again (${stop.error}); it runs${proven ? " with the bot's login blocked" : ", the manager can't confirm that the bot's login is blocked"}, and the hand-over stays recorded.`
+  : ` The database was started for Receive, and the manager can't confirm that it stopped again (${stop.error}); the hand-over stays recorded.`);
+
+type Back = { machine: string; stop: DbStop } | { machine: string; skipped: string };
+
+/**
+ * A receive that ended with no push under a hand-over with no address: the database stopped again. Null when no such
+ * record stands. The tick holds no operation, so it takes one for the stop and gives way to a lane or a new receive.
+ */
+async function stoppedAgain(botId: string, tick = false): Promise<Back | null> {
+  const db = containerManager.getBot(botId)?.fleetDb;
+  if (!db || !handedOverNoAddress(db.handover)) return null;
+  const machine = db.handover?.machine || 'another machine';
+  if (!tick) return { machine, stop: await stopAndReadDb(botId, db.containerName) };
+  const BUSY = 'an operation on this bot is running';
+  if (db.receive) return { machine, skipped: 'a new receive stands' };
+  if (containerManager.isBotBusy(botId)) return { machine, skipped: BUSY };
+  try {
+    return await containerManager.withExternalBotOp(botId, 'receive', async () => {
+      const now = containerManager.getBot(botId)?.fleetDb;
+      if (!now || !handedOverNoAddress(now.handover)) return null;
+      if (now.receive) return { machine, skipped: 'a new receive stands' };
+      return { machine, stop: await stopAndReadDb(botId, now.containerName) };
+    });
+  } catch (err) {
+    return { machine, skipped: `the stop could not run (${errText(err)})` };
+  }
+}
+
 export async function receiveMain(botId: string): Promise<LaneOutcome> {
   const inst = containerManager.getBot(botId);
   if (!inst) return refusal('Bot not found', 404);
@@ -274,18 +307,91 @@ export async function receiveMain(botId: string): Promise<LaneOutcome> {
   if (!db.replication) return refusal(`Replication is not enabled, so the other machine has no address to push to; enable it first${NOTHING}`);
   const prior = db.receive;
   if (!prior) {
-    const admission = mainAdmission(inst, { replication: true, noun: 'replace', allowPushBroken: true });
+    const admission = mainAdmission(inst, { replication: true, noun: 'replace', allowPushBroken: true, resume: handoverNoAddress });
     if (admission) return refusal(admission);
   }
   if (noticeRefusal(botId, 'receiving was refused')) {
     return refusal(`Receiving was refused and nothing was changed: a restore of ${fleetBackup.shownRestoreNoticeFile(botId)} has not finished cleanly here (its notice is on the Database window), and a push would replace the database that notice is about. Dismiss the notice, or restore a dump again, then press Receive.`);
   }
-  const rec = maintenance.maintenanceOf(inst);
-  if (rec.state !== 'off' || !rec.settled) {
-    return refusal(`Receiving replaces this machine's database, so the bot must be Off first (its state is ${NAME[rec.state]}${rec.settled ? '' : ', not confirmed'}); choose Off in the State window${NOTHING}`);
+  const finish = await finishWaitingHandover(botId);
+  const to = db.handover?.machine || 'another machine';
+  if (finish.state === 'failed') return refusal(`Receiving was refused and nothing was changed: docker shows this database and the bot stopped, but the manager could not save the hand-over to ${to} as finished (${finish.error}); try again.`);
+  // A press that finished the record says so in its reply, and its later refusals no longer say that nothing was changed.
+  let note = '';
+  if (finish.state === 'open') {
+    const done = await finishUnconnectedHandover(botId, finish);
+    if (!done.ok) return refusal(done.text, done.status);
+    note = done.note;
   }
+  if (finish.state === 'finished') note = ` The hand-over to ${to} is now recorded as finished: docker showed this database and the bot stopped.`;
+  if (!note) return receiveFrom(botId, inst);
+  const out = await receiveFrom(botId, containerManager.getBot(botId)!);
+  return { ...out, text: out.success ? `${out.text}${note}` : `${sentence(withoutNothing(out.text))}${note}` };
+}
+
+/** Receive past the checks that read no state of the bot: the state test, and under a hand-over with no address the start and the stop-again. */
+async function receiveFrom(botId: string, inst: InstanceConfig): Promise<LaneOutcome> {
+  const db = inst.fleetDb!;
+  const rec = maintenance.maintenanceOf(inst);
+  const handedOver = handedOverNoAddress(db.handover) ? db.handover : null;
+  if (!handedOver) {
+    if (rec.state !== 'off' || !rec.settled) {
+      return refusal(`Receiving replaces this machine's database, so the bot must be Off first (its state is ${NAME[rec.state]}${rec.settled ? '' : ', not confirmed'}); choose Off in the State window${NOTHING}`);
+    }
+    return receiveAdmitted(botId, inst, {});
+  }
+  const from = handedOver.machine || 'another machine';
+  if (rec.state === 'running' || !rec.settled) {
+    return refusal(`Receiving was refused and nothing was changed: taking the main back needs the bot in a confirmed Maintenance or Off, and its state is ${NAME[rec.state]}${rec.settled ? '' : ', not confirmed'}`);
+  }
+  const app = await containerManager.appContainerRunning(botId);
+  if (app === true) return refusal("Receiving was refused and nothing was changed: the bot runs here, and taking the main back needs docker to show it stopped. Press Stop on the bot's card, then Receive a main again.");
+  if (app !== false) return refusal("Receiving was refused and nothing was changed: the manager can't confirm that the bot is stopped here (docker did not say whether it runs). Press Receive a main again.");
+  const container = db.containerName;
+  // tried: this press called the start, so a database left up by it is stopped again when no receive stands at the end.
+  let tried = false;
+  let startError: string | null = null;
+  let threw = false;
+  const flow: { proven?: boolean } = {};
+  let out: LaneOutcome;
+  try {
+    if (await dbLogin.sidecarRunning(container) !== true) {
+      tried = true;
+      const up = await containerManager.startFleetDbSidecar(botId, { handedOver: true });
+      if (!up.success) startError = up.error || 'no reason given';
+    }
+    out = startError !== null ? refusal(`Receiving was refused: this machine's database did not start (${startError})`) : await receiveAdmitted(botId, inst, flow);
+  } catch (err) {
+    threw = true;
+    out = { success: false, status: 500, text: `Receiving stopped on an unexpected error (${errText(err)}).` };
+  }
+  const now = containerManager.getBot(botId)?.fleetDb;
+  if (now?.receive || !handedOverNoAddress(now?.handover)) {
+    if (startError !== null) return refusal(`${out.text}; receiving stays recorded. Press Receive a main again.`);
+    if (!out.success || !out.moveCode) return out;
+    return { ...out, text: `${out.text} This machine's database ${tried ? 'was started' : 'runs'} to receive it; the hand-over to ${from} stays recorded until the push finishes.` };
+  }
+  if (!tried) return out;
+  const stop = await stopAndReadDb(botId, container);
+  if (stop.runs === false) {
+    if (startError !== null) return refusal(`${out.text}${NOTHING}`);
+    return threw ? { ...out, text: `${out.text} This machine's database is stopped again, and the hand-over stays recorded.` } : out;
+  }
+  if (startError !== null) {
+    return refusal(stop.runs
+      ? `${out.text}. Its container did not stop again (${stop.error}); it runs, the manager can't confirm that the bot's login is blocked, and the hand-over stays recorded.`
+      : `${out.text}. The manager can't confirm that its container stopped again (${stop.error}); the hand-over stays recorded.`);
+  }
+  return { ...out, text: `${sentence(withoutNothing(out.text))}${stopAgainTail(stop, !!flow.proven)}` };
+}
+
+/** Receive past its admission: the login proof, the dump, the record, the mark, the logins and the move code. */
+async function receiveAdmitted(botId: string, inst: InstanceConfig, flow: { proven?: boolean }): Promise<LaneOutcome> {
+  const db = inst.fleetDb!;
+  const prior = db.receive;
   const proof = await maintenance.requireMaintenance(botId, 'database');
   if (!proof.ok) return refusal(`Receiving was refused and nothing was changed: ${proof.error}`);
+  flow.proven = true;
   const fence = await switchAdmissionNotice(botId, 'receiving was refused', { skipNotice: true });
   if (fence) return refusal(fence);
   const t = { container: db.containerName, user: db.user };
@@ -397,9 +503,20 @@ export async function stopReceiving(botId: string): Promise<LaneOutcome> {
   endErrorLogged.delete(botId);
   const still = containerManager.getBot(botId)?.fleetDb?.pushBroken;
   if (!check.broken && !still) await clearMarkLogged(inst, markIdOf(r));
-  if (check.broken) return { success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: restore the dump ${r.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.` };
-  const tail = still ? ` A push that did not finish earlier still stands: restore the dump ${still.safetyDump} (taken before that push) with the bot in Maintenance or Off, or press Receive again.` : '';
-  return { success: true, text: `Receiving stopped; the move code no longer works.${tail}` };
+  const back = await stoppedAgain(botId);
+  if (!back) {
+    if (check.broken) return { success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: restore the dump ${r.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.` };
+    const tail = still ? ` A push that did not finish earlier still stands: restore the dump ${still.safetyDump} (taken before that push) with the bot in Maintenance or Off, or press Receive again.` : '';
+    return { success: true, text: `Receiving stopped; the move code no longer works.${tail}` };
+  }
+  const stop = 'stop' in back ? back.stop : null;
+  const backTail = !stop || stop.runs === false ? ` This machine's database is stopped again; the hand-over to ${back.machine} is still recorded.`
+    : stop.runs ? ` This machine's database did not stop (${stop.error}); it still runs, and the hand-over to ${back.machine} is still recorded.`
+    : ` The manager can't confirm that this machine's database stopped (${stop.error}); the hand-over to ${back.machine} is still recorded.`;
+  const kept = (dump: string, taken: string) => `press Receive a main again so ${back.machine} can push again. The dump ${dump} (taken before ${taken}) stays with the backups; a restore is refused while the hand-over to ${back.machine} is recorded.`;
+  if (check.broken) return { success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: ${kept(r.safetyDump, 'receiving')}${backTail}` };
+  const tail = still ? ` A push that did not finish earlier still stands: ${kept(still.safetyDump, 'that push')}` : '';
+  return { success: true, text: `Receiving stopped; the move code no longer works.${tail}${backTail}` };
 }
 
 /** N-c: a push that committed, or a code that expired unused, ends receiving. */
@@ -436,10 +553,15 @@ export async function receiveStep(inst: InstanceConfig, now: number): Promise<vo
   if (!check.broken && !containerManager.getBot(inst.id)?.fleetDb?.pushBroken) await clearMarkLogged(inst, markIdOf(r));
   sessionsLogged.delete(inst.id);
   endErrorLogged.delete(inst.id);
+  const back = await stoppedAgain(inst.id, true);
   containerManager.broadcastBotUpdated(inst.id);
+  const dbNow = !back ? '' : 'skipped' in back ? `; the database was not stopped: ${back.skipped}`
+    : back.stop.runs === false ? '; the database is stopped again'
+    : back.stop.runs ? `; the database did not stop (${back.stop.error})` : `; the manager can't confirm that the database stopped (${back.stop.error})`;
+  const until = back ? `a push from ${back.machine} finishes (the dump ${r.safetyDump} stays with the backups; a restore is refused while the hand-over is recorded)` : `the dump ${r.safetyDump} is restored or a push finishes`;
   console.log(check.broken
-    ? `[Switch] ${inst.displayName}: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until the dump ${r.safetyDump} is restored or a push finishes; the receive login is removed`
-    : `[Switch] ${inst.displayName}: the move code expired unused; the receive login is removed`);
+    ? `[Switch] ${inst.displayName}: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until ${until}; the receive login is removed${dbNow}`
+    : `[Switch] ${inst.displayName}: the move code expired unused; the receive login is removed${dbNow}`);
 }
 
 setReceiveStep(receiveStep);

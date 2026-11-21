@@ -96,7 +96,7 @@ describe('O4 the old main rejoins as a copy', () => {
     handedOver(alone);
     await switchTick(now);
     expect(h.reseedCalls).toEqual([]);
-    expect(switchView(stored('a')).lines[0]).toBe('Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped; decommission it, or move the main back here with Push from copy.example.');
+    expect(switchView(stored('a')).lines[0]).toBe("Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager. Cancel the hand-over only if copy.example never took over.");
   });
 });
 

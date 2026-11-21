@@ -69,11 +69,11 @@ describe('O2 Cancel', () => {
     expect(stored('a').fleetDb.handover).toBeDefined();
     expect(await cancelHandOver('a', true)).toEqual({ success: true, text: X_OK });
   });
-  it('X3: a mark with no address asks without a probe', async () => {
+  it('X3 (NM41): a mark with no address asks nothing and probes nothing; the replayed delete cancels', async () => {
     withMark({ ...MARK, host: undefined, port: undefined, cert: undefined });
-    const r = await cancelHandOver('a');
-    expect(r.text).toContain('(the copy registered no address)');
-    expect(h.events).toEqual([]);
+    expect(await cancelHandOver('a')).toEqual({ success: true, text: X_OK });
+    expect(h.events).toEqual(['db-start:override', 'handover-delete']);
+    expect(stored('a').fleetDb.handover).toBeUndefined();
   });
   it('X5: the database does not start', async () => {
     h.peer = peer('in-recovery');

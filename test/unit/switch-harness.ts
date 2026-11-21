@@ -23,7 +23,8 @@ export interface Harness {
   app: boolean | null;
   stop: { success: boolean; error?: string };
   dbStop: { success: boolean; error?: string };
-  dbStart: { success: boolean; error?: string };
+  /** ran: the container came up although the start failed (the database was not ready in time). */
+  dbStart: { success: boolean; error?: string; ran?: boolean };
   start: { success: boolean; error?: string };
   memoryNotice: string | null;
   cert: { ok: true; pem: string } | { ok: false; kind: 'unreachable' | 'fingerprint'; reason: string; text: string };
@@ -157,7 +158,7 @@ export function containerManagerMock(real: typeof import('../../src/docker/conta
   return {
     ...real,
     stopBotInOp: async (_id: string, op: string) => { h.events.push(`stop-bot:${op}`); return h.stop; },
-    startFleetDbSidecar: async (_id: string, opts: any = {}) => { h.events.push(`db-start${opts.handedOver ? ':override' : ''}`); return h.dbStart; },
+    startFleetDbSidecar: async (_id: string, opts: any = {}) => { h.events.push(`db-start${opts.handedOver ? ':override' : ''}`); const c = real.getBot(_id)?.fleetDb?.containerName; if (c && (h.dbStart.success || h.dbStart.ran)) h.sidecar[c] = true; return h.dbStart; },
     stopFleetDbSidecar: async () => { h.events.push('db-stop'); if (h.dbStop.success) h.sidecar['a-pg'] = false; return h.dbStop; },
     appContainerRunning: async () => h.app,
     startBot: async () => { h.events.push('start-bot'); return h.start; },

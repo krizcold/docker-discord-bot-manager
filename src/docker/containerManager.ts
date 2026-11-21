@@ -4934,7 +4934,7 @@ export async function stopBotInOp(botId: string, op: string): Promise<LaneResult
   return result.success ? withWarning(result, clearFinishedLane(botId)) : result;
 }
 
-const STOP_UNSEEN = 'Docker did not say whether the bot runs, so nothing was stopped';
+export const STOP_UNSEEN = 'Docker did not say whether the bot runs, so nothing was stopped';
 
 async function stopBotImpl(botId: string, emit?: EmitFn): Promise<LaneResult> {
   const instance = getBot(botId);

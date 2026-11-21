@@ -34,7 +34,7 @@ import { MANAGER_DB_ROLE } from './dbLogin';
 import { addressTableSql } from './fleetReplication';
 import { parseAddressRows, readCopyCert, validAddress } from './fleetJoin';
 import {
-  ADDRESS_DDL_SQL, COPY_GROUP, copiesInsertSql, copyGroupEnsureSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, machineNameOf, missingTable, moveModeText, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
+  ADDRESS_DDL_SQL, COPY_GROUP, copiesInsertSql, copyGroupEnsureSql, cutAddressesSql, GENERATION_SCHEMA_SQL, GEN_READ_SQL, MetaParse, MetaRowsReader, OWN_COPIES_READ_SQL, GenRow, generationAfterRestore, generationBefore, handoverNoAddress, machineNameOf, missingTable, moveModeText, noAddressRestoreRefusal, parseGenRow, parseRestoreStateBefore, restoreStateBackSql,
   raiseSql, receiveMarkClearSql, RESTORE_STATE_CLEAR, restoreKindOf, restoreOrderSql, restoreStateUpsertSql, SAVE_ORDER_TABLES, SHARD_CAP_SET,
 } from './switchSql';
 import { readDatabaseUrl } from '../config/databaseUrl';
@@ -1766,6 +1766,7 @@ function restoreAdmissionBlock(instance: InstanceConfig): { refusal: string; ste
   const seed = fleetReplica.seedView(instance);
   if (seed && seed.parked !== true) return { refusal: 'A standby seed is running on this instance; wait for it before restoring a dump', step: 'wait for the standby seed to finish' };
   const db = instance.fleetDb;
+  if (db && handoverNoAddress(db.handover)) return { refusal: noAddressRestoreRefusal(db), step: db.handover?.phase === 'waiting' ? 'cancel the hand-over, or move the main back' : 'move the main back' };
   if (db?.handover) return { refusal: `A move of this database is recorded (${moveModeText(db.handover)}); Cancel it in the Database window before restoring a dump`, step: 'cancel the move' };
   if (db?.receive) return { refusal: 'This database is waiting to receive a main pushed from another machine; Stop receiving before restoring a dump', step: 'stop receiving' };
   if (db?.replacedBy) {

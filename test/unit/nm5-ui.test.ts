@@ -103,7 +103,11 @@ describe('W4: the card badges', () => {
   const STREAM = { mode: 'stream', machine: 'copy.example', host: 'copy.example', port: 5434, at: '2026-10-30T09:00:00.000Z', lastCheck: 'connection refused' };
   it.each([
     ['B-HANDOVER (J-WAIT)', { fleetDb: { handover: { ...STREAM, phase: 'stopped' } } }, [['Handed over', 'Handed over to copy.example on 2026-10-30 09:00 UTC. This machine rejoins as its copy once copy.example is the main; last check: connection refused.', false]]],
-    ['B-HANDOVER (J-ALONE)', { fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', at: '2026-10-30T09:00:00.000Z' } } }, [['Handed over', 'Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped; decommission it, or move the main back here with Push from copy.example.', false]]],
+    ['B-HANDOVER (J-ALONE)', { takeBack: true, fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', at: '2026-10-30T09:00:00.000Z' } } }, [['Handed over', "Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager. Cancel the hand-over only if copy.example never took over.", false]]],
+    ['B-HANDOVER (J-ALONE) while receiving', { takeBack: true, fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', at: '2026-10-30T09:00:00.000Z' }, receive: { startedAt: 'x', expiresAt: '2026-10-31T09:00:00.000Z', safetyDump: 'z' } } }, [['Handed over', "Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database runs to receive the main back; the hand-over stays recorded until a push from copy.example's manager finishes.", false], ['Receiving', 'Waiting for a push until 2026-10-31 09:00 UTC', false]]],
+    ['B-HANDOVER (J-ALONE) with a push that did not finish', { takeBack: true, fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', at: '2026-10-30T09:00:00.000Z' }, pushBroken: { at: '2026-10-30T09:00:00.000Z', safetyDump: 'pre-receive-x.dump' } } }, [['Handed over', "Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager.", false], ['Push not finished', "A push replaced this database on or before 2026-10-30 09:00 UTC and did not finish, so the bot cannot run on it. Press Receive a main again so copy.example can push again. The dump pre-receive-x.dump (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.", true]]],
+    ['B-HANDOVER with no address in the record and no served flag', { fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', at: '2026-10-30T09:00:00.000Z' }, pushBroken: { at: '2026-10-30T09:00:00.000Z', safetyDump: 'pre-receive-x.dump' } } }, [['Handed over', 'Handed over to copy.example on 2026-10-30 09:00 UTC. This machine rejoins as its copy once copy.example is the main; last check: not checked yet.', false], ['Push not finished', 'A push replaced this database on or before 2026-10-30 09:00 UTC and did not finish, so the bot cannot run on it. Restore the dump pre-receive-x.dump (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.', true]]],
+    ['B-HANDOVER with an address in the record and the served flag false', { takeBack: false, fleetDb: { handover: { ...STREAM, phase: 'stopped' } } }, [['Handed over', 'Handed over to copy.example on 2026-10-30 09:00 UTC. This machine rejoins as its copy once copy.example is the main; last check: connection refused.', false]]],
     ['B-HANDOVER-CUT', { fleetDb: { handover: { ...STREAM, phase: 'waiting' } } }, [['Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true]]],
     ['B-TAKEOVER-CUT', { fleetDbReplica: { takeover: { startedAt: 'x', planned: true, generation: 4 } } }, [['Take-over not finished', 'Press Take over again', true]]],
     ['B-RECEIVING', { fleetDb: { receive: { startedAt: 'x', expiresAt: '2026-10-31T09:00:00.000Z', safetyDump: 'z' } } }, [['Receiving', 'Waiting for a push until 2026-10-31 09:00 UTC', false]]],
@@ -128,6 +132,32 @@ describe('W5: the Database window buttons and confirms', () => {
   });
   it('a hand-over stopped: Cancel the hand-over, Upload, Rejoin as a copy', () => {
     expect(panel({ fleetDb: { handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', host: 'copy.example' } } })).toEqual(['Cancel the hand-over', 'Upload a backup', 'Rejoin as a copy']);
+  });
+  it('NM41: a hand-over stopped for a copy with no address, as the switch read serves it: Receive a main is offered; while receiving, Stop receiving', () => {
+    const alone = { mode: 'stream', phase: 'stopped', machine: 'copy.example' };
+    expect(panel({ fleetDb: { handover: alone } }, { lines: [], copies: [], takeBack: true, noAddress: true })).toEqual(['Cancel the hand-over', 'Receive a main', 'Upload a backup', 'Rejoin as a copy']);
+    expect(panel({ fleetDb: { handover: alone, receive: { expiresAt: 'x' } } }, { lines: [], copies: [], takeBack: true, noAddress: true })).toEqual(['Cancel the hand-over', 'Stop receiving', 'Upload a backup', 'Rejoin as a copy']);
+    expect(panel({ fleetDb: { handover: alone } }, { lines: [], copies: [], takeBack: false, noAddress: false })).toEqual(['Cancel the hand-over', 'Upload a backup', 'Rejoin as a copy']);
+    // A hand-over that did not finish, to a copy with no address: Receive a main is offered under the served noAddress.
+    const unfinished = { ...alone, phase: 'waiting' };
+    expect(panel({ fleetDb: { handover: unfinished } }, { lines: [], copies: [], takeBack: false, noAddress: true })).toEqual(['Cancel the hand-over', 'Receive a main', 'Upload a backup']);
+    expect(panel({ fleetDb: { handover: unfinished } }, { lines: [], copies: [], takeBack: false, noAddress: false })).toEqual(['Cancel the hand-over', 'Upload a backup']);
+    const { ctx } = load(['escapeHtml', 'jsArg', 'switchPanelHtml'], () => null);
+    expect((ctx.switchPanelHtml('b1', { fleetDb: { handover: unfinished } }, { lines: [], copies: [], takeBack: false, noAddress: true }) as string).replace(/&#39;/g, "'").replace(/&quot;/g, '"')).toContain('receiveFleet("b1", "copy.example", true)');
+    const html: string = ctx.switchPanelHtml('b1', { fleetDb: { handover: alone } }, { lines: [], copies: [], takeBack: true, noAddress: true });
+    expect(html.replace(/&#39;/g, "'").replace(/&quot;/g, '"')).toContain('receiveFleet("b1", "copy.example")');
+  });
+  it.each([
+    ['a dump is kept first', {}, "Take the main back from copy.example? This machine's database is started and waits for a push from copy.example's manager; a dump of it is kept first."],
+    ['an unfinished hand-over: what Receive stops first, and when it is refused', { unfinished: true }, "Take the main back from copy.example? The hand-over to copy.example did not finish. When copy.example's copy is not connected, the manager first stops this machine's database and the bot, records the hand-over as finished, then starts the database to wait for a push from copy.example's manager; a dump of it is kept first. When the copy still follows this database, Receive is refused."],
+    ['a push that did not finish keeps its dump', { pushBroken: { safetyDump: 'pre-receive-x.dump' } }, "Take the main back from copy.example? This machine's database is started and waits for a push from copy.example's manager. This database holds a push that did not finish, so no new dump is taken; the dump pre-receive-x.dump, taken before that push, stays with the backups."],
+  ])('NM41: receiveFleet under such a record asks to take the main back: %s', async (_n, over, text) => {
+    const { unfinished, ...fleetDb } = over as { unfinished?: boolean };
+    const { ctx, seen } = load(['receiveFleet', 'switchRequest'], () => ({ success: true, opId: 'op1' }), { bots: [{ id: 'b1', displayName: 'Bot 1', fleetDb }], renderFleetSwitch: () => {} });
+    await ctx.receiveFleet('b1', 'copy.example', unfinished);
+    await new Promise(r => setTimeout(r, 0));
+    expect(seen.confirm).toEqual([text]);
+    expect(seen.calls[0].slice(0, 2)).toEqual(['POST', '/bots/b1/fleet-receive']);
   });
   it('a push or file mark: Cancel the move', () => {
     expect(panel({ fleetDb: { handover: { mode: 'push', phase: 'pushing', machine: 'srv' } } })).toEqual(['Cancel the move', 'Upload a backup']);

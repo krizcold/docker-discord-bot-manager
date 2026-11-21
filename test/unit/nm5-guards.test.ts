@@ -106,7 +106,7 @@ afterAll(() => {
 import * as maintenance from '../../src/instance/maintenance';
 
 const DB = { containerName: 'bot1-postgres', user: 'app', db: 'app', volume: 'bot1-pgdata' };
-const HANDOVER = { mode: 'stream', phase: 'stopped', slot: 'slot_c', machine: 'copy.example', generation: 4, at: '2026-10-30T10:00:00.000Z' };
+const HANDOVER = { mode: 'stream', phase: 'stopped', slot: 'slot_c', machine: 'copy.example', host: 'copy.example', port: 5434, cert: 'x', generation: 4, at: '2026-10-30T10:00:00.000Z' };
 const REPLACED = { machine: 'copy.example', host: 'copy.example', port: 5434, generation: 5, own: 4, since: null, at: '2026-10-30T10:00:00.000Z' };
 const RECEIVE = { startedAt: '2026-10-30T10:00:00.000Z', expiresAt: '2026-10-31T10:00:00.000Z', safetyDump: 'pre-receive-x.dump' };
 const MAINT = { state: 'maintenance', message: '', orderedAt: '2026-10-30T00:00:00.000Z', settled: true, hook: 'confirmed', login: 'blocked', savedByBot: 'maintenance' };

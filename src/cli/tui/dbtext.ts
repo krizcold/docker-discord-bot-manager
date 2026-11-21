@@ -100,13 +100,16 @@ export function switchBadges(bot: Bot): Badge[] {
   const out: Badge[] = [];
   const b = (text: string, title: string, danger: boolean) => out.push({ text, title, danger });
   const h = db.handover;
+  const noAddress = bot.takeBack === true;
   if (h) {
     const machine = h.machine || 'another machine';
     if (h.mode === 'stream' && h.phase === 'waiting') b('Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true);
     else if (h.mode === 'stream') {
-      b('Handed over', h.host
+      b('Handed over', !noAddress
         ? `Handed over to ${machine} on ${switchDate(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`
-        : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped; decommission it, or move the main back here with Push from ${machine}.`, false);
+        : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. ${db.receive
+         ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes.`
+         : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`}`}`, false);
     } else if (h.phase === 'done') b('Handed over', h.mode === 'push' ? `a push to ${machine}` : 'a backup made for a move', false);
     else b('Hand-over not finished', 'Press Push again, or Cancel the push', true);
   }
@@ -117,7 +120,9 @@ export function switchBadges(bot: Bot): Badge[] {
       ? `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here could not be blocked (${db.mainConflict.blockError}), so bots may still write to this database. Choose one in the Database window.`
       : `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here is blocked. Choose one in the Database window.`, true);
   }
-  if (db.pushBroken) b('Push not finished', `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
+  if (db.pushBroken) b('Push not finished', noAddress
+    ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h?.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`
+    : `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
   if (bot.fleetDbReplica && bot.fleetDbReplica.takeover) b('Take-over not finished', 'Press Take over again', true);
   return out;
 }

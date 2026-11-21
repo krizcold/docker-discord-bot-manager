@@ -18,6 +18,8 @@ export interface Bot {
   maintenance?: { state?: string; message?: string; settled?: boolean; orderedAt?: string; lastError?: string | null; held?: Held | null } | null;
   maintenanceDrift?: string | null;
   fenceStuck?: string | null;
+  /** Served by the list: the hand-over stopped this database for a copy with no address. */
+  takeBack?: boolean;
   migrate?: MigrateRecordView | null;
   migrateLast?: MigrateLastView | null;
   updateAvailable?: boolean;
@@ -1288,6 +1290,10 @@ export function readReplica(client: Client, botId: string, limitMs: number): Rea
 export interface SwitchAnswer {
   lines?: string[];
   takeover?: unknown;
+  /** True under a hand-over that stopped this database for a copy with no address: Receive is offered. */
+  takeBack?: boolean;
+  /** True for a hand-over, finished or not, to a copy with no address: Cancel decides by the copy's replay. */
+  noAddress?: boolean;
   generation?: { machine?: string; generation?: number; since?: string | null; error?: string } | null;
   /** streamingCopies (fleetSwitch.ts:1774): this main's copies and whether each streams now. */
   copies?: Array<{ slot?: string; machine?: string; streaming?: boolean }>;

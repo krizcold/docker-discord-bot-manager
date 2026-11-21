@@ -31,7 +31,7 @@ describe('L5 e: the switch view texts', () => {
     expect(v.badges).toEqual([{ text: 'Hand-over not finished', title: 'Press Hand over again, or Cancel the hand-over', danger: true }]);
   });
   it('a stopped stream hand-over with no machine name reads another machine', () => {
-    const v = switchView(base({ handover: { mode: 'stream', phase: 'stopped', host: 'copy.example', port: 5434, generation: 4, at: AT } }));
+    const v = switchView(base({ handover: { mode: 'stream', phase: 'stopped', host: 'copy.example', port: 5434, cert: 'x', generation: 4, at: AT } }));
     const title = `Handed over to another machine on ${WHEN}. This machine rejoins as its copy once another machine is the main; last check: not checked yet.`;
     expect(v.lines).toEqual([title]);
     expect(v.badges).toEqual([{ text: 'Handed over', title, danger: false }]);

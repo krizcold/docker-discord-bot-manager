@@ -344,14 +344,30 @@ describe('O2 Cancel', () => {
     expect((await cancelMove('a', true)).success).toBe(true);
     expect(stored('a').fleetDb.handover).toBeUndefined();
   });
-  it.each([
+  const PART = [
     ['a certificate but no host or port', { host: undefined, port: undefined }],
     ['a host and a certificate but no port', { port: undefined }],
-  ])('a mark with %s is not probed', async (_n, over) => {
+    ['a host and a port but no certificate', { cert: undefined }],
+  ] as const;
+  it.each(PART)('a mark with %s is not probed and asks nothing: the replayed delete cancels (NM41)', async (_n, over) => {
     withMark({ ...MARK, ...over });
     const r = await cancelMove('a', false);
-    expect(r.text).toContain('(the copy registered no address)');
-    expect(h.events).toEqual([]);
+    expect(r).toEqual({ success: true, text: "The hand-over is cancelled: this database runs again as the main, with the bot's login still blocked. Choose Running in the State window to start the bot here." });
+    expect(h.events).toEqual(['db-start:override', 'handover-delete']);
+    expect(stored('a').fleetDb.handover).toBeUndefined();
+    expect(fake.dbs['a-pg'].generation?.generation).toBe(3);
+  });
+  it.each(PART)('a mark with %s, the delete not replayed, with confirm: refused, no raise, the mark kept (NM41)', async (_n, over) => {
+    withMark({ ...MARK, ...over });
+    fake.dbs['a-pg'].deleteLsn = '0/5000010';
+    const r = await cancelMove('a', true);
+    expect(r.success).toBe(false);
+    expect(r.needsConfirm).toBeUndefined();
+    expect(r.text).toContain("The manager can't confirm whether copy.example took over: copy.example registered no address");
+    expect(h.events).toEqual(['db-start:override', 'handover-delete', 'db-stop']);
+    expect(stored('a').fleetDb.handover).toMatchObject({ mode: 'stream', phase: 'stopped' });
+    expect(stored('a').fleetDb.switchNotice).toBeUndefined();
+    expect(fake.dbs['a-pg'].generation?.generation).toBe(3);
   });
   it('a writable target with a lower generation asks and names its generation', async () => {
     h.peer = () => ({ kind: 'writable', systemId: '7001', timeline: 2, gen: { generation: 3, machine: 'copy.example', since: null } }) as any;
@@ -416,8 +432,20 @@ describe('probeTarget in the rejoin, and switchView', () => {
   });
   it('switchView names an unknown time for a mark time that does not parse', () => {
     const a = stored('a');
-    expect(switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', host: 'copy.example', at: 'x' } } }).lines[0])
+    expect(switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', host: 'copy.example', port: 5434, cert: COPY_PEM, at: 'x' } } }).lines[0])
       .toBe('Handed over to copy.example on an unknown time. This machine rejoins as its copy once copy.example is the main; last check: not checked yet.');
+  });
+  it.each([
+    ['no certificate', { host: 'copy.example', port: 5434 }],
+    ['no port', { host: 'copy.example', cert: COPY_PEM }],
+    ['no host', { port: 5434, cert: COPY_PEM }],
+  ])('switchView gives a stopped record with %s the no-address line and takeBack (NM41)', (_n, address) => {
+    const a = stored('a');
+    const v = switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', ...address, at: 'x' } } });
+    expect(v.takeBack).toBe(true);
+    expect(v.lines[0]).toBe("Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager. Cancel the hand-over only if copy.example never took over.");
+    const full = switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', host: 'copy.example', port: 5434, cert: COPY_PEM, at: 'x' } } });
+    expect(full.takeBack).toBe(false);
   });
 });
 

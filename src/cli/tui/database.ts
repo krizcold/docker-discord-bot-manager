@@ -787,7 +787,7 @@ export class DatabaseScreen {
       return;
     }
     if (row.kind === 'cancel') {
-      const q = cancelQuestion(row.mode, row.machine, row.file, row.phase);
+      const q = cancelQuestion(row.mode, row.machine, row.file, row.phase, row.noAddress);
       this.ask(q.lines, q.yes, () => this.lane('cancel', 'DELETE', 'fleet-handover', undefined, false, row.label === 'Cancel the move' ? 'Cancelling the move.' : 'Cancelling the hand-over.'));
       return;
     }
@@ -827,7 +827,7 @@ export class DatabaseScreen {
     }
     if (row.kind === 'receive') {
       const broken = row.safetyDump !== null;
-      this.ask(receiveQuestion(row.safetyDump), 'Y Receive', () => this.receive(broken ? 'Making the move code.' : 'Dumping this database, then making the move code; the dump can take minutes.'),
+      this.ask(receiveQuestion(row.safetyDump, row.takeBack, row.unfinished), 'Y Receive', () => this.receive(broken ? 'Making the move code.' : 'Dumping this database, then making the move code; the dump can take minutes.'),
         LANE_NOT_CONFIRMED.receive);
       return;
     }

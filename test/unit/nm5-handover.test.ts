@@ -135,7 +135,7 @@ describe('O1 Hand over', () => {
     fake.dbs['a-pg'].addresses = [];
     const r = await go();
     expect(r.success).toBe(true);
-    expect(r.text).toContain("The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine cannot rejoin it as a copy; move back later with Push from that machine.");
+    expect(r.text).toContain("The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine cannot rejoin it as a copy. To move the main back later, press Receive a main here, then Push the main in slot_c's manager.");
   });
 
   it('H13: the target read fails', async () => {

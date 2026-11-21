@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  actionRows, MOVE_CODE_SHOWN_TEXT, MOVE_OUT_QUESTION, moveCodeReadyText, newCodeQuestion, NO_MOVE_CODE_TEXT, noAnswerText, PUSH_LIMIT_MS, pushQuestion,
+  actionRows, cancelQuestion, MOVE_CODE_SHOWN_TEXT, MOVE_OUT_QUESTION, moveCodeReadyText, newCodeQuestion, NO_MOVE_CODE_TEXT, noAnswerText, PUSH_LIMIT_MS, pushQuestion,
   receiveQuestion, workingText,
 } from '../../src/cli/tui/actions';
 import { Bot, laneCall } from '../../src/cli/tui/api';
 import { codeLines } from '../../src/cli/tui/codes';
-import { moveOutText } from '../../src/cli/tui/dbtext';
+import { moveOutText, switchBadges } from '../../src/cli/tui/dbtext';
 import { noAnswer, ok, Reply } from './m2-fake';
 import { mainBot, switchBody } from './m4-fake';
 import {
@@ -71,6 +71,54 @@ describe('m5 move rows', () => {
       for (const l of [...moveLabels, 'Stop receiving']) expect(moving).not.toContain(l);
       expect(moving.some((l) => l.startsWith('Cancel the'))).toBe(true);
     }
+    // NM41: under a hand-over stopped for a copy with no address the switch read serves takeBack, and Receive is offered.
+    const alone = { mode: 'stream', phase: 'stopped', machine: 'yundera' };
+    const back = actionRows('main', { switch: { ok: true, value: { takeBack: true, noAddress: true } } as never }, botOf({ handover: alone }));
+    expect(back.find((r) => r.kind === 'receive')).toEqual({ kind: 'receive', label: 'Receive a main', safetyDump: null, takeBack: 'yundera' });
+    expect(back.find((r) => r.kind === 'cancel')).toMatchObject({ label: 'Cancel the hand-over', noAddress: true });
+    // A hand-over that did not finish, to a copy with no address: the Receive row under the served noAddress, and the cancel question of a record this manager cannot read.
+    const unfinished = actionRows('main', { switch: { ok: true, value: { takeBack: false, noAddress: true } } as never }, botOf({ handover: { ...alone, phase: 'waiting' } }));
+    expect(unfinished.find((r) => r.kind === 'receive')).toEqual({ kind: 'receive', label: 'Receive a main', safetyDump: null, takeBack: 'yundera', unfinished: true });
+    expect(receiveQuestion(null, 'yundera', true)).toEqual(['Take the main back from yundera?', "The hand-over to yundera did not finish. When yundera's copy is not connected, the manager first stops this machine's database and the bot, records the hand-over as finished, then starts the database to wait for a push from yundera's manager; a dump of it is kept first. When the copy still follows this database, Receive is refused."]);
+    for (const l of ['Make a backup for a move', 'Push the main']) expect(labels(unfinished)).not.toContain(l);
+    const unfinishedAddressed = actionRows('main', { switch: { ok: true, value: { takeBack: false, noAddress: false } } as never }, botOf({ handover: { ...alone, phase: 'waiting', host: 'yundera', port: 5434, cert: 'x' } }));
+    expect(labels(unfinishedAddressed)).not.toContain('Receive a main');
+    expect(unfinished.find((r) => r.kind === 'cancel')).toMatchObject({ label: 'Cancel the hand-over', noAddress: true });
+    for (const l of ['Make a backup for a move', 'Push the main']) expect(labels(back)).not.toContain(l);
+    const backReceiving = labels(actionRows('main', { switch: { ok: true, value: { takeBack: true, noAddress: true } } as never }, botOf({ handover: alone, receive: { expiresAt: '2026-11-15T10:00:00.000Z' } })));
+    expect(backReceiving).toContain('Stop receiving');
+    expect(backReceiving).not.toContain('Receive a main');
+    const addressed = actionRows('main', { switch: { ok: true, value: { takeBack: false, noAddress: false } } as never }, botOf({ handover: { ...alone, host: 'yundera', port: 5434, cert: 'x' } }));
+    expect(labels(addressed)).not.toContain('Receive a main');
+    expect(addressed.find((r) => r.kind === 'cancel')).not.toHaveProperty('noAddress');
+    expect(receiveQuestion(null, 'yundera')).toEqual(['Take the main back from yundera?', "This machine's database is started and waits for a push from yundera's manager; a dump of it is kept first."]);
+    expect(receiveQuestion(BROKEN_DUMP, 'yundera')).toEqual(['Take the main back from yundera?', `This machine's database is started and waits for a push from yundera's manager. This database holds a push that did not finish, so no new dump is taken; the dump ${BROKEN_DUMP}, taken before that push, stays with the backups.`]);
+    expect(cancelQuestion('stream', 'yundera', '', 'stopped', true)).toEqual({
+      lines: ['Cancel the hand-over to yundera?', "yundera registered no address, so the manager cannot read whether it took over. It deletes the hand-over in this machine's database, which it starts first when it is stopped, and waits a minute for yundera's copy to receive that. If the copy receives it, this database is the main again, with the bot's login still blocked; then choose Running on the State screen to start the bot here. If it does not, the manager can't confirm what yundera did: it refuses the cancel, keeps the hand-over recorded, and stops the database again when it had started it."],
+      yes: 'Y Cancel the hand-over',
+    });
+    expect(cancelQuestion('stream', 'yundera', '', 'stopped').lines[1]).toContain('it asks again and says what follows');
+    // The card badge of such a record: stopped, while receiving, and beside a push that did not finish.
+    const served = (fleetDb: Record<string, unknown>, takeBack: boolean): Bot => ({ ...botOf(fleetDb), takeBack }) as Bot;
+    const lead = 'Handed over to yundera, which has no address for other machines, so this machine cannot rejoin it as a copy. ';
+    const stays = `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager. Cancel the hand-over only if yundera never took over.`;
+    expect(switchBadges(served({ handover: alone }, true))).toEqual([{ text: 'Handed over', title: stays, danger: false }]);
+    expect(switchBadges(served({ handover: alone, receive: { expiresAt: '2026-11-15T10:00:00.000Z' } }, true))).toEqual([
+      { text: 'Handed over', title: `${lead}Its database runs to receive the main back; the hand-over stays recorded until a push from yundera's manager finishes.`, danger: false },
+      { text: 'Receiving', title: 'Waiting for a push until 2026-11-15 10:00 UTC', danger: false },
+    ]);
+    // The list did not serve the flag, or served false: the texts of a record with an address, whatever the record's host.
+    const BROKEN = { at: '2026-11-14T09:00:00.000Z', safetyDump: BROKEN_DUMP };
+    for (const bot of [botOf({ handover: { ...alone, at: '2026-11-14T09:00:00.000Z' }, pushBroken: BROKEN }), served({ handover: { ...alone, at: '2026-11-14T09:00:00.000Z' }, pushBroken: BROKEN }, false)]) {
+      expect(switchBadges(bot)).toEqual([
+        { text: 'Handed over', title: 'Handed over to yundera on 2026-11-14 09:00 UTC. This machine rejoins as its copy once yundera is the main; last check: not checked yet.', danger: false },
+        { text: 'Push not finished', title: `A push replaced this database on or before 2026-11-14 09:00 UTC and did not finish, so the bot cannot run on it. Restore the dump ${BROKEN_DUMP} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, danger: true },
+      ]);
+    }
+    expect(switchBadges(served({ handover: alone, pushBroken: BROKEN }, true))).toEqual([
+      { text: 'Handed over', title: `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager.`, danger: false },
+      { text: 'Push not finished', title: `A push replaced this database on or before 2026-11-14 09:00 UTC and did not finish, so the bot cannot run on it. Press Receive a main again so yundera can push again. The dump ${BROKEN_DUMP} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`, danger: true },
+    ]);
     // A push that did not finish: Receive names the kept dump (:3653).
     const broken = actionRows('main', { switch: { ok: true, value: {} } as never }, botOf({ pushBroken: { at: 'x', safetyDump: BROKEN_DUMP } }));
     expect(broken.find((r) => r.kind === 'receive')).toEqual({ kind: 'receive', label: 'Receive a main', safetyDump: BROKEN_DUMP });
@@ -89,6 +137,17 @@ describe('m5 move rows', () => {
 });
 
 describe('m5 Receive a main', () => {
+  it('NM41: under an unfinished hand-over with no address the dialog asks the unfinished question', async () => {
+    const handover = { mode: 'stream', phase: 'waiting', machine: 'yundera' };
+    const f = mainRoutes({ bot: mainLaneBot({ handover }), switch: switchBody({ handover, takeBack: false, noAddress: true }) });
+    const v = await toDb(f);
+    await take(v, 'Receive a main');
+    await v.until('Take the main back from yundera?');
+    await v.untilFn(() => flat(v.frame()).includes('The hand-over to yundera did not finish.'));
+    expect(flat(v.frame())).not.toContain("This machine's database is started and waits");
+    expect(calls(f, 'POST', RECEIVE)).toEqual([]);
+  });
+
   it('the dialog, Y Y Y sending one POST, the code screen with the page\'s text, then Esc dropping the code', async () => {
     const h = held();
     const f = mainRoutes().on('POST', RECEIVE, h.answer);

@@ -3771,13 +3771,16 @@
       const b = (text, title, danger) => `<span class="update-badge${danger ? ' danger' : ''}" title="${escapeHtml(title)}">${escapeHtml(text)}</span>`;
       let html = '';
       const h = db.handover;
+      const noAddress = bot.takeBack === true;
       if (h) {
         const machine = h.machine || 'another machine';
         if (h.mode === 'stream' && h.phase === 'waiting') html += b('Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true);
         else if (h.mode === 'stream') {
-          html += b('Handed over', h.host
+          html += b('Handed over', !noAddress
             ? `Handed over to ${machine} on ${switchDate(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`
-            : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped; decommission it, or move the main back here with Push from ${machine}.`, false);
+            : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. ${db.receive
+             ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes.`
+             : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`}`}`, false);
         } else if (h.phase === 'done') html += b('Handed over', h.mode === 'push' ? `a push to ${machine}` : 'a backup made for a move', false);
         else html += b('Hand-over not finished', 'Press Push again, or Cancel the push', true);
       }
@@ -3786,7 +3789,9 @@
       if (db.mainConflict) html += b('Two mains', db.mainConflict.blockError
         ? `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here could not be blocked (${db.mainConflict.blockError}), so bots may still write to this database. Choose one in the Database window.`
         : `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here is blocked. Choose one in the Database window.`, true);
-      if (db.pushBroken) html += b('Push not finished', `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
+      if (db.pushBroken) html += b('Push not finished', noAddress
+        ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`
+        : `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
       if (bot.fleetDbReplica && bot.fleetDbReplica.takeover) html += b('Take-over not finished', 'Press Take over again', true);
       return html;
     }
@@ -3873,7 +3878,7 @@
       }
       if (db.handover) parts.push(btn(db.handover.mode === 'stream' ? 'Cancel the hand-over' : 'Cancel the move', `cancelFleetMove(${id})`));
       if (db.receive) parts.push(btn('Stop receiving', `stopReceivingFleet(${id})`));
-      else if (!db.handover) parts.push(btn('Receive a main', `receiveFleet(${id})`));
+      else if (!db.handover || view.noAddress) parts.push(btn('Receive a main', `receiveFleet(${id}${view.noAddress ? `, ${jsArg((db.handover || {}).machine || 'another machine')}${(db.handover || {}).phase === 'waiting' ? ', true' : ''}` : ''})`));
       if (!db.handover && !db.receive) {
         parts.push(btn('Download for a move', `moveOutFleet(${id})`));
         parts.push(`<input type="text" id="fleet-move-code" placeholder="Move code from the receiving machine" style="min-width:220px;">` + btn('Push the main', `pushFleet(${id})`));
@@ -3914,9 +3919,13 @@
       switchRequest(botId, 'POST', `/bots/${botId}/fleet-takeover`, { start: !start || start.checked }, 'take-over');
     }
 
-    async function receiveFleet(botId) {
+    async function receiveFleet(botId, takeBackFrom, unfinished) {
       const broken = (bots.find(b => b.id === botId)?.fleetDb || {}).pushBroken;
-      const ask = broken
+      const ask = takeBackFrom && unfinished
+        ? `Take the main back from ${takeBackFrom}? The hand-over to ${takeBackFrom} did not finish. When ${takeBackFrom}'s copy is not connected, the manager first stops this machine's database and the bot, records the hand-over as finished, then starts the database to wait for a push from ${takeBackFrom}'s manager; a dump of it is kept first. When the copy still follows this database, Receive is refused.`
+        : takeBackFrom
+        ? `Take the main back from ${takeBackFrom}? This machine's database is started and waits for a push from ${takeBackFrom}'s manager${broken ? `. This database holds a push that did not finish, so no new dump is taken; the dump ${broken.safetyDump}, taken before that push, stays with the backups.` : '; a dump of it is kept first.'}`
+        : broken
         ? `Replace this machine's database with one pushed from another machine? The bot must be Off. This database holds a push that did not finish, so no new dump is taken; the dump ${broken.safetyDump}, taken before that push, stays with the backups.`
         : "Replace this machine's database with one pushed from another machine? The bot must be Off; a dump of this database is kept first.";
       if (!confirm(ask)) return;

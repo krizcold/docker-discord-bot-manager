@@ -361,9 +361,13 @@ describe('S2, S3, S5 to S11, S13 to S15: the rest of the restore lane', () => {
   const REPLACED = { machine: 'new.example', host: 'new.example', port: 5434, generation: 9, own: 5, since: null, at: '2026-10-29T10:00:00.000Z' };
   it.each([
     ['S6 receive', { receive: RECEIVE }, 'This database is waiting to receive a main pushed from another machine; Stop receiving before restoring a dump (nothing was changed)'],
-    ['S9 handover stream', { handover: HANDOVER }, 'A move of this database is recorded (a hand-over to copy.example); Cancel it in the Database window before restoring a dump (nothing was changed)'],
+    ['S9 handover stream, waiting, with an address', { handover: { ...HANDOVER, host: 'copy.example', port: 5434, cert: 'x' } }, 'A move of this database is recorded (a hand-over to copy.example); Cancel it in the Database window before restoring a dump (nothing was changed)'],
+    ['S9 (NM41) handover stream, waiting, no address', { handover: HANDOVER }, "This machine's hand-over of its main database to copy.example did not finish, and copy.example has no address for other machines; a restore is refused while the hand-over is recorded: Hand over again finishes it while copy.example's copy streams from this database, and Cancel the hand-over or the move back (Receive a main here, then Push the main in copy.example's manager) ends it (nothing was changed)"],
     ['S9 handover push, done', { handover: { ...HANDOVER, mode: 'push', phase: 'done' } }, 'A move of this database is recorded (a push to copy.example); Cancel it in the Database window before restoring a dump (nothing was changed)'],
     ['S9 handover file', { handover: { mode: 'file', phase: 'done', at: '2026-10-29T10:00:00.000Z', file: 'moved-x.dump' } }, 'A move of this database is recorded (a backup made for a move); Cancel it in the Database window before restoring a dump (nothing was changed)'],
+    ['S9 (NM41) handover stream, stopped, no address', { handover: { ...HANDOVER, phase: 'stopped' } }, "This machine handed its main database to copy.example, which has no address for other machines; a restore is refused until the main is moved back (Receive a main here, then Push the main in copy.example's manager) or the hand-over is cancelled in the Database window (nothing was changed)"],
+    ['S9 (NM41) the same beside a push that did not finish', { handover: { ...HANDOVER, phase: 'stopped' }, pushBroken: { at: '2026-10-29T10:00:00.000Z', safetyDump: 'pre-receive.dump' } }, "This machine handed its main database to copy.example, which has no address for other machines; a restore is refused until the main is moved back (Receive a main here, then Push the main in copy.example's manager) (nothing was changed)"],
+    ['S9 (NM41) handover stream, stopped, with an address', { handover: { ...HANDOVER, phase: 'stopped', host: 'copy.example', port: 5434, cert: 'x' } }, 'A move of this database is recorded (a hand-over to copy.example); Cancel it in the Database window before restoring a dump (nothing was changed)'],
     ['S10 replacedBy', { replacedBy: REPLACED }, 'new.example replaced this database as the main; rejoin this machine as a copy instead of restoring a dump (nothing was changed)'],
   ])('%s: refused at admission, nothing run', async (_n, fleet, text) => {
     withA(fleet);
@@ -425,7 +429,9 @@ describe('S2, S3, S5 to S11, S13 to S15: the rest of the restore lane', () => {
   });
 
   it.each([
-    ['handover', { handover: HANDOVER }, 'cancel the move, then run a restore again with the bot in Maintenance or Off to retry the lift'],
+    ['handover', { handover: { ...HANDOVER, host: 'copy.example', port: 5434, cert: 'x' } }, 'cancel the move, then run a restore again with the bot in Maintenance or Off to retry the lift'],
+    ['handover that did not finish, to a copy with no address,', { handover: HANDOVER }, 'cancel the hand-over, or move the main back, then run a restore again with the bot in Maintenance or Off to retry the lift'],
+    ['handover to a copy with no address', { handover: { ...HANDOVER, phase: 'stopped' } }, 'move the main back, then run a restore again with the bot in Maintenance or Off to retry the lift'],
     ['receive', { receive: RECEIVE }, 'stop receiving, then run a restore again with the bot in Maintenance or Off to retry the lift'],
     ['replacedBy', { replacedBy: REPLACED }, 'rejoining this machine as a copy rebuilds the database without the fence'],
   ])('S15: a stuck restore fence under a %s mark names RS-STEP', async (_n, fleet, step) => {

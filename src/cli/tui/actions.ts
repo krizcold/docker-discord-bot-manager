@@ -17,12 +17,12 @@ export type ActionRow =
   | { kind: 'remove'; label: string; slot: string | null }
   | { kind: 'reseed'; label: string }
   | { kind: 'handover'; label: string; slot: string; machine: string }
-  | { kind: 'cancel'; label: string; mode: string; phase: string; machine: string; file: string }
+  | { kind: 'cancel'; label: string; mode: string; phase: string; machine: string; file: string; noAddress?: boolean }
   | { kind: 'takeover'; label: string }
   | { kind: 'keep'; label: string; machine: string }
   | { kind: 'rejoin'; label: string; machine: string; recorded: boolean }
   | { kind: 'stale'; label: string; host: string; port: string; running: boolean }
-  | { kind: 'receive'; label: string; safetyDump: string | null }
+  | { kind: 'receive'; label: string; safetyDump: string | null; takeBack?: string; unfinished?: boolean }
   | { kind: 'newcode'; label: string }
   | { kind: 'stopreceive'; label: string; safetyDump: string }
   | { kind: 'moveout'; label: string }
@@ -82,6 +82,7 @@ function mainSwitchRows(reads: ActionReads, bot: Bot | undefined): ActionRow[] {
     rows.push({
       kind: 'cancel', label: db.handover.mode === 'stream' ? 'Cancel the hand-over' : 'Cancel the move', mode: db.handover.mode || '',
       phase: db.handover.phase || '', machine: db.handover.machine || 'another machine', file: db.handover.file || '',
+      ...(view.noAddress ? { noAddress: true } : {}),
     });
   }
   // Stop receiving while receiving (:3610), with a new move code (plan section 9.5); Receive a main with no move recorded
@@ -89,8 +90,12 @@ function mainSwitchRows(reads: ActionReads, bot: Bot | undefined): ActionRow[] {
   if (db.receive) {
     rows.push({ kind: 'stopreceive', label: 'Stop receiving', safetyDump: db.receive.safetyDump || '' });
     rows.push({ kind: 'newcode', label: 'Make a new move code (the code shown before stops working)' });
-  } else if (!db.handover) {
-    rows.push({ kind: 'receive', label: 'Receive a main', safetyDump: db.pushBroken ? db.pushBroken.safetyDump || '' : null });
+  } else if (!db.handover || view.noAddress) {
+    // Under a hand-over to a copy with no address, finished or not, the switch read serves noAddress, and Receive takes the main back.
+    rows.push({
+      kind: 'receive', label: 'Receive a main', safetyDump: db.pushBroken ? db.pushBroken.safetyDump || '' : null,
+      ...(db.handover ? { takeBack: db.handover.machine || 'another machine', ...(db.handover.phase === 'waiting' ? { unfinished: true } : {}) } : {}),
+    });
   }
   // Download for a move and Push the main with no move and no receive recorded (:3612 to :3615).
   if (!db.handover && !db.receive) {
@@ -528,7 +533,16 @@ export const keepQuestion = (machine: string) => [
 ];
 
 // receiveFleet (:3653 to :3655): the variant of a push that did not finish names the dump it keeps.
-export const receiveQuestion = (safetyDump: string | null) => safetyDump !== null
+export const receiveQuestion = (safetyDump: string | null, takeBack?: string, unfinished = false) => takeBack && unfinished
+  ? [`Take the main back from ${takeBack}?`, `The hand-over to ${takeBack} did not finish. When ${takeBack}'s copy is not connected, the manager first stops this machine's database and the bot, records the hand-over as finished, then starts the database to wait for a push from ${takeBack}'s manager; a dump of it is kept first. When the copy still follows this database, Receive is refused.`]
+  : takeBack
+  ? [
+    `Take the main back from ${takeBack}?`,
+    safetyDump !== null
+      ? `This machine's database is started and waits for a push from ${takeBack}'s manager. This database holds a push that did not finish, so no new dump is taken; the dump ${safetyDump}, taken before that push, stays with the backups.`
+      : `This machine's database is started and waits for a push from ${takeBack}'s manager; a dump of it is kept first.`,
+  ]
+  : safetyDump !== null
   ? [
     "Replace this machine's database with one pushed from another machine?",
     `The bot must be Off. This database holds a push that did not finish, so no new dump is taken; the dump ${safetyDump}, taken before that push, stays with the backups.`,
@@ -536,8 +550,17 @@ export const receiveQuestion = (safetyDump: string | null) => safetyDump !== nul
   : ["Replace this machine's database with one pushed from another machine?", 'The bot must be Off; a dump of this database is kept first.'];
 
 // cancelMove (fleetSwitch.ts NM20:740 to :800): what the cancel does for each kind of move, before the route's own question.
-export function cancelQuestion(mode: string, machine: string, file: string, phase = ''): { lines: string[]; yes: string } {
+export function cancelQuestion(mode: string, machine: string, file: string, phase = '', noAddress = false): { lines: string[]; yes: string } {
   const after = 'Afterwards choose Running on the State screen to start the bot here.';
+  if (mode === 'stream' && noAddress) {
+    return {
+      lines: [
+        `Cancel the hand-over to ${machine}?`,
+        `${machine} registered no address, so the manager cannot read whether it took over. It deletes the hand-over in this machine's database, which it starts first when it is stopped, and waits a minute for ${machine}'s copy to receive that. If the copy receives it, this database is the main again, with the bot's login still blocked; then choose Running on the State screen to start the bot here. If it does not, the manager can't confirm what ${machine} did: it refuses the cancel, keeps the hand-over recorded, and stops the database again when it had started it.`,
+      ],
+      yes: 'Y Cancel the hand-over',
+    };
+  }
   if (mode === 'stream') {
     return {
       lines: [

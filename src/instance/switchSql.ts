@@ -956,6 +956,30 @@ export function handoverMachine(h: Handover): string {
   return h.machine || 'another machine';
 }
 
+/** A stream hand-over whose record lacks part of the copy's address: this manager cannot read that copy. */
+export function handoverNoAddress(h: Handover | null | undefined): boolean {
+  return !!h && h.mode === 'stream' && !(h.host && h.port && h.cert);
+}
+
+/** Such a hand-over once it stopped this database: the rejoin cannot run, and Receive takes the main back. */
+export function handedOverNoAddress(h: Handover | null | undefined): boolean {
+  return handoverNoAddress(h) && h?.phase === 'stopped';
+}
+
+const moveBack = (machine: string) => `Receive a main here, then Push the main in ${machine}'s manager`;
+const NO_ADDRESS = (h: Handover) => `This machine handed its main database to ${handoverMachine(h)}, which has no address for other machines`;
+
+const UNFINISHED = (h: Handover) => `This machine's hand-over of its main database to ${handoverMachine(h)} did not finish, and ${handoverMachine(h)} has no address for other machines`;
+const unfinishedNoAddress = (h: Handover | null | undefined): h is Handover => handoverNoAddress(h) && h?.phase === 'waiting';
+const UNFINISHED_ENDS = (h: Handover) => `Hand over again finishes it while ${handoverMachine(h)}'s copy streams from this database, and Cancel the hand-over or the move back (${moveBack(handoverMachine(h))}) ends it`;
+
+/** A restore refused under a hand-over to a copy with no address: Cancel refuses after a push that did not finish, so it is named only without one. */
+export function noAddressRestoreRefusal(db: NonNullable<InstanceConfig['fleetDb']>): string {
+  const h = db.handover!;
+  if (unfinishedNoAddress(h)) return `${UNFINISHED(h)}; a restore is refused while the hand-over is recorded: ${UNFINISHED_ENDS(h)}`;
+  return `${NO_ADDRESS(h)}; a restore is refused until the main is moved back (${moveBack(handoverMachine(h))})${db.pushBroken ? '' : ' or the hand-over is cancelled in the Database window'}`;
+}
+
 /** `a hand-over to <machine>`, `a push to <machine>`, `a backup made for a move`. */
 export function moveModeText(h: Handover): string {
   return h.mode === 'stream' ? `a hand-over to ${handoverMachine(h)}` : h.mode === 'push' ? `a push to ${handoverMachine(h)}` : 'a backup made for a move';
@@ -965,6 +989,11 @@ export function moveModeText(h: Handover): string {
 export function switchStateRefusal(instance: InstanceConfig, to: 'running' | 'maintenance' | 'off'): string | null {
   const db = instance.fleetDb;
   if (!db) return null;
+  if (handedOverNoAddress(db.handover)) {
+    const h = db.handover!;
+    return `${NO_ADDRESS(h)}, so its state cannot change until the main is moved back (${moveBack(handoverMachine(h))})${db.pushBroken ? '' : ' or the hand-over is cancelled'}; nothing was changed`;
+  }
+  if (unfinishedNoAddress(db.handover)) return `${UNFINISHED(db.handover)}, so its state cannot change while the hand-over is recorded: ${UNFINISHED_ENDS(db.handover)}; nothing was changed`;
   if (db.handover) {
     return `This machine handed its main database to ${handoverMachine(db.handover)} (${moveModeText(db.handover)}), so its state cannot change until it rejoins as a copy or the move is cancelled; nothing was changed`;
   }
@@ -979,6 +1008,11 @@ export function switchStateRefusal(instance: InstanceConfig, to: 'running' | 'ma
 /** G4, G5, G17, G19: a start of the bot refused under a switch mark; null when none. */
 export function switchStartRefusal(instance: InstanceConfig): string | null {
   const db = instance.fleetDb;
+  if (db && handedOverNoAddress(db.handover)) {
+    const h = db.handover!;
+    return `${NO_ADDRESS(h)}, so the bot does not start here; move the main back (${moveBack(handoverMachine(h))})${db.pushBroken ? '' : ', or cancel the hand-over'}`;
+  }
+  if (unfinishedNoAddress(db?.handover)) return `${UNFINISHED(db!.handover!)}, so the bot does not start here while the hand-over is recorded: ${UNFINISHED_ENDS(db!.handover!)}`;
   if (db?.handover) return `This machine handed its main database to ${handoverMachine(db.handover)}, so the bot does not start here; rejoin it as a copy, or cancel the move`;
   if (db?.replacedBy) return `${db.replacedBy.machine} replaced this database as the main, so the bot does not start here; rejoin it as a copy`;
   if (db?.mainConflict) return 'Two databases of this bot are mains with the same generation, so the bot does not start here; keep this machine as the main, or rejoin it as a copy';
@@ -989,6 +1023,11 @@ export function switchStartRefusal(instance: InstanceConfig): string | null {
 /** G6: a start of the database alone refused on a handed-over main; null when none. */
 export function switchDbStartRefusal(instance: InstanceConfig): string | null {
   const h = instance.fleetDb?.handover;
+  if (h && handedOverNoAddress(h)) {
+    if (instance.fleetDb?.receive) return `${NO_ADDRESS(h)}; while it waits to receive the main back, only Receive a main starts its database`;
+    return `${NO_ADDRESS(h)}; the database stays stopped until Receive a main starts it${instance.fleetDb?.pushBroken ? '' : ' or the hand-over is cancelled'}`;
+  }
+  if (unfinishedNoAddress(h)) return `${UNFINISHED(h)}; Hand over again, Cancel the hand-over and Receive a main start its database when they need it`;
   return h ? `This machine handed its main database to ${handoverMachine(h)}; the database stays stopped until it rejoins as a copy or the hand-over is cancelled` : null;
 }
 

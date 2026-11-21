@@ -59,7 +59,7 @@ describe('O1 Hand over', () => {
   it.each([
     admit('no managed main', { fleetDb: undefined }, `This instance holds no main database, so there is nothing to hand over${NOTHING}`),
     admit('replication off', { fleetDb: { containerName: 'a-pg', user: 'app', db: 'app', volume: 'v' } }, `Replication is not enabled on this database, so no copy follows it; enable it and add a live copy first${NOTHING}`),
-    admit('copy here', { fleetDbReplica: { containerName: 'x', volume: 'y', slot: 's', primaryHost: 'p', primaryPort: 1, certHost: 'x' } }, `This instance also holds a live copy; remove it before handing over the main${NOTHING}`),
+    admit('copy here', { fleetDbReplica: { containerName: 'x', volume: 'y', slot: 's', primaryHost: 'p', primaryPort: 1, certHost: 'x' } }, `This instance also holds a live copy; remove it first${NOTHING}`),
     admit('seed record', { fleetDbReplicaSeed: { purpose: 'provision', phase: 'seeding', startedAt: 1, updatedAt: 1, primaryHost: 'p', primaryPort: 1, slot: 's' } }, `A live copy seed is recorded on this instance; wait for it or dismiss it first${NOTHING}`),
     admit('receive', { receive: { startedAt: 'x', expiresAt: 'y', safetyDump: 'z' } }, `This database is waiting to receive a main from another machine; Stop receiving first${NOTHING}`),
     admit('replaced', { replacedBy: { machine: 'b', host: 'b', port: 1, generation: 5, own: 3, since: null, at: 'x' } }, `Another database replaced this one as the main; rejoin this machine as a copy instead${NOTHING}`),
@@ -135,7 +135,7 @@ describe('O1 Hand over', () => {
     fake.dbs['a-pg'].addresses = [];
     const r = await go();
     expect(r.success).toBe(true);
-    expect(r.text).toContain("The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine cannot rejoin it as a copy. To move the main back later, press Receive a main here, then Push the main in slot_c's manager.");
+    expect(r.text).toContain("The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine does not rejoin it as a copy by itself. To move the main back later, press Receive a main here, then Push the main in slot_c's manager.");
   });
 
   it('H13: the target read fails', async () => {

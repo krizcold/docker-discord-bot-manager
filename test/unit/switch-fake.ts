@@ -69,6 +69,8 @@ export interface FakeDb {
   lobj: string[];
   /** The members of smdb_copies with LOGIN; null: every machine login an address row names. */
   members: string[] | null;
+  /** When set, a raise that ran answers this line in place of the row (NM42 RA13b). */
+  raiseAnswer?: string;
 }
 
 export function freshDb(over: Partial<FakeDb> = {}): FakeDb {
@@ -325,6 +327,7 @@ export function answerSql(container: string, dbName: string, sql: string): Answe
     if (sql.includes('  DELETE FROM smdb_manager.addresses;\n')) d.addresses = [];
     const old = /host = %L AND port = (\d+)', '([^']*)'\)/.exec(sql);
     if (old) d.addresses = d.addresses.filter(a => !(a.slot === null && a.host === old[2] && a.port === Number(old[1])));
+    if (d.raiseAnswer !== undefined) return ok(`${d.raiseAnswer}\n`);
     return ok(`${genLine(d.generation)}\n`);
   }
   if (sql.trim().startsWith('DELETE FROM smdb_manager.handover;')) {

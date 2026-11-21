@@ -1396,6 +1396,12 @@
 
     // A write whose answer was lost may still have run; the caller re-reads its view after this.
     function showNoAnswer(op, instant) {
+      if (op === 'run-again') {
+        showMessage('error', instant
+          ? "No answer from the manager, so running the main here again can't be confirmed. Check whether it took effect before trying again."
+          : 'No answer from the manager; running the main here again may still be in progress. Check its state before trying again.');
+        return;
+      }
       showMessage('error', instant
         ? `No answer from the manager, so the ${op} can't be confirmed. Check whether it took effect before trying again.`
         : `No answer from the manager; the ${op} may still be running. Check its state before trying again.`);
@@ -3776,13 +3782,15 @@
       const noAddress = bot.takeBack === true;
       if (h) {
         const machine = h.machine || 'another machine';
-        if (h.mode === 'stream' && h.phase === 'waiting') html += b('Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true);
+        if (h.mode === 'stream' && h.phase === 'waiting') html += b('Hand-over not finished', bot.noAddress === true
+          ? `The hand-over to ${machine} did not finish, and ${machine} has no address for other machines. Hand over again finishes it while ${machine}'s copy streams from this database; Receive a main takes the main back when ${machine}'s copy is not connected; Cancel the hand-over ends it when ${machine}'s copy receives the cancel; if ${machine} is lost for good, press Run the main here again.`
+          : 'Press Hand over again, or Cancel the hand-over', true);
         else if (h.mode === 'stream') {
           html += b('Handed over', !noAddress
             ? `Handed over to ${machine} on ${switchDate(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`
-            : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. ${db.receive
-             ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes.`
-             : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`}`}`, false);
+            : `Handed over to ${machine}, which has no address for other machines, so this machine does not rejoin it as a copy by itself. ${db.receive
+             ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes, or until you press Stop receiving and then Run the main here again if ${machine} is lost for good.`
+             : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`} If ${machine} is lost for good, press Run the main here again.`}`, false);
         } else if (h.phase === 'done') html += b('Handed over', h.mode === 'push' ? `a push to ${machine}` : 'a backup made for a move', false);
         else html += b('Hand-over not finished', 'Press Push again, or Cancel the push', true);
       }
@@ -3792,7 +3800,7 @@
         ? `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here could not be blocked (${db.mainConflict.blockError}), so bots may still write to this database. Choose one in the Database window.`
         : `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here is blocked. Choose one in the Database window.`, true);
       if (db.pushBroken) html += b('Push not finished', noAddress
-        ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`
+        ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded. If ${h.machine || 'another machine'} is lost for good, press Run the main here again, which restores that dump first.`
         : `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
       if (bot.fleetDbReplica && bot.fleetDbReplica.takeover) html += b('Take-over not finished', 'Press Take over again', true);
       return html;
@@ -3825,12 +3833,13 @@
     async function switchRequest(botId, method, endpoint, body, what) {
       try {
         let res = await api(method, endpoint, body);
-        if (!res.success && res.needsConfirm) {
-          if (!confirm(res.error)) return;
+        for (let round = 0; round < 3 && !res.success && res.needsConfirm; round++) {
+          if (!confirm(round === 0 ? res.error : 'The question changed; read it again:\n\n' + res.error)) return;
           if (method === 'DELETE') res = await api(method, `${endpoint}${endpoint.includes('?') ? '&' : '?'}confirm=1`);
-          else res = await api(method, endpoint, { ...(body || {}), confirm: true, ...(res.confirmFlag ? { [res.confirmFlag]: true } : {}) });
+          else res = await api(method, endpoint, { ...(body || {}), confirm: true, ...(res.confirmFlag ? { [res.confirmFlag]: true } : {}), ...(typeof res.confirmDump === 'string' ? { confirmDump: res.confirmDump } : {}) });
         }
-        if (!res.success) { showMessage('error', res.error || `The ${what} was refused`); return; }
+        if (!res.success && res.needsConfirm) { showMessage('error', 'The question changed again, so nothing was run. Press the button again to read the new question.'); return; }
+        if (!res.success) { showMessage('error', res.error || (what === 'run-again' ? 'Running the main here again was refused' : `The ${what} was refused`)); return; }
         if (res.opId) {
           const bot = bots.find(b => b.id === botId);
           showMessage('info', `Working on ${bot ? bot.displayName : botId}; the result shows here when it finishes`);
@@ -3879,6 +3888,7 @@
         if (c.streaming) parts.push(btn(`Hand over to ${c.machine}`, `handOverFleet(${id}, ${jsArg(c.slot)}, ${jsArg(c.machine)})`));
       }
       if (db.handover) parts.push(btn(db.handover.mode === 'stream' ? 'Cancel the hand-over' : 'Cancel the move', `cancelFleetMove(${id})`));
+      if (view.runAgain) parts.push(`<button class="btn btn-danger btn-small" onclick="runAgainFleet(${id})">Run the main here again</button>`);
       if (db.receive) parts.push(btn('Stop receiving', `stopReceivingFleet(${id})`));
       else if (!db.handover || view.noAddress) parts.push(btn('Receive a main', `receiveFleet(${id}${view.noAddress ? `, ${jsArg((db.handover || {}).machine || 'another machine')}${(db.handover || {}).phase === 'waiting' ? ', true' : ''}` : ''})`));
       if (!db.handover && !db.receive) {
@@ -3913,6 +3923,10 @@
 
     function cancelFleetMove(botId) {
       switchRequest(botId, 'DELETE', `/bots/${botId}/fleet-handover`, null, 'cancel');
+    }
+
+    function runAgainFleet(botId) {
+      return switchRequest(botId, 'POST', `/bots/${botId}/fleet-run-again`, null, 'run-again');
     }
 
     function takeOverFleet(botId) {

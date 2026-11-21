@@ -443,7 +443,7 @@ describe('probeTarget in the rejoin, and switchView', () => {
     const a = stored('a');
     const v = switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', ...address, at: 'x' } } });
     expect(v.takeBack).toBe(true);
-    expect(v.lines[0]).toBe("Handed over to copy.example, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager. Cancel the hand-over only if copy.example never took over.");
+    expect(v.lines[0]).toBe("Handed over to copy.example, which has no address for other machines, so this machine does not rejoin it as a copy by itself. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in copy.example's manager. Cancel the hand-over only if copy.example never took over. If copy.example is lost for good, press Run the main here again.");
     const full = switchView({ ...a, fleetDb: { ...a.fleetDb, handover: { mode: 'stream', phase: 'stopped', machine: 'copy.example', host: 'copy.example', port: 5434, cert: COPY_PEM, at: 'x' } } });
     expect(full.takeBack).toBe(false);
   });

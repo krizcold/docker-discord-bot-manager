@@ -349,7 +349,10 @@ function withStoredErrorsScrubbed(inst: InstanceConfig): InstanceConfig {
     r && typeof r.lastError === 'string' ? { ...r, lastError: redactSecrets(r.lastError, secrets) } : r;
   const out: InstanceConfig = { ...inst };
   if (out.fleetDbReplicaSeed) out.fleetDbReplicaSeed = scrub(out.fleetDbReplicaSeed);
-  if (out.fleetRestoreError) out.fleetRestoreError = { ...out.fleetRestoreError, text: redactSecrets(out.fleetRestoreError.text, secrets) };
+  if (out.fleetRestoreError) {
+    const n = out.fleetRestoreError;
+    out.fleetRestoreError = { ...n, text: redactSecrets(n.text, secrets), ...(n.ends ? { ends: { cleared: redactSecrets(n.ends.cleared, secrets), still: redactSecrets(n.ends.still, secrets) } } : {}) };
+  }
   if (out.fleetBackupTests) {
     const tests: InstanceConfig['fleetBackupTests'] = {};
     for (const [family, t] of Object.entries(out.fleetBackupTests) as Array<[BackupFamily, FleetBackupTests]>) {

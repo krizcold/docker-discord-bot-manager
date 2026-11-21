@@ -9,7 +9,7 @@ import {
   ActionRow, actionRows, boundOutcome, SeedCancelAnswer, boundReadFailure, DISABLE_QUESTION, disableOutcome, dropOutcome, dropQuestion, EnableForm, enableOutcome,
   SEED_CHANGED_TEXT, SEED_ROUNDS, seedCancelOutcome, addQuestion, CHECKING_REFUSAL, CHECKING_TEXT, CopyAnswer, JoinForm, joinOutcome, joinQuestion,
   NO_SEED_TEXT, PROVISION_ROUNDS, provisionOutcome, provisionQuestion, removeOutcome, removeQuestion, RESEED_QUESTION, reseedOutcome, retireOutcome,
-  handOverQuestion, keepQuestion, LANE_LIMIT_MS, LANE_NOT_CONFIRMED, LaneOp, laneOutcome, rejoinOutcome, rejoinQuestion, STALE_QUESTION, STALE_RUNNING,
+  handOverQuestion, keepQuestion, LANE_LIMIT_MS, LANE_NOT_CONFIRMED, RUN_AGAIN_LIMIT_MS, LaneOp, laneOutcome, rejoinOutcome, rejoinQuestion, STALE_QUESTION, STALE_RUNNING,
   STALE_TIP, staleOutcome, takeOverQuestion, workingText, MOVE_CODE_SHOWN_TEXT, MOVE_OUT_QUESTION, moveCodeReadyText, newCodeQuestion, PUSH_LIMIT_MS,
   pushQuestion, receiveQuestion, joinedFirst, cancelQuestion, stopReceiveQuestion, LoginAnswer, removeLoginOutcome, RENEW_QUESTION, renewNoCodeText,
   renewOutcome,
@@ -619,19 +619,19 @@ export class DatabaseScreen {
     void this.act(waitText, true, async (busy) => {
       const r = await laneCall(this.client, this.botId, method, lanePath(this.botId, route), body, {
         op,
-        limitMs: op === 'push' ? this.pushLimitMs : this.laneLimitMs,
+        limitMs: op === 'push' ? this.pushLimitMs : op === 'run-again' ? RUN_AGAIN_LIMIT_MS : this.laneLimitMs,
         onAccepted: () => {
           busy.text = workingText(name);
           this.report({ ok: null, text: busy.text });
           this.changed();
         },
       });
-      if (r.kind === 'question' && !confirmed) {
+      if (r.kind === 'question' && (!confirmed || op === 'run-again')) {
         const again = method === 'DELETE'
           ? { route: `${route}${route.includes('?') ? '&' : '?'}confirm=1`, body: undefined }
-          : { route, body: { ...(body ?? {}), confirm: true, ...(r.confirmFlag ? { [r.confirmFlag]: true } : {}) } };
+          : { route, body: { ...(body ?? {}), confirm: true, ...(r.confirmFlag ? { [r.confirmFlag]: true } : {}), ...(r.confirmDump !== undefined ? { confirmDump: r.confirmDump } : {}) } };
         return {
-          ask: () => this.ask([r.text], 'Y Confirm', () => this.lane(op, method, again.route, again.body, true, waitText, finish), LANE_NOT_CONFIRMED[op]),
+          ask: () => this.ask(confirmed ? ['The question changed; read it again:', r.text] : [r.text], 'Y Confirm', () => this.lane(op, method, again.route, again.body, true, waitText, finish), LANE_NOT_CONFIRMED[op]),
           lost: { ok: false, text: `Nothing was sent again: the manager asked to confirm after the Database screen was closed (${r.text}).` },
         };
       }
@@ -784,6 +784,10 @@ export class DatabaseScreen {
     if (row.kind === 'handover') {
       const { slot, machine } = row;
       this.ask(handOverQuestion(machine), 'Y Hand over', () => this.lane('hand-over', 'POST', 'fleet-handover', { slot }, false, 'Handing over the main.'));
+      return;
+    }
+    if (row.kind === 'runagain') {
+      this.lane('run-again', 'POST', 'fleet-run-again', undefined, false, 'Running the main here again.');
       return;
     }
     if (row.kind === 'cancel') {

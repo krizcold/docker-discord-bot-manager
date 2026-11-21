@@ -1,4 +1,4 @@
-import { Bot, LaneResult, Outcome, ProvisionBody, ReplicaStatus, ReplicationStatus, SwitchAnswer } from './api';
+import { Bot, LaneResult, laneName, Outcome, ProvisionBody, ReplicaStatus, ReplicationStatus, SwitchAnswer } from './api';
 import { CodeField } from './codes';
 import { DbLayout } from './dbtext';
 import { editField, Field, field, FieldKey, showField } from './field';
@@ -18,6 +18,7 @@ export type ActionRow =
   | { kind: 'reseed'; label: string }
   | { kind: 'handover'; label: string; slot: string; machine: string }
   | { kind: 'cancel'; label: string; mode: string; phase: string; machine: string; file: string; noAddress?: boolean }
+  | { kind: 'runagain'; label: string; machine: string }
   | { kind: 'takeover'; label: string }
   | { kind: 'keep'; label: string; machine: string }
   | { kind: 'rejoin'; label: string; machine: string; recorded: boolean }
@@ -85,6 +86,7 @@ function mainSwitchRows(reads: ActionReads, bot: Bot | undefined): ActionRow[] {
       ...(view.noAddress ? { noAddress: true } : {}),
     });
   }
+  if (view.runAgain) rows.push({ kind: 'runagain', label: 'Run the main here again', machine: db.handover?.machine || 'another machine' });
   // Stop receiving while receiving (:3610), with a new move code (plan section 9.5); Receive a main with no move recorded
   // (:3611), naming the kept dump of a push that did not finish (:3653 to :3655).
   if (db.receive) {
@@ -467,7 +469,7 @@ export function retireOutcome(r: Outcome<CopyAnswer>): Said {
 }
 
 /** The lanes of part 4 by the page's op names (switchRequest's `what`, :3639 to :3686). */
-export type LaneOp = 'hand-over' | 'cancel' | 'take-over' | 'keep' | 'receive' | 'stop' | 'push' | 'move';
+export type LaneOp = 'hand-over' | 'cancel' | 'take-over' | 'keep' | 'receive' | 'stop' | 'push' | 'move' | 'run-again';
 
 // SWITCH_TIMING (fleetSwitch.ts:31 to :44) plus a Running order's hook wait of 120 s: how long an accepted hand-over or
 // take-over is waited for.
@@ -477,6 +479,14 @@ export const LANE_LIMIT_MS = 20 * 60_000;
 // MOVE_TIMING NM20:33: two pushMs of 30 min, three verifyMs of 10 min, five clientMs of 1 min, about 95 min) plus the
 // bot's stop, rounded up.
 export const PUSH_LIMIT_MS = 110 * 60_000;
+
+// How long an accepted Run the main here again is waited for: the pre-restore dump (dumpTiming.snapshotTimeoutMs 5 min,
+// dumpTimeoutMs 10, conflictBudgetMs 10), the meta write (DUMP_TIMEOUT_MS 10), pg_restore (DUMP_TIMEOUT_MS + 30 s), the
+// count (restoreCountTiming 5 min), two table-of-contents reads (tocTiming.backstopMs 90 s each) and two database starts
+// (START_DB_READY 30 s each) are about 54.5 min, rounded up for the stops and the lift.
+export const RUN_AGAIN_LIMIT_MS = 60 * 60_000;
+
+const capitalized = (t: string) => t.charAt(0).toUpperCase() + t.slice(1);
 
 // switchRequest (:3564), while an accepted lane runs.
 export const workingText = (name: string) => `Working on ${name}; the result shows here when it finishes`;
@@ -488,14 +498,14 @@ export function laneOutcome(op: LaneOp, r: LaneResult): Said {
     case 'unconfirmed':
       return { ok: r.kind === 'no-stream' ? false : null, text: r.text };
     case 'lost':
-      return { ok: null, text: noAnswerText(op, r.text) };
+      return { ok: null, text: op === 'run-again' ? `No answer from the manager (${r.text}); running the main here again may still be in progress. Check its state before trying again.` : noAnswerText(op, r.text) };
     case 'refused':
     case 'question':
-      return { ok: false, text: r.text || `The ${op} was refused` };
+      return { ok: false, text: r.text || `${capitalized(laneName(op))} was refused` };
     case 'done':
       return { ok: true, text: r.text || 'Done' };
     default:
-      return { ok: r.ok, text: r.text || (r.ok ? `The ${op} finished.` : `The ${op} failed; the manager gave no reason.`) };
+      return { ok: r.ok, text: r.text || (r.ok ? `${capitalized(laneName(op))} finished.` : `${capitalized(laneName(op))} failed; the manager gave no reason.`) };
   }
 }
 
@@ -511,6 +521,7 @@ export const LANE_NOT_CONFIRMED: Record<LaneOp, string> = {
   stop: 'Cancelled: receiving was not stopped.',
   push: 'Cancelled: nothing was pushed.',
   move: 'Cancelled: no backup was made.',
+  'run-again': 'Cancelled: nothing was changed.',
 };
 
 // handOverFleet (:3638).

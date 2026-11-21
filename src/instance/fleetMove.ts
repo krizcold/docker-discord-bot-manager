@@ -513,7 +513,7 @@ export async function stopReceiving(botId: string): Promise<LaneOutcome> {
   const backTail = !stop || stop.runs === false ? ` This machine's database is stopped again; the hand-over to ${back.machine} is still recorded.`
     : stop.runs ? ` This machine's database did not stop (${stop.error}); it still runs, and the hand-over to ${back.machine} is still recorded.`
     : ` The manager can't confirm that this machine's database stopped (${stop.error}); the hand-over to ${back.machine} is still recorded.`;
-  const kept = (dump: string, taken: string) => `press Receive a main again so ${back.machine} can push again. The dump ${dump} (taken before ${taken}) stays with the backups; a restore is refused while the hand-over to ${back.machine} is recorded.`;
+  const kept = (dump: string, taken: string) => `press Receive a main again so ${back.machine} can push again, or, if ${back.machine} is lost for good, press Run the main here again, which restores the dump ${dump} (taken before ${taken}) first. That dump stays with the backups; a restore is refused while the hand-over to ${back.machine} is recorded.`;
   if (check.broken) return { success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: ${kept(r.safetyDump, 'receiving')}${backTail}` };
   const tail = still ? ` A push that did not finish earlier still stands: ${kept(still.safetyDump, 'that push')}` : '';
   return { success: true, text: `Receiving stopped; the move code no longer works.${tail}${backTail}` };
@@ -558,7 +558,7 @@ export async function receiveStep(inst: InstanceConfig, now: number): Promise<vo
   const dbNow = !back ? '' : 'skipped' in back ? `; the database was not stopped: ${back.skipped}`
     : back.stop.runs === false ? '; the database is stopped again'
     : back.stop.runs ? `; the database did not stop (${back.stop.error})` : `; the manager can't confirm that the database stopped (${back.stop.error})`;
-  const until = back ? `a push from ${back.machine} finishes (the dump ${r.safetyDump} stays with the backups; a restore is refused while the hand-over is recorded)` : `the dump ${r.safetyDump} is restored or a push finishes`;
+  const until = back ? `a push from ${back.machine} finishes or Run the main here again ends the hand-over (the dump ${r.safetyDump} stays with the backups; a restore is refused while the hand-over is recorded)` : `the dump ${r.safetyDump} is restored or a push finishes`;
   console.log(check.broken
     ? `[Switch] ${inst.displayName}: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until ${until}; the receive login is removed${dbNow}`
     : `[Switch] ${inst.displayName}: the move code expired unused; the receive login is removed${dbNow}`);

@@ -26,9 +26,14 @@ const CONFLICT_LINE = "Two databases of A are mains with the same generation 3: 
 
 describe('L5 e: the switch view texts', () => {
   it('a stream hand-over waiting: the not-finished line and badge only', () => {
-    const v = switchView(base({ handover: { mode: 'stream', phase: 'waiting', machine: 'copy.example', host: 'copy.example', port: 5434, generation: 4, at: AT } }));
-    expect(v.lines).toEqual(['The hand-over did not finish. Press Hand over again, or Cancel the hand-over.']);
-    expect(v.badges).toEqual([{ text: 'Hand-over not finished', title: 'Press Hand over again, or Cancel the hand-over', danger: true }]);
+    // NM42: the copy registered no address, so the hand-over recorded no host, port or certificate.
+    const v = switchView(base({ handover: { mode: 'stream', phase: 'waiting', machine: 'copy.example', generation: 4, at: AT } }));
+    const title = "The hand-over to copy.example did not finish, and copy.example has no address for other machines. Hand over again finishes it while copy.example's copy streams from this database; Receive a main takes the main back when copy.example's copy is not connected; Cancel the hand-over ends it when copy.example's copy receives the cancel; if copy.example is lost for good, press Run the main here again.";
+    expect(v.lines).toEqual([title]);
+    expect(v.badges).toEqual([{ text: 'Hand-over not finished', title, danger: true }]);
+    const full = switchView(base({ handover: { mode: 'stream', phase: 'waiting', machine: 'copy.example', host: 'copy.example', port: 5434, cert: 'x', generation: 4, at: AT } }));
+    expect(full.lines).toEqual(['The hand-over did not finish. Press Hand over again, or Cancel the hand-over.']);
+    expect(full.badges).toEqual([{ text: 'Hand-over not finished', title: 'Press Hand over again, or Cancel the hand-over', danger: true }]);
   });
   it('a stopped stream hand-over with no machine name reads another machine', () => {
     const v = switchView(base({ handover: { mode: 'stream', phase: 'stopped', host: 'copy.example', port: 5434, cert: 'x', generation: 4, at: AT } }));

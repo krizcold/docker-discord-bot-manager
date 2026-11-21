@@ -82,7 +82,7 @@ describe('O5 Receive', () => {
   it.each([
     ['no main', { fleetDb: undefined }, `This instance holds no main database to replace; install it with a blank Database URL first${NOTHING}`],
     ['replication off', { fleetDb: { containerName: 'a-pg', user: 'app', db: 'app', volume: 'v' } }, `Replication is not enabled, so the other machine has no address to push to; enable it first${NOTHING}`],
-    ['a copy here', { fleetDbReplica: { containerName: 'c', volume: 'v', slot: 's', primaryHost: 'p', primaryPort: 1, certHost: 'c' } }, `This instance also holds a live copy; remove it before handing over the main${NOTHING}`],
+    ['a copy here', { fleetDbReplica: { containerName: 'c', volume: 'v', slot: 's', primaryHost: 'p', primaryPort: 1, certHost: 'c' } }, `This instance also holds a live copy; remove it first${NOTHING}`],
   ])('V2: %s', async (_n, over, text) => {
     off(over);
     expect((await receive('a')).text).toBe(text);

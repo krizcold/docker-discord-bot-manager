@@ -20,6 +20,8 @@ export interface Bot {
   fenceStuck?: string | null;
   /** Served by the list: the hand-over stopped this database for a copy with no address. */
   takeBack?: boolean;
+  /** Served by the list: a hand-over, finished or not, to a copy with no address. */
+  noAddress?: boolean;
   migrate?: MigrateRecordView | null;
   migrateLast?: MigrateLastView | null;
   updateAvailable?: boolean;
@@ -1294,6 +1296,8 @@ export interface SwitchAnswer {
   takeBack?: boolean;
   /** True for a hand-over, finished or not, to a copy with no address: Cancel decides by the copy's replay. */
   noAddress?: boolean;
+  /** True while Run the main here again's checks of stored facts admit it: the button is offered. */
+  runAgain?: boolean;
   generation?: { machine?: string; generation?: number; since?: string | null; error?: string } | null;
   /** streamingCopies (fleetSwitch.ts:1774): this main's copies and whether each streams now. */
   copies?: Array<{ slot?: string; machine?: string; streaming?: boolean }>;
@@ -1309,13 +1313,16 @@ export type LaneResult =
   | { kind: 'no-stream'; text: string }
   | { kind: 'lost'; text: string }
   | { kind: 'refused'; text: string }
-  | { kind: 'question'; text: string; confirmFlag?: string }
+  | { kind: 'question'; text: string; confirmFlag?: string; confirmDump?: string }
   | { kind: 'done'; text: string; moveCode?: string; file?: string }
   | { kind: 'ended'; ok: boolean; text: string; file?: string }
   | { kind: 'unconfirmed'; text: string };
 
 const limitText = (ms: number) => (ms % 60_000 === 0 ? `${ms / 60_000} min` : ms % 1000 === 0 ? `${ms / 1000} s` : `${ms} ms`);
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+
+/** The lane's name in a sentence: 'run-again' reads as running the main here again. */
+export const laneName = (op: string): string => (op === 'run-again' ? 'running the main here again' : `the ${op}`);
 
 export const lanePath = (botId: string, route: string): string => `/api/bots/${botId}/${route}`;
 
@@ -1380,14 +1387,19 @@ export async function laneCall(
     if (r.ok !== true) return { kind: 'lost', text: r.text };
     const b = r.value;
     if (b.success !== true) {
-      if (b.needsConfirm === true) return { kind: 'question', text: str(b.error), ...(str(b.confirmFlag) ? { confirmFlag: str(b.confirmFlag) } : {}) };
+      if (b.needsConfirm === true) {
+        return {
+          kind: 'question', text: str(b.error), ...(str(b.confirmFlag) ? { confirmFlag: str(b.confirmFlag) } : {}),
+          ...(typeof b.confirmDump === 'string' ? { confirmDump: b.confirmDump } : {}),
+        };
+      }
       return { kind: 'refused', text: str(b.error) };
     }
     const opId = str(b.opId);
     if (!opId) return { kind: 'done', text: str(b.text), ...(str(b.moveCode) ? { moveCode: str(b.moveCode) } : {}), ...(str(b.file) ? { file: str(b.file) } : {}) };
     opts.onAccepted?.();
     const unconfirmed = (reason: string): LaneResult => ({
-      kind: 'unconfirmed', text: `Can't confirm the ${opts.op}: ${reason}; it may still be running. The Move lines show what stands.`,
+      kind: 'unconfirmed', text: `Can't confirm ${laneName(opts.op)}: ${reason}; it may still be running. The Move lines show what stands.`,
     });
     return await new Promise<LaneResult>((resolve) => {
       const judge = (d: Record<string, unknown>) => resolve({ kind: 'ended', ok: d.success === true, text: str(d.text), ...(str(d.file) ? { file: str(d.file) } : {}) });

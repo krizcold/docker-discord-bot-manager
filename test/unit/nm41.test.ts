@@ -46,8 +46,8 @@ const READY = `Paste this move code into Push the main in the other machine's ma
 const T3 = " This machine's database was started to receive it; the hand-over to slot_c stays recorded until the push finishes.";
 const T4_TAIL = (error: string) => ` The database was started for Receive and did not stop again (${error}); it runs with the bot's login blocked, and the hand-over stays recorded.`;
 const T5 = " This machine's database is stopped again; the hand-over to slot_c is still recorded.";
-const T6 = (state: string, dbClause = 'and the database is stopped again') => `The manager can't confirm whether slot_c took over: slot_c registered no address, so this manager cannot read it, and its copy did not receive the cancel within 0 seconds (${state}). The hand-over stays recorded, the bot's login stays blocked, this database's generation was not changed, ${dbClause}. If slot_c's manager shows it as the main, move the main back: press Receive a main here, then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again.`;
-const T6_WAITING = (state: string, dbClause = 'and the database is stopped again') => `The manager can't confirm whether slot_c took over: slot_c registered no address, so this manager cannot read it, and its copy did not receive the cancel within 0 seconds (${state}). The hand-over stays recorded, the bot's login stays blocked, this database's generation was not changed, ${dbClause}. If slot_c's manager shows it as the main, move the main back: press Receive a main here, which first stops this database and the bot when slot_c's copy is not connected; then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again; while this database runs and the copy streams, Hand over again finishes the hand-over instead.`;
+const T6 = (state: string, dbClause = 'and the database is stopped again') => `The manager can't confirm whether slot_c took over: slot_c registered no address, so this manager cannot read it, and its copy did not receive the cancel within 0 seconds (${state}). The hand-over stays recorded, the bot's login stays blocked, this database's generation was not changed, ${dbClause}. If slot_c's manager shows it as the main, move the main back: press Receive a main here, then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again. If slot_c is lost for good, press Run the main here again.`;
+const T6_WAITING = (state: string, dbClause = 'and the database is stopped again') => `The manager can't confirm whether slot_c took over: slot_c registered no address, so this manager cannot read it, and its copy did not receive the cancel within 0 seconds (${state}). The hand-over stays recorded, the bot's login stays blocked, this database's generation was not changed, ${dbClause}. If slot_c's manager shows it as the main, move the main back: press Receive a main here, which first stops this database and the bot when slot_c's copy is not connected; then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again; while this database runs and the copy streams, Hand over again finishes the hand-over instead. If slot_c is lost for good, press Run the main here again.`;
 const X_OK = "The hand-over is cancelled: this database runs again as the main, with the bot's login still blocked. Choose Running in the State window to start the bot here.";
 
 function trackSaves() {
@@ -105,10 +105,10 @@ describe('NM41: the planned move to a copy that registered no address', () => {
     expect(record.port).toBeUndefined();
     expect(record.cert).toBeUndefined();
     expect(events[events.length - 1]).toBe('db-stop');
-    expect(r.text.endsWith(" The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine cannot rejoin it as a copy. To move the main back later, press Receive a main here, then Push the main in slot_c's manager.")).toBe(true);
+    expect(r.text.endsWith(" The copy on slot_c has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine does not rejoin it as a copy by itself. To move the main back later, press Receive a main here, then Push the main in slot_c's manager.")).toBe(true);
     const view = switchView(inst());
     expect(view.takeBack).toBe(true);
-    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in slot_c's manager. Cancel the hand-over only if slot_c never took over.");
+    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine does not rejoin it as a copy by itself. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in slot_c's manager. Cancel the hand-over only if slot_c never took over. If slot_c is lost for good, press Run the main here again.");
   });
 
   it('the take-over leaves the copy alone with formerMain', async () => {
@@ -153,7 +153,7 @@ describe('NM41: Receive takes the main back under the record', () => {
     expect(stored('a').fleetDb.receive).toMatchObject({ safetyDump: DUMP });
     expect(stored('a').fleetDb.handover).toEqual(record);
     const view = switchView(inst());
-    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database runs to receive the main back; the hand-over stays recorded until a push from slot_c's manager finishes.");
+    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine does not rejoin it as a copy by itself. Its database runs to receive the main back; the hand-over stays recorded until a push from slot_c's manager finishes, or until you press Stop receiving and then Run the main here again if slot_c is lost for good.");
   });
 
   it.each([
@@ -234,7 +234,7 @@ describe('NM41: Receive takes the main back under the record', () => {
     expect(stored('a').fleetDb.handover).toEqual(record);
     expect(h.events).toContain('db-stop');
     expect(h.sidecar['a-pg']).toBe(false);
-    expect(switchStartRefusal(inst())).toMatch(/^This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here; /);
+    expect(switchStartRefusal(inst())).toMatch(/^This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here while the hand-over is recorded: /);
   });
 
   it('Stop receiving whose stop fails says that the database still runs', async () => {
@@ -266,7 +266,7 @@ describe('NM41: Receive takes the main back under the record', () => {
     await receive('a');
     fake.dbs['a-pg'].dbOid = '99999';
     const stopped = await stopReceive('a');
-    expect(stopped).toEqual({ success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: press Receive a main again so slot_c can push again. The dump ${DUMP} (taken before receiving) stays with the backups; a restore is refused while the hand-over to slot_c is recorded.${T5}` });
+    expect(stopped).toEqual({ success: true, text: `Receiving stopped; the move code no longer works. A push replaced this machine's database and did not finish, so the database is empty or holds data that was not checked, and the bot cannot run on it: press Receive a main again so slot_c can push again, or, if slot_c is lost for good, press Run the main here again, which restores the dump ${DUMP} (taken before receiving) first. That dump stays with the backups; a restore is refused while the hand-over to slot_c is recorded.${T5}` });
     expect(stored('a').fleetDb.pushBroken).toMatchObject({ safetyDump: DUMP });
     expect(stored('a').fleetDb.handover).toEqual(record);
     h.events.length = 0;
@@ -343,7 +343,7 @@ describe('NM41: Cancel under a record with no address', () => {
     await stopReceive('a');
     expect(stored('a').fleetDb.pushBroken).toBeDefined();
     h.events.length = 0;
-    expect(await cancelHandOver('a', true)).toEqual({ success: false, status: 409, text: 'A push replaced this database and did not finish, so it is no longer the database that was handed over; press Receive a main again so slot_c can push again.' });
+    expect(await cancelHandOver('a', true)).toEqual({ success: false, status: 409, text: `A push replaced this database and did not finish, so it is no longer the database that was handed over; press Receive a main again so slot_c can push again. If slot_c is lost for good, press Run the main here again, which restores the dump ${DUMP} first.` });
     expect(h.events).toEqual([]);
     expect(stored('a').fleetDb.handover).toBeDefined();
   });
@@ -689,14 +689,14 @@ describe('NM41 fix 1: branches no row pinned (R6)', () => {
     expect(h.sidecar['a-pg']).toBe(true);
   });
 
-  it('Stop receiving beside an earlier push that did not finish: the still-stands tail names Receive, not a restore', async () => {
+  it('Stop receiving beside an earlier push that did not finish: the still-stands tail names Receive and Run the main here again, not a plain restore', async () => {
     await handedOver();
     await receive('a');
     fake.dbs['a-pg'].dbOid = '99999';
     await stopReceive('a');
     await receive('a');
     const r = await stopReceive('a');
-    expect(r).toEqual({ success: true, text: `Receiving stopped; the move code no longer works. A push that did not finish earlier still stands: press Receive a main again so slot_c can push again. The dump ${DUMP} (taken before that push) stays with the backups; a restore is refused while the hand-over to slot_c is recorded.${T5}` });
+    expect(r).toEqual({ success: true, text: `Receiving stopped; the move code no longer works. A push that did not finish earlier still stands: press Receive a main again so slot_c can push again, or, if slot_c is lost for good, press Run the main here again, which restores the dump ${DUMP} (taken before that push) first. That dump stays with the backups; a restore is refused while the hand-over to slot_c is recorded.${T5}` });
   });
 
   it('Stop receiving whose stop docker does not confirm, and one that fails: neither names the login', async () => {
@@ -719,7 +719,7 @@ describe('NM41 fix 1: branches no row pinned (R6)', () => {
     await receiveStep(inst(), at);
     spy.mockRestore();
     expect(stored('a').fleetDb.pushBroken).toMatchObject({ safetyDump: DUMP });
-    expect(lines).toContain(`[Switch] A: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until a push from slot_c finishes (the dump ${DUMP} stays with the backups; a restore is refused while the hand-over is recorded); the receive login is removed; the database did not stop (compose stop failed)`);
+    expect(lines).toContain(`[Switch] A: the move code expired; a push replaced this database and did not finish, so the bot stays stopped until a push from slot_c finishes or Run the main here again ends the hand-over (the dump ${DUMP} stays with the backups; a restore is refused while the hand-over is recorded); the receive login is removed; the database did not stop (compose stop failed)`);
   });
 
   it('the card under the record beside a push that did not finish: Receive again, and no advice to cancel', async () => {
@@ -728,16 +728,16 @@ describe('NM41 fix 1: branches no row pinned (R6)', () => {
     fake.dbs['a-pg'].dbOid = '99999';
     await stopReceive('a');
     const view = switchView(inst());
-    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine cannot rejoin it as a copy. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in slot_c's manager.");
-    expect(view.lines[1]).toMatch(/^A push replaced this database on or before \d{4}-\d\d-\d\d \d\d:\d\d UTC and did not finish, so the bot cannot run on it\. Press Receive a main again so slot_c can push again\. The dump pre-receive-2026-10-28T12-00-00-000Z\.dump \(taken before receiving\) stays with the backups; a restore is refused while the hand-over is recorded\.$/);
+    expect(view.lines[0]).toBe("Handed over to slot_c, which has no address for other machines, so this machine does not rejoin it as a copy by itself. Its database stays stopped. To move the main back, press Receive a main here, then Push the main in slot_c's manager. If slot_c is lost for good, press Run the main here again.");
+    expect(view.lines[1]).toMatch(/^A push replaced this database on or before \d{4}-\d\d-\d\d \d\d:\d\d UTC and did not finish, so the bot cannot run on it\. Press Receive a main again so slot_c can push again\. The dump pre-receive-2026-10-28T12-00-00-000Z\.dump \(taken before receiving\) stays with the backups; a restore is refused while the hand-over is recorded\. If slot_c is lost for good, press Run the main here again, which restores that dump first\.$/);
     expect(view.badges.map(b => b.text)).toEqual(['Handed over', 'Push not finished']);
   });
 
   it('the refusals of a state order, a start and a database start name Receive under the record', async () => {
     await handedOver();
-    expect(switchStateRefusal(inst(), 'off')).toBe("This machine handed its main database to slot_c, which has no address for other machines, so its state cannot change until the main is moved back (Receive a main here, then Push the main in slot_c's manager) or the hand-over is cancelled; nothing was changed");
-    expect(switchStartRefusal(inst())).toBe("This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here; move the main back (Receive a main here, then Push the main in slot_c's manager), or cancel the hand-over");
-    expect(switchDbStartRefusal(inst())).toBe('This machine handed its main database to slot_c, which has no address for other machines; the database stays stopped until Receive a main starts it or the hand-over is cancelled');
+    expect(switchStateRefusal(inst(), 'off')).toBe("This machine handed its main database to slot_c, which has no address for other machines, so its state cannot change while the hand-over is recorded: the move back (Receive a main here, then Push the main in slot_c's manager), a Cancel the hand-over that slot_c's copy receives, or Run the main here again (if slot_c is lost for good) ends it; nothing was changed");
+    expect(switchStartRefusal(inst())).toBe("This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here while the hand-over is recorded: the move back (Receive a main here, then Push the main in slot_c's manager), a Cancel the hand-over that slot_c's copy receives, or Run the main here again (if slot_c is lost for good) ends it");
+    expect(switchDbStartRefusal(inst())).toBe('This machine handed its main database to slot_c, which has no address for other machines; the database stays stopped until Receive a main, Cancel the hand-over or Run the main here again starts it');
   });
 });
 
@@ -927,10 +927,10 @@ describe('NM41 text round: the general refusals under an unfinished hand-over wi
     save.mockRestore();
     expect(stored('a').fleetDb.handover).toMatchObject({ phase: 'waiting' });
     const LEAD = "This machine's hand-over of its main database to slot_c did not finish, and slot_c has no address for other machines";
-    const ENDS = "Hand over again finishes it while slot_c's copy streams from this database, and Cancel the hand-over or the move back (Receive a main here, then Push the main in slot_c's manager) ends it";
+    const ENDS = "Hand over again finishes it while slot_c's copy streams from this database, and Cancel the hand-over, the move back (Receive a main here, then Push the main in slot_c's manager) or Run the main here again (if slot_c is lost for good) ends it";
     expect(switchStateRefusal(inst(), 'running')).toBe(`${LEAD}, so its state cannot change while the hand-over is recorded: ${ENDS}; nothing was changed`);
     expect(switchStartRefusal(inst())).toBe(`${LEAD}, so the bot does not start here while the hand-over is recorded: ${ENDS}`);
-    expect(switchDbStartRefusal(inst())).toBe(`${LEAD}; Hand over again, Cancel the hand-over and Receive a main start its database when they need it`);
+    expect(switchDbStartRefusal(inst())).toBe(`${LEAD}; Hand over again, Cancel the hand-over, Receive a main and Run the main here again start its database when they need it`);
   });
 
   it('a waiting record with an address keeps the general texts', async () => {
@@ -957,15 +957,15 @@ describe('NM41 fix 2: rows for branches that had none (F5)', () => {
     expect(switchView(inst())).toMatchObject({ noAddress: false, takeBack: false });
   });
 
-  it('beside a push that did not finish, the state order, the start and the database start name only the move back', async () => {
+  it('beside a push that did not finish, the state order, the start and the database start name the move back and Run the main here again, not Cancel', async () => {
     await handedOver();
     await receive('a');
     fake.dbs['a-pg'].dbOid = '99999';
     await stopReceive('a');
     expect(stored('a').fleetDb.pushBroken).toBeDefined();
-    expect(switchStateRefusal(inst(), 'off')).toBe("This machine handed its main database to slot_c, which has no address for other machines, so its state cannot change until the main is moved back (Receive a main here, then Push the main in slot_c's manager); nothing was changed");
-    expect(switchStartRefusal(inst())).toBe("This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here; move the main back (Receive a main here, then Push the main in slot_c's manager)");
-    expect(switchDbStartRefusal(inst())).toBe('This machine handed its main database to slot_c, which has no address for other machines; the database stays stopped until Receive a main starts it');
+    expect(switchStateRefusal(inst(), 'off')).toBe(`This machine handed its main database to slot_c, which has no address for other machines, so its state cannot change while the hand-over is recorded: the move back (Receive a main here, then Push the main in slot_c's manager) or Run the main here again (if slot_c is lost for good; it restores the dump ${DUMP} first) ends it; nothing was changed`);
+    expect(switchStartRefusal(inst())).toBe(`This machine handed its main database to slot_c, which has no address for other machines, so the bot does not start here while the hand-over is recorded: the move back (Receive a main here, then Push the main in slot_c's manager) or Run the main here again (if slot_c is lost for good; it restores the dump ${DUMP} first) ends it`);
+    expect(switchDbStartRefusal(inst())).toBe('This machine handed its main database to slot_c, which has no address for other machines; the database stays stopped until Receive a main or Run the main here again starts it');
   });
 
   it('the database start refused while a receive stands says that only Receive starts it', async () => {

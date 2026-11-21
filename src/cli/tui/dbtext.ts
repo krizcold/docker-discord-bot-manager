@@ -103,13 +103,15 @@ export function switchBadges(bot: Bot): Badge[] {
   const noAddress = bot.takeBack === true;
   if (h) {
     const machine = h.machine || 'another machine';
-    if (h.mode === 'stream' && h.phase === 'waiting') b('Hand-over not finished', 'Press Hand over again, or Cancel the hand-over', true);
+    if (h.mode === 'stream' && h.phase === 'waiting') b('Hand-over not finished', bot.noAddress === true
+      ? `The hand-over to ${machine} did not finish, and ${machine} has no address for other machines. Hand over again finishes it while ${machine}'s copy streams from this database; Receive a main takes the main back when ${machine}'s copy is not connected; Cancel the hand-over ends it when ${machine}'s copy receives the cancel; if ${machine} is lost for good, press Run the main here again.`
+      : 'Press Hand over again, or Cancel the hand-over', true);
     else if (h.mode === 'stream') {
       b('Handed over', !noAddress
         ? `Handed over to ${machine} on ${switchDate(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`
-        : `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. ${db.receive
-         ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes.`
-         : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`}`}`, false);
+        : `Handed over to ${machine}, which has no address for other machines, so this machine does not rejoin it as a copy by itself. ${db.receive
+         ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes, or until you press Stop receiving and then Run the main here again if ${machine} is lost for good.`
+         : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`} If ${machine} is lost for good, press Run the main here again.`}`, false);
     } else if (h.phase === 'done') b('Handed over', h.mode === 'push' ? `a push to ${machine}` : 'a backup made for a move', false);
     else b('Hand-over not finished', 'Press Push again, or Cancel the push', true);
   }
@@ -121,7 +123,7 @@ export function switchBadges(bot: Bot): Badge[] {
       : `This database and ${db.mainConflict.machine} are both mains with the same generation; the bot's login here is blocked. Choose one in the Database window.`, true);
   }
   if (db.pushBroken) b('Push not finished', noAddress
-    ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h?.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`
+    ? `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h?.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded. If ${h?.machine || 'another machine'} is lost for good, press Run the main here again, which restores that dump first.`
     : `A push replaced this database on or before ${switchDate(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`, true);
   if (bot.fleetDbReplica && bot.fleetDbReplica.takeover) b('Take-over not finished', 'Press Take over again', true);
   return out;

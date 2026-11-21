@@ -94,6 +94,8 @@ export interface FleetDbHandover {
   rejoinError?: string;
   rejoinTriedAt?: number;
   lastCheck?: string;
+  /** Run the main here again's target generation, fixed before its raise; a rerun raises to it. */
+  runAgainGeneration?: number;
 }
 
 export interface FleetDbReceive {
@@ -343,6 +345,8 @@ export interface FleetRestoreNotice {
   asWas?: { dump: string | null; file: string };
   /** Written before any drop by a restore that followed no unfinished one: without asWas, the database is as it was. */
   beforeDrop?: true;
+  /** A doubtful lane restore's two endings, after text: the reader adds still while the push is recorded as not finished, cleared otherwise. */
+  ends?: { cleared: string; still: string };
 }
 
 export interface InstanceConfig {

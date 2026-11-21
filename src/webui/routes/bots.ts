@@ -63,13 +63,15 @@ function withActiveOp<T extends { id: string } | null | undefined>(bot: T): T | 
 
 // The computed health keys every bot record carries to the page, so a push
 // never replaces them with the raw record's fleetBackup config.
-function botHealth(bot: InstanceConfig): { fleetBackup: ReturnType<typeof fleetBackup.fleetBackupStatus> | null; fenceStuck: string | null; maintenanceDrift: string | null; takeBack: boolean } {
+function botHealth(bot: InstanceConfig): { fleetBackup: ReturnType<typeof fleetBackup.fleetBackupStatus> | null; fenceStuck: string | null; maintenanceDrift: string | null; takeBack: boolean; noAddress: boolean } {
   return {
     fleetBackup: bot.fleetDb || bot.fleetDbReplica ? fleetBackup.fleetBackupStatus(bot) : null,
     fenceStuck: fleetBackup.getFleetFenceStuck(bot.id),
     maintenanceDrift: maintenance.getMaintenanceDrift(bot.id),
     // The hand-over stopped this database for a copy with no address: the card badges choose their text from it.
     takeBack: fleetSwitch.handedOverNoAddress(bot.fleetDb?.handover),
+    // A hand-over to a copy with no address in either phase: the waiting badges and Run the main here again read it.
+    noAddress: fleetSwitch.handoverNoAddress(bot.fleetDb?.handover),
   };
 }
 
@@ -95,7 +97,7 @@ export function collectHealthChanges(seen: Map<string, string>): HealthPush[] {
     live.add(bot.id);
     let health: ReturnType<typeof botHealth>;
     try { health = botHealth(bot); } catch { continue; }
-    const key = JSON.stringify([health.fleetBackup, health.fenceStuck, health.maintenanceDrift, health.takeBack]);
+    const key = JSON.stringify([health.fleetBackup, health.fenceStuck, health.maintenanceDrift, health.takeBack, health.noAddress]);
     if (seen.get(bot.id) === key) continue;
     seen.set(bot.id, key);
     changed.push({ id: bot.id, ...health });
@@ -2161,7 +2163,7 @@ export function createBotRoutes(wss: WebSocketServer): Router {
       res.json({ success: true, text: answer.text, ...(answer.moveCode ? { moveCode: answer.moveCode } : {}), ...(answer.file ? { file: answer.file } : {}) });
       return;
     }
-    res.status(answer.status ?? 409).json({ success: false, error: answer.text, ...(answer.needsConfirm ? { needsConfirm: true } : {}), ...(answer.confirmFlag ? { confirmFlag: answer.confirmFlag } : {}) });
+    res.status(answer.status ?? 409).json({ success: false, error: answer.text, ...(answer.needsConfirm ? { needsConfirm: true } : {}), ...(answer.confirmFlag ? { confirmFlag: answer.confirmFlag } : {}), ...(answer.confirmDump !== undefined ? { confirmDump: answer.confirmDump } : {}) });
   };
 
   /** GET /api/bots/:id/fleet-switch - The switch records as the Database window reads them, and the streaming copies. */
@@ -2197,6 +2199,17 @@ export function createBotRoutes(wss: WebSocketServer): Router {
   router.delete('/:id/fleet-handover', async (req: Request, res: Response) => {
     try {
       await laneRoute(req, res, 'handover', () => fleetSwitch.cancelMove(req.params.id, req.query.confirm === '1'));
+    } catch (error) {
+      res.status(500).json({ success: false, error: String(error) });
+    }
+  });
+
+  /** POST /api/bots/:id/fleet-run-again { confirm?, confirmDump? } - Run the main here again after a hand-over to a copy with no address. */
+  router.post('/:id/fleet-run-again', async (req: Request, res: Response) => {
+    try {
+      const { confirm, confirmDump } = (req.body ?? {}) as { confirm?: unknown; confirmDump?: unknown };
+      const dump = typeof confirmDump === 'string' ? confirmDump : '';
+      await laneRoute(req, res, fleetSwitch.RUN_AGAIN_OP, admit => fleetSwitch.runAgainMain(req.params.id, confirm === true, admit, dump));
     } catch (error) {
       res.status(500).json({ success: false, error: String(error) });
     }

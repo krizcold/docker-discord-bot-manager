@@ -7,6 +7,7 @@
 import { startProcess } from '../docker/processStart';
 import * as fs from 'fs';
 import * as net from 'net';
+import * as path from 'path';
 import * as containerManager from '../docker/containerManager';
 import * as envManager from '../env/manager';
 import * as dbLogin from './dbLogin';
@@ -20,7 +21,7 @@ import { notifyOwner } from './backupCheck';
 import { claimFleetBackupBusy, releaseFleetBackupBusy } from './fleetBackupGuards';
 import { machineLoginsTickRuns, managedDbPassword } from './fleetReplication';
 import { certFingerprint, decodeJoinCode, encodeJoinCode, JoinCode, lsnToBigInt, machineText, sqlLiteral } from '../config/joinCode';
-import { DM_RETRY_MS, utcText } from './backupFiles';
+import { backupDir, DM_RETRY_MS, utcText } from './backupFiles';
 import {
   BLOCKED_SESSIONS_SQL, closedCount, COPIES_READ_SQL, COPIES_SYNC_SQL, COPY_LOGIN_RE, copyLogin, copySlot, DB_OID_SQL, FOREIGN_READ_SQL, ForeignStream, LOBJ_SWEEP_SQL, NEW_LOGINS_READ_SQL, parseForeignStreams, parseRemoveBlock, REMOVE_BLOCK_SQL, TAINTED_SLOT_SQL, ensureGenerationSql, FORMER_LISTED_SQL, GEN_READ_SQL, GENERATION_SCHEMA_SQL, GenRow, generationBefore, HANDOVER_READ_SQL, handedOverNoAddress, handoverNoAddress, machineNameOf, missingTable, moveModeText,
   parseGenRow, parseReceiveMark, parseRestoreState, raiseSql, RECEIVE_MARK_READ_SQL, RECEIVED_OF_SQL, receiveMarkClearSql, receiveMarkVerdict, RESTORE_STATE_CLEAR, RESTORE_STATE_READ, RestoreState, TAKEOVER_ROLE_RE,
@@ -52,6 +53,7 @@ const errorOf = (stderr: string) => {
 };
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const NOTHING = '; nothing was changed';
+const END_AGAIN = 'Press Run the main here again to end it.';
 
 // ─── Process starts ───
 
@@ -493,6 +495,8 @@ export function peerCode(instance: InstanceConfig, target: { host: string; port:
 
 export type LaneOutcome = {
   success: boolean; text: string; status?: number; needsConfirm?: boolean; confirmFlag?: 'confirmUnchecked'; moveCode?: string; file?: string;
+  /** Run the main here again's question names this dump ('' for none); a confirm must send it back. */
+  confirmDump?: string;
   /** The steps that run once the op lock is released (a Running order, a rejoin): their outcome replaces this one. */
   after?: () => Promise<LaneOutcome>;
 };
@@ -500,7 +504,11 @@ export type LaneOutcome = {
 const settle = async (r: LaneOutcome): Promise<LaneOutcome> => (r.after ? r.after() : r);
 
 const refusal = (text: string, status = 409): LaneOutcome => ({ success: false, text, status });
-const busyText = (op: string) => `Operation '${op}' is running on this bot; wait for it to finish${NOTHING}`;
+/** Run the main here again's op name. */
+export const RUN_AGAIN_OP = 'run-again';
+const opName = (op: string) => (op === RUN_AGAIN_OP ? 'running the main here again' : op);
+const busyText = (op: string) => `Operation '${opName(op)}' is running on this bot; wait for it to finish${NOTHING}`;
+const laneError = (op: string, err: unknown) => (op === RUN_AGAIN_OP ? `Running the main here again stopped on an unexpected error: ${errText(err)}` : `The ${op} stopped on an unexpected error: ${errText(err)}`);
 const SLOT_BUSY = `A backup or restore operation is in progress on this database; wait for it to finish${NOTHING}`;
 
 /**
@@ -520,7 +528,7 @@ export async function startLane(botId: string, op: string, fn: (admit: () => voi
     .then(settle)
     .then(r => (admitted ? onDone(r) : answer(r)))
     .catch(err => {
-      const r = { success: false, text: `The ${op} stopped on an unexpected error: ${errText(err)}`, status: 500 };
+      const r = { success: false, text: laneError(op, err), status: 500 };
       if (admitted) onDone(r); else answer(r);
     });
   return answered;
@@ -536,7 +544,7 @@ export async function runLane(botId: string, op: string, fn: (admit: () => void)
   try {
     return await settle(await containerManager.withExternalBotOp(botId, op, () => fn(() => undefined)));
   } catch (err) {
-    return { success: false, text: `The ${op} stopped on an unexpected error: ${errText(err)}`, status: 500 };
+    return { success: false, text: laneError(op, err), status: 500 };
   }
 }
 
@@ -621,7 +629,7 @@ export function mainAdmission(inst: InstanceConfig, need: { replication: boolean
   const db = inst.fleetDb;
   if (!db || db.retiringAt) return `This instance holds no main database, so there is nothing to ${need.noun}${NOTHING}`;
   if (need.replication && !db.replication) return `Replication is not enabled on this database, so no copy follows it; enable it and add a live copy first${NOTHING}`;
-  if (inst.fleetDbReplica) return `This instance also holds a live copy; remove it before handing over the main${NOTHING}`;
+  if (inst.fleetDbReplica) return `This instance also holds a live copy; remove it first${NOTHING}`;
   if (inst.fleetDbReplicaSeed) return `A live copy seed is recorded on this instance; wait for it or dismiss it first${NOTHING}`;
   if (db.receive) return `This database is waiting to receive a main from another machine; Stop receiving first${NOTHING}`;
   if (db.replacedBy) return `Another database replaced this one as the main; rejoin this machine as a copy instead${NOTHING}`;
@@ -965,7 +973,7 @@ SELECT pg_current_wal_lsn();`);
   }
   const phaseError = saveSwitch(botId, { handover: { ...mark, phase: 'stopped' } });
   let text = `The main database on this machine is stopped, and the live copy on ${machine} holds every change it had. Open ${machine}'s manager and press Take over in the bot's Database window. This machine rejoins as a copy of ${machine} by itself once ${machine} is the main; until then its database stays stopped, unless you Cancel the hand-over.`;
-  if (!address) text += ` The copy on ${machine} has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine cannot rejoin it as a copy. To move the main back later, press Receive a main here, then Push the main in ${machine}'s manager.`;
+  if (!address) text += ` The copy on ${machine} has no address for other machines, so after it takes over it is the main only while it runs alone, and this machine does not rejoin it as a copy by itself. To move the main back later, press Receive a main here, then Push the main in ${machine}'s manager.`;
   if (phaseError) text += NOTREC_TAIL(phaseError);
   console.log(`[Switch] ${inst.displayName}: handed the main over to ${machine} (generation ${target} on take-over)${resuming ? ', resumed' : ''}`);
   return { success: true, text };
@@ -1034,6 +1042,9 @@ export async function cancelMove(botId: string, confirm: boolean): Promise<LaneO
  * the row's delete, which a copy that took over never does. The generation and the switch notice are never written.
  */
 async function cancelNoAddress(botId: string): Promise<LaneOutcome> {
+  const db = containerManager.getBot(botId)!.fleetDb!;
+  const file = db.pushBroken ? null : fleetBackup.shownRestoreNoticeFile(botId);
+  if (file) return refusal(`A restore of ${file} has not finished cleanly (its notice is on the Database window), so the hand-over was not cancelled and nothing was changed: this database would run as the main in that state. Dismiss the notice to keep the restored data, then cancel the hand-over again.`);
   const finish = await finishWaitingHandover(botId);
   const machine = containerManager.getBot(botId)!.fleetDb!.handover!.machine || 'another machine';
   if (finish.state === 'failed') return refusal(`The hand-over was not cancelled and nothing was changed: docker shows this database and the bot stopped, but the manager could not save the hand-over to ${machine} as finished (${finish.error}); try again.`);
@@ -1048,7 +1059,7 @@ async function cancelByReplay(botId: string): Promise<LaneOutcome> {
   const h = db.handover!;
   const machine = h.machine || 'another machine';
   if (db.receive) return refusal('This database is waiting to receive a main; Stop receiving first, then cancel the hand-over.');
-  if (db.pushBroken) return refusal(`A push replaced this database and did not finish, so it is no longer the database that was handed over; press Receive a main again so ${machine} can push again.`);
+  if (db.pushBroken) return refusal(`A push replaced this database and did not finish, so it is no longer the database that was handed over; press Receive a main again so ${machine} can push again. If ${machine} is lost for good, press Run the main here again, which restores the dump ${db.pushBroken.safetyDump} first.`);
   const t = { container: db.containerName, user: db.user };
   // started: this press may stop the database again. Under a waiting record that needs docker to have read it stopped.
   let started = false;
@@ -1087,8 +1098,8 @@ async function cancelByReplay(botId: string): Promise<LaneOutcome> {
       ? `, and its copy did not receive the cancel within ${Math.round(SWITCH_TIMING.catchUpMs / 1000)} seconds (${proof.behind} bytes behind, ${proof.state}).`
       : ', and this database holds no hand-over table, so no cancel was sent to its copy.';
     const back = containerManager.getBot(botId)?.fleetDb?.handover?.phase === 'waiting'
-      ? `If ${machine}'s manager shows it as the main, move the main back: press Receive a main here, which first stops this database and the bot when ${machine}'s copy is not connected; then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again; while this database runs and the copy streams, Hand over again finishes the hand-over instead.`
-      : `If ${machine}'s manager shows it as the main, move the main back: press Receive a main here, then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again.`;
+      ? `If ${machine}'s manager shows it as the main, move the main back: press Receive a main here, which first stops this database and the bot when ${machine}'s copy is not connected; then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again; while this database runs and the copy streams, Hand over again finishes the hand-over instead. If ${machine} is lost for good, press Run the main here again.`
+      : `If ${machine}'s manager shows it as the main, move the main back: press Receive a main here, then Push the main there. If it shows its copy still following this database, start that copy and press Cancel the hand-over again. If ${machine} is lost for good, press Run the main here again.`;
     return refusal(`The manager can't confirm whether ${machine} took over: ${machine} registered no address, so this manager cannot read it${sent} The hand-over stays recorded, the bot's login stays blocked, this database's generation was not changed, ${await dbNow()}. ${back}`);
   } catch (err) {
     const recorded = !!containerManager.getBot(botId)?.fleetDb?.handover;
@@ -1106,6 +1117,219 @@ async function probeTarget(inst: InstanceConfig, h: { host?: string; port?: numb
   if (pulled) return { verdict: null, reason: pulled };
   const verdict = await fleetJoin.peerProbe(inst, composed.code, cert.pem, 'switch');
   return { verdict, reason: 'reason' in verdict ? verdict.reason : verdict.kind };
+}
+
+// ─── Run the main here again ───
+
+/** What follows on the copy, which this manager cannot read: `below` and `equals` name this database's generation. */
+function runAgainOutcomes(c: string, n: number, below: string, equals: string): string {
+  return `This manager cannot read ${c}'s generation: ${c}'s take-over wrote ${n}, and one restore on ${c} after it writes ${n + 1}. If ${c}'s generation is below ${below}, ${c}'s manager blocks the bot's login there once it reaches this machine, and puts that bot in Off when it holds nothing it could not save. If it equals ${equals}, ${c}'s manager blocks the bot's login there and asks the owner to choose; Keep this machine as the main on ${c} then makes two mains that no manager reports. If it is higher, or ${c}'s manager lost the join code it kept at its take-over (its take-over said so), both machines run the bot as the main and no manager reports it. While this database's generation is at or above ${c}'s, a push from ${c} is refused. If ${c} comes back as a copy that has not reconnected to this database, remove its copy there (Remove replica) instead of pressing Take over: while it cannot reach this machine, a take-over there asks nothing and runs the bot as a second main until ${c}'s manager reaches this machine.`;
+}
+
+/** The question of Run the main here again, bound to the dump a press restores first ('' for none). */
+function runAgainQuestion(h: FleetDbHandover, pushBroken: { safetyDump: string } | undefined): LaneOutcome {
+  const c = h.machine || 'another machine';
+  const n = h.generation ?? 0;
+  const gt = !pushBroken && h.runAgainGeneration !== undefined ? `${h.runAgainGeneration}` : `${n + 1} or more`;
+  const ends = `above ${n} (the generation a take-over on ${c} writes) and ends the hand-over; the bot's login stays blocked until you choose Running.`;
+  const lead = pushBroken
+    ? `Run the main here again only if ${c} is lost for good. A push replaced this database and did not finish; the machine that pushed ran as the main, so its database holds changes this one lacks, and running the main here makes two mains with different data. The manager first restores the dump ${pushBroken.safetyDump}, taken here before receiving, which holds this machine's data as they were then; when the push left a database, the restore dumps it first and keeps that dump with the backups. When a step after the restore fails and you press again, the manager runs the restore again only while the push is still recorded as not finished, and each restore it runs raises this database's generation once more. Then it raises this database's generation ${ends}`
+    : `Run the main here again only if ${c} is lost for good. ${c} registered no address, so this manager cannot read it and can't confirm whether ${c} took over the main after the hand-over on ${whenText(h.at)}. If it did, ${c}'s database holds the bot's changes made there since, and this database lacks them: running the main here makes two mains with different data. The manager starts this database when it is stopped, raises its generation ${ends}`;
+  return {
+    success: false, needsConfirm: true, status: 409, confirmDump: pushBroken?.safetyDump ?? '',
+    text: `${lead} ${runAgainOutcomes(c, n, `this database's new generation, ${gt}`, 'it')} Run the main here again?`,
+  };
+}
+
+/** Run the main here again's checks of stored facts, before its file checks and its question; null when it may ask. */
+export function runAgainAdmission(inst: InstanceConfig): string | null {
+  const db = inst.fleetDb;
+  if (!db || db.retiringAt) return `This instance holds no main database, so there is no main to run here${NOTHING}`;
+  const h = db.handover;
+  if (!h) return `No hand-over to a machine without an address is recorded here, so there is nothing to run again${NOTHING}`;
+  if (!handoverNoAddress(h)) {
+    const m = h.machine || 'another machine';
+    return h.mode === 'stream'
+      ? `This machine handed its main database to ${m}, which registered an address, so this manager reads ${m} itself, and the Database window's lines say what ends the hand-over${NOTHING}`
+      : `This button is for a hand-over to a machine without an address, and the move recorded here (${moveModeText(h)}) is not one${NOTHING}`;
+  }
+  const admission = mainAdmission(inst, { replication: false, noun: 'run the main here again', resume: handoverNoAddress, allowPushBroken: true });
+  if (admission) return admission;
+  if (!db.pushBroken) {
+    const file = fleetBackup.shownRestoreNoticeFile(inst.id);
+    if (file) return `Running the main here again was refused and nothing was changed: the restore of ${file} left a notice on the Database window. Dismiss it to keep the restored data, then press Run the main here again, which ends the hand-over without restoring again; to restore ${file} again or another dump instead, do the same, then restore with the bot in Maintenance or Off.`;
+  }
+  return null;
+}
+
+/**
+ * Run the main here again: on the old main of a hand-over to a copy that registered no address, for a copy lost for
+ * good. After a push that did not finish it first restores the pre-receive dump; then it raises this database's
+ * generation to a target above the hand-over's, fixed in the record before the raise, and ends the hand-over.
+ */
+export async function runAgainMain(botId: string, confirm: boolean, admit: () => void = () => undefined, confirmDump = ''): Promise<LaneOutcome> {
+  const inst = containerManager.getBot(botId);
+  if (!inst) return refusal('Bot not found', 404);
+  const refused = runAgainAdmission(inst);
+  if (refused) return refusal(refused);
+  const db = inst.fleetDb!;
+  const h = db.handover!;
+  const pb = db.pushBroken;
+  if (pb) {
+    const F = pb.safetyDump;
+    const has = (name: string) => fs.existsSync(path.join(backupDir(botId), name));
+    const dump = has(F);
+    const counts = has(`${F}.json`);
+    if (!dump || !counts) {
+      const missing = !dump && !counts ? `the dump ${F} and its counts file ${F}.json` : !dump ? `the dump ${F}` : `its counts file ${F}.json`;
+      return refusal(`Running the main here again was refused and nothing was changed: a push replaced this database and did not finish, and ${missing}, kept from before that push, ${!dump && !counts ? 'are' : 'is'} not in this bot's backups, so there is nothing to restore this machine's data from. If copies exist, put them back in the backups under the same names, then press Run the main here again.`);
+    }
+  }
+  if (!confirm || confirmDump !== (pb?.safetyDump ?? '')) return runAgainQuestion(h, pb);
+
+  const c = h.machine || 'another machine';
+  const n = h.generation ?? 0;
+  const t = { container: db.containerName, user: db.user };
+  // The push sentence is owed once this database may be at or above the generation a take-over on the copy wrote.
+  let pushedUp = h.runAgainGeneration !== undefined || (!!pb && fleetBackup.restoreNoticePastDrop(botId, pb.safetyDump));
+  let startedHere = false;
+  let loginProven = false;
+  let ended = false;
+  let restored: { file: string; pre: string | null; warning?: string } | null = null;
+  const restoredText = () => (!restored ? ''
+    : restored.pre ? ` The dump ${restored.file} was restored first; the database as the push left it is kept in ${restored.pre}.`
+      : ` The dump ${restored.file} was restored first; the push had left no database to keep.`);
+  const pushText = () => (pushedUp ? ` A push from ${c} is refused while this database's generation is at or above ${c}'s.` : '');
+  const STOPPED_AGAIN = ' This database is stopped again.';
+  const tail = async (): Promise<string> => {
+    if (!startedHere || ended) return '';
+    const stop = await stopAndReadDb(botId, db.containerName);
+    if (stop.runs === false) return STOPPED_AGAIN;
+    if (stop.runs) {
+      return loginProven
+        ? ` It did not stop again (${stop.error}); it runs with the bot's login blocked, and the hand-over stays recorded.`
+        : ` It did not stop again (${stop.error}); it runs, the manager can't confirm that the bot's login is blocked, and the hand-over stays recorded.`;
+    }
+    return ` The manager can't confirm that it stopped again (${stop.error}); the hand-over stays recorded.`;
+  };
+  // "Nothing was changed" stands only while no restore ran and docker shows the database as it was before the press.
+  const refuse = async (text: string): Promise<LaneOutcome> => {
+    const after = await tail();
+    const body = !restored && (after === '' || after === STOPPED_AGAIN) ? text : withoutNothing(text);
+    return refusal(`${sentence(body)}${restoredText()}${pushText()}${after}`);
+  };
+
+  if (!claimFleetBackupBusy(botId)) {
+    return containerManager.isShuttingDown() ? refusal(containerManager.SHUTDOWN_REFUSAL, 503) : refusal(pushedUp ? `${sentence(SLOT_BUSY)}${pushText()}` : SLOT_BUSY);
+  }
+  try {
+    const ran = await dbLogin.sidecarRunning(db.containerName);
+    if (ran === null) return await refuse('Running the main here again was refused and nothing was changed: docker did not say whether this database runs. Press Run the main here again.');
+    if (ran === false) {
+      const up = await containerManager.startFleetDbSidecar(botId, { handedOver: true });
+      startedHere = true;
+      if (!up.success) {
+        const why = up.error || 'no reason given';
+        if (await dbLogin.sidecarRunning(db.containerName) === false) {
+          startedHere = false;
+          return await refuse(`Running the main here again was refused: this database did not start (${why})${NOTHING}`);
+        }
+        return await refuse(`Running the main here again was refused: this database did not start (${why})`);
+      }
+    }
+    const proof = await maintenance.requireMaintenance(botId, 'database');
+    if (!proof.ok) return await refuse(`Running the main here again was refused: ${withoutNothing(proof.error).replace(/\.$/, '')}${startedHere ? '' : NOTHING}`);
+    loginProven = true;
+    admit();
+
+    if (pb) {
+      const F = pb.safetyDump;
+      const r = await fleetBackup.restoreUnderLane(botId, F, RUN_AGAIN_OP);
+      if (r.steps.generation !== null) pushedUp = true;
+      if (!r.success) {
+        const still = containerManager.getBot(botId)?.fleetDb?.pushBroken;
+        if (still && fleetBackup.restoreNoticePastDrop(botId, F)) pushedUp = true;
+        const head = `Running the main here again stopped at the restore of ${F}: ${(r.error || 'no reason given').replace(/\.$/, '')}.`;
+        const wayOut = `a readable copy of ${F} and ${F}.json put back in this bot's backups under the same names, or a push from another machine that finishes here (press Receive a main again), is the way out.`;
+        let text: string;
+        if (r.refusedAs === 'read') {
+          text = `${head} The dump ${F} or its counts file ${F}.json could not be read, so this button cannot restore this machine's data until a readable copy of both is put back in this bot's backups under the same names; a push from another machine that finishes here (press Receive a main again) also ends the hand-over. The hand-over to ${c} stays recorded, and nothing else was changed.`;
+        } else if (r.refusedAs === 'shape') {
+          text = `${head} This button cannot restore that dump, so it cannot run the main here; a push from another machine that finishes here (press Receive a main again) ends the hand-over. The hand-over to ${c} stays recorded, and nothing else was changed.`;
+        } else {
+          text = `${head} The hand-over to ${c} stays recorded and the bot does not start here.`;
+          if (still) {
+            text += r.saysAgain
+              ? " Each restore that gets as far as writing the generation raises this database's generation once more."
+              : " Pressing Run the main here again tries again and restores that dump again; each restore that gets as far as writing the generation raises this database's generation once more.";
+            if (r.failedAt === 'pg_restore') text += ` If the data fail to restore the same way again, ${wayOut}`;
+            else if (r.failedAt === 'dumpRead') text += ` If the same error repeats, ${wayOut}`;
+          }
+        }
+        return await refuse(text);
+      }
+      restored = { file: F, pre: r.steps.preRestoreDump, ...(r.warning ? { warning: r.warning } : {}) };
+    }
+
+    const fence = await switchAdmissionNotice(botId, 'running the main here again was refused', { skipNotice: true });
+    if (fence) return await refuse(fence);
+    const layers = await fleetBackup.fenceLayers(db);
+    if (!layers) return await refuse("Running the main here again was refused: the manager can't confirm whether this database still refuses the bot's connections (its write fence could not be read).");
+
+    const now = containerManager.getBot(botId)?.fleetDb?.handover;
+    if (!now) return await refuse(`Running the main here again stopped: the hand-over to ${c} is no longer recorded here, so the generation was not raised`);
+    let target = restored ? undefined : now.runAgainGeneration;
+    if (target === undefined) {
+      const own = await ownGeneration(t, db.db);
+      if (!own.ok) return await refuse(`Running the main here again was refused: this database's generation could not be read (${own.error}).`);
+      const g = own.row?.generation ?? 0;
+      if (g >= n) pushedUp = true;
+      target = Math.max(g, n) + 1;
+    }
+    if (restored || now.runAgainGeneration !== target) {
+      const saved = saveSwitch(botId, { handover: { ...now, runAgainGeneration: target }, ...(restored ? { pushBroken: null } : {}) });
+      if (saved) return await refuse(`Running the main here again was refused: the manager could not record the generation it writes (${saved}).`);
+    }
+
+    const raised = await metaSql(t, db.db, raiseSql(machineNameOf(inst), target));
+    if (!raised.ok) {
+      // psql stops a script at its first error with 3 (ON_ERROR_STOP) and docker exec with 125 to 127 when psql never ran; a null code without a timeout is a process that did not start.
+      const beforeCommit = raised.code === 3 || (raised.code !== null && raised.code >= 125 && raised.code <= 127) || (raised.code === null && !raised.timedOut);
+      if (beforeCommit) return await refuse(`Running the main here again was refused: this database's generation could not be raised to ${target} (${failText(raised)}), so the hand-over to ${c} stays recorded. ${END_AGAIN}`);
+      pushedUp = true;
+      return await refuse(`Running the main here again stopped: the manager can't confirm whether this database's generation was raised to ${target} (${failText(raised)}), so the hand-over to ${c} stays recorded. ${END_AGAIN}`);
+    }
+    pushedUp = true;
+    const row = parseGenRow(raised.stdout);
+    if (!row) return await refuse(`Running the main here again stopped: the raise to ${target} answered '${lastLine(raised.stdout)}', so the manager can't confirm this database's generation; the hand-over to ${c} stays recorded. ${END_AGAIN}`);
+    const g = row.generation;
+
+    const cleared = saveSwitch(botId, { handover: null });
+    if (cleared) {
+      pushedUp = true;
+      return await refuse(`This database holds generation ${g} now, above the ${n} a take-over on ${c} writes, but the manager could not record that the hand-over ended (${cleared}), so it stays recorded and the bot does not start here. Press Run the main here again to finish recording it.`);
+    }
+    ended = true;
+    containerManager.broadcastBotUpdated(botId);
+    console.log(`[Switch] ${inst.displayName}: ran the main here again after the hand-over to ${c} (generation ${g})${restored ? `, after a restore of ${restored.file}` : ''}`);
+
+    const lead = restored
+      ? 'The machine whose push did not finish ran as the main, so its database holds changes this one lacks.'
+      : `The manager can't confirm whether ${c} took over.`;
+    const outcomes = runAgainOutcomes(c, n, `generation ${g}`, `generation ${g}${g === n + 1 ? ` (what one restore on ${c} after its take-over writes)` : ''}`);
+    const head = `This machine runs the main again: the hand-over to ${c} is ended, and this database holds generation ${g}, above the ${n} a take-over on ${c} writes.${restoredText()}`;
+    let text = layers.hba
+      ? `${head} ${lead} This database still refuses the bot's connections: the lines of a write fence stand in its pg_hba.conf. Until a restore lifts them, which the end of the hand-over now allows (restore a dump with the bot in Maintenance or Off), the bot cannot connect here, and ${c}'s manager cannot read this database's generation, so it does not stop the bot on ${c}. Once that fence is lifted: ${outcomes}`
+      : `${head} The bot's login stays blocked; choose Running in the State window to start the bot here. ${lead} ${outcomes}`;
+    if (restored?.warning) text += ` ${ucFirst(sentence(restored.warning))}`;
+    return { success: true, text };
+  } catch (err) {
+    const lead = `Running the main here again stopped on an unexpected error (${errText(err)}); `;
+    if (!containerManager.getBot(botId)?.fleetDb?.handover) return { success: false, status: 500, text: `${lead}the hand-over is no longer recorded.${restoredText()}${pushText()}` };
+    return { success: false, status: 500, text: `${lead}the hand-over is still recorded.${restoredText()}${pushText()}${await tail()}` };
+  } finally {
+    releaseFleetBackupBusy(botId);
+  }
 }
 
 // ─── O3 Take over ───
@@ -1155,6 +1379,7 @@ export const handOver = (botId: string, slot: string, confirm = false) => runLan
 export const cancelHandOver = (botId: string, confirm = false) => runLane(botId, 'handover', () => cancelMove(botId, confirm));
 export const takeOverMain = (botId: string, opts: { confirm?: boolean; confirmUnchecked?: boolean; start?: boolean } = {}) => runLane(botId, 'takeover', admit => takeOver(botId, opts, admit));
 export const keepThisMain = (botId: string) => runLane(botId, 'keep-main', () => keepMain(botId));
+export const runAgain = (botId: string, confirm = false, confirmDump = '') => runLane(botId, RUN_AGAIN_OP, admit => runAgainMain(botId, confirm, admit, confirmDump));
 
 const TK_PUSHED = "When this copy last received a change, the main still held the mark of a Receive, and its database had been replaced since that Receive (by a push or a restore) with no record that a push finished, so a take-over could run the bot on data no one checked; nothing was changed. If the main's machine still runs, its Database window says what stands there: let the push finish, or restore the dump it names with the bot in Maintenance or Off. If that window names no unfinished push and no receive, the mark was left over: start that database if it is stopped, and its manager removes the mark within a minute; then hand over from there. If that machine is gone, the machine that pushed keeps its own database until its push finishes or is cancelled: Cancel the push in its manager to keep that database as the main, then remove this copy and join that main. If no machine pushed, keep this copy, which may hold the bot's only database: when the manager cannot check the old main, Take over asks whether to take over anyway.";
 const W_UNCHECKED_Q = " The manager could not check the old main (the warning above says why), so it cannot tell whether a push into it finished; you can take over anyway. Do so only if you know that no machine was pushing into the old main, or that the machine that pushed holds no newer database than this copy. If that is wrong, this copy becomes the main with a database a push may have emptied or only partly filled; the machine that pushed keeps its own database and the pre-push- dump it made, and the data is recovered from there by a restore. Take over anyway?";
@@ -2144,6 +2369,8 @@ export interface SwitchView {
   takeBack: boolean;
   /** handoverNoAddress of the record, in either phase: Cancel decides by the copy's replay and asks nothing. */
   noAddress: boolean;
+  /** runAgainAdmission admits: both UIs offer Run the main here again. */
+  runAgain: boolean;
 }
 
 /** The N-g line after the replaced line (D36). */
@@ -2181,14 +2408,18 @@ export function switchView(inst: InstanceConfig): SwitchView {
   const h = db?.handover ?? null;
   if (h) {
     const machine = h.machine || 'another machine';
-    if (h.mode === 'stream' && h.phase === 'waiting') {
+    if (h.mode === 'stream' && h.phase === 'waiting' && handoverNoAddress(h)) {
+      const title = `The hand-over to ${machine} did not finish, and ${machine} has no address for other machines. Hand over again finishes it while ${machine}'s copy streams from this database; Receive a main takes the main back when ${machine}'s copy is not connected; Cancel the hand-over ends it when ${machine}'s copy receives the cancel; if ${machine} is lost for good, press Run the main here again.`;
+      lines.push(title);
+      badges.push({ text: 'Hand-over not finished', title, danger: true });
+    } else if (h.mode === 'stream' && h.phase === 'waiting') {
       lines.push('The hand-over did not finish. Press Hand over again, or Cancel the hand-over.');
       badges.push({ text: 'Hand-over not finished', title: 'Press Hand over again, or Cancel the hand-over', danger: true });
     } else if (h.mode === 'stream') {
       const title = handedOverNoAddress(h)
-        ? `Handed over to ${machine}, which has no address for other machines, so this machine cannot rejoin it as a copy. ${db?.receive
-          ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes.`
-          : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db?.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`}`}`
+        ? `Handed over to ${machine}, which has no address for other machines, so this machine does not rejoin it as a copy by itself. ${db?.receive
+          ? `Its database runs to receive the main back; the hand-over stays recorded until a push from ${machine}'s manager finishes, or until you press Stop receiving and then Run the main here again if ${machine} is lost for good.`
+          : `Its database stays stopped. To move the main back, press Receive a main here, then Push the main in ${machine}'s manager.${db?.pushBroken ? '' : ` Cancel the hand-over only if ${machine} never took over.`} If ${machine} is lost for good, press Run the main here again.`}`
         : `Handed over to ${machine} on ${whenText(h.at)}. This machine rejoins as its copy once ${machine} is the main; last check: ${h.lastCheck || 'not checked yet'}.`;
       lines.push(title);
       if (h.rejoinError) lines.push(h.rejoinError);
@@ -2225,7 +2456,7 @@ export function switchView(inst: InstanceConfig): SwitchView {
   }
   if (db?.pushBroken) {
     const text = handedOverNoAddress(h)
-      ? `A push replaced this database on or before ${whenText(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h?.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`
+      ? `A push replaced this database on or before ${whenText(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Press Receive a main again so ${h?.machine || 'another machine'} can push again. The dump ${db.pushBroken.safetyDump} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded. If ${h?.machine || 'another machine'} is lost for good, press Run the main here again, which restores that dump first.`
       : `A push replaced this database on or before ${whenText(db.pushBroken.at)} and did not finish, so the bot cannot run on it. Restore the dump ${db.pushBroken.safetyDump} (taken before receiving) with the bot in Maintenance or Off, or press Receive again so the other machine can push again.`;
     lines.push(text);
     badges.push({ text: 'Push not finished', title: text, danger: true });
@@ -2248,6 +2479,7 @@ export function switchView(inst: InstanceConfig): SwitchView {
     takeover: tk ? { planned: tk.planned, generation: tk.generation } : null,
     takeBack: handedOverNoAddress(h),
     noAddress: handoverNoAddress(h),
+    runAgain: runAgainAdmission(inst) === null,
   };
 }
 

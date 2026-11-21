@@ -100,11 +100,11 @@ describe('m5 move rows', () => {
     expect(cancelQuestion('stream', 'yundera', '', 'stopped').lines[1]).toContain('it asks again and says what follows');
     // The card badge of such a record: stopped, while receiving, and beside a push that did not finish.
     const served = (fleetDb: Record<string, unknown>, takeBack: boolean): Bot => ({ ...botOf(fleetDb), takeBack }) as Bot;
-    const lead = 'Handed over to yundera, which has no address for other machines, so this machine cannot rejoin it as a copy. ';
-    const stays = `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager. Cancel the hand-over only if yundera never took over.`;
+    const lead = 'Handed over to yundera, which has no address for other machines, so this machine does not rejoin it as a copy by itself. ';
+    const stays = `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager. Cancel the hand-over only if yundera never took over. If yundera is lost for good, press Run the main here again.`;
     expect(switchBadges(served({ handover: alone }, true))).toEqual([{ text: 'Handed over', title: stays, danger: false }]);
     expect(switchBadges(served({ handover: alone, receive: { expiresAt: '2026-11-15T10:00:00.000Z' } }, true))).toEqual([
-      { text: 'Handed over', title: `${lead}Its database runs to receive the main back; the hand-over stays recorded until a push from yundera's manager finishes.`, danger: false },
+      { text: 'Handed over', title: `${lead}Its database runs to receive the main back; the hand-over stays recorded until a push from yundera's manager finishes, or until you press Stop receiving and then Run the main here again if yundera is lost for good.`, danger: false },
       { text: 'Receiving', title: 'Waiting for a push until 2026-11-15 10:00 UTC', danger: false },
     ]);
     // The list did not serve the flag, or served false: the texts of a record with an address, whatever the record's host.
@@ -116,8 +116,8 @@ describe('m5 move rows', () => {
       ]);
     }
     expect(switchBadges(served({ handover: alone, pushBroken: BROKEN }, true))).toEqual([
-      { text: 'Handed over', title: `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager.`, danger: false },
-      { text: 'Push not finished', title: `A push replaced this database on or before 2026-11-14 09:00 UTC and did not finish, so the bot cannot run on it. Press Receive a main again so yundera can push again. The dump ${BROKEN_DUMP} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded.`, danger: true },
+      { text: 'Handed over', title: `${lead}Its database stays stopped. To move the main back, press Receive a main here, then Push the main in yundera's manager. If yundera is lost for good, press Run the main here again.`, danger: false },
+      { text: 'Push not finished', title: `A push replaced this database on or before 2026-11-14 09:00 UTC and did not finish, so the bot cannot run on it. Press Receive a main again so yundera can push again. The dump ${BROKEN_DUMP} (taken before receiving) stays with the backups; a restore is refused while the hand-over is recorded. If yundera is lost for good, press Run the main here again, which restores that dump first.`, danger: true },
     ]);
     // A push that did not finish: Receive names the kept dump (:3653).
     const broken = actionRows('main', { switch: { ok: true, value: {} } as never }, botOf({ pushBroken: { at: 'x', safetyDump: BROKEN_DUMP } }));

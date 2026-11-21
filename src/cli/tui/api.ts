@@ -1620,8 +1620,8 @@ export async function dismissRestoreNotice(client: Client, botId: string, at: st
 }
 
 /** POST /api/bots/:id/fleet-db/decommission (bots.ts:1817), decommissionFleetDb (fleetReplica.ts:1664). */
-export async function decommissionDb(client: Client, botId: string): Promise<Outcome<{ success?: boolean; error?: string; dumpFile?: string; warning?: string }>> {
+export async function decommissionDb(client: Client, botId: string): Promise<Outcome<{ success?: boolean; error?: string; dumpFile?: string; warning?: string; envNote?: string }>> {
   const r = await call(client, 'POST', `/api/bots/${botId}/fleet-db/decommission`, {});
   if (r.ok !== true) return r;
-  return { ok: true, value: r.value as { success?: boolean; error?: string; dumpFile?: string; warning?: string } };
+  return { ok: true, value: r.value as { success?: boolean; error?: string; dumpFile?: string; warning?: string; envNote?: string } };
 }

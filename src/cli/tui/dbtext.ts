@@ -734,15 +734,17 @@ export const DECOMMISSION_LINES = [
 ];
 
 // decommissionFleetDb's outcomes (:2937 to :2946).
-export function decommissionOutcome(r: Outcome<{ success?: boolean; error?: string; dumpFile?: string; warning?: string }>): { ok: boolean | null; text: string } {
+export function decommissionOutcome(r: Outcome<{ success?: boolean; error?: string; dumpFile?: string; warning?: string; envNote?: string }>): { ok: boolean | null; text: string } {
   if (r.ok === null) return { ok: null, text: 'No answer from the manager; the decommission may still be running. Check its state before trying again.' };
-  const res = r.ok === true ? r.value : { success: false, error: r.text };
+  const res: { success?: boolean; error?: string; dumpFile?: string; warning?: string; envNote?: string } = r.ok === true ? r.value : { success: false, error: r.text };
   if (res.success !== true) return { ok: false, text: res.error || 'Decommission refused' };
-  if (res.warning) return { ok: false, text: `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}` };
+  const note = res.envNote ? ` ${res.envNote}` : '';
+  const warningEnd = note && res.warning && !/[.!?]$/.test(res.warning) ? '.' : '';
+  if (res.warning) return { ok: false, text: `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}${warningEnd}${note}` };
   return {
     ok: true,
-    text: res.dumpFile
+    text: (res.dumpFile
       ? `Database decommissioned; safety dump kept: ${res.dumpFile}.`
-      : "Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt's dump, if any, is in the backups list).",
+      : "Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt's dump, if any, is in the backups list).") + note,
   };
 }

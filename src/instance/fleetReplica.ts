@@ -1357,15 +1357,25 @@ export async function instanceRemovalRefusal(
  * pin). The mode key goes too, otherwise the next rebuild reads it with no URL
  * beside it and mints a fresh sidecar for a node that just stopped having one.
  */
-function retireFleetDbEnvPins(botId: string): { unedited: string[]; unretired: { key: string; error: string }[] } {
+function retireFleetDbEnvPins(botId: string): { unedited: string[]; unretired: { key: string; error: string }[]; removed: string[]; allGone: boolean } {
   const unedited = new Set<string>();
+  const uneditedKeys = new Set<string>();
   const unretired: { key: string; error: string }[] = [];
+  const keys = companionEnvKeys(botId);
+  const recorded = containerManager.getBot(botId)?.envVars ?? {};
+  let inStore: envManager.StoredKeys | null = null;
+  try { inStore = envManager.snapshotStoredKeys(botId, keys); } catch { inStore = null; }
+  const storedBefore = keys.filter(key => Object.prototype.hasOwnProperty.call(recorded, key)
+    || (inStore !== null && (Object.prototype.hasOwnProperty.call(inStore.vars, key) || Object.prototype.hasOwnProperty.call(inStore.encrypted, key))));
   // Every key is tried: one refused write must not leave the others pinned.
-  for (const key of companionEnvKeys(botId)) {
+  for (const key of keys) {
     try {
       envManager.deleteEnvVar(botId, key);
       containerManager.removeBotEnvVars(botId, [key]);
-      for (const file of containerManager.removeEnvKeyFromDeployedCompose(botId, key)) unedited.add(file);
+      for (const file of containerManager.removeEnvKeyFromDeployedCompose(botId, key)) {
+        unedited.add(file);
+        uneditedKeys.add(key);
+      }
     } catch (err) {
       unretired.push({ key, error: errorText(err) });
     }
@@ -1377,7 +1387,21 @@ function retireFleetDbEnvPins(botId: string): { unedited: string[]; unretired: {
   } catch (err) {
     console.warn(`[FleetReplica] ${botId}: the env pins warning could not be saved: ${errorText(err)}`);
   }
-  return { unedited: [...unedited], unretired };
+  const left = new Set([...unretired.map(p => p.key), ...uneditedKeys]);
+  return { unedited: [...unedited], unretired, removed: storedBefore.filter(key => !left.has(key)), allGone: left.size === 0 };
+}
+
+/** What a decommission's removed env keys change for the operator; undefined when none was stored. */
+function removedEnvNote(botId: string, removed: string[], allGone: boolean): string | undefined {
+  if (removed.length === 0) return undefined;
+  const one = removed.length === 1;
+  const names = one ? removed[0] : `${removed.slice(0, -1).join(', ')} and ${removed[removed.length - 1]}`;
+  const modeKey = findAppCapabilities(containerManager.getBot(botId)?.sourceUrl)?.companionDb?.env.mode?.key;
+  const files = !!modeKey && removed.includes(modeKey);
+  const effect = files && allGone ? ', so the manager now reads it as a files bot and passes it no database'
+    : files ? ', so the manager now reads it as a files bot'
+    : allGone ? ', so the manager passes it no database' : '';
+  return `${names} ${one ? 'was' : 'were'} removed from this instance's env vars${effect}. What the bot runs on at its next start depends on its own settings in its data folder, which the manager can't confirm.`;
 }
 
 function unretiredPinsText(unretired: { key: string; error: string }[]): string {
@@ -1708,7 +1732,7 @@ async function liftFenceLeftStanding(botId: string, fleetDb: NonNullable<Instanc
  */
 export async function decommissionFleetDb(
   botId: string
-): Promise<{ success: boolean; error?: string; dumpFile?: string; warning?: string }> {
+): Promise<{ success: boolean; error?: string; dumpFile?: string; warning?: string; envNote?: string }> {
   try {
     // The bot op lock is held for the whole lane so a concurrent Start cannot
     // boot the instance onto the database mid-destroy; the guards re-read a
@@ -1734,7 +1758,7 @@ export async function decommissionFleetDb(
         return { success: false, error: 'Could not verify that this instance is fully stopped (docker did not answer) - try again' };
       }
       if (liveContainers.length > 0) {
-        return { success: false, error: `Containers of this instance are still running (${liveContainers.join(', ')}) - stop it fully first` };
+        return { success: false, error: `Docker still runs ${liveContainers.join(', ')} of this instance, which can use this database: stop the instance, then decommission again. Nothing was destroyed` };
       }
       if (!fleetBackupGuards.claimFleetBackupBusy(instance.id)) {
         return { success: false, error: containerManager.isShuttingDown() ? containerManager.SHUTDOWN_REFUSAL : 'A backup or restore operation is in progress on this database - wait for it to finish' };
@@ -1777,8 +1801,10 @@ export async function decommissionFleetDb(
           return { success: false, error: `${dumpFile ? `The safety dump succeeded (${dumpFile}) but the teardown failed` : 'The teardown failed'}: ${retired.error}${note}`, dumpFile };
         }
         let warning: string | undefined;
+        let envNote: string | undefined;
         try {
           const pins = retireFleetDbEnvPins(instance.id);
+          envNote = removedEnvNote(instance.id, pins.removed, pins.allGone);
           const parts = [
             ...(pins.unedited.length > 0 ? [uneditedPinsWarning(pins.unedited)] : []),
             ...(pins.unretired.length > 0 ? [`The database env pins ${pins.unretired.map(p => p.key).join(', ')} could not be removed (${pins.unretired[0].error}); delete them in the Env editor`] : []),
@@ -1794,7 +1820,7 @@ export async function decommissionFleetDb(
         if (warning) console.error(`[FleetReplica] ${instance.id}: ${warning}`);
         fleetBackup.clearClaimFloor(instance.id);
         fleetBackup.forgetRestoreNotice(instance.id);
-        return warning ? { success: true, dumpFile, warning } : { success: true, dumpFile };
+        return { success: true, dumpFile, ...(warning ? { warning } : {}), ...(envNote ? { envNote } : {}) };
       } finally {
         fleetBackupGuards.releaseFleetBackupBusy(instance.id);
       }

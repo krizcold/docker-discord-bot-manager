@@ -3158,10 +3158,12 @@
       try {
         const res = await api('POST', `/bots/${botId}/fleet-db/decommission`, {});
         if (!res.success) { showMessage('error', res.error || 'Decommission refused'); return; }
-        if (res.warning) { showMessage('error', `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}`); return; }
+        const envNote = res.envNote ? ` ${res.envNote}` : '';
+        const warningEnd = envNote && res.warning && !/[.!?]$/.test(res.warning) ? '.' : '';
+        if (res.warning) { showMessage('error', `Database decommissioned${res.dumpFile ? `; safety dump kept: ${res.dumpFile}` : ''}. ${res.warning}${warningEnd}${envNote}`); return; }
         showMessage('success', (res.dumpFile
           ? `Database decommissioned; safety dump kept: ${res.dumpFile}.`
-          : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list).'));
+          : 'Database decommissioned; no dump was taken (its volume no longer existed - an earlier attempt\'s dump, if any, is in the backups list).') + envNote);
       } catch (err) {
         showNoAnswer('decommission');
       } finally {

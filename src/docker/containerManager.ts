@@ -22,7 +22,7 @@ import {
   ContainerInfo, FleetBackupConfig, InstanceLane, MaintenanceRecord, BackupFamily, FleetBackupTests, FleetBackupAlert,
   FleetJoinRecord, MigrateLast, MigrateRecord, KeptOpKind, KeptOpRecord, KeptDataSet, KeptLast, KeptStep, FleetRestoreNotice,
 } from '../types';
-import { decodeJoinCode, isBackendUrlList, isJoinCode } from '../config/joinCode';
+import { decodeJoinCode, isBackendUrlList, isJoinCode, splitBackendUrls } from '../config/joinCode';
 import { copyLogin, switchDbStartRefusal, switchStartRefusal } from '../instance/switchSql';
 import { stampOf } from '../instance/backupFiles';
 import type { AppMemory } from '../instance/memoryRoom';
@@ -87,7 +87,8 @@ import {
   takeServiceOut,
   putServiceBack,
   platformNetworkNames,
-  splitDockerVolume
+  splitDockerVolume,
+  frontingGateway
 } from '../templates/pcsProcessing';
 import { generateStatusPageHtml } from '../templates/statusPage';
 import * as configFileManager from '../config/configFileManager';
@@ -4230,10 +4231,117 @@ export function syncComposeEnvVars(instance: InstanceConfig, composePath: string
 /** The instance's running compose containers other than its own fleet sidecar, for an instance with or without one; null when docker did not answer. */
 export async function runningInstanceContainers(botId: string): Promise<string[] | null> {
   if (getBot(botId)?.fleetDb) return runningNonSidecarContainers(botId);
+  return runningProjectContainersExcept(botId, null);
+}
+
+type QuietGateway = { name: string; service: string; image: string };
+
+/** The volume keys, their declared names and the bind sources a compose service mounts, trailing slashes dropped; anonymous volumes have none. */
+function mountSources(svc: Record<string, unknown> | undefined, declared: Record<string, unknown> | undefined): string[] {
+  const volumes = svc?.volumes;
+  if (!Array.isArray(volumes)) return [];
+  const sources: string[] = [];
+  for (const v of volumes) {
+    let source: unknown;
+    if (typeof v === 'string') source = v.includes(':') ? v.slice(0, v.indexOf(':')) : undefined;
+    else if (v && typeof v === 'object') source = (v as Record<string, unknown>).source;
+    if (typeof source !== 'string' || !source.trim()) continue;
+    const key = source.trim().replace(/\/+$/, '') || '/';
+    sources.push(key);
+    const name = (declared?.[key] as Record<string, unknown> | undefined)?.name;
+    if (typeof name === 'string' && name.trim()) sources.push(name.trim());
+  }
+  return sources;
+}
+
+/** Every key and string value in a compose service, at any depth, numbers and booleans as text. */
+function serviceStrings(value: unknown, out: string[] = []): string[] {
+  if (Array.isArray(value)) for (const v of value) serviceStrings(v, out);
+  else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      out.push(k);
+      serviceStrings(v, out);
+    }
+  } else if (value !== null && value !== undefined) out.push(String(value));
+  return out;
+}
+
+/**
+ * The deployed compose's fronting gateway when that compose shows it cannot
+ * receive the database: not the service the bot's env goes to; no env_file,
+ * secrets, configs or extends; no mount shared with or nested in another
+ * service's; and no string anywhere in it naming a companion key, a stored
+ * URL or a database host. Null on anything unknown, so the caller counts the
+ * container.
+ */
+function quietGateway(instance: InstanceConfig): QuietGateway | null {
+  try {
+    const doc = YAML.parseDocument(fs.readFileSync(resolveComposePath(instance.id, instance.sanitizedName), 'utf-8'));
+    if (doc.errors.length > 0) return null;
+    const compose = doc.toJSON();
+    if (!compose || typeof compose !== 'object') return null;
+    const found = frontingGateway(compose);
+    if (!found || found.gateway === getAppServiceName(compose)) return null;
+    const svc = compose.services?.[found.gateway];
+    if (!svc || typeof svc !== 'object') return null;
+    if (svc.env_file !== undefined || svc.secrets !== undefined || svc.configs !== undefined || svc.extends !== undefined || svc.volumes_from !== undefined) return null;
+    if (['pid', 'ipc', 'network_mode'].some(k => /^\s*(service|container):/i.test(String(svc[k] ?? '')))) return null;
+    if (String(svc.pid ?? '').trim().toLowerCase() === 'host') return null;
+    const socketParents = ['/', '/var', '/var/run', '/run'];
+    if (mountSources(svc, compose.volumes).some(source => /(^|\/)docker\.sock$/.test(source) || socketParents.includes(source))) return null;
+    const name = svc.container_name;
+    const image = svc.image;
+    if (typeof name !== 'string' || !name || typeof image !== 'string' || !image) return null;
+    const otherMounts = Object.entries(compose.services ?? {})
+      .filter(([key]) => key !== found.gateway)
+      .flatMap(([, other]) => mountSources(other as Record<string, unknown>, compose.volumes));
+    // Any bind path, `$DATA_ROOT/...` included, lies under '/'; a plain volume name does not.
+    const under = (child: string, parent: string) => parent === '/' ? !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(child) : child.startsWith(`${parent}/`);
+    const nested = (a: string, b: string) => a === b || under(b, a) || under(a, b);
+    if (mountSources(svc, compose.volumes).some(source => otherMounts.some(other => nested(source, other)))) return null;
+    const db = findAppCapabilities(instance.sourceUrl)?.companionDb;
+    const keys = db ? [db.env.url, db.env.mode?.key].filter((k): k is string => !!k) : [];
+    const urls = new Set<string>();
+    const hosts = new Set<string>();
+    if (instance.fleetDb?.containerName) hosts.add(instance.fleetDb.containerName.toLowerCase());
+    if (db) {
+      const store = envManager.getEnvVarsWithStatus(instance.id);
+      if (store.corrupt || store.undecryptable.includes(db.env.url)) return null;
+      for (const value of [instance.envVars?.[db.env.url], store.vars[db.env.url]]) {
+        for (const url of splitBackendUrls(typeof value === 'string' ? value : '')) {
+          urls.add(url);
+          for (const a of readDatabaseUrl(url).addresses) if (a.host) hosts.add(a.host.toLowerCase());
+        }
+      }
+    }
+    // Labels are read by docker and Caddy, never by the process inside.
+    const { labels: _labels, ...readable } = svc;
+    for (const text of serviceStrings(readable)) {
+      const value = composeEnvLiteral(text);
+      if (keys.some(key => value.includes(key))) return null;
+      if ([...urls].some(url => value.includes(url))) return null;
+      const lower = value.toLowerCase();
+      if ([...hosts].some(host => lower.includes(host))) return null;
+    }
+    return { name, service: found.gateway, image };
+  } catch {
+    return null;
+  }
+}
+
+/** The project's running containers other than skip and a quiet fronting gateway (matched by name, service label and image); null when docker did not answer or the instance has no record. */
+async function runningProjectContainersExcept(botId: string, skip: string | null): Promise<string[] | null> {
+  const instance = getBot(botId);
+  if (!instance) return null;
+  const gateway = quietGateway(instance);
   try {
     const { stdout } = await execAsync(
-      `docker ps --filter "label=com.docker.compose.project=${resolveAppName(botId)}" --format "{{.Names}}"`, { timeout: 10000 });
-    return stdout.split('\n').map(s => s.trim()).filter(Boolean);
+      `docker ps --filter "label=com.docker.compose.project=${instance.sanitizedName}" --format "{{.Names}}|{{.Label \\"com.docker.compose.service\\"}}|{{.Image}}"`, { timeout: 10000 });
+    return stdout.split('\n').map(s => s.trim()).filter(Boolean)
+      .map(line => line.split('|'))
+      .filter(([name, service, image]) => !(gateway && name === gateway.name && service === gateway.service && image === gateway.image))
+      .map(([name]) => name)
+      .filter(name => name !== skip);
   } catch {
     return null;
   }
@@ -4245,20 +4353,12 @@ export async function runningInstanceContainers(botId: string): Promise<string[]
  * so the caller must refuse rather than assume quiet.
  */
 export async function runningNonSidecarContainers(botId: string): Promise<string[] | null> {
-  const appName = resolveAppName(botId);
   // Exclusion by the record's exact container name, not by service key: an
   // adopted standby's database keeps service 'fleet-postgres-replica' until
   // its next rebuild, and misclassifying it as a leftover would stop it.
   const sidecarName = getBot(botId)?.fleetDb?.containerName;
   if (!sidecarName) return null;
-  try {
-    const { stdout } = await execAsync(
-      `docker ps --filter "label=com.docker.compose.project=${appName}" --format "{{.Names}}"`, { timeout: 10000 });
-    return stdout.split('\n').map(s => s.trim()).filter(Boolean)
-      .filter(name => name !== sidecarName);
-  } catch {
-    return null;
-  }
+  return runningProjectContainersExcept(botId, sidecarName);
 }
 
 /**
